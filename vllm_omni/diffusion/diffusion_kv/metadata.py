@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Scheduler-to-Worker allocation payloads for diffusion KV.
 
@@ -40,7 +40,9 @@ class DiffusionKVSequenceMetadata:
     target_len: int
     seq_len: int
     block_ids: tuple[list[int], ...]
+    cached_prefix_len: int = 0
     context_ids: tuple[str, ...] = ()
+    num_computed_tokens: int = 0
 
 
 @dataclass

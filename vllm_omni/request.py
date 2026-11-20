@@ -14,7 +14,12 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PayloadSenderInfo,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -39,6 +44,7 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
+        payload_sender_info: PayloadSenderInfo | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -58,6 +64,8 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        # Sender's connector address, or the payload itself for run requests.
+        self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -75,6 +83,7 @@ class OmniRequest(Request):
         cls,
         request: OmniEngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
+        block_hashes: list["BlockHash"] | None = None,
     ) -> "Request":
         """Create an OmniRequest from an OmniEngineCoreRequest.
 
@@ -82,6 +91,9 @@ class OmniRequest(Request):
             request: The OmniEngineCoreRequest to convert
             block_hasher: Optional function to compute block hashes for
                 prefix caching
+            block_hashes: Optional frontend-computed prompt block hashes
+                (v0.34); the hasher continues from the first block they
+                do not cover.
 
         Returns:
             OmniRequest instance created from the engine core request
@@ -103,10 +115,13 @@ class OmniRequest(Request):
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            block_hashes=block_hashes,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            payload_sender_info=request.payload_sender_info,
             resumable=request.resumable,
             session_id=request.session_id,
+            kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,

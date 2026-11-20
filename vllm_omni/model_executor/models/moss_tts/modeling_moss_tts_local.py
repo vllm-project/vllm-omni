@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -23,7 +26,7 @@ previous KV-cache loop -- causal attention, only the last position is read.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -62,6 +65,43 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
             use_parallel_embedding=False,
             prefix="model",
         )
+        self._kv_buf: torch.Tensor | None = None
+        self._kv_steps: dict[tuple[torch.device, int], list[tuple[torch.Tensor, torch.Tensor]]] = {}
+
+    def _ensure_kv_state(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        bsz: int,
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]:
+        cfg = self.config
+        rvq = int(cfg.rvq)
+        head_dim = int(getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads)
+        if (
+            self._kv_buf is None
+            or self._kv_buf.device != device
+            or self._kv_buf.dtype != dtype
+            or self._kv_buf.shape[2] < bsz
+        ):
+            self._kv_buf = torch.zeros(
+                (int(cfg.num_hidden_layers), 2, bsz, int(cfg.num_key_value_heads), rvq + 1, head_dim),
+                dtype=dtype,
+                device=device,
+            )
+        kv_views = [(self._kv_buf[i, 0, :bsz], self._kv_buf[i, 1, :bsz]) for i in range(self._kv_buf.shape[0])]
+        step_key = (device, rvq + 1)
+        steps = self._kv_steps.get(step_key)
+        if steps is None:
+            keys = torch.arange(rvq + 1, device=device)
+            steps = [
+                (
+                    torch.tensor([step], device=device, dtype=torch.long),
+                    (keys[None, :] <= step).view(1, 1, 1, rvq + 1),
+                )
+                for step in range(rvq)
+            ]
+            self._kv_steps[step_key] = steps
+        return kv_views, steps
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Delegate ``model.*`` tensors to ``CodePredictorBaseModel.load_weights``.
@@ -91,10 +131,14 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """Generate one audio frame (rvq codebook tokens) for batch B.
 
         Returns a ``(B, rvq)`` LongTensor.
+
+        ``generators`` follows batch-row order so each seeded request owns its
+        RVQ sampling stream across codebooks and successive frames.
 
         ``history_per_codebook[i]`` is a list of recently-emitted token ids for
         codebook ``i``; when ``repetition_penalty != 1.0`` those tokens get
@@ -102,10 +146,46 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         """
         device = backbone_last_hidden.device
         B = backbone_last_hidden.shape[0]
+        generators = _normalize_generators(generators, B)
         rvq = self.config.rvq
         hidden_size = self.config.hidden_size
 
         codec_embeds = self.model.codec_embedding
+        codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
+        # CodePredictorBaseModel upcasts float16 inputs to float32 under autocast,
+        # whereas a float16 KV buffer truncates cached K/V; keep re-prefill there.
+        use_kv_cache = hasattr(self.model, "forward_cached") and backbone_last_hidden.dtype != torch.float16
+
+        if use_kv_cache:
+            kv_views, kv_steps = self._ensure_kv_state(device, backbone_last_hidden.dtype, B)
+            cur_embed = backbone_last_hidden.unsqueeze(1)
+            for step in range(rvq):
+                write_pos, key_mask = kv_steps[step]
+                pos_ids = write_pos.unsqueeze(0).expand(B, 1)
+                hidden = self.model.forward_cached(cur_embed, pos_ids, kv_views, write_pos, key_mask)
+                logits = lm_heads[step](hidden[:, 0, :]).float()
+
+                if repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
+                    hist = history_per_codebook[step]
+                    if hist:
+                        hist_t = torch.tensor(hist, dtype=torch.long, device=logits.device)
+                        sel = logits.index_select(-1, hist_t)
+                        pos = sel > 0
+                        sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
+                        logits.index_copy_(-1, hist_t, sel)
+
+                codes[:, step] = _sample_token(
+                    logits,
+                    temperature,
+                    top_k,
+                    top_p,
+                    do_sample,
+                    generators=generators,
+                )
+
+                if step + 1 < rvq:
+                    cur_embed = codec_embeds[step](codes[:, step].view(B, 1))
+            return codes
 
         # Re-prefill buffer: position 0 = backbone hidden, position s = embed of
         # code_{s-1}. At step s we forward positions [0..s] and read the last.
@@ -113,8 +193,6 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         embeds[:, 0, :] = backbone_last_hidden.to(embeds.dtype)
 
         pos_ids_full = torch.arange(rvq, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
-
-        codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
 
         for step in range(rvq):
             seq_len = step + 1
@@ -130,12 +208,37 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
                     sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
                     logits.index_copy_(-1, hist_t, sel)
 
-            codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
+            codes[:, step] = _sample_token(
+                logits,
+                temperature,
+                top_k,
+                top_p,
+                do_sample,
+                generators=generators,
+            )
 
             if step + 1 < rvq:
                 embeds[:, step + 1, :] = codec_embeds[step](codes[:, step].view(B, 1)).view(B, hidden_size)
 
         return codes
+
+
+def _normalize_generators(
+    generators: Sequence[torch.Generator | None] | None,
+    batch_size: int,
+) -> list[torch.Generator | None] | None:
+    """Validate per-row generators against the batch they will sample for.
+
+    Mirrors ``Qwen3CodePredictor._normalize_generators``: a length mismatch is
+    an error instead of a silent per-row fallback to the global RNG, which would
+    quietly break reproducibility of seeded requests.
+    """
+    if generators is None:
+        return None
+    row_generators = list(generators)
+    if len(row_generators) != batch_size:
+        raise ValueError(f"Expected {batch_size} per-row generators, but got {len(row_generators)}.")
+    return row_generators
 
 
 def _sample_token(
@@ -145,6 +248,7 @@ def _sample_token(
     top_p: float,
     do_sample: bool,
     generator: torch.Generator | None = None,
+    generators: Sequence[torch.Generator | None] | None = None,
 ) -> torch.Tensor:
     """Top-k + top-p sampling for the upstream inference branch.
 
@@ -153,6 +257,12 @@ def _sample_token(
     vocabulary. This preserves the categorical distribution when the top-k
     boundary has no ties, but it is not seed/bit equivalent to multinomial over
     a full-vocabulary tensor because random-number mapping depends on width.
+
+    When ``generators`` is provided (per-row), each row is sampled with its
+    own generator via separate ``multinomial`` calls. This keeps the rest of
+    the forward batched while making seeded requests reproducible per-row.
+    ``generators`` must hold exactly one entry per batch row; a mismatch raises
+    ``ValueError`` rather than silently falling back to the global RNG.
     """
     if not do_sample or temperature <= 0:
         return logits.argmax(dim=-1)
@@ -181,8 +291,20 @@ def _sample_token(
             logits = torch.full_like(logits, float("-inf")).scatter_(-1, sorted_indices, logits)
 
     probs = F.softmax(logits, dim=-1)
-    flat = probs.reshape(-1, probs.shape[-1])
-    sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+    B = int(probs.shape[0])
+    row_generators = _normalize_generators(generators, B)
+    if row_generators is not None and any(gen is not None for gen in row_generators):
+        rows = []
+        for row in range(B):
+            row_probs = probs[row : row + 1]
+            flat = row_probs.reshape(-1, row_probs.shape[-1])
+            sampled = torch.multinomial(flat, num_samples=1, generator=row_generators[row])
+            rows.append(sampled)
+        sampled = torch.cat(rows, dim=0).reshape(probs.shape[:-1])
+    else:
+        flat = probs.reshape(-1, probs.shape[-1])
+        sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+
     if compact_indices is not None:
         return compact_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
     return sampled

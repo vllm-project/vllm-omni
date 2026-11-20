@@ -3,14 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Any
 
-
-def patch_minicpmo_remote_config(config: Any) -> None:
+def patch_minicpmo_remote_config(config: object) -> None:
     """Fill config fields expected by the vLLM MiniCPM implementation."""
     seen: set[int] = set()
 
-    def patch_cfg(cfg: Any) -> None:
+    def patch_cfg(cfg: object) -> None:
         if cfg is None or id(cfg) in seen:
             return
         seen.add(id(cfg))

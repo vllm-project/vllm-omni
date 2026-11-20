@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -14,7 +14,9 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+    from vllm_omni.diffusion.attention.schedule import AttentionSchedule, AttentionSigmaSchedule
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+    from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -53,6 +55,9 @@ class StepBatchSamplingParamsKey:
     participate in the current homogeneous batching policy.
     """
 
+    # Packed and ordinary dense requests never share an execution contract.
+    mixfusion_key: tuple | None = None
+
     # Spatial / temporal shape.
     height: int | None = None
     width: int | None = None
@@ -88,10 +93,16 @@ class StepBatchSamplingParamsKey:
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
 
-    # LoRA identity. Requests with different adapters or scales must run in
-    # separate batches so the worker can activate exactly one adapter per step.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. Requests with different adapter combinations or scales
+    # must run in separate batches so the worker can activate exactly one
+    # adapter (or one composed multi-LoRA adapter) per step. Normalized via
+    # ``build_lora_batch_key``; None when no LoRA is active.
+    lora_key: tuple[tuple[int, float], ...] | None = None
+
+    # Same resolved request schedules, and step-range source, as the request-batch key.
+    attention_schedule: AttentionSchedule = ()
+    attention_schedule_explicit: bool = False
+    attention_sigma_schedule: AttentionSigmaSchedule = ()
 
 
 @dataclass(frozen=True, eq=True)
@@ -149,14 +160,39 @@ class RequestBatchSamplingParamsKey:
     sample_solver: str | None = None
     flow_shift: float | None = None
 
+    # Names of non-None ``negative_*`` prompt fields. Negative text,
+    # embeddings, masks, and pooled embeddings can select a pipeline's CFG
+    # branches independently of do_classifier_free_guidance. Compare their
+    # presence conservatively alongside guidance fields to align forward counts.
+    negative_conditioning: frozenset[str] = frozenset()
+
     # Pipeline-specific condition structure populated during preprocessing.
     # It prevents independently valid requests with incompatible conditions
     # from being admitted to the same request batch.
     condition_key: tuple[Any, ...] | None = None
 
-    # LoRA identity.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. See StepBatchSamplingParamsKey.lora_key.
+    lora_key: tuple[tuple[int, float], ...] | None = None
+
+    # Rank-local DP shares weight collectives across requests and requires
+    # identical full extra_args. The scheduler caches this at request addition;
+    # ordinary request batching leaves it unset to allow request-local values.
+    rank_local_dp_extra_args_signature: str | None = None
+
+    # Text-encoder AllGather requires matching encoder forward counts across
+    # DP ranks. Cached only when that mode is active.
+    text_encoder_input_signature: tuple[bool, bool] | None = None
+
+    # Request schedule resolved against the service default; () runs the baseline. Different ranges
+    # must not share a batch.
+    attention_schedule: AttentionSchedule = ()
+    # Whether the request sent its schedule. An explicit schedule is checked against the step count and
+    # an inherited default is not, so the two never share a batch even when their ranges are equal.
+    attention_schedule_explicit: bool = False
+    # Sigma windows resolved against the service default; () runs without them. Nothing checks
+    # explicit windows differently from inherited ones, so an inherited default and the same windows
+    # sent explicitly share a batch, and no source bit is kept for them.
+    attention_sigma_schedule: AttentionSigmaSchedule = ()
 
 
 @dataclass
@@ -170,6 +206,8 @@ class SchedulerRequestState:
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
     queued_at: float = 0.0
+    # Request-mode admission must leave this request alone in its wave.
+    requires_single_request: bool = False
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)
@@ -252,11 +290,31 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    # Execution mode only; the worker owns the packed tensor layout.
+    use_mixfusion: bool = False
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
-    # Opaque metadata emitted by a future Scheduler-role connector. PR0 keeps
-    # the input port but does not build or consume it.
     kv_connector_metadata: KVConnectorMetadata | None = None
+    kv_transfer_request_ids: set[str] = field(default_factory=set)
+    # None preserves the synchronous path; an empty set means submit/poll
+    # without waiting. Transfer IDs above are submitted only once.
+    kv_required_request_ids: set[str] | None = None
+    kv_poll_only: bool = False
+    # Keep background transfers out of the current request's Mooncake batch.
+    kv_prefetch_connector_metadata: KVConnectorMetadata | None = None
+    kv_prefetch_request_ids: set[str] = field(default_factory=set)
+    # Connector lifecycle uses per-sequence IDs, not public request IDs.
+    kv_finished_request_ids: set[str] = field(default_factory=set)
+    # A single host-selected boundary decision is delivered to every Worker.
+    step_resumes: dict[str, Literal["interaction", "timeout"]] = field(default_factory=dict)
+    interaction_boundaries: dict[str, InteractionBoundaryContext] = field(default_factory=dict)
+
+    @property
+    def has_sync_kv_loads(self) -> bool:
+        # vLLM defers async submission until post_forward. The synchronous
+        # receive loop must start its loads in pre_forward before polling.
+        required = self.kv_required_request_ids
+        return bool(self.kv_transfer_request_ids if required is None else required)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:
@@ -274,4 +332,10 @@ class DiffusionSchedulerOutput:
 
     @property
     def is_empty(self) -> bool:
-        return self.num_scheduled_reqs == 0
+        return (
+            self.num_scheduled_reqs == 0
+            and self.kv_connector_metadata is None
+            and self.kv_prefetch_connector_metadata is None
+            and not self.kv_required_request_ids
+            and not self.kv_poll_only
+        )

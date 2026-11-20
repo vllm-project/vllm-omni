@@ -19,14 +19,17 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import regex as re
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.multimodal.cache import LruKeyReplicatedSenderCache, ShmObjectStoreSenderCache
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
@@ -43,12 +46,14 @@ from vllm_omni.config.omni_config import (
     _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
     _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     _LOAD_STAGE_ENGINE_FIELD_MAP,
+    _LORA_CONFIG_ENGINE_FIELD_MAP,
     _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
     _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     BaseVllmOmniStageConfig,
     VllmOmniDiffusionStageConfig,
 )
 from vllm_omni.config.stage_config import StageType
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
@@ -62,6 +67,7 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.watermarking.utils import to_vllm_watermark_config
 
 logger = init_logger(__name__)
 
@@ -402,6 +408,11 @@ def _tp_size_for_stage(stage_configs: Sequence[Any], stage_id: Any) -> int | Non
     for stage_cfg in stage_configs:
         if str(getattr(stage_cfg, "stage_id", None)) not in id_strs:
             continue
+        if isinstance(stage_cfg, BaseVllmOmniStageConfig):
+            try:
+                return max(1, int(stage_cfg.parallel_config.tensor_parallel_size))
+            except (TypeError, ValueError):
+                return 1
         engine_args = getattr(stage_cfg, "engine_args", None)
         if engine_args is None:
             return 1
@@ -489,11 +500,15 @@ def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[
     rank mappings automatically.
     """
     try:
-        engine_args = stage_cfg.engine_args
-        if hasattr(engine_args, "get"):
-            omni_kv = engine_args.get("omni_kv_config", None)
+        connector_config = getattr(stage_cfg, "connector_config", None)
+        if connector_config is not None:
+            omni_kv = connector_config.omni_kv_config
         else:
-            omni_kv = getattr(engine_args, "omni_kv_config", None)
+            engine_args = stage_cfg.engine_args
+            if hasattr(engine_args, "get"):
+                omni_kv = engine_args.get("omni_kv_config", None)
+            else:
+                omni_kv = getattr(engine_args, "omni_kv_config", None)
 
         if omni_kv is None:
             return
@@ -504,7 +519,11 @@ def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[
             if "stage_id" not in omni_kv:
                 omni_kv["stage_id"] = stage_id
 
-        engine_input_source = getattr(stage_cfg, "engine_input_source", None)
+        engine_input_source = (
+            getattr(stage_cfg, "input_sources", None)
+            if connector_config is not None
+            else getattr(stage_cfg, "engine_input_source", None)
+        )
         if engine_input_source is not None:
             if hasattr(omni_kv, "setdefault"):
                 omni_kv.setdefault("engine_input_source", list(engine_input_source))
@@ -561,6 +580,7 @@ class StageMetadata:
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    async_chunk_prewarm_payload_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -646,6 +666,12 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    async_chunk_prewarm_payload_func: Callable | None = None
+    _acp_path = _get_attr_or_item(stage_config, "async_chunk_prewarm_payload_func")
+    if _acp_path:
+        _mod, _fn = _acp_path.rsplit(".", 1)
+        async_chunk_prewarm_payload_func = getattr(importlib.import_module(_mod), _fn)
+
     model_stage = engine_args.get("model_stage")
 
     if stage_type == "diffusion":
@@ -685,6 +711,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         runtime_cfg=runtime_cfg,
         prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
+        async_chunk_prewarm_payload_func=async_chunk_prewarm_payload_func,
     )
 
 
@@ -703,17 +730,16 @@ def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
 def extract_stage_metadata_from_omni_stage_config(
     stage_config: BaseVllmOmniStageConfig,
 ) -> StageMetadata:
-    """Project one typed stage config into metadata for a future cutover.
-
-    This projection is not used by production startup yet. Current replica
-    layout, engine-argument, remote-diffusion, and platform setup paths still
-    require the legacy StageConfig/OmegaConf shape.
-    """
+    """Project one typed stage config into production runtime metadata."""
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
-    sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    sampling_params: OmniSamplingParams = sampling_params_cls(
-        **(stage_config.model_config.default_sampling_params or {})
-    )
+    pooling_config = stage_config.pooling_config
+    if stage_type == "llm" and (pooling_config.runner or "").lower() == "pooling":
+        sampling_params: OmniSamplingParams | PoolingParams = (
+            copy.deepcopy(pooling_config.default_pooling_params) or PoolingParams()
+        )
+    else:
+        sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
+        sampling_params = sampling_params_cls(**(stage_config.model_config.default_sampling_params or {}))
     custom_process_input_func = _resolve_omni_metadata_hook(stage_config.custom_process_input_func)
 
     if stage_type == "diffusion":
@@ -749,6 +775,7 @@ def extract_stage_metadata_from_omni_stage_config(
         runtime_cfg=stage_config.runtime_config,
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
+        async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
     )
 
 
@@ -878,7 +905,9 @@ def _get_local_llm_parallel_sizes(
     unset.
     """
     if engine_args is None:
-        engine_args = getattr(stage_cfg, "engine_args", {})
+        engine_args = getattr(stage_cfg, "parallel_config", None)
+        if engine_args is None:
+            engine_args = getattr(stage_cfg, "engine_args", {})
     tp_size = int(_get_attr_or_item(engine_args, "tensor_parallel_size", 1) or 1)
     pp_size = int(_get_attr_or_item(engine_args, "pipeline_parallel_size", 1) or 1)
     local_dp_size = _get_attr_or_item(engine_args, "data_parallel_size_local", None)
@@ -889,9 +918,12 @@ def _get_local_llm_parallel_sizes(
 
 def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
-    if engine_args is None:
-        engine_args = getattr(stage_cfg, "engine_args", {})
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
+        typed_parallel_config = getattr(stage_cfg, "parallel_config", None)
+        if typed_parallel_config is not None:
+            return max(1, int(typed_parallel_config.world_size))
+        if engine_args is None:
+            engine_args = getattr(stage_cfg, "engine_args", {})
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
         if parallel_config is None:
             return 1
@@ -915,6 +947,7 @@ def compute_replica_layout(
     stage_configs: Sequence[Any],
     *,
     allow_zero: bool = False,
+    local_replica_counts: Mapping[int, int] | None = None,
 ) -> tuple[list[int], dict[int, list[str | None]]]:
     """Compute per-stage replica counts and device assignments.
 
@@ -925,6 +958,9 @@ def compute_replica_layout(
             single-stage / head-distributed mode for non-self stages that
             will be filled dynamically by remote registrations); when False
             (default), the count is clamped to at least 1.
+        local_replica_counts: optional stage-index overrides for the number of
+            replicas using this host's device pool. Cluster totals are preserved;
+            remote slots receive no local device assignment.
 
     Returns:
         replicas_per_stage: num_replicas per logical stage.
@@ -933,7 +969,7 @@ def compute_replica_layout(
     """
     replicas_per_stage: list[int] = []
     for stage_cfg in stage_configs:
-        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
         num_replicas = int(
             runtime_cfg.get("num_replicas", 1)
             if hasattr(runtime_cfg, "get")
@@ -946,19 +982,27 @@ def compute_replica_layout(
     replica_devices_map: dict[int, list[str | None]] = {}
     for stage_id, stage_cfg in enumerate(stage_configs):
         num_replicas = replicas_per_stage[stage_id]
+        local_replicas = (
+            local_replica_counts.get(stage_id, num_replicas) if local_replica_counts is not None else num_replicas
+        )
+        if not 0 <= local_replicas <= num_replicas:
+            raise ValueError(f"Stage {stage_id}: local replica count {local_replicas} must be in [0, {num_replicas}]")
         if num_replicas <= 1:
             continue
-        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        if local_replicas == 0:
+            replica_devices_map[stage_id] = [None] * num_replicas
+            continue
+        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
         devices_str = (
             runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
         )
         devices_per_replica = get_stage_devices_per_replica(stage_cfg)
         replica_devices_map[stage_id] = split_devices_for_replicas(
             devices_str,
-            num_replicas,
+            local_replicas,
             devices_per_replica,
             stage_id,
-        )
+        ) + [None] * (num_replicas - local_replicas)
         logger.info(
             "[stage_init] Stage %s: %d replicas, devices_per_replica=%d, devices split: %s",
             stage_id,
@@ -1024,14 +1068,17 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
             return
 
     previous_env: dict[str, str | None] = {}
-    for key, value in runtime_env.items():
-        env_key = str(key)
-        previous_env[env_key] = os.environ.get(env_key)
-        os.environ[env_key] = str(value)
-
-    if previous_env:
-        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
     try:
+        for key, value in runtime_env.items():
+            env_key = str(key)
+            old_value = os.environ.get(env_key)
+            os.environ[env_key] = str(value)
+            # Track only successful writes, preserving the original value
+            # if distinct keys normalize to the same environment name.
+            previous_env.setdefault(env_key, old_value)
+
+        if previous_env:
+            logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
         yield
     finally:
         for key, old_value in previous_env.items():
@@ -1086,15 +1133,52 @@ def _project_omni_stage_engine_args(
         diffusion_stage = cast(VllmOmniDiffusionStageConfig, stage_config)
         engine_args.update(_project_omni_config_fields(diffusion_stage.diffusion_config))
 
+    model_excluded_fields = {
+        "default_sampling_params",
+        "has_sampling_extra_args",
+    }
+    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps"}
+    if is_diffusion:
+        # Diffusion owns these fields. Model defaults must not overwrite the
+        # explicit diffusion selection copied above. Retain explicit model
+        # inputs for callers using the shared model config representation.
+        model_explicit = getattr(stage_config.model_config, "_omni_explicit_fields", ())
+        diffusion_explicit = getattr(diffusion_stage.diffusion_config, "_omni_explicit_fields", ())
+        for name in ("moe_backend", "linear_backend"):
+            if name not in model_explicit:
+                model_excluded_fields.add(name)
+            elif name in diffusion_explicit:
+                model_value = getattr(stage_config.model_config, name)
+                diffusion_value = getattr(diffusion_stage.diffusion_config, name)
+                if model_value != diffusion_value:
+                    warnings.warn(
+                        f"stage {stage_config.stage_id}: model_config.{name}={model_value!r} overrides "
+                        f"diffusion_config.{name}={diffusion_value!r}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+    if not is_diffusion:
+        # These defaults configure diffusion loading or its worker process.
+        # Do not project them onto LLM stages, even when OmniEngineArgs also
+        # declares a field to preserve explicit diffusion CLI values.
+        model_excluded_fields.update(
+            {
+                "disable_autocast",
+                "enable_multithread_weight_load",
+                "enable_broadcast_weight_load",
+                "num_weight_load_threads",
+            }
+        )
+        runtime_excluded_fields.add("log_level")
+
     for config, excluded_fields in (
         (
             stage_config.model_config,
-            frozenset({"default_sampling_params", "has_sampling_extra_args"}),
+            frozenset(model_excluded_fields),
         ),
         (
             stage_config.runtime_config,
-            frozenset({"devices", "num_replicas", "env", "num_gpus"})
-            | (frozenset({"additional_config"}) if is_diffusion else frozenset()),
+            frozenset(runtime_excluded_fields) | (frozenset({"additional_config"}) if is_diffusion else frozenset()),
         ),
     ):
         engine_args.update(
@@ -1103,6 +1187,11 @@ def _project_omni_stage_engine_args(
                 exclude=excluded_fields,
             )
         )
+    pooling_config = stage_config.pooling_config
+    if pooling_config.runner is not None:
+        engine_args["runner"] = pooling_config.runner
+    if pooling_config.pooling_output_decoder is not None:
+        engine_args["pooling_output_decoder"] = pooling_config.pooling_output_decoder
 
     if is_diffusion:
         for config, field_map in (
@@ -1119,14 +1208,26 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    for name in ("compilation_config", "profiler_config"):
-        value = getattr(stage_config, name)
+    # Copy typed vLLM config objects verbatim from stage config to engine args.
+    # Keeping this list in sync prevents settings such as speculative_config
+    # from disappearing before engine startup. getattr(..., None) keeps
+    # compatibility with stage config types that omit a field.
+    for name in (
+        "compilation_config",
+        "kernel_config",
+        "profiler_config",
+        "speculative_config",
+        "weight_transfer_config",
+    ):
+        value = getattr(stage_config, name, None)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
+    # Preserve the legacy adapter key even when the topology leaves it unset.
+    engine_args["scheduling_metadata_adapter"] = stage_config.model_config.scheduling_metadata_adapter
     _maybe_set_qwen3_omni_moe_backend(
         engine_args,
         moe_backend_is_explicit="moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ()),
@@ -1151,6 +1252,8 @@ def _project_omni_stage_engine_args(
     engine_args["async_chunk"] = connector_config.async_chunk
     if connector_config.omni_kv_config is not None:
         engine_args["omni_kv_config"] = copy.deepcopy(connector_config.omni_kv_config)
+    if connector_config.kv_transfer_config is not None:
+        engine_args["kv_transfer_config"] = copy.deepcopy(connector_config.kv_transfer_config)
 
     if is_diffusion:
         engine_args["parallel_config"] = _project_omni_config_fields(
@@ -1165,6 +1268,9 @@ def _project_omni_stage_engine_args(
                 _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
             )
         )
+        if stage_config.lora_config is not None:
+            engine_args["enable_lora"] = True
+            engine_args.update(_project_upstream_config_fields(stage_config.lora_config, _LORA_CONFIG_ENGINE_FIELD_MAP))
 
     quantization_config = stage_config.quantization_config
     if quantization_config is not None:
@@ -1202,6 +1308,19 @@ def _finalize_engine_args_dict(
     sampling_extra_args_keys: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Apply representation-independent engine adapter behavior."""
+    from vllm.config import KernelConfig
+
+    # The legacy kwargs path does not pass through the typed config validators.
+    # Validate only present fields so an omitted MoE choice still gets its
+    # established model-specific default below.
+    kernel_values = {
+        name: engine_args_dict[name]
+        for name in ("moe_backend", "linear_backend")
+        if engine_args_dict.get(name) is not None
+    }
+    kernels = KernelConfig(**kernel_values)
+    for name in kernel_values:
+        engine_args_dict[name] = getattr(kernels, name)
     pipeline_model_root = model
     model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (
@@ -1304,7 +1423,16 @@ def build_legacy_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Implement engine-argument building for the legacy stage representation."""
-    engine_args_dict = copy.deepcopy(_to_dict(stage_config.engine_args))
+    source_args = stage_config.engine_args
+    if is_dataclass(source_args) and not isinstance(source_args, type):
+        # Keep prebuilt upstream config objects typed. Flattening them with
+        # asdict makes a default FaultToleranceConfig look like an explicit
+        # JSON override, which EngineArgs interprets as opting into FT.
+        engine_args_dict = {
+            field.name: copy.deepcopy(getattr(source_args, field.name)) for field in fields(source_args)
+        }
+    else:
+        engine_args_dict = copy.deepcopy(_to_dict(source_args))
     # Legacy configs can materialize an omitted optional TP size as None.
     # Remove it from the detached adapter dict so the backend default applies
     # without mutating stage_config.engine_args.
@@ -1330,11 +1458,9 @@ def build_engine_args_dict(
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
-    """Build engine arguments through the stable production entry point.
+    """Preserve the legacy engine-argument API for compatibility callers.
 
-    Production inputs still use the legacy stage representation. Keep that
-    compatibility choice behind this function so callers do not bind directly
-    to a representation-specific implementation.
+    Typed runtime stages use ``build_engine_args_dict_from_omni_stage_config``.
     """
     return build_legacy_engine_args_dict(
         stage_config,
@@ -1350,13 +1476,7 @@ def build_engine_args_dict_from_omni_stage_config(
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
-    """Project one typed stage config into backend engine arguments.
-
-    This projection is prepared for the RFC #4021 stage-init cutover. Current
-    production startup reaches the legacy implementation through
-    ``build_engine_args_dict`` while strategy and startup-plan inputs still
-    use the legacy representation.
-    """
+    """Project one typed production stage config into backend engine arguments."""
     engine_args_dict = _project_omni_stage_engine_args(stage_config)
     _apply_rocm_attention_backend(engine_args_dict, stage_config.stage_type)
     return _finalize_engine_args_dict(
@@ -1380,7 +1500,9 @@ def _count_stage_devices(devices: Any) -> int | None:
     return len(values) or None
 
 
-def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
+def _check_stage_device_layout(
+    stage_config: Any, engine_args_dict: dict[str, Any], *, local_replica_count: int | None = None
+) -> None:
     """Fail early when a stage's world size cannot fit its assigned ``devices``.
 
     Re-runs :func:`check_device_layout` (normally only reached on the
@@ -1391,13 +1513,17 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
     """
     from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
 
-    runtime = getattr(stage_config, "runtime", None)
+    if local_replica_count == 0:
+        return
+    runtime = getattr(stage_config, "runtime_config", getattr(stage_config, "runtime", None))
     devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
     if devices is None:
         # No explicit placement -> vLLM assigns devices itself; nothing to check.
         return
 
-    num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
+    num_replicas = local_replica_count
+    if num_replicas is None:
+        num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
     stage_id = getattr(stage_config, "stage_id", "?")
     tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_config, engine_args_dict)
     if local_dp_size == 0:
@@ -1445,20 +1571,32 @@ def build_vllm_config(
     stage_connector_spec: dict[str, Any] | None = None,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
+    api_process_count: int = 1,
+    api_process_rank: int = 0,
+    watermark_config: WatermarkConfig | None = None,
+    local_replica_count: int | None = None,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
+
+    ``local_replica_count`` scopes device validation to this host without
+    changing the stage's cluster-wide replica count.
 
     Returns:
         (vllm_config, executor_class)
     """
     if engine_args_dict is None:
-        engine_args_dict = build_engine_args_dict(
-            stage_config,
-            model,
-            stage_connector_spec=stage_connector_spec,
+        engine_args_dict = (
+            build_engine_args_dict_from_omni_stage_config(
+                stage_config, model, stage_connector_spec=stage_connector_spec
+            )
+            if isinstance(stage_config, BaseVllmOmniStageConfig)
+            else build_engine_args_dict(stage_config, model, stage_connector_spec=stage_connector_spec)
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+    if api_process_count != 1 or api_process_rank != 0:
+        filtered_engine_args_dict["_api_process_count"] = api_process_count
+        filtered_engine_args_dict["_api_process_rank"] = api_process_rank
 
     # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
     # plain dicts.  When OmniEngineArgs is instantiated with the dict, these
@@ -1474,6 +1612,17 @@ def build_vllm_config(
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 
+    # extract the vLLM config arg from Omni's watermark config if we have text watermarking
+    # explicitly configured and it's supported, otherwise delegate to vLLM's default.
+    # NOTE: text watermarking in vLLM is only implemented for model runner v2.
+    vllm_wm_config = to_vllm_watermark_config(
+        watermark_config,
+        stage_config.final_output_type,
+        omni_engine_args.use_v2_model_runner,
+    )
+    if vllm_wm_config is not None:
+        omni_engine_args.watermark_config = vllm_wm_config
+
     # Guard against a per-stage world size that its assigned ``devices`` cannot
     # satisfy (issue #5003). A top-level ``--tensor-parallel-size`` is broadcast
     # to every stage, but ``devices`` is not, so a stage can end up with e.g.
@@ -1482,7 +1631,7 @@ def build_vllm_config(
     # the mismatch used to surface only as an opaque worker-side assertion
     # ("DP adjusted local rank N is out of bounds for M devices."). Re-run the
     # same check here, before workers spawn, to fail early with a clear message.
-    _check_stage_device_layout(stage_config, filtered_engine_args_dict)
+    _check_stage_device_layout(stage_config, filtered_engine_args_dict, local_replica_count=local_replica_count)
 
     # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
     # larger than HF max_position_embeddings by design. vLLM's validator
@@ -1555,13 +1704,17 @@ def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
     return omni_renderer_cls(_TokenOnlyRenderer)(stage_vllm_config, tokenizer=None)
 
 
-def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
+def build_stage0_input_processor(stage_vllm_config: VllmConfig, *, replicated: bool = False) -> InputProcessor:
     """Build the shared stage-0 input processor.
 
     The renderer is the Omni subclass of the upstream renderer class that
     ``renderer_from_config`` would have picked (or of the token-only renderer
     when the stage skips tokenizer initialization), so upstream's
     ``InputProcessor`` runs unmodified on top of it.
+
+    Replicated frontends reuse processing results but send tensors on every
+    request: a frontend cache hit does not imply a hit in the selected
+    replica's receiver cache. This also applies before dynamic replicas join.
     """
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
@@ -1569,6 +1722,11 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
         renderer = _build_token_only_renderer(stage_vllm_config)
     else:
         renderer = build_omni_renderer(stage_vllm_config)
+    if replicated and isinstance(renderer.mm_processor_cache, (LruKeyReplicatedSenderCache, ShmObjectStoreSenderCache)):
+        # vLLM 0.33 owns both caches on the renderer, including their cleanup.
+        # Select its existing processor-only cache before serving/rendering;
+        # chat inputs are already rendered when replica routing runs.
+        renderer._mm_processor_cache = renderer._mm_processor_only_cache
     return InputProcessor(vllm_config=stage_vllm_config, renderer=renderer)
 
 
@@ -1715,9 +1873,14 @@ def acquire_device_locks(
     stage_id: int,
     engine_args_dict: dict[str, Any],
     stage_init_timeout: int,
+    locked_devices: set[int] | None = None,
+    *,
+    visible_devices: str | None = None,
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
+    Pass resolved physical ``visible_devices`` to avoid changing the process
+    environment while waiting. When omitted, use the device-control environment.
     Returns list of lock file descriptors that must be released after init.
     """
     lock_fds: list[int] = []
@@ -1750,7 +1913,7 @@ def acquire_device_locks(
 
         # Get physical device IDs
         device_control_env = current_omni_platform.device_control_env_var
-        visible_devices_str = os.environ.get(device_control_env)
+        visible_devices_str = visible_devices if visible_devices is not None else os.environ.get(device_control_env)
         physical_devices: list[int] = []
 
         if visible_devices_str:
@@ -1769,8 +1932,7 @@ def acquire_device_locks(
                 f"but only {len(physical_devices)} device(s) are available: {physical_devices}"
             )
 
-        num_devices_to_lock = num_devices_per_stage
-        devices_to_lock = sorted(physical_devices[:num_devices_to_lock])
+        devices_to_lock = sorted(set(physical_devices[:num_devices_per_stage]) - (locked_devices or set()))
 
         logger.debug(
             "Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d, SP=%d, CFG=%d; will lock %d devices: %s",
@@ -1780,7 +1942,7 @@ def acquire_device_locks(
             prefill_context_parallel_size,
             sequence_parallel_size,
             cfg_parallel_size,
-            num_devices_to_lock,
+            len(devices_to_lock),
             devices_to_lock,
         )
 
@@ -1798,6 +1960,8 @@ def acquire_device_locks(
                         record_lock_holder_pid(lock_fd, lock_writable)
                         lock_acquired = True
                         lock_fds.append(lock_fd)
+                        if locked_devices is not None:
+                            locked_devices.add(device_id)
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
@@ -1926,9 +2090,29 @@ def build_diffusion_config(
     metadata: StageMetadata,
 ) -> Any:
     """Build diffusion config for a stage."""
+    from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
 
-    engine_args_dict = build_engine_args_dict(stage_cfg, model)
-    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+    engine_args_dict = (
+        build_engine_args_dict_from_omni_stage_config(stage_cfg, model)
+        if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+        else build_engine_args_dict(stage_cfg, model)
+    )
+    stage_id = engine_args_dict.get("stage_id", metadata.stage_id)
+    diffusion_kwargs = extract_diffusion_stage_config_kwargs(
+        engine_args_dict,
+        stage_id=stage_id,
+        include_engine_adapter_metadata=True,
+    )
+    od_config = OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
+
+    for dimension in ("height", "width"):
+        value = getattr(metadata.default_sampling_params, dimension, None)
+        if isinstance(value, int) and value > 0:
+            od_config.additional_config.setdefault(f"diffusion_kv_profile_{dimension}", value)
+
+    if od_config.distributed_executor_backend == "ray":
+        runtime_env = _to_dict(_get_attr_or_item(metadata.runtime_cfg, "env", {}) or {})
+        od_config.ray_worker_env = {str(key): str(value) for key, value in runtime_env.items()}
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
@@ -1939,7 +2123,10 @@ def build_diffusion_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    if len(physical_devices) < num_devices_per_stage:
+    # Ray validates cluster-wide GPU availability through its placement
+    # group. The stage driver only sees the GPUs on its own node, so a local
+    # device-count check would reject every valid multi-node configuration.
+    if od_config.distributed_executor_backend != "ray" and len(physical_devices) < num_devices_per_stage:
         raise ValueError(
             f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"
@@ -1971,6 +2158,9 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    # Startup-only carrier: the manager retains ownership and the executor
+    # removes this registry before od_config is serialized in request RPCs.
+    setattr(od_config, "_sharing_worker_registry", getattr(stage_cfg, "_sharing_worker_registry", None))
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for OmniRequest substitutability with the base Request.
 
@@ -17,9 +18,13 @@ import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.core_client import _with_packed_prompt
+from vllm.v1.kv_hints import KvHintAction, KvHintsEnvelope
 from vllm.v1.request import Request
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-from vllm_omni.engine import PromptEmbedsPayload
+from vllm_omni.engine import OmniEngineCoreRequest, PromptEmbedsPayload
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -111,3 +116,31 @@ def test_model_intermediate_buffer_round_trips_to_streaming_update():
     assert update is not None
     assert request.model_intermediate_buffer is buffer
     assert update.model_intermediate_buffer is buffer
+
+
+def test_kv_hints_survive_omni_upgrade_wire_transport_and_scheduler_conversion():
+    hints = KvHintsEnvelope("1", "hint-message", [KvHintAction("a", "prefetch", "1", {"blocks": [7]})])
+    core = EngineCoreRequest(
+        request_id="hint-request",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=2),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        session_id="session",
+        kv_hints=hints,
+    )
+    upgraded = OmniEngineCoreRequest.from_request(core)
+    # v0.34 wires prompt token ids as a packed int32 ndarray (the plain-list
+    # decode raises "Expected `numpy.ndarray`, got `list`"); the real engine
+    # core transport packs via `_with_packed_prompt` and serializes with vLLM's
+    # MsgpackEncoder/MsgpackDecoder pair.
+    packed = _with_packed_prompt(upgraded)
+    decoded = MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(packed))
+    scheduled = OmniRequest.from_engine_core_request(decoded, block_hasher=None)
+    assert decoded.session_id == "session"
+    assert scheduled.kv_hints == hints
+    assert scheduled.session_id == "session"

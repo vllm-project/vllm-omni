@@ -27,6 +27,8 @@ import torch
 from einops import rearrange
 from torch.nn import functional as F
 
+from vllm_omni.platforms import current_omni_platform
+
 from .attention import VarlenHandler
 
 
@@ -653,7 +655,9 @@ class Magi2DataProxy:
             )
 
         packed = SimplePackedData(items)
-        cu_seqlens = packed.cu_seqlen.to(device=data.x_t.device, dtype=torch.int32)
+        # Ascend consumes host lengths; avoid a device round-trip in every layer.
+        cu_seqlens_device = torch.device("cpu") if current_omni_platform.is_npu() else data.x_t.device
+        cu_seqlens = packed.cu_seqlen.to(device=cu_seqlens_device, dtype=torch.int32)
         varlen_handler = VarlenHandler(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,

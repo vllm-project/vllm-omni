@@ -199,7 +199,10 @@ def _validate_native_tensors(checkpoint) -> dict[str, torch.Tensor]:
                 f"MiniMax-H3 native tensor has invalid global shape: {name}={tuple(tensor.shape)}, "
                 f"expected={expected_shape}"
             )
-        tensors[name] = tensor
+        # The LoRA manager re-parses raw tensor names without the weights mapper, so
+        # the PEFT adapter-name segment must be dropped here: `parse_fine_tuned_lora_name`
+        # rejects `...lora_A.<adapter>.weight` keys.
+        tensors[f"{raw_target}.lora_{'A' if side == 'a' else 'B'}.weight"] = tensor
 
     incomplete = sorted(target for target, sides in pairs.items() if sides != {"a", "b"})
     if incomplete:
@@ -254,7 +257,7 @@ def _pack_h3_native_qkv(lora_model: LoRAModel) -> None:
         )
 
 
-def load_minimax_h3_native_lora(
+def load_minimax_h3_native_distilled_lora(
     *,
     partition: str,
     lora_request: LoRARequest,

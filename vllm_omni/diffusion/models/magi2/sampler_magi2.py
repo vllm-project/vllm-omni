@@ -308,29 +308,11 @@ class Magi2PreviewSampler(CFGParallelMixin):
         per_token_video_t = t_batch.view(-1, 1, 1, 1, 1).expand(cfg_batch, 1, video_t, video_h, video_w)
         per_token_audio_t = t_batch.view(-1, 1, 1).expand(cfg_batch, audio_t, 1)
 
-        audio_lengths = torch.full(
-            (cfg_batch,),
-            audio_latent_len,
-            device=latent.device,
-            dtype=torch.long,
-        )
-        text_lengths = torch.tensor(
-            [txt_feat_len] * batch_size + [null_txt_feat_len] * batch_size,
-            device=latent.device,
-            dtype=torch.long,
-        )
-        ref_audio_lengths = torch.full(
-            (cfg_batch,),
-            ref_audio_feat_len,
-            device=latent.device,
-            dtype=torch.long,
-        )
-        ref_video_lengths = torch.full(
-            (cfg_batch,),
-            ref_video_feat_len,
-            device=latent.device,
-            dtype=torch.long,
-        )
+        # Lengths stay host integers; the data proxy reads them as Python ints.
+        audio_lengths = [audio_latent_len] * cfg_batch
+        text_lengths = [txt_feat_len] * batch_size + [null_txt_feat_len] * batch_size
+        ref_audio_lengths = [ref_audio_feat_len] * cfg_batch
+        ref_video_lengths = [ref_video_feat_len] * cfg_batch
 
         return ModelInput(
             x_t=torch.cat((latent, latent), dim=0),

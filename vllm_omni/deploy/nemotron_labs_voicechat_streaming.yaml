@@ -22,7 +22,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       # Streaming cadence for talker -> code2wav: emit a chunk once this many
       # NEW frames (80 ms each) have accumulated (5 frames = 0.4 s of audio).
       # Small chunks are cheap because the incremental codec cache decodes

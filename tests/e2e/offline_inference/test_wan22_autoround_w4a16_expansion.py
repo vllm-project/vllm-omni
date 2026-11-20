@@ -156,7 +156,7 @@ def _generate_t2v_video(offline_client, prompt: str = "A cat sitting on a table"
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.parametrize("omni_runner", quant_i2v_params, indirect=True)
 def test_wan22_i2v_autoround_w4a16_generates_video(omni_runner, offline_client):
     """Load the W4A16 quantized Wan2.2 I2V model and verify it produces a valid video."""
@@ -180,7 +180,7 @@ def test_wan22_i2v_autoround_w4a16_generates_video(omni_runner, offline_client):
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.parametrize("omni_runner", quant_t2v_params, indirect=True)
 def test_wan22_t2v_autoround_w4a16_generates_video(omni_runner, offline_client):
     """Load the W4A16 quantized Wan2.2 T2V model and verify it produces a valid video."""
@@ -202,7 +202,7 @@ def test_wan22_t2v_autoround_w4a16_generates_video(omni_runner, offline_client):
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.parametrize("omni_runner", quant_i2v_params, indirect=True)
 def test_wan22_i2v_autoround_w4a16_quant_peak(omni_runner, offline_client):
     """Measure peak GPU memory of W4A16 quantized I2V model."""
@@ -218,7 +218,7 @@ def test_wan22_i2v_autoround_w4a16_quant_peak(omni_runner, offline_client):
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.parametrize("omni_runner", baseline_i2v_params, indirect=True)
 def test_wan22_i2v_autoround_w4a16_baseline_peak(omni_runner, offline_client):
     """Measure peak GPU memory of BF16 baseline I2V model."""
@@ -234,7 +234,7 @@ def test_wan22_i2v_autoround_w4a16_baseline_peak(omni_runner, offline_client):
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 def test_wan22_i2v_autoround_w4a16_memory_savings():
     """Assert quantized I2V model uses meaningfully less memory than BF16 baseline."""
     quant_peak = _memory_results["quant_i2v"]
@@ -259,7 +259,7 @@ def test_wan22_i2v_autoround_w4a16_memory_savings():
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.parametrize("omni_runner", quant_t2v_params, indirect=True)
 def test_wan22_t2v_autoround_w4a16_quant_peak(omni_runner, offline_client):
     """Measure peak GPU memory of W4A16 quantized T2V model."""
@@ -275,7 +275,7 @@ def test_wan22_t2v_autoround_w4a16_quant_peak(omni_runner, offline_client):
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.parametrize("omni_runner", baseline_t2v_params, indirect=True)
 def test_wan22_t2v_autoround_w4a16_baseline_peak(omni_runner, offline_client):
     """Measure peak GPU memory of BF16 baseline T2V model."""
@@ -291,7 +291,7 @@ def test_wan22_t2v_autoround_w4a16_baseline_peak(omni_runner, offline_client):
 # ------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 def test_wan22_t2v_autoround_w4a16_memory_savings():
     """Assert quantized T2V model uses meaningfully less memory than BF16 baseline."""
     quant_peak = _memory_results["quant_t2v"]

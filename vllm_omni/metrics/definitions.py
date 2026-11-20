@@ -17,6 +17,7 @@ time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
 import logging
 import os
 from collections.abc import Mapping, Sequence
+from typing import NamedTuple
 
 from vllm_omni.metrics.utils import resolve_int_by_sequential_keys
 
@@ -65,6 +66,7 @@ IMAGE_GENERATION = "image_generation"
 IMAGE_GENERATION_TIME_MS = f"{IMAGE_GENERATION}_time_ms"
 IMAGE_PIXELS = "image_pixels"
 DIFFUSION_SCHEDULER_WAITING_KEY = "scheduler_num_waiting_reqs"
+SCHEDULER_QUEUE_WAIT_MS = "scheduler_queue_wait_ms"
 TOTAL_IMAGES = "total_images"
 IMAGE_THROUGHPUT = "image_throughput"
 AVERAGE_PIXELS_PER_IMAGE = "average_pixels_per_image"
@@ -88,6 +90,38 @@ MEAN_VIDEO_RTF = f"mean_{VIDEO_RTF}"
 MEDIAN_VIDEO_RTF = f"median_{VIDEO_RTF}"
 STD_VIDEO_RTF = f"std_{VIDEO_RTF}"
 PERCENTILES_VIDEO_RTF = f"percentiles_{VIDEO_RTF}"
+# Realtime video observations: TTFC/steady samples are seconds on request
+# outputs and milliseconds in aggregates; generated FPS is frames/second.
+VIDEO_TTFC = "video_ttfc"
+VIDEO_FPS = "video_fps"
+VIDEO_STEADY_INTERVAL = "video_steady_interval"
+VIDEO_STEADY_INTERVALS = "video_steady_intervals"
+MEAN_VIDEO_TTFC_MS = f"mean_{VIDEO_TTFC}_ms"
+MEDIAN_VIDEO_TTFC_MS = f"median_{VIDEO_TTFC}_ms"
+STD_VIDEO_TTFC_MS = f"std_{VIDEO_TTFC}_ms"
+PERCENTILES_VIDEO_TTFC_MS = f"percentiles_{VIDEO_TTFC}_ms"
+MIN_VIDEO_FPS = f"min_{VIDEO_FPS}"
+MEAN_VIDEO_FPS = f"mean_{VIDEO_FPS}"
+MEDIAN_VIDEO_FPS = f"median_{VIDEO_FPS}"
+STD_VIDEO_FPS = f"std_{VIDEO_FPS}"
+PERCENTILES_VIDEO_FPS = f"percentiles_{VIDEO_FPS}"
+MEAN_VIDEO_STEADY_INTERVAL_MS = f"mean_{VIDEO_STEADY_INTERVAL}_ms"
+MEDIAN_VIDEO_STEADY_INTERVAL_MS = f"median_{VIDEO_STEADY_INTERVAL}_ms"
+STD_VIDEO_STEADY_INTERVAL_MS = f"std_{VIDEO_STEADY_INTERVAL}_ms"
+PERCENTILES_VIDEO_STEADY_INTERVAL_MS = f"percentiles_{VIDEO_STEADY_INTERVAL}_ms"
+VIDEO_STREAM_METRIC_UNITS = {VIDEO_TTFC: "ms", VIDEO_FPS: "frames/s", VIDEO_STEADY_INTERVAL: "ms", VIDEO_RTF: "ratio"}
+VIDEO_RTF_CLIENT_SCOPE = {
+    "numerator": "client_session_wall_seconds",
+    "denominator": "frames / target_fps",
+    "timing_boundary": (
+        "after session.start send completes through session.done and keepalive cleanup; connection setup/close excluded"
+    ),
+}
+VIDEO_RTF_SERVER_SCOPE = {
+    "numerator": "server_generation_seconds; client_request_latency_seconds fallback",
+    "denominator": "resolved_video_content_duration_seconds",
+    "duration_resolution": "payload duration_s; payload num_frames/fps; request seconds; request num_frames/fps",
+}
 MEAN_VIDEO_GENERATION_MS = f"mean_{VIDEO_GENERATION}_ms"
 MEDIAN_VIDEO_GENERATION_MS = f"median_{VIDEO_GENERATION}_ms"
 STD_VIDEO_GENERATION_MS = f"std_{VIDEO_GENERATION}_ms"
@@ -98,6 +132,10 @@ MEAN_PEAK_MEMORY_MB = f"mean_{PEAK_MEMORY_MB}"
 MEDIAN_PEAK_MEMORY_MB = f"median_{PEAK_MEMORY_MB}"
 STD_PEAK_MEMORY_MB = f"std_{PEAK_MEMORY_MB}"
 PERCENTILES_PEAK_MEMORY_MB = f"percentiles_{PEAK_MEMORY_MB}"
+
+STAGE_DURATIONS_MEAN = "stage_durations_mean"
+STAGE_DURATIONS_P50 = "stage_durations_p50"
+STAGE_DURATIONS_P99 = "stage_durations_p99"
 
 # Stage snapshot / StageBenchmarkMetrics field names.
 TOTAL_OUTPUT = "total_output"
@@ -128,6 +166,10 @@ VLLM_TTFT_MS = "vllm_ttft_ms"
 VLLM_TPOT_MS = "vllm_tpot_ms"
 VLLM_ITL_MS = "vllm_itl_ms"
 VLLM_ITLS_MS = "vllm_itls_ms"
+VLLM_QUEUED_MS = "vllm_queued_ms"
+VLLM_PREFILL_MS = "vllm_prefill_ms"
+VLLM_DECODE_MS = "vllm_decode_ms"
+VLLM_NUM_PREEMPTIONS = "vllm_num_preemptions"
 NUM_TOKENS_IN = "num_tokens_in"
 NUM_TOKENS_OUT = "num_tokens_out"
 AUDIO_SAMPLE_RATE = "audio_sample_rate"
@@ -148,6 +190,11 @@ REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
 # Token counters — aggregated across all pipeline stages per request.
 PROMPT_TOKENS = METRIC_PREFIX + "prompt_tokens"
 GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
+
+# Session placement families are registered only when the opt-in policy emits.
+DUPLEX_RESERVED_SESSIONS = METRIC_PREFIX + "duplex_reserved_sessions"
+DUPLEX_ADMISSION_REJECTED = METRIC_PREFIX + "duplex_admission_rejected"
+DUPLEX_ADMISSION_REJECT_REASONS = frozenset({"global_capacity_exhausted", "replica_capacity_exhausted", "unknown"})
 
 
 # ============================================================================
@@ -210,6 +257,13 @@ DENOISE_STEP_LATENCY_S = METRIC_PREFIX + DENOISE_STEP_LATENCY + "_s"
 DIFFUSION_KV_LOAD_S = METRIC_PREFIX + "diffusion_kv_load_s"
 IMAGE_TTFP_S = METRIC_PREFIX + "image_ttfp_s"
 STAGE_IN_QUEUE_S = METRIC_PREFIX + "stage_in_queue_s"
+
+
+# ============================================================================
+# Generation-stage post-warmup memory family (per-stage + per-replica)
+# ============================================================================
+STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES = METRIC_PREFIX + "stage_post_warmup_memory_allocated_bytes"
+STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES = METRIC_PREFIX + "stage_post_warmup_memory_reserved_bytes"
 
 
 # ============================================================================
@@ -336,6 +390,43 @@ AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
 # Default underrun threshold — kept aligned with the bench-side default and
 # the commonly-cited "audible gap" threshold for streaming TTS.
 AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S = 0.1
+
+# Intermediate streaming units that are not the pipeline's text or audio
+# final output (e.g. MiniCPM Talker codec tokens).
+STREAMING_OUTPUT_UNIT_TYPES = frozenset({"text", "stream", "audio"})
+
+
+class StageModalityFlags(NamedTuple):
+    """How ``--print-stage`` classifies one engine stage."""
+
+    is_text_stage: bool
+    is_audio_stage: bool
+    is_image_stage: bool
+    is_video_stage: bool
+    is_internal_stream_stage: bool
+
+
+def stage_modality_flags(
+    final_output_type: object,
+    output_unit_type: object,
+) -> StageModalityFlags:
+    """Classify a stage from wire ``final_output_type`` / ``output_unit_type``."""
+    final_type = final_output_type if isinstance(final_output_type, str) else ""
+    unit_type = output_unit_type if isinstance(output_unit_type, str) else ""
+    is_text_stage = final_type == "text" or unit_type == "text"
+    is_audio_stage = final_type == "audio" or unit_type == "audio"
+    is_video_stage = final_type in {"video", "videos"} or unit_type == "video"
+    # Video diffusion may still report output_unit_type="image" when frames are
+    # stored in ``images``; prefer video when final_output_type says so.
+    is_image_stage = (not is_video_stage) and (final_type in {"image", "images"} or unit_type == "image")
+    is_internal_stream_stage = unit_type in STREAMING_OUTPUT_UNIT_TYPES and not is_text_stage and not is_audio_stage
+    return StageModalityFlags(
+        is_text_stage=is_text_stage,
+        is_audio_stage=is_audio_stage,
+        is_image_stage=is_image_stage,
+        is_video_stage=is_video_stage,
+        is_internal_stream_stage=is_internal_stream_stage,
+    )
 
 
 # ============================================================================

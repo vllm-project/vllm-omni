@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for HunyuanImage3 AR sampler logic (stage transitions,
 ratio restriction, comprehension blocking)."""
 
 import pytest
 import torch
+from vllm.config import VllmConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -21,11 +22,17 @@ RATIO_END = 210
 RATIO_OTHER_START = 220
 RATIO_OTHER_END = 223
 TIMESTEP = 224
+CFG = 110
+IMG_TOK = 111
+JOINT_SEP = 112
+EOI = 113
 
 
 class FakeSamplerModel:
     """Minimal stub that replicates the sampler-relevant attributes of
     HunyuanImage3ForConditionalGeneration without loading real weights."""
+
+    vllm_config: VllmConfig
 
     def __init__(self, *, is_comprehension: bool = False):
         self._is_comprehension = is_comprehension
@@ -47,18 +54,18 @@ class FakeSamplerModel:
             self._stage_transitions[END_OF_THINK] = [RECAPTION]
             self._stage_transitions[END_OF_RECAPTION] = [ANSWER, BOI, SIZE_TOKEN]
 
-        self._blocked_token_ids: set[int] = set()
-        if is_comprehension:
-            self._blocked_token_ids.update([BOI, SIZE_TOKEN])
-            self._blocked_token_ids.update(self._all_ratio_ids)
+        # Mirrors the model: the blocklist is always built so generation-mode
+        # engines can apply it to per-request comprehension rows (#6088).
+        self._cfg_token_id = CFG
+        self._blocked_token_ids: set[int] = {BOI, EOI, SIZE_TOKEN, CFG, IMG_TOK, TIMESTEP, JOINT_SEP}
+        self._blocked_token_ids.update(self._all_ratio_ids)
 
     # Bind the real methods from the model class.
     from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
         HunyuanImage3ForConditionalGeneration as _Real,
     )
 
-    _get_forced_token = _Real._get_forced_token
-    _apply_ratio_restriction = _Real._apply_ratio_restriction
+    mrv2_custom_sampler = _Real.mrv2_custom_sampler
 
 
 class FakeTokenEmbedding:
@@ -122,131 +129,153 @@ class TestTimestepEmbedding:
         torch.testing.assert_close(actual, model.model.embed_input_ids(input_ids))
 
 
-class TestGetForcedToken:
-    """Tests for the stateless _get_forced_token method."""
+class TestMRv2Sampler:
+    @staticmethod
+    def _make_sampler(mocker, model, histories, extra_args=None):
+        from vllm.sampling_params import SamplingParams
 
-    def setup_method(self):
-        self.model = FakeSamplerModel(is_comprehension=False)
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
-    def test_no_trigger_returns_none(self):
-        assert self.model._get_forced_token([1, 2, 3]) is None
+        num_reqs = len(histories)
+        # A prompt ending in a trigger must not activate generation rules.
+        prompt = [1, END_OF_RECAPTION]
+        all_tokens = torch.zeros(num_reqs, max(map(len, histories)) + len(prompt) + 8, dtype=torch.int32)
+        for slot, history in enumerate(histories):
+            tokens = prompt + history
+            all_tokens[slot, : len(tokens)] = torch.tensor(tokens)
+        base_sampler = mocker.Mock(side_effect=lambda logits, input_batch: logits)
+        base_sampler.req_states.prompt_len.gpu = torch.full((num_reqs,), len(prompt), dtype=torch.int32)
+        base_sampler.req_states.all_token_ids.gpu = all_tokens
+        model.vllm_config = mocker.Mock(speculative_config=None)
+        state = OmniModelState.__new__(OmniModelState)
+        state.model = model
+        sampler, rejection = state.custom_sampler(base_sampler)
+        assert rejection is None
+        for slot in range(num_reqs):
+            sampler.add_request(slot, SamplingParams(extra_args=extra_args[slot] if extra_args else None))
+        batch = mocker.Mock()
+        batch.idx_mapping = torch.arange(num_reqs)
+        batch.seq_lens = torch.tensor([len(prompt) + len(history) for history in histories], dtype=torch.int32)
+        batch.num_reqs = num_reqs
+        return sampler, batch
 
-    def test_empty_history_returns_none(self):
-        assert self.model._get_forced_token([]) is None
+    @pytest.mark.parametrize("is_comprehension", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("extra_ratios", [False, True])
+    def test_sampling_constraints(self, mocker, is_comprehension, dtype, extra_ratios):
+        model = FakeSamplerModel(is_comprehension=is_comprehension)
+        if not extra_ratios:
+            model._ratio_other_slices = []
+            model._all_ratio_ids = set(range(RATIO_START, RATIO_END + 1))
+        histories = [
+            [],
+            [END_OF_THINK],
+            [END_OF_THINK, RECAPTION],
+            [END_OF_RECAPTION],
+            [END_OF_RECAPTION, ANSWER],
+            [END_OF_RECAPTION, ANSWER, BOI],
+            [END_OF_RECAPTION, ANSWER, BOI, SIZE_TOKEN],
+            [END_OF_RECAPTION, 50, BOI],
+            [RATIO_START],
+            [RATIO_OTHER_END],
+            [END_OF_RECAPTION, ANSWER, END_OF_THINK],
+            [50, 51],
+        ]
+        extra_args: list[dict[str, str] | None] = [None] * len(histories)
+        histories += histories
+        extra_args += [{"ar_task_mode": "comprehension"}] * len(extra_args)
+        sampler, batch = self._make_sampler(mocker, model, histories, extra_args)
+        logits = torch.randn(len(histories), 300, dtype=dtype)
+        # A non-ratio token can have the highest score; size still selects
+        # the best allowed ratio, including the optional extra ratio range.
+        logits[:, 50] = 20
+        logits[:, RATIO_START + 3] = 10
+        logits[:, RATIO_OTHER_START] = 15
+        best_ratio = RATIO_OTHER_START if extra_ratios else RATIO_START + 3
+        forced_tokens = [
+            None,
+            RECAPTION,
+            None,
+            ANSWER,
+            BOI,
+            SIZE_TOKEN,
+            best_ratio,
+            None,
+            EOS,
+            EOS if extra_ratios else None,
+            RECAPTION,
+            None,
+        ]
+        expected = logits.clone()
+        min_score = torch.finfo(dtype).min
+        for row, forced in enumerate(forced_tokens * 2):
+            if is_comprehension or extra_args[row]:
+                expected[row, sorted(model._blocked_token_ids)] = min_score
+            elif forced is not None:
+                expected[row].fill_(min_score)
+                expected[row, forced] = 0
+        actual = sampler(logits, batch)
+        torch.testing.assert_close(actual, expected)
+        sampler.base_sampler.assert_called_once()
 
-    def test_end_of_think_forces_recaption(self):
-        assert self.model._get_forced_token([END_OF_THINK]) == RECAPTION
+    def test_reordered_slots_and_reused_slot(self, mocker):
+        from vllm.sampling_params import SamplingParams
 
-    def test_end_of_think_completed(self):
-        assert self.model._get_forced_token([END_OF_THINK, RECAPTION]) is None
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(
+            mocker, model, [[END_OF_THINK], [END_OF_RECAPTION]], [{"ar_task_mode": "comprehension"}, None]
+        )
+        batch.idx_mapping = torch.tensor([1, 0])
+        logits = sampler(torch.ones(2, 300), batch)
+        assert logits[0].argmax().item() == ANSWER
+        assert logits[1, 50].item() == 1
 
-    def test_end_of_recaption_forces_answer(self):
-        tokens = [END_OF_THINK, RECAPTION, END_OF_RECAPTION]
-        assert self.model._get_forced_token(tokens) == ANSWER
+        sampler.add_request(0, SamplingParams())
+        logits = sampler(torch.ones(2, 300), batch)
+        assert logits[0, ANSWER].item() == 0
+        assert logits[1, RECAPTION].item() == 0
+        assert logits[:, 50].tolist() == [torch.finfo(logits.dtype).min] * 2
 
-    def test_end_of_recaption_forces_boi_after_answer(self):
-        tokens = [END_OF_THINK, RECAPTION, END_OF_RECAPTION, ANSWER]
-        assert self.model._get_forced_token(tokens) == BOI
+    def test_chunked_prefill_ignores_prompt_triggers(self, mocker):
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(mocker, model, [[], []])
+        batch.seq_lens = torch.tensor([1, 2])
+        logits = torch.randn(2, 300)
+        torch.testing.assert_close(sampler(logits.clone(), batch), logits)
 
-    def test_end_of_recaption_forces_size_after_boi(self):
-        tokens = [END_OF_THINK, RECAPTION, END_OF_RECAPTION, ANSWER, BOI]
-        assert self.model._get_forced_token(tokens) == SIZE_TOKEN
+    def test_device_history_after_resume(self, mocker):
+        from vllm.sampling_params import SamplingParams
 
-    def test_full_sequence_complete(self):
-        tokens = [END_OF_THINK, RECAPTION, END_OF_RECAPTION, ANSWER, BOI, SIZE_TOKEN]
-        assert self.model._get_forced_token(tokens) is None
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(mocker, model, [[END_OF_RECAPTION, ANSWER, BOI]])
+        # Re-registration after preemption reconstructs from MRv2 history.
+        sampler.add_request(0, SamplingParams())
+        logits = sampler(torch.ones(1, 300), batch)
+        assert logits.argmax().item() == SIZE_TOKEN
 
-    def test_diverged_history_returns_none(self):
-        tokens = [END_OF_RECAPTION, 999]  # 999 != ANSWER
-        assert self.model._get_forced_token(tokens) is None
+    def test_sampling_does_not_read_device_scalars(self, mocker, monkeypatch):
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(mocker, model, [[SIZE_TOKEN], [END_OF_THINK]])
 
-    def test_later_trigger_takes_precedence(self):
-        tokens = [END_OF_THINK, RECAPTION, END_OF_RECAPTION]
-        assert self.model._get_forced_token(tokens) == ANSWER
+        def fail_read(*args, **kwargs):
+            raise AssertionError("MRv2 constraints must keep token history on device")
 
-    def test_trigger_with_extra_tokens_before(self):
-        tokens = [1, 2, 3, END_OF_THINK]
-        assert self.model._get_forced_token(tokens) == RECAPTION
+        monkeypatch.setattr(torch.Tensor, "item", fail_read)
+        monkeypatch.setattr(torch.Tensor, "tolist", fail_read)
+        monkeypatch.setattr(torch.Tensor, "cpu", fail_read)
+        sampler(torch.ones(2, 300), batch)
 
+    def test_model_registers_sampler(self, mocker):
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(mocker, model, [[END_OF_THINK]])
+        # #10668: the raw model can prefer another </think>; the registered
+        # MRv2 path must force <recaption> before the AR-to-DiT bridge.
+        logits = torch.zeros(1, 300)
+        logits[0, END_OF_THINK] = 10
+        assert sampler(logits, batch).argmax().item() == RECAPTION
 
-class TestComprehensionBlocking:
-    """Tests for comprehension mode token blocking."""
-
-    def test_blocked_tokens_masked(self):
-        model = FakeSamplerModel(is_comprehension=True)
-        vocab_size = 300
-        logits = torch.zeros(1, vocab_size)
-        logits[0, BOI] = 5.0
-        logits[0, SIZE_TOKEN] = 3.0
-        logits[0, RATIO_START] = 2.0
-        min_score = torch.finfo(logits.dtype).min
-
-        for tid in model._blocked_token_ids:
-            if tid < vocab_size:
-                logits[0, tid] = min_score
-
-        assert logits[0, BOI].item() == min_score
-        assert logits[0, SIZE_TOKEN].item() == min_score
-        assert logits[0, RATIO_START].item() == min_score
-
-    def test_non_blocked_tokens_preserved(self):
-        model = FakeSamplerModel(is_comprehension=True)
-        vocab_size = 300
-        logits = torch.zeros(1, vocab_size)
-        logits[0, 50] = 7.0
-        min_score = torch.finfo(logits.dtype).min
-
-        for tid in model._blocked_token_ids:
-            if tid < vocab_size:
-                logits[0, tid] = min_score
-
-        assert logits[0, 50].item() == 7.0
-
-
-class TestRatioRestriction:
-    """Tests for _apply_ratio_restriction (greedy: only argmax ratio survives)."""
-
-    def test_greedy_selects_single_ratio_token(self):
-        model = FakeSamplerModel(is_comprehension=False)
-        vocab_size = 300
-        logits = torch.zeros(1, vocab_size)
-        logits[0, RATIO_START + 3] = 10.0
-        logits[0, RATIO_START + 1] = 5.0
-        logits[0, 50] = 20.0  # non-ratio, should be masked
-        min_score = torch.finfo(logits.dtype).min
-
-        model._apply_ratio_restriction(logits, 0, min_score)
-
-        assert logits[0, RATIO_START + 3].item() == 0
-        assert logits[0, RATIO_START + 1].item() == min_score
-        assert logits[0, 50].item() == min_score
-
-    def test_extra_ratio_slices_considered(self):
-        model = FakeSamplerModel(is_comprehension=False)
-        vocab_size = 300
-        logits = torch.zeros(1, vocab_size)
-        logits[0, RATIO_OTHER_START] = 15.0
-        logits[0, RATIO_START] = 5.0
-        min_score = torch.finfo(logits.dtype).min
-
-        model._apply_ratio_restriction(logits, 0, min_score)
-
-        assert logits[0, RATIO_OTHER_START].item() == 0
-        assert logits[0, RATIO_START].item() == min_score
-
-
-class TestForceEosAfterRatio:
-    """Tests that a ratio token as last_token forces EOS."""
-
-    def test_ratio_token_forces_eos(self):
-        model = FakeSamplerModel(is_comprehension=False)
-        vocab_size = 300
-        logits = torch.randn(1, vocab_size)
-        min_score = torch.finfo(logits.dtype).min
-
-        logits[0].fill_(min_score)
-        logits[0, model._eos_token_id] = 0
-
-        assert logits[0, EOS].item() == 0
-        non_eos_max = logits[0, :EOS].max().item()
-        assert non_eos_max == min_score
+    def test_speculative_decoding_rejected(self, mocker):
+        model = FakeSamplerModel()
+        model.vllm_config = mocker.Mock(speculative_config=object())
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            model.mrv2_custom_sampler(mocker.Mock())

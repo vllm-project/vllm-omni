@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright 2023 Antgroup and The HuggingFace Inc. team. All rights reserved.
 # Adapted from Ming
@@ -21,7 +22,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -58,10 +62,12 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMoeV2Config
+
+if TYPE_CHECKING:
+    pass
 
 logger = init_logger(__name__)
 
@@ -728,7 +734,8 @@ class BailingMoeV2Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         audio_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+        capture_layers: tuple[int, ...] | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, dict[int, torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -740,7 +747,14 @@ class BailingMoeV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        capture_set = set(capture_layers or ())
+        captured: dict[int, torch.Tensor] = {}
+        for layer_idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer],
+            start=self.start_layer,
+        ):
+            if layer_idx in capture_set:
+                captured[layer_idx] = hidden_states if residual is None else hidden_states + residual
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -753,6 +767,10 @@ class BailingMoeV2Model(nn.Module):
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if self.end_layer in capture_set:
+            captured[self.end_layer] = hidden_states
+        if capture_layers:
+            return hidden_states, captured
         return hidden_states
 
 
@@ -797,7 +815,6 @@ class BailingMoeV2ForCausalLM(nn.Module, CustomProcessMixin):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -811,6 +828,7 @@ class BailingMoeV2ForCausalLM(nn.Module, CustomProcessMixin):
         inputs_embeds: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         audio_mask: torch.Tensor | None = None,
+        capture_layers: tuple[int, ...] | None = None,
     ):
         hidden_states = self.model(
             input_ids=input_ids,
@@ -819,6 +837,7 @@ class BailingMoeV2ForCausalLM(nn.Module, CustomProcessMixin):
             inputs_embeds=inputs_embeds,
             image_mask=image_mask,
             audio_mask=audio_mask,
+            capture_layers=capture_layers,
         )
         return hidden_states
 
@@ -835,6 +854,9 @@ class BailingMoeV2ForCausalLM(nn.Module, CustomProcessMixin):
         logits: torch.Tensor,
         sampling_metadata,
     ) -> SamplerOutput | None:
+        from vllm.v1.sample.sampler import Sampler
+
+        self.sampler = Sampler()
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 

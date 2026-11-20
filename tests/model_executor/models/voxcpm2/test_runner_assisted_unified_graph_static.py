@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Static regression checks for VoxCPM2 runner-assisted unified graph hooks.
 
 These tests intentionally avoid importing torch/vLLM so they can run in a
@@ -14,7 +14,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-RUNNER = REPO_ROOT / "vllm_omni" / "worker" / "gpu_ar_model_runner.py"
 RUNNER_ASSISTED_METADATA = REPO_ROOT / "vllm_omni" / "worker" / "runner_assisted_metadata.py"
 TALKER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "voxcpm2_talker.py"
 VOXCPM2_RUNTIME_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "runtime_config.py"
@@ -22,60 +21,6 @@ VOXCPM2_PIPELINE = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxc
 VOXCPM2_SCHEDULER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "scheduler.py"
 OMNI_AR_SCHEDULER = REPO_ROOT / "vllm_omni" / "core" / "sched" / "omni_ar_scheduler.py"
 DEPLOY = REPO_ROOT / "vllm_omni" / "deploy" / "voxcpm2.yaml"
-
-
-def test_ar_runner_exposes_runner_assisted_full_metadata_hook():
-    source = RUNNER.read_text()
-
-    assert "Models without this hook keep the normal runner path" in source
-    assert "get_runner_assisted_full_attention_metadata_request" in source
-    assert "set_runner_assisted_full_attention_metadata_context" in source
-    assert "runner_assisted_full_attn" in source
-    assert "runner_assisted_full_attn_capture" in source
-    assert "pad_attn = cudagraph_mode == CUDAGraphMode.FULL or runner_assisted_full_attn" in source
-    assert "for_cudagraph_capture=runner_assisted_full_attn_capture" in source
-    assert "cudagraph_runtime_mode=(" in source
-    assert "CUDAGraphMode.FULL if runner_assisted_full_attn else cudagraph_mode" in source
-    refresh_source = source[source.index("def _refresh_runner_assisted_full_attention_metadata_buffers") :]
-    refresh_source = refresh_source[: refresh_source.index("def _set_runner_assisted_full_attention_metadata_context")]
-    assert "num_computed_tokens_cpu" in refresh_source
-    assert "num_scheduled_tokens_np" in refresh_source
-    assert "optimistic_seq_lens_cpu[:num_reqs]=1" not in "".join(refresh_source.split())
-    padding_source = source[
-        source.index("runner_assisted_full_attn_request = self._get_runner_assisted_full_attention_metadata_request") :
-    ]
-    padding_source = padding_source[: padding_source.index("ubatch_slices, ubatch_slices_padded")]
-    assert "runner_assisted_full_attn_request.num_reqs_padded" in padding_source
-    assert "runner_assisted_full_attn_request.for_cudagraph_capture" in padding_source
-    assert "num_reqs_padded * max_num_scheduled_tokens" in padding_source
-
-
-def test_ar_runner_without_model_hook_stays_on_normal_path():
-    source = RUNNER.read_text()
-    contract_source = RUNNER_ASSISTED_METADATA.read_text()
-    request_source = source[source.index("def _get_runner_assisted_full_attention_metadata_request") :]
-    request_source = request_source[
-        : request_source.index("def _refresh_runner_assisted_full_attention_metadata_buffers")
-    ]
-    compact_request_source = "".join(request_source.split())
-
-    assert "Models without this hook keep the normal runner path" in request_source
-    assert "class RunnerAssistedAttentionMetadataProvider(Protocol)" in contract_source
-    assert "class RunnerAssistedFullAttentionMetadataRequest(NamedTuple)" in contract_source
-    assert "tuple[int, bool]" not in contract_source
-    assert 'hook=getattr(self.model,"get_runner_assisted_full_attention_metadata_request",None)' in (
-        compact_request_source
-    )
-    assert "ifnotcallable(hook):returnNone" in compact_request_source
-    assert ".tolist()" not in compact_request_source
-    assert "isinstance(request,RunnerAssistedFullAttentionMetadataRequest)" in compact_request_source
-    assert "request.num_reqs_padded" in request_source
-    assert "request.for_cudagraph_capture" in request_source
-    assert "exceptException" not in compact_request_source
-
-    set_context_source = source[source.index("def _set_runner_assisted_full_attention_metadata_context") :]
-    set_context_source = set_context_source[: set_context_source.index("def _deferred_prefix_cache_mm_keys")]
-    assert "except Exception" not in set_context_source
 
 
 def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
@@ -152,7 +97,8 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     forward_source = source[source.index("def _forward_unified_decode") :]
     forward_source = forward_source[: forward_source.index("# -------------------- vllm hooks")]
     assert "graph_size = self._select_unified_graph_bucket_size(num_reqs)" in forward_source
-    assert "self._unified_graphs[graph_size]" in forward_source
+    assert "self._unified_graphs if mixed_token_capacity is None else self._mixed_graphs" in forward_source
+    assert "graph_cache[graph_key] = g" in forward_source
     assert "g.input_embeds[num_reqs:graph_size].zero_()" not in forward_source
     assert "padded rows as valid duplicates" in forward_source
     assert "g.input_embeds[last : last + 1].expand" in forward_source
@@ -190,9 +136,10 @@ def test_voxcpm2_scheduler_policy_stays_model_local():
     assert "def _should_defer_waiting_admission(self) -> bool:" in common_source
 
     assert "class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler)" in voxcpm2_scheduler_source
+    assert "import vllm_omni.platforms as omni_platform" in voxcpm2_scheduler_source
     assert "from .runtime_config import _VoxCPM2RuntimeConfig" in voxcpm2_scheduler_source
     assert "_VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)" in voxcpm2_scheduler_source
-    assert "unified_decode_graph_available(use_cuda_graph=current_omni_platform.is_cuda())" in voxcpm2_scheduler_source
+    assert "use_cuda_graph=omni_platform.current_omni_platform.is_cuda()" in voxcpm2_scheduler_source
     assert "_should_defer_waiting_for_unified_decode_graph" in voxcpm2_scheduler_source
     assert "def schedule(" not in voxcpm2_scheduler_source
     assert "create_request_queue" not in voxcpm2_scheduler_source

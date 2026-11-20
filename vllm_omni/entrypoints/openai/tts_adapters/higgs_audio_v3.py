@@ -16,6 +16,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
+    resolve_stage_model_path,
 )
 
 _REF_CODE_CACHE_MAX_ENTRIES = 256
@@ -170,13 +171,7 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
             HiggsAudioV3TokenizerAdapter,
         )
 
-        model_path = None
-        for stage in self.engine_client.stage_configs:
-            model_path = getattr(getattr(stage, "engine_args", None), "model", None)
-            if model_path:
-                break
-        if model_path is None:
-            model_path = getattr(self.engine_client, "model", None)
+        model_path = resolve_stage_model_path(self.engine_client)
         if model_path is None:
             raise RuntimeError("higgs_audio_v3 serving could not resolve model path")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -195,9 +190,6 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
             return err
         if not request.input or not request.input.strip():
             return "higgs_audio_v3: input text cannot be empty"
-        if request.ref_audio is not None and not request.ref_text:
-            # Voice clone ref_text is optional for v3 (improves fidelity but not required)
-            pass
         if request.max_new_tokens is not None:
             if request.max_new_tokens < self.max_new_tokens_min:
                 return f"max_new_tokens must be at least {self.max_new_tokens_min}"

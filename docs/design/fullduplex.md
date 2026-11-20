@@ -1,1070 +1,1754 @@
-# MiniCPM-o 4.5 Full-Duplex Runtime Architecture
+# Unified Full-Duplex Framework
 
-> Relocation note: after the H20 validation recorded below, the full-duplex
-> implementation moved out of `vllm_omni/experimental/fullduplex/` into the
-> stable tree (`vllm_omni/engine/duplex/`, `vllm_omni/entrypoints/duplex/`,
-> `vllm_omni/model_executor/models/minicpmo_4_5/duplex/`, and companion
-> modules). Module paths in this document reflect the new layout; the runtime
-> evidence was produced on the pre-move tree, which is file-identical apart
-> from module paths.
+This document is the design record of the full-duplex serving framework:
+the engine-resident session model, the typed command/event contract, the
+single model plugin, and the serving/API surfaces built on top of them. It is
+the owner document for `vllm_omni/engine/duplex/**`,
+`vllm_omni/engine/duplex_omni_engine.py`,
+`vllm_omni/engine/duplex_orchestrator.py`,
+`vllm_omni/entrypoints/duplex_omni.py`, `vllm_omni/entrypoints/duplex/**`,
+`vllm_omni/clients/**` and the per-model `duplex/` packages.
+
+`vllm_omni/protocol/realtime/**` (the OpenAI Realtime API) and
+`vllm_omni/protocol/duplex/**` (vLLM-Omni's extension of it) are the shared
+wire codec duplex is built on. Duplex is its first consumer but not its owner: the codec
+is deliberately runtime-agnostic so a second Realtime surface can reuse it
+(RFC #6592 P0a).
+
+The public wire contract lives in
+[`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md);
+this page describes how it is produced.
 
 ## Purpose
 
-This document records the runtime architecture implemented by PR #3907, the
-cleanup applied after published commit `e011d936`, and the remaining work that
-must not be advertised as complete. Implemented contracts and future
-architecture work are called out separately below.
+A full-duplex model listens and speaks at the same time: audio streams into
+the model while it produces audio, the model decides when to speak, and the
+user can interrupt. Serving such a model needs a long-lived session with its
+own identity (epoch, turn), ledgers (input, response, playback, history), a
+lease (idle TTL, disconnect grace, resume) and a binding to the resumable
+stage requests that carry the session's audio through the pipeline.
 
-The checkpoint preserves the active runtime path already exercised on H20. It does
-not introduce another reducer, controller, worker provider, or shadow runtime.
+The framework gives that session exactly one owner, keeps the generic
+turn-based stack free of duplex code, and exposes the same session to three
+consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
+the model plugins.
 
-## Review Snapshot
+## Runtime process placement
 
-- PR: `vllm-project/vllm-omni#3907`
-- Published head before this refactor: `e011d936`
-- Published base snapshot: `62589203`
-- Published diff: 93 files, approximately `+29.2k/-0.6k`
-- Local runtime and pytest validation: intentionally not used
-- Required validation environment: an NVIDIA H20 CUDA host
-- PR head reviewed for the current cleanup:
-  `f4f78fa555af4d65e46b003022d352ca2ea9d703`
-- Validated tree: the uncommitted refactor synchronized file-for-file to the
-  isolated H20 worktree on 2026-07-20
+The optional process runtime isolates the orchestrator from the frontend GIL
+and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
 
-The current tree has received fresh H20 focused and E2E validation against vLLM
-0.25.0. The final affected matrix includes the pre-response continuation and
-Stage1 CUDA Graph padding regressions. The checked-in MiniCPM profile admits
-two concurrent sessions through an engine-owned limit; a third
-session was rejected and capacity returned after one session closed. The two
-accepted sessions independently completed their audio, transcript, response,
-playback, and close lifecycles. This is isolation and admission evidence for the
-tested two-session deployment, not a production fairness, arbitrary-capacity,
-or failure-recovery claim. The validated paths include the MiniCPM duplex
-runtime extension, typed resumable policy, extracted control plane and clients, request
-preregistration, typed direct-output decision, engine-managed two-session
-capacity in the checked-in deploy profile, separate public/runtime configuration
-channels, private Session ledgers, ordered `session.update`, the MiniCPM runner
-fast path, continuous
-browser input, and the final Realtime input-lifecycle fixes. Exact evidence and
-scope limits are recorded below.
+## Playback completion ownership
 
-## Scope
+Cancellation of a retained model stream identifies the response owning its
+queued audio, even after generation completes. The Realtime projection clears
+that playback without emitting a second terminal for the completed response.
 
-The checkpoint keeps these verified contracts:
+`DuplexEngineSession` owns response snapshots and playback cursors. Output
+completion and a client's full `playback.ack` can arrive in either order.
+`finalize_response_playback` is the shared check used by ACK processing,
+normal response completion, draining response completion, and cancellation.
+It retains state while that response is active, any of its requests are still
+draining, or playback is partial without an explicit hard truncate. A hard
+truncate means playback has stopped; once output ends, no further ACK is needed.
+At that point, detach the stopped response from the current playback gate even
+if calibration keeps its response-scoped cursor. Detach by cursor identity so
+an older stop or delayed ACK cannot unblock or overwrite a newer response.
+A final output
+can add transcript or completion metadata after the ACK, so history is reconciled
+against the retained cursor before releasing the snapshot and pending item state.
+Deleted history is never reconstructed. Natural drain completion establishes
+`audio_complete`; cancellation does not. A later response's cursor and history
+position remain independent. Without calibration, aligned history keeps its
+timing marks after a hard stop so a later explicit truncate can shorten the
+stored prefix. Marks retain their original character offsets; repeated truncation
+does not rescale them to the remaining text. Unaligned stops and retired
+calibration evidence keep only the stored prefix and cutoff. Delayed progress
+ACKs cannot change finalized history or restore unheard text. Plugin runtime
+settlement follows all history writes, including cancellation writeback into a
+reserved older turn; it must observe the final committed result.
 
-- MiniCPM Stage0 conversation KV continuity;
-- Stage1 TTS and Token2Wav continuity;
-- model-owned listen/speak decisions on the normal auto-response path;
-- continuous browser PCM upload during assistant playback, without browser VAD
-  or browser-generated input commits;
-- segment EOS and turn EOS as different boundaries;
-- transcript/audio cursors scoped to a response and turn;
-- playback acknowledgement and history commit;
-- Stage0 request metadata routed per batch row rather than inherited from the
-  first request in the batch;
-- Stage0 token timing snapshots and client-observed audio chunk cadence;
-- scheduler data-plane append over a resumable request;
-- stale epoch/turn/response fencing;
-- `/v1/duplex` and OpenAI Realtime projection;
-- optional OpenAI `server_vad` turn detection backed by a process-shared Silero
-  model and per-session VAD state;
-- existing JoyVL behavior.
+Audio truncation is valid only for an item whose response produced audio.
+The session checks its live cursor or retained audio provenance before any
+history or playback mutation. Cursor cleanup preserves that provenance only
+for stored history items; deleting or replacing finalized context removes it.
+This distinguishes a retired audio reply from imported context or a reply that never emitted audio
+without retaining its recording or full response snapshot. Realtime commands,
+native truncate signals, and hard playback ACKs reject a no-audio target.
+An ACK's implicit target is resolved before validation or mutation. Pending and
+stored-item fallbacks must match `last_response_id`, which `begin_response`
+updates together with the current playback cursor. A retained older reply cannot
+consume the current reply's ACK, even when it is the only remaining history item.
+Resolution looks up that current item directly in pending or stored history;
+unrelated older or imported items do not make its identity ambiguous. This must
+continue working when a partial ACK moves it from pending to stored history.
+The stored-item fallback also requires the item's live or retained audio
+provenance, including for audio-only replies, then passes the same ownership
+and late-ACK validation as an explicit target. Imported context without audio
+provenance is not selected, even if its ID starts with `item_`. Without an
+identifiable target, ordinary ACKs
+update only the current playback cursor and hard ACKs fail before any history or
+cursor mutation.
+The typed `AckPlayback` command preserves the wire `truncate` flag through
+translation and mailbox delivery, so hard stops reach the same handler as
+internal playback controls.
 
-The checkpoint does not claim:
+History edits pass the item's own timing marks and playback cursor explicitly;
+the text-prefix calculation never reads the active response implicitly. If both
+marks and duration of a known audio reply have been released, a new explicit
+truncate cannot establish a heard prefix and clears the text conservatively.
+Truncation preserves the empty assistant turn so the command's following playback ACK remains valid;
+only deletion removes that turn. Ignored ACKs for finalized history report
+`history_committed: false` and do not settle plugin runtime again, including
+when calibration evidence has been retired.
 
-- scheduler-native KV append;
-- an acoustic-onset-to-cancel latency target across arbitrary client chunk sizes;
-- production multi-session admission, fairness, capacity, or failure recovery;
-- bounded long-session KV;
-- audio/video synchronization beyond one camera frame per model unit (camera
-  frames ride the audio appends as `video_frames`; the wire contract is in the
-  [Realtime Duplex API](../serving/realtime_duplex_api.md) guide).
+Opt-in history calibration is a separate retention owner: incomplete or
+hard-capped replies remain in its bounded cache for prefix correction. Every
+completion path preserves that evidence until calibration retires it. Sessions
+without calibration release stopped output immediately.
 
-## Active Runtime Path
+## Experimental Qwen history policy
 
-The actual path is:
+Qwen defaults to `full_history` when `history_policy` is omitted from server-owned
+`duplex_session.model_custom_options`. It sends all effective Session messages and
+retained original input audio/images, without a recent-message window, automatic
+summaries, media substitution or oldest-first eviction. Source deletion and
+playback calibration still determine the effective Session records.
 
-```text
-WebSocket
-  -> OmniDuplexSessionHandler
-  -> DuplexSession + MiniCPMO45ServingSessionState
-  -> DuplexRequestClient
-  -> AsyncOmni thin open/append/signal/close proxies
-  -> DuplexControlClient over the engine-owned correlated RPC transport
-  -> DuplexControlPlane + DuplexSessionRuntimeManager
-  -> MiniCPM DuplexRuntimeExtension + engine session/stage bindings
-  -> StagePool
-  -> resumable scheduler request
-  -> MiniCPM Stage0
-  -> Stage1 TTS / Token2Wav
-  -> output processor
-  -> Realtime protocol projection
-  -> WebSocket writer
-```
+| `history_policy` | Model input | Capacity behavior |
+| --- | --- | --- |
+| `full_history` (default) | All effective original messages and media. | Reject the request if the complete input plus reserved output exceeds resolved token or per-request media limits. |
+| `recent` | The legacy 16-message window and bounded input-audio cache. | Preserve the previous clipping behavior. |
+| `bounded_recent` | Recent complete turns under the configured context/media budget. | Remove older turns until the request fits. |
+| `incremental` | Published memory plus selected uncompressed turns. | Compress older sources and fit the foreground request to budget. |
 
-The removed typed reducer/facade and worker-provider runtimes were not in this
-path. This refactor continues to modify only the path above.
+The default now changes from `recent` to `full_history`. Deployments that need the
+previous bounded window must explicitly set `history_policy: recent`. Full-history
+requests preserve system-message order and the existing tool-call protocol. They
+keep pending tool-call anchors beyond the legacy 16-message window. Full history
+uses original sources even when `context_keep_media_turns` is configured; select
+`recent` to use that policy's media-dropped view.
 
-## State Ownership
+The plugin checks the deployment's per-request audio/image counts and passes its
+context limit and reserved output to the stage submission. The engine renders
+the input once, checks those actual expanded tokens before backend admission,
+then passes the same rendered input and media features to `InputProcessor`.
+Full-history validation does not run a separate HF processor pass. The context
+limit includes `max_context_tokens` when configured. Overflow
+raises a recoverable `input_capacity_exceeded` error without submitting a partial
+request or deleting history. Clients can delete source items and retry. Session
+input-admission limits still reject additional material before it is accepted.
+The base deployment permits four audio inputs and eight images per request;
+full history does not raise these deployment limits automatically. Direct plugin
+calls without a resolved model configuration leave validation to the downstream
+engine.
 
-The architecture allows several state objects only when their facts are
-orthogonal.
+Session-owned input readiness records authoritative history source IDs, including
+rejected requests; unbound seed text keeps its existing notification count.
+Deleting/recreating an item cannot rearm its old identity, while transcript
+corrections retain that identity. Text and speech arriving during preparation
+remain independently pending. The model deletion hook removes idle committed
+PCM before a reused item ID can merge with the deleted source, and the Session
+releases the corresponding reserved input bytes. A queued append retains the
+same payload identity until consumption settles.
 
-| Owner | Authoritative facts |
+Full history retains original input PCM without the recent cache's item/byte
+evictions. Merged commits preserve their item boundaries: deleting one source
+removes only its PCM segment during the next prompt preparation. New commits
+remain separate from previously rejected input. Closing the Session releases its
+state. Storage can grow with the conversation, and the original history is counted
+again for each request.
+
+Every built-in, including `full_history` and `recent`, is a `QwenHistoryPolicy`
+object. Their `select` methods choose the original groups to render.
+`HistoryBehavior` declares original versus summary-aware rendering, the overflow
+action, message and media retention limits, and whether an L1 media view applies.
+The plugin consumes these choices without comparing the configured policy name.
+`FullHistoryPolicy` selects all original groups and rejects overflow;
+`RecentHistoryPolicy` selects the legacy window and declares its cache limits.
+Custom original-history strategies can subclass either and override selection
+or behavior. Session image admission is supplied by `session_image_limits`.
+Existing custom bounded/compression strategies retain the four required hooks.
+
+Audio retention is selected explicitly with `audio_retention`. `original` keeps
+PCM until source deletion and requires both audio cache limits to be `None`.
+`bounded` requires a positive `audio_cache_items` limit and accepts an optional
+`audio_cache_bytes` target; it keeps at least the newest binding, including when
+that binding exceeds the byte target. Unsupported combinations fail at policy
+construction. With original-message rendering, `original` also rejects selected
+sources whose PCM is unavailable, independently of the context overflow action.
+This check uses the selected source before L1 view formatting; a transcript view
+cannot hide missing PCM and does not release retained original audio.
+
+`DuplexAppendPlan.input_capacity` carries model-owned context and output limits
+through `DuplexStageSubmission`. `DuplexOrchestrator` owns renderer adaptation and
+checks expanded input before ordinary backend length validation and submission.
+The shared worker delegates input processing and retains its serialization,
+cancellation join and sender-cache cleanup. Capacity checks count prompt
+embeddings as well as token IDs. Other plugins leave this optional field unset.
+
+`incremental` folds older text and original audio into a bounded text memory,
+and images into intermediate and long-term visual memories.
+Model-specific selection, source retention, compression prompts and token budgets
+remain in the Qwen plugin. Published dialogue and visual summaries are `SUMMARY`
+nodes in `DuplexEngineSession.context_ledger`; the public history snapshot supplies
+their source IDs and revisions. Qwen and JoyAI share `engine/duplex/text_folding.py`
+for labeled text excerpts and `engine/duplex/visual_memory.py` for visual batching
+and retention. `SessionVisualHistory` in `engine/duplex/session/visual_history.py`
+binds visual sources to the public snapshot, resolves valid ledger text, and
+publishes/retires visual summaries. Models supply decoded batches and prompt
+formatting. `SessionMemoryRuntime` executes private requests with the Thinker
+as both entry and final stage.
+
+Each Session holds `QwenDuplexSessionState.history_policy_state`. This state keeps
+summary node IDs, selection progress, retained media and unfinished text excerpts.
+Summary text is read from the Session ledger. Qwen's visual store keeps batch
+metadata; its published text is also read from ledger nodes. Original Session
+records and source dependencies remain retained, so the bounded prompt and media
+limits do not bound total Session storage.
+
+An assistant reply reserves a history position before becoming visible. When
+generation or playback materializes that reply, unchanged camera sources can
+move to later list positions. Their published visual summaries remain valid
+while source IDs, revisions, image parts and URLs are unchanged. Pending
+compression work still validates its original message labels and is retried
+when those positions move.
+
+Unanswered user items and intervening system messages form one protected turn.
+Merged audio submissions retain their committed source IDs. Only the source
+items whose PCM is present share that payload in the prompt, including on the
+explicit `recent` path. Deleting an assistant reply can join older turns without
+merging their existing audio bindings. Distinct bindings remain separate even
+when their payload objects or PCM values are identical.
+Foreground fitting preserves that complete turn, including original media, or
+returns a recoverable capacity error. After removing oversized source items,
+clients can retry the remaining input without submitting a new user item.
+Background dialogue and visual compression wait until the turn has an assistant
+reply. `chunk_messages` is a batch target:
+an indivisible audio turn can exceed it when its actual audio count, retained
+bytes and processor-expanded input plus reserved output fit the hard limits.
+
+The summary lifecycle is:
+
+1. The Session owner supplies a current snapshot and refreshed ledger through
+   `bind_history_context`. Qwen selects sources by position in that snapshot and
+   captures their public `(source_id, revision)` references.
+2. Qwen's compression policy prepares one private Thinker request. The existing
+   `SessionMemoryRuntime` handles submission, cancellation, cleanup and retry.
+3. Before applying its result, the runtime supplies the current snapshot again.
+   Qwen checks source references and its selection progress, validates the model
+   output, and publishes through `ledger.replace_summary` on the owner loop.
+4. A rolling dialogue summary inherits all dependencies of the previous summary
+   plus the new batch's sources. A long-term visual summary inherits all sources
+   of its intermediate summaries. Replaced nodes are retired after publication.
+5. Before foreground preparation, the owner refreshes the ledger against current
+   history. Qwen reads surviving nodes and applies its own selection and token
+   budget. Deletion, correction, transcript or playback revision changes revoke
+   affected summaries, including when a tighter cutoff leaves visible text equal.
+
+Replacing summaries flattens their source dependencies, so obsolete summary
+nodes do not accumulate into a parent chain. Qwen rewinds its dialogue selection
+progress after invalidation; an invalidated visual batch resets its visual plan.
+Evicting a long-term visual summary also removes its ledger node. Visual writeback
+first stages batch/cursor changes using copies of the small metadata lists, sharing
+immutable encoded payloads. Only successful ledger publication adopts that state;
+either validation failure leaves the previous visual store and ledger intact.
+L1 nodes remain independent. A missing audio source records an omission and does
+not block later work; the omitted source is not claimed as summary evidence. Media eligibility
+remains independent of the recent text window.
+
+External policies inherit `QwenHistoryPolicy` and supply four methods:
+
+| Method | Decision |
 | --- | --- |
-| `DuplexSession` | session state, epoch, turn, active/last response, pending input, overlap duration, playback cursor, history |
-| `MiniCPMO45ServingSessionState` | MiniCPM PCM buffer, deferred overlap payload, data-plane task, continuation effect counter |
-| `DuplexWebSocketActor` | inbound mailbox, outbound queue, writer, transport close state, effect task handles |
-| `NativeRealtimeSessionProtocol` | wire-only response/item projection and input-buffer projection |
-| `DuplexSessionRuntimeManager` | fence snapshot, append reservation, completed-operation cache, resource reservations, stage bindings |
-| `DuplexControlPlane` | control-message validation, transactional open/append/update/close, extension invocation, typed segment/output decisions |
+| `select(state, limits)` | Original whole turns offered to the next foreground request; the runtime adds stored memory and fits the actual input. |
+| `next_batch(state, limits, *, max_audio)` | Next unprocessed prefix to compress, or `None`. |
+| `build_compression(batch, previous_memory, limits)` | Compression instructions, quoted source layout and temperature for a private Thinker request. |
+| `parse_compression(text)` | Complete replacement memory, or rejection of the model output. |
 
-Important distinctions:
+For example, an extension can reuse incremental selection/batching while
+replacing free-form summaries with a validated JSON fact list. Compression
+instructions and result interpretation belong to the policy. The runtime owns
+PCM binding, Qwen processing, actual token limits and committing valid results;
+`SessionMemoryRuntime` still owns submission, cancellation and retry. The
+extension does not implement a second model-execution loop.
 
-- Realtime response IDs are projection caches, not domain decision sources.
-- Engine fences duplicate identity across a process boundary by design; they
-  are immutable validation snapshots.
-- Stage bindings are engine resources, not serving response state.
-- `continuation_owner_id` scopes an effect counter either to a visible response
-  or, before `response.created`, to an explicit model turn. A pre-response
-  continuation also revalidates request, epoch, turn state, and model-turn
-  identity immediately before append; it cannot survive turn completion.
-- runtime open/close acknowledgements are handler-local effect bookkeeping,
-  not Session lifecycle.
+Compression builders run in the joined CPU preparation worker on frozen
+`CompressionMessage` values. Text, batch-local `CompressionAudioRef` and
+`CompressionImageRef` indices replace borrowed Session objects and media. Every
+reference must appear once in source order within its modality in the returned
+`CompressionPrompt`. The same compression hooks construct and parse visual
+summaries. `compress_visual_history=False` disables visual summarization;
+`bounded_recent` uses this setting. If a batch must shrink
+to fit context, the builder runs again on that actual smaller batch. Parsers
+run on the Session loop and must be small and nonblocking. Both hooks are
+stateless, perform no I/O and must not retain input material. Selection hooks
+receive Session-owned state under a read-only contract; server-loaded Python
+extensions are trusted code, not a sandbox.
 
-## Implemented Concurrency Contracts
+Before invoking the parser, the runtime rejects stale, empty, truncated or
+overlong model output. It also bounds the parsed text before committing memory
+and source progress together. A parser can return `None` or raise `ValueError`
+to reject malformed output without advancing progress. Memory remains bounded
+text (including serialized JSON), inserted as reference data in foreground
+input. The interface uses the same Qwen Thinker; it does not support external
+summarization services, arbitrary retrieval stores or mid-session switching.
 
-### Single inbound mailbox
+The built-in incremental parser also rejects output containing only source
+delimiter markers, role labels, numbered visual-source labels and the closing
+instruction `Return the complete updated memory.` Rejection preserves published
+memory, pending images and text, and compression progress for retry. Labels
+accompanied by actual facts remain valid memory. These checks detect structural
+echoes; they do not certify factual accuracy. Control-line matching ignores
+surrounding whitespace but otherwise requires exact case and punctuation.
 
-The Actor now uses one:
+The default compression prompt separates role labels from source text. For
+images, it requests observable content even without a stated user preference
+and combines repeated observations across frames into one memory.
 
-```python
-asyncio.Queue[event]
+Configure the policy in a deployment overlay:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  model_custom_options:
+    history_policy: incremental
+    history_limits:
+      recent_messages: 8
+      chunk_messages: 8
+      summary_tokens: 512
 ```
 
-This replaces competing control/input/event `Queue.get()` tasks and the
-deferred-event list while preserving WebSocket arrival order. A later close,
-cancel, or clear must not overtake earlier append, playback ACK, or
-session-update events. Slow runtime appends remain background tasks. Cancelling
-their asyncio task does not stop a synchronous callable already running in the
-default executor, so cancellation correctness is provided by the engine fence,
-not by `Task.cancel()`.
+Pass the overlay with `vllm serve ... --omni --deploy-config /path/to/history.yaml`.
+Set `history_policy` to `bounded_recent` for clipping, or to
+`your_package.policy:YourPolicy` for a server-importable class with a no-argument
+constructor. Subclass `IncrementalHistoryPolicy` to reuse its selection and
+batching while overriding compression. Omitting the policy selects `full_history`.
+The optional `history_limits.max_context_tokens` caps context below the resolved
+model limit, including reserved output; omitting it uses the model limit.
 
-Properties covered by focused tests:
+Message count alone cannot distinguish a short text turn from a large image or
+audio turn. Optional token targets let deployments trigger compression according
+to the cost of the originals that remain in context, while keeping the same
+selection/compression interface. They independently replace message-count
+triggering and batching:
 
-- every enqueued event is delivered exactly once;
-- terminal control preserves wire order while cancelling background work;
-- clear and cancel never scan or delete later mailbox events;
-- one writer owns all WebSocket sends.
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  model_custom_options:
+    history_policy: incremental
+    history_limits:
+      recent_tokens: 6000
+      chunk_tokens: 2000
+      summary_tokens: 512
+```
 
-### Correlated RPC result router
+`recent_tokens` starts dialogue compression when unsummarized originals exceed
+the target. Once triggered, the policy fills a batch up to `chunk_tokens` from
+the oldest completed turns. For example, roughly 7000 original tokens can
+produce a batch of roughly 2000 tokens, leaving roughly 5000 original tokens
+alongside the new summary. The output size is controlled by `summary_tokens`.
+Reaching the trigger does not require a full batch to be available.
 
-`AsyncOmniEngine` now has one consumer for `rpc_output_queue`. Results route by:
+Both token targets default to unset. Setting `recent_tokens` replaces
+`recent_messages`; setting `chunk_tokens` replaces `chunk_messages` for batch
+size. Either can be used alone with the other message-count setting. Targets
+must be positive integers. Audio count/byte pressure and visual count pressure
+remain independent triggers, including below `recent_tokens`.
+
+Counting runs in joined CPU workers. Dialogue targets sum the rendered token
+costs of complete original turns, including their chat templates and expanded
+audio/image tokens. Existing summaries, compression instructions and reserved
+output are excluded from these source targets; the final rendered request
+must still fit all of them within the effective model-context limit. The shared `SourceTokenCache` stores only scalar costs, public source references
+and model-supplied media-view keys. Unchanged turns reuse their costs after an
+append; edits, regrouping, audio rebinding and visual summary/omission changes
+require a fresh count. Processed and removed groups are pruned. Token counting
+adds CPU preparation work and does not bound total Session storage.
+Visual batches also shrink to `chunk_tokens`, within their existing image-count
+and summary-group targets. Indivisible audio turns and visual entries may exceed
+the soft batch target when they fit the hard model/media limits. An oversized
+text turn uses the existing private excerpt-folding path, even when the whole
+turn would fit the model context. No partial excerpt publishes summary coverage.
+An unusably small `chunk_tokens` value can leave no room for excerpt labels;
+preparation logs the capacity issue and keeps the original source pending.
+
+Incomplete implementations fail at server initialization. Selection is
+stateless and may be cached while
+the Session history revision, memory generation, retained-media revision and
+audio-preparation ownership are unchanged. Reusing an already retained audio
+payload for counting does not change its retained-media revision. Source checks still run before submitting or applying a summary.
+Audio compression uses the renderer's effective per-request audio count and a
+separate `audio_summary_trigger_bytes` setting (default 8 MiB). The trigger is
+capped by the strategy's `max_audio_bytes` retention limit (default 32 MiB),
+independently of the legacy recent cache. The policy receives the resolved
+per-request count as `next_batch(..., max_audio=...)`. A still-valid foreground
+source can be recovered for compression, but its worker references must fit the
+strategy limits and remain charged until
+feature preparation finishes. Current text/audio/image input is preserved independently of
+background retention capacity; unavailable current audio is an explicit error.
+
+Foreground rendering emits one debug record per successful prompt build with
+`degraded`, `trimmed_turns` and `summary_dropped`. These count preparation-time
+clipping, including plans cancelled before submission, rather than completed
+responses. Worker logging does not mutate Session state.
+
+When an indivisible text turn exceeds the compression input capacity, the
+runtime folds labeled excerpts using private `HistoryFold` state. Each request
+includes the previous intermediate memory. Only the final successful excerpt
+publishes replacement memory and advances the processed position. Failed or
+cancelled excerpts leave progress unchanged; source edits revoke partial state.
+Text folding uses the same custom compression builder and parser as whole
+batches. Raw audio is not split by the text algorithm.
+
+Visual input uses existing `input_image` items with JPEG/PNG data URLs, including
+client-extracted video frames. No video-file decoder or audio-append frame path
+is added. Completed visual sources become eligible when selected dialogue needs
+compression, when they leave the recent-message target, or when unsummarized
+images reach the per-request image limit. The runtime processes up to
+`visual_chunk_images` (default 8) at a time, shrinking to the actual processor
+capacity. Five intermediate summaries (`visual_mid_group`) trigger a long-term
+merge; at most 15 long-term summaries (`visual_max_long`) are retained. Each
+visual output is limited by `summary_tokens`, default 512. Oldest long-term
+summaries are retired beyond this bound. Source message positions label visual
+evidence; they are not video timestamps. Qwen installs visual limits when the
+Session model state is constructed; planning does not rewrite live limits.
+Both the history state and its deployment limits are required constructor
+arguments, so callers cannot silently fall back to default visual limits.
+
+An admitted JPEG/PNG can have a valid header but an undecodable body. For completed
+history, the preparation worker identifies that source as unavailable. After
+rechecking its identity on the owner loop, Qwen records a visual omission, advances
+past it and continues with valid images or dialogue. The failed image is not
+included in a visual summary's source dependencies. Resource errors, including
+Pillow decompression-bomb protection, and programming errors still fail
+preparation without advancing visual progress. Original Session records remain intact, and an undecodable
+current input still fails foreground preparation rather than being silently omitted.
+
+Visual summaries are separate from dialogue memory. Source images remain
+available until a valid visual result commits; dialogue compression waits for
+its visual sources to be summarized or explicitly marked unavailable. Foreground requests include visual memories
+and uncompressed images. Consumed originals use a neutral “original image omitted”
+marker, which remains accurate if visual memory is retired or excluded from this
+request. If current input plus memories exceeds capacity, the
+runtime removes dialogue memory and then oldest visual memories before failing
+the current request. It subsequently adds older whole turns while they fit.
+Image edits or deletions revoke derived visual memory and stale results. Worker
+cancellation joins decoding/rendering before another preparation can own its
+materials.
+
+The plugin separately provides Session image admission limits. `full_history`,
+`bounded_recent` and `incremental` default to 200 stored images / 32 MiB of encoded
+image URLs. Explicit `recent` retains the original Session defaults of 8 images /
+4 MiB, named
+`DEFAULT_IMAGE_HISTORY_MAX_ITEMS` and `DEFAULT_IMAGE_HISTORY_MAX_BYTES` in
+`engine/duplex/config.py`. These records are not deleted by summarization.
+Reaching this limit rejects additional images; deleting source items also revokes
+memory derived from them. The visual preparation store has its own configurable
+image count, encoded PNG byte and decoded pixel byte bounds. These are not
+process RSS limits.
+
+`bounded_recent` and `incremental` accept text/audio/images and reject tools.
+`full_history` and `recent` retain the original image/tool rendering path.
+
+## Architecture
 
 ```text
-("duplex", control_id)
-("collective", rpc_id)
+              Python users                                WebSocket clients
+        ┌──────────────────────┐                    ┌────────────────────────┐
+        │  InlineDuplexClient  │                    │      DuplexClient      │
+        │  (DuplexClientBase)  │                    │   (DuplexClientBase)   │
+        └──────────┬───────────┘                    └───────────┬────────────┘
+                   │   DuplexSessionHandle                      │ /v1/realtime?duplex=1 (alias /v1/duplex)
+                   │                                            ▼
+                   │                          ┌──────────────────────────────────────┐
+                   │                          │ OmniDuplexSessionHandler (thin)      │
+                   │                          │  websocket I/O, command_from_realtime│
+                   │                          │  event.to_realtime(), attachment /   │
+                   │                          │  resume tokens / replay journal      │
+                   │                          └──────────────────┬───────────────────┘
+                   ▼                                             ▼   DuplexSessionHandle
+        ┌──────────────────────────────────────────────────────────────────────────────┐
+        │ DuplexOmni(AsyncOmni)                      [entrypoints/duplex_omni.py, thin] │
+        │   open_session / get_session / resume_session / detach_session / close_session│
+        │   DuplexSessionHandle: submit(DuplexCommand) / events() -> DuplexEvent       │
+        └──────────────────────────────────────┬───────────────────────────────────────┘
+                                               │ engine.open/close/resume/touch_session_async (RPC)
+                                               │ engine.submit_command_async (one-way)
+                                               ▼
+        ┌──────────────────────────────────────────────────────────────────────────────┐
+        │ DuplexOmniEngine(AsyncOmniEngine) [engine/duplex_omni_engine.py, thin]        │
+        │   loads the plugin, validates session_mode, builds queue messages            │
+        │  └─ DuplexOrchestrator(Orchestrator)            [engine/duplex_orchestrator.py]│
+        │       template seams + DuplexStagePort over the shared stage machinery       │
+        │       ├─ DuplexSessionManager      admission, backpressure, lease reaper,     │
+        │       │                            open/close/resume/touch, command dispatch  │
+        │       └─ DuplexSessionRunner ×N    ONE session state (DuplexEngineSession),   │
+        │                                    ordered mailbox, append planning + stage   │
+        │                                    submit, output projection, response /     │
+        │                                    playback / history, VAD, typed events     │
+        │       plugin: DuplexModelPlugin    (PipelineConfig.duplex_plugin, one/model)  │
+        └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The router replaces the global RPC lock. It supports out-of-order replies,
-timeout unregister, late-result rejection, fatal-error broadcast, and close
-unblocking.
+In each layer the duplex class extends the turn-based one, which extends
+the shared base. The dependency runs duplex -> turn-based and never the
+reverse, so the turn-based stack is unchanged and the duplex stack reuses
+its request machinery instead of duplicating it:
 
-Additional lifecycle rules:
+```text
+OmniBase                          OmniEngineBase                        OrchestratorBase
+ ├─ Omni       (sync, turn)        └─ AsyncOmniEngine  (turn requests)   └─ Orchestrator        (turn-based admission)
+ └─ AsyncOmniBase                      └─ DuplexOmniEngine (session msgs)    └─ DuplexOrchestrator  (hosts DuplexSessionManager,
+     └─ AsyncOmni  (EngineClient)                                                                     implements DuplexStagePort)
+         └─ DuplexOmni
 
-- uncorrelated non-fatal errors are not broadcast to unrelated waiters;
-- a latched fatal rejects new calls before they enter the request queue;
-- `EngineDeadError` is broadcast directly to the RPC queue even though the
-  orchestrator consumes that exception during teardown;
-- shutdown closes the router before joining the orchestrator;
-- failure to enqueue shutdown closes the request queue and still attempts a
-  bounded orchestrator join;
-- `StageRuntime` cleanup runs only after the orchestrator has stopped, avoiding
-  concurrent client teardown.
+AsyncOmni._create_engine  -> AsyncOmniEngine     AsyncOmniEngine._create_orchestrator  -> Orchestrator
+DuplexOmni._create_engine -> DuplexOmniEngine    DuplexOmniEngine._create_orchestrator -> DuplexOrchestrator
+```
 
-The router removes wait-side head-of-line blocking. The orchestrator request
-handler remains ordered, but executor submission order is not itself a session
-ordering guarantee.
+Each concrete class constructs its collaborator in an explicit factory
+method the base calls at the right moment: `OmniBase.__init__` calls
+`self._create_engine(...)`; `OmniEngineBase._bootstrap_orchestrator` calls
+`self._create_orchestrator(...)` on the orchestrator thread once the stages
+are initialized. `DuplexOmniEngine._create_orchestrator` passes the loaded
+plugin and the session runtime config to `DuplexOrchestrator` directly.
 
-### Extracted control ownership
+### Design rules
 
-The generic engine mechanism and the duplex plugin are split by
-responsibility:
+1. **One session authority.** The whole duplex session (config, epoch/turn,
+   ledgers, lease, stage request resources, model state, projection state) is
+   one object, `DuplexEngineSession`, owned by one `DuplexSessionRunner` on
+   the orchestrator loop. Nothing above the engine keeps session state beyond
+   a handle (session id, event queue, capabilities, public session object).
+2. **Typed contract.** Commands into a session are `DuplexCommand`
+   dataclasses (`engine/duplex/commands.py`); outputs are `DuplexEvent`
+   dataclasses (`engine/duplex/events.py`). `command_from_realtime()` and
+   `DuplexEvent.to_realtime()` derive the OpenAI Realtime JSON, so the wire
+   format is never hand-built, and the websocket handler and the inline client
+   share one conversion.
+3. **Generic bases and the turn-based classes have zero duplex vocabulary.**
+   `OmniBase`, `AsyncOmniBase`, `AsyncOmni`, `OmniEngineBase`,
+   `AsyncOmniEngine`, `OrchestratorBase` and `Orchestrator` carry only
+   template seams; `tests/engine/test_duplex_import_boundary.py` checks that
+   importing the turn-based stack loads no duplex module.
+4. **Deployment selects the serving stack.**
+   `vllm-omni serve` constructs `DuplexOmni` when the pipeline declares
+   `duplex_plugin` and the deploy configuration sets `session_mode: duplex`.
+   An explicit `session_mode: turn` selects `AsyncOmni` instead, without
+   changing the pipeline's duplex capability. In duplex mode the server exposes `/v1/realtime?duplex=1` (alias
+   `/v1/duplex`), `POST /v1/chat/completions`, `/v1/models` and `/health`, and
+   every other turn-based route reports "not available". The chat route uses
+   the ordinary chat service on the duplex engine, without a session, when
+   the plugin declares `DuplexCapabilities.supports_chat_completions`.
+   Turn-based deployments use the ordinary API initialization and retain
+   model capability checks and endpoint restrictions.
+5. **Serving is transport only.** The websocket handler does socket I/O,
+   wire-envelope validation, command translation, event rendering and the
+   attachment/resume/replay bookkeeping; it holds no session state.
+6. **No `typing.Protocol`** in the duplex surfaces: the plugin, data plane,
+   session state, PCM buffer, stage port and client transport seams are ABCs.
+7. **The wire codec is not duplex, and a wire type is not a mailbox message.**
+   The event and command *vocabulary* plus its wire rendering, the audio format
+   negotiation, the conversation-item rules and the error envelope are model-
+   and runtime-agnostic, and split along the three tiers
+   [`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md)
+   already defines: **Tier 1** (identical to OpenAI) is
+   `vllm_omni/protocol/realtime/**`; **Tier 2** (OpenAI names carrying our
+   extensions) and **Tier 3** (ours alone) are `vllm_omni/protocol/duplex/**`.
+   A Tier 2 class *subclasses* its Tier 1 twin and declares only what it adds,
+   so the OpenAI surface stays honestly pure --- `session.created` without
+   `resume_token`, `input_audio_buffer.append` without `video_frames`. Our
+   error **codes** are Tier 3 (`protocol/duplex/errors.py`); only the envelope
+   shape and OpenAI's three `error.type` classes are Tier 1.
+   What stays engine-side is everything that is *internal representation*
+   rather than contract: `DuplexCommand.payload()` renders the session runner's
+   mailbox dictionary, whose channel genuinely differs from the client event
+   (`session.update` and the three `conversation.item.*` commands all travel on
+   `turn.signal`); `engine/duplex/realtime_commands.py` decides which command a
+   decoded event becomes; `engine/duplex/realtime_events.py` holds the
+   session's projection state. The codec may not import the engine, the
+   entrypoints, `model_executor` or the clients
+   (`tests/protocol/realtime/test_protocol_import_boundary.py`), and there is
+   exactly one implementation of each codec behaviour
+   (`tests/protocol/realtime/test_realtime_codec_single_source.py`).
+   The dependency chain is `protocol/realtime` <- `protocol/duplex` <- engine /
+   entrypoints / clients, and a duplex consumer uses **only** the middle link:
+   `protocol/duplex/**` re-exports the Tier 1 names it does not extend, so a
+   helper that later needs a duplex-specific version (`convert_input_audio_with_rate`
+   resamples to MiniCPM-o's 16 kHz rather than the client's rate) is overridden
+   in one file instead of at every call site
+   (`tests/protocol/duplex/test_duplex_protocol_facade.py`).
+   `DuplexEvent` is therefore a plain alias of `RealtimeEvent` --- an event has
+   no engine-internal half --- while `DuplexCommand` is a real class, because a
+   command does.
 
-| Module | Responsibility |
+## Package layout
+
+```text
+vllm_omni/
+├── entrypoints/
+│   ├── omni_base.py                 OmniBase (+ abstract _create_engine)
+│   ├── async_omni_base.py           AsyncOmniBase (output pump, _route_engine_message seam)
+│   ├── async_omni.py                AsyncOmni (turn-based requests)
+│   ├── duplex_omni.py               DuplexOmni, DuplexSessionHandle (thin pipe)
+│   ├── duplex/                      SERVING (thin)
+│   │   ├── serving.py               OmniDuplexSessionHandler
+│   │   ├── realtime_input.py        RealtimeEnvelope (query rules, first message), parse_resume_request
+│   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
+│   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
+│   │   ├── openai.py                dispatch_realtime_websocket (turn-based /v1/realtime, when duplex mode is not selected)
+│   │   ├── warmup.py                startup warmup probe; holds native session admission after WebSocket acceptance
+│   │   └── websocket.py             websocket send/close/receive helpers
+│   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
+├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
+│   ├── realtime/                    the OpenAI Realtime API itself
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (21 ship as Tier 1;
+│   │   │                            9 have a Tier 2 twin in protocol/duplex)
+│   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
+│   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
+│   │   ├── formats.py               audio format spellings, what is supported, per-session validation
+│   │   ├── session.py               session-object readers; RealtimeInputDefaults (append defaults)
+│   │   ├── items.py                 conversation item shape, truncation, transcripts, camera frames
+│   │   ├── audio_input.py           decode_audio_append -> RealtimeAudioAppend; client speech hints
+│   │   ├── audio.py                 PCM / G.711 / WAV decode, resample, re-encode
+│   │   ├── errors.py                RealtimeProtocolError (the envelope's exception type)
+│   │   └── capabilities.py          RealtimeProtocolCapabilities: what one consumer can serve
+│   └── duplex/                      Tier 2 + Tier 3, and the one door a duplex consumer uses
+│       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
+│       │                            items, session, capabilities) so the engine never
+│       │                            imports protocol/realtime directly
+│       ├── events.py                the whole 44-event vocabulary: 21 Tier-1 re-exports,
+│       │                            9 Tier-2 subclasses (session.created + resume_token, ...),
+│       │                            14 Tier-3 events (listen/speak, playback, resume, ...);
+│       │                            DuplexEvent = RealtimeEvent
+│       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
+│       │                            2 Tier-2 subclasses (append + hints, commit + final),
+│       │                            7 Tier-3 commands (barge_in, playback.ack, ...)
+│       └── errors.py                our error-code vocabulary (Tier 3) + RealtimeProtocolError
+├── engine/
+│   ├── omni_engine_base.py          OmniEngineBase (stage processes, orchestrator thread, queues, RPC)
+│   ├── async_omni_engine.py         AsyncOmniEngine (turn-based request building)
+│   ├── duplex_omni_engine.py        DuplexOmniEngine (session message surface, creates DuplexOrchestrator)
+│   ├── orchestrator.py              OrchestratorBase + Orchestrator
+│   ├── duplex_orchestrator.py       DuplexOrchestrator (+ DuplexOrchestratorRequestState; implements DuplexStagePort)
+│   └── duplex/
+│       ├── commands.py              mailbox half: DuplexCommand.payload() + the mailbox `type`,
+│       │                            paired with each protocol command; command_from_realtime
+│       ├── realtime_commands.py     duplex binding of the codec: decoded event -> DuplexCommand,
+│       │                            DUPLEX_REALTIME_CAPABILITIES, duplex_response_format
+│       ├── events.py                re-export shim (DuplexEvent = RealtimeEvent) + the runner's
+│       │                            epoch-filter sets DOMAIN_TERMINAL_EVENTS / MODEL_OUTPUT_EVENTS
+│       ├── delivery.py              DuplexOutputBuffer (bounded output shared with the session handle)
+│       ├── realtime_events.py       RealtimeProjectionState: internal event -> typed events
+│       ├── messages.py              queue envelopes (Open/Close/Resume/Touch/Command/Result/Event), DuplexSessionError
+│       ├── config.py                DuplexSessionConfig, DuplexCapabilities, ResponseCreateOptions
+│       ├── contracts.py             DuplexFence (session_id, epoch, turn_id), stage request records, DuplexStagePort
+│       ├── plugin.py                DuplexModelPlugin, DuplexModelSessionState, DuplexDataPlane, PcmAppendBuffer ABCs
+│       ├── turn_detection.py        server-side VAD turn detector used by the session
+│       ├── audio.py                 compatibility re-export, via protocol/duplex
+│       ├── vad.py / intermediate.py
+│       └── session/                 one engine-resident session and everything that runs it
+│           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
+│           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)
+│           ├── manager.py           DuplexSessionManager (admission, backpressure, reaper, dispatch)
+│           ├── context.py           DuplexSessionContext / DuplexRunState: what the runner shares with its components
+│           ├── emitter.py           SessionEmitter: projection, epoch filter, domain effects of a terminal event
+│           ├── model_channel.py     ModelChannel: submit an append, project stage output, continue a turn
+│           ├── memory_runtime.py    SessionMemoryRuntime: execute private model-planned memory requests
+│           ├── control.py           SessionControl: server VAD and the events that reconfigure it
+│           ├── append_task.py       AppendAttempt: one append in flight and the rollback its failure owes
+│           ├── input_clock.py       InputClock: model units and input acknowledgements of input-clocked sessions
+│           ├── helpers.py           pure reads and payload builders over a session
+│           ├── lease.py             DuplexLeaseState (idle TTL, disconnect grace, resume generation)
+│           └── overlap_policy.py / commit_policy.py / playback_ledger.py
+├── config/stage_config.py           PipelineConfig.duplex_plugin; DuplexSessionRuntimeConfig
+├── model_executor/models/minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, ...)
+├── model_executor/models/nemotron_voicechat/duplex/plugin.py   NemotronVoiceChatDuplexPlugin (+ data_plane, input, capabilities)
+├── model_executor/models/personaplex/duplex/plugin.py   PersonaPlexDuplexPlugin (+ stage0, data_plane, input, policy)
+├── model_executor/models/qwen3_omni/duplex/plugin.py   Qwen3OmniDuplexPlugin (+ input, session)
+├── model_executor/models/aura_omni/duplex/plugin.py   AuraDuplexPlugin
+└── clients/
+    ├── duplex.py                    DuplexClientBase (ABC), DuplexClient (websocket), client-side events
+    ├── inline_duplex.py             InlineDuplexClient (in-process, over DuplexOmni)
+    ├── minicpmo_4_5.py              MiniCPM-o 4.5 session preset
+    ├── nemotron_voicechat.py        Nemotron VoiceChat session preset
+    └── personaplex.py               PersonaPlex session preset
+```
+
+## Session identity
+
+- **The server allocates every session id.** `DuplexOmni.open_session`
+  generates `duplex-<uuid4 hex>`; a `session_id` / `id` key inside the
+  Realtime session object is ignored (Realtime clients echo the session object
+  back). The allocated id reaches the client in `session.created` and is the
+  only handle for `session.resume`, `close` and every command.
+- **Ids are never reused** within an engine's lifetime, so the id alone
+  identifies a session. There is no incarnation counter: stage request ids are
+  `duplex-s.<b64 session id>.e.<epoch>.r.<role>`, model-side per-session state
+  is keyed by `session_id` alone, and a command, close, touch or resume for an
+  id the manager no longer holds is answered with `unknown_session`.
+- **Staleness inside a live session is epoch-based.** `DuplexFence
+  (session_id, epoch, turn_id)` is an engine-internal identity: every stage
+  request is bound to the fence it was submitted under, cancels advance the
+  epoch, and tracked tasks re-check the epoch after each `await`.
+- **Resume identity** is `(session_id, resume_token, expected_lease_generation)`:
+  the token belongs to the attachment registry, the lease generation is the
+  engine-side compare-and-swap.
+
+### Authoritative history snapshots
+
+`DuplexEngineSession.history_snapshot()` synchronously captures a
+`DuplexHistorySnapshot` on the session owner's loop, without an `await`.
+Its aligned tuple columns are `messages`, public `item_ids` (possibly `None`),
+internal `source_ids`, and `source_revisions`, together with one
+`history_revision`. Unresolved history placeholders are omitted from every
+column. The record is frozen; nested protocol dictionaries and lists are
+detached, mutable copies for plugin compatibility. Text, bytes and opaque
+media payloads are shared, rather than cloned. Consumers must treat opaque
+payloads as read-only. Session mutation methods own authoritative writes.
+
+Every non-placeholder history insertion must call `_track_history_message`,
+and removal must call `_forget_history_message`, keeping the source map complete
+for snapshot capture and hard-cutoff updates. Hidden placeholders are untracked.
+
+The default prompt path uses `session.history_for_prompt()` to capture aligned
+history and item IDs while preserving Qwen retained-PCM identity. Like
+`session.history` and unlike `snapshot.messages`, it copies only top-level
+message dictionaries; nested
+protocol/media containers and payloads remain shared with authoritative history
+and must be treated as read-only by prompt consumers.
+
+A source ID is allocated monotonically when a message becomes visible and
+is never reused within that session. Replacing a public item's contents
+preserves its source ID. Deleting it retires the source; recreating the same
+public item ID allocates a new source ID. A late item-ID binding preserves
+the source ID and advances its revision. New sources start at revision zero.
+
+Content edits, accepted changes to heard-prefix evidence, and tighter
+permanent audio cutoffs advance the affected source revision and the global
+history revision. A cutoff change can advance revisions even when the text
+stays equal. Appending or deleting a source advances the global revision.
+Equal-value replacements, rejected operations, hidden reservations, and
+internal playback/cache cleanup alone do not. Revisions are monotonic change
+tokens, not operation counts; one operation can perform multiple writes.
+
+Epoch changes fence in-flight work independently of source validity.
+Re-leasing the same live session on resume preserves IDs and revisions;
+dropping the session drops this state. Snapshots do not imply persistence
+across process restarts. Existing prompt construction remains unchanged;
+stage views and Qwen L2 memory consume these snapshots without changing Session
+history ownership.
+
+### Derived context and per-stage views
+
+`DuplexEngineSession.context_ledger` holds derived nodes. A node records the
+`(source_id, revision)` pairs it was built from and the IDs of its parent
+nodes; parents always have smaller IDs. Nodes never write to history or
+advance a revision, and node IDs are never reused.
+
+A node is valid only while every recorded source has the recorded revision in
+the current snapshot and every parent is valid. `refresh(snapshot)` walks the
+nodes in ID order and prunes the invalid ones, so a content edit, a transcript
+update, a deleted source, an accepted heard prefix or a tighter hard cutoff
+removes the affected nodes and all of their descendants. An epoch change alone
+removes nothing. `add_node` admits a node only if its sources and parents are
+valid against the snapshot it is given, so a result computed from older
+sources is rejected when checked against a current snapshot. Admission with
+a historical snapshot does not displace a newer L1 source lookup; duplicate
+L1 nodes for the same source revision are rejected through either admission
+API. Callers refresh against a current authoritative snapshot before reading
+valid nodes.
+
+`get(node_id)` reads a node after refresh. `remove(*node_ids)` explicitly retires
+nodes and their descendants, preserving unrelated nodes and L1 lookup indexes.
+`replace_summary(snapshot, sources=..., replaces=..., message=...)` validates new
+source references and all replaced summaries against the supplied snapshot. It
+copies the complete transitive source dependencies into the new `SUMMARY`, then
+removes the old summaries and their descendants. The new node has no parent edges,
+so retiring old summaries does not invalidate their replacement. Invalid sources,
+missing replacements, non-summary replacements or message-copy failures leave the
+ledger unchanged. This API does not refresh implicitly: the caller supplies the
+current authoritative snapshot for result acceptance.
+
+Admission detaches message dictionaries, lists and tuples from the caller while
+sharing opaque payloads. Batch admission prepares every message before writing
+nodes, so a preparation failure leaves the graph and next node ID unchanged.
+The ledger owns admitted message containers; node readers must treat them and
+opaque payloads as read-only. Rendered views are detached from ledger messages.
+
+A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
+`context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
+the prompt config is built exactly as before and no L1 view is rendered. With a
+policy, `conversation` stays the authoritative history and the stage also
+receives `conversation_view`, a list aligned one-to-one with `conversation`:
+
+- User messages before the `keep_media_user_turns` most recent user runs
+  (consecutive user messages) drop their `audio_url` and `image_url` parts and
+  keep their text. The transcript is added as a text part when no text part
+  already carries it.
+- A user run is never emptied. If every message in a run would be empty, the
+  whole run is passed through unchanged.
+- Assistant, system and tool messages are never rewritten. Assistant text
+  already reflects the accepted heard prefix.
+
+This is a candidate context view, not a complete prompt: with a zero-keep
+policy, unanswered input is eligible too. Plugins must preserve current
+request media from `conversation`, and keep binding audio and validating
+sources against it. ModelChannel reuses the snapshot captured for item IDs
+when rendering the view, so both come from the same capture. Policy config
+is deployment-owned; plugin request runtime state is a separate input.
+
+Qwen3-Omni opts in its Thinker stage when
+`duplex_session.context_keep_media_turns` is set (default `null`). Its default
+`recent` policy formats older user items from the view, including mixed
+text/media items. The experimental Qwen history policies instead select original
+turns and ledger summaries using their own context and media budgets; the L1
+candidate view does not override that selection.
+Dropped images are never decoded, and a text-only view replaces old audio
+even while its payload remains in the retained audio slots. A turn whose
+audio left those slots keeps its available transcript instead of being
+dropped. The current unanswered user input remains verbatim, including during
+tool continuations, after intervening system instructions, and for audio and
+image items when the knob is `0`.
+The 16-message window, the
+audio-slot limits and the no-empty-run fallback are unchanged.
+
+## Session lifecycle
+
+```text
+open   DuplexOmni.open_session(config)
+         -> engine.open_session_async(session_id, DuplexSessionConfig)      [RPC]
+         -> DuplexSessionManager.open: admission (max_sessions, closing sessions keep their slot),
+            plugin.validate_client_extra_body / prepare_runtime_config, DuplexEngineSession,
+            Stage0 request id reserved (ensure_stage_request), DuplexSessionRunner.start()
+         -> first event: SessionCreated (announces the allocated id)
+command  handle.submit(DuplexCommand)
+         -> engine.submit_command_async -> DuplexSessionCommandMessage on the request queue [one-way]
+         -> DuplexSessionManager.dispatch: unknown_session / input_backpressure checks, then runner mailbox
+output   DuplexOrchestrator._intercept_stage_output -> runner.on_stage_output -> mailbox -> typed events
+         -> session's bounded output buffer -> handle.events(); closure and errors without a live session
+            use output_sink (DuplexSessionEventMessage) -> DuplexOmni._route_engine_message
+detach   DuplexOmni.detach_session(expected_lease_generation) -> touch(DETACH): engine-owned disconnect
+         grace, refused for a lease newer than the one the caller held; expiry -> SessionExpired
+resume   DuplexOmni.resume_session(expected_lease_generation) -> lease CAS keyed by the control id (a replay
+         answers with the generation it produced); the existing handle is re-entered. A caller cancelled
+         mid-RPC observes the outcome afterwards (replaying until the engine answers) and settles a landed
+         resume: the generation goes to the resume waiting to activate, else to the connection still
+         attached, else the lease is detached again
+close    DuplexOmni.close_session -> close RPC; the manager tears the runner down, then the stage cleanup
+         (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result.
+         SessionClosed is emitted after the cleanup attempt (in a finally), so it is also sent when the
+         stage cleanup failed; in that case the admission slot is intentionally retained and the cleanup
+         is retried by the reaper, and opening a replacement session can still be refused with
+         resource_exhausted. Seeing the event therefore does not by itself guarantee a free slot.
+reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, cleanup retries
+```
+
+### Concurrency and ordering model of the runner
+
+The runner's session state is owned by the orchestrator asyncio loop and
+needs no lock. The output buffer shared with the caller thread uses a lock
+for queue updates and the final validity check before delivery.
+
+- **Single writer per session.** `DuplexEngineSession` is mutated only by its
+  runner. Inputs reach the runner through one mailbox in this order: client
+  commands (from `_request_handler`, in request-queue order), stage outputs
+  (`on_stage_output` enqueues an internal item; it does not mutate the session
+  inline), timers (silence continuation, bounded auto-response, the input
+  clock's timeout check) and internal items (deferred overlap promotion,
+  VAD-synthesized commits; in an input-clocked session also the
+  `StageProgress` record queued behind each stage output, the marker of an
+  input refused at admission, and the settling of an append task). The
+  mailbox worker processes items one at a time.
+- **Slow work is not awaited inline.** An `AppendAudio` handler reserves
+  bytes, then schedules a tracked append task on the per-session append tail:
+  the task awaits `_offload(decode/resample/VAD)` on a dedicated
+  `ThreadPoolExecutor` owned by the manager, then `plugin.plan_append`, then
+  `stage_port.submit`. The worker returns to the mailbox immediately, so a
+  later `CancelResponse` is not blocked behind an in-flight append.
+- **Re-validation after every `await`.** A tracked task captures `(epoch,
+  turn_id)` when it starts and re-checks them before the stage submit and
+  before committing ledgers; a task that finds the epoch advanced rolls back
+  its PCM reservation and exits.
+- **Buffered commit prefixes.** A model buffer may reserve non-terminal units
+  before its terminal commit payload. The runner submits these in wire order
+  with `force_listen=True` and waits for append acceptance before acknowledging
+  the commit. A commit that must wait for an active response holds those
+  prefixes and submits them, still in wire order, when that response ends,
+  before the retained terminal payload. Reservations keep their normal rollback
+  ownership. MiniCPM uses this path to preserve separate buffered VISION units
+  and a following speech tail in manual commit/response sessions. Native
+  resumable responses also defer video-only commits. If response creation is
+  disabled on the commit, a later explicit `response.create` must drain the
+  held prefixes before submitting the terminal payload.
+- **Coalesced camera commits.** Single-terminal models such as JoyAI combine
+  frames from retained camera commits in capture order. The newest commit
+  owns the response while earlier committed frames remain available to model
+  memory. Retained frames continue to consume the pending-input byte budget
+  until submission or cleanup. Before commit, the model's frame buffer applies
+  its sampling policy, such as retaining only the latest camera frame.
+- **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
+  the epoch, cancel tracked append tasks, abort the owned stage bindings
+  through the stage port and emit the cancelled terminal events before
+  yielding. An append task already past its last check is harmless: its stage
+  request is bound to the old epoch's request id, which the abort covers, and
+  the base never emits session-owned outputs to a client.
+- **Tool calls settle once, and the epoch settles them.** A function call the
+  runtime exposes to the client (`response.function_call_arguments.done`) is
+  recorded in a session-owned ledger before it is emitted, and its
+  `function_call_output` is admitted only against that record:
+  `pending -> accepted | timed_out | cancelled`, one transition, no rebinding
+  of a call id, and terminal records kept as tombstones until the session
+  closes. A client can also settle one call with `function_call.cancel`. Conversation history is not admission authority -- it is history-wide
+  and epoch-blind, so a result arriving after a barge-in could otherwise be
+  admitted against a call the session had already moved past. The epoch
+  consequences hang off the single epoch-advance path: pending calls from older
+  epochs are cancelled (or, with `function_call_interrupt_policy: keep`, move to the new
+  epoch and stay answerable), and a result the model accepted but never consumed is
+  retired from the runtime so the new epoch cannot speak it. A retired or
+  already-consumed generation stays *named* in the worker-facing runtime config
+  (model-owned state is per resumable stage request, and a cancel moves the
+  session to a different one), so the next request starts above what the
+  previous one took instead of re-speaking it or rejecting the next result as
+  missing; a generation that only *looks* missing is still refused by the
+  worker. Eligibility is the
+  origin epoch plus the settlement, never the current turn: a model turn
+  completing while the client answers does not invalidate the result, and the
+  continuation it triggers targets the turn that is current at admission.
+  An optional deadline (`extra_body.tool_result_timeout_s`, off by default)
+  times a pending call out; its timer callback only enqueues the call identity
+  onto the session's mailbox, so the deadline decision is serialized with every
+  other command instead of running inside an `asyncio` timer callback.
+- **Ordered event stream.** Because the epoch bump and every emission happen
+  on one loop in program order, nothing can be emitted for an old epoch after
+  its terminal event; `runner.emit()` still drops a terminal carrying a stale
+  epoch and stamps `epoch` on every event for clients that filter
+  defensively. In this experimental follow-up, public output goes directly to
+  one bounded buffer shared by the engine and `DuplexSessionHandle`. Accepted
+  cancellation removes queued `AudioDelta` events for that response through
+  the cancelled epoch. Text increments, audio/transcript completion markers,
+  other responses and normal completion retain FIFO order. The consumer also
+  checks an event already taken from the buffer: WebSocket delivery repeats
+  that check under the connection lock, before sequencing and journaling.
+  Already sequenced replay entries are unchanged; already delivered audio
+  still requires the client to stop its own playback.
+- **Backpressure before the mailbox.** `DuplexSessionManager.dispatch`
+  checks `max_pending_input_bytes_per_session` and reserves a pending turn for
+  `Commit` before the put; a rejected command is answered with
+  `ErrorEvent(code="input_backpressure")`.
+- **Per-response stage metrics.** `_route_output` computes the per-segment
+  `StageMetrics` before calling `_intercept_stage_output`; the runner
+  accumulates the snapshot into the active response, so
+  `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
+  wire keep their meaning.
+- **Session stats (busy RTF, RFC #8325).** Opt-in with
+  `duplex_session.collect_stats`. `ModelChannel` stamps each Stage-0 append's
+  envelope with `duplex.perf_chunk = [epoch, seq]` (a seq retried after a failed
+  submit gets a fresh id, so the aborted submit's late spans are ignored); the orchestrator copies the
+  producing step's chunk into forwarded updates and the chunk transfer adapter
+  into connector payloads. Stage schedulers (`DuplexStageWorkRecorder`) time
+  every step of a request that carries a chunk and return the spans on
+  `OmniEngineCoreOutput.stage_work`, which the orchestrator hands to the
+  session as it collects them. `DuplexEngineSession.perf`
+  (`SessionPerfLedger`) groups chunks by turn with their acceptance times and
+  spans (a chunk is done at its last span end), and records each turn's emitted audio through the
+  response it belongs to; turns close on model-turn completion, barge-in or
+  close. The runner answers `session.stats.get` from the ledger on
+  the ordered mailbox; clients derive busy RTF and stall ratio
+  (`vllm_omni.benchmarks.duplex_session_metrics`). A turn is reported final
+  only after the model turn completed, its responses ended and every chunk was
+  handled; cancelled turns never become final, and later spans are counted in
+  `late_spans`. With the flag off nothing is stamped or attached, and stage
+  schedulers check only newly scheduled requests. Single-host only: the API and
+  stage processes must share one `CLOCK_MONOTONIC`.
+
+Model plugins may opt into one bounded auxiliary request per Session. The
+Session-owned `SessionMemoryRuntime` gives it a separate resource identity,
+submits and terminates it at the selected stage, and intercepts its output and
+errors before response policy, speech routing, playback history or response
+metrics. The plugin receives immutable
+committed history and owns prompt/result formatting and source validation. Sources
+can cover text, images or model-owned derived state. The helper checks the epoch,
+session configuration revision, operation identity and plugin source validity before
+mailbox writeback. Appending newer history can preserve a stable prefix; editing
+or deleting its evidence invalidates it. Cancellation and close abort owned
+requests. A failed cleanup retains its resource for teardown retry and prevents
+new auxiliary work from accumulating behind it. Each auxiliary cleanup attempt
+uses the shorter of five seconds and the model request timeout, keeping long
+generation deadlines separate from this cancellation-safe cleanup wait.
+The configuration revision tracks adopted Session settings; model-owned chunk
+and tool progress retain their existing stage generation and preserve pending
+memory work while its source remains valid.
+The plugin supplies a stable work key and whether work can enter the existing
+stage queue during an ordinary observation. Explicit user interaction takes
+priority through cancellation after its append plan passes validation, and
+suppresses restart until its turn completes. Rejected input leaves an in-flight
+summary running so it can release memory capacity for the next input.
+Requests may specify short retry delays and a cooldown for subsequent attempts;
+failures remain keyed to the same source as newer observations arrive. Background
+failures are logged on the server. Successful application allows the next
+bounded chunk to catch up without waiting for new input.
+Plugins with `uses_history_context=True` also receive
+`bind_history_context(state=..., snapshot=..., ledger=...)` before foreground
+preparation, auxiliary planning and auxiliary source validation. The owner first
+refreshes the Session ledger; validation and result application run consecutively
+on the owner loop without yielding. The hook supplies source authority while
+leaving existing model-specific auxiliary request and compression interfaces
+unchanged. Plugins that do not opt in retain their existing path.
+
+The committed-history revision lets auxiliary events reuse an unchanged snapshot.
+The ledger is still refreshed before use, and Qwen compares public source IDs and
+revisions before submission and writeback. These checks can grow with retained
+history and summary dependencies; they do not provide constant CPU or memory cost.
+The runner delegates auxiliary lifecycle and retry state to this helper through
+`DuplexSessionContext`, tracks its tasks, and dispatches completion events through
+the existing mailbox. Model plugins retain the existing policy hooks and own
+content policy, memory tiers, prompts and budgets. Recoverable input-capacity
+rejection releases the unsubmitted request and its reservations while keeping
+the Session open.
+
+### Semantic turn decisions
+
+`SessionControl` owns a detector per session and offloads its ordered audio
+processing to the manager's executor. `SemanticTurnDetector` loads the shared
+Smart Turn backend on the first audio chunk; the backend constructor warms the
+CPU ONNX session. Silero's candidate pauses trigger subsequent scoring. Each
+detector retains the current pause's semantic decision until speech resumes or
+the turn resets. At commit, session-correlated logs distinguish a complete
+semantic decision from the silence timeout, including whether the preceding
+score was incomplete or inference failed. These diagnostics do not change the
+wire protocol or the endpoint decision.
+
+Only unfinished response-bound append tasks keep the response gate closed.
+A completed task awaiting its cleanup callback does not block a new turn after
+barge-in. Active responses and unplayed output retain their own gates.
+
+### Experimental output limits
+
+`max_pending_output_bytes_per_session` defaults to 2 MiB and
+`max_pending_output_events_per_session` to 512. The byte limit counts compact
+Realtime JSON, including base64 audio, not decoded PCM or Python object
+overhead. Audio is already base64-encoded by the producer; counting its length
+avoids serializing or decoding that large field again. Neither default has
+been tuned from a performance study.
+
+Errors and response endings have an additional 64 KiB / eight-event reserve
+and retain FIFO order. One final session-closure notification has an independent
+slot, so an exhausted reserve cannot prevent closure or break delivery to
+other sessions. If that reserve also fills, an error or response-ending
+notification may be omitted; the final session-closure notification still
+has its independent slot. Oversized close details (over 4 KiB with generated identity)
+are replaced by a compact reason, preserving terminal type and identity.
+Late writes after closure are ignored; a locally ended iterator is not reopened
+by a late terminal, and a failed open closes the abandoned handle. Events other
+than errors are not forwarded once their session's buffer has been removed.
+One event held by the consumer is outside the queued budget.
+
+The overflow policy fails the active response without committing its partial
+text to history and closes only the affected session. If overflow occurs while
+a completion batch is being delivered, its not-yet-queued `ResponseDone` is
+converted to failure with its identity and output preserved; any history entry
+for that response is removed. An ending already accepted by the buffer is not
+replaced or followed by a second ending. After overflow, newly
+emitted ordinary events are suppressed, including text/audio completion,
+content-part and output-item completion markers. Previously queued non-audio
+events retain FIFO order; error and failed response-ending notifications may
+use the reserve before the independent closure notification. This differs from
+accepted cancellation, which removes only matching audio. See the
+[public error and closure fields](../serving/realtime_duplex_api.md#output-limits-and-slow-consumers).
+Response-only recovery is not implemented. These limits do not bound the runner's raw stage
+output mailbox, replay journal, or client playback queues. The shared buffer
+requires the current same-process, separate-thread engine arrangement; it is
+not a cross-process delivery protocol. Direct handle iteration and WebSocket
+delivery share buffer validity, but end-to-end client behavior still needs
+independent real-model verification.
+
+## Session-aware replica placement
+
+The opt-in `duplex_session.replica_policy: least_sessions` policy places each
+session on a replica group mapping every stage to a replica, including replicas
+attached from headless runtimes on other hosts. The orchestrator owns a separate
+session reservation ledger; StagePool's request
+bindings continue to describe submitted requests only. Admission reserves a
+group synchronously after taking the global admission slot. The group must
+have space under `max_sessions_per_replica` on every member replica. Replicas
+shared by groups share their capacity counter. Eligible groups are ordered by
+maximum reserved-to-capacity ratio, total reserved count, and round-robin
+tie-breaking.
+
+The reservation covers opening, active and closing sessions. Failed opens
+roll it back; ordinary request completion, response cancellation and epoch
+changes do not release it. Session cleanup releases it only after the closing
+session is finalized. Every Stage0 submission, downstream forward, prewarm and
+derived request uses the session's pinned stage replica. Routing is fixed
+before multimodal preprocessing and connector sender information are built.
+A conflicting or unavailable pin fails instead of falling back to another
+replica.
+
+Replica failure marks the replica unavailable and closes every session in its
+reverse index, including idle sessions without an in-flight request. Other
+groups retain their reservations and can continue serving. This policy does
+not migrate model state. Distributed pins use StagePool's explicit-routing
+bindings and hub availability checks; detach notifications also close idle
+sessions. Session reservations remain separate from request bindings.
+Worker-local state capacity uses the per-replica cap, while `max_sessions`
+remains the global service cap. The default `legacy` policy preserves the
+existing routing, admission and worker capacity behavior. See the
+[configuration reference](../configuration/stage_configs.md#duplex-replica-placement)
+for group validation and model capability requirements.
+
+With metrics enabled, `vllm_omni:duplex_reserved_sessions` reports reservations
+by model, stage and replica, and `vllm_omni:duplex_admission_rejected_total`
+counts global and replica capacity rejections. These collectors are created
+on first use by this policy and carry no session ID labels.
+
+### Multiple runtimes and hosts
+
+A runtime is one `vllm serve --omni` invocation. In a stage-based deployment,
+each stage-hosting runtime launches local replicas of one stage. One runtime is the head:
+it omits `--headless`, serves the API, and owns the master and session
+orchestration. Any stage runtime can take this role. The remaining runtimes
+use `--headless` and connect to the same `--omni-master-address` and
+`--omni-master-port`. A stage can span several runtimes, including runtimes on
+different hosts.
+
+For example, the declared stage totals `[1, 3, 1]` can be placed as follows:
+
+| Host | Stage | Local replicas | Role | Runtime arguments |
+| --- | --- | --- | --- | --- |
+| host0 | 0 | 1 | headless | `--stage-id 0 --omni-dp-size-local 1 --headless` |
+| host0 | 1 | 1 | head | `--stage-id 1 --omni-dp-size-local 1` |
+| host1 | 1 | 2 | headless | `--stage-id 1 --omni-dp-size-local 2 --headless` |
+| host0 | 2 | 1 | headless | `--stage-id 2 --omni-dp-size-local 1 --headless` |
+
+The head's `stages[].num_replicas` declares the cluster total for each stage;
+`--omni-dp-size-local` specifies the runtime's local share. For its own stage,
+the head resolves the total to `max(configured_total, local_count)`, preserving
+the existing CLI override when the configured count is smaller. The first
+`local_count` slots launch locally; the remaining slots attach remotely.
+Other stages attach remotely in their entirety. The existing unfiltered
+`single_stage_mode=True` path keeps all configured replicas local.
+The existing frontend-only head keeps all stage replicas remote.
+
+Device pools are split against the runtime's local replica count. For example,
+total `3`, local `2`, TP `1`, and `devices: "0,1"` assign GPUs 0/1 to the two
+local replicas; the third registration slot has no local device assignment.
+
+`DuplexReplicaPlacement` owns the startup group map and session reservations.
+Omitting `replica_groups` generates the Cartesian product of the stage replica
+slots, equivalent to a SQL `CROSS JOIN`, for both equal and unequal stage counts.
+The example above automatically gets three groups `{0: 0, 1: i, 2: 0}` for
+`i = 0, 1, 2`; `[2, 2]` gets all four pairs. The last stage's replica index
+changes fastest when assigning group IDs.
+Implicit paths are selected lazily from the least occupied replicas at each
+stage, preserving the same group IDs and round-robin tie-breaking without
+enumerating the product. Diagnostics record stage counts and the total group
+count instead of expanding every implicit path. Explicit groups restrict the paths
+instead of adding to the generated product. Each session reserves one path;
+replicas shared across paths retain one capacity counter. Stage 0 and stage 2
+each need a per-replica session cap of at
+least three to admit three sessions concurrently. Registration-assigned replica
+IDs identify replica slots, not durable host identities; explicit groups do
+not establish host affinity.
+
+StagePool owns dispatch and request bindings. A duplex pin reuses
+`bind_requested_replica`, including attachment and hub-UP validation, and uses
+the existing distributed address-affinity ledger. Internal routing errors are
+translated to stage failures. There is no second distributed pin ledger and no
+fallback to another replica after a required pin becomes unavailable.
+`MembershipController` invalidates the removed address and notifies the
+orchestrator. Duplex retirement marks the replica unavailable and closes every
+session reserved on it, including sessions with no active request. Generic
+request cleanup remains responsible for request bindings.
+
+Group topology is fixed for the head's lifetime. Later attachments do not add
+groups or recover closed sessions. This design adds neither elastic placement
+nor session migration or automatic restoration of an unavailable group.
+The distributed stage topology uses a single API frontend; the existing
+`--api-server-count > 1` launcher rejects distributed stage arguments. The
+local multi-frontend mode below is a separate deployment mode.
+
+The master address must be reachable from every runtime. Each cross-host
+pipeline edge also needs a connector with a suitable remote data plane;
+`SharedMemoryConnector` requires its sender and receiver to share a host.
+See [Disaggregated Inference](feature/disaggregated_inference.md) for transport
+configuration. Control-plane registration alone does not validate a connector's
+cross-host data path.
+
+For MiniCPM-o 4.5 on CUDA, keep the deploy profile's native MRv2 runner on all
+three stages when selecting `NixlConnector` for remote payload transfer.
+
+### Multiple frontends
+
+`--api-server-count K` reuses the existing local multi-API launcher. The parent
+launches all stage cores, each core exposes one IPC endpoint pair per frontend,
+and every frontend attaches to every replica. Each frontend has its own
+`DuplexOrchestrator`, `DuplexSessionManager` and Python interpreter. Request
+`client_index` routes engine output back to the submitting frontend; there is
+no central per-frame session dispatcher.
+
+Placement, rather than engine attachment, enforces exclusive ownership. Group
+`g` belongs to frontend `g % K`, and only that frontend may reserve its replicas
+or submit its session requests. Groups sharing a physical stage replica must
+have the same owner, and `K` must not exceed the group count. This validation
+also applies to automatically joined groups. Multi-stage joins usually share
+replicas across frontend owners, so those deployments must supply explicit
+groups with disjoint ownership, such as `[{0: 0, 1: 0}, {0: 1, 1: 1}]` for
+two stages with two replicas and two frontends. The global session
+budget is divided by floor/remainder across frontends and bounded by each
+frontend's owned replica capacity; budgets do not move between frontends.
+The reservation lifetime, strict stage pins and worker caps apply within each
+owner's groups. With `K=1`, routing and admission behavior are unchanged.
+
+The multi-frontend WebSocket guard allows only `least_sessions` and plugins
+without session resume. Credentials, attachment state and replay journals
+remain process-local. The shared public address does not provide resume
+affinity; supporting resume-capable models would require a separate design.
+INET listeners use the existing per-process `SO_REUSEPORT` path where available
+(with a shared-socket fallback). Kernel connection distribution is not capacity
+aware, so a locally full frontend can return `resource_exhausted` with
+`retryable: true` even when another has room. Clients reconnect with backoff;
+an established session never moves to another frontend.
+
+When enabled, warmup runs against the local engine and owned groups rather than
+connecting through the public listener. PersonaPlex keeps its opt-in behavior:
+`duplex_session.warmup_frames` must be positive. Each frontend keeps its own
+warmup completion gate; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
+before being admitted, as in single-frontend mode; there is no all-frontend
+warmup barrier. `/health`
+retains the engine health check, and a 200 response does not guarantee admission
+capacity on the frontend accepting a connection. Only the owner publishes its
+replicas' reservation gauges, using Prometheus `livesum` aggregation;
+admission rejection counters aggregate across
+frontends without changing their label schema.
+
+This mode keeps the current supervisor's whole-service fail-fast behavior on
+an engine failure or a frontend's abnormal exit. It does not add frontend
+restart, session migration or failure isolation. All-frontend engine attachment
+and SHM notification fan-out are unchanged; narrowing SHM wakeups is a separate
+optimization. See the [configuration reference](../configuration/stage_configs.md#multiple-duplex-frontends)
+and [serving guide](../serving/realtime_duplex_api.md#multiple-frontends).
+
+## Orchestrator seams
+
+`OrchestratorBase` keeps the generic machinery (request handler skeleton,
+abort, collective RPC, output loops, stage error and dead-replica handling,
+`_route_output`, stage forwarding, prewarm, cleanup, shutdown) and offers
+these seams. `DuplexOrchestrator` extends `Orchestrator` rather than sitting
+beside it: a seam it does not override falls through to the turn-based
+implementation, and `_dispatch_message` hands anything that is not a session
+message to `super()`:
+
+| Seam | `Orchestrator` | `DuplexOrchestrator` |
+| --- | --- | --- |
+| `_dispatch_message(msg) -> bool` | `add_request`, `streaming_update`, `add_companion_request`, `interaction` | open/command/close/resume/touch messages -> `DuplexSessionManager` |
+| `_background_tasks()` | — | `[manager.reaper_loop()]` |
+| `_shutdown_extensions()` | — | `await manager.shutdown()` |
+| `_on_stage_submitted(stage_id, request_id, replica_id, req_state)` | — | bind the forwarded stage request to the owning session |
+| `_intercept_stage_output(...) -> bool` | — | hand every session-owned output (Stage0 decision, Stage1 audio) plus its metric snapshot to `runner.on_stage_output`; `True` = do not forward |
+| `_handle_forward_failure(...) -> bool` | — | fail the owning session's response and close the session, keep the loop alive |
+| `_on_replica_removed(stage_id, replica_id)` | — | retire the detached replica and close its reserved sessions, including idle sessions |
+| `_cleanup_request_ids(ids, abort=, release_owners=)` | ignores `release_owners` | brackets `super()` with `close_sessions_for_request_ids` / `defer_request_cleanups` / `finalize_closed_sessions` |
+| `OrchestratorRequestState.session_owned` | never set | set by `ensure_request`: no synthetic terminal, no client emission, no terminal re-forward, no auto-cleanup on finish |
+
+`DuplexOrchestrator` also implements the `DuplexStagePort` ABC the manager and
+runner use (`stage_count`, `sampling_defaults`, `ensure_request`, `submit`,
+`cleanup`, `abort_requests`): the resumable Stage0 request is preregistered at
+open with `DuplexOrchestratorRequestState(session_owned=True, session_id,
+fence)`, submitted with `submit_initial` on the first unit and
+`submit_update` afterwards, and the request's `streaming.bridge_states["duplex"]`
+carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
+`model_turn_id`), the public session config and the server-owned runtime
+config for the worker-side model hooks.
+
+## Model plugin
+
+`DuplexModelPlugin` (ABC, `engine/duplex/plugin.py`) is the one class a model
+provides, selected by `PipelineConfig.duplex_plugin`; "is a duplex model" is
+`duplex_plugin is not None`. It merges the engine policy and the session
+policy that used to be two separately configured objects:
+
+| Half | Members |
 | --- | --- |
-| `engine.messages` | ordinary engine queue messages and collective RPC envelopes |
-| `engine.rpc_result_router` | generic correlation routing through each result message's `rpc_correlation_key` |
-| `engine.duplex.contracts` | immutable duplex DTOs, extension/stage protocols, typed decisions, request-ID codec |
-| `engine.duplex.lease` | duplex lease activity, TTL/grace configuration, and expiry records |
-| `engine.duplex.messages` | identity fence and duplex control message/result envelopes |
-| `engine.duplex.runtime` | extension loading, validation, and compatibility exports |
-| `engine.duplex.session` | session resources, fences, append reservations, idempotency cache, binding cleanup |
-| `engine.duplex.control_plane` | control algorithms and the narrow `DuplexStagePort` used to submit and clean up stage requests |
-| `engine.duplex.control_client` | typed control-message construction and calls through the engine-owned correlated RPC transport |
-| `entrypoints.duplex_request_client` | deterministic request identity, client-state preregistration, acknowledgement validation, data-plane collection, rollback |
-
-`Orchestrator`, `AsyncOmniEngine`, and `AsyncOmni` retain explicit wiring and
-compatibility proxies. They no longer own the corresponding duplex algorithms.
-The ControlClient does not own waiters or consume the result queue;
-`RpcResultRouter` remains the single correlation owner for both duplex and
-collective RPC. The ControlPlane receives a narrow stage port rather than the
-Orchestrator object.
-
-Control-plane enablement is independent from extension presence.
-`PipelineConfig.duplex_control_enabled` determines whether an Orchestrator
-constructs a ControlPlane. This preserves extension-free
-`TURN_COMMIT_ONLY` deployments while allowing ordinary deployments to use a
-single `None` fast-path check. The MiniCPM pipeline explicitly enables control
-and separately selects its runtime extension.
-
-### Transactional open and append
-
-Opening a native session registers its engine state and reserves the Stage0
-request resource as one externally atomic operation. If capability, sampling,
-extension, or request-state initialization fails, the ControlPlane removes the
-session, reserved request resources, and any preregistered request state before
-returning the error. Cleanup distinguishes a reserved resource from a submitted
-request, so it does not decrement the running counter for unrelated work.
-Closing a session that never appended also removes the preregistered resource.
-
-Expiry and request-triggered cleanup use a two-step close. The runtime manager
-first marks the session closing but retains it in the admission set. Only a
-successful stage cleanup finalizes and removes the session. A blocked or failed
-cleanup therefore continues to consume its server-owned slot and is retried;
-replacement admission cannot overlap request or KV resources that are still
-owned by the closing session.
-
-Append uses prepare/submit/commit ordering. `prepare_append()` computes the
-next sequence values without mutating the session. Prompt planning and stage
-submission use that reservation, and only a successful submit commits
-`input_seq`, `input_turn_seq`, and the accepted fence. Serving uses a matching
-PCM reservation and consumes bytes only after the append acknowledgement;
-failure or a closed predecessor rolls the bytes back. An `operation_id` caches
-completed append results so a retry cannot submit the same physical append
-twice.
-
-### Ordered append and configuration effects
-
-Native append effects form a per-session tail. Each append awaits its
-predecessor before entering the engine, and `session.update` awaits that same
-tail before changing either the serving aggregate or engine configuration.
-Consequently, an append received before an update uses the old immutable
-sampling snapshot, while the first accepted append after the update uses
-the new generation.
-
-The engine increments `config_generation` when it accepts the replacement
-configuration. At the next append boundary, the control plane rebuilds sampling
-parameters from stage defaults through the model extension. It never mutates
-the snapshot of a segment already in progress.
-
-### Irreversible cancellation fence
-
-Every cancel control carries the cancelled fence and the next session fence.
-The `AsyncOmni` facade preserves both values across the serving,
-entrypoint, engine-message, and orchestrator boundaries. The orchestrator then
-atomically:
-
-1. advances the runtime state to the next fence;
-2. releases and aborts bindings owned by the cancelled fence;
-3. permanently rejects an append that arrives later with the old fence.
-
-Missing `next_fence` is rejected without releasing bindings; the engine never
-advances independently from serving. A late cancel cannot move a session
-backward when the runtime is already on a newer fence. Idle playback clear does
-not send an engine cancel because no runtime resource is being cancelled.
-
-`model_native_duplex` also validates its engine-client contract before opening
-the session. The open, append, signal, and close methods must exist and declare
-the required `fence` arguments; signal must additionally accept `next_fence`.
-An older or custom client that cannot preserve this boundary fails with
-`runtime_contract_invalid` instead of silently running an unfenced native
-session. The generic serving-session adapter retains its compatibility behavior.
-
-`DuplexFence` also carries a server-side session incarnation. Reusing a public
-session ID after close increments that incarnation, and resource request IDs
-include it after the first incarnation. A synchronous append from a closed
-session therefore cannot be accepted by a newly opened session with the same
-public ID. Stale close validates the full fence before removing the runtime
-registry entry or releasing bindings.
-
-## Implemented Serving Ownership
-
-### Session-owned response and overlap state
-
-The Actor no longer stores:
-
-- a Session reference;
-- lifecycle mirror state;
-- active or last response ID;
-- overlap duration;
-- response-in-progress or playback business predicates;
-- runtime open/close acknowledgements.
-
-`DuplexSession.begin_response()` owns both active and last response identity.
-The Session owns overlap accumulation/reset and playback state.
-
-One `native_response_in_progress()` predicate now covers:
-
-- active response ID;
-- active engine request ID;
-- uncommitted ACK-only playback;
-- active generic response task;
-- response-bound append tasks;
-- MiniCPM data-plane task;
-- assistant-generating turn state.
-
-The write-only `MiniCPMO45ServingSessionState.response_emitted` field and a dead
-data-plane task mirror were removed.
-
-### Response-scoped options
-
-`response.create` is represented by an immutable `ResponseCreateOptions` value.
-The Session reserves it for one response, applies it to a response-local copy
-when that response begins, and restores the base session configuration on
-completion, listen, cancellation, or failure. Instructions, voice, modalities,
-temperature, token limit, format, tools, and conversation metadata therefore do
-not mutate the permanent session configuration or leak into a later response.
-
-### Explicit event effects and pure writer
-
-Business paths call `emit_event()`. It serializes domain effects and outbound
-queue insertion with one session-local lock. Deferred append starts outside the
-lock so recursive event emission cannot deadlock.
-
-The writer only:
-
-1. dequeues an event;
-2. applies late stale filtering to streaming model output;
-3. projects the event to the selected wire protocol;
-4. sends JSON.
-
-The writer does not promote overlap, clear input, advance Session state, call
-the engine, or commit history.
-
-### Single terminal acceptance point
-
-Terminal events are accepted or rejected before domain effects run:
-
-```text
-response.done
-response.listen
-audio.cancelled
-input.cancelled
-session.closed
-```
-
-For a terminal carrying an epoch, that epoch must match the current Session.
-Stale cancellation therefore cannot reset overlap belonging to a later turn.
-Once a terminal is accepted and its effect is applied, the writer cannot revoke
-it because close or epoch state changed while it waited in the output queue.
-
-Streaming audio/text deltas still receive late stale filtering at send time,
-which prevents queued old audio from leaking after a cancel or epoch bump.
-
-## Runtime Type Boundary
-
-The stable kernel is deliberately limited to generic engine and scheduler
-mechanisms:
-
-```text
-vllm_omni.engine.messages                  # ordinary queue and collective RPC envelopes
-vllm_omni.engine.rpc_result_router         # generic correlation routing
-vllm_omni.engine.async_engine_utils        # ordinary engine lifecycle helpers
-```
-
-The full-duplex implementation lives in dedicated duplex modules:
-
-```text
-vllm_omni.engine.duplex.runtime
-                                           # extension loading and validation
-vllm_omni.engine.duplex.contracts
-                                           # immutable DTOs and narrow protocols
-vllm_omni.engine.duplex.lease
-                                           # duplex lease primitives
-vllm_omni.engine.duplex.messages
-                                           # duplex identity and queue envelopes
-vllm_omni.engine.duplex.session
-                                           # session transaction implementation
-vllm_omni.engine.duplex.control_plane
-                                           # engine-side control algorithms
-vllm_omni.engine.duplex.control_client
-                                           # correlated control client
-vllm_omni.entrypoints.duplex_request_client
-                                           # entrypoint request/output lifecycle
-```
-
-Stable engine and entrypoint modules import the duplex kernel eagerly at
-module load (top-of-file imports). Duplex behavior remains opt-in: the
-ControlPlane, ControlClient, and request client are *constructed* only on
-duplex-enabled deployments, and the model runtime extension still loads only
-through the dotted-string plugin path. The client-side package
-(`vllm_omni/clients/`, home of the public `DuplexClient`) is never imported
-by runtime code.
-
-`PipelineConfig.duplex_control_enabled` enables the generic mechanism, while
-`PipelineConfig.duplex_runtime_extension` separately selects the model adapter.
-The MiniCPM pipeline opts into both and installs
-`MiniCPMO45DuplexRuntimeExtension`; ordinary pipelines construct neither a
-ControlPlane nor a ControlClient. The model-neutral protocol exposes
-sampling-parameter configuration, append planning, and a typed stage-output
-decision. MiniCPM owns
-stage-specific overrides, PCM-to-token budgeting, force-listen payload policy,
-special-token interpretation, and `listen` response metadata. The generic
-Orchestrator does not parse MiniCPM session keys, `listen_token_id`, or construct
-MiniCPM metadata, and it does not import the adapter.
-
-Extension loading is fail-fast. Startup validates every required callable and
-the number and type of returned stage sampling parameters. Invalid custom
-extensions fail before a session can open.
-
-Direct listen/speak outcomes use `DuplexOutputDecision` on
-`OmniRequestOutput`. That typed envelope is authoritative over inner completion
-metadata for native projection, so a processed output cannot hide a listen
-decision merely because it retains unrelated multimodal metadata.
-
-Generic multimodal chunk accumulation lives in
-`vllm_omni.outputs.multimodal_accumulation`. It owns snapshot replacement,
-DELTA draining, and audio-finality interpretation; `OmniRequestState` only
-invokes that policy while assembling request output. Model output processors no
-longer need to add chunk-retention rules to the main output orchestration file.
-
-The strict chunk-transfer schema still contains `hidden_states.tts` as the
-generic AR-stage-to-TTS handoff and several MiniCPM streaming token IDs as
-compatibility wire fields. The latter are not a preferred generic model
-contract. Moving them behind a model-namespaced metadata envelope requires a
-versioned producer/consumer migration because unknown msgspec fields are
-rejected; silently deleting or renaming them in this checkpoint would break
-existing Stage0-to-Stage1 transfer.
-
-### Public and runtime configuration channels
-
-Control messages carry two independent snapshots:
-
-- `session_config` contains the public Realtime/session values used by serving
-  and model prompt policy;
-- `runtime_config` contains server-derived MiniCPM sampling, scheduler, context
-  reserve, prefix-budget, and resolved reference-audio values.
-
-The MiniCPM serving adapter derives `runtime_config` from deploy/model defaults
-and validated public options. Clients cannot provide private runtime keys in
-`session.create` or `session.update`; response-scoped `extra_body` drops those
-keys rather than turning them into engine policy. The ControlPlane constructs
-sampling parameters only from `runtime_config`,
-while append planning receives both snapshots explicitly. Raw Realtime
-`extra_body` is not used as the engine's sampling-policy channel.
-
-`session.update` prepares both candidates, validates the runtime candidate in
-the engine, and replaces the serving snapshots only after the engine ACK. A
-rejected candidate therefore leaves both the public configuration and runtime
-sampling generation unchanged.
-
-`DeployConfig.duplex_session` is an immutable, server-owned
-`DuplexSessionRuntimeConfig`. These limits are not read from client
-`extra_body` or session payloads:
-
-| Field | Default | Owner | Lifecycle or resource effect |
-| --- | ---: | --- | --- |
-| `idle_ttl_s` | `300.0` | Engine lease manager | Expires an attached or detached session after inactivity; `null` disables only idle expiry. |
-| `disconnect_grace_s` | `30.0` | Engine lease manager and API attachment registry | Bounds how long a detached session may retain engine resources before cleanup. |
-| `reaper_interval_s` | `5.0` | Orchestrator | Sets the cadence for lease expiry and pending cleanup retries. |
-| `resume_replay_ttl_s` | `60.0` | API attachment registry | Expires replay events retained for resume or takeover. |
-| `resume_replay_max_bytes_per_session` | `8388608` | API attachment registry | Bounds each session's replay buffer. |
-| `max_pending_input_bytes_per_session` | `16777216` | API session input ledger | Applies per-session byte backpressure before input is admitted. |
-| `max_pending_turns_per_session` | `4` | API session input ledger | Bounds queued turns that have not completed runtime processing. |
-| `max_sessions` | `1` | Engine session manager | Atomically enforces admission; closing sessions retain capacity until cleanup finalizes. |
-| `completed_append_cache_size` | `256` | Engine session manager | Bounds completed append idempotency records per session. |
-
-Deploy profiles may lower or raise these values to match scheduler capacity,
-but clients cannot override them. The engine remains authoritative for
-admission and cleanup ownership even when the API performs an early check.
-
-### Client-side companion package
-
-The public client surface ships under `vllm_omni/clients/` and stays on the
-consumer side of the boundary above: `vllm_omni.clients.duplex` provides the
-model-agnostic `DuplexClient` (typed events, per-response demux via
-`ResponseHandle`, `session.resume` with acknowledgement-based replay dedup)
-and the `EventCollector` helper used for timing and request-metric summaries.
-Model-specific session defaults live in thin per-model preset modules —
-`vllm_omni.clients.minicpmo_4_5.create_duplex_session_config()` and
-`vllm_omni.clients.personaplex.create_duplex_session_config()` — so the core
-client never imports model packages and the model duplex plugin packages
-never import the client (both directions are enforced by tests:
-`tests/engine/test_duplex_import_boundary.py`,
-`tests/entrypoints/openai_api/test_duplex_capability.py`, and the subprocess
-purity guards in `tests/clients/test_model_session_configs.py`).
-`examples/online_serving/barge_in_client.py` (with its flow companion
-`barge_in_client_flow.md`) is the runnable reference for the client library
-against a live duplex deployment. The wire vocabulary the client speaks —
-every `/v1/realtime?duplex=1` event with its OpenAI-compatibility tier and a
-JSON example, plus the native-to-Realtime name map — is catalogued in the
-[Realtime Duplex API](../serving/realtime_duplex_api.md) serving guide; that
-page derives from the normative contract table above and must be updated
-with it.
-
-## Generic-Path Cleanup
-
-Model-specific `MINICPMO45_PROFILE_LOGS` probes were removed from:
-
-- the generic AR scheduler;
-- orchestrator;
-- AsyncOmni;
-- the generic GPU AR runner.
-
-The cleanup removes the temporary serving and generic-runtime probes. The
-generic AR runner builds `DuplexSamplingRow` values only when the model exposes
-the optional `prepare_duplex_sampling()` hook, then invokes that hook exactly
-once before the normal sampler. Ordinary models do not scan request rows.
-MiniCPM owns force-listen logits, turn-ended state, and its row-local sampling
-policy behind that hook; the runner no longer reads `_minicpmo45_*` attributes
-or retries sampling after matching `TypeError` text.
-
-The scheduler no longer parses serving `session_config`, `extra_body`, or
-`duplex_stage_sampling_params`. Stage-specific overrides are materialized as
-ordinary `SamplingParams` by the model runtime extension before scheduler
-admission. Existing vLLM stop-token, EOS, and max-token handling defines each
-segment boundary; `resumable=True` parks the request for the next streaming
-update. The scheduler does not inspect a duplex dictionary, Realtime
-configuration, or MiniCPM sampling fields.
-
-The generic runner's unused `_duplex_force_listen_applied_segments` cleanup and
-the obsolete `streaming_accumulated_keys` accumulation hook were removed. The
-latter had no model producer after its upstream Qwen removal; streaming input
-still performs the ordinary replacement merge needed by active models.
-
-Local `turn.signal` transitions such as `user_started` and
-`assistant_started` no longer perform an engine RPC. Only cancellation and
-`session.update` cross the engine boundary because those operations change
-runtime resource identity or runtime configuration.
-
-During a stage transition, `StreamingInputState.source_token_decoder` exposes a
-short-lived, model-neutral decoder sourced from the upstream output processor.
-The MiniCPM Stage1 input processor consumes that capability for token-faithful
-delta transcripts. The generic orchestrator no longer installs or names a
-MiniCPM-specific bridge-state key.
-
-The stable API server imports the duplex serving package eagerly and inspects
-the deployment `session_mode` before constructing the duplex handler. Ordinary
-deployments do not create its registries and background state.
-For an enabled deployment, the client still selects the Realtime duplex route
-with `?duplex=1` (or an equivalent explicit true value). Model-name matching is
-not used for routing or native-runtime activation. MiniCPM clients explicitly
-set `extra_body.native_duplex=true`; the canonical way to do so is
-the `vllm_omni.clients.minicpmo_4_5.create_duplex_session_config()` preset,
-which the repository's barge-in example
-(`examples/online_serving/barge_in_client.py`) uses in its session payload.
-
-`DuplexRequestClient` derives the data-plane request identity from the accepted
-fence and preregisters a resumable `ClientRequestState` before the append crosses
-the engine boundary. The acknowledgement must return the same identity or the
-operation fails. Unregistered outputs, including names that merely use the old
-`duplex-` prefix, are dropped. Timeout, cancel, and close remove the
-preregistered state.
-
-## Why Scheduler Changes Remain
-
-Serving cannot preserve model KV after a segment ends. The scheduler must keep
-one resumable request in a waiting state and accept a later update:
-
-```text
-RUNNING
-  -> segment stop
-WAITING_FOR_STREAMING_REQ  (KV retained)
-  -> next append
-RUNNING
-  -> session close
-FINISHED                   (KV released)
-```
-
-Scheduler responsibilities are limited to resumable request state, runtime
-context update, stop/boundary handling, and final release. Scheduler must not
-own response IDs, playback, overlap, Realtime events, or model policy.
-
-## Serving and Compatibility Boundaries
-
-### Normative Realtime event contract
-
-The public contract in this section applies to `/v1/realtime?duplex=1`. Internal
-duplex event names such as `response.output_audio.delta` are projection inputs,
-not additional public aliases. Events for one attachment preserve mailbox
-order; replay after resume preserves the original event order and `event_id`.
-
-Accepted compatibility aliases are normalized before mailbox admission:
-
-| Canonical input event | Accepted aliases | Contract |
-| --- | --- | --- |
-| `input.text.append` | `input_text.append`, `push_text` | Appends text to the open input item. |
-| `input_audio_buffer.append` | `input.audio.append`, `push_chunk` | Appends audio; legacy aliases default to WAV when no format is supplied. |
-| `turn.signal` | `signal_turn` | Sends an explicit turn signal; it does not imply response creation. |
-| `playback.ack` | `audio.playback_ack` | Advances playback/history only for the identified response and attachment. |
-| `session.close` | `close_session`, `close` | Closes the session after previously admitted mailbox events. |
-
-The Realtime projector emits the following response lifecycle. Cardinality is
-scoped to one `response_id` unless stated otherwise.
-
-| Public event | Trigger and ordering | Cardinality |
-| --- | --- | --- |
-| `response.created` | First event for a visible assistant response; precedes its output-item, content-part, speak, text, and audio events. | Exactly once for every visible response. |
-| `response.speak` | The model selected speak; emitted after `response.created` and no later than the first `response.output_audio.delta`. It carries decision metadata, not transcript text. | At most once. |
-| `response.output_audio.delta` | Carries one ordered audio chunk. Every emitted audio delta is followed by a `response.output_audio_transcript.delta` for the same chunk. | Zero or more. |
-| `response.output_audio_transcript.delta` | Append-only transcript contribution paired with an audio delta; it may be empty for a text-less audio unit and must not repeat or overlap earlier text. | One per audio delta. |
-| `response.output_audio.done` | Closes the audio stream after its final delta and before response terminal events. It is omitted for a response with no audio or transcript. | At most once. |
-| `response.output_audio_transcript.done` | Contains the exact concatenation of all non-overlapping transcript deltas for the response. | At most once, and only for a non-empty transcript. |
-| `response.output_item.done` / `conversation.item.done` | Finalize the assistant item after content-part terminal events and before `response.done`. | At most once each. |
-| `response.done` | Terminal event for a created response; follows audio, transcript, content-part, and item terminal events. | Exactly once for every created response that reaches a terminal state. |
-| `rate_limits.updated` | Compatibility event emitted immediately after `response.done`; the current payload has an empty rate-limit list. | Once per emitted `response.done`. |
-| `response.listen` | The model selected listen at a model-unit boundary. It may be emitted without `response.created`; clients must not infer a missing or pending response from it. | Zero or more per session, at most once per model-unit decision. |
-
-Session lifecycle events (`session.created`, `session.updated`,
-`session.resumed`, `session.replaced`, `session.expired`, and
-`session.resync_required`) are session-scoped rather than response-scoped.
-`session.created` is emitted before held response output on a new attachment.
-Cancellation and truncation use terminal status/details on the affected
-response and never reuse that response ID for later model turns.
-
-Compatibility changes must update this table and its protocol contract tests in
-the same change. The golden transcript test requires joined
-`response.output_audio_transcript.delta` values to equal
-`response.output_audio_transcript.done.transcript`; response tests separately enforce
-at-most-once `response.speak` and terminal event cardinality.
-
-### Session internal ledgers
-
-`DuplexSession` remains the serving aggregate root and now composes
-`InputBufferState`, `ResponseState`, `PlaybackLedger`, and
-`ConversationHistory`. The ledgers are private. Read-only properties return
-tuples, snapshots, or mapping proxies, and serving modules mutate them through
-Session transition methods for request, response-turn, lifecycle, playback,
-capability replacement, and history. The Realtime session-update parser still
-normalizes individual fields before atomically retaining or rolling back the
-aggregate configuration. Further work may narrow the read-only compatibility
-surface, but it must not introduce another reducer or a second session state
-machine.
-
-### Realtime input ownership
-
-The browser is a continuous PCM producer. While the session is open and the
-microphone is unmuted, it sends `input_audio_buffer.append` every 200 ms,
-including while assistant audio is being generated or played. It does not run
-VAD and does not send `input_audio_buffer.commit`. Native Stage0 consumes the
-stream in approximately one-second model units; MiniCPM listen, speak, and turn
-EOS decisions advance the model conversation.
-
-Explicit Realtime clients may still use `input_audio_buffer.commit` to create a
-conversation item. The translator validates that wire input before producing a
-commit carrying `item_id`. Native auto-response may already have
-streamed those PCM samples into the runtime, so the runner accepts a validated
-commit even when no runtime-side chunk remains. A truly empty explicit buffer
-continues to return `input_audio_buffer_empty`.
-
-The commit-to-response contract is:
-
-| Session state at `input_audio_buffer.commit` | Runtime action | Required event outcome |
-| --- | --- | --- |
-| Auto-response disabled, valid idle input | Commit and retain the input item. | Emit `input_audio_buffer.committed`; emit no response until an explicit `response.create`. |
-| Auto-response enabled, valid idle speech | Submit the final native append for the current model turn. | Emit `input_audio_buffer.committed` before model output. Create a response only on the first visible text/audio output; a model listen decision may end with `response.listen` and no response. |
-| Auto-response enabled, short overlap during an active response | Discard the short overlap as an acknowledgement. | Emit the committed/no-response acknowledgement; do not create or defer a response. |
-| Auto-response enabled, meaningful overlap during an active response | Retain one deferred payload and promote it after the active response terminates. | Emit `input_audio_buffer.committed` with deferred metadata. A later response follows the same visible-output rule and never reuses the prior response ID. |
-| Explicit silence/noise (`is_speech=false`) | Clear the physical input without a runtime append. | Emit the committed/no-response acknowledgement followed by `response.listen`. |
-| Empty or invalid input | Reject without changing response ownership. | Emit one typed `error`; do not emit `response.created`. |
-| Previous response cancelled or truncated and cleanup complete | Apply the corresponding idle rule above. | The prior response remains terminal; any later visible output receives a new response ID. |
-
-Append tasks, explicit commits, cancellation, and deferred promotion are
-serialized by the session actor. Tests cover post-response commits, active
-playback deferral, truncated-response ownership, and two-turn
-response-required execution; the H20 validation record below is the golden
-multi-turn runtime evidence.
-
-During auto-response overlap, `preserve_realtime_input` distinguishes "do not
-append this silent chunk to the native buffer" from "clear the open Realtime
-item". Silent overlap no longer discards earlier user PCM.
-
-The first chunk of one overlapping input item also reserves its target model
-turn. A later Realtime commit uses that reserved identity even if response EOS
-has already advanced the Session turn; clear, cancel, close, and successful
-promotion release the reservation.
-
-### Physical input and model-turn identity
-
-A Realtime input item, an optional `input_audio_buffer.commit`, and a MiniCPM
-model turn are intentionally different identities. The browser normally keeps
-one input stream open without commits. Native Stage0 evaluates that stream in
-approximately one-second model units. A sampled `<|turn_eos|>` closes the
-current model turn and allows a later streamed unit to start another turn.
-Explicitly committed input may also produce only model-listen decisions and no
-spoken response.
-
-Therefore neither `model_turn_id` nor response cardinality is derived from the
-number of physical inputs. `model_turn_id` advances at model EOS. The
-`response-required` fixture may require exactly one response per requested
-turn, but `model-policy` validation must accept additional model-owned responses
-and cannot assert cross-turn transcript independence through physical-input
-attribution.
-Before closing, the model-policy demo drains every created response through
-`response.done`, acknowledges every completed audio playback, and requires a
-bounded quiet interval with no newly created response. This validates lifecycle
-completion without suppressing or overriding the model's listen/speak policy.
-
-### Non-cancel signal semantics
-
-`turn.signal` remains a public compatibility surface for local Session and
-Realtime transitions. Serving forwards only cancellation and `session.update`
-to the engine. The engine rejects arbitrary non-cancel signal names instead of
-returning a misleading supported acknowledgement. `session.update` remains a
-real engine operation because it replaces the configuration consumed by later
-append plans.
-
-## Remaining Architecture Work
-
-The following work is deliberately not hidden inside this checkpoint.
-
-### Serving composition
-
-The generic runner and runtime bridge now depend on the model-neutral
-`ServingRuntimeAdapter` protocol and no longer import MiniCPM modules. The
-`MiniCPMO45ServingRuntimeAdapter` owns MiniCPM serving state, PCM preparation,
-data-plane projection, client/runtime configuration validation, prefix policy,
-and capability projection. `PipelineConfig.duplex_serving_adapter` explicitly
-selects its import path; `AsyncOmniEngine` and `AsyncOmni` carry that path to the
-API server, which passes it into the generic handler. The handler has no model
-default and fails startup when the duplex endpoint is enabled without an
-adapter. Tests may inject an adapter instance directly. Import-boundary tests
-verify that loading the generic runner, bridge, or handler does not load MiniCPM
-modules.
-
-Behavior is still assembled through `DuplexSessionRunnerMixin`,
-`NativeRuntimeBridgeMixin`, and `ChatFallbackProjectorMixin`, so explicit
-adapter composition is only the model-policy boundary, not a completed removal
-of host-method coupling. A later refactor may replace the remaining mixins with
-explicit protocol and effect-runner dependencies while preserving one actor
-mailbox and one `DuplexSession` transition owner. Splitting those components
-must not create a second reducer or concurrent state machine.
-
-The four private Session ledgers are data partitions, not independent owners.
-`DuplexSession` intentionally remains the aggregate root. Further encapsulation
-may narrow compatibility properties, but serving code must continue to perform
-state changes through Session transitions.
-
-### Plugin descriptor and typed payloads
-
-The pipeline currently selects the MiniCPM engine extension and Serving adapter
-through two explicit fields, but there is not yet one versioned plugin descriptor
-that binds those identities in an open handshake. Realtime client payloads do
-not select either implementation. Adding a second native model should first
-introduce that descriptor and reject serving/engine plugin mismatches explicitly.
-
-The stable boundary has typed fences, plans, policies, decisions, and control
-messages, but `session_config`, `runtime_config`, and append payloads still use
-generic mappings or objects at the extension boundary. Model-neutral typed
-session and input-chunk contracts remain follow-up work, especially before
-adding video.
-
-### Output modality policy
-
-The current Realtime duplex contract supports text and audio output. Unknown
-output modalities fail closed with `unsupported_response_modality`; they are
-never silently projected as text. This checkpoint deliberately does not add a
-modality registry because there is only one native text/audio projection path
-to register.
-
-A registry becomes justified when a second non-audio/non-text implementation
-uses the same validation, encoding, lifecycle, and projection contract. At that
-point the abstraction must be extracted from two working adapters and retain
-the same fail-closed behavior. A speculative registry before that condition
-would add selection state without removing any existing branch.
-
-### Performance measurement contract
-
-Stage0 token timing comes only from the engine's per-segment metric snapshot:
-`vllm_ttft_ms`, `vllm_tpot_ms`, and `vllm_itls_ms`. A resumable Stage0 request
-exports its segment-local `num_generation_tokens`; ordinary requests retain the
-existing output-token fallback. Realtime response state clears its metric
-accumulator at `response.created`, combines only model units owned by that
-response, and ignores session-level events with no matching `response_id`.
-Realtime projection carries the result under
-`metadata.vllm_omni.stage_metrics`; clients do not estimate TPOT from transcript
-deltas or subtract cumulative snapshots.
-
-Audio timing uses the client's monotonic receive clock and is partitioned by
-`response_id`. `response_created_to_first_audio_ms` measures projection startup
-after `response.created`; `commit_to_first_audio_ms` measures end-to-end output
-from an explicit input commit. Neither field is called TTFP without naming its
-origin. Reports also include inter-chunk and chunk-duration
-count/mean/p50/p95/max plus maximum chunk gap. Engine and client measurements
-have different clock origins and must not be merged into one timeline.
-
-### Stage1 CUDA Graph boundary
-
-Native Stage1 streaming advances Python-owned request generators and turn
-state on every scheduler step. A full-model CUDA Graph would execute that
-Python control flow only while capturing and then replay stale chunk and turn
-metadata, even if its host-to-device tensor construction were made
-capture-safe. The duplex deploy profile therefore keeps `enforce_eager=false`
-but selects `cudagraph_mode=PIECEWISE` for Stage1. Python orchestration runs on
-every step while fixed-topology compiled regions remain eligible for CUDA
-Graph capture. This is a model execution constraint, not an E2E-only override.
-
-### Resource capabilities
-
-At the time of this snapshot the checked-in MiniCPM duplex deploy profile set
-Stage0 and Stage1 `max_num_seqs` to two and configured the engine runtime
-manager with `max_sessions=2`; the duplex settings have since been folded into
-`vllm_omni/deploy/minicpmo_4_5.yaml`, which admits four sessions
-(`duplex_session.max_sessions: 4`, matching its stage `max_num_seqs`). The
-Realtime capability response advertises
-multi-session and same-replica multi-session support with
-`session_admission_mode="engine_managed"`. Client session fields cannot raise
-this server-owned limit. Fresh E2E evidence covers two concurrent sessions in
-both model-policy and response-required modes, rejection of a third session,
-and admission of a replacement after one accepted session closes. It does not
-establish behavior beyond that configured limit.
-
-Session leases, lease TTL, resumable attachment, orphan reaping, and bounded
-Serving input/backpressure are implemented. A production admission controller,
-KV-aware capacity budgeting, fairness, starvation metrics, and multi-session
-worker-failure recovery remain follow-up work. Capability claims must stay
-limited to the mechanisms and two-session execution shape validated here.
-
-## Validation Evidence
-
-All pytest and runtime evidence for this branch must run on the remote H20.
-
-### Current synchronized tree
-
-The current dirty tree was synchronized to the isolated H20 worktree at
-`/home/admin/workspace/aop_lab/model_runner_v2/vllm-omni-worktrees/pr3907-boundary-cg-0721`.
-
-- Final affected matrix: 661 passed, one network-dependent config test
-  deselected, 20 warnings. It includes the complete MiniCPM native-duplex hook
-  file and all control/session/handler/Orchestrator/import-boundary suites. The
-  run is task `be221f67` (`/tmp/remote_gpu_logs/be221f67.log`). The deselected
-  `test_resolve_when_autodetect_resolves_none` attempted a Hugging Face model
-  lookup and hung in the isolated environment; the duplex deploy-config test
-  passed independently.
-- Stage1 PIECEWISE CUDA Graph validation: the deploy-config assertion first
-  failed with no Stage1 compilation config, then passed in task `3ed6091d`.
-  Server task `95827027` started with `enforce_eager=False`, logged
-  `cudagraph_mode=PIECEWISE`, and captured batch sizes 1, 2, and 4 without the
-  CPU-to-CUDA capture error. The first concurrent E2E exposed graph padding as
-  `request_token_spans` covering three valid rows in a four-row capture. A
-  focused RED/GREEN now verifies both single-request and batched-request
-  padding, and the full MiniCPM hook file passed 47 tests in task `e89dba88`.
-  After the fix, two concurrent response-required sessions each completed two
-  spoken responses, playback acknowledgements, and history lifecycles with no
-  error or stale event. Artifacts are under
-  `/tmp/pr3907_piecewise_response_required_2x2_fixed_20260721`.
-- An exploratory two-session, two-turn model-policy run still left one session
-  waiting after its second input commit while the other session completed both
-  turns. The same liveness symptom was reproduced with Stage1 eager mode before
-  the padding fix, and no Stage1 fatal occurred after the fix. This run is not
-  counted as PIECEWISE acceptance evidence; the remaining Stage0 resumable
-  reactivation path requires separate diagnosis. Artifacts are under
-  `/tmp/pr3907_piecewise_model_policy_2x2_fixed_20260721`.
-- Latest broad affected matrix before the final pre-response continuation fix:
-  608 passed, 19 warnings. This includes the
-  Stage0 row-routing regression, cleanup-held admission regressions,
-  segment-local token accounting, response-owned metric filtering, the generic
-  output-processor suite, direct E2E script execution, and continuous-response
-  overlap ownership. The run is task `e2146318`
-  (`/tmp/remote_gpu_logs/e2146318.log`).
-- The pre-response continuation regression group passed 5 focused tests. The
-  response-required two-turn scenario then passed 5/5 repeated runs in task
-  two-session semantic isolation plus resume, takeover, and
-  admission passed in task `49225794`; model-unit overlap passed in task
-  `3888387d`. The final affected matrix above supersedes the earlier pending
-  rerun requirement.
-- Serving plugin selection was first reproduced as three RED tests: the generic
-  handler silently selected MiniCPM and the pipeline had no explicit Serving
-  adapter field. The final pipeline/import/fail-fast group passed 9 tests in task
-  `4db6d959` (`/tmp/remote_gpu_logs/4db6d959.log`). The token-metric and client
-  audio-cadence producer-to-consumer group passed 8 tests in task `cf80f6b2`
-  (`/tmp/remote_gpu_logs/cf80f6b2.log`).
-- Stable-import isolation was first reproduced as a RED that loaded twelve
-  `experimental.fullduplex` modules. After extracting the kernel and making
-  implementation loading conditional, the isolated import regression passed.
-  The focused ControlPlane/ControlClient/session/runtime/Orchestrator/AsyncOmni
-  suite then passed 139 tests in task `fad613ea`
-  (`/tmp/remote_gpu_logs/fad613ea.log`).
-  After the final contract-import cleanup, the import-boundary, runtime, and
-  lease suites passed 45 tests in task `bc138887`
-  (`/tmp/remote_gpu_logs/bc138887.log`).
-- Concurrency and failure-path hardening now has direct regressions for
-  single-flight cancel/close cleanup, cleanup retry without dropping request
-  resources, failed-replica affinity cleanup and same-address reattachment,
-  append ordering across resume, takeover ownership of pending-turn
-  reservations, and a closed-transport send immediately after resumable
-  credentials are delivered. The final focused resume/takeover group passed 5
-  tests in task `dc2ac96e` (`/tmp/remote_gpu_logs/dc2ac96e.log`).
-- Stage1 batching regression: the focused test first failed because only the
-  first request in `runtime_additional_information` reached the talker. After
-  routing every request by `request_token_spans`, preserving per-row terminal
-  flags, and emitting request-keyed sparse audio, the complete MiniCPM duplex
-  hook file passed 42 tests.
-- Stage0 batching regression: two requests in one batch now retain different
-  `duplex_prompt_token_ids` and `special_token_ids`. The model emits row-aligned
-  payload elements, so Stage0 no longer copies request zero's duplex metadata to
-  later sessions.
-- Admission finalization regressions cover `max_sessions=1` with blocked and
-  failed expiry cleanup plus request-triggered cleanup. Every replacement is
-  rejected with `resource_exhausted` until stage resources are cleaned and the
-  old session is explicitly finalized.
-- Resumable token accounting exports each model unit's native generation-token
-  count instead of recounting the request's cumulative token IDs. Realtime
-  response state resets and accumulates those segment snapshots, and the client
-  ignores unowned session-level metrics while summarizing a response.
-- Engine-owned admission and two-session model-policy E2E: two random session
-  IDs were admitted and remained isolated, a third was rejected with
-  `resource_exhausted`, closing one accepted session returned capacity, and a
-  random replacement session was admitted. The capability projection reported
-  `configured_limit=2`, `advertised_multi_session=true`, and
-  `session_admission_mode=engine_managed`. In the same run one session selected
-  speak and the other selected listen without identity leakage. Detach/resume
-  advanced attachment generation from one to two and rotated its token; active
-  takeover rejected all four writes from the replaced connection. The run is
-  task `1d9dd1ed` (`/tmp/remote_gpu_logs/1d9dd1ed.log`), with artifacts under
-  `/tmp/pr3907_resume_takeover_native_metrics`.
-- Concurrent two-session, two-turn response-required E2E: both sessions produced
-  two complete spoken responses, committed two playback acknowledgements and
-  history records, and emitted no error, cancel, truncate, or stale events. The
-  semantically distinct inputs produced isolated transcripts containing
-  "当时" and "一加一" respectively. Per-response Stage0 output counts were 20,
-  38, 32, and 33 tokens rather than cumulative request totals. The run is task
-  `a16f1467` (`/tmp/remote_gpu_logs/a16f1467.log`), with artifacts under
-  `/tmp/pr3907_semantic_2turn_native_metrics`.
-- Disconnect-grace E2E: a detached session expired after the configured
-  30-second engine grace, and a later resume was rejected with
-  `session_resume_expired`. The run is task `9872d50c`, with artifacts under
-  `/tmp/pr3907_0719_disconnect_grace_expiry`.
-- A separate black-box takeover client exercised the current backend with two
-  semantically distinct concurrent inputs. Active resume replayed 17 events
-  including five audio deltas and committed playback history; takeover rejected
-  all four stale-attachment sends, emitted `session.replaced`, and preserved
-  attachment/session isolation. Both transcripts contained only their expected
-  semantic token. The client task is `6773bd34`
-  (`/tmp/remote_gpu_logs/6773bd34.log`), with artifacts under
-  `/tmp/pr3907_gaohan_final_takeover`. The backend task was `5abcd1ee`.
-- Across the final response-required, overlap, and resume/takeover runs, engine
-  Stage0 TTFT ranged from 31.17 to 310.18 ms, TPOT from 15.18 to 21.18 ms, and
-  reported ITL p95 from 16.35 to 32.83 ms. Explicit
-  `commit_to_first_audio_ms` ranged from 386.80 to 1033.25 ms, while the
-  client-monotonic maximum audio chunk gap ranged from 388.30 to 1316.37 ms.
-  These are response-scoped observations from a small, warm-state-sensitive
-  sample, not an SLO claim. The slowest response still does not satisfy a 200 ms
-  end-to-end first-output target.
-- Post-merge focused handler/demo/Web/Stage0/runner/video suite: 324 passed,
-  19 warnings. The run is task `f78cb7a8`
-  (`/tmp/remote_gpu_logs/f78cb7a8.log`). The Web contract explicitly rejects
-  browser VAD markers and browser-generated input commits while the merged
-  video path retains camera-frame admission.
-- No-response listen and residual accounting: the focused handler regressions
-  passed after first reproducing both failures. A model-listen unit without a
-  Realtime response no longer defers the next committed input, and three
-  consecutive 1.2-second `pcm_f32le` inputs each returned pending input bytes
-  to zero.
-- Model-unit overlap E2E: the second physical input streamed while the first
-  response remained active. Seven overlap decisions had
-  `defer_runtime_append=false`; the one-second model-unit boundary occurred
-  before the first `response.done`, and no barge-in, cancel, truncate, stale, or
-  error event occurred. The model-policy contract accepts a later unit ending
-  the continuous response instead of requiring a second physical-input-owned
-  response. The two response-owned Stage0 snapshots independently reported 20
-  tokens / 152.8 ms TTFT and 19 tokens / 43.3 ms TTFT. The run is task
-  `a4977622` (`/tmp/remote_gpu_logs/a4977622.log`), with artifacts under
-  `/tmp/pr3907_overlap_native_metrics_scoped`.
-- The split multi-session E2E runner is directly executable from the repository
-  even when another installed package owns the top-level `tests` name. Its
-  script-import and continuous-terminal regressions passed in task `f11b106c`.
-- Pinned response-required E2E: the first 1400 ms of the pinned fixture produced
-  one complete spoken response, five audio/transcript deltas, and one playback
-  history commit, with symmetric created/audio-done/done lifecycle and no
-  duplicate `response.speak`. The client task is `a76dec52`
-  (`/tmp/remote_gpu_logs/a76dec52.log`).
-- Continuous-input model-policy E2E: 36 browser-like 200 ms chunks produced
-  seven model-listen decisions with zero input commits and no
-  error/cancel/truncate/stale events. The client task is `fb256595`; artifacts
-  are in `/tmp/minicpmo_pr3907_continuous_model_policy_20260718`.
-- Three-response continuous-input E2E: three consecutive 9469 ms streams,
-  composed of the original fixture plus four seconds of silence, produced three
-  spoken responses in one session. All three completed `response.done`, audio
-  transcript, playback ACK, and history commit; the run had 22 audio/transcript
-  deltas, zero input commits, and no error/cancel/truncate/stale events. This is
-  lifecycle evidence, not semantic cross-input independence, because the same
-  fixture was repeated. The client task is `2a5f29f0`; artifacts are in
-  `/tmp/minicpmo_pr3907_continuous_three_response_20260718`.
-- The fresh validation backend was stopped after the E2E runs and GPU0/1 returned
-  to baseline. Audio-quality and ASR evaluation were not rerun for these
-  lifecycle-only changes. Other GPU workloads were not modified.
-
-### Regression lineage
-
-Earlier synchronized checkpoints passed broader affected matrices before the
-extension, policy, and ledger consolidation. Those runs were useful while
-developing the refactor but are superseded by the current file-identical H20
-matrix and E2E evidence above; they are intentionally omitted to avoid mixing
-different trees in the acceptance argument.
-
-### Focused suites
-
-- RPC router and AsyncOmni shutdown/error routing;
-- orchestrator fatal and duplex control paths;
-- WebSocket Actor mailbox and writer;
-- duplex protocol and Session ownership;
-- Realtime handler, terminal ordering, overlap, playback ACK;
-- scheduler resumable boundary;
-- MiniCPM runner and Stage0/Stage1 lifecycle.
-
-### E2E contract
-
-Run two deliberately separate fixture contracts:
-
-- model-policy uses three distinct inputs, no transcript hints, 200 ms
-  real-time pacing, and continuous input with no browser commit. It allows
-  natural listen or speak decisions and assumes no 1:1 mapping between
-  physical inputs, model turns, and responses;
-- response-required uses `minicpmo_pr3907_jiayan_16k.wav` pinned to SHA-256
-  `2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941`,
-  sends its first 1400 ms, and requires one complete spoken response.
-  It is an output-lifecycle fixture, not evidence that arbitrary no-hint,
-  real-time input must select speak;
-- late and old-response playback ACK handling in the affected test matrix;
-- final model-policy response drain before `session.close`;
-- close/disconnect with no post-terminal audio;
-- transcript delta/final consistency;
-- generated WAV validity and external ASR sanity.
-
-Distinct-input fixtures must also be semantically distinct. Different files or
-waveform hashes containing the same greeting can legitimately produce the same
-reply and are not sufficient evidence for cross-turn transcript independence.
-
-For each run record the exact SHA/worktree, command, server log, client log,
-WAV path, and cleanup result.
-
-## Acceptance Criteria
-
-This checkpoint is ready to publish only when:
-
-- one mailbox passes exactly-once and wire-order tests;
-- cancel advances the engine fence even when the old append continues in an
-  executor, and the next-epoch append remains accepted;
-- request completion removes MiniCPM helper and model-owned force-listen state;
-- RPC fatal/close wakes every waiter and no new work enters after terminal;
-- Session is the only serving response/overlap authority;
-- stale terminal events cannot mutate a newer epoch;
-- an accepted terminal cannot be dropped by the writer;
-- no duplicate `response.speak` or transcript delta appears;
-- Stage0 KV continuity and Stage1 turn reset pass;
-- the real H20 multi-turn audio E2E passes;
-- ordinary non-duplex paths in the affected matrix still pass;
-- no local path, proxy token, temporary profiling probe, or test-only switch is present.
-
-Passing this checkpoint supports the statement:
-
-> Single-session, model-owned MiniCPM-o 4.5 native duplex is reviewable on the
-> validated H20 configuration.
-
-It does not support claims for an acoustic-onset barge-in latency target across
-arbitrary client chunk sizes, multi-session production concurrency, bounded
-long-session KV, or scheduler-native append. Camera-frame input
-(`video_frames`) landed after this snapshot and is covered by its own E2E
-test rather than by the evidence above.
+| engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
+| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `parse_function_call` (recognize one call), `runtime_config_for_function_output` (feed an accepted result back into that model), `note_published_function_call` (plugin stores history length at publish), `has_pending_tool_followup` (plugin still has a tool result to answer), `extra_prompt_config`, `runtime_patch_for_submitted_prompt`, `runtime_config_after_response` (keep or drop a result after the response ends), `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+
+A duplex tool call uses one client sequence. The client supplies tools, receives one function call, runs the function, and sends `function_call_output`. The server does not execute the function. Each model plugin implements both hooks. A recognized call is published through `model_channel._expose_function_call`. Before the plugin sees a `function_call_output`, the session copies `name` and `arguments` from the call origin recorded at publish. Conversation history is not admission authority. The client item stays `call_id` and `output`. Qwen3-Omni `parse_function_call` reads a Hermes `<tool_call>` and returns `{call_id, name, arguments}` without retaining them. One Thinker chunk can carry more than one completed call; each is emitted. `note_published_function_call` stores that call's history length in the Qwen runtime. `runtime_config_for_function_output` reads `name` and `arguments` from the preparation item, refuses when either is absent, and appends one `{history_len, messages}` entry there. The stored length wins over the length at result time. Tool pairs stay out of `session.history`. `has_pending_tool_followup` is how the runner learns that a bare `response.create` may open `{"type":"conversation"}`. `plan_append` splices each turn after the history it was accepted against, and `runtime_patch_for_submitted_prompt` holds those turns aside after the append is accepted. The pair stays owned by that response until playback stores its text. The next prompt puts a still-inflight pair back on the waiting list before the usual splice, and the pair keeps that response id so the playback ACK can drop it once the assistant text is stored. A cancel, a playback clear before any audio is committed, or `realtime_response_conversation: none` stores no text and puts the pair back with that response id. A failure before playback can store the answer puts the pair back without the id, so the retry can own it. `tool_choice: none` is rejected. A result whose published anchor has left the prompt window is refused instead of being attached to the latest question. `runtime_config_after_response` is that step. Nemotron VoiceChat `parse_function_call` reads the data-plane function-channel event, and `runtime_config_for_function_output` places the result on a later frame of the request that is still open. The session call book is #8758.
+
+The application-side `DuplexToolRunner` must consume events before generation
+starts. It delivers tool output independently of generation, but only requests
+continuation after all observed responses end and ACK-only playback is committed.
+Results delivered before the same continuation share one follow-up. Failed result
+writes stay visible in `undelivered_results` / `delivery_errors`; `retry_result`
+resends the cached output after reconnecting without rerunning the handler.
+A failed continuation write instead retains the call in `pending_continuations`
+with its `continuation_errors` entry; `retry_continuation` retries only that
+follow-up. Continuations reserve awaiting-response state before the send can
+yield, so lifecycle events observed during the write remain authoritative.
+Only results delivered before a follow-up begins are covered by that request.
+An acknowledged hard playback truncate retires the targeted playback gate when
+generation ends, including when the ACK precedes terminal metadata. Late ACKs
+cannot reopen a retired gate; the early-stop marker is removed at response end.
+A successful write is not proof of server acceptance, and the runner never sends
+playback ACKs on behalf of the application.
+
+`DuplexOmniEngine._validate_deployment` loads the plugin before any stage
+starts; `DuplexSessionManager.__init__` validates it against the stage
+sampling defaults once the stage pools exist. Plugin hooks that may block
+(`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
+offloaded from the loop.
+
+Input-clocked sessions (`extra_body.clock == "input"`, see the
+[API reference](../serving/realtime_duplex_api.md#input-clocked-sessions))
+track every model unit (one Stage0 submission) until all of its output has
+been emitted. The clock lives in `session/input_clock.py` and exists only for
+sessions created with the option; the runner calls it at explicit points: a
+client input is admitted (indexed in wire order when the runner takes it on
+its mailbox; an input the manager refuses at admission is indexed by an
+explicit `runner.input_refused` call in each refusal branch, which only queues
+a payload-free marker acknowledged as `rejected`, like an append the runner
+refuses before its audio reaches the model, `_refuse_append`; an append server
+VAD split into segments is refused from the refused segment on, the segments
+before it stay buffered and its `audio_end_ms` says where they end), begins
+and ends, a Stage0 submission is created / accepted / finishes, a committed turn is deferred or
+its deferred audio is dropped, a cancel advances the epoch, and teardown. Each
+stage output puts a `StageProgress` item on the session mailbox *after* the
+events of that output, and an append's outcome and the timeout checks are
+settled from the mailbox too, so an acknowledgement never overtakes the output
+it covers. A command that waits on the mailbox for an append (a commit or
+`session.update`) watches the timeouts of the appends still running and gives
+up once one of their units is due or timed out, so a stalled submission
+cannot keep the timeout check queued behind it from running. A unit takes its
+ordinal among its epoch's Stage0 submissions when Stage0 accepts it, and the
+n-th Stage0 segment end of the epoch decides that unit (also after the unit
+was settled, so late output is never credited to the next unit; a unit
+settled before Stage0 accepted it stays matchable until its submission
+resolves, and a deferred turn submitted after its reserved slot was settled
+takes that settled unit's place unless a client input submitted it); a
+non-final stage only ends a unit through a decision, and only
+the final stage completes a speaking unit. Two optional hooks carry what only
+the model knows. `unit_decision(stage_id, decision, output, context,
+runtime_config) -> DuplexUnitDecision | None` labels a decision of a stage
+before the final one and says whether it ends the unit's pipeline (default:
+any decision does, labelled `listen` when its metadata sets `model_listen`;
+a plugin overrides this when some decisions do not end the unit); it is also
+asked about every segment end of such a stage that carries no decision
+(default: no classification), so a plugin can end a unit whose segment hands
+the next stage nothing. It is called when the output arrives and reads the
+live output at that moment. Decisions taken on the final stage are not
+consulted. `unit_output_complete(unit, final_stage_id, new_output, new_context,
+state, runtime_config) -> bool` says when the oldest speaking unit's
+final-stage output is complete; `unit` carries only its session-wide index,
+its epoch and its ordinal in that epoch, and two flags (the stage before the
+final one ended its segment; the final stage ended its segment for it: the
+final stage's segment ends go to the speaking units in order, so a unit that
+still waits for its upstream segment end does not take the next unit's), and
+the engine keeps no output history (default: the final
+stage marks one segment end per unit; a final stage that streams across unit
+boundaries keeps its own markers or coverage in `state`, which the engine
+replaces with an empty dict whenever a cancel starts a new epoch, so frame
+coverage is counted per epoch against the ordinal). Later-stage progress
+that overtakes the Stage0 segment end of its unit (no unit is speaking yet,
+or none still needs that stage's segment end) is held by the clock and
+replayed in arrival order when the next unit of the epoch starts speaking.
+It is held only while the epoch has a Stage0 submission without a segment
+end yet (the unit it can belong to); otherwise, and once the epoch has no
+such submission left, it is dropped with a warning, so it never ends a unit
+submitted after it arrived. If more than 256 events are held, the clock
+drops all of them and holds nothing more for that epoch (logged as an
+error): the epoch's later units are left to the timeouts until a cancel.
+Progress that arrives while a later unit of its epoch is pending is
+attributed to that unit, so a plugin's later stages must not emit progress
+(e.g. a repeated segment end) for a unit after it is complete.
+A hook that raises is logged once per session and counts as "no decision" /
+"not complete", which leaves the unit to the timeouts. A settled speaking
+unit keeps its place for its final-stage output, so attribution stays
+correct after a stall. Each acknowledgement reports only units created up
+to its input. A plugin whose input buffer can cut several units from one
+append implements `PcmAppendBuffer.prepare_backlog`; the runner then submits
+all of them for that append. The timeouts' defaults are the same for every
+model (a per-plugin default is a possible follow-up). A plugin enables the mode with
+`supports_input_clock = True` once those hooks match its real unit
+boundaries; sessions of other models that ask for it are refused
+(`input_clock_unsupported`). No model opts in yet.
+
+What a plugin must guarantee before it opts in:
+
+- Stage0 ends every accepted submission with exactly one segment end, in
+  submission order, and the unit's decision (if any) is taken on that
+  segment-ending output. An extra or missing segment end (e.g. a
+  prefill-only append that produces none) shifts the epoch's later units onto
+  the wrong segment ends: an acknowledgement may then arrive before its
+  unit's output, or wait for the timeouts, until the next cancel starts a new
+  epoch; the timeouts keep acknowledgements coming but do not resynchronise.
+- The stage just before the final one (`final_stage_id - 1`) is the only
+  one whose segment end sets a unit's `upstream_segment_finished`, and it
+  ends exactly one segment per unit; an extra one is held for, or credited
+  to, the next unit.
+- With `final_stage_id == 0` (e.g. a text-only request), a unit completes at
+  its Stage0 segment end whatever the hooks say.
+- The default `unit_output_complete` assumes final-stage outputs of
+  different units do not interleave (each unit's audio ends with its own
+  segment end before the next unit's begins). A model whose final stage
+  streams across unit boundaries must override it. Turns never overlap in
+  an input-clocked session: the session is created without
+  `supports_concurrent_turn_requests` (`apply_input_clock_capabilities`,
+  the one place that decides it, so the advertised value and the runner's
+  check cannot disagree), so a commit during a response waits for that
+  response (the deferred-turn path),
+  because the clock credits outputs to the speaking units in order.
+  Crediting by request, which would let turns overlap, is future work.
+- A unit is complete when everything the model emits for it has been
+  emitted. A final stage that synthesises the end of a unit's output only
+  together with later units' input (e.g. a vocoder lookahead, or a codec
+  that emits several units per chunk) may complete the unit before that
+  output, as real-time operation emits it; the lag is model-specific and
+  each model documents its own in its model entry. The
+  acknowledgement waits for a response continuation the output handler
+  spawned (e.g. the `response.done` a non-resumable model sends from it);
+  the wait is bounded (one second) and happens once per continuation, so a
+  continuation that blocks is logged and acknowledged around rather than
+  stalling the session, and delays only the acknowledgement that waited for it.
+
+Every cancel that calls off appends of an input-clocked session advances the
+epoch (an overlap barge-in does so too, where a session without the clock
+keeps its epoch when nothing else was running), so a called-off submission
+that already reached Stage0 has its output dropped instead of shifting the
+count.
+
+Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
+for the shared request identity, sequencing and config snapshots. Token budgets,
+PCM framing and model-specific worker fields remain in the plugins.
+
+MiniCPM-o 4.5 preserves the complete reference waveform after resampling to
+16 kHz. Its first-append context budget follows the whole-clip encoder:
+ceil to 160-sample mel frames, ceil through the stride-2 CNN, then floor
+through stride-5 pooling. Reference audio must not be cropped to a 100 ms
+boundary to simplify budgeting: the remaining samples can change the
+embeddings even when they do not add a pooled token.
+
+The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
+on CUDA, ROCm and NPU. The ROCm override changes runner selection while
+preserving the shared duplex session, async-chunk, device, connector and stage
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph,
+speculation and fused-kernel behavior described below does not apply to ROCm;
+runner selection alone does not establish ROCm runtime or quality qualification.
+
+MiniCPM-o native duplex does not apply a character cap unless
+`max_speak_chars_per_chunk` is set to a positive value. The default is 0,
+so the default length limit is the official 20-token budget; sampled chunk
+terminators can still close a chunk earlier. A decoded prefix
+ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
+cap is set. That cap keeps the token that crosses the target, then closes
+the chunk before another draw. Hard token and request caps retain priority;
+explicit `force_listen` bypasses only the soft character target.
+
+MiniCPM-o preserves the stage-2 sampled `<|turn_eos|>`, including after text
+without sentence-ending punctuation. The sampler does not infer whether an
+answer is complete from its decoded tail or replace EOS with another candidate.
+This matches the released `streaming_generate` turn-ending behavior and avoids
+adding text to short answers such as `11` or `北京`. There is no worker-local
+punctuation/continuation state for asynchronous lookahead to advance beyond the
+scheduler's accepted span. The scheduler still supplies the canonical unit
+content and terminator for the next append, including with sliding windows off.
+Sentence-ending punctuation remains a Talker drain hint; it does not decide
+whether the Thinker may end a turn.
+
+An explicit `response.create` may open a latched assistant turn on its first
+silence unit. The sampler consumes that opening marker once per request/unit,
+even if the turn was already open, so repeated decode steps cannot undo a later
+`<|turn_eos|>` decision. The consumed identity lives in the session state.
+Opening a forced response permits the model to speak or listen. Its initial
+listen decision is preserved and closes the response without audio; only an
+already-speaking turn uses the normal listen-to-TTS continuation rewrite.
+
+`<|turn_eos|>` does not terminate the input unit. The Thinker continues until
+a chunk terminator, and the Talker receives all forwarded tokens and their
+hidden states before that boundary, including any text after an intermediate
+EOS. Such text or a later speak decision reopens the turn. The bridge and
+Talker therefore report `turn_end` only when the final condition token is
+`<|turn_eos|>`, not merely when EOS occurs somewhere in the unit. For example,
+`<|speak|><|turn_eos|><|speak|>green<|chunk_eos|>` delivers `green` and keeps the
+response open. Async lookahead after the actual chunk terminator is excluded.
+
+If a speech unit has no text, its chunk boundary still
+travels through Talker's empty-condition path. That path emits no audio but
+preserves the TTS segment-end notification needed to schedule the next silence
+unit; an empty speech chunk must not be dropped as if it were a listen unit.
+
+Code2Wav attaches queued transcript text once per output payload. The data
+plane deduplicates it by `(duplex_audio_cache_epoch, duplex_audio_chunk_seq)`
+within a model turn, not by text equality or a shared prefix. Adjacent chunks
+containing `1` and `1` must deliver `11`. Legacy outputs without a chunk
+identity retain the cumulative-text snapshot handling.
+
+The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
+sessions. SDPA and eager produce different BF16 embeddings, which can change
+scene descriptions during long video sessions. Turn-mode and non-CUDA vision
+retain SDPA by default. An explicit engine or vision attention setting still
+overrides the default.
+
+The reference vision path fuses scaling and softmax for unmasked CUDA BF16
+inputs, preserving BF16 score/probability rounding and FP32 accumulation.
+Encoder CUDA graphs remain enabled. This avoids the full FP32 probability
+buffer used by eager attention, but still materializes attention scores and
+can reduce vision throughput compared with SDPA at larger image batches.
+An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
+
+With reference vision attention, `vision_fused_layers: true` does not enable
+fused encoder layers: `supports_fused_layers()` excludes this attention backend.
+This also applies to the `minicpmo_4_5_duplex_h200.yaml` profile. Packed encoding,
+vision CUDA graphs and the fused scaled softmax remain enabled in that profile.
+Selecting SDPA explicitly allows fused encoder layers, but can change BF16 vision
+outputs and requires rechecking long-video recognition for the workload.
+
+MiniCPM-o deployments select `TRITON_ATTN` for CUDA stage 0, including the
+standalone 2-GPU, 3-GPU and 8x4090 layouts and inherited replica and turn-mode
+profiles. Talker and NPU attention settings are unchanged. This aligns the
+Thinker backend selection; it does not establish accuracy or performance parity
+across GPU types and layouts.
+
+The inherited CUDA duplex profile uses upstream `vllm_c` RMSNorm and fused
+add-RMSNorm, `silu_and_mul`, and QK-normalization/RoPE fusion for Thinker stage 0.
+The checkpoint's model and head dtypes are retained. The turn profile resets
+`kernel_config` and `compilation_config` to upstream defaults, including its
+MRv2 derivatives. Other platforms and Talker keep their existing settings;
+explicit engine overrides retain precedence.
+
+Tool result conversion is preparation until the session's final deadline/epoch
+check and admission. `runtime_config_for_function_output` receives an isolated
+item copy with `name` and `arguments` from the immutable session call origin,
+when available. Client-supplied hints for those fields are ignored; a plugin
+requiring absent metadata rejects the result before admission. The client
+acknowledgement retains the submitted item. Parsing and conversion should not
+consume a separate call-metadata cache before admission.
+
+A preparation refusal leaves the call pending and does not reset its deadline.
+Missing origin metadata cannot be repaired with client hints: a plugin that
+requires it keeps refusing retries until the call times out or is cancelled.
+When the optional timeout is disabled, cancellation or session teardown is
+required to retire such a call.
+
+`on_tool_call_settled` handles metadata-only terminal cleanup, including old
+epochs; `on_tool_calls_closed` disposes registered call metadata during teardown.
+Model recovery uses the mailbox-ordered `runtime_config_for_abandoned_tool_call`
+for a call that timed out or was cancelled in the current epoch, and for a repeat
+the session refused to expose. The hook shows a fixed status, never client text.
+It defaults to a no-op, and each model adapter decides which reasons it can
+deliver. Qwen, Nemotron and JoyAI implement it. Showing a notice does not
+establish how a model behaves afterwards; validate that per model. Accepted
+results use their prepared candidate, while effective epoch cancellation uses
+`retire_pending_function_output` for queued work according to model policy.
+
+The ledger keeps a fingerprint (name plus canonical JSON arguments) of each
+pending, timed-out or cancelled call. A pending call needs this too: Qwen keeps
+tool pairs out of history until a result arrives, so the model sees an unanswered
+question on the next turn and asks again.
+`model_channel._expose_function_call` refuses a matching call before registering
+it, so a suppressed repeat uses no call budget and arms no timer. A repeat of a
+pending call gets no notice, because its result may still arrive. The ledger takes the session's `user_turn_seq` only when
+`function_call_retry_policy` is `user_turn` and the model declares
+`clears_function_call_block_on_user_commit`, because a commit is not always a user turn:
+JoyAI commits are camera observations and native models free-run. An entry stays
+blocking until that counter moves past the turn it was abandoned in.
+
+`function_call_interrupt_policy: keep` gives each record a mutable `admission_epoch`;
+`ToolCallOrigin` stays immutable. An epoch advance moves the epoch forward instead
+of settling the call, and admission and timeouts read it.
+
+JoyAI-VL-Interaction uses the same call book for a different decision shape. Its
+model emits an action token (`</response> <note> </delegation> <question>`), so
+`parse_function_call` reads a call the plugin itself projected, not a native tool
+schema, and the declared function is one opt-in `delegate` entry. A recognised
+call short-circuits the rest of that stage output, so the plugin projects the call
+alone and the spoken note on its own ordinary path; the note therefore still
+reaches the audio stage while the call is published. An accepted result never
+enters `session.history`. It becomes a `[Delegated Results]` block in later JoyAI
+prompts, and `has_pending_tool_followup` reports whether one is still waiting.
+JoyAI's interaction is chunk based: a result is carried by observations until a
+stored reply answers it, reused once inside the chunk that answered it, and
+expired when the turn that asked it is cancelled. The chunk id and the
+"a reply of it stored text" flag live in the session runtime config rather than on
+the plugin, because one plugin instance serves every session of a deployment.
+Every hook that the session installs returns the complete runtime, not just its
+own keys: the session replaces the whole config, so a partial return would drop
+the model's TTS and prompt settings.
+
+Nemotron's function-channel wire output is request-aligned. In runtime batches,the worker-provided spans select each request's last scheduled hidden row rather
+than CUDA-graph padding; the worker's payload split preserves that mapping for
+the session data plane. Intermediate prefill chunks expose no function token
+and keep empty slots in mixed batches. The final prefill chunk and decode frames
+can expose function tokens. Model-local postprocess feedback alone does not
+expose a client tool call. Forced feedback remains queued until an eligible
+frame's postprocess consumes it once.
+
+Turn plugins may bind their stage identities in `configure_pipeline` and select
+an append's entry with `input_stage_id(payload)` (default 0). The request context
+and orchestrator retain that entry stage. Session prompt preparation receives
+the request's complete `stage_sampling_params`, so a pipeline with an ASR prefix
+budgets the JoyAI prompt against JoyAI's generation settings. Session model config
+comes from the first tokenizer-owning stage, matching frontend comprehension
+ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
+enters ASR and carries the original observation context through the handoff.
+
+While idle, JoyAI retains the latest camera frame and one input chunk of audio
+pre-roll. Once speech starts, it keeps the utterance until commit. An idle
+camera commit enters JoyAI directly; reserved-byte accounting includes the
+pre-roll until the commit is consumed or rolled back.
+
+Completed input transcriptions travel with stage outputs through the runner
+mailbox. After checking the request fence, the runner updates the exact committed
+audio history item and emits its transcription event. The append captures the
+original native audio part before yielding and retains that identity on its
+request resource; a reused public item ID does not confer transcript ownership.
+Cancellation, item deletion or replacement cannot apply a late transcript to a
+newer turn.
+
+See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
+for the current plugin integrations and deployment configurations.
+
+## Heard-text history calibration
+
+With `ack_only`, the client reports how much output audio it played. Some
+models have no text-to-audio alignment for an interrupted reply, so the
+existing history policy may retain an empty assistant turn. Optional
+calibration estimates a prefix of that reply's original text before the next
+prompt is built. It remains experimental and disabled by default; configuration
+and strategy limitations are described in the
+[serving guide](../serving/realtime_duplex_api.md#optional-history-calibration-for-interrupted-qwen3-omni-replies).
+
+### Ownership and callback contract
+
+`DuplexModelPlugin.history_calibrator(runtime_config)` returns either `None`
+or a `HistoryCalibrationPolicy`. The plugin selects the strategy and declares
+whether it needs retained audio through `requires_audio`. The runner creates
+one `HistoryCalibration` controller per session on its own asyncio loop. The
+controller owns recordings, task deadlines and result versions;
+`DuplexEngineSession` owns the authoritative conversation and validates every
+writeback. The callback must yield during slow work and must not mutate session
+history.
+
+The async callback receives an immutable `HeardTextSnapshot`: response ID,
+original text, client-confirmed playback cutoff in milliseconds, and mono
+float32 PCM from the reply's start with its sample rate. A text-only policy
+receives empty PCM and a zero sample rate. `complete_audio_duration_ms` is
+present only after the final audio stage finishes; an interrupted generation's
+partial audio duration cannot estimate the rate of its complete text. The
+callback returns an exclusive character offset into the original text (`0`
+means an accepted empty prefix), or `None` to keep the existing policy. It
+never supplies replacement history text or an ASR transcript to insert.
+
+### Runtime sequence and guarded writeback
+
+1. `ModelChannel` records projected output in the controller. Under `ack_only`,
+   cancellation of a response or input, output-audio clearing, barge-in,
+   truncation and a final playback acknowledgement can trigger `request_ready()`.
+   Each prompt build also calls it through `before_prompt()`, re-evaluating
+   eligibility on every append. Only ended replies with a positive, partially
+   played cutoff are eligible; active replies and replies whose TTS still drains
+   wait.
+2. The controller captures the original text and cutoff, starts the callback
+   with `asyncio.wait_for`, and identifies the task's evidence by
+   `(text, cutoff, retained_audio_bytes)`. Changed evidence replaces the task;
+   unchanged evidence is not retried after failure. Callback failure, refusal
+   or timeout preserves the existing conservative history policy.
+3. Before freezing the stage request's runtime and preparing its conversation,
+   `ModelChannel._append_via_data_plane` awaits `before_prompt()`. This has one
+   `history_calibration_timeout_ms` budget (default 1000 ms) for all eligible
+   tasks, including replacements; replacement work does not extend it. At the
+   deadline, the controller revokes task ownership and cancels pending work.
+   The append then checks the session epoch and open state before continuing,
+   so cancellation or close during the wait cannot submit a stale prompt.
+   History and tool runtime are captured after the wait, so a calibration that
+   consumes a tool pair cannot leave that pair beside its stored answer in
+   the submitted prompt.
+4. A result may write back only while its controller is open, its task still
+   owns that response and its evidence version still matches. The session
+   additionally checks that the original response snapshot and conversation
+   item exist, the original text is unchanged, the offset is in range, and
+   the result's audio cutoff does not exceed the current permanent cutoff.
+   Accepted results replace text at the original assistant item's position in
+   history.
+   Deletion, replacement, stricter truncation and close therefore reject stale
+   results even if cancellation of an async callback arrives late.
+5. After an accepted writeback, the controller notifies the runner. If the
+   stored assistant item has nonempty text, the runner settles that response's
+   runtime as committed, just as a playback ACK does. Qwen then consumes its
+   tool pair without requiring another ACK. An empty prefix keeps the pair
+   available for a retry, including late ACKs after its evidence is retired.
+   Settlement runs outside the calibration-failure handler. A plugin failure
+   while settling a stored answer emits `tool_call_settlement_failed` and closes
+   that session; it cannot continue with history and tool runtime out of sync.
+
+### Evidence lifetime and limits
+
+The controller retains at most four replies and bounds retained PCM by
+`history_audio_max_bytes_per_session` (default 8 MiB). It drops whole replies
+rather than retaining a suffix that could be mistaken for audio starting at
+zero. Text-only calibration retains no PCM. The byte limit excludes temporary
+callback copies and does not bound the conversation's stored text.
+
+Eviction and item deletion discard recordings and revoke pending tasks. For an
+ended reply, `retire_history_calibration` also releases its original response
+snapshot, playback cursor and pending reconciliation state. A still-generating
+or draining reply defers retirement until its output no longer needs that
+state. The stored prefix and compact cutoff metadata remain with an undeleted
+conversation item. Late ACKs cannot expand a retired prefix; a later, stricter
+explicit truncation clears it conservatively because its alignment evidence
+has expired. Finishing calibration alone does not retire evidence that a
+stricter truncation may still need. Session close closes the controller,
+cancels its tasks and releases its recordings.
+
+## Serving
+
+`OmniDuplexSessionHandler.handle_realtime_session(websocket)`:
+
+1. accept; build the `RealtimeEnvelope` (autostart / default session from
+   query params, `event_id` correlation, error rendering through the typed
+   `ErrorEvent`);
+2. handshake: first message `session.update` -> `omni.open_session(session)`
+   (the id inside the payload is ignored; the allocated id is announced in
+   `session.created` together with `resume_token` / `attachment_generation`
+   when the model supports resume); `session.resume(session_id, resume_token,
+   last_received_server_event_seq)` -> `attachment.authenticate_resume` ->
+   `omni.resume_session`;
+3. reader loop: JSON -> `RealtimeEnvelope.translate` (`translate_realtime_command`
+   with the session's declared audio defaults) -> `handle.submit`;
+   envelope-level errors (invalid JSON, oversize frame, unknown type,
+   event acks) are answered locally;
+4. writer pump (session-scoped, survives reconnects): `async for ev in
+   handle.events(): attachment.send_event(ev.to_realtime())`, journaling
+   for replay until the journal overflows (`session.resync_required`);
+5. disconnect: a resumable session is detached (`attachment.detach` +
+   `omni.detach_session`, engine-owned grace); a superseded socket's
+   disconnect is a no-op; a non-resumable session is closed. Takeover sends
+   `session.replaced` to the old socket and closes it.
+
+## Validation
+
+- CPU suites: `tests/engine/duplex/**` (session, lease, manager, runner,
+  plugin, events, commands), `tests/engine/test_duplex_orchestrator.py`,
+  `tests/engine/test_duplex_omni_engine.py`,
+  `tests/entrypoints/test_duplex_omni.py`,
+  `tests/entrypoints/duplex/test_duplex_serving.py`,
+  `tests/entrypoints/openai/test_duplex_session_attachment.py`,
+  `tests/entrypoints/openai_api/test_duplex_api_server.py` (the duplex
+  server: pipeline probe, app state, routes, warmup gate),
+  `tests/entrypoints/duplex/test_duplex_warmup.py`,
+  `tests/entrypoints/duplex/test_startup_warmup.py`,
+  `tests/clients/**`, `tests/engine/test_duplex_import_boundary.py`,
+  `tests/model_executor/models/minicpmo_4_5/duplex/**`,
+  `tests/worker/test_native_duplex_hooks.py`.
+- Calibration CPU suites: `tests/engine/duplex/test_history_calibration.py`
+  covers cache eviction, live-suffix rejection and deferred retirement.
+  `tests/model_executor/models/qwen3_omni/test_history_integration.py` covers
+  task ownership, cancellation, prompt deadlines, failed-snapshot deduplication
+  and the calibrated history in the next submitted prompt. The remaining Qwen
+  `test_history_*.py` files cover prefix matching and token-rate estimates.
+- GPU: `examples/online_serving/minicpmo/realtime_duplex_demo.py` (one turn
+  over the websocket), `examples/online_serving/barge_in_client.py` (cancel
+  during playback; `--inline` drives the same scenario through
+  `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
+  (admission, resume, takeover, expiry).

@@ -56,13 +56,7 @@ class Audio8TTSAdapter(ARTTSAdapter):
             if not request.ref_text or not request.ref_text.strip():
                 return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
 
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     def apply_sampling_overrides(
         self,
@@ -97,9 +91,11 @@ class Audio8TTSAdapter(ARTTSAdapter):
         del sampling_params_list
         server = self.ctx.server
         ref_audio_data = None
+        tts_params: dict = {}
         if request.ref_audio is not None:
-            wav_list, sample_rate = await server._resolve_ref_audio(request.ref_audio)
+            wav_list, sample_rate, cache_key = await server._resolve_ref_audio(request.ref_audio)
             ref_audio_data = (wav_list, sample_rate)
+            tts_params["ref_audio_cache_key"] = cache_key
         # Prompt building tokenizes and, for voice clone, allocates tensors; keep
         # it off the event loop via the server's single-worker TTS executor.
         build_prompt = make_async(self._build_prompt, executor=server._tts_executor)
@@ -108,7 +104,6 @@ class Audio8TTSAdapter(ARTTSAdapter):
             ref_audio_data=ref_audio_data,
             has_inline_ref_audio=has_inline_ref_audio,
         )
-        tts_params: dict = {}
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
 

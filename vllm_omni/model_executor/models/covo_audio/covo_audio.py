@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2026 Tencent.
+from __future__ import annotations
+
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -21,17 +23,18 @@ from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseProcessingInfo,
-    ProcessorInputs,
     PromptReplacement,
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 # Max tokens per audio: Whisper 30s → 3000 mel frames → encoder 2x + adapter 8x = 16x → 188
 MAX_AUDIO_TOKENS = 188
@@ -93,20 +96,6 @@ class CovoAudioDummyInputsBuilder(BaseDummyInputsBuilder[CovoAudioProcessingInfo
         # allocates memory for the worst-case MAX_AUDIO_TOKENS (188) tokens.
         dummy_audio = np.zeros((16000 * 30,), dtype=np.float32)
         return {"audio": [(dummy_audio, 16000)] * num_audios}
-
-    def get_dummy_processor_inputs(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
-    ) -> ProcessorInputs:
-        dummy_text = self.get_dummy_text(mm_counts)
-        dummy_mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
-        dummy_mm_items = self.info.parse_mm_data(dummy_mm_data)
-        return ProcessorInputs(
-            prompt=dummy_text,
-            mm_data_items=dummy_mm_items,
-        )
 
 
 class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingInfo]):
@@ -186,7 +175,11 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
             )
 
         return [
-            PromptReplacement("audio", "<|cAUDIO|>", get_replacement),
+            PromptReplacement(
+                modality="audio",
+                target=[audio_token_id],
+                replacement=get_replacement,
+            ),
         ]
 
 
@@ -243,7 +236,7 @@ class CovoAudioForConditionalGeneration(
             else lambda *args, **kwargs: None
         )
 
-    def get_language_model(self) -> "nn.Module":
+    def get_language_model(self) -> nn.Module:
         """Return the language model for upstream MoE detection."""
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()

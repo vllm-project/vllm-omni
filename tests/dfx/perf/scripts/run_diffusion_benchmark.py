@@ -14,7 +14,7 @@ This runner separates two concepts:
 A config JSON file may be passed via --test-config-file. If omitted, every ``*.json`` under
 ``tests/dfx/perf/tests/`` is loaded and pytest ``-m`` filters by each case's ``mark``:
   pytest run_diffusion_benchmark.py -m "diffusion"
-  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 
 Optional JSON field ``mark`` is applied as pytest marks on that case via
 ``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).
@@ -43,6 +43,7 @@ import pytest
 
 from benchmarks.diffusion.backends import endpoint_filename_token, normalize_endpoint
 from tests.dfx.conftest import (
+    assert_baseline_within_tolerance,
     create_paired_benchmark_pytest_params,
     get_runtime_resource_label,
     hardware_json_value,
@@ -204,11 +205,11 @@ def load_diffusion_benchmark_configs(
 ) -> list[dict[str, Any]]:
     """Load one diffusion benchmark JSON, or merge all ``*.json`` under *config_dir*."""
     if config_path is not None:
-        configs = load_configs(config_path)
+        loaded = load_configs(config_path)
         source = str(Path(config_path).resolve())
-        for cfg in configs:
+        for cfg in loaded:
             cfg.setdefault(_DIFFUSION_SOURCE_CONFIG_KEY, source)
-        return configs
+        return loaded
     if config_dir is None:
         raise ValueError("load_diffusion_benchmark_configs requires config_path or config_dir")
     configs: list[dict[str, Any]] = []
@@ -231,7 +232,15 @@ if CONFIG_FILE_PATH is None:
         f"use -m to filter, e.g. -m diffusion)"
     )
 else:
-    BENCHMARK_CONFIGS = load_diffusion_benchmark_configs(CONFIG_FILE_PATH)
+    _loaded = load_diffusion_benchmark_configs(CONFIG_FILE_PATH)
+    BENCHMARK_CONFIGS = [cfg for cfg in _loaded if is_diffusion_perf_config(cfg)]
+    skipped = len(_loaded) - len(BENCHMARK_CONFIGS)
+    if skipped:
+        print(
+            f"--test-config-file: loaded {len(BENCHMARK_CONFIGS)} diffusion case(s); "
+            f"skipped {skipped} omni-bench generation case(s) "
+            f"(/v1/images/edits, /v1/images/generations, /v1/videos → run_benchmark.py)"
+        )
 
 _AGGREGATED_RESULT_FILES_BY_SOURCE: dict[str, Path] = {}
 
@@ -852,6 +861,7 @@ def run_benchmark(
         "stage_durations_p50": metrics.get("stage_durations_p50"),
         "stage_durations_p99": metrics.get("stage_durations_p99"),
         "commit_sha": _get_branchpoint_commit_sha(),
+        "branch": os.environ.get("BUILDKITE_BRANCH", ""),
         "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
         "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
         "source_file": source_file,
@@ -871,10 +881,24 @@ def run_benchmark(
 def assert_result(
     result: dict[str, Any],
     num_prompts: int,
+    *,
+    check_baseline: bool = False,
+    require_baseline: bool = False,
+    hardware: str | None = None,
 ) -> None:
-    """Assert that the expected number of requests completed."""
+    """Assert that the expected number of requests completed.
+
+    When ``check_baseline`` is set, metrics in the current hardware bucket must
+    stay within 10% of the sweep-resolved baseline in the worse direction.
+    """
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
+    if check_baseline or require_baseline:
+        label = hardware if isinstance(hardware, str) and hardware else result.get("Hardware")
+        baseline = result.get("baseline")
+        assert_baseline_within_tolerance(
+            result, baseline if isinstance(baseline, dict) else None, label, required=require_baseline
+        )
 
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
@@ -996,7 +1020,7 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
     paired_benchmark_params,
     indirect=["diffusion_server", "benchmark_params"],
 )
-def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
+def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, pytestconfig: pytest.Config):
     """Run the diffusion performance benchmark and verify request completion.
 
     One server is started per unique parallel configuration (module scope).
@@ -1044,4 +1068,10 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
             print(f"\n  Aggregated results: {_aggregated_result_file_for_source(str(source))}")
         print("=" * 60)
 
-        assert_result(result, sweep_run["num_prompts"])
+        assert_result(
+            result,
+            sweep_run["num_prompts"],
+            check_baseline=pytestconfig.getoption("assert_baseline"),
+            require_baseline=pytestconfig.getoption("require_baseline"),
+            hardware=hardware_json_value(get_runtime_resource_label()),
+        )

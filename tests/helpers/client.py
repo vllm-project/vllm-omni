@@ -58,6 +58,14 @@ def _parse_response_json(r: requests.Response) -> dict[str, Any] | list[Any] | N
     return None
 
 
+def _data_url_upload(data_url: str, stem: str) -> tuple[str, BytesIO, str]:
+    """Decode a base64 ``data:`` URL into a multipart ``(filename, file, content_type)`` tuple."""
+    header, encoded = data_url.split(",", 1)
+    content_type = header.split(";")[0].removeprefix("data:")
+    extension = content_type.split("/")[-1]
+    return f"{stem}.{extension}", BytesIO(base64.b64decode(encoded)), content_type
+
+
 def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
     """If ``extra_body`` has list ``height``/``width``, return one config per index (scalar h/w, ``num_outputs_per_prompt=1``)."""
     eb = cfg.get("extra_body")
@@ -97,11 +105,13 @@ def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[
 class OmniResponse:
     """Decoded multimodal / chat output from the OpenAI SDK or offline runner (not raw ``requests``)."""
 
+    request_id: str | None = None
     text_content: str | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
     audio_format: str | None = None
     audio_bytes: bytes | None = None
+    word_timestamps: list[dict[str, str | int]] | None = None
     #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before the
     #: OpenAI client call through response parsing and local post-process (e.g. audio decode).
     e2e_latency: float | None = None
@@ -134,6 +144,7 @@ class HttpResponse:
     success: bool
     error_message: str | None = None
     json_body: dict[str, Any] | list[Any] | None = None
+    content: bytes = b""
 
 
 @dataclass
@@ -269,8 +280,11 @@ class OpenPIWebSocketSession:
             raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: websockets") from exc
         try:
             from openpi_client import msgpack_numpy
-        except ImportError as exc:  # pragma: no cover - optional e2e dependency
-            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: openpi-client") from exc
+        except ImportError:
+            # Prefer the real library when it is installed. Otherwise use the
+            # standalone OpenPI codec. Do not call connection._pack/_unpack here:
+            # that round-trip accepts a wrong wire format.
+            from tests.helpers import openpi_msgpack as msgpack_numpy
         return websockets_client, msgpack_numpy
 
     def __init__(
@@ -363,6 +377,24 @@ def _merge_ws_expectation_kwargs(
     return cfg
 
 
+def _ws_error_code(jb: Mapping[str, Any]) -> Any:
+    """Read an error code from a WebSocket JSON frame.
+
+    Speech and video frames put ``code`` on the envelope. OpenAI Realtime nests
+    it under ``error`` (``{"type": "error", "error": {"code": "invalid_event"}}``).
+    The envelope wins when both differ; Realtime frames are expected to omit
+    top-level ``code`` (as in the Buildkite failure) so a stale envelope field
+    does not mask the nested code.
+    """
+    code = jb.get("code")
+    if code is not None:
+        return code
+    error = jb.get("error")
+    if isinstance(error, dict):
+        return error.get("code")
+    return None
+
+
 def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocketJsonResponse) -> None:
     jb = resp.json_body
     want_type = cfg.get("ws_json_type")
@@ -370,7 +402,7 @@ def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocke
         assert jb.get("type") == want_type, (jb, want_type)
     want_code = cfg.get("ws_error_code")
     if want_code is not None:
-        assert jb.get("code") == want_code, (jb, want_code)
+        assert _ws_error_code(jb) == want_code, (jb, want_code)
     err_message = cfg.get("err_message")
     if err_message is not None:
         assert_http_error(resp, err_message=err_message, websocket_json_message=True)
@@ -420,6 +452,8 @@ class OnlineOmniClient:
             text_content = ""
             audio_data = []
             for chunk in chat_completion:
+                if result.request_id is None:
+                    result.request_id = getattr(chunk, "id", None)
                 for choice in chunk.choices:
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     modality = getattr(chunk, "modality", None)
@@ -452,6 +486,7 @@ class OnlineOmniClient:
         """Wall clock from *before* ``chat.completions.create`` through response parse + local decode."""
         result = OmniResponse()
         try:
+            result.request_id = getattr(chat_completion, "id", None)
             audio_data = None
             text_content = None
             for choice in chat_completion.choices:
@@ -528,6 +563,7 @@ class OnlineOmniClient:
             success=ok,
             error_message=None if ok else (r.text[:8000] if r.text else None),
             json_body=payload,
+            content=r.content,
         )
 
     def send_health_http_request(
@@ -541,6 +577,7 @@ class OnlineOmniClient:
 
         ``request_config``: optional ``timeout`` plus optional ``err_code`` / ``err_message`` for
         :func:`~tests.helpers.assertions.assert_http_error` (also as keyword-only args).
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
         """
         cfg = _merge_http_expectation_kwargs(
             request_config,
@@ -549,11 +586,19 @@ class OnlineOmniClient:
         )
         r = requests.get(self._build_url("/health"), timeout=float(cfg.get("timeout", 120.0)))
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "GET /health expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_models_http_request(
@@ -589,7 +634,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """POST ``/v1/chat/completions`` with ``json`` or ``raw_body`` (malformed-body / contract tests)."""
+        """POST ``/v1/chat/completions`` with ``json`` or ``raw_body`` (malformed-body / contract tests).
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -597,11 +645,19 @@ class OnlineOmniClient:
         )
         r = self._post_json_endpoint("/v1/chat/completions", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "POST /v1/chat/completions expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_batched_chat_completions_http_request(
@@ -843,7 +899,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """POST ``/v1/images/generations`` — ``json`` or ``raw_body``, ``timeout``."""
+        """POST ``/v1/images/generations`` — ``json`` or ``raw_body``, ``timeout``.
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -851,16 +910,23 @@ class OnlineOmniClient:
         )
         r = self._post_json_endpoint("/v1/images/generations", cfg, default_timeout=300.0)
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
-        if cfg.get("err_code") is None:
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "POST /v1/images/generations expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
             assert resp.success, resp.error_message
             payload = resp.json_body
             assert isinstance(payload, dict)
             assert_images_generations_response(payload, cfg, run_level=self.run_level)
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_images_edits_http_request(
@@ -892,7 +958,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """POST ``/v1/videos`` (async job) — multipart ``data`` / ``files``."""
+        """POST ``/v1/videos`` (async job) — multipart ``data`` / ``files``.
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -900,11 +969,19 @@ class OnlineOmniClient:
         )
         r = self._post_form_endpoint("/v1/videos", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "POST /v1/videos expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_videos_sync_http_request(
@@ -963,7 +1040,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """GET ``/v1/videos/{video_id}``."""
+        """GET ``/v1/videos/{video_id}``.
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -977,11 +1057,19 @@ class OnlineOmniClient:
             timeout=timeout,
         )
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "GET /v1/videos/{video_id} expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_video_delete_http_request(
@@ -1419,6 +1507,9 @@ class OnlineOmniClient:
             result.success = True
             result.audio_format = getattr(response, "response", None)
             if result.audio_format is not None:
+                timestamps = result.audio_format.headers.get("X-Word-Timestamps")
+                if timestamps is not None:
+                    result.word_timestamps = json.loads(timestamps)
                 result.audio_format = result.audio_format.headers.get("content-type", "")
 
         except Exception as e:
@@ -1427,25 +1518,42 @@ class OnlineOmniClient:
 
         return result
 
-    def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_audio_speech_request(
+        self, request_config: dict[str, Any] | list[dict[str, Any]], request_num: int = 1
+    ) -> list[OmniResponse]:
         """
         Call the /v1/audio/speech endpoint using the same configuration-dict
         style as send_omni_request, but via the OpenAI Python client's
         audio.speech APIs.
 
-        Expected keys in request_config:
+        A list sends distinct requests concurrently and validates each response
+        against its own configuration. Results retain input order.
+
+        Expected keys in each request configuration:
           - model: model name/path (required)
           - input: text to synthesize (required)
           - response_format: audio format such as "wav" or "pcm" (optional)
           - task_type, ref_text, ref_audio: TTS-specific extras (optional, passed via extra_body)
           - min_audio_bytes: optional minimum ``len(audio_bytes)`` checked in ``assert_audio_speech_response``
           - transcript_expected_text: local expected spoken text; defaults to ``input``
+          - transcript_model: primary Whisper model for content checks; defaults to ``small``
+          - transcript_pcm_sample_rate: local-only opt-in to transcribe mono int16 PCM;
+            must be the actual output sample rate, also used for HNR
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
 
         For negative / contract checks (expected 4xx), use
         :meth:`send_audio_speech_http_request` with ``err_code`` / ``err_message``.
         """
+        if isinstance(request_config, list):
+            if not request_config:
+                raise ValueError("request_config list must not be empty")
+            if request_num != 1:
+                raise ValueError("request_num is not supported when request_config is a list")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_config)) as executor:
+                config_futures = [executor.submit(self.send_audio_speech_request, config) for config in request_config]
+                return [config_future.result()[0] for config_future in config_futures]
+
         timeout = float(request_config.get("timeout", 120.0))
 
         model = request_config["model"]
@@ -1463,15 +1571,18 @@ class OnlineOmniClient:
             "task_type",
             "ref_text",
             "ref_audio",
+            "extra_params",
             "language",
             "max_new_tokens",
             "seed",
             "instructions",
+            "duration_seconds",
             "speed",
             "sample_rate",
             "extra_params",
             "stream_format",
             "x_vector_only_mode",
+            "word_timestamps",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]
@@ -1708,6 +1819,9 @@ class OnlineOmniClient:
         """
         Send native /v1/videos requests: multipart ``form_data`` job create, poll until done, download content.
 
+        ``input_references`` is a list of ``data:`` URLs uploaded as repeated ``input_references``
+        parts, in order, for models whose ``extra_params`` refer to uploads by index.
+
         For raw HTTP to video routes without polling, use ``send_videos_create_http_request``, etc.
         """
         if request_num != 1:
@@ -1717,29 +1831,26 @@ class OnlineOmniClient:
         if not isinstance(form_data, dict):
             raise ValueError("Video request_config must contain 'form_data'")
         normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
-        files: dict[str, tuple[str, BytesIO, str]] = {}
+        files: list[tuple[str, tuple[str, BytesIO, str]]] = []
         image_reference = request_config.get("image_reference")
         video_reference = request_config.get("video_reference")
-        if image_reference and video_reference:
-            raise ValueError("Only one of image_reference or video_reference can be provided")
+        input_references = request_config.get("input_references") or []
+        if sum(bool(reference) for reference in (image_reference, video_reference, input_references)) > 1:
+            raise ValueError("Only one of image_reference, video_reference or input_references can be provided")
         if image_reference:
             if image_reference.startswith("data:image"):
-                header, encoded = image_reference.split(",", 1)
-                content_type = header.split(";")[0].removeprefix("data:")
-                extension = content_type.split("/")[-1]
-                file_data = base64.b64decode(encoded)
-                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+                files.append(("input_reference", _data_url_upload(image_reference, "reference")))
             else:
                 normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
         if video_reference:
             if video_reference.startswith("data:video"):
-                header, encoded = video_reference.split(",", 1)
-                content_type = header.split(";")[0].removeprefix("data:")
-                extension = content_type.split("/")[-1]
-                file_data = base64.b64decode(encoded)
-                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+                files.append(("input_reference", _data_url_upload(video_reference, "reference")))
             else:
                 normalized_form_data["video_reference"] = json.dumps({"video_url": video_reference})
+        for index, reference in enumerate(input_references):
+            if not reference.startswith("data:"):
+                raise ValueError(f"input_references[{index}] must be a data: URL")
+            files.append(("input_references", _data_url_upload(reference, f"reference_{index}")))
 
         result = DiffusionResponse()
         create_url = self._build_url("/v1/videos")

@@ -43,11 +43,111 @@ sufficient — no tensor parallelism is required.
 
 ## Hardware Support
 
-This recipe documents one tested 24 GB consumer-GPU configuration.
-Larger-VRAM (H20 / H100 / A100) and other vendor sections (ROCm, NPU) are
-welcome as community validation lands.
+This recipe documents tested single-card configurations for a 24 GB NVIDIA
+GPU and an Ascend Atlas A2.
+
+## Ascend NPU
+
+### 1 x Ascend 910B3 64GB (Atlas A2)
+
+VoxCPM2 runs on one Atlas A2 card with the standard deploy config. The model's
+LocDiT path uses eager PyTorch on NPU; keep `enforce_eager: true`. The default
+config enables fused QKV, fused gate/up projection, and the zero-delta-time
+cache for this path.
+
+#### Environment
+
+- Hardware: 1 x Ascend 910B3 64GB (Atlas A2)
+- Container: `quay.nju.edu.cn/ascend/vllm-omni:v0.28.0`
+- vLLM: 0.28.0
+- vLLM-Omni: current `main`
+- Model: `openbmb/VoxCPM2`, bfloat16
+
+#### Command
+
+Expose one physical NPU to the container, then start the server normally. The
+visible card is addressed as logical device `0` by `voxcpm2.yaml`.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=5
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+vllm serve /path/to/VoxCPM2 --omni \
+    --host 0.0.0.0 --port 8000
+```
+
+#### Performance validation
+
+The component timer was measured after model warmup with a single Chinese TTS
+request. Each decode step executes nine LocDiT estimator calls, so per-step
+measurements compare the same amount of model work even when generated audio
+duration differs.
+
+| path | CFM estimator / call | decode / step | forward / step |
+| ---- | -------------------- | ------------- | -------------- |
+| Before (optimization flags skipped on NPU) | 18.84 ms | 193.86 ms | 265.35 ms |
+| Fused QKV + fused MLP + zero-dt cache | 17.50 ms | 182.22 ms | 254.07 ms |
+| Above + experimental reduced-precision RoPE | 14.93 ms | 157.36 ms | 227.33 ms |
+
+The default fused path reduces CFM estimator latency by about **7.1%** and
+complete decode-step latency by **6.0%**. Its generated WAV was byte-identical
+to the pre-optimization baseline. Setting
+`enable_loc_dit_fast_rope: true` can increase the reductions to about **20.8%**
+and **18.8%**, respectively, but changes the recurrent acoustic state and is
+therefore an opt-in quality/performance tradeoff. Its test audio was valid 48
+kHz mono PCM with finite samples and no clipping; evaluate voice quality on a
+representative corpus before enabling it in production.
+
+Do not set `enforce_eager: false` for VoxCPM2 on Ascend yet. ACL Graph captures
+the language-model runner, but the request-owned VoxCPM2 state has dynamic
+prefill/decode shapes; replay can therefore feed an empty captured row into a
+non-empty residual state and fail at `aclnnCat`.
 
 ## GPU
+
+### Concurrency tuning
+
+The bundled deploy config keeps `max_num_seqs: 8` and
+`unified_decode_graph_max_batch_size: 8` as the latency-oriented defaults.
+For a throughput-oriented workload with many concurrent clients, evaluate
+`max_num_seqs: 32` as an opt-in setting in a local copy of
+[`voxcpm2.yaml`](../../vllm_omni/deploy/voxcpm2.yaml), then pass that file with
+`--deploy-config /path/to/voxcpm2-throughput.yaml`. Keep the other settings
+unchanged for the initial comparison. This is a tuning candidate, not a
+recommended default for every GPU or workload.
+
+The scheduler can defer new admissions during decode, but does not split an
+already-running batch to fit the unified decode graph maximum. A higher
+admission limit can therefore increase streaming audio chunk intervals and
+end-to-end latency even when aggregate audio throughput improves. Audio chunk
+intervals measure emitted audio, not per-step inter-token latency (ITL).
+
+In the [reported RTX 3090 comparison](https://github.com/vllm-project/vllm-omni/pull/5071#issuecomment-5618173455),
+30 measured runs completed 752 requests across short text, long text, and
+reference-audio workloads. At client concurrency 32, the report found roughly
+33–47% higher audio throughput with the larger admission limit, alongside
+6–11% higher median end-to-end latency and typical audio chunk intervals of
+325–335 ms instead of about 120 ms. At client concurrency 1 and 8, it found
+no consistent throughput benefit. These measurements used an older checkout
+on one RTX 3090; they are not validation of current main, H100 CI, or a fix
+for the concurrency-8 CI regression.
+
+Before selecting a setting, compare identical requests at your expected client
+concurrency, warm up both configurations, and repeat measured runs. Include
+long inputs and reference audio when relevant. Record the model and software
+revisions, GPU, successful requests, peak memory, audio throughput, time to
+first audio, end-to-end latency, and streaming chunk intervals. Derive audio
+duration from the actual output sample rate (VoxCPM2 emits 48 kHz), and choose
+the setting that meets your latency and memory requirements.
+
+The pinned 6 GiB KV cache is a separate budget from diffusion and AudioVAE
+memory. For the BF16 configuration used in that report, the theoretical KV
+footprint is `2 (K/V) × (28 backbone + 8 residual layers) × 2 KV heads × 128
+head dimension × 2 bytes = 36 KiB/token`. Thus `6 × 1024³ / 36864` is about
+175k tokens before block alignment and runtime overhead. Recheck the actual
+model configuration and runtime-reported capacity when changing model,
+context length, concurrency, or prefix caching. This estimate guarantees
+neither total GPU memory fit nor throughput or latency.
 
 ### 1 x RTX 4090 24GB (Single GPU, Minimum Recommended)
 
@@ -85,11 +185,17 @@ The deploy config at
 is loaded automatically by the model registry (HF `model_type=voxcpm2`).
 Pass `--deploy-config <path>` to override.
 
+The `engine_extras.hf_overrides.voxcpm2_runtime_config` section controls
+LocDiT CFM generation. `inference_timesteps`, `cfg_value`, and
+`cfg_cutoff_ratio` default to `10`, `2.0`, and `1.0`, respectively.
+`inference_timesteps` is clamped to at least `2`: with CFG-Zero*, a single
+step would skip all estimator calls and return the initial noise.
+
 #### Verification
 
 **Server cold-start**: ~60 s from `vllm serve` to `Application startup
-complete` (subprocess fork + vLLM 0.21 init + model load + flashinfer JIT
-+ torch.compile of LocDiT / feat_encoder / AudioVAE + CUDA-Graph warmup).
+complete` (subprocess fork, vLLM 0.21 init, model load, flashinfer JIT,
+torch.compile of LocDiT / feat_encoder / AudioVAE, and CUDA-Graph warmup).
 The first request after startup pays a small additional cost; steady-state
 requests are much faster.
 
@@ -199,7 +305,7 @@ after a one-off ~28 s engine init:
 | ---- | -------- | --------- | ----- | ------------------------------------------------ |
 | #1   | 6.72 s   | 11.97 s   | 1.782 | cold: torch.compile + CUDA-Graph capture         |
 | #2   | 6.24 s   | 11.43 s   | 1.831 | still runtime warmup                             |
-| #3   | 6.88 s   | 0.82 s    | 0.120 | ⚡ steady-state                                   |
+| #3   | 6.88 s   | 0.82 s    | 0.120 | steady-state                                     |
 | #4   | 6.56 s   | 0.78 s    | 0.119 | steady-state                                     |
 | #5   | 5.76 s   | 0.70 s    | 0.121 | steady-state                                     |
 
@@ -231,7 +337,7 @@ Same 5-call methodology as the zero-shot table, this time with a
 | ---- | -------- | --------- | ----- | ------------------------------------------------ |
 | #1   | 5.44 s   | 12.38 s   | 2.276 | cold: compile + CUDA-Graph capture + ref encode  |
 | #2   | 5.12 s   | 2.47 s    | 0.482 | most warmup done                                 |
-| #3   | 5.44 s   | 0.76 s    | 0.139 | ⚡ steady-state                                   |
+| #3   | 5.44 s   | 0.76 s    | 0.139 | steady-state                                     |
 | #4   | 4.96 s   | 0.68 s    | 0.137 | steady-state                                     |
 | #5   | 5.28 s   | 0.71 s    | 0.134 | steady-state                                     |
 

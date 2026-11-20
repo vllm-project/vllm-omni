@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from __future__ import annotations
+
 import gc
+import hashlib
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+import msgspec
 import numpy as np
 import regex as re
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from PIL import Image
 from torch import nn
@@ -27,7 +32,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.inputs import MultiModalDataDict
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs import MultiModalDataDict, MultiModalHashes, MultiModalInput
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
@@ -73,18 +79,18 @@ from vllm.multimodal.parse import (
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseProcessingInfo,
+    ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.multimodal.processing.context import TimingContext
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
-from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY, RandomDrawSpec, RequestRNGProvider
 from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
     HunYuanMLP,
     HunYuanModel,
@@ -95,7 +101,15 @@ from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import 
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.sampler import Sampler as MRv2Sampler
+
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
+    from vllm_omni.model_executor.models.hunyuan_image3.ar_sampler import HunyuanImage3ARSampler
+
 logger = init_logger(__name__)
+
+HUNYUAN_VAE_RNG_POLICY = "hunyuan-ar-vae-v1"
 
 
 @support_torch_compile(
@@ -1031,6 +1045,34 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
 class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3ProcessingInfo]):
     """Multimodal processor for HunyuanImage3 model."""
 
+    @staticmethod
+    def _validate_vae_generator_seed(seed: object) -> int:
+        # The per-image transport field is torch.long, even on platforms whose
+        # Generator also accepts unsigned 64-bit seeds.
+        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or not -(2**63) <= seed < 2**63:
+            raise VLLMValidationError("Hunyuan vae_generator_seed must be a signed 64-bit integer")
+        return int(seed)
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx: TimingContext) -> MultiModalInput:
+        seed = inputs.hf_processor_mm_kwargs.get("vae_generator_seed")
+        if seed is not None:
+            self._validate_vae_generator_seed(seed)
+        return super().apply(inputs, timing_ctx)
+
+    def _get_mm_hashes(self, inputs: ProcessorInputs) -> MultiModalHashes:
+        hashes = super()._get_mm_hashes(inputs)
+        if inputs.hf_processor_mm_kwargs.get("vae_generator_seed") is None:
+            return hashes
+        # Upstream already hashes the seed and processor kwargs. Extend each
+        # image's identity with the preceding draws before cache lookup. This
+        # scopes both processor and encoder caches to the reference prefix.
+        prefix = b""
+        image_hashes = []
+        for image_hash in hashes.get("image", ()):
+            prefix = hashlib.sha256(msgspec.msgpack.encode((HUNYUAN_VAE_RNG_POLICY, prefix, image_hash))).digest()
+            image_hashes.append(f"{HUNYUAN_VAE_RNG_POLICY}:{prefix.hex()}")
+        return {**hashes, "image": image_hashes}
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -1046,6 +1088,29 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
         if vae_generator_seed is not None and images:
             batch_feature["vae_generator_seed"] = torch.full((len(images),), int(vae_generator_seed), dtype=torch.long)
         return batch_feature
+
+    def _apply_hf_processor_main(self, mm_items: MultiModalDataItems, hf_kwargs: Mapping[str, object]) -> BatchFeature:
+        result = super()._apply_hf_processor_main(mm_items, hf_kwargs)
+        seed = hf_kwargs.get("vae_generator_seed")
+        num_images = mm_items.get_count("image", strict=False)
+        if seed is None or num_images == 0:
+            return result
+        # Validate before field splitting and LRU/SHM writes. At this point
+        # metadata includes passthrough values and the uncached image count is known.
+        for name, shape in (("vae_generator_seed", (num_images,)), ("vae_token_grid_hw", (num_images, 2))):
+            value = result.get(name)
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.device.type != "cpu"
+                or value.dtype != torch.long
+                or value.shape != shape
+            ):
+                raise VLLMValidationError(f"Hunyuan {name} must be a CPU int64 tensor with shape {shape}")
+        if not bool((result["vae_generator_seed"] == seed).all()):
+            raise VLLMValidationError("Hunyuan vae_generator_seed must match the request seed")
+        if not bool((result["vae_token_grid_hw"] > 0).all()):
+            raise VLLMValidationError("Hunyuan vae_token_grid_hw must contain positive dimensions")
+        return result
 
     def _get_mm_fields_config(
         self,
@@ -1068,13 +1133,13 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
         if "vae_pixel_size" in hf_inputs:
             config["vae_pixel_size"] = MultiModalFieldConfig.batched("image")
         if "vae_token_grid_hw" in hf_inputs:
-            config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image")
+            config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
         if "base_size" in hf_inputs:
             config["base_size"] = MultiModalFieldConfig.batched("image")
         if "ratio_index" in hf_inputs:
             config["ratio_index"] = MultiModalFieldConfig.batched("image")
         if "vae_generator_seed" in hf_inputs:
-            config["vae_generator_seed"] = MultiModalFieldConfig.batched("image")
+            config["vae_generator_seed"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
         return config
 
     def _get_prompt_updates(
@@ -1444,10 +1509,40 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     - Tensor Parallelism
     """
 
-    HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
+    supports_mm_request_rng = True
+    mm_rng_seed_field = "vae_generator_seed"
+    _mm_rng_provider: RequestRNGProvider | None = None
 
-    prefer_model_sampler = True
-    logitsprocs_need_output_token_ids = True
+    def bind_mm_rng_provider(self, provider: RequestRNGProvider) -> None:
+        self._mm_rng_provider = provider
+
+    def get_mm_rng_specs(self, features: list[MultiModalFeatureSpec], seed: int) -> dict[int, RandomDrawSpec]:
+        specs = {}
+        for index, feature in enumerate(features):
+            if feature.modality != "image":
+                continue
+            data = feature.data
+            if data is None or "vae_token_grid_hw" not in data or "vae_generator_seed" not in data:
+                raise ValueError("Seeded Hunyuan requests require VAE metadata for every reference image")
+            if int(data["vae_generator_seed"].data.item()) != seed:
+                raise ValueError("VAE image seed does not match the request seed")
+            token_h, token_w = data["vae_token_grid_hw"].data.tolist()
+            h = token_h * self.config.vae_downsample_factor[0] * self.config.patch_size
+            w = token_w * self.config.vae_downsample_factor[1] * self.config.patch_size
+            factor = self.vae.ffactor_spatial
+            if h % factor or w % factor:
+                raise ValueError("VAE reference image dimensions must align with the spatial downsample factor")
+            shape = (1, self.config.vae["latent_channels"], 1, h // factor, w // factor)
+            specs[index] = RandomDrawSpec(shape, self.vae.dtype, self.vae.device)
+        return specs
+
+    @staticmethod
+    def advance_mm_rng(generator: torch.Generator, spec: RandomDrawSpec) -> None:
+        # Match DiagonalGaussianDistribution.sample exactly, including dtype
+        # and shape-dependent CUDA RNG consumption. No VAE forward is needed.
+        randn_tensor(spec.shape, generator=generator, dtype=spec.dtype, device=spec.device)
+
+    HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
     # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
     # weights are replicated and the image batch is sharded across TP ranks.
@@ -1536,7 +1631,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # Used to embed timestep information into the input sequence.
         self.timestep_emb = TimestepEmbedder(hidden_size=config.hidden_size)
 
-        tokenizer = get_tokenizer(vllm_config.model_config.tokenizer)
+        tokenizer = get_tokenizer(
+            vllm_config.model_config.tokenizer,
+            trust_remote_code=vllm_config.model_config.trust_remote_code,
+        )
         self._mrope_img_token_id = tokenizer.convert_tokens_to_ids("<img>")
         self._mrope_boi_token_id = tokenizer.convert_tokens_to_ids("<boi>")
         self._mrope_eoi_token_id = tokenizer.convert_tokens_to_ids("<eoi>")
@@ -1557,31 +1655,48 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
         ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
         ratio_36 = tokenizer.convert_tokens_to_ids("<img_ratio_36>")
-        self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
+        # The base checkpoint stops at <img_ratio_32>; only Instruct has 33-36.
+        if ratio_33 is None or ratio_36 is None:
+            self._ratio_other_slices = []
+        else:
+            self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
         # Build the full set of ratio token IDs for use as stop tokens.
         self._all_ratio_ids = set(range(self._start_ratio_id, self._end_ratio_id + 1))
         for s, e in self._ratio_other_slices:
             self._all_ratio_ids.update(range(s, e))
 
         # Determine mode: comprehension (I2T/T2T) vs generation (IT2I/T2I).
+        # ``engine_output_type`` is a per-engine static (from the pipeline
+        # registry), but a generation deployment (e.g. the AR+DiT
+        # hunyuan_image_3_moe pipeline, engine_output_type="latent") also
+        # serves plain chat completions whose answer is text (I2T/T2T).
+        # Those requests are marked per-request via
+        # ``SamplingParams.extra_args["ar_task_mode"] == "comprehension"``
+        # by the serving layer and must not go through the image-generation
+        # stage transitions below (#6088).
         engine_output_type = getattr(vllm_config.model_config, "engine_output_type", None)
         self._is_comprehension = engine_output_type in (None, "text")
 
-        # For comprehension mode, block image generation tokens but allow
+        # For comprehension requests, block image generation tokens but allow
         # text structure tokens (<think>, <answer>, etc.) so the model can
         # follow its natural generation pattern. Runtime sampling params
         # decide stop tokens from the active bot_task, matching the official
         # HunyuanImage3 generation path without hard-coded YAML token ids.
-        self._blocked_token_ids: set[int] = set()
-        if self._is_comprehension:
-            self._blocked_token_ids.update(
-                [
-                    self._mrope_boi_token_id,  # <boi>
-                    self._mrope_eoi_token_id,  # <eoi>
-                    self._size_token_id,  # <img_size_*>
-                ]
-            )
-            self._blocked_token_ids.update(self._all_ratio_ids)
+        # <cfg>, <img>, <timestep> and <joint_img_sep> are DiT-side scaffold
+        # tokens that are never valid in a text answer; without them in the
+        # blocklist an I2T request can degenerate into a stream of <cfg>
+        # tokens (#6088).
+        self._cfg_token_id = tokenizer.convert_tokens_to_ids("<cfg>")
+        self._blocked_token_ids: set[int] = {
+            self._mrope_boi_token_id,  # <boi>
+            self._mrope_eoi_token_id,  # <eoi>
+            self._size_token_id,  # <img_size_*>
+            self._cfg_token_id,  # <cfg>
+            self._mrope_img_token_id,  # <img>
+            self._timestep_token_id,  # <timestep>
+            self._mrope_joint_img_sep_token_id,  # <joint_img_sep>
+        }
+        self._blocked_token_ids.update(self._all_ratio_ids)
 
         # For generation mode, build stage transition map.
         # Official logic: </think> → [<recaption>],
@@ -1599,12 +1714,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 self._size_token_id,
             ]
 
-        self._sampler: Sampler | None = None
         self._eos_token_id: int = tokenizer.eos_token_id
-        # Lazily built on first sample() call so we can pick up logits.device
-        # without guessing during init. See `sample()` for the comprehension
-        # fast path that uses this.
-        self._blocked_token_ids_tensor: torch.Tensor | None = None
 
         self._replace_rotary_embeddings()
         self._patch_moe_blocks()
@@ -1776,7 +1886,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self,
         images: torch.Tensor,
         cfg_factor: int = 1,
-        generator: torch.Generator | None = None,
+        rng_item: tuple[int, int] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """
         Encode images through VAE encoder.
@@ -1796,7 +1906,15 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
-        latents = vae_encode_result.latent_dist.sample(generator)
+        posterior = vae_encode_result.latent_dist
+        if rng_item is None:
+            latents = posterior.sample()
+        else:
+            if self._mm_rng_provider is None:
+                raise ValueError("Seeded VAE sampling requires a Runner RNG provider")
+            spec = RandomDrawSpec(tuple(posterior.mean.shape), posterior.parameters.dtype, posterior.parameters.device)
+            with self._mm_rng_provider.sample(*rng_item, spec) as request_generator:
+                latents = posterior.sample(request_generator)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:
@@ -1918,6 +2036,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         """Get multimodal embeddings from input."""
+        rng_items = kwargs.pop(MM_RNG_ITEM_KEY, None)
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
@@ -1929,11 +2048,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
         vae_pixel_values = pixel_values["vae_pixel_values"]
         vae_generator_seed = pixel_values.get("vae_generator_seed")
-        vae_generator = None
-        if vae_generator_seed is not None and vae_generator_seed.numel() > 0:
-            vae_generator = torch.Generator(device=vae_pixel_values[0].device).manual_seed(
-                int(vae_generator_seed.reshape(-1)[0].item())
-            )
+        if vae_generator_seed is not None:
+            if vae_generator_seed.numel() != len(vae_pixel_values):
+                raise ValueError("VAE seeds must align with the reference images")
+            if not isinstance(rng_items, torch.Tensor) or rng_items.shape != (len(vae_pixel_values), 2):
+                raise ValueError("Seeded VAE sampling requires aligned request RNG context from the Omni Runner")
+            rng_items = rng_items.tolist()
+        elif rng_items is not None:
+            raise ValueError("VAE RNG context requires an explicit processor seed")
 
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
@@ -1941,8 +2063,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # VAE encode + patch_embed per image — each cond image is at its own
         # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
-        for vae_image_i in vae_pixel_values:
-            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, generator=vae_generator)
+        for i, vae_image_i in enumerate(vae_pixel_values):
+            rng_item = tuple(rng_items[i]) if rng_items is not None else None
+            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, rng_item=rng_item)
             t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
@@ -2019,9 +2142,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        sampling_metadata: SamplingMetadata | None = None,
-        logits_index: int | None = None,
-        sampler=None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         model_input_ids = None if inputs_embeds is not None else input_ids
@@ -2050,108 +2170,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     #      restrict vocab to ratio tokens only (greedy).
     # ------------------------------------------------------------------
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> SamplerOutput | None:
-        if logits is None or logits.numel() == 0:
-            return None
+    def mrv2_custom_sampler(self, sampler: MRv2Sampler) -> tuple[HunyuanImage3ARSampler, None]:
+        from vllm_omni.model_executor.models.hunyuan_image3.ar_sampler import HunyuanImage3ARSampler
 
-        if self._sampler is None:
-            self._sampler = Sampler()
-
-        min_score = torch.finfo(logits.dtype).min
-
-        if self._is_comprehension:
-            # Comprehension path is stateless: we only need to mask a fixed
-            # set of blocked token ids on every step. Do it in one batched
-            # index_fill_ instead of a per-(req, id) Python loop of scalar
-            # GPU writes, and skip reading `output_token_ids` from CPU
-            # (unused here) so this branch never forces a D2H sync.
-            if self._blocked_token_ids_tensor is None and self._blocked_token_ids:
-                self._blocked_token_ids_tensor = torch.tensor(
-                    sorted(self._blocked_token_ids),
-                    dtype=torch.long,
-                    device=logits.device,
-                )
-            if self._blocked_token_ids_tensor is not None:
-                logits.index_fill_(-1, self._blocked_token_ids_tensor, min_score)
-            return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
-
-        # Generation path retains the per-request stateful logic for forced
-        # stage-transition tokens and ratio-restriction.
-        for req_idx in range(logits.shape[0]):
-            decoded_tokens: list[int] = (
-                sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
-            )
-            last_token = decoded_tokens[-1] if decoded_tokens else -1
-
-            forced = self._get_forced_token(decoded_tokens)
-            if forced is not None:
-                logits[req_idx].fill_(min_score)
-                logits[req_idx, forced] = 0
-            elif last_token == self._size_token_id:
-                self._apply_ratio_restriction(logits, req_idx, min_score)
-            elif last_token in self._all_ratio_ids:
-                logits[req_idx].fill_(min_score)
-                logits[req_idx, self._eos_token_id] = 0
-
-        return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
-
-    def _get_forced_token(self, decoded_tokens: list[int]) -> int | None:
-        """Derive the next forced token from output history (stateless).
-
-        Scans decoded_tokens backwards for the most recent trigger token,
-        then prefix-matches the forced sequence against what followed.
-        Returns the next token to force, or None if the sequence is complete
-        or history has diverged from the expected forced sequence.
-        """
-        for i in range(len(decoded_tokens) - 1, -1, -1):
-            trigger = decoded_tokens[i]
-            if trigger not in self._stage_transitions:
-                continue
-
-            forced_seq = self._stage_transitions[trigger]
-            emitted = decoded_tokens[i + 1 :]
-
-            matched = 0
-            for expected, actual in zip(forced_seq, emitted):
-                if actual != expected:
-                    # History diverged from the expected forced sequence.
-                    # Stop applying transition forcing for safety.
-                    return None
-                matched += 1
-
-            if matched < len(forced_seq):
-                return forced_seq[matched]
-            return None
-
-        return None
-
-    def _apply_ratio_restriction(
-        self,
-        logits: torch.Tensor,
-        req_idx: int,
-        min_score: float,
-    ) -> None:
-        """Port of official _ConditionalSliceVocabLogitsProcessor.__call__.
-
-        After the size token, only allow ratio tokens and pick greedily.
-        """
-        original = logits[req_idx].clone()
-        logits[req_idx].fill_(min_score)
-        # Allow primary ratio range.
-        logits[req_idx, self._start_ratio_id : self._end_ratio_id + 1] = original[
-            self._start_ratio_id : self._end_ratio_id + 1
-        ]
-        # Allow extra ratio slices.
-        for s, e in self._ratio_other_slices:
-            logits[req_idx, s:e] = original[s:e]
-        # Force greedy: keep only the argmax.
-        max_id = logits[req_idx].argmax().item()
-        logits[req_idx].fill_(min_score)
-        logits[req_idx, max_id] = 0
+        if self.vllm_config.speculative_config is not None:
+            raise NotImplementedError("HunyuanImage3 AR on MRv2 requires speculative decoding to be disabled")
+        return HunyuanImage3ARSampler(sampler, self), None
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
@@ -2178,6 +2202,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
         return loaded_params
+
+    @staticmethod
+    def get_weight_sharing_adapter() -> WeightSharingAdapter:
+        """Return the model-specific shared-weight operations used by the runner."""
+        from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
+
+        return hunyuan_image3
 
     def get_language_model(self) -> torch.nn.Module:
         return self.model

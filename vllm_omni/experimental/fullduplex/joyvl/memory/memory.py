@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -107,8 +107,9 @@ def _resize_data_url(data_url: str, max_pixels: int) -> str:
         return data_url
     try:
         from PIL import Image
+        from vllm.multimodal.image import open_image
 
-        img = Image.open(io.BytesIO(base64.b64decode(match.group(1))))
+        img = open_image(io.BytesIO(base64.b64decode(match.group(1))))
         w, h = img.size
         if w * h <= max_pixels:
             return data_url

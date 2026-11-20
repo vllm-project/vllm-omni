@@ -5,7 +5,8 @@
             {
                 "hardware_marks": {
                     "res": {
-                        "cuda": "H800"
+                        "cuda": "H800",
+                        "npu": "A3"
                     },
                     "num_cards": 2
                 }

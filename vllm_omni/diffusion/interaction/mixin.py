@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, cast
 
+from vllm_omni.diffusion.interaction.types import synchronized_monotonic_time
 from vllm_omni.diffusion.models.interface import SupportsInteractionApply
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -35,18 +35,24 @@ class InteractionMixin:
                 "onto the pipeline before chunked generation"
             )
 
-        num_frames: int | None = None
+        num_media_frames: int | None = None
         fps: float | None = None
+        num_latent_frames: int | None = None
         if self._interaction_coordinator.needs_chunk_media:
             media = cast(SupportsInteractionApply, self).peek_chunk_media(state)
-            num_frames = media.num_frames
+            num_media_frames = media.num_media_frames
             fps = media.fps
+            num_latent_frames = media.num_latent_frames
 
+        context = state.interaction_boundary
+        if getattr(state.sampling, "streaming_buffer_seconds", None) is not None and context is None:
+            raise ValueError("paced interactions require an engine-owned boundary")
         merged = self._interaction_coordinator.apply_at_chunk_boundary(
             state,
-            boundary_at=time.monotonic(),
-            num_frames=num_frames,
+            boundary_at=context.boundary_at if context is not None else synchronized_monotonic_time(),
+            num_media_frames=num_media_frames,
             fps=fps,
+            num_latent_frames=num_latent_frames,
         )
         state.interaction_chunk_metadata = merged
 

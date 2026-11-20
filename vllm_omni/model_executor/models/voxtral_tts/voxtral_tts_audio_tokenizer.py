@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import math
@@ -50,9 +50,6 @@ if not HAS_FLASH_ATTN:
     )
 
 weight_norm = torch.nn.utils.parametrizations.weight_norm
-
-
-CODEC_NORM_EPS = 1e-2
 
 
 @dataclass
@@ -900,6 +897,10 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         """List of size of each codebook"""
         return self.quantizer.codebook_sizes
 
+    @property
+    def encoder_loaded(self) -> bool:
+        return self._encoder_loaded
+
     def load_weight(self, weight: tuple[str, torch.Tensor]) -> str:
         params_dict = dict(self.named_parameters())
         name, loaded_weight = weight
@@ -985,7 +986,7 @@ class VoxtralTTSAudioTokenizer(nn.Module):
 
     def encode_waveforms(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
         if not self._encoder_loaded:
-            raise RuntimeError(
+            raise ValueError(
                 "encode_waveforms requires encoder weights which are not available in the open-source checkpoint."
             )
         audio_codes = []
@@ -1094,7 +1095,8 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         padded = pad_sequence(all_chunks, batch_first=True, padding_value=0.0)
 
         audio_codes = padded.to(device=current_omni_platform.device_type)  # [B, T, K]
-        audio_values = self.decode(audio_codes.transpose(1, 2), dtype=torch.bfloat16)  # [B, 1, T_out]
+        decoder_dtype = next(self.decoder_blocks.parameters()).dtype
+        audio_values = self.decode(audio_codes.transpose(1, 2), dtype=decoder_dtype)  # [B, 1, T_out]
         audio_values = audio_values.detach().cpu().float().squeeze(1)  # [B, T_out]
         # Gate min/max reductions behind logger level.
         if logger.isEnabledFor(logging.WARNING):

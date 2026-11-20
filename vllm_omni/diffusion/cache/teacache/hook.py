@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Hook-based TeaCache implementation for vLLM-Omni.
@@ -23,8 +23,32 @@ from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_sp_group,
+    is_cfg_group_initialized,
+    model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
+
+
+def _average_l1_stats_across_sp(mean_diff: torch.Tensor, mean_prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Average TeaCache L1 stats across sequence-parallel ranks.
+
+    Skip vs compute must be identical on every rank that participates in
+    transformer SP collectives. Sequence shards otherwise produce different
+    local means and deadlock. TP is not included: the residual TeaCache reads
+    is replicated across TP ranks. CFG/DP ranks are also excluded: they do
+    not share those collectives.
+    """
+    if not model_parallel_is_initialized():
+        return mean_diff, mean_prev
+
+    sp_group = get_sp_group()
+    if sp_group.world_size <= 1:
+        return mean_diff, mean_prev
+
+    stats = torch.stack((mean_diff.detach(), mean_prev.detach()))
+    stats = sp_group.all_reduce(stats) / sp_group.world_size
+    return stats[0], stats[1]
 
 
 class TeaCacheHook(ModelHook):
@@ -117,21 +141,19 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
-        # Set context based on CFG branch for separate state tracking
-        # With CFG-parallel, each rank processes only one branch:
-        #   - cfg_rank 0: positive branch
-        #   - cfg_rank > 0: negative branch
-        # Without CFG-parallel, branches alternate within a single rank
-        if getattr(module, "do_true_cfg", False):
-            cfg_parallel_size = get_classifier_free_guidance_world_size()
-            if cfg_parallel_size > 1:
-                cfg_rank = get_classifier_free_guidance_rank()
-                cache_branch = "negative" if cfg_rank > 0 else "positive"
-            else:
-                # No CFG-parallel: use forward counter to alternate branches
-                cache_branch = "negative" if self._forward_cnt % 2 == 1 else "positive"
-        else:
-            cache_branch = "positive"
+        # Set context based on CFG branch for separate state tracking.
+        # Explicit sources win, most specific first:
+        #   1. the extractor's per-call hint, ctx.extra_states["teacache_branch"]
+        #      (MammothModa2 passes it through its forward kwargs);
+        #   2. module.cfg_branch, stamped by CFGParallelMixin on every call it
+        #      makes, which stays correct when non-CFG forwards are interleaved
+        #      (step execution).
+        # Callers that provide neither fall back to the inferred branch:
+        #   - CFG-parallel: cfg_rank 0 is positive, cfg_rank > 0 negative
+        #   - otherwise branches are assumed to alternate on this rank
+        cache_branch = self._explicit_cfg_branch(module, ctx)
+        if cache_branch is None:
+            cache_branch = self._infer_cfg_branch(module)
 
         context_name = f"teacache_{cache_branch}"
         self.state_manager.set_context(context_name)
@@ -197,6 +219,28 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         return ctx.postprocess(output)
 
+    @staticmethod
+    def _explicit_cfg_branch(module: torch.nn.Module, ctx: Any) -> str | None:
+        """Branch named by the extractor hint or the caller's stamp, if any."""
+        extra_states = getattr(ctx, "extra_states", None) or {}
+        source, branch = "teacache_branch", extra_states.get("teacache_branch")
+        if branch is None:
+            source, branch = "cfg_branch", getattr(module, "cfg_branch", None)
+        if branch is not None and branch not in ("positive", "negative"):
+            raise ValueError(f"Invalid {source}={branch!r}; expected 'positive' or 'negative'.")
+        return branch
+
+    def _infer_cfg_branch(self, module: torch.nn.Module) -> str:
+        """Fallback branch for callers that don't stamp ``module.cfg_branch``."""
+        if not getattr(module, "do_true_cfg", False):
+            return "positive"
+        # Direct pipeline calls may not initialize a CFG process group.
+        cfg_parallel_size = get_classifier_free_guidance_world_size() if is_cfg_group_initialized() else 1
+        if cfg_parallel_size > 1:
+            return "negative" if get_classifier_free_guidance_rank() > 0 else "positive"
+        # Sequential CFG without a stamp: assume calls alternate on this rank.
+        return "negative" if self._forward_cnt % 2 == 1 else "positive"
+
     def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
         """
         Determine whether to compute full transformer or reuse cached residual.
@@ -205,6 +249,7 @@ class TeaCacheHook(ModelHook):
         1. Always compute first timestep
         2. For intermediate steps:
            - Compute relative L1 distance between current and previous modulated inputs
+           - Average that distance across SP so all ranks share the skip decision
            - Apply polynomial rescaling with model-specific coefficients
            - Accumulate rescaled distances
            - Compare to threshold: below = cache, above = compute
@@ -225,15 +270,14 @@ class TeaCacheHook(ModelHook):
         if state.previous_modulated_input is None:
             return True
 
-        # Compute relative L1 distance between consecutive modulated inputs
-        rel_distance = (
-            (
-                (modulated_inp - state.previous_modulated_input).abs().mean()
-                / (state.previous_modulated_input.abs().mean() + 1e-8)
-            )
-            .cpu()
-            .item()
-        )
+        # Compute relative L1 distance between consecutive modulated inputs.
+        # Reduce across SP before the threshold so every rank takes the same
+        # skip/compute path (otherwise a cache hit on one rank deadlocks
+        # waiting on collectives the miss path never enters).
+        mean_diff = (modulated_inp - state.previous_modulated_input).abs().mean()
+        mean_prev = state.previous_modulated_input.abs().mean()
+        mean_diff, mean_prev = _average_l1_stats_across_sp(mean_diff, mean_prev)
+        rel_distance = (mean_diff / (mean_prev + 1e-8)).item()
 
         # Apply model-specific polynomial rescaling
         rescaled_distance = float(self.rescale_func(rel_distance))

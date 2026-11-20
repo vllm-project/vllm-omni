@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TTS model detection: registry-driven stage -> model-type resolution.
 
 ``serving_speech.py`` used to carry a hand-written 20-branch ladder mapping
@@ -35,7 +36,6 @@ _LEGACY_VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _LEGACY_QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _LEGACY_FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _LEGACY_COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
-_LEGACY_OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _LEGACY_COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _LEGACY_VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _LEGACY_MING_TTS_MODEL_STAGES = {"ming_tts"}
@@ -55,7 +55,6 @@ _LEGACY_TTS_MODEL_STAGES = (
     | _LEGACY_QWEN3_TTS_MODEL_STAGES
     | _LEGACY_FISH_TTS_MODEL_STAGES
     | _LEGACY_COSYVOICE3_TTS_MODEL_STAGES
-    | _LEGACY_OMNIVOICE_TTS_MODEL_STAGES
     | _LEGACY_HIGGS_AUDIO_V2_TTS_MODEL_STAGES
     | _LEGACY_HIGGS_V3_TTS_MODEL_STAGES
     | _LEGACY_COVO_AUDIO_MODEL_STAGES
@@ -83,8 +82,6 @@ def _legacy_detect(model_stage, model_arch):
         return "fish_tts"
     if model_stage in _LEGACY_COSYVOICE3_TTS_MODEL_STAGES:
         return "cosyvoice3"
-    if model_stage in _LEGACY_OMNIVOICE_TTS_MODEL_STAGES:
-        return "omnivoice"
     if model_stage in _LEGACY_COVO_AUDIO_MODEL_STAGES:
         if model_arch and "CovoAudio" in model_arch:
             return "covo_audio"
@@ -138,14 +135,18 @@ _PIPELINE_STAGES = [
     "audio_tokenizer",
     "audio_vae",
     "aura",
+    "breeze_tts_2",
+    "breeze_tts_2_codec",
     "code2wav",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
     "dac_decoder",
     "diffusion",
     "dit",
+    "fish_omni",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
+    "gepard",
     "glm_tts",
     "glm_tts_dit",
     "higgs_audio_v2",
@@ -154,21 +155,17 @@ _PIPELINE_STAGES = [
     "indextts2_s2mel_decoder",
     "indextts2_talker",
     "latent_generator",
+    "lfm3_code2wav",
+    "lfm3_temporal",
     "llm",
     "minimax_music3_ar",
     "ming_tts",
+    "ming3_tts",
     "moss_tts",
     "moss_tts_codec",
     "moss_tts_local",
     "moss_tts_local_codec",
     "moss_tts_nano",
-    # Claimed by the OmniVoice adapter but emitted by no pipeline: OmniVoice is
-    # served through the diffusion path (``OmniOpenAIServingSpeech.for_diffusion``
-    # sets ``_tts_model_type`` directly and leaves ``_tts_stage`` None), so
-    # detection is never consulted for it. The key is vestigial in the adapter
-    # exactly as it was in the deleted ladder; kept here so detection is still
-    # exercised on it.
-    "omnivoice_generator",
     "qwen3_tts",
     "step_audio2_thinker",
     "talker",
@@ -178,12 +175,15 @@ _PIPELINE_STAGES = [
     "token2text",
     "token2wav",
     "tts",
+    "encoder",
+    "yue2",
 ]
 
 _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]
 _ARCHS = [
     None,
     "VoxCPM2TalkerForConditionalGeneration",
+    "BreezeForConditionalGeneration",
     "MingTTSForConditionalGeneration",
     "CovoAudioForConditionalGeneration",
     "MyCovoAudioThing",
@@ -259,7 +259,6 @@ def test_arch_matching_is_a_fallback_not_an_override():
 
 def test_shared_latent_generator_resolves_by_architecture_priority():
     assert detect_tts_model_type("latent_generator", "VoxCPM2TalkerForConditionalGeneration") == "voxcpm2"
-    assert detect_tts_model_type("latent_generator", "DotsTTSForConditionalGeneration") == "dots_tts"
 
 
 def test_stage_keys_cover_legacy_stage_set():
@@ -279,14 +278,29 @@ def test_pipeline_stage_list_is_complete():
     assert not missing, f"stage keys claimed by adapters but absent from _PIPELINE_STAGES: {sorted(missing)}"
 
 
-def test_entry_stage_archs_is_ming_only():
-    """Only Ming dense identifies its entry stage by architecture.
+def test_entry_stage_archs_are_explicit():
+    """Ming dense, AuK, and Ming3 identify entry stages by architecture.
 
-    Widening this set would change which stage ``_find_tts_stage`` selects in
-    mixed deployments — notably VoxCPM2, which declares ``model_archs`` but is
-    found by its ``latent_generator`` stage key.
+    They use generic ``model_stage`` values (``llm`` and ``encoder``) that other
+    pipelines share. Widening this set would change which stage
+    ``_find_tts_stage`` selects in mixed deployments — notably VoxCPM2, which
+    declares ``model_archs`` but is found by its ``latent_generator`` stage key.
     """
-    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration"})
+    assert tts_entry_stage_archs() == frozenset(
+        {
+            "MingTTSForConditionalGeneration",
+            "AuKForConditionalGeneration",
+            "Ming3TTSForConditionalGeneration",
+            "LingV3TTSForConditionalGeneration",
+        }
+    )
+
+
+def test_minimax_h3_encoder_is_not_a_tts_stage():
+    """MiniMax H3 shares AuK's ``encoder`` stage key but is not a speech model."""
+    assert "encoder" not in all_tts_stage_keys()
+    assert detect_tts_model_type("encoder", "MiniMaxH3Encoder") is None
+    assert detect_tts_model_type("encoder", "AuKForConditionalGeneration") == "auk"
 
 
 def test_every_detected_type_is_adapter_backed():
@@ -342,7 +356,8 @@ def test_audex_omni_requires_speech_decoder():
 
 def test_default_stage_serves_speech_is_unconditional():
     for name, cls in TTS_ADAPTER_REGISTRY.items():
-        if name == "audex":
+        # Speech-capable only when their codec stage is deployed.
+        if name in ("audex", "lfm3_omni"):
             continue
         for key in cls.stage_keys:
             assert cls.stage_serves_speech(key, frozenset({key})) is True

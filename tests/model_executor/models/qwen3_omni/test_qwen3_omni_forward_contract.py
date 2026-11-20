@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the Qwen3-Omni thinker forward return contract.
 
 Background
@@ -36,12 +36,15 @@ import torch
 from torch import nn
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+    Qwen3MoeLLMModel,
     Qwen3OmniMoeThinkerForConditionalGeneration,
+    _get_capture_key,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -52,6 +55,52 @@ _TOKENS = 4
 
 def _hidden_states() -> torch.Tensor:
     return torch.zeros(_TOKENS, _HIDDEN)
+
+
+def test_single_rank_intermediate_capture_includes_deferred_residual(mocker):
+    """Capture the Talker state on the default single-PP-rank path."""
+    import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker as module
+
+    pp_group = mocker.Mock(is_first_rank=True, is_last_rank=True)
+    mocker.patch.object(module, "get_pp_group", return_value=pp_group)
+
+    class SplitStateLayer(nn.Module):
+        def forward(self, positions, hidden_states, residual):
+            next_residual = hidden_states if residual is None else hidden_states + residual
+            return hidden_states * 2, next_residual
+
+    class Combine(nn.Module):
+        def forward(self, hidden_states, residual):
+            return hidden_states + residual, None
+
+    model = object.__new__(Qwen3MoeLLMModel)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([SplitStateLayer(), SplitStateLayer()])
+    model.start_layer = 0
+    model.end_layer = 2
+    model.norm = Combine()
+    inputs = torch.ones(_TOKENS, _HIDDEN)
+
+    output_without_capture, _ = Qwen3MoeLLMModel.forward(
+        model,
+        input_ids=None,
+        positions=torch.arange(_TOKENS),
+        inputs_embeds=inputs,
+    )
+    output_with_capture, captured = Qwen3MoeLLMModel.forward(
+        model,
+        input_ids=None,
+        positions=torch.arange(_TOKENS),
+        inputs_embeds=inputs,
+        capture_layer_indices=[0, 1],
+        return_hidden_states=True,
+    )
+
+    layers = captured["hidden_states"]["layers"]
+    torch.testing.assert_close(layers[0], inputs)
+    torch.testing.assert_close(layers[1], torch.full_like(inputs, 3))
+    torch.testing.assert_close(output_with_capture, output_without_capture)
+    torch.testing.assert_close(output_with_capture, torch.full_like(inputs, 7))
 
 
 class _InnerModelStub:
@@ -77,6 +126,29 @@ def _make_thinker(inner_output=None) -> tuple[Qwen3OmniMoeThinkerForConditionalG
     thinker.use_deepstack = False
     thinker.language_model = SimpleNamespace(model=inner)
     return thinker, inner
+
+
+def _overwrite_inputs_embeds(input_ids, positions, intermediate_tensors, *, inputs_embeds, **kwargs):
+    """Mutates the input embeddings by adding 1; we use this to check mutated behavior for compile."""
+    inputs_embeds.add_(1)
+    return inputs_embeds, {"hidden_states": {"layers": {0: inputs_embeds}}}
+
+
+def _overwrite_inputs_embeds_on_first_pp_rank(input_ids, positions, intermediate_tensors, *, inputs_embeds, **kwargs):
+    """Same as ``_overwrite_inputs_embeds``, on a PP rank that sends its captures to the next rank."""
+    inputs_embeds.add_(1)
+    return IntermediateTensors(
+        {"hidden_states": inputs_embeds, "residual": inputs_embeds, _get_capture_key(0): inputs_embeds}
+    )
+
+
+@pytest.fixture
+def first_rank_thinker(monkeypatch) -> Qwen3OmniMoeThinkerForConditionalGeneration:
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True),
+    )
+    return _make_thinker()[0]
 
 
 def _forward_args():
@@ -111,6 +183,30 @@ def test_thinker_forward_passes_through_intermediate_tensors():
     thinker, _ = _make_thinker(inner_output=it)
     out = thinker.forward(**_forward_args())
     assert out is it
+
+
+def test_thinker_embedding_capture_survives_overwritten_inputs_embeds(first_rank_thinker):
+    """Ensure the layer-0 capture is the original embeddings, not the overwritten inputs_embeds."""
+    first_rank_thinker.language_model.model = _overwrite_inputs_embeds
+    embeds = torch.randn(_TOKENS, _HIDDEN)
+
+    _, captured = first_rank_thinker.forward(
+        **_forward_args(), inputs_embeds=embeds.clone(), capture_layer_indices=[0], return_hidden_states=True
+    )
+
+    assert torch.equal(captured["hidden_states"]["layers"][0], embeds)
+
+
+def test_thinker_sends_original_embeddings_to_next_pp_rank(first_rank_thinker):
+    """Ensure a non-last PP rank sends the original embeddings as its layer-0 capture."""
+    first_rank_thinker.language_model.model = _overwrite_inputs_embeds_on_first_pp_rank
+    embeds = torch.randn(_TOKENS, _HIDDEN)
+
+    out = first_rank_thinker.forward(
+        **_forward_args(), inputs_embeds=embeds.clone(), capture_layer_indices=[0], return_hidden_states=True
+    )
+
+    assert torch.equal(out[_get_capture_key(0)], embeds)
 
 
 class _ThinkerStub(nn.Module):
@@ -159,6 +255,16 @@ def test_combined_forward_staged_run_without_accept_layer_returns_tensor():
     assert isinstance(out, torch.Tensor)
 
 
+@pytest.mark.parametrize("accept_layer, expected", [(None, [0, 2, 4]), (6, [0, 2, 4, 6])])
+def test_combined_forward_dflash_captures_embeddings_and_aux_layers(accept_layer, expected):
+    model = _make_combined(is_staged_run=True, accept_hidden_layer=accept_layer)
+    model.set_aux_hidden_state_layers((2, 4))
+    out = model.forward(**_forward_args())
+    assert model.thinker.received["capture_layer_indices"] == expected
+    assert model.thinker.received["return_hidden_states"] is True
+    assert isinstance(out, tuple)
+
+
 def test_make_omni_output_accepts_bare_tensor():
     model = _make_combined(is_staged_run=False)
     out = model.make_omni_output(_hidden_states())
@@ -169,7 +275,47 @@ def test_make_omni_output_accepts_bare_tensor():
 
 def test_make_omni_output_accepts_capture_tuple():
     model = _make_combined(is_staged_run=True)
-    captured = {"hidden_states": {"layers": {}}}
+    captured: dict[str, dict[str, dict[int, torch.Tensor]]] = {"hidden_states": {"layers": {}}}
     out = model.make_omni_output((_hidden_states(), captured))
     assert isinstance(out, OmniOutput)
     assert out.multimodal_outputs == captured
+
+
+@pytest.mark.parametrize("consumed", [False, True])
+def test_aux_hidden_states_keep_drafter_order_outside_speech_snapshot(consumed):
+    from vllm_omni.model_executor.output_snapshot import pack_output_snapshot
+
+    model = _make_combined(is_staged_run=True)
+    model.set_aux_hidden_state_layers((4, 6, 2))
+    model.thinker.embed_input_ids = lambda input_ids: input_ids.float().view(-1, 1)
+    layers = {index: torch.full((_TOKENS, 1), float(index)) for index in (0, 2, 4, 6)}
+    layers[0] = torch.tensor([[1.0], [2.0], [10.0], [11.0]])
+    captured: OmniPayload = {"hidden_states": {"layers": layers, "last": _hidden_states()}}
+    output = OmniOutput(_hidden_states(), captured)
+    hidden, aux = model.extract_aux_hidden_states(output)
+    assert model._thinker_capture_layer_indices() == [0, 2, 4, 6]
+    prepared = model.prepare_speculative_multimodal_outputs(
+        multimodal_outputs=captured,
+        req_ids=["prefill", "decode"],
+        speculative_request_ids={"decode"},
+        invalid_req_indices=[],
+        sampled_token_ids=torch.tensor([[3, -1], [11, 12]]),
+        input_token_ids=torch.tensor([1, 2, 10, 11]),
+        input_positions=torch.tensor([0, 1, 3, 4]),
+        query_start_loc=[0, 2, 4],
+        prompt_lens=[2, 3],
+        vocab_size=100,
+        consumed_input_span=consumed,
+    )
+    assert hidden is output.text_hidden_states
+    assert len(aux) == 3
+    assert all(value is layers[index] for value, index in zip(aux, (4, 6, 2)))
+    assert set(captured["hidden_states"]["layers"]) == {0, 2, 4, 6}
+    assert prepared["hidden_states"]["last"] is captured["hidden_states"]["last"]
+    assert all(prepared["hidden_states"]["layers"][index] is layers[index] for index in (0, 6))
+    packed = pack_output_snapshot(prepared, {}, max_buckets=4)
+    assert packed is not None
+    snapshot = packed.copy_to_cpu(lambda tensor: tensor.clone())
+    assert set(snapshot["hidden_states"]["layers"]) == {0, 6}
+    for index in (0, 6):
+        torch.testing.assert_close(snapshot["hidden_states"]["layers"][index], layers[index])

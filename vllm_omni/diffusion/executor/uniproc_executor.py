@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """In-process diffusion executor for single-GPU deployments.
 
@@ -31,11 +31,11 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -70,6 +70,8 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             worker_extension_cls=self.od_config.worker_extension_cls,
             custom_pipeline_args=getattr(self.od_config, "custom_pipeline_args", None),
             base_worker_class=resolve_obj_by_qualname(worker_cls_path),
+            # Inline worker: do not overwrite the API-server process title.
+            set_proc_title=False,
         )
         logger.info("Diffusion worker initialized in-process (uniproc executor)")
 
@@ -108,6 +110,15 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             )
         try:
             result = self.driver_worker.execute_method(method, *(args or ()), **(kwargs or {}))
+            if isinstance(result, DiffusionOutput):
+                result._record_device_ready()
+            elif isinstance(result, RunnerOutput):
+                if result.result is not None:
+                    result.result._record_device_ready()
+            elif isinstance(result, BatchRunnerOutput):
+                for output in result.runner_outputs:
+                    if output.result is not None:
+                        output.result._record_device_ready()
         except Exception:
             if not self._device_is_usable():
                 self._mark_failed()
@@ -116,7 +127,6 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         from vllm_omni.diffusion.sched.interface import validate_new_request_data_identity
-        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
         self._ensure_open()
         runner_outputs: list[RunnerOutput] = []
@@ -143,19 +153,19 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                     )
                 )
             except Exception as exc:
+                # The worker runs inline, so a pipeline's OmniClientError lands
+                # here; from_exception keeps its 4xx status for the engine/API.
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
                 )
         return BatchRunnerOutput.from_list(runner_outputs)
 
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
-
         self._ensure_open()
         if len(scheduler_output.scheduled_new_reqs) <= 1:
             return self.execute_request(scheduler_output)
@@ -171,8 +181,6 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         return result
 
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
-
         self._ensure_open()
         result = self.collective_rpc(
             "execute_stepwise",

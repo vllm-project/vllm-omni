@@ -4,12 +4,14 @@
 import json
 import os
 import types
-from dataclasses import fields, is_dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, get_args, get_origin
 
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.config_factory import with_trust_remote_code_override
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 
@@ -18,6 +20,13 @@ logger = init_logger(__name__)
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
     """Inject connector configuration into stage engine arguments."""
+    typed_connector_config = getattr(stage, "connector_config", None)
+    if typed_connector_config is not None:
+        omni_conf_dict = dict(typed_connector_config.omni_kv_config or {})
+        omni_conf_dict.update(connector_config=omni_conn_cfg, omni_from_stage=omni_from, omni_to_stage=omni_to)
+        typed_connector_config.omni_kv_config = omni_conf_dict
+        return
+
     # Prepare omni_kv_config dict
     omni_conf_dict = {}
     try:
@@ -49,8 +58,8 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
         logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
-def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
-    """Parse and validate the shape of per-stage JSON overrides."""
+def parse_stage_overrides(value: Any, *, filter_deploy_fields: bool = True) -> dict[str, dict[str, Any]] | None:
+    """Validate per-stage overrides and optionally drop known deploy-only fields."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -66,6 +75,9 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             "--stage-overrides must be a JSON object mapping stage_id -> overrides, "
             f"got {type(parsed).__name__}: {parsed!r}"
         )
+    from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS
+
+    filtered: dict[str, dict[str, Any]] = {}
     for stage_id, overrides in parsed.items():
         if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
             raise ValueError(
@@ -75,8 +87,82 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             raise ValueError(
                 f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
             )
+        if not filter_deploy_fields:
+            filtered[stage_id] = overrides
+            continue
+        kept_overrides = {}
+        for key, override in overrides.items():
+            config_key = str(key).partition(".")[0]
+            if config_key in NON_STAGE_OVERRIDE_FIELDS:
+                logger.warning(
+                    "Ignoring --stage-overrides[%r][%r]: set %r in the deploy config instead.",
+                    stage_id,
+                    key,
+                    config_key,
+                )
+                continue
+            kept_overrides[key] = override
+        filtered[stage_id] = kept_overrides
 
-    return parsed
+    return filtered
+
+
+@dataclass(frozen=True)
+class StageConfigInputs:
+    """Normalized inputs shared by all stage-config loading paths."""
+
+    model: str
+    kwargs: dict[str, Any]
+    trust_remote_code: bool | None
+    deploy_config_path: str | None
+    stage_overrides: dict[str, dict[str, Any]] | None
+    strategy_config_path: str | None
+
+
+def prepare_stage_config_inputs(
+    model: str,
+    kwargs: Mapping[str, Any],
+    *,
+    trust_remote_code: bool | None,
+    snapshot_model: bool = False,
+) -> StageConfigInputs:
+    """Normalize model/config arguments before resolving stage configs.
+
+    The standard API worker, multi-API parent, and headless entrypoint must
+    apply the same legacy-key filtering, trust-remote-code precedence, and
+    config-file extraction before calling :func:`resolve_omni_config`.
+    """
+    resolved_model = model
+    if snapshot_model:
+        # Keep model materialization at the CLI boundary for the parent-owned
+        # launch path. The API worker's OmniBase has already done this work.
+        from vllm_omni.entrypoints.omni_base import omni_snapshot_download
+
+        resolved_model = omni_snapshot_download(model)
+
+    resolved_kwargs = dict(kwargs)
+    for legacy_arg in ("stage_configs_path", "stage_configs"):
+        if legacy_arg in resolved_kwargs:
+            raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
+    # Frontend process count is not a stage engine override.
+    resolved_kwargs.pop("api_server_count", None)
+    resolved_kwargs.pop("disable_log_stats", None)
+    if resolved_kwargs.get("diffusion_streaming_output") and resolved_kwargs.get("streaming_output") is None:
+        resolved_kwargs["streaming_output"] = True
+    resolved_kwargs.pop("model_tag", None)
+
+    resolved_kwargs = with_trust_remote_code_override(resolved_kwargs, trust_remote_code)
+    deploy_config_path = resolved_kwargs.pop("deploy_config", None)
+    strategy_config_path = resolved_kwargs.pop("strategy_config", None)
+    stage_overrides = parse_stage_overrides(resolved_kwargs.pop("stage_overrides", None))
+    return StageConfigInputs(
+        model=resolved_model,
+        kwargs=resolved_kwargs,
+        trust_remote_code=trust_remote_code,
+        deploy_config_path=deploy_config_path,
+        stage_overrides=stage_overrides,
+        strategy_config_path=strategy_config_path,
+    )
 
 
 def get_final_stage_id_for_e2e(

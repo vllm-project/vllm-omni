@@ -1,16 +1,69 @@
 # .buildkite/intel/pipeline-intel.yml
+#
+# Two mutually exclusive XPU steps, one per scope. They carry the signals the
+# CUDA weekly/nightly steps use (.buildkite/cuda/test-weekly.yml): a scheduled
+# build that sets NIGHTLY=1, or a PR labelled ``nightly-test``. Every ordinary
+# PR takes the pr step.
+#
+#   pr     the no-card XPU-dispatch stage, the omni models, core_model on one
+#          card and on two, and the mxfp8 config check.
+#   broad  adds advanced_model on one card (Qwen3-TTS, Z-Image, Wan2.1,
+#          Voxtral) and on two (Z-Image-Turbo, tensor parallel TP=2).
+#
+# Checkpoints the pr step needs in the mounted HF cache, resolved up front so a
+# missing one fails in seconds instead of inside a test: tiny-random/Qwen-Image
+# 30MB, riverclouds/qwen_image_random 9.9GB, Qwen2.5-Omni-3B 12GB,
+# Qwen2.5-Omni-7B 21GB. broad adds Qwen3-TTS-0.6B, Z-Image-Turbo 31GB,
+# Wan2.1-T2V-1.3B and Voxtral-4B.
+#
+# Cards: the script pins the first entry of the agent's ZE_AFFINITY_MASK for the
+# cards_1 stages and the first two for the cards_2 ones, so a single agent with
+# two or more cards runs both groups. XPU_REQUIRE_CARDS is the minimum a step
+# needs; an agent that hands over fewer fails the step instead of quietly
+# dropping stages. Today's agents expose four cards each, which satisfies it.
+#
+# When the agents are re-cut into dedicated classes, tag them
+# (``--tags "queue=intel-gpu-omni,cards=N"``) and split each step in two:
+# ``agents: {cards: "1"}`` with XPU_TEST_CARDS and XPU_REQUIRE_CARDS of "1",
+# and ``agents: {cards: "2"}`` with "2". The cards_2 group is a few minutes of
+# the lane, so scarce 2-card agents would then carry only that.
+common_xpu_env: &common_xpu_env
+  DOCKER_BUILDKIT: "1"
+  # Buildkite will automatically replace this with the actual commit hash
+  VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
+  VLLM_VERSION: "v0.34.0"
+  # The CI image is local-only and the run's trap deletes it, so compressing
+  # its ~37GB of layers only costs test time.
+  EXPORT_COMPRESSION: "uncompressed"
+  # Both card groups in one step; needs an agent with at least two cards.
+  XPU_TEST_CARDS: "1,2"
+  XPU_REQUIRE_CARDS: "2"
+
 steps:
   - group: "INTEL Tests"
     steps:
       - label: "Intel: XPU Test"
+        if: build.env("NIGHTLY") != "1" && !(build.pull_request.labels includes "nightly-test")
         command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
         agents:
           queue: "intel-gpu-omni"
         env:
-          DOCKER_BUILDKIT: "1"
-          # Buildkite will automatically replace this with the actual commit hash
-          VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
-          VLLM_VERSION: "v0.29.0"
+          <<: *common_xpu_env
+          XPU_TEST_SCOPE: "pr"
+          XPU_TEST_BUDGET: "60m"
         priority: 100
-        timeout_in_minutes: 60
+        timeout_in_minutes: 80
+        soft_fail: false
+
+      - label: "Intel: XPU Test (broad)"
+        if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+        command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
+        agents:
+          queue: "intel-gpu-omni"
+        env:
+          <<: *common_xpu_env
+          XPU_TEST_SCOPE: "broad"
+          XPU_TEST_BUDGET: "95m"
+        priority: 100
+        timeout_in_minutes: 120
         soft_fail: false

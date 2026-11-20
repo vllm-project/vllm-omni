@@ -94,9 +94,9 @@ class MiniMaxH3MultiModalProcessor(Qwen3VLMultiModalProcessor):
     def _apply_hf_processor_main(
         self,
         mm_items: Any,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ):
-        base_kwargs = self._base_processor_kwargs(hf_processor_mm_kwargs)
+        base_kwargs = self._base_processor_kwargs(hf_kwargs)
         return super()._apply_hf_processor_main(
             mm_items,
             base_kwargs,
@@ -176,7 +176,7 @@ class _ResidualMerge(nn.Module):
     info=Qwen3VLProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class MiniMaxH3TextEncoder(Qwen3VLForConditionalGeneration):
+class MiniMaxH3TextEncoderBackbone(Qwen3VLForConditionalGeneration):
     """Qwen3-VL encoder used by MiniMax H3.
 
     MiniMax H3 consumes the residual stream after decoder layer 50.  The
@@ -305,3 +305,6 @@ class MiniMaxH3TextEncoder(Qwen3VLForConditionalGeneration):
             encoder_weights(),
             mapper=self.hf_to_vllm_mapper,
         )
+
+
+MiniMaxH3TextEncoder = MiniMaxH3TextEncoderBackbone

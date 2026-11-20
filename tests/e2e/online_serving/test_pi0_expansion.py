@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E online serving test for π0 (Pi-Zero) OpenPI websocket serving.
 
@@ -58,7 +58,7 @@ test_params = [
 
 @pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_pi0_openpi_online(omni_server):
     try:

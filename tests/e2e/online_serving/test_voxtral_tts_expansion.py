@@ -12,11 +12,14 @@ import os
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import pytest
+from openai import BadRequestError as OpenAIBadRequestError
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
+# Note this model is the public checkpoint without the encoder weights required for voice cloning
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
 STAGE_CONFIG = get_deploy_config_path("voxtral_tts.yaml")
 EXTRA_ARGS = ["--trust-remote-code", "--enforce-eager", "--disable-log-stats"]
@@ -30,7 +33,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_speech_english_basic(omni_server, online_client) -> None:
     """Test basic English TTS generation."""
     online_client.send_audio_speech_request(
@@ -46,7 +49,7 @@ def test_speech_english_basic(omni_server, online_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_speech_english_streaming(omni_server, online_client) -> None:
     """Test basic streaming English TTS generation (PCM via streaming API)."""
     online_client.send_audio_speech_request(
@@ -64,7 +67,7 @@ def test_speech_english_streaming(omni_server, online_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_speech_different_voices(omni_server, online_client) -> None:
     """Test TTS with different voice presets."""
     voices = ["casual_female", "neutral_male"]
@@ -81,7 +84,7 @@ def test_speech_different_voices(omni_server, online_client) -> None:
         )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_speech_speed(omni_server, online_client) -> None:
     """Request with speed parameters."""
     speeds = [0.5, 1, 1.5, 2, 2.5]
@@ -99,7 +102,7 @@ def test_speech_speed(omni_server, online_client) -> None:
         )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_speech_instructions(omni_server, online_client) -> None:
     """Request with instructions parameters."""
     instructions = [
@@ -133,7 +136,7 @@ def test_speech_instructions(omni_server, online_client) -> None:
         )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_speech_response_formats(omni_server, online_client) -> None:
     """Test TTS with different response formats."""
     response_formats = ["wav", "mp3"]
@@ -150,7 +153,7 @@ def test_speech_response_formats(omni_server, online_client) -> None:
         )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_speech_batches(omni_server, online_client) -> None:
     """Test TTS batches."""
     items = [
@@ -173,3 +176,21 @@ def test_speech_batches(omni_server, online_client) -> None:
             "timeout": 120.0,
         }
     )
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+def test_speech_ref_audio(omni_server, online_client) -> None:
+    """Test ref_audio failure is handled as a BadRequest instead of a RuntimeError"""
+    audio_data = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    with pytest.raises(OpenAIBadRequestError) as exc_info:
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "how are you",
+                "ref_audio": audio_data,
+                "language": "English",
+                "response_format": "wav",
+            }
+        )
+
+    assert exc_info.value.status_code == 400

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Patch Qwen3-TTS NPU runtime setup and weights.
 
@@ -66,13 +66,47 @@ def _prepare_npu_decoder_weights(decoder: nn.Module) -> None:
 
 def _patched_load_weights(self, weights):
     assert _original_load_weights is not None
+    if self.decoder._npu_incremental is not None:
+        self.decoder._npu_incremental.close()
+        self.decoder._npu_incremental = None
     loaded = _original_load_weights(self, weights)
     device = self.vllm_config.device_config.device
-    runtime_dtype = getattr(self, "_npu_decoder_runtime_dtype", lambda _: torch.float32)(device)
-    self.decoder.to(device=device, dtype=runtime_dtype)
+    platform_dtype_override = getattr(self, "_npu_decoder_runtime_dtype", None)
+    if platform_dtype_override is not None:
+        # 310P requires FP16 and deliberately overrides the stage dtype.
+        runtime_dtype = platform_dtype_override(device)
+        self.decoder.to(device=device, dtype=runtime_dtype)
+        if hasattr(self.decoder, "precompute_snake_caches"):
+            self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
-    if runtime_dtype != torch.float32 and hasattr(self.decoder, "precompute_snake_caches"):
-        self.decoder.precompute_snake_caches()
+    connector = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+    extra = connector.get("extra", connector) if isinstance(connector, dict) else {}
+    additional = getattr(self.vllm_config, "additional_config", None)
+    if isinstance(additional, dict):
+        extra = {**additional, **extra}
+    incremental = extra.get("npu_incremental_codec", True)
+    if not isinstance(incremental, bool):
+        raise ValueError("npu_incremental_codec must be a boolean")
+    if incremental and self.vllm_config.model_config.enforce_eager:
+        # Arena construction prewarms NPU graphs. Honor the stage-wide graph
+        # opt-out before construction, including explicit incremental opt-ins.
+        logger.info("Skipping NPU incremental Codec because enforce_eager is set; using the stateless decoder")
+        incremental = False
+    if incremental:
+        from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
+
+        slots = int(self.vllm_config.scheduler_config.max_num_seqs)
+        chunk_frames = int(extra.get("codec_chunk_frames") or 25)
+        max_batch = int(extra.get("decode_batch_max_size") or 1)
+        with torch.inference_mode():
+            self.decoder._npu_incremental = NPUIncrementalCodec(
+                self.decoder,
+                slots=slots,
+                max_batch=max(1, min(max_batch, slots)),
+                chunk_frames=chunk_frames,
+            )
+    actual_dtype = next(self.decoder.parameters()).dtype
+    logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
     return loaded
 
 
@@ -108,8 +142,8 @@ def _apply_a5_prompt_embeds_builder_patch() -> None:
 
     # The talker imports the builder by name at module scope, so its reference
     # must be swapped as well (same as the 310P patch).
-    prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilderA5
-    qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilderA5
+    setattr(prompt_embeds_builder, "Qwen3TTSPromptEmbedsBuilder", _Qwen3TTSPromptEmbedsBuilderA5)
+    setattr(qwen3_tts_talker, "Qwen3TTSPromptEmbedsBuilder", _Qwen3TTSPromptEmbedsBuilderA5)
     _A5_PATCHED = True
     logger.debug("Applied A5 prompt-embeds builder patch for Qwen3-TTS")
 

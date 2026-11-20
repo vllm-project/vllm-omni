@@ -8,6 +8,7 @@ owners:
   - "@fake0fan"
   - "@Sy0307"
   - "@Gaohan123"
+  - "@ZhengWG"
 primary_code_paths:
   - vllm_omni/core/**
   - vllm_omni/worker/**
@@ -30,6 +31,106 @@ last_reviewed: 2026-07-16
 
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
+Omni workers use Model Runner V2; the retired GPU, NPU and XPU V1 runner
+implementations and their exclusive helpers are removed. Shared utilities under
+`worker/` remain in use by `worker_v2/`. The upstream `vllm.v1` package name
+does not select Model Runner V1.
+
+The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
+state transitions for Qwen3-Omni turn requests and duplex utterances, which
+are also ordinary requests. Its connector must withhold
+successful receive completion until both GPU KV and request-local CPU captures
+are ready. For a cancelled or failed load, it reports completion once the
+native KV copy drains, so a CPU-only HS read never holds destination GPU
+blocks. Its prefix lookup is asynchronous: a slow Store delays only requests
+waiting for that lookup, and a lookup past its deadline is a miss.
+A failed receive uses the explicitly configured `recompute` policy;
+the upstream `fail` default still terminates requests for other configurations.
+Restored captures are merged before output publication and consumed once per
+request attempt. External loads do not populate the worker's local prefix-cache
+slots, so local prefix caching remains disabled with this backend. See
+[KV offload configuration](../../configuration/kv_offload.md#mooncake-kv-and-hidden-state-caching-experimental)
+for configuration, scope, and validation limits, and the
+[Mooncake KV/HS cache design](../feature/mooncake_kv_hs_cache.md) for its
+lifecycle and the deferred two-level mode.
+
+MRv2 preserves the auxiliary output tree when capturing PIECEWISE CUDA graphs,
+because their replay returns that tree directly to model postprocessing.
+FULL captures and their NONE-mode warmup flatten auxiliary tensors into the
+native graph buffers; FULL replay restores the tree before postprocessing.
+Both paths therefore publish the same named hidden-state fields to prefix
+caching and downstream stages.
+
+Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
+`make_omni_output()` builds the multimodal payload afterward declare
+`mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
+not require excluding FULL capture.
+
+MRv2 computes prompt logprobs after sampling and may split prompt hidden states
+into arbitrary row chunks. A model whose sampling logits depend on request-local
+state or full-batch row spans can expose `compute_prompt_logits(hidden_states)`
+for stateless prompt chunks and the startup sampler profiling pass. The runner
+otherwise falls back to `compute_logits`; real sampling keeps the model's normal
+request-state validation and updates.
+
+Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
+the same FULL descriptor from the MTP capture sizes, bounded by
+`max_num_seqs`, independently of the backbone's graph mode. A backbone that
+uses PIECEWISE graphs must not make the MTP wrapper bypass its captured graph.
+This does not enable graphs for an eager or graph-unsafe MTP implementation;
+requests without a supported capture bucket retain eager execution.
+
+After applying sampled output, the AR scheduler publishes only completed KV
+blocks to upstream prefix caching, including on its plain-decode path. Async
+placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
+as the materialized frontier. Stale output and requests that were not running
+before the update do not publish blocks. Publication precedes stop cleanup so
+the last completed blocks remain reusable after a request finishes.
+
+For Bagel image editing, the vLLM 0.34 prefix-range helper receives shallow
+`image` views of the custom `img2img` features so both VAE and ViT embedding
+spans retain bidirectional attention. The original features keep their modality,
+encoder data, cache identifiers and placeholder masks. Upstream still computes
+the ranges and applies sliding-window and padding rules. This adapter is installed
+from `vllm_omni.patch` for the upstream V2 runner; it is unnecessary
+with vLLM versions that build the ranges inline.
+
+MOSS Local's fused and separate depth-attention paths share an explicitly
+rounded initial weighted value and the same FMA accumulation order. This
+preserves bitwise parity when the compiler inlines attention into sampling,
+including SM89 code generation affected by LLVM SLP reduction reordering.
+
+## Qwen3-Omni Talker sampling
+
+The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,
+including its `has_topp_only_rows` predicate. Seeded rows pass that predicate to
+top-k/top-p masking before the model's categorical draw with request-local Torch generators.
+Unseeded and greedy rows keep upstream sampling. When mixed rows have already
+been masked, their upstream call disables repeated masking and fused sampling.
+
+Custom samplers register their selected JIT kernels while the runner's startup
+registry is active. The Talker's seeded stream uses native top-k/top-p
+masking even when unseeded sampling selects FlashInfer, so it registers those
+native kernels explicitly. AR workers also warm the existing fused-MoE prefill
+batch sizes on the V2 runner before CUDA graph capture and JIT
+monitoring. These startup passes leave EPLB load recording disabled.
+
+## Full-payload input scheduling
+
+For a downstream, non-async stage with `requires_full_payload_input`,
+`OmniSchedulingCoordinator` parks requests until the Model Runner receives the
+complete upstream payload. `OmniConnectorModelRunnerMixin` keeps that payload
+in its local cache and uses `SchedulingMetadataAdapter` to translate
+model-specific fields into `SchedulingMetadataUpdate`. The Scheduler consumes
+only the typed update and readiness signal; it does not inspect payload fields.
+
+The receive flow is
+`process_pending_full_payload_inputs()` -> `register_chunk_recv()` ->
+`recv_full_payload_inputs()` -> `SchedulingMetadataAdapter.extract()` ->
+`OmniConnectorOutput` -> `update_request_metadata()`. Native MRV2 async
+receive also uses this coordinator and typed updates, with the built-in
+metadata adapter. Other async-chunk paths retain `OmniChunkTransferAdapter`
+ownership of chunk transfer and request updates.
 
 ## Candidate invariants
 
@@ -46,6 +147,64 @@ adapter, not injected through unrelated scheduler state.
 ### AR-INV-003: Workers execute assigned work
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
+
+## Token-only output payloads
+
+An AR stage whose downstream decoder consumes sampled tokens rather than
+hidden states can set `omni_pooler_payload_include_hidden = False`. Hidden
+states remain available for logits and sampling; prefill conditioning and
+other required multimodal outputs still cross the stage boundary.
+
+A chunk processor that needs IDs on steps without a tensor payload declares
+`requires_token_updates = True`. The scheduler then enqueues nonempty sampled
+IDs while preserving final-stage exclusions and the processor's EOF handling.
+Processors without this declaration retain their tensor-payload trigger.
+
+When hidden and multimodal payloads are absent, the shared runner skips empty
+per-request payload construction. Prefix-cache merges and pending model
+postprocess retain the normal path. This policy is independent of whether
+output materialization runs inline or in the background.
+
+Inline construction consumes query offsets, scheduled-token counts and
+scheduler metadata before the next execution can reuse them. Background
+construction snapshots those inputs. Both paths reuse the request IDs already
+copied by upstream bookkeeping; connector collection stays on the main thread
+because it can run a tensor-parallel collective.
+
+## GPU memory accounting and output snapshots
+
+Workers size the KV cache from model weights, persistent runner buffers
+allocated before profiling starts (torch allocations beyond the weights at
+that point), the profiling-window peak increase and non-torch memory, then
+reserve CUDA graph and auxiliary graph memory separately. Upstream
+profiling's `non_kv_cache_memory` is not used, because it also counts memory
+the caching allocator reserves without allocating, such as graph pools
+captured at model load; co-located stage budgets are tuned without it.
+
+MRv2 asynchronous output snapshots reuse one capacity buffer per dtype/device
+group in each ring slot. The slot waits for its previous device-to-host copy
+event before reuse or growth. Shorter outputs publish and copy only the live
+prefix. Retained GPU storage is bounded by each slot's largest payload rather
+than accumulating a buffer for every prefill length; published CPU outputs
+own their storage independently of subsequent slot reuse.
+
+## Request-local model errors
+
+MRV2 model states can return an owned, step-local failure mask from
+`get_request_errors()`. `OmniAsyncOutput` copies it alongside the other output
+tensors and resolves request IDs after the copy completes. Before handing
+outputs to the native data plane, it removes failed rows' tokens and audio
+payloads. The scheduler then marks only those requests `FINISHED_ERROR`, frees
+their state through the normal completion path, and propagates `FinishReason.ERROR`
+to the API. Healthy rows continue. Numerical failure must not be represented as
+an ordinary EOS or a successful, truncated audio response.
+
+Ming3's `create_omni_model_state` hook selects its model-owned state before
+generic hybrid dispatch, preserving its flow and AudioVAE lifecycle.
+Ming3 defaults to one MRV2 stage containing the backbone, flow head and
+AudioVAE, without an inter-stage connector. The VAE cursor stays on device and advances under
+the same emission-or-flush mask as the decoder's KV length. Invalid rows
+leave both unchanged; CUDA graph padding rows expose no cached tokens.
 
 ## Safe-change guide
 

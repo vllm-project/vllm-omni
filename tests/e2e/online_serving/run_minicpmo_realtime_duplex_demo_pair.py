@@ -17,7 +17,6 @@ import hashlib
 import io
 import json
 import sys
-import uuid
 import wave
 from pathlib import Path
 
@@ -266,14 +265,13 @@ async def _run_demo_process(
         str(args.chunk_ms),
         "--timeout-s",
         str(args.timeout_s),
-        "--session-id",
-        f"duplex-pair-{label}-{uuid.uuid4().hex}",
     ]
     if args.no_realtime_pacing:
         command.append("--no-realtime-pacing")
     if args.require_audio:
         command.append("--require-audio")
-    command.extend(["--ref-audio", str(args.ref_audio)])
+    if args.ref_audio is not None:
+        command.extend(["--ref-audio", str(args.ref_audio)])
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -366,7 +364,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--input-wav-a", required=True)
     parser.add_argument("--input-wav-b", required=True)
-    parser.add_argument("--ref-audio", required=True)
+    parser.add_argument(
+        "--ref-audio",
+        help="Optional reference WAV; the MiniCPM-o server uses the bundled prompt when omitted.",
+    )
     parser.add_argument("--output-dir-a", required=True)
     parser.add_argument("--output-dir-b", required=True)
     parser.add_argument("--summary-output")

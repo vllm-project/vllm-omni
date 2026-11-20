@@ -10,6 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
     FASTH3_BASE_MODEL,
     FASTH3_BASE_SCHEDULE,
@@ -24,6 +25,16 @@ from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_s
 from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+_FASTH3_CHECKPOINT = "vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint"
+
+
+@pytest.fixture
+def cpu_vsa_worker(monkeypatch):
+    """Resolve VSA providers as a CPU worker with fastvideo-kernel would, whatever machine runs the tests."""
+    monkeypatch.setattr(f"{_FASTH3_CHECKPOINT}.get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(f"{_FASTH3_CHECKPOINT}.require_fastvideo_sparse", lambda: None)
+
 
 _RANK = 2
 _HIDDEN = 4
@@ -262,7 +273,10 @@ def test_a_vsa_variant_is_recognised_by_its_compression_gates(tmp_path):
 
 def test_a_tensor_naming_no_h3_parameter_is_an_error(tmp_path):
     path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path, tensors={"transformer_blocks.0.attn.norm_q.lora_A.weight": torch.ones((_RANK, _HIDDEN))})
+    _write_adapter(
+        path,
+        tensors={"transformer_blocks.0.attn.not_a_projection.lora_A.weight": torch.ones((_RANK, _HIDDEN))},
+    )
     # Dropping it silently would load a model that is not the distilled student.
     with pytest.raises(FastH3AdapterError, match="name no known"):
         _load(path.parent)
@@ -311,7 +325,7 @@ def _pipeline_stub(fusion=None):
 
 
 def _sampling(steps=FASTH3_DENOISE_STEPS, **kwargs) -> SimpleNamespace:
-    fields = {"num_inference_steps": steps, "extra_args": {}, "lora_request": None}
+    fields = {"num_inference_steps": steps, "extra_args": {}, "lora_request": None, "lora_scale": 1.0}
     return SimpleNamespace(**{**fields, **kwargs})
 
 
@@ -443,6 +457,7 @@ def test_a_vsa_variant_accepts_pure_ulysses_and_refuses_ring(tmp_path):
     od_config = SimpleNamespace(
         diffusion_attention_backend="FASTVIDEO_VSA",
         parallel_config=SimpleNamespace(sequence_parallel_size=8, ulysses_degree=8, ring_degree=1),
+        diffusion_attention_schedule=None,
     )
     fusion = _load(sparse.parent)
     fusion.check_serving_contract(partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0)
@@ -452,19 +467,20 @@ def test_a_vsa_variant_accepts_pure_ulysses_and_refuses_ring(tmp_path):
         fusion.check_serving_contract(partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0)
 
 
-def test_a_vsa_variant_accepts_normalized_attention_config(tmp_path):
+def test_a_vsa_variant_accepts_normalized_attention_config(tmp_path, cpu_vsa_worker):
     sparse = tmp_path / "vsa" / "adapter_model.safetensors"
     _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
     od_config = SimpleNamespace(
-        diffusion_attention_config=SimpleNamespace(default=SimpleNamespace(backend="FASTVIDEO_VSA")),
+        diffusion_attention_config=SimpleNamespace(default=AttentionSpec(backend="FASTVIDEO_VSA")),
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
+        diffusion_attention_schedule=None,
     )
     _load(sparse.parent).check_serving_contract(
         partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0
     )
 
 
-def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path):
+def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path, cpu_vsa_worker):
     # The 50 DiT blocks carry attention role "self", so a per_role entry - not
     # the default - decides whether the compression gates ever reach a sparse
     # kernel.
@@ -486,11 +502,50 @@ def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path)
     sparse_dit = SimpleNamespace(
         diffusion_attention_config=SimpleNamespace(
             default=None,
-            per_role={"self": SimpleNamespace(backend="FASTVIDEO_VSA")},
+            per_role={"self": AttentionSpec(backend="FASTVIDEO_VSA")},
         ),
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
+        diffusion_attention_schedule=None,
     )
     fusion.check_serving_contract(od_config=sparse_dit, **contract)
+
+
+@pytest.mark.parametrize(
+    "per_role",
+    [{}, {"self": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="sage")}],
+    ids=["default", "per_role_self"],
+)
+def test_a_vsa_variant_checks_its_base_provider_at_startup(tmp_path, cpu_vsa_worker, per_role):
+    # H3 skips warm-up, so a base provider the device can't run has to fail at
+    # startup rather than on the first request.
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    default = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="bf16" if per_role else "sage")
+    od_config = OmniDiffusionConfig(diffusion_attention_config=AttentionConfig(default=default, per_role=per_role))
+
+    with pytest.raises(ValueError, match="FastH3 adapter cannot run its base attention: FlashInfer tile64"):
+        _load(sparse.parent).check_serving_contract(
+            partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0
+        )
+
+
+def test_a_vsa_variant_checks_scheduled_vsa_providers_at_startup(tmp_path, cpu_vsa_worker):
+    # H3 skips warm-up, so a scheduled profile the device can't run has to
+    # fail at startup rather than on the first step that selects it.
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    sage = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="sage")
+    od_config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
+        diffusion_attention_schedule=AttentionScheduleConfig(
+            profiles={"sage": AttentionConfig(default=sage)}, default=[]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="FastH3 adapter cannot run attention schedule profile 'sage'"):
+        _load(sparse.parent).check_serving_contract(
+            partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0
+        )
 
 
 def test_a_gate_that_never_reached_the_model_is_refused(tmp_path):

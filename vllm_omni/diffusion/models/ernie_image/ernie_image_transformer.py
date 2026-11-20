@@ -28,6 +28,9 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.models.ernie_image.fused_rope import (
+    try_fused_qk_rotary_emb,
+)
 
 logger = init_logger(__name__)
 
@@ -99,6 +102,26 @@ def _apply_rotary_emb(
     x1, x2 = x_rot.chunk(2, dim=-1)
     x_rotated = torch.cat((-x2, x1), dim=-1)
     return torch.cat((x_rot * cos_ + x_rotated * sin_, x[..., rot_dim:]), dim=-1)
+
+
+def _apply_qk_rotary_emb(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fused = try_fused_qk_rotary_emb(
+        query,
+        key,
+        freqs_cos,
+        freqs_sin,
+    )
+    if fused is not None:
+        return fused
+    return (
+        _apply_rotary_emb(query, freqs_cos, freqs_sin),
+        _apply_rotary_emb(key, freqs_cos, freqs_sin),
+    )
 
 
 class ErnieImageEmbedND3(nn.Module):
@@ -340,8 +363,7 @@ class ErnieImageAttention(nn.Module):
 
         if image_rotary_emb is not None:
             freqs_cos, freqs_sin = image_rotary_emb
-            query = _apply_rotary_emb(query, freqs_cos, freqs_sin)
-            key = _apply_rotary_emb(key, freqs_cos, freqs_sin)
+            query, key = _apply_qk_rotary_emb(query, key, freqs_cos, freqs_sin)
 
         attn_metadata = None
         if attention_mask is not None:

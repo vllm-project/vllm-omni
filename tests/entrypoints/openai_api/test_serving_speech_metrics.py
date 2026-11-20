@@ -9,10 +9,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.openai import serving_speech as speech_module
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -46,12 +48,11 @@ def _serving(metrics: _MetricsStub, *, adapter=None) -> OmniOpenAIServingSpeech:
     serving._tts_model_type = "qwen3_tts"
     serving.engine_client = SimpleNamespace(mod_metrics=metrics, request_states={})
     serving._get_tts_adapter = lambda: adapter
+    serving._speech_output_policies = {}
     serving.create_audio = lambda audio_obj: SimpleNamespace(
         audio_data=b"\0\0" * int(audio_obj.audio_tensor.size),
         media_type="audio/pcm",
     )
-    serving._mark_ref_audio_artifact_ready_for_request = lambda request_id: None
-    serving._discard_ref_audio_artifact_warmup = lambda request_id: None
     return serving
 
 
@@ -282,7 +283,7 @@ async def test_streaming_speech_does_not_count_empty_payload_as_first_packet(mon
         request_id="speech-test",
         request_arrival_ts=100.0,
     )
-    assert len([chunk async for chunk in chunks]) == 2
+    assert [chunk async for chunk in chunks] == [b"\0\0" * 320]
     assert metrics.ttfp_calls == [("1", "2", pytest.approx(0.25))]
     assert metrics.underrun_calls == [("1", "2", pytest.approx(0.0))]
     assert metrics.continuity_calls == [("1", "2", 100)]
@@ -312,13 +313,11 @@ async def test_streaming_speech_does_not_finalize_continuity_on_error(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_streaming_speech_does_not_finalize_continuity_on_validation_error(monkeypatch):
+async def test_streaming_speech_does_not_finalize_continuity_on_validation_error(monkeypatch, mocker: MockerFixture):
     metrics = _MetricsStub()
-
-    def reject_generation(_tts_params, **_kwargs):
-        raise RuntimeError("generation validation failed")
-
-    adapter = SimpleNamespace(validates_generation=True, validate_generation=reject_generation)
+    adapter = mocker.create_autospec(TTSModelAdapter, instance=True)
+    adapter.validates_generation = True
+    adapter.validate_generation.side_effect = RuntimeError("generation validation failed")
     serving = _serving(metrics, adapter=adapter)
     monkeypatch.setattr("vllm_omni.entrypoints.openai.serving_speech.time.time", lambda: 100.25)
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
@@ -7,9 +8,37 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.attention.backends.ring.fused_merge import try_fused_ring_merge
+
 LseLayout = Literal["bhs", "bsh"]
 
-__all__ = ["update_out_and_lse", "flatten_varlen_lse", "unflatten_varlen_lse"]
+__all__ = [
+    "ring_kv_block_valid_length",
+    "update_out_and_lse",
+    "flatten_varlen_lse",
+    "unflatten_varlen_lse",
+]
+
+
+def ring_kv_block_valid_length(
+    valid_kv_length: int | None,
+    block_size: int,
+    block_rank: int,
+    world_size: int,
+) -> int:
+    """Return the valid prefix length in one globally ordered ring K/V block."""
+    if valid_kv_length is None:
+        return block_size
+    if isinstance(valid_kv_length, bool) or not isinstance(valid_kv_length, int):
+        raise ValueError("valid_kv_length must be a Python integer")
+    total_length = block_size * world_size
+    if not 0 < valid_kv_length <= total_length:
+        raise ValueError(
+            "valid_kv_length must be within the global ring K/V sequence, "
+            f"got {valid_kv_length} for length {total_length}"
+        )
+    block_start = block_rank * block_size
+    return max(0, min(block_size, valid_kv_length - block_start))
 
 
 def _normalize_lse(block_lse: torch.Tensor, block_out: torch.Tensor, lse_layout: LseLayout) -> torch.Tensor:
@@ -57,8 +86,9 @@ def _update_out_and_lse(
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
     lse_layout: LseLayout,
+    *,
+    use_fused_merge: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    block_out = block_out.to(torch.float32)
     if out.shape != block_out.shape:
         raise ValueError(
             f"Ring attention block output shape {tuple(block_out.shape)} does not match "
@@ -71,6 +101,12 @@ def _update_out_and_lse(
             f"accumulated LSE shape {tuple(lse.shape)}."
         )
 
+    if use_fused_merge:
+        fused = try_fused_ring_merge(out, lse, block_out, block_lse)
+        if fused is not None:
+            return fused
+
+    block_out = block_out.to(torch.float32)
     out = out - F.sigmoid(block_lse - lse) * (out - block_out)
     lse = lse - F.logsigmoid(lse - block_lse)
 
@@ -85,6 +121,7 @@ def update_out_and_lse(
     slice_=None,
     *,
     lse_layout: LseLayout,
+    use_fused_merge: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         if slice_ is not None:
@@ -94,11 +131,15 @@ def update_out_and_lse(
         lse = _normalize_lse(block_lse, out, lse_layout)
 
     elif slice_ is not None:
+        assert lse is not None
         slice_out, slice_lse = out[slice_], lse[slice_]
-        slice_out, slice_lse = _update_out_and_lse(slice_out, slice_lse, block_out, block_lse, lse_layout)
+        slice_out, slice_lse = _update_out_and_lse(
+            slice_out, slice_lse, block_out, block_lse, lse_layout, use_fused_merge=use_fused_merge
+        )
         out[slice_], lse[slice_] = slice_out, slice_lse
     else:
-        out, lse = _update_out_and_lse(out, lse, block_out, block_lse, lse_layout)
+        assert lse is not None
+        out, lse = _update_out_and_lse(out, lse, block_out, block_lse, lse_layout, use_fused_merge=use_fused_merge)
     return out, lse
 
 

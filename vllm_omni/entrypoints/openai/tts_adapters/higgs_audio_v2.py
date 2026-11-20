@@ -9,7 +9,13 @@ import numpy as np
 from vllm.inputs import tokens_input
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    conditioning_cache_salt,
+    resolve_stage_model_path,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -50,7 +56,7 @@ class HiggsAudioV2Adapter(ARTTSAdapter):
             prompt_token_ids = input_ids_to_python_list(inputs)
             return tokens_input(prompt_token_ids=prompt_token_ids)
 
-        wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+        wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
         wav = np.asarray(wav_list, dtype=np.float32)
         out = await asyncio.to_thread(
             build_voice_clone_prompt,
@@ -70,7 +76,9 @@ class HiggsAudioV2Adapter(ARTTSAdapter):
         prompt["additional_information"] = {
             "audio_input_ids": out["audio_input_ids"],
             "audio_input_ids_mask": out["audio_input_ids_mask"],
+            "ref_audio_cache_key": cache_key,
         }
+        prompt["cache_salt"] = conditioning_cache_salt(request, prompt["additional_information"])
         return prompt
 
     async def _resolve_higgs_audio_v2_processor(self):
@@ -81,17 +89,7 @@ class HiggsAudioV2Adapter(ARTTSAdapter):
 
         from transformers import AutoProcessor
 
-        model_path = None
-        for stage in self.engine_client.stage_configs:
-            model_path = getattr(getattr(stage, "engine_args", None), "model", None)
-            if model_path:
-                break
-        if model_path is None:
-            # Fallback: the orchestrator stores the served model id on the engine
-            # itself (set by AsyncOmniEngine.__init__). Stage-level engine_args
-            # may not surface ``model`` when the deploy yaml doesn't set it per
-            # stage (the CLI-passed model id is the single source of truth).
-            model_path = getattr(self.engine_client, "model", None)
+        model_path = resolve_stage_model_path(self.engine_client)
         if model_path is None:
             raise RuntimeError("higgs_audio_v2 serving could not resolve the model path from the engine stage configs")
         processor = AutoProcessor.from_pretrained(model_path)

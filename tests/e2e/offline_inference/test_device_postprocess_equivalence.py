@@ -28,7 +28,6 @@ MODEL = os.environ.get("VLLM_OMNI_DEVICE_POSTPROCESS_MODEL")
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.diffusion,
-    pytest.mark.gpu,
     pytest.mark.skipif(
         not MODEL,
         reason="Set VLLM_OMNI_DEVICE_POSTPROCESS_MODEL to a WAN2.2 checkpoint to run this.",
@@ -83,7 +82,7 @@ def _as_uint8_frames(video: np.ndarray) -> np.ndarray:
 _MAX_DIFFERING_FRACTION = 0.35
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 def test_device_postprocess_produces_equivalent_frames() -> None:
     float_path = _generate(False)
     device_path = _generate(True)

@@ -1,0 +1,15 @@
+# Opt-in Model Runner V2 profile for Qwen3-Omni duplex.
+# Qwen duplex commits each utterance as a fresh request, so Thinker, Talker,
+# and Code2Wav use the same native MRv2 data plane as turn mode. CUDA, ROCm
+# and XPU run V2; NPU and MUSA retain their explicit V1 overrides.
+base_config: qwen3_omni_moe_mrv2.yaml
+
+session_mode: duplex
+
+stages:
+  - stage_id: 0
+    # Each utterance is a fresh request, so the base profile's opt-in
+    # Thinker prefix cache applies unchanged (shared session prefix hits).
+    limit_mm_per_prompt:
+      audio: 4
+      image: 8

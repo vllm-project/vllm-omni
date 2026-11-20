@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.diffusion.diffusion_kv.metadata import (
@@ -61,13 +63,14 @@ class _MetadataScheduler(BaseScheduler):
 
 
 def test_scheduler_copies_opaque_params_to_sequence_requests() -> None:
-    params = {"transfer_id": "xfer-req-0", "do_remote_prefill": True}
+    params = {"transfer_id": "xfer-req-0", "do_remote_prefill": True, "num_transfer_tokens": 3}
     sequence = DiffusionKVRequest(
         "req-0/diffusion-kv/0",
         sequence_id=0,
         prefix_len=4,
         target_len=2,
         seq_len=6,
+        prompt_token_ids=[10, 11, 12, 13],
     )
     request = OmniDiffusionRequest(
         prompt="prompt",
@@ -77,12 +80,16 @@ def test_scheduler_copies_opaque_params_to_sequence_requests() -> None:
         kv_transfer_params=params,
     )
     scheduler = _MetadataScheduler()
+    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=None)
     scheduler._diffusion_kv_manager = object()
 
     state = scheduler._make_request_state("req-0", request)
 
     assert state.diffusion_kv_requests[0].kv_transfer_params == params
     assert state.diffusion_kv_requests[0].kv_transfer_params is not params
+    assert sequence.prompt_token_ids == [10, 11, 12]
+    assert sequence.num_prompt_tokens == 3
+    assert sequence.seq_len == 6
 
 
 def test_diffusion_kv_metadata_uses_native_cache_group_block_ids() -> None:

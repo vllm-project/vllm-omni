@@ -1,8 +1,10 @@
 # `barge_in_client.py` — what happens, at a glance
 
-The demo plays one everyday conversation pattern against the full-duplex
-server: ask something, get talked-over mid-answer, and see the assistant
-cope. High-level flow below — for the exact wire events, read the
+The demo plays one everyday conversation pattern against a full-duplex
+model: ask something, get talked-over mid-answer, and see the assistant
+cope. It runs either against a server over `/v1/realtime?duplex=1` or, with
+`--inline`, against an in-process `DuplexOmni` — the conversation below is the
+same in both modes. High-level flow — for the exact wire events, read the
 docstring in `barge_in_client.py`.
 
 ```mermaid
@@ -48,7 +50,8 @@ answer is saved as `response_1_cancelled.wav`, a completed one as
 duration per answer.
 
 Companion: the runtime architecture lives in
-[`docs/design/fullduplex.md`](../../docs/design/fullduplex.md); the client
-API is `vllm_omni.clients.duplex.DuplexClient`, documented with the wire
-protocol in
+[`docs/design/fullduplex.md`](../../docs/design/fullduplex.md); the client API is
+`vllm_omni.clients.duplex.DuplexClient` over the websocket and
+`vllm_omni.clients.inline_duplex.InlineDuplexClient` in-process — both are
+documented with the wire protocol in
 [`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md).

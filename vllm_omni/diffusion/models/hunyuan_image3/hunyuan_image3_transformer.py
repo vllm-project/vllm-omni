@@ -4,6 +4,7 @@
 import inspect
 import logging
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -59,7 +60,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_allgather_parallel_world_size,
@@ -75,7 +76,15 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    begin_scheduled_denoise,
+    check_scheduler_sigmas,
+    get_forward_context,
+    get_paged_kv_computed_tokens,
+    is_forward_context_available,
+    paged_kv_prefill,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -884,6 +893,28 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
+def _require_attention_mask_support(record: ScheduleCandidate) -> str | None:
+    """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
+
+    The dense path sends a 4D attention mask with ``full_attn_spans`` on every forward. A backend that honors
+    the spans or declares dense 4D mask support runs it only if it also takes the mask. Any other backend
+    raises at the first dense forward that selects the profile if the profile names it; if the role uses the
+    platform default, that forward falls back to SDPA as outside a schedule, so the check accepts it. The
+    paged path sends no mask; there, startup validation already requires every candidate to match the
+    baseline paged backend.
+    """
+    backend_cls = record.backend_cls
+    if backend_cls.supports_piecewise_spans or backend_cls.supports_dense_4d_mask(record.spec):
+        if backend_cls.supports_attention_mask(record.spec):
+            return None
+    elif record.spec is None:
+        return None
+    return (
+        "HunyuanImage3 image attention sends a 4D attention mask with full_attn_spans on every dense "
+        "forward, so the backend must take the mask and either honor full_attn_spans or consume a dense 4D mask"
+    )
+
+
 class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
@@ -930,6 +961,9 @@ class ImageKVCacheManager(nn.Module):
             # bfloat16 autocast, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
+        # The dense image attention path always sends a 4D mask together with full_attn_spans.
+        # Startup validation runs this check only with a schedule.
+        self.attn.add_schedule_candidate_check(_require_attention_mask_support)
 
     @staticmethod
     def _get_current_starts(
@@ -1097,8 +1131,6 @@ class ImageKVCacheManager(nn.Module):
         layer resolves the actual CUDA or Ascend paged kernel.
         """
 
-        if uncond_cfg_prefill:
-            raise RuntimeError("Hunyuan negative-CFG prefill must run before paged row activation")
         if self._injected_ar_kv is not None:
             raise NotImplementedError("Hunyuan Scheduler-paged KV does not support imported AR KV")
         if not query_lens or len(seq_lens) != len(query_lens):
@@ -1109,7 +1141,6 @@ class ImageKVCacheManager(nn.Module):
         self.clear_legacy_prompt_kv_cache()
         bs = len(query_lens)
         q_len = query_lens[0]
-        seq_len = seq_lens[0]
         assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
 
         head_num_per_rank = query.shape[1]
@@ -1121,22 +1152,19 @@ class ImageKVCacheManager(nn.Module):
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
         joint_text_query = joint_text_key = joint_text_value = None
-        if self.sp_size > 1 and first_step:
+        if self.sp_size > 1 and uncond_cfg_prefill:
+            joint_text_query, joint_text_key, joint_text_value = query, key, value
+            query, key, value = query[:, :0], key[:, :0], value[:, :0]
+        elif self.sp_size > 1 and first_step:
             if shard_image_size is None or shard_image_size <= 0:
                 raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
-            local_prompt_len = seq_len - shard_image_size
             joint_query_len = query.shape[1] - shard_image_size
-            if local_prompt_len != joint_query_len:
-                raise ValueError(
-                    "Hunyuan paged Ulysses prompt layout mismatch: "
-                    f"key_prompt={local_prompt_len}, query_prompt={joint_query_len}"
-                )
             joint_text_query = query[:, :joint_query_len]
-            joint_text_key = key[:, :local_prompt_len]
-            joint_text_value = value[:, :local_prompt_len]
+            joint_text_key = key[:, :joint_query_len]
+            joint_text_value = value[:, :joint_query_len]
             query = query[:, joint_query_len:]
-            key = key[:, local_prompt_len:]
-            value = value[:, local_prompt_len:]
+            key = key[:, joint_query_len:]
+            value = value[:, joint_query_len:]
 
         if joint_text_query is None:
             attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
@@ -1254,6 +1282,8 @@ class ImageKVCacheManager(nn.Module):
     ) -> torch.Tensor:
         self.image_token_len = kwargs.get("num_image_tokens")
         if self.attn.is_paged_kv_active():
+            # A native connector fills the same Scheduler-owned pages as
+            # local prefill. Imported prefixes need no dense reconstruction.
             full_attn_spans = kwargs.get("full_attn_spans")
             if full_attn_spans is None:
                 raise ValueError("Hunyuan Scheduler-paged KV requires full_attn_spans metadata")
@@ -1653,6 +1683,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         layer_id: int = -1,
         prefix: str = "",
         enable_eplb: bool = False,
+        shared_router_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1684,11 +1715,14 @@ class HunYuanSparseMoeBlock(nn.Module):
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = 0
 
+        # None preserves the ordinary model dtype and autocast behavior.
+        self._shared_router_dtype = shared_router_dtype
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
             quant_config=quant_config,
+            params_dtype=shared_router_dtype,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -1733,8 +1767,12 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        # Only shared routers override the ordinary dtype/autocast contract.
+        if self._shared_router_dtype is not None:
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                router_logits, _ = self.gate(hidden_states.to(dtype=self._shared_router_dtype))
+        else:
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         return final_hidden_states.view(orig_shape)
@@ -1755,6 +1793,7 @@ class HunYuanAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         layer_id: int = -1,
+        rope_device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1811,12 +1850,19 @@ class HunYuanAttention(nn.Module):
         if rope_scaling is not None:
             # for t2t, fallback rotary_emb type from 'custom' to default.
             rope_scaling["rope_type"] = "default"
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters=rope_scaling,
-            is_neox_style=True,
-        )
+        # Shared weights stay on meta until attach; private RoPE caches need real data.
+        with rope_device if rope_device is not None else nullcontext():
+            self.rotary_emb = get_rope(
+                head_size=self.head_dim,
+                max_position=max_position_embeddings,
+                rope_parameters=rope_scaling,
+                is_neox_style=True,
+            )
+        # get_rope may return a cached module without observing rope_device.
+        if rope_device is not None and self.rotary_emb.cos_sin_cache.is_meta:
+            raise ValueError(
+                "Shared-backbone loading received a cached meta RoPE; a materialized RoPE cache is required."
+            )
         # which attention, from vllm or omni?
         # try use Atten from diffusion
         self.attn = Attention(
@@ -1837,7 +1883,9 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             scaling=self.scaling,
             image_token_len=4097,
-            prefix=f"{prefix}.image_attn",
+            # Native Mooncake pairs this canonical KV layer name with the AR
+            # HunYuanAttention: model.layers.N.self_attn.attn. Keep both in sync.
+            prefix=f"model.{prefix}",
         )
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(
             num_heads=self.num_heads,
@@ -1895,7 +1943,13 @@ class HunYuanAttention(nn.Module):
 
 class HunyuanImage3DecoderLayer(nn.Module):
     def __init__(
-        self, config: HunyuanImage3Config, quant_config: QuantizationConfig | None, layer_idx: int, prefix: str = ""
+        self,
+        config: HunyuanImage3Config,
+        quant_config: QuantizationConfig | None,
+        layer_idx: int,
+        prefix: str = "",
+        shared_router_dtype: torch.dtype | None = None,
+        rope_device: torch.device | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1930,6 +1984,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 cache_config=None,
                 prefix=f"{prefix}.self_attn",
                 layer_id=layer_idx,
+                rope_device=rope_device,
             )
         else:
             raise RuntimeError(f"Unsupported attention type: {attention_type}")
@@ -1939,7 +1994,11 @@ class HunyuanImage3DecoderLayer(nn.Module):
             or (isinstance(config.num_experts, list) and max(config.num_experts) > 1)
         ) and layer_idx >= config.moe_layer_num_skipped:
             self.mlp = HunYuanSparseMoeBlock(
-                config, quant_config=quant_config, layer_id=layer_idx, prefix=f"{prefix}.mlp"
+                config,
+                quant_config=quant_config,
+                layer_id=layer_idx,
+                prefix=f"{prefix}.mlp",
+                shared_router_dtype=shared_router_dtype,
             )
         else:
             self.mlp = HunYuanMLP(
@@ -2127,7 +2186,14 @@ class HunyuanImage3Model(nn.Module):
         "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
-    def __init__(self, config: HunyuanImage3Config, quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        config: HunyuanImage3Config,
+        quant_config=None,
+        prefix: str = "",
+        shared_router_dtype: torch.dtype | None = None,
+        rope_device: torch.device | None = None,
+    ):
         super().__init__()
         lora_config = None
         self.num_redundant_experts = 0
@@ -2157,6 +2223,8 @@ class HunyuanImage3Model(nn.Module):
                 quant_config=quant_config,
                 layer_idx=int(prefix.split(".")[-1]),
                 prefix=prefix,
+                shared_router_dtype=shared_router_dtype,
+                rope_device=rope_device,
             ),
             prefix=f"{prefix}.layers" if prefix else "layers",
         )
@@ -2479,6 +2547,7 @@ class HunyuanImage3Model(nn.Module):
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
+        paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
@@ -2537,7 +2606,9 @@ class HunyuanImage3Model(nn.Module):
             else:
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
-                seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
+                seq_lens = [
+                    prompt_size + shard_image_size + ar_kv_reuse_len + paged_kv_cached_prefix_len for _ in seq_lens
+                ]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
                 seq_lens = [seq_len + shard_image_size for seq_len in seq_lens]
@@ -2649,6 +2720,25 @@ class ClassifierFreeGuidance:
 @dataclass
 class HunyuanImage3Text2ImagePipelineOutput(BaseOutput):
     samples: list[Any] | np.ndarray
+
+
+@contextmanager
+def _clear_denoise_progress_on_exit():
+    """Clear the published denoise step on any exit and restore the timestep, total and sigma seen on entry.
+
+    The denoise loop publishes a timestep, total and sigma only when a schedule is bound; without one,
+    the restore assigns the values those fields already hold. Wan2.2 uses
+    ``clear_scheduled_denoise_step_on_exit`` instead, which clears the step, total and sigma only
+    for scheduled runs.
+    """
+    ctx = get_forward_context() if is_forward_context_available() else None
+    previous = (ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma) if ctx is not None else (None,) * 3
+    try:
+        yield
+    finally:
+        set_forward_context_denoise_step_idx(None)
+        if ctx is not None:
+            ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma = previous
 
 
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
@@ -2964,7 +3054,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             seq_lens=[prefill_seq_len],
             num_image_tokens=0,
             ar_kv_reuse_len=negative_reuse_len,
-            full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
+            full_attn_spans=[
+                [(start, min(end, prefill_seq_len)) for start, end in spans if start < prefill_seq_len]
+                for spans in model_kwargs["full_attn_spans"][batch_slice]
+            ]
             if model_kwargs.get("full_attn_spans")
             else None,
         )
@@ -3018,7 +3111,33 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         cfg_rank,
         device,
     ):
+        if is_forward_context_available() and get_forward_context().paged_kv_cached_prefix_len:
+            # Local hits are sliced after conditional-image embeddings are
+            # prepared in forward_call; the AR path must not truncate them.
+            return input_ids, 0
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
+        computed_tokens = get_paged_kv_computed_tokens()
+        if computed_tokens and computed_tokens[0] > 0:
+            positive_reuse_len = computed_tokens[0]
+            if (
+                len(computed_tokens) > 1
+                and computed_tokens[1] < positive_reuse_len
+                and (not cfg_parallel_ready or cfg_rank == 1)
+            ):
+                prefill_inputs = self._build_negative_cfg_prefill_inputs(
+                    input_ids,
+                    model_kwargs,
+                    batch_size,
+                    computed_tokens[1],
+                    positive_reuse_len,
+                    cfg_parallel_ready,
+                )
+                with (
+                    paged_kv_prefill(1, positive_reuse_len),
+                    torch.autocast(device_type=device.type, dtype=torch.bfloat16),
+                ):
+                    self.model.forward_call(**prefill_inputs)
+            return self._truncate_reused_prefix(input_ids, model_kwargs, positive_reuse_len), positive_reuse_len
         if ar_kv_data is None:
             logger.debug(
                 "[AR KV Reuse] cfg_rank=%s: no AR KV received, fallback to full recompute (reuse_len=0)",
@@ -3028,19 +3147,42 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # 1. positive prefix len
         positive_reuse_len, negative_reuse_len = self._get_kv_reuse_len(model_kwargs, batch_size)
+        if positive_reuse_len <= 0:
+            return input_ids, 0
+
+        # Sampled tokens can extend beyond the prefix actually computed by
+        # AR. Every decoder layer must have KV for the prefix we remove.
+        for layer in self.model.model.layers:
+            layer_kv = ar_kv_data.get(layer.layer_idx)
+            if layer_kv is None or layer_kv.get("key") is None or layer_kv.get("value") is None:
+                raise ValueError(f"AR KV cache is missing key/value tensors for layer {layer.layer_idx}")
+            positive_reuse_len = min(positive_reuse_len, layer_kv["key"].shape[0], layer_kv["value"].shape[0])
+        if positive_reuse_len <= 0:
+            raise ValueError("AR KV cache does not contain a computed prefix")
+        if any(
+            image_slice.stop > positive_reuse_len
+            for image_slices in model_kwargs["tokenizer_output"].joint_image_slices or []
+            for image_slice in image_slices
+        ):
+            raise ValueError("AR KV cache does not cover the conditional images")
+        if (
+            self.do_classifier_free_guidance
+            and not getattr(self.model.config, "cfg_distilled", False)
+            and negative_reuse_len is not None
+            and positive_reuse_len <= negative_reuse_len
+        ):
+            raise ValueError("AR KV cache does not cover the negative CFG prefill boundary")
         logger.info(
             f"Handling AR KV reuse with positive_reuse_len={positive_reuse_len}, "
             f"negative_reuse_len={negative_reuse_len}"
         )
-        if positive_reuse_len <= 0:
-            return input_ids, 0
 
         # 2. inject positive kv
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
 
         # 3. negative cfg prefill
         # For CFG distilled models, skip negative CFG prefill (cfg_factor=1, no negative prompt)
-        if self.do_classifier_free_guidance and not self.model.config.cfg_distilled:
+        if self.do_classifier_free_guidance and not getattr(self.model.config, "cfg_distilled", False):
             self._maybe_run_negative_cfg_prefill(
                 input_ids=input_ids,
                 model_kwargs=model_kwargs,
@@ -3151,7 +3293,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # For CFG distilled models, skip CFG parallel (cfg_factor=1, no negative branch)
         cfg_parallel_ready = (
             self.do_classifier_free_guidance
-            and not self.model.config.cfg_distilled
+            and not getattr(self.model.config, "cfg_distilled", False)
             and get_classifier_free_guidance_world_size() == 2
         )
 
@@ -3166,6 +3308,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             timesteps,
             sigmas,
         )
+        # Check a bound schedule against the sequence this call runs, before any forward below, including
+        # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
+        scheduled_total = begin_scheduled_denoise(len(timesteps))
+        # Bound sigma windows read these scheduler sigmas at every step; reject unusable ones here too.
+        check_scheduler_sigmas(self.scheduler.sigmas)
 
         # Prepare latent variables
         latents = self.prepare_latents(
@@ -3207,7 +3354,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
             # For CFG distilled models, cfg_factor is always 1 (CFG embedded in model)
-            if self.model.config.cfg_distilled:
+            if getattr(self.model.config, "cfg_distilled", False):
                 cfg_factor = 1
             else:
                 cfg_factor = 1 + self.do_classifier_free_guidance
@@ -3242,9 +3389,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             tc_prev_pred = None
             tc_cnt = 0
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=num_inference_steps) as progress_bar, _clear_denoise_progress_on_exit():
             for i, t in enumerate(timesteps):
-                set_forward_context_denoise_step_idx(i)
+                if scheduled_total is None:
+                    set_forward_context_denoise_step_idx(i)
+                else:
+                    self.model.record_denoise_step(i, t, scheduler=self.scheduler, total_steps=scheduled_total)
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
@@ -3252,7 +3402,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     # Sequential CFG: double the batch
                     latent_model_input = torch.cat([latents] * cfg_factor)
 
-                if self.model.config.use_meanflow:
+                if getattr(self.model.config, "use_meanflow", False):
                     r = self.scheduler.get_timestep_r(t)
                     r_expand = r.repeat(latent_model_input.shape[0])
                 else:
@@ -3281,7 +3431,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
                 if should_compute:
                     # Handle guidance for CFG distilled models
-                    if self.model.config.cfg_distilled:
+                    if getattr(self.model.config, "cfg_distilled", False):
                         model_kwargs["guidance"] = torch.tensor(
                             [1000.0 * self._guidance_scale],
                             device=self.device,
@@ -3294,6 +3444,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         **model_kwargs,
                     )
 
+                    # Later steps reuse the prompt K/V computed at step 0 under whatever profile step 0 selected.
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                         model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
@@ -3308,7 +3459,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # Perform guidance
                 # For CFG distilled models, guidance is already embedded in the model,
                 # so we skip the explicit CFG computation
-                if self.model.config.cfg_distilled:
+                if getattr(self.model.config, "cfg_distilled", False):
                     # CFG distilled: guidance is handled internally via guidance_emb
                     pass
                 elif cfg_parallel_ready:
@@ -3347,8 +3498,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
-        set_forward_context_denoise_step_idx(None)
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
