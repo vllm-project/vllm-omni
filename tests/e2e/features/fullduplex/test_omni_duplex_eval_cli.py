@@ -325,6 +325,57 @@ def test_cli_evaluate_rejects_negative_judge_frame_max_side(tmp_path: Path):
         OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
 
 
+@pytest.mark.parametrize(
+    ("sample_ids", "cached_score"),
+    [(["cached"], {}), (["new", "cached"], {"judge_frame_max_side": 1920})],
+    ids=["fully-cached-legacy", "partial-resume"],
+)
+def test_cli_evaluate_rejects_mismatched_cached_rtd_cap(tmp_path, monkeypatch, sample_ids, cached_score):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": sample_id, "split": "RTD_OCR"} for sample_id in sample_ids]))
+    score_root = tmp_path / "scores"
+    cached_path = score_root / "RTD_OCR" / "cached.json"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_text(json.dumps(cached_score))
+    seen = []
+    monkeypatch.setattr(cli, "evaluate_sample", lambda sample, *args, **kwargs: seen.append(sample.id))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    with pytest.raises(ValueError, match=r"cached\.json.*judge_frame_max_side.*--overwrite.*--score-root"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+    assert seen == []
+    assert list(cached_path.parent.iterdir()) == [cached_path]
+    assert json.loads(cached_path.read_text()) == cached_score
+
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args([*args, "--overwrite"]))
+    assert seen == sample_ids
+
+
+def test_cli_evaluate_reuses_matching_rtd_and_legacy_pr_scores(tmp_path, monkeypatch):
+    samples = [{"id": "rtd", "split": "RTD_OCR"}, {"id": "pr", "split": "PR_correction"}]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(samples))
+    score_root = tmp_path / "scores"
+    for sample, score in zip(samples, ({"judge_frame_max_side": 768}, {})):
+        path = score_root / sample["split"] / f"{sample['id']}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(score))
+
+    def unexpected_evaluation(*args, **kwargs):
+        pytest.fail("compatible cached scores should be reused")
+
+    monkeypatch.setattr(cli, "evaluate_sample", unexpected_evaluation)
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    assert cli.run(parser.parse_args(args)) == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True])
 async def test_generate_rejects_unpaced_server_vad_before_preparation_or_cache(tmp_path, monkeypatch, cached):

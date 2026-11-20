@@ -224,43 +224,49 @@ def test_content_and_reminder_completion_budget_stays_at_1200(judge_http):
     assert judge_http.call_args.kwargs["json"]["max_tokens"] == 1200
 
 
-def _evaluate_with_cap(sample_paths, sample_id, max_side):
-    sample, response, score = sample_paths
-    path = score.with_name(f"{sample_id}.json")
-    judge = judge_module.DuplexJudge("http://unused", "judge")
-    evaluator.evaluate_sample(replace(sample, id=sample_id), response, path, judge, judge_frame_max_side=max_side)
-    return path
+def _write_rtd_score(root, sample_id, **metadata):
+    path = root / "RTD_OCR" / f"{sample_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"temporal": {"summary": {"avg_temporal_score": 1}}, **metadata}))
 
 
 @pytest.mark.parametrize("max_side", [None, 768], ids=["source", "capped"])
-def test_summary_records_a_uniform_judge_frame_max_side(sample_paths, judge_http, max_side):
-    judge_http.return_value = _reply('{"success_score": 1}')
-    _evaluate_with_cap(sample_paths, "first", max_side)
-    path = _evaluate_with_cap(sample_paths, "second", max_side)
-    summary = evaluator.summarize_scores(path.parent)
+def test_summary_records_a_uniform_judge_frame_max_side(tmp_path, max_side):
+    _write_rtd_score(tmp_path, "first", judge_frame_max_side=max_side)
+    _write_rtd_score(tmp_path, "second", judge_frame_max_side=max_side)
+    summary = evaluator.summarize_scores(tmp_path)
     assert summary["samples"] == 2
     assert summary["judge_frame_max_side"] == max_side
 
 
-def test_summary_rejects_mixed_judge_frame_max_side(sample_paths, judge_http):
-    judge_http.return_value = _reply('{"success_score": 1}')
-    _evaluate_with_cap(sample_paths, "first", 1920)
-    path = _evaluate_with_cap(sample_paths, "second", 768)
+def test_summary_rejects_mixed_judge_frame_max_side(tmp_path):
+    _write_rtd_score(tmp_path, "first", judge_frame_max_side=1920)
+    _write_rtd_score(tmp_path, "second", judge_frame_max_side=768)
     with pytest.raises(ValueError, match=r"mixes judge_frame_max_side values \[1920, 768\]"):
-        evaluator.summarize_scores(path.parent)
+        evaluator.summarize_scores(tmp_path)
 
 
-def test_summary_treats_a_score_without_the_field_as_source_resolution(sample_paths, judge_http):
-    judge_http.return_value = _reply('{"success_score": 1}')
-    path = _evaluate_with_cap(sample_paths, "first", None)
-    legacy = json.loads(path.read_text())
-    del legacy["judge_frame_max_side"]
-    path.with_name("legacy.json").write_text(json.dumps(legacy))
-    assert evaluator.summarize_scores(path.parent)["judge_frame_max_side"] is None
+def test_summary_treats_a_score_without_the_field_as_source_resolution(tmp_path):
+    _write_rtd_score(tmp_path, "first", judge_frame_max_side=None)
+    _write_rtd_score(tmp_path, "legacy")
+    assert evaluator.summarize_scores(tmp_path)["judge_frame_max_side"] is None
 
-    _evaluate_with_cap(sample_paths, "capped", 1920)
+    _write_rtd_score(tmp_path, "capped", judge_frame_max_side=1920)
     with pytest.raises(ValueError, match="mixes judge_frame_max_side"):
-        evaluator.summarize_scores(path.parent)
+        evaluator.summarize_scores(tmp_path)
+
+
+def test_summary_combines_capped_rtd_and_legacy_pr_scores(tmp_path):
+    _write_rtd_score(tmp_path, "rtd", judge_frame_max_side=1920)
+    pr_score = tmp_path / "PR_correction" / "pr.json"
+    pr_score.parent.mkdir()
+    pr_score.write_text(json.dumps({"task_type": "correction", "pr": {"total_score": 1}}))
+
+    summary = evaluator.summarize_scores(tmp_path)
+    assert summary["samples"] == 2
+    assert summary["judge_frame_max_side"] == 1920
+    assert summary["rtd"]["mean_avg_temporal_score"] == 1
+    assert summary["pr"]["mean_all_success"] == 1
 
 
 @pytest.mark.parametrize(
