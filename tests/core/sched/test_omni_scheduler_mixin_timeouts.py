@@ -20,10 +20,11 @@ from types import SimpleNamespace
 
 import pytest
 from vllm import SamplingParams
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.request import Request
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.outputs import OmniConnectorOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -419,6 +420,63 @@ def test_a_rejected_value_does_not_outlive_its_test(monkeypatch):
     monkeypatch.undo()
     importlib.reload(mod)
     assert mod.DEFAULT_INPUT_WAIT_TIMEOUT_S == ambient
+
+
+class _PermanentSendScheduler(OmniSchedulerMixin):
+    def __init__(self, requests):
+        self.requests = requests
+        self.input_coordinator = None
+        self.chunk_transfer_adapter = None
+        self._outputs_awaiting_stage_payload = {}
+        self._latest_omni_connector_output = None
+        self.finished_req_ids_dict = {}
+        self.finish_calls = []
+
+    def finish_requests(self, req_ids, status):
+        self.finish_calls.append((set(req_ids), status))
+        for req_id in req_ids:
+            self.requests.pop(req_id, None)
+
+
+def test_permanent_send_failure_emits_error_after_request_left_scheduler():
+    """A full-payload give-up still fails the request after the producer finished."""
+    reason = "Stage-1 connector send failed permanently for request 'req-gone'"
+    scheduler = _PermanentSendScheduler({})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_send_failures={"req-gone": (3, reason)},
+    )
+
+    scheduler._process_pending_omni_inputs("ar")
+
+    assert scheduler.finish_calls == []
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert list(outputs) == [3]
+    eco = outputs[3].outputs[0]
+    assert eco.request_id == "req-gone"
+    assert eco.finish_reason == FinishReason.ERROR
+    assert eco.stop_reason.startswith("Stage-1")
+
+
+def test_permanent_send_failure_finishes_request_still_scheduled():
+    request = SimpleNamespace(request_id="req-live", client_index=2, stop_reason=None)
+    scheduler = _PermanentSendScheduler({"req-live": request})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_send_failures={"req-live": (9, "Stage-0 connector send failed")},
+    )
+
+    scheduler._process_pending_omni_inputs("ar")
+
+    assert len(scheduler.finish_calls) == 1
+    finished_ids, status = scheduler.finish_calls[0]
+    assert finished_ids == {"req-live"}
+    assert getattr(status, "name", str(status)).endswith("FINISHED_ERROR")
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    eco = outputs[2].outputs[0]
+    assert eco.request_id == "req-live"
+    assert eco.finish_reason == FinishReason.ERROR
+    assert "Stage-0" in eco.stop_reason
 
 
 if __name__ == "__main__":

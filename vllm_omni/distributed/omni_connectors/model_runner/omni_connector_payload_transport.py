@@ -67,6 +67,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     """Own payload caching, full/chunk transport, and connector I/O."""
 
     _full_payload_replace_keys_cached: frozenset[str]
+    # request_id -> (client_index, reason), drained into OmniConnectorOutput.
+    _permanent_send_failures: dict[str, tuple[int, str]]
 
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
@@ -472,6 +474,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             or output.stage_recv_req_ids
             or output.has_pending_kv_work
             or output.stage_payloads
+            or output.permanent_send_failures
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:
@@ -946,6 +949,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 "put_key": connector_put_key,
                 "data": payload,
                 "request_id": req_id,
+                "client_index": self._task_client_index(request),
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(req_id, deque()).append(task)
@@ -1182,6 +1186,21 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             self._save_work_available.wait(timeout=0.01)
             self._save_work_available.clear()
 
+    def _permanent_send_failure_map(self) -> dict[str, tuple[int, str]]:
+        failures = getattr(self, "_permanent_send_failures", None)
+        if failures is None:
+            failures = {}
+            self._permanent_send_failures = failures
+        return failures
+
+    @staticmethod
+    def _task_client_index(request: Any | None) -> int:
+        raw = getattr(request, "client_index", 0) if request is not None else 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
     def _requeue_or_drop_failed_send(
         self,
         task: dict,
@@ -1213,16 +1232,27 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 dq.appendleft(task)
         else:
             cause = error or task.get("_last_send_error")
-            failure = RuntimeError(
-                "connector send failed permanently for "
+            stage_id = getattr(self, "_stage_id", "?")
+            reason = (
+                f"Stage-{stage_id} connector send failed permanently for "
                 f"request {req_id!r}, key {task.get('put_key')!r} "
                 f"after {self._MAX_SEND_RETRIES + 1} attempts"
             )
             if cause is not None:
+                reason = f"{reason}: {type(cause).__name__}: {cause}"
+            failure = RuntimeError(reason)
+            if cause is not None:
                 failure.__cause__ = cause
+            client_index = task.get("client_index", 0)
+            try:
+                client_index = int(client_index)
+            except (TypeError, ValueError):
+                client_index = 0
+            with self._lock:
+                self._permanent_send_failure_map().setdefault(req_id, (client_index, reason))
             logger.error(
                 "[Stage-%s] Giving up on send for %s after %d retries",
-                getattr(self, "_stage_id", "?"),
+                stage_id,
                 req_id,
                 self._MAX_SEND_RETRIES,
             )
@@ -1683,6 +1713,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._chunk_ready_req_ids.update(newly_finished)
         with self._lock:
             stage_payloads, self._run_stage_payloads = self._run_stage_payloads, {}
+            permanent_send_failures = dict(self._permanent_send_failure_map())
+            self._permanent_send_failures.clear()
 
         output = OmniConnectorOutput(
             chunk_ready_req_ids=set(self._chunk_ready_req_ids),
@@ -1692,6 +1724,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
             stage_payloads=stage_payloads,
+            permanent_send_failures=permanent_send_failures,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1746,6 +1779,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             "put_key": connector_put_key,
             "data": payload_data,
             "request_id": request_id,
+            "client_index": self._task_client_index(request),
             "completion": completion,
         }
         with self._lock:

@@ -593,6 +593,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain input notifications into the coordinator on the scheduler thread."""
         connector_outputs = self._drain_omni_connector_outputs()
+        self._queue_permanent_send_failures(connector_outputs)
 
         # Attach returned payloads to held run outputs.
         awaiting = self._outputs_awaiting_stage_payload
@@ -641,6 +642,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     def _process_pending_omni_inputs(self, model_mode: str) -> None:
         """Apply pending connector inputs, timeouts, and async chunks."""
         self._consume_pending_connector_output(model_mode)
+        self._process_permanent_send_failures()
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
@@ -682,6 +684,57 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             )
         if self.input_coordinator:
             self.input_coordinator.restore_queues(_OmniWaitingQueue(self), self.running)
+
+    def _queue_permanent_send_failures(self, connector_outputs: list[OmniConnectorOutput]) -> None:
+        """Hold producer send give-ups until this scheduler step can emit them."""
+        if not connector_outputs:
+            return
+        queued = getattr(self, "_queued_permanent_send_failures", None)
+        if queued is None:
+            queued = {}
+            self._queued_permanent_send_failures = queued
+        for output in connector_outputs:
+            for req_id, failure in getattr(output, "permanent_send_failures", {}).items():
+                queued.setdefault(req_id, failure)
+
+    def _process_permanent_send_failures(self) -> None:
+        """Turn an exhausted connector send into a client-visible ERROR.
+
+        Full-payload flush happens after the producer request has already
+        left this scheduler, so ``finish_requests`` alone cannot reach the
+        client. The ERROR output is attached later by
+        ``_attach_finished_request_sets`` and the orchestrator fails the
+        request from any stage. A request still scheduled here is finished
+        as well, so its slot is released.
+        """
+        queued = getattr(self, "_queued_permanent_send_failures", None)
+        if not queued:
+            return
+        failures, self._queued_permanent_send_failures = queued, {}
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        still_local: list[str] = []
+        for req_id, (client_index, reason) in failures.items():
+            request = self.requests.get(req_id)
+            if request is not None:
+                client_index = request.client_index
+                request.stop_reason = reason
+                still_local.append(req_id)
+            if req_id in pending:
+                continue
+            logger.error("Failing request %s after connector send gave up: %s", req_id, reason)
+            pending[req_id] = (
+                client_index,
+                OmniEngineCoreOutput(
+                    request_id=req_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason=reason,
+                ),
+            )
+        if still_local:
+            self.finish_requests(still_local, RequestStatus.FINISHED_ERROR)
 
     def _process_pending_input_timeouts(self) -> None:
         """Force-fail requests waiting on the full-payload coordinator too long.

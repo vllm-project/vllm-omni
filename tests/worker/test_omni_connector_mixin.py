@@ -2032,6 +2032,9 @@ class TestSendRetry(unittest.TestCase):
         sender = self._make_sender(MockConnector(stage_id=0))
         sender._pending_save_counts["r1"] = 1
         task = self._make_task()
+        task["client_index"] = 4
+        task["put_key"] = "r1_0_0"
+        task["_last_send_error"] = ConnectionError("put rejected")
         task["_retry_count"] = sender._MAX_SEND_RETRIES  # already at max
 
         sender._requeue_or_drop_failed_send(task)
@@ -2040,6 +2043,13 @@ class TestSendRetry(unittest.TestCase):
             dq = sender._pending_save_reqs.get("r1")
         self.assertTrue(dq is None or len(dq) == 0, "task should NOT be re-enqueued after max retries")
         self.assertNotIn("r1", sender._pending_save_counts, "pending count should be cleaned up on final drop")
+        output = sender.get_omni_connector_output()
+        client_index, reason = output.permanent_send_failures["r1"]
+        self.assertEqual(client_index, 4)
+        self.assertIn("Stage-0", reason)
+        self.assertIn("r1_0_0", reason)
+        self.assertIn("put rejected", reason)
+        self.assertEqual(sender.get_omni_connector_output().permanent_send_failures, {})
         sender.shutdown_omni_connectors()
 
     def test_save_loop_retries_on_exception(self):

@@ -51,6 +51,9 @@ class OmniConnectorOutput:
             completed KV transfers that the scheduler should account for.
         stage_payloads: Serialized stage payloads of run requests keyed by
             request ID, returned to the scheduler instead of sent on the connector.
+        permanent_send_failures: Requests whose connector send exhausted
+            retries. Values are ``(client_index, reason)``. The request may
+            already have left the producer scheduler.
     """
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
@@ -60,6 +63,7 @@ class OmniConnectorOutput:
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
     stage_payloads: dict[str, bytes] = field(default_factory=dict)
+    permanent_send_failures: dict[str, tuple[int, str]] = field(default_factory=dict)
 
 
 @dataclass
