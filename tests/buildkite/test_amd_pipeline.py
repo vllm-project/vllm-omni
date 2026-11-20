@@ -1565,6 +1565,14 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
         ),
         (
+            "Reliability Test · hunyuan-image",
+            "ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR",
+            "hunyuan-reliability-guard",
+            13,
+            0,
+            "Expected exactly 13 executed HunyuanImage reliability tests with no skips",
+        ),
+        (
             "Reliability Test · minicpmo-4.5",
             "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "minicpmo-reliability-guard",
@@ -1597,7 +1605,15 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         ),
     ),
-    ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
+    ids=(
+        "qwen3-omni",
+        "wan22",
+        "hunyuan-image",
+        "minicpmo",
+        "invalid-parameters-single",
+        "invalid-parameters-2gpu",
+        "audio",
+    ),
 )
 def test_weekly_reliability_executes_junit_guard_before_exit(
     tmp_path: Path,
@@ -1697,8 +1713,8 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert reliability_step["artifact_paths"] == ["artifacts/rocm-hunyuan-image-reliability/**/*"]
     assert reliability_command.count("--shard-id=0 --num-shards=1") == 2
     assert "Expected exactly 13 HunyuanImage reliability nodes" in reliability_command
-    assert "Expected exactly 13 executed HunyuanImage reliability tests" in reliability_command
-    assert "skipped != 1" in reliability_command
+    assert "Expected exactly 13 executed HunyuanImage reliability tests with no skips" in reliability_command
+    assert "skipped != 0" in reliability_command
     assert "vllm_omni/deploy/hunyuan_image3_dit_rocm_reliability.yaml" not in dependencies
     assert "tests/dfx/reliability/test_hunyuan_image_ep_startup.py" in dependencies
     assert "env" not in step
