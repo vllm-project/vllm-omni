@@ -5,23 +5,35 @@
 One engine token is one audio frame. The backbone hidden state gives the first
 codebook through ``lm_head``, the depth decoder completes the frame, and the sum
 of the frame's codebook embeddings is the backbone's next input.
+
+Generation ends on a frame whose codebooks, except the last, are all the EOS id.
+That cannot be seen from the first codebook alone, so the step after such a
+frame is forced to emit ``stop_token_id``, an engine-only id one past the
+codebook vocabulary.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from itertools import islice
 from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaModel
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, make_layers, maybe_prefix
 
-from vllm_omni.model_executor.models.csm.csm_depth_decoder import CsmDepthDecoder
+from vllm_omni.model_executor.models.csm.csm_depth_decoder import CsmDepthDecoder, draw_frame_uniforms
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
+
+# Depth-decoder sampling of sesame/csm-1b's generation_config.json (depth_decoder_*).
+_DEFAULT_DEPTH_SAMPLING = {"do_sample": True, "temperature": 0.9, "top_k": 50, "top_p": 1.0}
 
 
 def stop_frame_mask(codes: torch.Tensor, codebook_eos_token_id: int = 0) -> torch.Tensor:
@@ -112,6 +124,30 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         # Tied in the checkpoint (tie_codebooks_embeddings).
         self.depth_decoder.model.embed_tokens.weight = self.backbone_model.embed_tokens.embed_audio_tokens.weight
 
+        self.have_multimodal_outputs = True
+        self.has_preprocess = True
+        self.has_postprocess = False
+        self.has_talker_mtp = True
+        self.mtp_output_key = ("codes", "audio")
+        self.mtp_accepts_per_row_generators = True
+        # talker_mtp records the stop frame per request id.
+        self.mtp_accepts_req_infos = True
+        # Enables mrv2_sampling_context, which gives compute_logits the request order.
+        self.logitsprocs_need_output_token_ids = True
+        self.omni_pooler_payload_include_hidden = False
+        self.stop_token_id = self.codebook_vocab_size
+        self.logits_vocab_size = self.codebook_vocab_size + 1
+        sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        self.mtp_sampling_params = {**_DEFAULT_DEPTH_SAMPLING, **(sampling if isinstance(sampling, Mapping) else {})}
+
+        stop_logits = torch.full((self.logits_vocab_size,), float("-inf"))
+        stop_logits[self.stop_token_id] = 0.0
+        self.register_buffer("_stop_logits", stop_logits, persistent=False)
+        self.register_buffer("_no_stop", torch.zeros((), dtype=torch.bool), persistent=False)
+        self.register_buffer("_zero_text_step", torch.zeros((1, config.hidden_size)), persistent=False)
+        self._stop_flags: dict[str, torch.Tensor] = {}
+        self._forced_stop_mask: torch.Tensor | None = None
+
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         """Embed prompt text tokens."""
         return self.embed_text_tokens(input_ids)
@@ -133,9 +169,127 @@ class CsmTalkerForConditionalGeneration(nn.Module):
             inputs_embeds = self.embed_input_ids(input_ids)
         return self.backbone_model(positions, inputs_embeds)
 
-    def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: Any = None) -> torch.Tensor:
-        """Return first-codebook logits."""
-        return self.lm_head(hidden_states)
+    def compute_logits(
+        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
+    ) -> torch.Tensor | None:
+        """Return first-codebook logits plus the stop column, ``[N, logits_vocab_size]``."""
+        if isinstance(hidden_states, OmniOutput):
+            hidden_states = hidden_states.text_hidden_states
+        if hidden_states is None:
+            return None
+        logits = F.pad(self.lm_head(hidden_states), (0, 1), value=float("-inf"))
+        mask = self._forced_stop_mask
+        # The mask is set only while sampling; prompt-logprob calls have other row counts.
+        if mask is not None and mask.shape[0] == logits.shape[0]:
+            logits = torch.where(mask, self._stop_logits.to(logits.dtype), logits)
+        return logits
+
+    @contextmanager
+    def mrv2_sampling_context(self, *, req_ids: Sequence[str], num_output_tokens: torch.Tensor) -> Iterator[None]:
+        """Force the stop token for requests whose previous frame was a stop frame."""
+        flags = self._stop_flags
+        if flags:
+            self._forced_stop_mask = torch.stack([flags.get(req_id, self._no_stop) for req_id in req_ids])[:, None]
+        try:
+            yield
+        finally:
+            self._forced_stop_mask = None
+
+    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+        """Allocate this step's token-major frame outputs; the runner fills them after sampling."""
+        if isinstance(model_outputs, OmniOutput):
+            return model_outputs
+        spans = kwargs.get("request_token_spans")
+        num_tokens = spans[-1][1] if spans else model_outputs.shape[0]
+        device = model_outputs.device
+        return OmniOutput(
+            text_hidden_states=model_outputs,
+            multimodal_outputs={
+                "codes": {"audio": torch.zeros((num_tokens, self.num_codebooks), dtype=torch.long, device=device)},
+                "meta": {"codec_frame_valid": torch.zeros((num_tokens,), dtype=torch.int8, device=device)},
+            },
+        )
+
+    def preprocess(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Per-request input hook: prompt rows pass through, decode rows take the stored frame embedding."""
+        if input_embeds is None:
+            input_embeds = self.embed_input_ids(input_ids)
+        is_prefill = info.get("_omni_is_prefill")
+        if is_prefill is None:
+            is_prefill = input_ids.shape[0] != 1
+        if is_prefill:
+            return input_ids, input_embeds, {}
+        # CSM adds nothing to the frame embedding on decode steps.
+        return input_ids, input_embeds, {"mtp_inputs": (self._zero_text_step, self._zero_text_step)}
+
+    def mtp_frame_valid(self, layer0: torch.Tensor) -> torch.Tensor:
+        """Rows whose first codebook is a code rather than the stop token."""
+        return (layer0 >= 0) & (layer0 < self.codebook_vocab_size)
+
+    def talker_mtp(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        text_step: torch.Tensor,
+        do_sample: bool | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
+        sample_uniforms: torch.Tensor | None = None,
+        req_ids: Sequence[str] | None = None,
+        **_: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Complete the frames of the just-sampled first codebooks.
+
+        Returns the next backbone input ``[B, hidden]`` and the codes ``[B, num_codebooks]``.
+        """
+        first_codes = input_ids.reshape(-1).to(torch.long)
+        bsz = first_codes.shape[0]
+        # A forced stop token is not a code; its row is computed on code 0 and discarded.
+        is_code = self.mtp_frame_valid(first_codes)
+        first_codes = torch.where(is_code, first_codes, torch.zeros_like(first_codes))
+
+        defaults = self.mtp_sampling_params
+        do_sample = bool(defaults["do_sample"] if do_sample is None else do_sample)
+        if do_sample and sample_uniforms is None:
+            if generators is None and generator is not None:
+                generators = [generator] * bsz
+            sample_uniforms = draw_frame_uniforms(
+                bsz,
+                self.depth_decoder.num_steps,
+                self.codebook_vocab_size,
+                device=first_codes.device,
+                generators=generators,
+            )
+        codes, frame_embeds = self.generate_frame(
+            last_talker_hidden.reshape(bsz, -1),
+            first_codes,
+            do_sample=do_sample,
+            temperature=float(defaults["temperature"] if temperature is None else temperature),
+            top_k=int(defaults["top_k"] if top_k is None else top_k),
+            top_p=float(defaults["top_p"] if top_p is None else top_p),
+            uniforms=sample_uniforms,
+        )
+        if req_ids is not None:
+            # A request that already received the stop token stays stopped.
+            stop = stop_frame_mask(codes, self.codebook_eos_token_id) | ~is_code
+            for row, req_id in enumerate(req_ids):
+                self._stop_flags[req_id] = stop[row]
+        codes = torch.where(is_code[:, None], codes, torch.zeros_like(codes))
+        return frame_embeds.to(input_embeds.dtype), codes
+
+    mtp = talker_mtp
+    get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    def on_requests_finished(self, req_ids: Iterable[str]) -> None:
+        """Drop the stop flags of finished or aborted requests."""
+        for req_id in req_ids:
+            self._stop_flags.pop(req_id, None)
 
     def generate_frame(
         self,

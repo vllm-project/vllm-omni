@@ -83,13 +83,17 @@ def _config(**overrides) -> CsmConfig:
     )
 
 
-def _build_talker(config: CsmConfig, monkeypatch: pytest.MonkeyPatch) -> CsmTalkerForConditionalGeneration:
+def _build_talker(
+    config: CsmConfig, monkeypatch: pytest.MonkeyPatch, **model_config
+) -> CsmTalkerForConditionalGeneration:
     single_rank = SimpleNamespace(rank_in_group=0, world_size=1, is_first_rank=True, is_last_rank=True)
     monkeypatch.setattr(parallel_state, "_PP", single_rank)
     monkeypatch.setattr(parallel_state, "_TP", single_rank)
     vllm_config = VllmConfig()
     object.__setattr__(
-        vllm_config, "model_config", _ModelConfig(dtype=torch.float32, hf_config=config, model="csm-test")
+        vllm_config,
+        "model_config",
+        _ModelConfig(dtype=torch.float32, hf_config=config, model="csm-test", **model_config),
     )
     with set_current_vllm_config(vllm_config):
         return CsmTalkerForConditionalGeneration(vllm_config=vllm_config).eval()
@@ -179,7 +183,11 @@ def test_embeddings_and_first_codebook_head_match_transformers(
         torch.testing.assert_close(
             talker.embed_audio_frames(codes), reference.backbone_model.embed_tokens(codes[:, None, :])[:, 0]
         )
-        torch.testing.assert_close(talker.compute_logits(hidden), reference.lm_head(hidden))
+        logits = talker.compute_logits(hidden)
+        torch.testing.assert_close(logits[:, : reference.config.vocab_size], reference.lm_head(hidden))
+        # The extra column is the engine-only stop token, closed unless forced.
+        assert logits.shape == (5, reference.config.vocab_size + 1)
+        assert torch.isneginf(logits[:, -1]).all()
 
 
 def test_generate_frame_matches_transformers_greedy(
