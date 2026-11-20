@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex code2wav: streaming speech-codec-token → waveform stage.
 
 Wraps the vendored Audex causal speech decoder (see ``speech_decoder/``).
@@ -79,6 +79,7 @@ class AudexCode2Wav(nn.Module):
     """Stage-1 model for Audex TTS (GenerationModelRunner)."""
 
     input_modalities = "audio"
+    logits_vocab_size = 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

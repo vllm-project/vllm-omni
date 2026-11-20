@@ -218,6 +218,53 @@ def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeyp
     }
 
 
+@pytest.mark.parametrize("replica_host", ["127.0.0.1", "127.0.1.1", "localhost", "::1"])
+def test_resolve_contact_host_replaces_loopback_replica_host(monkeypatch, replica_host):
+    client = object.__new__(StageEngineCoreClient)
+    client.client_addresses = {"replica_host": replica_host}
+    monkeypatch.setattr(client, "_detect_local_ip", lambda: "10.19.83.77")
+
+    assert client._resolve_contact_host() == "10.19.83.77"
+
+
+def test_resolve_contact_host_preserves_loopback_when_ip_detection_fails(monkeypatch):
+    client = object.__new__(StageEngineCoreClient)
+    client.client_addresses = {"replica_host": "127.0.0.1"}
+    monkeypatch.setattr(client, "_detect_local_ip", lambda: None)
+
+    assert client._resolve_contact_host() == "127.0.0.1"
+
+
+def test_intermediate_payload_sender_replaces_loopback_replica_host(mocker, monkeypatch):
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 1
+    client.replica_id = 0
+    client.client_addresses = {"replica_host": "127.0.0.1"}
+    client.vllm_config = mocker.Mock(
+        model_config=mocker.Mock(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {
+                    "role": "receiver",
+                    "outgoing": {"host": "auto", "zmq_port": 50061, "from_stage": 1},
+                },
+            }
+        )
+    )
+    client._omni_kv_config = None
+    client._kv_sender_info = None
+    monkeypatch.setattr(client, "_detect_local_ip", lambda: "10.19.83.77")
+
+    assert client._build_payload_sender_info() == {"host": "10.19.83.77", "zmq_port": 50062}
+
+
+def test_resolve_contact_host_preserves_routable_replica_host():
+    client = object.__new__(StageEngineCoreClient)
+    client.client_addresses = {"replica_host": "10.19.83.77"}
+
+    assert client._resolve_contact_host() == "10.19.83.77"
+
+
 def test_stage_engine_core_client_uses_connector_config_for_sender_port():
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 3
