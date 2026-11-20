@@ -445,15 +445,14 @@ def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict
 
 def _attach_omni_chat_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
     """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni / Video-MME / Mixed-Omni."""
-    if isinstance(sample, (DailyOmniSampleRequest, VideoMMESampleRequest)):
-        rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
-        if sample.omni_chat_messages is not None:
-            setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
-        elif isinstance(sample, DailyOmniSampleRequest):
-            setattr(rfi, "mm_position", sample.omni_chat_mm_position)
-    elif isinstance(sample, MixedOmniSampleRequest):
-        rfi.extra_body = sample.omni_extra_body
+    if not isinstance(sample, (DailyOmniSampleRequest, VideoMMESampleRequest, MixedOmniSampleRequest)):
+        return
+    rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
+    if sample.omni_chat_messages is not None:
         setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+    elif isinstance(sample, DailyOmniSampleRequest):
+        setattr(rfi, "mm_position", sample.omni_chat_mm_position)
+    if isinstance(sample, MixedOmniSampleRequest):
         setattr(rfi, "omni_task_type", sample.omni_task_type)
 
 
