@@ -80,7 +80,7 @@ def _make_finished_sentinel() -> OmniPayloadStruct:
 
 def _flush_remaining_codes(
     transfer_manager: Any,
-    request_id: str | None,
+    request_id: str,
     chunk_size: int,
     left_context_size: int,
 ) -> OmniPayloadStruct:
@@ -116,8 +116,6 @@ def _flush_remaining_codes(
 
 def _to_code_tensor(codes: Any) -> torch.Tensor | None:
     """Convert codes to a (B, 1, 8, 4) long tensor, or return None if shape is invalid."""
-    if codes is None:
-        return None
     code_tensor = codes.to(torch.long) if isinstance(codes, torch.Tensor) else torch.tensor(codes, dtype=torch.long)
     if code_tensor.ndim == 3:
         code_tensor = code_tensor.unsqueeze(0)
