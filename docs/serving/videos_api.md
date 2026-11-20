@@ -46,7 +46,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
 | `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
 | `/v1/videos` | `GET` | List stored video jobs |
-| `/v1/videos/{video_id}/content` | `GET` | Download generated video content |
+| `/v1/videos/{video_id}/content` | `GET` | Download generated content; `variant=video` (default) returns the MP4, `variant=lidar` returns a job's numeric LiDAR file when its record carries a `lidar` descriptor |
 | `/v1/videos/{video_id}` | `DELETE` | Delete a video job and stored output |
 
 ### Request Parameters
@@ -68,6 +68,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `input_references` | repeated file | null | Ordered reference uploads; supported media types and mapping to model inputs depend on the active model |
 | `timeline_guides` | string | null | MiniMax H3 JSON manifest of ordered timeline guides; see [MiniMax H3 Timeline Guides](#minimax-h3-timeline-guides) |
 | `guide_files` | repeated file | null | Guide uploads addressed by zero-based `upload_index` in `timeline_guides` |
 | `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
@@ -143,6 +144,18 @@ The job is then re-read so a completed save is not orphaned.
 `POST /v1/videos/sync` blocks until generation finishes and returns raw video
 bytes. It is useful for benchmarks and simple scripts that do not need job
 storage or polling.
+
+### Storage Expiration
+
+Set `VLLM_OMNI_SERVER_STORAGE__FILE_TTL` to enable expiration of locally stored
+videos. `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL` controls how often expired
+files are swept (default: 300 seconds).
+
+When a sweep successfully deletes a video file, it also removes the matching
+job record. The job then disappears from `GET /v1/videos`, and both its metadata
+and content endpoints return 404. A record may remain visible between its
+`expires_at` timestamp and the next sweep. If file deletion fails, its metadata
+is retained and deletion is retried on a later sweep.
 
 ## Examples
 
@@ -236,9 +249,11 @@ URL access policy.
 ### MiniMax H3 Samplers
 
 Set `"sampler"` in `extra_params` to select the sampler. Supported values are
-`euler` (default) and `res_multistep`. Both request and step execution support
-them, and compatible requests share packed model evaluations. Fixed distilled
-schedules remain Euler-only.
+`euler` (default), `res_multistep`, and `heun`. Both request and step execution
+support them, and compatible requests share packed model evaluations, including
+Heun's correction stage. An N-step schedule ending at zero uses `2N - 1` model
+evaluations with Heun. Fixed distilled schedules remain Euler-only. Disable cache
+acceleration, including `quality=high`, when using Heun.
 
 ### MiniMax H3 control and inpainting
 

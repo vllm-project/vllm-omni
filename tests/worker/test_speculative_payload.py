@@ -3,21 +3,15 @@
 
 """CPU contract tests for speculative payload token alignment."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.outputs import SamplerOutput
 from vllm.v1.request import Request
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.data_entry_keys import deserialize_payload, flatten_payload, serialize_payload
 from vllm_omni.model_executor.models.qwen3_omni.speculative_payload import (
     STAGING_KEY,
@@ -29,7 +23,8 @@ from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
     thinker2talker_async_chunk,
     thinker2talker_full_payload,
 )
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane, _NativeRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -106,22 +101,14 @@ def test_inline_batched_lookup_filters_sentinels_and_keeps_dtype(samples):
 
 
 def test_other_models_keep_generic_pooler_payload():
-    runner = object.__new__(GPUARModelRunner)
-    runner.model = SimpleNamespace()
-    payload = runner._build_omni_pooler_payload(
-        rid="r1",
-        idx=0,
-        start=0,
-        end=3,
-        hidden_states_cpu=torch.ones(3, 2),
-        req_hidden_states_cpu=None,
-        combined_hidden_states=None,
-        combined_multimodal_outputs=None,
+    [payload] = OmniARModelRunner._build_pooler_output_from_cpu(
+        hidden_cpu=torch.ones(3, 2),
         mm_cpu={"hidden_states.layer_0": torch.full((3, 2), 8.0), "hidden_states.layer_24": torch.full((3, 2), 7.0)},
-        audio_sparse_output=False,
-        sparse_mm_index={},
-        hidden_seq_len=3,
-        scheduled_seq_len=3,
+        query_start_loc_np=np.array([0, 3]),
+        num_scheduled_tokens=np.array([3]),
+        num_reqs=1,
+        req_ids=["r1"],
+        engine_output_type="latent",
     )
     assert torch.equal(payload["hidden_states.layer_0"], torch.full((3, 2), 8.0))
     assert torch.equal(payload["hidden_states.layer_24"], torch.full((3, 2), 7.0))
@@ -515,7 +502,7 @@ def test_first_decode_without_drafts_then_speculation_delivers_each_input_once(c
 
 
 def test_inline_zero_draft_handoff_accumulates_full_payload_without_missing_or_duplicate_rows():
-    runner = object.__new__(GPUARModelRunner)
+    runner = object.__new__(OmniRunnerDataPlane)
     runner._pending_full_payload_send = {}
     runner._full_payload_replace_keys_cached = frozenset()
     request = SimpleNamespace(prompt_token_ids=[1, 2, 3], output_token_ids=[], additional_information=None)
@@ -552,7 +539,6 @@ def test_inline_zero_draft_handoff_accumulates_full_payload_without_missing_or_d
     assert result["embed"]["prefill"].flatten().tolist() == request.all_token_ids[:-1]
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize(
     ("samples", "stop_ids", "max_tokens", "max_model_len"),
     [
@@ -564,9 +550,7 @@ def test_inline_zero_draft_handoff_accumulates_full_payload_without_missing_or_d
         pytest.param((11, 12, 13), [], 20, 6, id="max-model-len-middle"),
     ],
 )
-def test_full_payload_flush_honors_scheduler_stop_boundary(
-    monkeypatch, async_scheduling, samples, stop_ids, max_tokens, max_model_len
-):
+def test_full_payload_flush_honors_scheduler_stop_boundary(samples, stop_ids, max_tokens, max_model_len):
     """Verifier acceptance can extend past the scheduler's terminal token."""
     params = SamplingParams(max_tokens=max_tokens, stop_token_ids=stop_ids)
     params.update_from_generation_config({}, eos_token_id=99)
@@ -579,23 +563,21 @@ def test_full_payload_flush_honors_scheduler_stop_boundary(
     assert stopped
     final_ids = list(scheduled_request.output_token_ids)
 
-    runner = object.__new__(GPUARModelRunner)
+    runner = object.__new__(OmniRunnerDataPlane)
     runner._pending_full_payload_send = {}
     runner._full_payload_replace_keys_cached = frozenset()
-    runner._stage_id = 0
-    # Upstream async bookkeeping stores placeholders, while sync bookkeeping
-    # stores every verifier sample, including samples past the stop boundary.
-    cached_ids = [-1, -1] if async_scheduling else [10, *samples]
-    request = CachedRequestState(
-        req_id="r1",
+    runner._async_chunk = False
+    # The V2 transport owns accepted token history instead of V1's cached
+    # placeholder list. The scheduler's terminal span is authoritative here.
+    request = _NativeRequestState(
+        request_id="r1",
+        external_req_id="r1",
         prompt_token_ids=[1, 2, 3],
-        mm_features=[],
         sampling_params=params,
-        generator=None,
-        block_ids=([],),
         num_computed_tokens=6,
-        output_token_ids=cached_ids,
+        output_token_ids=final_ids,
     )
+    runner._native_requests = {"r1": request}
     for inputs, step_samples, position in (((1, 2, 3), (10, -1, -1), 0), ((10, 11, 12), samples, 3)):
         mm = finalize_speculative_payload(
             _prepare(
@@ -615,46 +597,16 @@ def test_full_payload_flush_honors_scheduler_stop_boundary(
     manager = SimpleNamespace(
         config=SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24)))
     )
-    sent = []
-
-    def send(*, scheduler_output, outputs):
-        payload, terminal_request = outputs["r1"]
-        sent.append(thinker2talker_full_payload(manager, payload, terminal_request))
-
-    # Exercise the real execute_model flush before finished requests are removed.
-    # Stop at input preparation: this contract needs neither a model nor a GPU.
-    class InputPreparationReachedError(Exception):
-        pass
-
-    def update_states(_output):
-        raise InputPreparationReachedError
-
-    runner.send_full_payload_outputs = send
-    runner.execute_model_state = None
-    runner._warmup_state_cleared = True
-    runner._prefix_cache_step_begin = lambda _: None
-    runner.kv_transfer_manager = SimpleNamespace(handle_finished_requests_kv_transfer=lambda **_: set())
-    runner.kv_caches = []
-    runner.cache_config = SimpleNamespace(block_size=16, cache_dtype="auto")
-    runner._resolve_global_request_id = lambda rid: rid
-    runner._omni_connector = object()
-    runner.recv_full_payload_inputs = lambda _: None
-    runner.requests = {"r1": request}
-    runner.speculative_config = None
-    runner.synchronize_input_prep = nullcontext
-    runner._update_states = update_states
-    monkeypatch.setattr("vllm_omni.worker.gpu_ar_model_runner.has_kv_transfer_group", lambda: False)
-    output = OmniSchedulerOutput.make_empty()
-    output.finished_req_ids = {"r1"}
-    output.finished_req_output_token_ids = {"r1": final_ids}
-    with pytest.raises(InputPreparationReachedError):
-        runner.execute_model(output)
-
-    assert len(sent) == 1
-    assert sent[0]["ids"]["all"] == [1, 2, 3, *final_ids]
-    assert sent[0]["embed"]["prefill"].flatten().tolist() == [1, 2, 3, *final_ids][:-1]
-    assert request.output_token_ids is cached_ids
-    assert request.output_token_ids == ([-1, -1] if async_scheduling else [10, *samples])
+    entries, finished = runner._build_chunk_entries(
+        req_ids=[], inter_stage_outputs=None, sampled_token_ids=None, terminal_req_ids={"r1"}
+    )
+    assert finished == ["r1"]
+    [(terminal_request, payload)] = entries
+    result = thinker2talker_full_payload(manager, payload, terminal_request)
+    assert result["ids"]["all"] == [1, 2, 3, *final_ids]
+    assert result["embed"]["prefill"].flatten().tolist() == [1, 2, 3, *final_ids][:-1]
+    assert request.output_token_ids is final_ids
+    assert request.output_token_ids == list(scheduled_request.output_token_ids)
     assert not runner._pending_full_payload_send
 
 
@@ -739,76 +691,3 @@ def test_consumed_input_span_rejects_wrong_token_identity():
     }
     with pytest.raises(RuntimeError, match="does not match scheduler"):
         thinker2talker_async_chunk(manager, payload, request, new_token_ids=[12])
-
-
-@pytest.mark.parametrize(
-    "async_scheduling,async_chunk,prefix_cache", [(False, False, False), (True, False, False), (True, True, True)]
-)
-@pytest.mark.parametrize("has_drafts", [False, True])
-def test_fallback_with_real_async_bookkeeping_keeps_aligned_tokens(
-    monkeypatch, async_scheduling, async_chunk, prefix_cache, has_drafts
-):
-    """Upstream intentionally returns [] and appends -1 under async scheduling."""
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
-
-    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
-    torch.nn.Module.__init__(model)
-    model.thinker = SimpleNamespace(embed_input_ids=lambda input_ids: input_ids.float().view(-1, 1))
-    model.supports_speculative_payload = True
-    model.use_async_omni_output = True
-    runner = object.__new__(GPUARModelRunner)
-    runner.model = model
-    runner._sampled_token_ids_cpu_override = None
-    runner.sampled_token_ids_pinned_cpu = torch.empty((1, 1), dtype=torch.int32)
-    runner.transfer_event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
-    runner.use_async_scheduling = async_scheduling
-    runner._async_chunk = async_chunk
-    runner.model_config = SimpleNamespace(async_chunk=async_chunk)
-    runner.speculative_config = SimpleNamespace(use_dflash=lambda: True)
-    runner.omni_prefix_cache = object() if prefix_cache else None
-    runner._should_accumulate_full_payload_output = lambda: not async_chunk
-    runner.requests = {"r1": SimpleNamespace(prompt_token_ids=[1, 2, 3], output_token_ids=[10])}
-    runner.max_model_len = 128
-    runner.supports_mm_inputs = runner.routed_experts_initialized = False
-    runner.input_batch = SimpleNamespace(
-        num_reqs=1,
-        req_ids=["r1"],
-        req_id_to_index={"r1": 0},
-        generators={},
-        vocab_size=100,
-        prev_sampled_token_ids=torch.tensor([[10]]),
-        num_tokens_no_spec=np.array([4], dtype=np.int32),
-        token_ids_cpu=np.zeros((1, 128), dtype=np.int32),
-        is_token_ids=np.zeros((1, 128), dtype=np.bool_),
-    )
-    runner.discard_request_mask = SimpleNamespace(np=np.array([False]))
-    runner._get_prompt_logprobs_dict = lambda *args: {}
-    scheduler = SchedulerOutput.make_empty()
-    scheduler.total_num_scheduled_tokens = 3
-    scheduler.num_scheduled_tokens = {"r1": 3}
-    samples = [[10, 12, -1]] if has_drafts else [[10]]
-    expected = [10, 10, 12] if has_drafts else [10, 10]
-    sampler = SamplerOutput(sampled_token_ids=torch.tensor(samples), logprobs_tensors=None)
-    monkeypatch.setattr("vllm.v1.worker.gpu_model_runner.envs.VLLM_COMPUTE_NANS_IN_LOGITS", False)
-    bookkeeping = GPUModelRunner._bookkeeping_sync(runner, scheduler, sampler, None, torch.ones(3, 1), 3)
-    assert bookkeeping[3] == ([] if async_scheduling else [expected[1:]])
-    assert not runner._should_use_async_omni_output()
-    if async_scheduling:
-        assert runner.requests["r1"].output_token_ids[-1] == -1
-    mm = model.prepare_speculative_multimodal_outputs(
-        multimodal_outputs={},
-        req_ids=["r1"],
-        speculative_request_ids={"r1"} if has_drafts else set(),
-        invalid_req_indices=[],
-        sampled_token_ids=sampler.sampled_token_ids,
-        input_token_ids=torch.tensor([10, 10, 12]),
-        input_positions=torch.tensor([3, 4, 5]),
-        query_start_loc=[0, 3],
-        prompt_lens=[3],
-        vocab_size=100,
-        consumed_input_span=False,
-    )
-    mm = model.finalize_multimodal_outputs_from_cpu_snapshot(mm)
-    output = model.finalize_pooler_payload({}, multimodal_outputs=mm, idx=0)
-    assert output["ids"]["output"] == expected
-    assert output["hidden_states.layer_0"].flatten().tolist() == expected

@@ -81,6 +81,18 @@ def test_protocol_accepts_a_codes_grid_and_rejects_malformed_ones():
         _request(ref_audio_codes=_codes(), ref_text=" ")
 
 
+@pytest.mark.parametrize("value", [0, 1.5, "x", None, float("nan"), True])
+def test_adapter_rejects_invalid_reference_top_p(value):
+    req = _request(ref_audio_codes=_codes(), extra_params={"fish_omni_reference_top_p": value})
+    assert _adapter().validate(req) == "fish_omni_reference_top_p must be a number in (0, 1]"
+
+
+@pytest.mark.parametrize("value", [0.4, 1])
+def test_adapter_accepts_valid_reference_top_p(value):
+    req = _request(ref_audio_codes=_codes(), extra_params={"fish_omni_reference_top_p": value})
+    assert _adapter().validate(req) is None
+
+
 def test_adapter_checks_codes_against_the_codec():
     adapter = _adapter()
     assert adapter.validate(_request(ref_audio_codes=_codes())) is None
@@ -146,3 +158,18 @@ def test_adapters_without_codes_support_reject_them():
     assert "not supported by qwen3_tts" in validate_tts_request(plain, request)
     assert validate_tts_request(plain, _request()) is None
     assert validate_tts_request(_adapter(), request) is None
+
+
+def test_adapter_refuses_an_epsilon_cutoff_the_deployment_cannot_serve():
+    """Without reference sampling a non-zero cutoff is a 400 naming the switch, not a silent
+    no-op; with it, the cutoff must lie in [0, 1) like top_p in (0, 1]."""
+    adapter = _adapter()
+    assert adapter.validate(_request(extra_params={"epsilon_cutoff": 0})) is None
+    error = adapter.validate(_request(extra_params={"epsilon_cutoff": 0.002}))
+    assert error is not None and "hf_overrides fish_omni_reference_sampling: true" in error
+
+    adapter.ctx.engine_client.model_config.hf_config.fish_omni_reference_sampling = True
+    assert adapter.validate(_request(extra_params={"epsilon_cutoff": 0.002})) is None
+    assert (
+        adapter.validate(_request(extra_params={"epsilon_cutoff": 1.5})) == "epsilon_cutoff must be in [0, 1), got 1.5."
+    )
