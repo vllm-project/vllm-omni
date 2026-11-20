@@ -1226,9 +1226,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         """Invoke the model once; platform runners may override for frame loops."""
         self._resolve_forward_signature()
         if not self._forward_accepts_var_kwargs and self._forward_param_names is not None:
-            model_inputs = {
-                name: value for name, value in model_inputs.items() if name in self._forward_param_names
-            }
+            model_inputs = {name: value for name, value in model_inputs.items() if name in self._forward_param_names}
         return self.model(**model_inputs)
 
     def _resolve_forward_signature(self) -> None:
