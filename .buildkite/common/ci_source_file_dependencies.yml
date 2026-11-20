@@ -1130,6 +1130,8 @@ source_file_dependencies:
     - tests/helpers/stage_config.py
     - vllm_omni/config/
     - vllm_omni/deploy/higgs_multimodal_qwen3.yaml
+    - vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml
+    - vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml
     - vllm_omni/engine/
     - vllm_omni/entrypoints/omni_base.py
     - vllm_omni/entrypoints/openai/tts_adapters/higgs_audio_v3.py
