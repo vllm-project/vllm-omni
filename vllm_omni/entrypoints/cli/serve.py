@@ -819,8 +819,8 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable Ulysses all-to-all over platform symmetric memory "
-                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "Optimize strict Ulysses exchanges using CUDA copy engines, fused HIP packing on ROCm, "
+                "or TorchNPU symmetric memory. ROCm requires four ranks, BF16, 56 heads and head size 128. "
                 "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
                 "TorchNPU NPUSHMEM and Triton-Ascend, "
                 "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."

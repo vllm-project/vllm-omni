@@ -20,6 +20,7 @@ def test_selected_transport_handles_qkv_and_output(monkeypatch, use_ce):
         ring_world_size=1,
         allgather_world_size=1,
     )
+    monkeypatch.setattr(ulysses, "current_omni_platform", SimpleNamespace(is_rocm=lambda: False))
     initialized: list[bool] = []
     exchanges: list[int] = []
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: initialized.append(True))
