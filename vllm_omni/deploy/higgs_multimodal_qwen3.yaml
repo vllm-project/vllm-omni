@@ -150,7 +150,6 @@ platforms:
     connectors: *eager_connector_geometry
     stages:
       - stage_id: 0
-        attention_backend: FLASHINFER
         enforce_eager: true
         async_scheduling: true
         enable_prefix_caching: true
@@ -172,7 +171,6 @@ platforms:
     connectors: *eager_connector_geometry
     stages:
       - stage_id: 0
-        attention_backend: FLASHINFER
         enforce_eager: true
         async_scheduling: true
         enable_prefix_caching: true
