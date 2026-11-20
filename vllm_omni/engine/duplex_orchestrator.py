@@ -123,6 +123,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 frontend_count=frontend_count,
                 frontend_index=frontend_index,
             )
+            # Replicas that exited before READY never emit a runtime death notification.
+            for stage_id, pool in enumerate(self.stage_pools):
+                for replica_id, client in enumerate(pool.clients):
+                    if client is None:
+                        self.replica_placement.mark_unavailable(stage_id, replica_id)
             if frontend_count > 1:
                 admission_limit = self.replica_placement.frontend_session_limit(duplex_session_config.max_sessions)
         self.session_manager = DuplexSessionManager(
