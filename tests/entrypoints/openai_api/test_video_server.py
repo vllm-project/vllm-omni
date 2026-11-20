@@ -18,7 +18,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import av
-import httpx
 import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -1241,21 +1240,16 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     assert input_image.size == (40, 24)
 
 
-def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker: MockerFixture, monkeypatch):
-    requested_paths = []
-    async_client = httpx.AsyncClient
+def test_i2v_video_generation_passes_image_redirect_policy(test_client, mocker: MockerFixture, monkeypatch):
+    calls = []
 
-    def _handler(request):
-        requested_paths.append(request.url.path)
-        if request.url.path == "/redirect.png":
-            return httpx.Response(302, headers={"location": "/image.png"})
-        return httpx.Response(200, content=_make_test_image_bytes((40, 24)))
-
-    def _client_factory(*args, **kwargs):
-        return async_client(*args, transport=httpx.MockTransport(_handler), **kwargs)
+    async def download(url, **kwargs):
+        calls.append((url, kwargs["follow_redirects"]))
+        assert kwargs["request_budget"] is not None
+        return _make_test_image_bytes((40, 24))
 
     monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
-    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+    monkeypatch.setattr(video_api_utils, "download_media_bytes", download)
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"fake-video",
@@ -1272,7 +1266,7 @@ def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker
     assert response.status_code == 200
     video_id = response.json()["id"]
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
-    assert requested_paths == ["/redirect.png", "/image.png"]
+    assert calls == [("https://example.com/redirect.png", True)]
 
     engine = test_client.app.state.openai_serving_video._engine_client
     input_image = engine.captured_prompt["multi_modal_data"]["image"]

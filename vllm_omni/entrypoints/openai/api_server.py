@@ -33,6 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from PIL import Image
 from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
+from vllm.connections import MediaRequestDownloadBudget
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
@@ -2653,17 +2654,22 @@ async def edit_images(
         # Match the offline path: RGB normalize when the caller opts into
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
-        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
+        download_budget = MediaRequestDownloadBudget()
+        pil_images = await _load_input_images(
+            input_images_list, normalize_rgb=normalize_edit_images_rgb, request_budget=download_budget
+        )
         omni_prompt["multi_modal_data"] = {}
         omni_prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
-            loaded = await _load_input_images([mask_image], normalize_rgb=False)
+            loaded = await _load_input_images([mask_image], normalize_rgb=False, request_budget=download_budget)
             omni_prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
+            loaded = await _load_input_images(
+                [reference_image], normalize_rgb=normalize_edit_images_rgb, request_budget=download_budget
+            )
             omni_prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         if not any(get_stage_type(cfg) == "diffusion" for cfg in stage_configs):

@@ -107,6 +107,16 @@ Content-Type: multipart/form-data
 | `reference_image` | string or array | null | Reference image for inpainting |
 | `mask_image` | string or array | null | Mask for inpainting (white areas will be inpainted) |
 
+URL inputs use vLLM's bounded media downloader and existing configuration.
+`VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` limits each download (default: 256 MiB), and
+`VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB` limits HTTP downloads across the input,
+mask, and reference images in one request (default: 256 MiB). Size checks count
+actual streamed bytes, including responses without `Content-Length`.
+
+The single-media limit also bounds base64 data-URL payloads before image
+decoding. Downloads have a 60-second total deadline, including retries and
+redirects. Compressed HTTP responses are rejected before decompression.
+
 ### Response Format
 
 When `stream=false` or omitted, the endpoint returns the standard image edit response:

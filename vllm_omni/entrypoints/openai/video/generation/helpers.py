@@ -39,6 +39,7 @@ from typing import Any, Literal, NoReturn, cast
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from PIL import Image
 from pydantic import TypeAdapter, ValidationError
+from vllm.connections import MediaRequestDownloadBudget
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
@@ -1380,6 +1381,7 @@ async def _parse_video_form(
         reference_image = None
         reference_video = None
         reference_audio: ReferenceAudio | None = None
+        download_budget = MediaRequestDownloadBudget()
         if input_references:
             if not supports_mixed_reference_inputs:
                 video_paths = await _persist_uploaded_video_references(input_references, resources)
@@ -1399,7 +1401,7 @@ async def _parse_video_form(
                 video_items = _reference_list(request.video_reference)
                 image_data = []
                 for item in image_items:
-                    media_data = await decode_input_reference(item, None, None)
+                    media_data = await decode_input_reference(item, None, None, request_budget=download_budget)
                     if not isinstance(media_data, Image.Image):
                         raise InvalidInputReferenceError("image_reference did not decode to an image")
                     image_data.append(media_data)
@@ -1412,6 +1414,7 @@ async def _parse_video_form(
                         None,
                         max_video_frames=decode_spec.max_frames,
                         video_keep=decode_spec.keep,
+                        request_budget=download_budget,
                     )
                     if not isinstance(media_data, VideoFrames):
                         raise InvalidInputReferenceError("video_reference did not decode to a video")
@@ -1455,7 +1458,7 @@ async def _parse_video_form(
         if request.audio_reference is not None:
             try:
                 for audio_reference in _reference_list(request.audio_reference):
-                    audio_path = await decode_audio_url(audio_reference.audio_url)
+                    audio_path = await decode_audio_url(audio_reference.audio_url, request_budget=download_budget)
                     resources.add(audio_path)
                     audio_paths.append(audio_path)
             except InvalidInputReferenceError as exc:

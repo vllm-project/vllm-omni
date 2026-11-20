@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for decode_audio_url helper."""
 
 import asyncio
@@ -7,9 +7,9 @@ import base64
 import os
 import tempfile
 
-import httpx
 import pytest
 
+from vllm_omni.entrypoints.openai import video_api_utils
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url
 
@@ -145,13 +145,11 @@ class TestDecodeAudioUrlHttp:
 
     def test_valid_http_url(self, monkeypatch):
         audio_bytes = b"\xff\xfb\x90\x00" * 50
-        fake_resp = httpx.Response(200, content=audio_bytes)
 
-        async def _mock_get(self, url):
-            return fake_resp
+        async def download(url, **kwargs):
+            return audio_bytes
 
-        monkeypatch.setattr(httpx.AsyncClient, "get", _mock_get)
-        monkeypatch.setattr(httpx.Response, "raise_for_status", lambda self: None)
+        monkeypatch.setattr(video_api_utils, "download_media_bytes", download)
 
         path = _run(decode_audio_url("https://example.com/audio.mp3"))
         try:
@@ -162,13 +160,12 @@ class TestDecodeAudioUrlHttp:
         finally:
             _cleanup(path)
 
-    def test_http_error_raises(self, monkeypatch):
-        async def _mock_get(self, url):
-            raise httpx.HTTPStatusError("Not Found", request=httpx.Request("GET", url), response=httpx.Response(404))
+    def test_download_error_propagates(self, monkeypatch):
+        async def download(url, **kwargs):
+            raise InvalidInputReferenceError("Invalid audio_reference.audio_url: server returned HTTP 404.")
 
-        monkeypatch.setattr(httpx.AsyncClient, "get", _mock_get)
-
-        with pytest.raises(InvalidInputReferenceError, match="failed to download audio"):
+        monkeypatch.setattr(video_api_utils, "download_media_bytes", download)
+        with pytest.raises(InvalidInputReferenceError, match="HTTP 404"):
             _run(decode_audio_url("https://example.com/missing.mp3"))
 
 

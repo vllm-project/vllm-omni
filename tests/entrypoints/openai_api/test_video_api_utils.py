@@ -8,7 +8,6 @@ from io import BytesIO
 from typing import Any
 
 import av
-import httpx
 import numpy as np
 import pytest
 import torch
@@ -29,97 +28,55 @@ def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     return buffer.getvalue()
 
 
-def _install_http_transport(monkeypatch, handler, client_kwargs):
-    async_client = httpx.AsyncClient
-
-    def _client_factory(*args, **kwargs):
-        client_kwargs.append(kwargs.copy())
-        return async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
-
-
 @pytest.mark.asyncio
-async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
-    requested_paths = []
-    client_kwargs: list[dict[str, object]] = []
+@pytest.mark.parametrize("allow_redirects", [False, True])
+async def test_decode_image_url_passes_redirect_policy(monkeypatch, allow_redirects):
+    calls = []
 
-    def _handler(request):
-        requested_paths.append(request.url.path)
-        if request.url.path == "/redirect.png":
-            return httpx.Response(302, headers={"location": "/image.png"})
-        return httpx.Response(200, content=_png_bytes(), headers={"content-type": "image/png"})
+    async def download(url, **kwargs):
+        calls.append((url, kwargs))
+        return _png_bytes()
 
-    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
-    _install_http_transport(monkeypatch, _handler, client_kwargs)
-
-    image = await video_api_utils.decode_image_url("https://example.com/redirect.png")
-
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", allow_redirects)
+    monkeypatch.setattr(video_api_utils, "download_media_bytes", download)
+    image = await video_api_utils.decode_image_url("https://example.com/image.png")
     assert image.size == (2, 1)
-    assert image.mode == "RGB"
-    assert requested_paths == ["/redirect.png", "/image.png"]
-    assert client_kwargs == [{"timeout": 60, "follow_redirects": True}]
-
-
-@pytest.mark.asyncio
-async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
-    requested_paths = []
-    client_kwargs: list[dict[str, object]] = []
-
-    def _handler(request):
-        requested_paths.append(request.url.path)
-        return httpx.Response(302, headers={"location": "/image.png"})
-
-    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", False)
-    _install_http_transport(monkeypatch, _handler, client_kwargs)
-
-    with pytest.raises(InvalidInputReferenceError, match="redirect.*VLLM_MEDIA_URL_ALLOW_REDIRECTS"):
-        await video_api_utils.decode_image_url("https://example.com/redirect.png")
-
-    assert requested_paths == ["/redirect.png"]
-    assert client_kwargs == [{"timeout": 60, "follow_redirects": False}]
-
-
-@pytest.mark.asyncio
-async def test_decode_image_url_reports_http_status(monkeypatch):
-    client_kwargs: list[dict[str, object]] = []
-
-    def _handler(request):
-        return httpx.Response(404)
-
-    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
-    _install_http_transport(monkeypatch, _handler, client_kwargs)
-
-    with pytest.raises(InvalidInputReferenceError, match="server returned HTTP 404"):
-        await video_api_utils.decode_image_url("https://example.com/missing.png")
-
-
-@pytest.mark.asyncio
-async def test_decode_image_url_reports_connection_failure(monkeypatch):
-    client_kwargs: list[dict[str, object]] = []
-
-    def _handler(request):
-        raise httpx.ConnectError("connection refused", request=request)
-
-    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
-    _install_http_transport(monkeypatch, _handler, client_kwargs)
-
-    with pytest.raises(InvalidInputReferenceError, match="failed to download image"):
-        await video_api_utils.decode_image_url("https://example.com/unreachable.png")
+    assert calls == [
+        (
+            "https://example.com/image.png",
+            {
+                "kind": "image",
+                "source": "image_reference.image_url",
+                "follow_redirects": allow_redirects,
+                "request_budget": None,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
 async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
-    def _unexpected_http_client(*args, **kwargs):
-        pytest.fail("data URLs must not create an HTTP client")
+    async def unexpected_download(*args, **kwargs):
+        pytest.fail("data URLs must not use the HTTP downloader")
 
-    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _unexpected_http_client)
+    monkeypatch.setattr(video_api_utils, "download_media_bytes", unexpected_download)
     encoded_image = base64.b64encode(_png_bytes()).decode()
-
     image = await video_api_utils.decode_image_url(f"data:image/png;base64,{encoded_image}")
-
     assert image.size == (2, 1)
     assert image.mode == "RGB"
+
+
+@pytest.mark.parametrize("kind", ["image", "video"])
+def test_data_url_limit_is_checked_before_media_decoder(monkeypatch, kind):
+    monkeypatch.setattr(envs, "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", 1)
+
+    def unexpected_decode(*args, **kwargs):
+        pytest.fail("over-limit payload reached the media decoder")
+
+    monkeypatch.setattr(video_api_utils, f"_decode_{kind}_bytes", unexpected_decode)
+    decoder = getattr(video_api_utils, f"_decode_base64_{kind}")
+    with pytest.raises(InvalidInputReferenceError, match="exceeds"):
+        decoder(f"data:{kind}/test;base64," + "A" * (2 * 1024 * 1024), source="test reference")
 
 
 def test_decode_image_bytes_rejects_image_over_pixel_limit_before_conversion(monkeypatch):

@@ -246,6 +246,20 @@ upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
 
+Remote references use vLLM's bounded media downloader. Configure
+`VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` for each download and
+`VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB` for all HTTP reference downloads in
+one request (both default to 256 MiB). Audio additionally respects
+`VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` (default: 25 MiB); the stricter limit applies.
+Actual streamed bytes are counted even without `Content-Length`.
+
+The same single-media limits bound base64 data-URL payloads before media
+decoding or payload writes. HTTP downloads have a 60-second total deadline,
+including retries and redirects. Compressed final responses are rejected
+before decompression, and redirect response bodies are released without being
+decoded or fully buffered. Existing model-specific multipart upload limits,
+including MiniMax H3's limits, still apply to those uploads.
+
 ### MiniMax H3 Samplers
 
 Set `"sampler"` in `extra_params` to select the sampler. Supported values are
