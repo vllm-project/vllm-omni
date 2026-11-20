@@ -61,6 +61,9 @@ def pytest_xdist_make_scheduler(config, log):
 
 
 class _CudaOomQueue(LoadGroupScheduling):
+    collection: list[str] | None
+    workqueue: OrderedDict[str, dict[str, bool]]
+
     def __init__(self, config, log):
         super().__init__(config, log)
         self.first_oom = set()
@@ -98,15 +101,16 @@ class _CudaOomQueue(LoadGroupScheduling):
             del self.retries[nodeid]
             self.workqueue[self._split_scope(nodeid)] = {nodeid: False}
         self._assign_work_unit(node)
-        node.send_runtest_some([len(self.collection)])
+        node.send_runtest_some([len(self.registered_collections[node])])
 
     def _running(self):
         return {nodeid for assigned in self.assigned_work.values() for group in assigned.values() for nodeid in group}
 
     def mark_test_complete(self, node, item_index, duration=0):
-        if item_index == len(self.collection):
+        collection = self.registered_collections[node]
+        if item_index == len(collection):
             return
-        nodeid = self.collection[item_index]
+        nodeid = collection[item_index]
         scope = self._split_scope(nodeid)
         group = self.assigned_work[node][scope]
         del group[nodeid]
