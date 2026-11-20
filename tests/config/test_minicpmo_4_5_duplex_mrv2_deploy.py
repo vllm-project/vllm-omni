@@ -67,7 +67,7 @@ def test_cuda_replica_profile_disables_prompt_logprobs_for_automatic_sizing(monk
 
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] is None
     assert stages[1].yaml_engine_args["max_logprobs"] == 0
-    assert stages[1].yaml_engine_args["num_replicas"] == 2
+    assert stages[1].yaml_runtime["num_replicas"] == 2
     assert stages[1].yaml_runtime["devices"] == "1,2"
     assert "max_logprobs" not in stages[0].yaml_engine_args
     assert "max_logprobs" not in stages[2].yaml_engine_args
