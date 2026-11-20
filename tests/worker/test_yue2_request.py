@@ -117,6 +117,31 @@ def test_invalid_or_overlong_abc_fails_only_request():
         assert request.status == RequestStatus.FINISHED_ERROR
 
 
+@pytest.mark.parametrize("explicit_seed", [False, True])
+def test_abc_replacement_preserves_native_seed_opt_in(mocker, explicit_seed):
+    prompt, params = prepare_song(encode, "style", "lyrics", cot="full")
+    if explicit_seed:
+        params.seed = 42
+        params.extra_args["omni_user_seed"] = True
+    request = OmniRequest("song", prompt["prompt_token_ids"], params, None)
+    request.yue2_next_prefix = prompt["prompt_token_ids"] + [42, ABC_END, MUSIC_START]
+    scheduler = object.__new__(Yue2SchedulerBase)
+    scheduler.requests = {"song": request}
+    scheduler.running = [request]
+    scheduler.waiting = mocker.Mock()
+    scheduler.finished_req_ids_dict = {}
+    scheduler._release_replaced_streaming_prompt_cache = mocker.Mock()
+    scheduler._replace_streaming_session = mocker.Mock()
+    mocker.patch.object(OmniARScheduler, "update_from_output", return_value={})
+    schedule = mocker.Mock(spec=OmniSchedulerOutput, num_scheduled_tokens={"song": 1})
+    scheduler.update_from_output(schedule, None)
+    replaced, update = scheduler._replace_streaming_session.call_args.args
+    assert replaced is request and request.yue2_reset_phase
+    assert update.sampling_params.seed == params.seed
+    assert update.sampling_params.extra_args.get("omni_user_seed") == (True if explicit_seed else None)
+    assert update.sampling_params.extra_args["yue2_seed"] == params.extra_args["yue2_seed"]
+
+
 @pytest.mark.parametrize(
     "abc_truncated,semantic_truncated", [(True, False), (False, True), (True, True), (False, False)]
 )
@@ -294,6 +319,8 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     from importlib import import_module
     from pathlib import Path
 
+    from vllm.config import CompilationConfig, CUDAGraphMode
+
     from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
     from vllm_omni.config.stage_config import PipelineConfig, load_deploy_config, merge_pipeline_deploy
     from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type
@@ -310,9 +337,19 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     deploy_root = Path(__file__).parents[2] / "vllm_omni/deploy"
     deploy = load_deploy_config(deploy_root / "yue2.yaml")
     assert deploy.pipeline == "yue2"
-    assert deploy.model_runner == "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(pipeline, deploy)
+    from vllm_omni.model_executor.models.yue2.worker import Yue2ModelRunner, Yue2Worker
+
+    assert deploy.model_runner == "v2"
+    (stage,) = merge_pipeline_deploy(pipeline, deploy)
+    assert stage.yaml_engine_args["use_v2_model_runner"]
+    assert stage.yaml_engine_args["max_num_seqs"] == 4
+    assert stage.yaml_engine_args["enforce_eager"] is False
+    compilation = CompilationConfig(**stage.yaml_engine_args["compilation_config"])
+    assert compilation.mode == 0
+    assert compilation.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+    assert compilation.decode_cudagraph_capture_request_sizes == [1, 2, 4]
+    assert stage.yaml_engine_args["worker_cls"] == "vllm_omni.model_executor.models.yue2.worker.Yue2Worker"
+    assert Yue2Worker.model_runner_cls is Yue2ModelRunner
     supported = OMNI_PIPELINES["qwen2_5_omni"]
     assert isinstance(supported, PipelineConfig)
     stages = merge_pipeline_deploy(supported, load_deploy_config(deploy_root / "qwen2_5_omni.yaml"))

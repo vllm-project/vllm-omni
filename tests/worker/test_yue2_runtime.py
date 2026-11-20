@@ -14,9 +14,9 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.model_executor.models.yue2.runtime import (
     Yue2ForCausalLM,
-    Yue2ModelRunnerOutput,
     Yue2SchedulerBase,
 )
+from vllm_omni.model_executor.models.yue2.worker import _attach_audio
 from vllm_omni.model_executor.models.yue2.yue2 import (
     MUSIC_END,
     _RequestState,
@@ -24,21 +24,22 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     _SynthesisJob,
     _SynthesisQueue,
 )
+from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_v2_is_rejected_before_backbone_initialization(mocker):
+def test_v1_is_rejected_before_backbone_initialization(mocker):
     config = mocker.Mock(
         spec=VllmConfig,
         parallel_config=mocker.Mock(spec=ParallelConfig, tensor_parallel_size=1, pipeline_parallel_size=1),
         scheduler_config=mocker.Mock(spec=SchedulerConfig, async_scheduling=False),
-        model_config=mocker.Mock(spec=ModelConfig, use_v2_model_runner=True),
+        model_config=mocker.Mock(spec=ModelConfig, use_v2_model_runner=False),
         speculative_config=None,
     )
     initialize = mocker.patch("vllm_omni.model_executor.models.yue2.runtime.Yue2Backbone.__init__", return_value=None)
-    with pytest.raises(ValueError, match="YuE2 requires model runner v1 without speculative decoding"):
+    with pytest.raises(ValueError, match="YuE2 requires model runner v2 without speculative decoding"):
         Yue2ForCausalLM(vllm_config=config)
     initialize.assert_not_called()
 
@@ -104,12 +105,14 @@ def test_detach_and_delayed_completion_with_coalesced_tokens(mocker, outcome):
             total_num_scheduled_tokens=len(scheduled),
             scheduled_spec_decode_tokens={},
         )
-        output = Yue2ModelRunnerOutput(
-            req_ids=["song"] if scheduled else [],
-            sampled_token_ids=[[token]] if scheduled else [],
-            multimodal_outputs=[{}] if scheduled else [],
-            acoustic_started=["song"] if started else [],
-            acoustic_ready={"song": payload} if payload is not None else {},
+        output = _attach_audio(
+            OmniModelRunnerOutput(
+                req_ids=["song"] if scheduled else [],
+                sampled_token_ids=[[token]] if scheduled else [],
+                multimodal_outputs=[{}] if scheduled else [],
+            ),
+            ["song"] if started else [],
+            {"song": payload} if payload is not None else {},
         )
         result = scheduler.update_from_output(schedule, output)
         return [item for batch in result.values() for item in batch.outputs]

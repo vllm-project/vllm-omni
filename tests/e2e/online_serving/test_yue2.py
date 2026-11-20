@@ -269,6 +269,107 @@ def test_yue2_abort_then_next_request_succeeds(omni_server) -> None:
 @pytest.mark.tts
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
+async def test_yue2_default_graphs_slot_reuse_and_auto_cfg(monkeypatch) -> None:
+    """Refill four native AR slots while request-owned audio finishes."""
+    import asyncio
+    from pathlib import Path
+
+    import torch
+
+    from tests.helpers.runtime import get_model_prefix
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.model_executor.models.yue2.request import SEMANTIC_ARGS, prepare_song
+    from vllm_omni.model_executor.models.yue2.yue2 import KEY_MIN_TOKENS
+    from vllm_omni.tokenizers.yue2_prompt import semantic_frames
+    from vllm_omni.tokenizers.yue2_tokenizer import YuE2TextTokenizer
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    model_path = Path(os.environ.get("YUE2_MODEL_DIR", get_model_prefix() + MODEL))
+    if not model_path.is_dir():
+        model_path = Path(hf_api().snapshot_download(str(model_path)))
+    tokenizer = YuE2TextTokenizer(model_path / "qwen.tiktoken")
+    engine = AsyncOmni(
+        model=str(model_path),
+        deploy_config=get_deploy_config_path("yue2.yaml"),
+        worker_extension_cls="tests.e2e.features.yue2.worker_extension.Yue2LifecycleWorkerExtension",
+        stage_init_timeout=600,
+        init_timeout=900,
+    )
+
+    async def probe():
+        return (await engine.collective_rpc("get_yue2_probe", stage_ids=[0]))[0][0]
+
+    async def song(request_id, index, *, automatic=False, cfg=False):
+        frames = 200 + (index % 4) * 40
+        prompt, params = prepare_song(
+            tokenizer.encode,
+            CAPTION,
+            LYRICS,
+            cot="full" if automatic else "off",
+            max_frames=frames,
+            max_abc_tokens=32,
+            seed=SEED + index,
+            cfg_scale=1.5 if cfg else 1.0,
+        )
+        semantic_args = params.extra_args.get(SEMANTIC_ARGS, params.extra_args)
+        semantic_args[KEY_MIN_TOKENS] = frames
+        audio, tokens, metadata = [], [], {}
+        async for output in engine.generate(prompt, request_id=request_id, sampling_params_list=[params]):
+            item = output.outputs[0]
+            tokens = list(item.token_ids)
+            multimodal = getattr(item, "multimodal_output", None)
+            if multimodal and "audio" in multimodal:
+                parts = multimodal["audio"]
+                audio.extend(parts if isinstance(parts, list) else [parts])
+                metadata.update(multimodal.get("meta", {}))
+        assert audio, request_id
+        assert metadata["error"] == 0 and metadata["truncated"] == 1, (request_id, metadata)
+        if automatic:
+            assert "abc_truncated" in metadata, (request_id, metadata)
+        waveform = torch.cat([part.detach().cpu().reshape(-1) for part in audio])
+        assert torch.isfinite(waveform).all() and waveform.abs().max() > 0, request_id
+        assert len(semantic_frames(tokens)) == frames, request_id
+        assert waveform.numel() == pytest.approx(frames * 1920 * 2, abs=256)
+
+    async def client(index):
+        await song(f"first-{index}", index)
+        await song(f"refill-{index}", index + 8, automatic=index % 4 in (0, 2, 3), cfg=index % 4 in (1, 2, 3))
+
+    tasks = []
+    try:
+        assert await engine.collective_rpc("start_yue2_probe", stage_ids=[0]) == [[True]]
+        tasks = [asyncio.create_task(client(index)) for index in range(8)]
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1200)
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            observations = await probe()
+            if (
+                observations["resident"] == observations["states"] == observations["waiting"] == 0
+                and not observations["active"]
+            ):
+                break
+            assert asyncio.get_running_loop().time() < deadline, observations
+            await asyncio.sleep(0.05)
+        assert observations["max_ar_rows"] == 4, observations
+        assert observations["slot_reuse_during_synthesis"] > 0, observations
+        assert observations["zero_ar_audio"] > 0, observations
+        assert observations["ar_full_replays"] > 0, observations
+        assert observations["cfg_requests"] == 6, observations
+        assert observations["auto_abc_cfg_requests"] == 4, observations
+        assert observations["cfg_pair_steps"] >= 6 * 200, observations
+        print("YuE2 default graph lifecycle:", observations)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        engine.shutdown()
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.asyncio
 @pytest.mark.parametrize("chunked", [True, False], ids=["chunked", "unchunked"])
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "ar-graphs"])
 async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monkeypatch) -> None:

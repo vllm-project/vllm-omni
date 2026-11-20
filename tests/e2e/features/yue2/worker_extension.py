@@ -18,6 +18,7 @@ class Yue2LifecycleWorkerExtension:
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
+        from vllm_omni.model_executor.models.yue2.batched_nar import BatchedCachedNAR
         from vllm_omni.model_executor.models.yue2.yue2 import ABC_END, HOLD_TOKEN, MUSIC_END
 
         model = self.model_runner.get_model()
@@ -29,7 +30,31 @@ class Yue2LifecycleWorkerExtension:
             "synthesis_started": False,
             "ar_full_replays": 0,
             "ar_piecewise_replays": 0,
+            "max_ar_rows": 0,
+            "slot_reuse_during_synthesis": 0,
+            "zero_ar_polls": 0,
+            "zero_ar_audio": 0,
+            "cfg_pair_steps": 0,
+            "cfg_requests": 0,
+            "auto_abc_cfg_requests": 0,
+            "packed_nar_calls": 0,
         }
+        packed_init = BatchedCachedNAR.__init__
+
+        def count_packed_nar(engine, *args, **kwargs):
+            packed_init(engine, *args, **kwargs)
+            self.yue2_probe["packed_nar_calls"] += 1
+
+        self.yue2_packed_patch = patch.object(BatchedCachedNAR, "__init__", count_packed_nar)
+        self.yue2_packed_patch.start()
+        manager = self.model_runner.cudagraph_manager
+        run_fullgraph = manager.run_fullgraph
+
+        def count_full_replays(*args, **kwargs):
+            self.yue2_probe["ar_full_replays"] += 1
+            return run_fullgraph(*args, **kwargs)
+
+        manager.run_fullgraph = count_full_replays
         graph_call = CUDAGraphWrapper.__call__
 
         def count_ar_replays(wrapper, *args, **kwargs):
@@ -38,9 +63,7 @@ class Yue2LifecycleWorkerExtension:
                 mode = context.cudagraph_runtime_mode
                 entry = wrapper.concrete_cudagraph_entries.get(context.batch_descriptor)
                 if mode == wrapper.runtime_mode and entry is not None and entry.cudagraph is not None:
-                    if mode == CUDAGraphMode.FULL:
-                        self.yue2_probe["ar_full_replays"] += 1
-                    elif mode == CUDAGraphMode.PIECEWISE:
+                    if mode == CUDAGraphMode.PIECEWISE:
                         self.yue2_probe["ar_piecewise_replays"] += 1
             return graph_call(wrapper, *args, **kwargs)
 
@@ -56,6 +79,21 @@ class Yue2LifecycleWorkerExtension:
         sample = model.sample
         resolve = model._resolve_pending
         emitted: dict[str, int] = {}
+        slot_owners: dict[int, str] = {}
+        abc_requests: set[str] = set()
+        cfg_requests: set[str] = set()
+        poll_audio = model.poll_audio
+
+        def poll():
+            idle = not self.model_runner.req_states.req_id_to_index
+            if idle:
+                self.yue2_probe["zero_ar_polls"] += 1
+            ready = poll_audio()
+            if idle:
+                self.yue2_probe["zero_ar_audio"] += len(ready)
+            return ready
+
+        model.poll_audio = poll
 
         def resolve_pending():
             if model._pending is not None:
@@ -74,10 +112,32 @@ class Yue2LifecycleWorkerExtension:
                 self.yue2_probe["mixed_steps"] += 1
             for (rid, _, _), row in zip(model._step_rows, result.tolist()):
                 emitted[rid] = row[0]
+            current_ids = {rid for rid, _, _ in model._step_rows}
+            for (rid, _, _), args in zip(model._step_rows, model._cfg_step, strict=True):
+                parent = (args or {}).get("yue2_cfg_parent")
+                if parent is not None:
+                    assert parent in current_ids, "CFG negative row has no current positive row"
+                    assert emitted[rid] == emitted[parent], "CFG branches sampled different tokens"
+                    cfg_requests.add(parent)
+                    self.yue2_probe["cfg_pair_steps"] += 1
+            self.yue2_probe["cfg_requests"] = len(cfg_requests)
+            self.yue2_probe["auto_abc_cfg_requests"] = len(abc_requests & cfg_requests)
             return result
 
         def prepare_inputs(**kwargs):
+            self.yue2_probe["max_ar_rows"] = max(self.yue2_probe["max_ar_rows"], len(kwargs["req_ids"]))
+            for rid, args in zip(kwargs["req_ids"], kwargs["sampling_extra_args"], strict=True):
+                if (args or {}).get("yue2_auto_abc"):
+                    abc_requests.add(rid)
             for rid, computed in zip(kwargs["req_ids"], kwargs["num_computed_tokens"]):
+                slot = self.model_runner.req_states.req_id_to_index[rid]
+                old = slot_owners.get(slot)
+                state = model._states.get(old)
+                queue = model._synthesis
+                acoustic_ids = {state.request_id for state in getattr(queue, "members", ())}
+                if state is not None and old != rid and (state.job is not None or old in acoustic_ids):
+                    self.yue2_probe["slot_reuse_during_synthesis"] += 1
+                slot_owners[slot] = rid
                 if int(computed) < previous.get(rid, 0):
                     self.yue2_probe["preemptions"] += 1
                 previous[rid] = int(computed)
@@ -116,6 +176,11 @@ class Yue2LifecycleWorkerExtension:
 
     def get_yue2_probe(self):
         result = dict(self.yue2_probe)
+        model = self.model_runner.get_model()
+        result["resident"] = len(self.model_runner.req_states.req_id_to_index)
+        result["states"] = len(model._states)
+        result["waiting"] = len(model._synthesis.waiting)
+        result["active"] = model._synthesis.active is not None
         job = self.yue2_cancel_job
         if job is not None:
             if job.cancelled:
