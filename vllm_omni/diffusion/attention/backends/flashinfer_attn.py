@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 from packaging.version import InvalidVersion, Version
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
@@ -53,6 +54,34 @@ except Exception as e:
 # instances share. The token is read back to a handle only inside the op.
 _IMPL_REGISTRY: weakref.WeakValueDictionary[int, FlashInferAttentionImpl] = weakref.WeakValueDictionary()
 _IMPL_HANDLE_COUNTER = itertools.count(1)
+
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _copy_strided_rows_kernel(src_ptr, dst_ptr, src_row_stride, row_size: tl.constexpr, block: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        columns = tl.arange(0, block)
+        for start in tl.static_range(0, row_size, block):
+            mask = start + columns < row_size
+            values = tl.load(src_ptr + row * src_row_stride + start + columns, mask=mask)
+            tl.store(dst_ptr + row * row_size + start + columns, values, mask=mask)
+
+
+def _dense_tokens(x: torch.Tensor) -> torch.Tensor:
+    """Contiguous copy of a [tokens, heads, dim] tensor.
+
+    A token-strided view whose heads are dense within each token (a slice of a fused QKV projection) is copied
+    row by row: torch's generic strided copy of that layout runs at about a quarter of the bandwidth.
+    """
+    if x.is_contiguous():
+        return x
+    tokens, heads, dim = x.shape
+    if not (HAS_TRITON and x.is_cuda and x.stride(2) == 1 and x.stride(1) == dim and tokens):
+        return x.contiguous()
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    _copy_strided_rows_kernel[(tokens,)](x, out, x.stride(0), heads * dim, block=2048, num_warps=8)
+    return out
 
 
 def _register_impl_for_boundary_op(impl: FlashInferAttentionImpl) -> int:
@@ -146,6 +175,9 @@ _flashinfer_attention_op = torch.ops.vllm_omni.flashinfer_attention
 
 class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    # Ragged prefill takes K/V shorter than Q: a contiguous valid K/V prefix replaces a key-padding mask,
+    # which cute-dsl cannot run.
+    supports_prefix_kv_slicing: bool = True
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
@@ -462,6 +494,10 @@ class FlashInferAttentionImpl(AttentionImpl):
         q = query.reshape(batch_size * qo_len, num_q_heads, head_dim_qk)
         k = key.reshape(batch_size * kv_len, num_kv_heads, head_dim_k)
         v = value.reshape(batch_size * kv_len, num_kv_heads, head_dim_vo)
+        if self.flashinfer_backend == "cute-dsl":
+            # The cute-dsl FMHA reads Q/K/V as dense [tokens, heads, dim] and ignores row strides, so a strided
+            # view (V split from a fused QKV projection) would silently give wrong results.
+            q, k, v = _dense_tokens(q), _dense_tokens(k), _dense_tokens(v)
         q, q_scale = self._per_tensor_quantize(q, self.dtype_qk or q.dtype)
         k, k_scale = self._per_tensor_quantize(k, self.dtype_qk or k.dtype)
         v, v_scale = self._per_tensor_quantize(v, self.dtype_vo or v.dtype)
@@ -576,6 +612,13 @@ class FlashInferAttentionImpl(AttentionImpl):
         # plan/run execute inside the opaque boundary op, preserving the
         # pre-compile eager semantics.
         raw_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        valid_kv_length = attn_metadata.extra.get("valid_kv_length") if attn_metadata is not None else None
+        if raw_mask is None and isinstance(valid_kv_length, int) and valid_kv_length < key.shape[1]:
+            if valid_kv_length <= 0:
+                raise ValueError(f"valid_kv_length must be positive, got {valid_kv_length}")
+            # Same result as a key-padding mask over the tail rows; padding query rows are discarded.
+            key = key[:, :valid_kv_length]
+            value = value[:, :valid_kv_length]
         return _flashinfer_attention_op(
             query,
             key,

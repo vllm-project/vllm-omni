@@ -159,3 +159,64 @@ def test_flashinfer_real_init_selects_fa2_on_sm80():
     )
 
     assert impl.flashinfer_backend == "fa2"
+
+
+@pytest.mark.cpu
+def test_valid_kv_length_slices_key_value_prefix_instead_of_masking(monkeypatch):
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    seen = {}
+
+    def fake_op(query, key, value, mask, token):
+        seen.update(key=key.shape, value=value.shape, mask=mask)
+        return torch.empty_like(query)
+
+    monkeypatch.setattr(flashinfer_attn, "_flashinfer_attention_op", fake_op)
+    query = torch.randn(1, 8, 2, 16)
+    metadata = AttentionMetadata(extra={"valid_kv_length": 5})
+
+    _impl(backend_explicit=True).forward_cuda(query, query, query, metadata)
+
+    assert FlashInferAttentionBackend.supports_prefix_kv_slicing
+    assert seen == {"key": (1, 5, 2, 16), "value": (1, 5, 2, 16), "mask": None}
+
+
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
+def test_cute_dsl_matches_sdpa_for_strided_value_and_kv_prefix():
+    if not torch.cuda.is_available() or not flashinfer_attn.HAS_FLASHINFER:
+        pytest.skip("CUDA and FlashInfer are required")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("cute-dsl prefill targets SM100")
+    torch.manual_seed(0)
+    tokens, valid, heads, head_dim = 1031, 1000, 4, 128
+    impl = FlashInferAttentionImpl(
+        num_heads=heads,
+        head_size=head_dim,
+        softmax_scale=head_dim**-0.5,
+        backend_kwargs={"quant": {"flashinfer_backend": "cute-dsl"}},
+    )
+    assert impl.flashinfer_backend == "cute-dsl"
+    # Q, K and V as strided views of one fused QKV projection, as in the DiT blocks.
+    qkv = torch.randn(1, tokens, 3, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    query, key, value = qkv.unbind(2)
+    assert not value.is_contiguous()
+
+    output = impl.forward_cuda(query, key, value, AttentionMetadata(extra={"valid_kv_length": valid}))
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        *(t.transpose(1, 2).float() for t in (query, key[:, :valid], value[:, :valid])),
+        scale=head_dim**-0.5,
+    ).transpose(1, 2)
+    torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("tokens", "heads", "head_dim"), [(2, 3, 64), (257, 56, 128), (64, 7, 96)])
+def test_dense_tokens_copies_token_strided_view_exactly(tokens, heads, head_dim):
+    qkv = torch.randn(tokens, 3, heads * head_dim, device="cuda", dtype=torch.bfloat16)
+    value = qkv[:, 2].view(tokens, heads, head_dim)
+    assert not value.is_contiguous()
+
+    dense = flashinfer_attn._dense_tokens(value)
+
+    assert dense.is_contiguous()
+    assert torch.equal(dense, value)
