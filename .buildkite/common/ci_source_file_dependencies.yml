@@ -1680,6 +1680,7 @@ source_file_dependencies:
 
   diffusion_lingbot_world_npu_function:
     - *lingbot_world_function
+    - tests/assets/qwen_image_edit/qwen_image_edit_2511_test2.png
     - tests/e2e/accuracy/lingbot_world/configs/npu_usp4_offload.yaml
     - vllm_omni/experimental/ar_diffusion/
     - vllm_omni/diffusion/offloader/

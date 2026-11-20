@@ -95,6 +95,7 @@ def _generate_one_block(handler: OmniRunnerHandler, action_path: str, *, stepwis
                 height=_HEIGHT,
                 width=_WIDTH,
                 num_frames=_NUM_FRAMES,
+                num_inference_steps=4,
                 max_sequence_length=512,
                 seed=42,
                 fps=16,
