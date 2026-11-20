@@ -280,6 +280,7 @@ class ModelOptFp8CheckpointAdapter:
 class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
     _PRE_QUANT_SCALE_SUFFIX = ".pre_quant_scale"
     _NVFP4_BLOCK_SIZE = 16
+    _NVFP4_DECODE_ROWS = 1024
     _FULL_PRECISION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
     @staticmethod
@@ -420,12 +421,22 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
 
         from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import break_fp4_bytes
 
-        values = break_fp4_bytes(loaded_weight, torch.float32).reshape(rows, -1, self._NVFP4_BLOCK_SIZE)
         device = loaded_weight.device
         scale = block_scale.to(device=device, dtype=torch.float32) * global_scale.to(
             device=device, dtype=torch.float32
         ).reshape(())
-        return (values * scale.unsqueeze(-1)).reshape(rows, cols).to(target_dtype)
+        # Decode bounded row chunks into one destination tensor. A whole-tensor
+        # break_fp4_bytes call expands every packed byte to an int64 index and
+        # float32 buffers; for [18432, 1536] that transiently held ~1.2 GB host
+        # memory per rank, which is paid again on every TP rank.
+        output = torch.empty(rows, cols, dtype=target_dtype, device=device)
+        for start in range(0, rows, self._NVFP4_DECODE_ROWS):
+            end = min(start + self._NVFP4_DECODE_ROWS, rows)
+            values = break_fp4_bytes(loaded_weight[start:end], torch.float32).reshape(
+                end - start, -1, self._NVFP4_BLOCK_SIZE
+            )
+            output[start:end] = (values * scale[start:end].unsqueeze(-1)).reshape(end - start, cols).to(target_dtype)
+        return output
 
     def adapt(
         self,

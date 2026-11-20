@@ -323,6 +323,36 @@ def test_modelopt_nvfp4_matches_vllm_cpu_reference_bitwise(dtype, scale_dtype):
     assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
+@pytest.mark.parametrize("chunk_rows", [1, 3, 4, 100])
+def test_modelopt_nvfp4_row_chunked_decode_matches_whole_tensor(monkeypatch, chunk_rows):
+    """Chunked decode must be bitwise identical to a single whole-tensor decode.
+
+    Row counts are chosen so that chunk_rows both divides and does not divide
+    the tensor, exercising the final partial chunk.
+    """
+    from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt import _AdaptState
+
+    rows, packed_cols = 7, 32
+    generator = torch.Generator().manual_seed(0)
+    packed = torch.randint(0, 256, (rows, packed_cols), generator=generator, dtype=torch.uint8)
+    block_scale = torch.rand(rows, packed_cols * 2 // 16, generator=generator).mul(4).to(torch.float8_e4m3fn)
+    global_scale = torch.tensor(0.37)
+    state = _AdaptState(
+        scale_tensors={
+            "transformer.proj.weight_scale": block_scale,
+            "transformer.proj.weight_scale_2": global_scale,
+        }
+    )
+    adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(), _make_source())
+
+    whole = adapter._dequantize_weight("transformer.proj.weight", packed, state, torch.bfloat16)
+    monkeypatch.setattr(ModelOptNvFp4CheckpointAdapter, "_NVFP4_DECODE_ROWS", chunk_rows)
+    chunked = adapter._dequantize_weight("transformer.proj.weight", packed, state, torch.bfloat16)
+
+    assert chunked.shape == (rows, packed_cols * 2)
+    assert torch.equal(chunked.view(torch.uint8), whole.view(torch.uint8))
+
+
 @pytest.mark.parametrize("scale_dtype", [torch.float16, torch.float32, torch.int8, torch.float8_e5m2])
 def test_modelopt_nvfp4_rejects_unsupported_block_scale_dtype(scale_dtype):
     adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(), _make_source())
