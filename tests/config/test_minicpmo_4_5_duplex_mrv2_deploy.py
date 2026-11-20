@@ -95,9 +95,9 @@ def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platfor
             "cfm_drop_upstream_att_buffer",
         ):
             assert extra.get(flag, False) is (platform == "cuda")
-        # CUDA overrides retain the shared NPU option and chunk geometry.
         assert extra["cfm_npu_cross_reference_batching"] is True
-        assert extra["codec_chunk_frames"] == 25
+        # The Ascend profile uses 32-frame output chunks.
+        assert extra["codec_chunk_frames"] == (32 if platform == "npu" else 25)
 
 
 @pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])
