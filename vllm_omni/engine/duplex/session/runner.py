@@ -203,6 +203,28 @@ _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "outp
 _INPUT_CLOCK_CHECK_INTERVAL_S = 1.0
 
 
+# A client streaming real input at exactly chunk_period_s races the first
+# continuation's deadline: ordinary jitter can let the deadline fire before
+# the next real append physically arrives, so both get submitted as separate
+# model steps instead of the real append superseding the continuation. A
+# fixed 30ms margin measurably reduced but did not eliminate this -- real
+# client jitter (network, scheduling, bursty delivery) regularly exceeds a
+# small fixed constant. Too little margin recreates the race; too much just
+# delays idle-continuation by a few hundred ms, imperceptible in a voice
+# conversation -- so scale generously with the model's own cadence rather
+# than guessing one constant for every model's chunk_period_s, with a cap so
+# large-native-unit models (e.g. a 1 s chunk_period_s) don't get an
+# excessive multi-second idle-detection delay.
+_CONTINUATION_JITTER_MARGIN_FACTOR = 2.0
+_CONTINUATION_JITTER_MARGIN_CAP_S = 0.25
+
+
+def _continuation_jitter_margin_s(chunk_period_s: float) -> float:
+    if chunk_period_s <= 0:
+        return 0.0
+    return min(_CONTINUATION_JITTER_MARGIN_FACTOR * chunk_period_s, _CONTINUATION_JITTER_MARGIN_CAP_S)
+
+
 def compute_silence_continuation_deadline(
     *,
     chunk_period_s: float,
@@ -213,20 +235,21 @@ def compute_silence_continuation_deadline(
     """Return the silence continuation schedule ``(delay_s, next_silence_deadline)``.
 
     The first continuation anchors to the latest accepted append's submission
-    time (``last_submit + chunk_period_s``), falling back to ``now`` when no
-    submission exists. Later continuations advance from the current deadline
-    instead of from ``now``, so pipeline processing time does not accumulate
-    as timer drift. When the schedule is more than one period overdue it is
-    stale: one continuation submits immediately and the schedule restarts
-    from ``now`` (``next_silence_deadline = now + chunk_period_s``) instead of
-    firing a burst of catch-ups.
+    time plus a jitter margin (see :func:`_continuation_jitter_margin_s`),
+    falling back to ``now`` when no submission exists. Later continuations
+    advance from the current deadline instead of from ``now``, so pipeline
+    processing time does not accumulate as timer drift (the margin is only
+    added once per anchor, not every period). When the schedule is more than
+    one period overdue it is stale: one continuation submits immediately and
+    the schedule restarts from ``now`` (``next_silence_deadline = now +
+    chunk_period_s``) instead of firing a burst of catch-ups.
 
     ``delay_s`` is the wait before this continuation and
     ``next_silence_deadline`` the deadline for the following one.
     """
     if current_deadline is None:
         base = last_submit if last_submit is not None else now
-        deadline = base + chunk_period_s
+        deadline = base + chunk_period_s + _continuation_jitter_margin_s(chunk_period_s)
     else:
         deadline = current_deadline
     if now - deadline > chunk_period_s:
@@ -1655,7 +1678,7 @@ class DuplexSessionRunner:
         # have reached Stage 0; a new epoch drops its output, as in ``_on_cancel``.
         # (With client playback still active, the playback branch below does it.)
         clocked_append = had_append and self._input_clock is not None and not playback_was_active
-        if not cancelled and (had_stream or clocked_append):
+        if not cancelled and not playback_was_active and (had_stream or clocked_append):
             old_epoch = session.epoch
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
@@ -2019,6 +2042,9 @@ class DuplexSessionRunner:
                 session.release_input_bytes(-pending_delta)
             if pcm_reservation is not None:
                 pcm_reservation.commit()
+            # A buffer can retain video while dropping an incomplete float PCM sample.
+            if payload["is_speech"] and raw_audio_bytes > 0 and (fmt != "pcm_f32le" or raw_audio_bytes % 4 == 0):
+                session.touch_lease(DuplexLeaseActivity.APPEND)
             # Fresh input for an ephemeral request is an explicit retry even
             # when the buffer waits until commit to start the append.
             if not session.capabilities.supports_core_resumable_request:
@@ -2678,7 +2704,7 @@ class DuplexSessionRunner:
         if self.run.closing:
             return
         had_stream = self.model.cancel_data_plane_stream() or had_stream
-        if not cancelled and (had_stream or had_append or had_unbuffered_append):
+        if not cancelled and not playback_was_active and (had_stream or had_append or had_unbuffered_append):
             old_epoch = session.epoch
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
@@ -2809,6 +2835,9 @@ class DuplexSessionRunner:
 
         old_epoch = session.epoch
         old_response_id = session.active_response_id
+        if old_response_id is None and helpers.assistant_playback_active(session):
+            # Generation can end before the retained request or its playback.
+            old_response_id = session.last_response_id
         committed_ms = session.playback.committed_ms
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.

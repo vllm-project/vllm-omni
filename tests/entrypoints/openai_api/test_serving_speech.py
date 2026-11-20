@@ -34,6 +34,7 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -1830,6 +1831,31 @@ class TestTTSMethods:
         assert isinstance(response, ErrorResponse)
         assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_engine_validation_error_returns_bad_request(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        # vLLM raises VLLMValidationError (a VLLMClientError, not a ValueError)
+        # from add_request when e.g. the prompt exceeds max_model_len.
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(
+                side_effect=VLLMValidationError(
+                    "The decoder prompt (length 12011) is longer than the maximum model length of 4096."
+                )
+            ),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.BAD_REQUEST
+        assert response.error.type == "BadRequestError"
 
     @pytest.mark.asyncio
     async def test_create_speech_unexpected_failure_returns_internal_server_error(
@@ -6514,6 +6540,27 @@ class TestTTSAsyncOffloading:
         request = OpenAICreateSpeechRequest(input="hello", voice="test")
         asyncio.run(voxtral_server._prepare_speech_generation(request))
         voxtral_server._adapter._build_prompt_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_voxtral_seed_sets_tts_local_seed(self, voxtral_server, mocker: MockerFixture):
+        default_params = voxtral_server.engine_client.default_sampling_params_list[0]
+        default_params.seed = None
+        default_params.extra_args = None
+        voxtral_server.engine_client.collective_rpc = mocker.AsyncMock(return_value=[False])
+        voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        stage0_params = voxtral_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert stage0_params.extra_args["omni_user_seed"] is True
+        assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
 
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):
         """Qwen3 TTS path should call _estimate_prompt_len_async."""
