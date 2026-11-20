@@ -346,9 +346,10 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout (INFO still shows in CI); capture stderr only for the
-        # exited-before-ready RuntimeError message. errors=replace keeps the
-        # reader alive on undecodable bytes so a full pipe cannot hang serve.
+        # Inherit stdout; tee stderr to pytest and the startup diagnostic tail.
+        # Request failures after readiness also need the child traceback.
+        # errors=replace keeps the reader alive on undecodable bytes so a full
+        # pipe cannot hang serve.
         self._server_error_lines = deque(maxlen=100)
         self._server_log_thread = None
         self.proc = subprocess.Popen(
@@ -369,6 +370,12 @@ class OmniServer:
                 try:
                     for line in stderr:
                         error_lines.append(line)
+                        try:
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                        except (OSError, ValueError):
+                            # A closed capture must not stop draining the pipe.
+                            pass
                 except Exception:
                     pass
 

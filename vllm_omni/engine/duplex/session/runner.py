@@ -1601,6 +1601,9 @@ class DuplexSessionRunner:
                 session.release_input_bytes(-pending_delta)
             if pcm_reservation is not None:
                 pcm_reservation.commit()
+            # A buffer can retain video while dropping an incomplete float PCM sample.
+            if payload["is_speech"] and raw_audio_bytes > 0 and (fmt != "pcm_f32le" or raw_audio_bytes % 4 == 0):
+                session.touch_lease(DuplexLeaseActivity.APPEND)
             # Fresh input for an ephemeral request is an explicit retry even
             # when the buffer waits until commit to start the append.
             if not session.capabilities.supports_core_resumable_request:
@@ -1714,6 +1717,10 @@ class DuplexSessionRunner:
             session.bind_response_turn(append_turn_id)
         if precreate_response and session.active_response_id is None:
             response_id = session.begin_response(turn_id=append_turn_id)
+            # Remember this response was opened by an explicit response.create
+            # (vs an engine-owned auto response): its first silence unit must
+            # be able to release a stale turn-ended latch in the model.
+            model_state.explicit_response_create_id = response_id
             self.emit(self.model.response_created_payload(response_id, epoch=append_epoch))
         if final and not session.capabilities.supports_core_resumable_request:
             logger.info(

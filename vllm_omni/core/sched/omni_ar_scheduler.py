@@ -223,9 +223,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._thinker_ngram = is_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
-            from vllm.v1.spec_decode.ngram_proposer import _find_longest_matched_ngram_and_propose_tokens
+            from vllm_omni.core.sched.ngram_lookup import find_longest_matched_ngram_and_propose_tokens
 
-            self._scheduler_ngram = _find_longest_matched_ngram_and_propose_tokens
+            self._scheduler_ngram = find_longest_matched_ngram_and_propose_tokens
             self._ngram_min = self.vllm_config.speculative_config.prompt_lookup_min
             self._ngram_max = self.vllm_config.speculative_config.prompt_lookup_max
             # Compile the lookup before serving the first request.
@@ -2186,6 +2186,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
+        self._record_full_payload_discard(request)
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
