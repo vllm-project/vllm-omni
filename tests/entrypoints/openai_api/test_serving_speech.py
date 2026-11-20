@@ -337,7 +337,7 @@ async def test_initial_burst_continuity_timeline_follows_delivery(monkeypatch, m
     sizes = captured["chunk_bytes"]
     assert len(arrivals) == 4 and len(sizes) == 4
     # Chunks 1-3 were HELD until the release: their delivery stamps share the
-    # release moment (three consecutive counter ticks), NOT their generation
+    # release moment (a single shared release stamp), NOT their generation
     # moments (three ticks earlier).
     assert arrivals[0] == arrivals[1] == arrivals[2], (
         f"held chunks must share the release delivery stamp, got {arrivals[:3]}"

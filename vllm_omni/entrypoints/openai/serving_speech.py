@@ -1922,7 +1922,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("non-finite burst value")
             burst_n = max(1, int(burst_value))
         except (TypeError, ValueError, OverflowError):
-            logger.warning(
+            # warning_once: the parse runs on EVERY streaming request — a bad
+            # deployment value would otherwise spam one warning per request.
+            logger.warning_once(
                 "Invalid VLLM_OMNI_SPEECH_INITIAL_BURST=%r; disabling initial burst buffering (1).",
                 os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", ""),
             )
