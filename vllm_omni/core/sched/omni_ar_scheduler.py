@@ -236,9 +236,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._thinker_ngram = is_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
-            from vllm.v1.spec_decode.ngram_proposer import _find_longest_matched_ngram_and_propose_tokens
+            from vllm_omni.core.sched.ngram_lookup import find_longest_matched_ngram_and_propose_tokens
 
-            self._scheduler_ngram = _find_longest_matched_ngram_and_propose_tokens
+            self._scheduler_ngram = find_longest_matched_ngram_and_propose_tokens
             self._ngram_min = self.vllm_config.speculative_config.prompt_lookup_min
             self._ngram_max = self.vllm_config.speculative_config.prompt_lookup_max
             # Compile the lookup before serving the first request.

@@ -31,7 +31,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 
 # Fish Speech S2 Pro
 vllm serve fishaudio/s2-pro --omni --port 8091
@@ -203,10 +203,17 @@ responses and `truncated` on the SSE `speech.audio.done` event:
 
 Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3,
 CosyVoice3, Voxtral TTS and YuE2 (YuE2 on non-streaming responses only, from
-its own metadata). Qwen3-TTS
-rejects some truncated generations with an error instead (Base task requests,
-and requests whose budget the server sizes from the text), so those never
-return audio.
+its own metadata). Qwen3-TTS returns the generated audio when any task
+(Base, CustomVoice or VoiceDesign) reaches its length limit, including a
+server-derived budget. It does not retry or raise an error solely because
+codec EOS was not emitted before the limit. The context window, configured
+output limit and text-scaled codec budgets still bound generation; a successful
+response does not guarantee that the entire input was spoken.
+
+The context window includes both the conditioned prompt and generated codec
+tokens. For example, an 892-token prompt in a 4096-token context leaves only
+3204 tokens for speech. Raising `max_new_tokens` alone cannot extend the
+context; adjust the Talker stage's `max_model_len` or split the text when needed.
 
 Raw audio streams (`stream_format="audio"`) send their headers before
 generation ends, and the batch endpoint and WebSocket streaming do not carry the
@@ -560,7 +567,14 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 ### Session Config Parameters
 
-All REST API parameters are supported, plus:
+All REST API parameters are supported, except `input` (sent as `input.text`)
+and `stream` / `stream_format` (replaced by `stream_audio`). The REST request
+rules are checked when `session.config` arrives; checks that depend on how the
+server was started, such as `word_timestamps` without `--forced-aligner`, run
+when the first text arrives. `ref_audio` takes a single string and
+`speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
+length of a whole request, so they require `split_granularity="none"` and
+`text_input_mode="buffered"`. Session parameters:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
@@ -634,7 +648,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 ```bash
@@ -656,7 +670,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 ```bash
@@ -773,6 +787,10 @@ python examples/online_serving/text_to_speech/voxcpm2/precompute_custom_voice.py
 Only profiles whose safetensors payload can be loaded and validated are exposed
 by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 `POST /v1/audio/speech` by passing `voice="alice"` without `ref_audio`.
+
+For VoxCPM2, an explicit `ref_audio` overrides an uploaded or precomputed
+`voice`. Such requests do not reuse the named voice's conditioning cache;
+requests without an explicit reference retain the normal named-voice cache.
 
 **Configuration (environment variables):**
 
@@ -956,9 +974,9 @@ For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overri
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --omni --port 8091 --trust-remote-code --enforce-eager \
-    --stage-overrides '{"0":{"max_num_seqs":10,"gpu_memory_utilization":0.2},
-                        "1":{"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
+    --omni --port 8091 --trust-remote-code \
+    --stage-overrides '{"0":{"enforce_eager":true,"max_num_seqs":10,"gpu_memory_utilization":0.2},
+                        "1":{"enforce_eager":true,"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
 ```
 
 The bundled `qwen3_tts.yaml` uses a multi-request default and lets stage 1 batch chunks across in-flight requests. For latency-sensitive deployments, avoid forcing stage 1 back to `max_num_seqs: 1`; benchmark before reducing it below `10`.
@@ -1209,7 +1227,7 @@ curl http://localhost:8091/v1/audio/voices
 If you encounter OOM errors:
 
 1. Use smaller model variant: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
-2. Reduce `--gpu-memory-utilization`
+2. Reduce `gpu_memory_utilization` for the affected stage in the deploy YAML or with `--stage-overrides`.
 
 ### Unsupported Speaker
 
@@ -1270,7 +1288,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
     --uvicorn-log-level debug
 ```
 

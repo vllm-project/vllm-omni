@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.models.fish_omni.reference_sampling import resolve_epsilon_cutoff
+from vllm_omni.model_executor.models.fish_omni.sampling import DEFAULT_REFERENCE_TOP_P, parse_reference_top_p
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -172,12 +173,14 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         req_id = str(new_req_data.req_id)
         prompt_ids = list(new_req_data.prompt_token_ids or [])
         token_ids = list(new_req_data.prefill_token_ids or prompt_ids)
+        info = {}
         if is_warmup_request(req_id):
             # Warmup requests: text rows with zero codes.
             rows = torch.zeros((len(prompt_ids), self.frame_width), dtype=torch.int64)
             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)
         else:
-            rows = self.model.build_frames(self._request_info(req_index), self.device)
+            info = self._request_info(req_index)
+            rows = self.model.build_frames(info, self.device)
         if rows.shape[0] != len(prompt_ids):
             raise ValueError(
                 f"fish_omni prompt has {rows.shape[0]} rows but request {req_id} reserved {len(prompt_ids)} "
@@ -209,12 +212,13 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
             # Reference sampling has no top-k cap; top_k < 1 turns the rule off.
             top_k = int(params.top_k) if params is not None and params.top_k else 0
         else:
-            top_k = int(params.top_k) if params is not None and params.top_k and params.top_k > 0 else 1 << 20
+            top_k = (
+                int(params.top_k) if params is not None and params.top_k and params.top_k > 0 else self.model.max_top_k
+            )
             if top_k > self.model.max_top_k:
                 if not self._warned_top_k:
                     logger.warning(
-                        "fish_omni fused sampling caps top_k at %d (request asked for %s); "
-                        "set hf_overrides fish_omni_max_top_k to raise it",
+                        "fish_omni main-token sampling caps top_k at %d (request asked for %s)",
                         self.model.max_top_k,
                         params.top_k if params is not None else None,
                     )
@@ -222,6 +226,10 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
                 top_k = self.model.max_top_k
         top_p = float(params.top_p) if params is not None else 1.0
         extra_args = getattr(params, "extra_args", None) or {}
+        has_reference = info.get("ref_codes") is not None or info.get("ref_audio_wav") is not None
+        if has_reference and top_p == 1.0 and extra_args.get("top_p") is None:
+            reference_top_p = parse_reference_top_p(extra_args.get("fish_omni_reference_top_p", top_p))
+            top_p = reference_top_p if reference_top_p is not None else DEFAULT_REFERENCE_TOP_P
         epsilon_cutoff = resolve_epsilon_cutoff(extra_args.get("epsilon_cutoff"), self.reference_sampling)
         seed = getattr(params, "seed", None) if params is not None else None
         if seed is not None:

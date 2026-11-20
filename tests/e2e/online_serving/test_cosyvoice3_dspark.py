@@ -71,6 +71,7 @@ _SERVER_PARAMS = [
                             "model_runner": "v2",
                             "max_num_seqs": 2,
                             "max_model_len": 4096,
+                            "hf_overrides": {"cosyvoice3_sampling_mode": "standard"},
                             "speculative_config": {
                                 "method": "dspark",
                                 "model": str(_DRAFT_DIR),
@@ -82,7 +83,7 @@ _SERVER_PARAMS = [
                     }
                 },
             ),
-            server_args=["--trust-remote-code", "--hf-overrides", '{"cosyvoice3_sampling_mode":"standard"}'],
+            server_args=["--trust-remote-code"],
             env_dict={
                 "COSYVOICE3_TRT": "0",
                 "VLLM_CONFIGURE_LOGGING": "1",
