@@ -388,8 +388,8 @@ Validated checkpoint:
 feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8
 ```
 
-Start the server with CUTLASS selected from the CLI for quantized linear and
-MoE kernels:
+Select the DiT-only deployment and give stage 0 both visible devices. The
+quantized linear and MoE kernels use CUTLASS.
 
 ```bash
 CUDA_VISIBLE_DEVICES=2,3 \
@@ -398,6 +398,8 @@ vllm serve feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
   --host 0.0.0.0 \
   --port 8091 \
   --trust-remote-code \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
+  --stage-overrides '{"0":{"devices":"0,1"}}' \
   --tensor-parallel-size 2 \
   --enable-expert-parallel \
   --linear-backend cutlass \

@@ -320,6 +320,32 @@ def test_serve_allows_minimax_h3_tp_when_encoder_has_its_own_flag() -> None:
     assert [stage.parallel_config.tensor_parallel_size for stage in config.stage_configs] == [2, 4]
 
 
+def test_serve_allows_encoder_tp_alias_on_owning_stage() -> None:
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={SERVE_CLI_SCOPE_KEY: True, "stage_id": 0, "text_encoder_tp_size": 4},
+    )
+
+    assert [stage.parallel_config.tensor_parallel_size for stage in config.stage_configs] == [4, 1]
+
+
+def test_serve_rejects_encoder_tp_alias_on_other_stage() -> None:
+    with pytest.raises(ValueError, match=r"--text-encoder-tp-size is not used by stage 1.*stage 0"):
+        _from_pipeline_key(
+            "minimax_h3_disaggregated",
+            cli_overrides={SERVE_CLI_SCOPE_KEY: True, "stage_id": 1, "text_encoder_tp_size": 4},
+        )
+
+
+def test_serve_routes_llm_only_cache_flag_in_mixed_pipeline() -> None:
+    model_type = "minimax_h3_disaggregated"
+    defaults = _from_pipeline_key(model_type)
+    config = _from_pipeline_key(model_type, cli_overrides={SERVE_CLI_SCOPE_KEY: True, "block_size": 32})
+
+    assert config.stage_by_id(0).cache_config.block_size == 32
+    assert config.stage_by_id(1).cache_config.block_size == defaults.stage_by_id(1).cache_config.block_size
+
+
 def test_serve_rejects_ambiguous_kv_cache_memory_budget() -> None:
     with pytest.raises(ValueError, match=r"--kv-cache-memory-bytes .*\[0, 1\].*--stage-overrides"):
         _from_pipeline_key(

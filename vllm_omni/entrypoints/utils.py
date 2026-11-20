@@ -93,6 +93,9 @@ def parse_stage_overrides(value: Any, *, filter_deploy_fields: bool = True) -> d
             raise ValueError(
                 f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id!r}"
             )
+        stage_id = stage_id.lstrip("0") or "0"
+        if stage_id in filtered:
+            raise ValueError(f"--stage-overrides contains more than one key for stage {stage_id}.")
         if not isinstance(overrides, dict):
             raise ValueError(
                 f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"

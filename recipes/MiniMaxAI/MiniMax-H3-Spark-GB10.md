@@ -80,8 +80,7 @@ vllm serve /path/to/MiniMax-H3/FL2VA \
   --num-gpus 1 --tensor-parallel-size 1 --text-encoder-tp-size 1 \
   --usp 1 --ring 1 --vae-patch-parallel-size 1 \
   --vae-parallel-mode tile --vae-use-tiling \
-  --quantization fp8 \
-  --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
+  --quantization fp8 --enforce-eager \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
@@ -145,8 +144,7 @@ vllm serve /path/to/MiniMax-H3/Ref2VA \
   --num-gpus 1 --tensor-parallel-size 1 --text-encoder-tp-size 1 \
   --usp 1 --ring 1 --vae-patch-parallel-size 1 \
   --vae-parallel-mode tile --vae-use-tiling \
-  --quantization fp8 \
-  --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
+  --quantization fp8 --enforce-eager \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
@@ -290,7 +288,7 @@ shorter than a 50-step Ref2VA run.
   script would otherwise supply higher degrees.
 - The two-host results require the external launch adaptation described above;
   cross-host diffusion worker launch is not exposed by the documented server CLI.
-- The stages run in eager mode because regional compile adds startup time without a
+- `--enforce-eager` is used because regional compile adds startup time without a
   parallelism win on a single rank.
 - `t2va` rejects requests without an explicit `aspect_ratio`. When `width` and
   `height` are both supplied they take precedence and `aspect_ratio` only has to

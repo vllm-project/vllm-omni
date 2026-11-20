@@ -85,7 +85,7 @@ guide: |
   - Ming's `model_type` falls through deploy-config auto-detection, so the
     launch command passes `--deploy-config vllm_omni/deploy/ming_tts.yaml`
     explicitly (the file ships in the vLLM-Omni repo/package).
-  - The tested environment uses `--enforce-eager`.
+  - The reference run used eager mode on both stages.
 
   ## Installation
 
@@ -118,7 +118,8 @@ guide: |
     vllm/vllm-omni-rocm:v0.22.0 \
     --model inclusionAI/Ming-omni-tts-0.5B \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
-    --omni --port 8000 --enforce-eager
+    --omni --port 8000 \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
   ```
 
   ## Client usage

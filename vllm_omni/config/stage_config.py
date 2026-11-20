@@ -184,6 +184,7 @@ def normalize_pipeline_cli_overrides(
 ) -> dict[str, Any]:
     """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
     normalized = dict(cli_overrides)
+    selected_stage_id = normalized.get("stage_id") if normalized.get(SERVE_CLI_SCOPE_KEY) else None
     for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
         invalid_stage_keys = [
             key
@@ -202,6 +203,12 @@ def normalize_pipeline_cli_overrides(
         value = normalized.pop(source, None)
         if value is None:
             continue
+        if isinstance(selected_stage_id, int) and selected_stage_id >= 0 and selected_stage_id != stage_id:
+            flag = "--" + source.replace("_", "-")
+            raise ValueError(
+                f"{flag} is not used by stage {selected_stage_id} of pipeline {pipeline.model_type!r}; "
+                f"use it on stage {stage_id}, or set {target} in that stage's deploy YAML or --stage-overrides."
+            )
         stage_key = f"stage_{stage_id}_{target}"
         stage_value = normalized.get(stage_key)
         if stage_value is not None and stage_value != value:

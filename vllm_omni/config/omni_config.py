@@ -491,6 +491,9 @@ def _scope_serve_stage_flags(pipeline: PipelineConfig, cli_overrides: dict[str, 
     scoped_overrides = {name: value for name, value in cli_overrides.items() if _STAGE_OVERRIDE_PATTERN.fullmatch(name)}
     scoped_by_stage: dict[int, set[str]] = {}
     owners_by_stage: dict[int, frozenset[str]] = {}
+    diffusion_stage_ids = {
+        stage.stage_id for stage in pipeline.stages if stage.execution_type == StageExecutionType.DIFFUSION
+    }
     for stage in pipeline.stages:
         stage_overrides = build_stage_runtime_overrides(stage.stage_id, scoped_overrides, warn_dropped=False)
         scoped_fields = set(stage_overrides)
@@ -539,6 +542,11 @@ def _scope_serve_stage_flags(pipeline: PipelineConfig, cli_overrides: dict[str, 
                 cli_overrides[f"stage_{selected.stage_id}_{name}"] = value
         elif len(recipients) > 1:
             ambiguous.append(f"{flag} (stages {recipients})")
+        elif diffusion_stage_ids and diffusion_stage_ids.isdisjoint(owners):
+            # Route LLM-only flags before diffusion ingress validates global inputs.
+            del cli_overrides[name]
+            if recipients:
+                cli_overrides[f"stage_{recipients[0]}_{name}"] = value
 
     if ambiguous:
         flags = ", ".join(ambiguous)

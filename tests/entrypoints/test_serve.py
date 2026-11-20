@@ -921,7 +921,8 @@ def test_parse_stage_overrides_valid_json() -> None:
     assert parsed == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
 
 
-def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
+@pytest.mark.parametrize("stage_id", ["0", "00"])
+def test_serve_parser_parses_stage_overrides_before_resolution(stage_id: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
@@ -932,7 +933,7 @@ def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
             "fake-model",
             "--omni",
             "--stage-overrides",
-            '{"0": {"devices": "0,1"}}',
+            f'{{"{stage_id}": {{"devices": "0,1"}}}}',
         ]
     )
 
@@ -966,6 +967,11 @@ def test_parse_stage_overrides_invalid_json_raises() -> None:
 def test_parse_stage_overrides_rejects_invalid_stage_ids(payload: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError, match="non-negative integer stage ids"):
         _parse_stage_overrides(payload)
+
+
+def test_parse_stage_overrides_rejects_duplicate_logical_stage_ids() -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="more than one key for stage 0"):
+        _parse_stage_overrides('{"0": {"enforce_eager": true}, "00": {"enforce_eager": false}}')
 
 
 def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
