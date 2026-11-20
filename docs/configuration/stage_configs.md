@@ -338,7 +338,7 @@ model-state lifecycle hooks. The sampler preserves phase-specific sampling and
 paired CFG; the hooks release AR slots while NAR/VAE jobs complete and deliver audio by
 request ID. Automatic ABC transitions reset the same request's phase state.
 The profile requires one GPU, synchronous scheduling, and disabled prefix
-caching and external KV transfer. See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md).
+caching and external KV transfer. See the [YuE2 recipe](gh-file:recipes/m-a-p/YuE2-3B.md).
 
 Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
 are unavailable. Their retired serving E2E tests covered speech generation,
