@@ -1448,10 +1448,10 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "artifact_path": "artifacts/rocm-wan22-reliability/**/*",
             "artifact_env": "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "expected_nodes": 13,
-            "expected_skipped": 1,
+            "expected_skipped": 0,
             "timeout": "220m",
             "collection_message": "Expected exactly 13 Wan2.2 reliability nodes",
-            "junit_message": "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
+            "junit_message": "Expected exactly 13 executed Wan2.2 reliability tests with no skips",
         },
         "Reliability Test · minicpmo-4.5": {
             "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
@@ -1561,8 +1561,8 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "wan22-reliability-guard",
             13,
-            1,
-            "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
+            0,
+            "Expected exactly 13 executed Wan2.2 reliability tests with no skips",
         ),
         (
             "Reliability Test · hunyuan-image",

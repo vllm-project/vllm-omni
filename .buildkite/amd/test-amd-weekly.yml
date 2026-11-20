@@ -126,9 +126,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 13 or skipped != 1:
+            if tests != 13 or skipped != 0:
                 print(
-                    f"Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip; "
+                    f"Expected exactly 13 executed Wan2.2 reliability tests with no skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
