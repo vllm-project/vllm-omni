@@ -103,6 +103,19 @@ class _VideoStream(Protocol):
     def codec_context(self) -> _CodecContext: ...
 
 
+class _JpegImage(Protocol):
+    @property
+    def size(self) -> tuple[int, int]: ...
+
+    def thumbnail(self, size: tuple[int, int]) -> None: ...
+
+    def save(self, fp: io.BytesIO, *, format: str, quality: int) -> None: ...
+
+
+class _VideoFrame(Protocol):
+    def to_image(self) -> _JpegImage: ...
+
+
 def _video_thread_type(stream: _VideoStream) -> str:
     """HEVC frame threads deadlock after seek; other codecs keep AUTO."""
     codec = getattr(getattr(stream, "codec_context", None), "name", None)
@@ -184,7 +197,7 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3, max_si
     raise ValueError(f"no decodable video frames in {path} at timestamp {timestamp}")
 
 
-def _frame_to_jpeg(frame: Any, quality: int, max_side: int | None = None) -> bytes:
+def _frame_to_jpeg(frame: _VideoFrame, quality: int, max_side: int | None = None) -> bytes:
     image = frame.to_image()
     if max_side is not None and max(image.size) > max_side:
         image.thumbnail((max_side, max_side))
