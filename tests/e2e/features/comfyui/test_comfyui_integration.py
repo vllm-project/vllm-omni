@@ -1811,6 +1811,7 @@ async def test_video_generation_node_minimax_h3_timeline_guides(api_server: str,
                 }
             ],
             outputs=[_build_diffusion_video_output()],
+            supported_tasks=("x2v",),
         )
     ],
     indirect=True,
