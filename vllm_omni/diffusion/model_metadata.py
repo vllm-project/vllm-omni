@@ -17,6 +17,7 @@ class DiffusionModelMetadata:
     # persisted upload through ``extra_args[control_type]["control_path"]``.
     supported_control_upload_types: tuple[str, ...] = ()
     attention_mask_free: bool = False
+    default_attention_backends: tuple[tuple[int, str], ...] = ()
     final_output_type: str | None = None
     # Additional generation outputs for the default topology (e.g. Cosmos3
     # can return images even though its default output is video).
@@ -43,6 +44,10 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
     # and returns a ``video_depth`` payload of per-frame depth maps.
     supports_video_depth: bool = False
+
+    def default_attention_backend(self, capability_major: int | None) -> str | None:
+        """This model's default attention backend on a CUDA device of ``capability_major``, if it has one."""
+        return dict(self.default_attention_backends).get(capability_major)
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
@@ -115,6 +120,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
         attention_mask_free=True,
+        default_attention_backends=((10, "FLASHINFER_ATTN"),),
     ),
     # The modular alias is served by MiniMaxH3Pipeline and has the same
     # Ref2VA request contract and packed-sequence layout. Every field must stay
@@ -131,6 +137,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_latent_continuation=True,
         final_output_type="video",
         attention_mask_free=True,
+        default_attention_backends=((10, "FLASHINFER_ATTN"),),
     ),
     # MiniMax-H3-Image: t2i without references, edit with ordered references
     # ("Picture i"); it shares H3's packed layout and padding document.
