@@ -1116,6 +1116,9 @@ def test_minicpmo_duplex_eval_config_replays_pr_correction_ids_at_c8(monkeypatch
     assert config["server_params"]["update"] == {
         "duplex_session.max_sessions": 8,
         "duplex_session.collect_stats": True,
+        "platforms.npu.stages.2.num_replicas": 2,
+        "platforms.npu.stages.2.devices": "0,0",
+        "platforms.npu.stages.2.gpu_memory_utilization": 0.11,
     }
     assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
     assert params["metric-percentiles"] == "50,95"
@@ -2236,6 +2239,81 @@ def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
     assert "tpot" in daily_params["percentile-metrics"]
     assert daily["server_params"]["update"]["session_mode"] == "turn"
     assert daily["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+
+
+def test_minicpmo_npu_nightly_seed_tts_matrix():
+    configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5_npu_nightly.json").read_text())
+    by_name = {config["test_name"]: config for config in configs}
+    default = by_name["test_minicpmo_4_5_npu_nightly_default"]
+    prefix_c32 = by_name["test_minicpmo_4_5_npu_nightly_async_prefix_c32"]
+    prefix_c64 = by_name["test_minicpmo_4_5_npu_nightly_async_prefix_c64"]
+    default_params = default["benchmark_params"][0]
+    c32_by_name = {item["name"]: item for item in prefix_c32["benchmark_params"]}
+    c64_by_name = {item["name"]: item for item in prefix_c64["benchmark_params"]}
+    npu_stage2 = {
+        "platforms.npu.stages.2.num_replicas": 2,
+        "platforms.npu.stages.2.devices": "0,0",
+        "platforms.npu.stages.2.gpu_memory_utilization": 0.11,
+    }
+    topology_1card = "1 card · 3-stage · stage2: 2 replicas"
+    topology_2card = "Single replica · 2 cards (stage0,1: 1 card; stage2: 1 card)"
+    assert default["description"].startswith(topology_1card)
+    assert prefix_c32["description"].startswith(topology_1card)
+    assert prefix_c64["description"].startswith(topology_2card)
+    assert default["mark"][0]["hardware_marks"] == {"res": {"npu": "A3"}, "num_cards": 2}
+    assert default["server_params"]["update"]["async_chunk"] is False
+    assert "--no-async-chunk" in default["server_params"]["extra_cli_args"]
+    assert default["server_params"]["update"]["duplex_session.max_sessions"] == 32
+    assert default["server_params"]["update"]["platforms.npu.stages.2.num_replicas"] == 2
+    assert {key: default["server_params"]["update"][key] for key in npu_stage2} == npu_stage2
+    assert default_params["name"] == "default-seed-tts-c32"
+    assert default_params["max_concurrency"] == [32]
+    assert default_params["num_prompts"] == [1088]
+    assert default_params["seed_tts_wer_eval"] is True
+    assert default_params["max_seed_tts_mean_wer"] == 0.05
+    assert default_params["min_seed_tts_mean_sim"] == 0.80
+    assert "tpot" in default_params["percentile-metrics"]
+    assert prefix_c32["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5_turn.yaml"
+    assert prefix_c32["server_params"]["update"]["stages"]["0"]["enable_prefix_caching"] is True
+    assert prefix_c32["server_params"]["update"]["platforms.npu.stages.0.enable_prefix_caching"] is True
+    assert {key: prefix_c32["server_params"]["update"][key] for key in npu_stage2} == npu_stage2
+    assert list(c32_by_name) == [
+        "async-prefix-seed-tts-c1",
+        "async-prefix-seed-tts-c16",
+        "async-prefix-seed-tts-c32",
+    ]
+    assert c32_by_name["async-prefix-seed-tts-c1"]["max_concurrency"] == [1]
+    assert c32_by_name["async-prefix-seed-tts-c1"]["num_prompts"] == [32]
+    assert "seed_tts_wer_eval" not in c32_by_name["async-prefix-seed-tts-c1"]
+    assert c32_by_name["async-prefix-seed-tts-c16"]["max_concurrency"] == [16]
+    assert c32_by_name["async-prefix-seed-tts-c16"]["num_prompts"] == [256]
+    assert c32_by_name["async-prefix-seed-tts-c32"]["max_concurrency"] == [32]
+    assert c32_by_name["async-prefix-seed-tts-c32"]["num_prompts"] == [1088]
+    assert c32_by_name["async-prefix-seed-tts-c32"]["seed_tts_wer_eval"] is True
+    assert c32_by_name["async-prefix-seed-tts-c32"]["max_seed_tts_mean_wer"] == 0.05
+    assert c32_by_name["async-prefix-seed-tts-c32"]["min_seed_tts_mean_sim"] == 0.80
+    assert prefix_c64["mark"][0]["hardware_marks"] == {"res": {"npu": "A3"}, "num_cards": 3}
+    assert prefix_c64["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml"
+    assert prefix_c64["server_params"]["update"]["session_mode"] == "turn"
+    assert prefix_c64["server_params"]["update"]["stages"]["0"]["devices"] == "0"
+    assert prefix_c64["server_params"]["update"]["stages"]["1"]["devices"] == "0"
+    assert prefix_c64["server_params"]["update"]["stages"]["2"]["devices"] == "1"
+    assert prefix_c64["server_params"]["update"]["platforms.npu.stages.0.max_num_seqs"] == 64
+    assert "platforms.npu.stages.2.num_replicas" not in prefix_c64["server_params"]["update"]
+    assert list(c64_by_name) == [
+        "async-prefix-seed-tts-c1",
+        "async-prefix-seed-tts-c16",
+        "async-prefix-seed-tts-c32",
+        "async-prefix-seed-tts-c64",
+    ]
+    assert c64_by_name["async-prefix-seed-tts-c1"]["num_prompts"] == [32]
+    assert c64_by_name["async-prefix-seed-tts-c16"]["num_prompts"] == [256]
+    assert c64_by_name["async-prefix-seed-tts-c32"]["num_prompts"] == [512]
+    assert "seed_tts_wer_eval" not in c64_by_name["async-prefix-seed-tts-c32"]
+    assert c64_by_name["async-prefix-seed-tts-c64"]["max_concurrency"] == [64]
+    assert c64_by_name["async-prefix-seed-tts-c64"]["num_prompts"] == [1088]
+    assert c64_by_name["async-prefix-seed-tts-c64"]["seed_tts_wer_eval"] is True
+    assert c64_by_name["async-prefix-seed-tts-c64"]["min_seed_tts_mean_sim"] == 0.80
 
 
 def test_minicpmo_daily_omni_nightly_config_uses_c8_and_minicpm_recipe():
