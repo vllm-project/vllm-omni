@@ -48,7 +48,7 @@ prompt positions: the input embeddings and the hidden states of
 
 | Component | Process | Owns |
 | --- | --- | --- |
-| Native `MooncakeStoreConnector` (vLLM `4ba787ec`) | Scheduler and worker | KV keys, KV loads and saves, GPU block references held by saves |
+| Native vLLM `MooncakeStoreConnector` | Scheduler and worker | KV keys, KV loads and saves, GPU block references held by saves |
 | `OmniMooncakeStoreConnector`, scheduler role | Engine core | Lookup deadlines, recovery bypass, load-attempt tokens, cancellation notices |
 | `JointStoreWorker` | Worker rank 0 | Joint KV/HS lookup over the native lookup channel |
 | `OmniMooncakeStoreConnector`, worker role | Worker | HS reads and writes, staging budget, restored rows, receive completion |

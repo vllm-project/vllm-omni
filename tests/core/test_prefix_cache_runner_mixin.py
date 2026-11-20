@@ -33,7 +33,7 @@ except ModuleNotFoundError:
 
 from tests.core.test_prefix_cache import FakeNewReq, FakeSchedOut, FakeView
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter, PrefixCacheStep, PrefixCacheWriteLayout
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
+from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 

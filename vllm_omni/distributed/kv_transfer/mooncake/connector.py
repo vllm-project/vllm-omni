@@ -4,8 +4,7 @@
 
 The native Mooncake connector owns KV copies and their GPU block references.
 This adapter adds a joint lookup on its worker, request-attempt identities,
-bounded CPU capture storage, and delayed receive completion. Native connector
-integration targets vLLM revision 4ba787ec9959e566d3b587a796dff07673324da5.
+bounded CPU capture storage, and delayed receive completion.
 
 The adapter reports its work through the native per-operation telemetry, next
 to the native ``lookup_exists``, ``load_get``, ``save_exists`` and ``save_put``:
@@ -57,6 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
     MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
+    ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import MooncakeStoreConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import MooncakeStoreScheduler
@@ -130,8 +130,8 @@ class JointStoreScheduler(MooncakeStoreScheduler):
         self.reused_tokens: dict[str, int] = {}
         super().__init__(config, kv_config)
 
-    def _reference_save_blocks(self, metadata: MooncakeStoreConnectorMetadata) -> None:
-        for req in metadata.requests:
+    def _reference_save_blocks(self, requests: list[ReqMeta]) -> None:
+        for req in requests:
             reused = self.reused_tokens.get(req.req_id, 0)
             if req.can_save and reused:
                 start = max(req.token_ids_start, reused)
@@ -140,7 +140,7 @@ class JointStoreScheduler(MooncakeStoreScheduler):
                 req.token_ids_start = start
                 if req.token_len_chunk <= reused:
                     req.can_save = False
-        super()._reference_save_blocks(metadata)
+        super()._reference_save_blocks(requests)
 
 
 class JointStoreWorker(MooncakeStoreWorker):

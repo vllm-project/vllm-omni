@@ -16,7 +16,7 @@ import torch
 import transformers.configuration_utils
 from transformers import Qwen3OmniMoeConfig
 from vllm import SamplingParams
-from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, DeviceConfig, KVEventsConfig, KVTransferConfig, SchedulerConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -41,7 +41,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
 )
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 from vllm.renderers.base import BaseRenderer
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.output import KVConnectorBlockState, NewRequestData, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -54,6 +56,7 @@ from vllm_omni.distributed.kv_transfer.mooncake.config import MooncakeConfig
 from vllm_omni.distributed.kv_transfer.mooncake.connector import (
     Attempt,
     JointMetadata,
+    JointStoreScheduler,
     JointStoreWorker,
     OmniMooncakeStoreConnector,
     PendingSave,
@@ -1792,25 +1795,52 @@ def test_replayed_final_loaded_token_is_counted_as_compute_once(connector):
     assert not connector._saves
 
 
-def test_local_hit_without_new_complete_block_does_not_pin_native_save(monkeypatch):
-    from vllm_omni.distributed.kv_transfer.mooncake.connector import JointStoreScheduler
-
-    scheduler = JointStoreScheduler.__new__(JointStoreScheduler)
-    scheduler.reused_tokens = {"hot": 8, "mixed": 4}
-    metadata = MooncakeStoreConnectorMetadata(set(), set())
-    metadata.requests = [
-        ReqMeta("hot", 8, ([1, 2],), [b"a", b"b"], can_save=True),
-        ReqMeta("mixed", 8, ([1, 3],), [b"a", b"c"], can_save=True),
-    ]
-    pinned: list[str] = []
+@pytest.mark.parametrize(
+    "prompt_len, expected_suffix", [(33, []), (49, list(range(32, 48)))], ids=["no-new-block", "one-new-block"]
+)
+def test_build_connector_meta_saves_only_new_blocks_after_mixed_hit(
+    connector, monkeypatch, prompt_len, expected_suffix
+):
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.cache_config = CacheConfig(block_size=16, enable_prefix_caching=True)
+    config.kv_transfer_config = KVTransferConfig(kv_connector="OmniMooncakeStoreConnector", kv_role="kv_both")
+    config.kv_events_config = KVEventsConfig(enable_kv_cache_events=True)
+    register_all_kvcache_specs(config)
+    client = Mock(spec=LookupKeyClient)
+    client.lookup.return_value = MooncakeLookupResult(16)
     monkeypatch.setattr(
-        MooncakeStoreScheduler,
-        "_reference_save_blocks",
-        lambda self, meta: pinned.extend(req.req_id for req in meta.requests if req.can_save),
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler.LookupKeyClient", lambda _: client
     )
-    scheduler._reference_save_blocks(metadata)
-    assert pinned == ["mixed"]
-    assert [req.token_ids_start for req in metadata.requests] == [8, 4]
+    connector.connector_scheduler = JointStoreScheduler(config, BLOCK16_KV_CONFIG)
+    connector.block_size = 16
+    connector.local_prefix_caching = True
+    pool = BlockPool(num_gpu_blocks=16, enable_caching=True, hash_block_size=16)
+    connector.bind_gpu_block_pool(pool)
+
+    prompt = list(range(prompt_len))
+    request = Request("mixed", prompt, SamplingParams(max_tokens=1), None)
+    request.block_hashes.extend([b"local", b"external", b"new"][: prompt_len // 16])
+    blocks = KVCacheBlocks((pool.get_new_blocks((prompt_len + 15) // 16),))
+    assert connector.get_num_new_matched_tokens(request, 16) == (16, True)
+    connector.update_state_after_alloc(request, blocks, 16)
+    (load,) = connector.build_connector_meta(SchedulerOutput.make_empty()).requests
+    assert load.load_spec == LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=True)
+    assert not load.can_save
+
+    # On the next step the first two blocks are available and the suffix runs.
+    request.num_computed_tokens = 32
+    block_ids = blocks.get_block_ids()
+    step = SchedulerOutput.make_empty()
+    step.scheduled_new_reqs = [NewRequestData.from_request(request, block_ids, prefill_token_ids=prompt)]
+    step.num_scheduled_tokens = {"mixed": prompt_len - 32}
+    step.total_num_scheduled_tokens = prompt_len - 32
+    step.kv_connector_block_state = KVConnectorBlockState({"mixed"}, lambda _: block_ids, {})
+    (save,) = connector.build_connector_meta(step).requests
+
+    assert (save.token_ids_start, save.token_len_chunk) == (32, 32 + len(expected_suffix))
+    assert save.token_ids == expected_suffix
+    assert save.can_save == bool(expected_suffix)
+    assert (save.store_job_id is not None) == bool(expected_suffix)
 
 
 def test_native_save_cursor_starts_after_reused_blocks_without_rewinding(monkeypatch):
