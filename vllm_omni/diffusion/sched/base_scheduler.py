@@ -7,7 +7,8 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import fields
+from dataclasses import fields, replace
+from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -23,7 +24,7 @@ from vllm_omni.diffusion.attention.schedule import (
     stage_runs_denoising,
     validate_request_attention_schedules,
 )
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionBatchingConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
     KVTransferRegistrationError,
@@ -37,6 +38,10 @@ from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.mixfusion.request import relax_step_batch_key
 from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.batching_policy import (
+    DiffusionBatchingPolicy,
+    create_diffusion_batching_policy,
+)
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionRequestStatus,
@@ -72,7 +77,13 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
 
 
 class BaseScheduler(ABC):
-    """Shared queue/state bookkeeping for diffusion schedulers."""
+    """Shared queue/state bookkeeping for diffusion schedulers.
+
+    Which waiting requests are admitted, and in what order, is owned by the
+    configured ``DiffusionBatchingPolicy``. The default policy reproduces
+    upstream vLLM's FIFO admission; alternative policies (e.g. compute-budget
+    DRR) override ``admit_waiting`` without changing this class.
+    """
 
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
@@ -88,6 +99,9 @@ class BaseScheduler(ABC):
         self._running_sampling_params_key: BatchSamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
+        # DRR budget pinned by an explicit max_num_seqs (> 1), in compute
+        # units. None means the policy derives the budget itself.
+        self.user_request_budget_units: int | None = None
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
         self._kv_connector = None
@@ -99,6 +113,8 @@ class BaseScheduler(ABC):
         self._kv_received_request_ids: set[str] = set()
         self._native_prefetch_enabled = False
         self._native_prefetch_request_id: str | None = None
+        self.batching_config: DiffusionBatchingConfig = DiffusionBatchingConfig()
+        self.batching_policy: DiffusionBatchingPolicy = create_diffusion_batching_policy(self.batching_config)
 
     def initialize(
         self,
@@ -128,7 +144,13 @@ class BaseScheduler(ABC):
             self.max_num_running_reqs = max(1, int(max_num_seqs))
         except (TypeError, ValueError):
             self.max_num_running_reqs = 1
-        omni_kv = od_config.omni_kv_config or {}
+        self.batching_config = self._resolve_batching_config(od_config)
+        self.user_request_budget_units = self._explicit_request_budget_units()
+        self.batching_policy = create_diffusion_batching_policy(
+            self.batching_config,
+            request_budget_units=self.user_request_budget_units,
+        )
+        omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
         diffusion_kv_enabled = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
         if diffusion_kv_enabled:
@@ -197,13 +219,14 @@ class BaseScheduler(ABC):
         state = self._make_request_state(request_id, request)
         state.queued_at = time.perf_counter()
         self._request_states[request_id] = state
-        self._waiting.append(request_id)
+        self._enqueue_waiting(state)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
         return request_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_request_ids: list[str] = []
+        self.batching_policy.on_schedule_start()
 
         # First, schedule the RUNNING request(s)
         for request_id in self._running:
@@ -211,98 +234,9 @@ class BaseScheduler(ABC):
             if state is not None and self._can_schedule_running(state):
                 scheduled_cached_request_ids.append(request_id)
 
-        # Second, schedule WAITING requests while capacity remains.
-        deferred: list[str] = []
-        waiting_budget = len(self._waiting)
-        while self._waiting and waiting_budget and len(self._running) < self.max_num_running_reqs:
-            waiting_budget -= 1
-            request_id = self._waiting[0]
-            state = self._request_states.get(request_id)
-            if state is None:
-                self._waiting.popleft()
-                continue
-            if not self._can_schedule_waiting(state):
-                break
-
-            diffusion_kv_metadata: DiffusionKVMetadata | None = None
-            if self._diffusion_kv_manager is not None:
-                already_reserved = self._diffusion_kv_manager.has_request(request_id)
-                if already_reserved:
-                    diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
-                else:
-                    matched_tokens: list[int] = []
-                    if self._kv_connector is not None:
-                        for request in state.diffusion_kv_requests:
-                            num_tokens, _ = self._kv_connector.get_num_new_matched_tokens(request, 0)
-                            if num_tokens is None:
-                                break
-                            matched_tokens.append(num_tokens)
-                        if len(matched_tokens) != len(state.diffusion_kv_requests):
-                            deferred.append(self._waiting.popleft())
-                            continue
-                    try:
-                        allocation = self._diffusion_kv_manager.reserve_request(
-                            request_id,
-                            state.diffusion_kv_requests,
-                        )
-                    except Exception as exc:
-                        # Reservation rolls back on failure and has not yet
-                        # handed any destination pages to the connector.
-                        self._finish_requests(
-                            {request_id: DiffusionRequestStatus.FINISHED_ERROR},
-                            {request_id: str(exc)},
-                        )
-                        continue
-                    if allocation is None:
-                        break
-                    # Check the lookup result before registering destination
-                    # pages with the connector: deferred pages can be freed.
-                    if not self._can_schedule_waiting(state):
-                        self._diffusion_kv_manager.free_request(request_id)
-                        break
-                    diffusion_kv_metadata = allocation
-                    self._kv_request_generations[request_id] = allocation.allocation_generation
-                    if self._kv_connector is not None:
-                        try:
-                            transfer_ids = commit_kv_load(
-                                self._kv_connector,
-                                self._diffusion_kv_manager.native_manager,
-                                state.diffusion_kv_requests,
-                                matched_tokens,
-                            )
-                        except KVTransferRegistrationError as exc:
-                            self._finish_requests(
-                                {request_id: DiffusionRequestStatus.FINISHED_ERROR}, {request_id: str(exc)}
-                            )
-                            continue
-                        # Other exceptions have no proven rollback. Keep pages
-                        # allocated until the Engine shuts down the Workers.
-                        self._kv_transfer_request_ids.update(transfer_ids)
-                        if transfer_ids:
-                            self._kv_loading_request_ids.add(request_id)
-                        for sequence, request in zip(allocation.sequences, state.diffusion_kv_requests, strict=True):
-                            sequence.num_computed_tokens = request.num_computed_tokens
-
-            self._waiting.popleft()
-            if request_id == self._native_prefetch_request_id:
-                self._native_prefetch_request_id = None
-            was_new_request = state.status == DiffusionRequestStatus.WAITING
-            if not self._running:
-                self._running_sampling_params_key = state.sampling_params_key
-            state.status = DiffusionRequestStatus.RUNNING
-            self._running.append(request_id)
-            if was_new_request:
-                state.req.scheduler_queue_wait_ms = max((time.perf_counter() - state.queued_at) * 1000.0, 0.0)
-                scheduled_new_reqs.append(
-                    NewRequestData.from_state(
-                        state,
-                        diffusion_kv_metadata=diffusion_kv_metadata,
-                    )
-                )
-            else:
-                scheduled_cached_request_ids.append(request_id)
-
-        self._waiting.extendleft(reversed(deferred))
+        # Second, schedule WAITING requests while capacity remains. The
+        # batching policy owns the admission order.
+        self._schedule_waiting_requests(scheduled_new_reqs, scheduled_cached_request_ids)
 
         # Expose the next waiting request (serial mode) so the runner can
         # prefetch its KV during this forward.  Skip a request without
@@ -451,6 +385,107 @@ class BaseScheduler(ABC):
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         pass
 
+    def _schedule_waiting_requests(
+        self,
+        scheduled_new_reqs: list[NewRequestData],
+        scheduled_cached_request_ids: list[str],
+    ) -> None:
+        if not self._waiting:
+            return
+        self.batching_policy.admit_waiting(self, scheduled_new_reqs, scheduled_cached_request_ids)
+
+    def _admit_state(
+        self,
+        state: SchedulerRequestState,
+        scheduled_new_reqs: list[NewRequestData],
+        scheduled_cached_request_ids: list[str],
+    ) -> str:
+        """Admit one waiting request, reserving KV pages first.
+
+        Returns "admitted", or one of:
+        - "deferred": the KV connector is not ready; the request stays waiting.
+        - "error": the request was finished with FINISHED_ERROR.
+        - "stalled": the KV manager lacks blocks; callers stop admission.
+        - "gated": a post-reservation scheduler gate rejected the request;
+          its pages were freed and it stays waiting.
+        """
+        request_id = state.request_id
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None
+        if self._diffusion_kv_manager is not None:
+            already_reserved = self._diffusion_kv_manager.has_request(request_id)
+            if already_reserved:
+                diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
+            else:
+                matched_tokens: list[int] = []
+                if self._kv_connector is not None:
+                    for request in state.diffusion_kv_requests:
+                        num_tokens, _ = self._kv_connector.get_num_new_matched_tokens(request, 0)
+                        if num_tokens is None:
+                            return "deferred"
+                        matched_tokens.append(num_tokens)
+                try:
+                    allocation = self._diffusion_kv_manager.reserve_request(
+                        request_id,
+                        state.diffusion_kv_requests,
+                    )
+                except Exception as exc:
+                    # Reservation rolls back on failure and has not yet
+                    # handed any destination pages to the connector.
+                    self._finish_requests(
+                        {request_id: DiffusionRequestStatus.FINISHED_ERROR},
+                        {request_id: str(exc)},
+                    )
+                    return "error"
+                if allocation is None:
+                    return "stalled"
+                # Check the lookup result before registering destination
+                # pages with the connector: deferred pages can be freed.
+                if not self._can_schedule_waiting(state):
+                    self._diffusion_kv_manager.free_request(request_id)
+                    return "gated"
+                diffusion_kv_metadata = allocation
+                self._kv_request_generations[request_id] = allocation.allocation_generation
+                if self._kv_connector is not None:
+                    try:
+                        transfer_ids = commit_kv_load(
+                            self._kv_connector,
+                            self._diffusion_kv_manager.native_manager,
+                            state.diffusion_kv_requests,
+                            matched_tokens,
+                        )
+                    except KVTransferRegistrationError as exc:
+                        self._finish_requests(
+                            {request_id: DiffusionRequestStatus.FINISHED_ERROR}, {request_id: str(exc)}
+                        )
+                        return "error"
+                    # Other exceptions have no proven rollback. Keep pages
+                    # allocated until the Engine shuts down the Workers.
+                    self._kv_transfer_request_ids.update(transfer_ids)
+                    if transfer_ids:
+                        self._kv_loading_request_ids.add(request_id)
+                    for sequence, request in zip(allocation.sequences, state.diffusion_kv_requests, strict=True):
+                        sequence.num_computed_tokens = request.num_computed_tokens
+
+        self._remove_waiting_id(request_id)
+        if request_id == self._native_prefetch_request_id:
+            self._native_prefetch_request_id = None
+        was_new_request = state.status == DiffusionRequestStatus.WAITING
+        if not self._running:
+            self._running_sampling_params_key = state.sampling_params_key
+        state.status = DiffusionRequestStatus.RUNNING
+        self._running.append(request_id)
+        if was_new_request:
+            state.req.scheduler_queue_wait_ms = max((time.perf_counter() - state.queued_at) * 1000.0, 0.0)
+            scheduled_new_reqs.append(
+                NewRequestData.from_state(
+                    state,
+                    diffusion_kv_metadata=diffusion_kv_metadata,
+                )
+            )
+        else:
+            scheduled_cached_request_ids.append(request_id)
+        return "admitted"
+
     def has_requests(self) -> bool:
         return bool(
             self._waiting
@@ -564,6 +599,15 @@ class BaseScheduler(ABC):
         self._pop_extra_request_state(request_id)
         if request_id not in self._kv_draining_requests:
             self._kv_request_generations.pop(request_id, None)
+        # A popped request must be fully detached from the queues: some callers
+        # (engine finalize) pop before _finish_requests runs, and a stale id in
+        # _running would KeyError later in _can_schedule_waiting.
+        if request_id in self._running:
+            self._running.remove(request_id)
+            if not self._running:
+                self._running_sampling_params_key = None
+        if request_id in self._waiting:
+            self._remove_waiting_id(request_id)
         return self._request_states.pop(request_id, None)
 
     def preempt_request(self, request_id: str) -> bool:
@@ -575,8 +619,9 @@ class BaseScheduler(ABC):
             self._running.remove(request_id)
             if not self._running:
                 self._running_sampling_params_key = None
-            self._waiting.appendleft(request_id)
-            self._request_states[request_id].status = DiffusionRequestStatus.PREEMPTED
+            state = self._request_states[request_id]
+            state.status = DiffusionRequestStatus.PREEMPTED
+            self._enqueue_waiting(state, front=True)
             return True
         return False
 
@@ -643,8 +688,8 @@ class BaseScheduler(ABC):
             self._running = [request_id for request_id in self._running if request_id not in running_to_remove]
             if not self._running:
                 self._running_sampling_params_key = None
-        if waiting_to_remove:
-            self._waiting = deque(request_id for request_id in self._waiting if request_id not in waiting_to_remove)
+        for waiting_id in waiting_to_remove:
+            self._remove_waiting_id(waiting_id)
 
         for request_id in finished_req_ids:
             state = self._request_states[request_id]
@@ -766,6 +811,52 @@ class BaseScheduler(ABC):
                 "paged_scheduler Diffusion KV does not accept legacy dense KV payloads; "
                 f"clear these fields before admission: {fields_text}"
             )
+
+    def _resolve_batching_config(self, od_config: OmniDiffusionConfig) -> DiffusionBatchingConfig:
+        cfg: Any = getattr(od_config, "diffusion_batching_config", None)
+        if isinstance(cfg, DiffusionBatchingConfig):
+            config = cfg
+        elif isinstance(cfg, dict):
+            config = DiffusionBatchingConfig.from_dict(cfg)
+        else:
+            config = DiffusionBatchingConfig()
+        resolved_policy = config.resolve_policy(enable_mixfusion=bool(getattr(od_config, "enable_mixfusion", False)))
+        if resolved_policy != config.policy:
+            logger.info(
+                "Diffusion batching policy 'auto' resolved to %s (enable_mixfusion=%s).",
+                resolved_policy,
+                getattr(od_config, "enable_mixfusion", False),
+            )
+            return replace(config, policy=resolved_policy)
+        return config
+
+    def _explicit_request_budget_units(self) -> int | None:
+        """Return the DRR budget pinned by an explicit ``max_num_seqs > 1``.
+
+        ``max_num_seqs <= 1`` is the default/unset sentinel: the policy computes
+        the budget from ``compute_unit_budget`` (or warmup calibration) instead
+        and replaces the literal cap with the budget-derived request count.
+        """
+        if self.max_num_running_reqs <= 1:
+            return None
+        return self.max_num_running_reqs * self.batching_config.reference_compute_units()
+
+    def _effective_max_running_reqs(self, candidate_state: SchedulerRequestState) -> int:
+        """Return the request-count cap for the current homogeneous batch."""
+        return self.batching_policy.get_max_running_reqs(self.max_num_running_reqs, candidate_state)
+
+    def _enqueue_waiting(self, state: SchedulerRequestState, *, front: bool = False) -> None:
+        request_id = state.request_id
+        if front:
+            self._waiting.appendleft(request_id)
+        else:
+            self._waiting.append(request_id)
+
+    def _remove_waiting_id(self, request_id: str) -> None:
+        self._waiting = deque(req_id for req_id in self._waiting if req_id != request_id)
+
+    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
+        return True
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not self._running:

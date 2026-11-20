@@ -4,6 +4,7 @@
 import asyncio
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
     AttentionSpec,
+    DiffusionBatchingConfig,
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
@@ -33,6 +35,10 @@ from vllm_omni.diffusion.sched import (
     RequestScheduler,
     Scheduler,
     StepScheduler,
+)
+from vllm_omni.diffusion.sched.batching_policy import (
+    ComputeBudgetDiffusionBatchingPolicy,
+    FixedDiffusionBatchingPolicy,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
@@ -1359,6 +1365,7 @@ class TestRequestScheduler:
         assert third.num_waiting_reqs == 0
 
     def test_records_initial_scheduler_queue_wait(self, mocker: MockerFixture) -> None:
+        # Clock reads: enqueue, then the queue-wait record (FIFO policy).
         perf_counter = mocker.patch(
             "vllm_omni.diffusion.sched.base_scheduler.time.perf_counter",
             side_effect=[10.0, 10.125],
@@ -1568,9 +1575,17 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
-    def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
+    def test_drr_respects_homogeneous_batch_gate_by_compute_budget(self) -> None:
         scheduler = RequestScheduler()
-        scheduler.initialize(_scheduler_config(max_num_seqs=3))
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=1,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 10240,
+                },
+            )
+        )
 
         req_id_a = scheduler.add_request(_make_request("a"))
         req_id_b = scheduler.add_request(
@@ -1580,20 +1595,32 @@ class TestRequestScheduler:
                 request_id="b",
             )
         )
-        scheduler.add_request(_make_request("c"))
+        req_id_c = scheduler.add_request(_make_request("c"))
+
+        # Age b so its DRR score dominates the microsecond-scale ages of the
+        # fresh requests; otherwise the ordering would be timing-dependent.
+        state_b = scheduler.get_request_state(req_id_b)
+        assert state_b is not None
+        state_b.queued_at = time.perf_counter() - 1.0
 
         first = scheduler.schedule()
 
-        assert _new_ids(first) == [req_id_a]
+        # The homogeneous-batching admission gate keeps request-mode batches
+        # single-key: the worker resolves height/width from the first
+        # request's sampling params, so b (1024x768 -> 3072) must be scheduled
+        # alone even though b + a (1024x1024 -> 4096) would fit the budget.
+        assert _new_ids(first) == [req_id_b]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 2
 
-        scheduler.update_from_output(first, _make_request_output(req_id_a))
+        scheduler.update_from_output(first, _make_request_output(req_id_b))
         second = scheduler.schedule()
 
-        assert _new_ids(second) == [req_id_b]
-        assert second.num_running_reqs == 1
-        assert second.num_waiting_reqs == 1
+        # With b finished, DRR fills the budget with same-key requests:
+        # a (4096) + c (4096) = 8192 <= 10240.
+        assert _new_ids(second) == [req_id_a, req_id_c]
+        assert second.num_running_reqs == 2
+        assert second.num_waiting_reqs == 0
 
     def test_abort_request_for_waiting_and_running(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
@@ -2242,6 +2269,359 @@ class TestStepScheduler:
         assert _new_ids(second) == []
         assert _cached_ids(second) == [req_good]
 
+    @staticmethod
+    def _age_request(scheduler: StepScheduler, sched_req_id: str, age_s: float) -> None:
+        state = scheduler.get_request_state(sched_req_id)
+        assert state is not None
+        state.queued_at = time.perf_counter() - age_s
+
+    def test_drr_aged_head_reserves_remaining_budget_gap(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=8,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 8192,
+                },
+            )
+        )
+
+        small_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"small-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(6)
+        ]
+        first = scheduler.schedule()
+        assert _new_ids(first) == small_ids
+
+        req_big = scheduler.add_request(
+            _make_step_request(
+                "big",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        self._age_request(scheduler, req_big, 120.0)
+        scheduler.add_request(
+            _make_step_request(
+                "late-small",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+
+        # Running units = 6 * 1024 = 6144, budget 8192 -> remaining 2048. The
+        # aged big (4096) cannot fit; reservation mode must not spend the gap
+        # on the late small (1024), otherwise the gap never accumulates.
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == []
+        assert second.num_running_reqs == 6
+        assert second.num_waiting_reqs == 2
+
+    def test_drr_aged_admission_respects_explicit_max_num_seqs_count_cap(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=2,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 2048,
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"small-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=256,
+                        width=256,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(3)
+        ]
+
+        # Budget 2 * 1024 units would admit all three 256x256 requests by cost;
+        # the explicit max_num_seqs=2 count cap must still bind.
+        first = scheduler.schedule()
+        assert _new_ids(first) == req_ids[:2]
+        assert first.num_running_reqs == 2
+        assert first.num_waiting_reqs == 1
+
+        self._age_request(scheduler, req_ids[2], 120.0)
+
+        # The aged request fits the remaining budget, but admitting it here
+        # would push the running count past the explicit cap.
+        second = scheduler.schedule()
+        assert _new_ids(second) == []
+        assert second.num_running_reqs == 2
+        assert second.num_waiting_reqs == 1
+
+    def test_drr_young_head_is_skipped_to_fill_budget(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=8,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 8192,
+                },
+            )
+        )
+
+        small_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"small-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(6)
+        ]
+        first = scheduler.schedule()
+        assert _new_ids(first) == small_ids
+
+        req_big = scheduler.add_request(
+            _make_step_request(
+                "big",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        # Young aged head: only 10s < drr_reserve_time_s, so it does not get
+        # reservation treatment.
+        self._age_request(scheduler, req_big, 10.0)
+        req_small = scheduler.add_request(
+            _make_step_request(
+                "late-small",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+
+        # Remaining budget = 2048. Big (4096) does not fit but is young, so it
+        # is skipped and the small (1024) fills the budget.
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_small]
+        assert second.num_running_reqs == 7
+        assert second.num_waiting_reqs == 1
+
+    def test_drr_aging_promotes_waiting_request_over_new_arrivals(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=1,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    # Room for exactly one 1024x1024 request, so the aged
+                    # expensive request wins the only slot.
+                    "compute_unit_budget": 4096,
+                },
+            )
+        )
+
+        req_first = scheduler.add_request(_make_step_request("first"))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_first]
+
+        scheduler.add_request(
+            _make_step_request(
+                "cheap",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        req_expensive = scheduler.add_request(
+            _make_step_request(
+                "expensive",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        self._age_request(scheduler, req_expensive, 120.0)
+
+        scheduler.update_from_output(
+            first,
+            _make_step_output(req_first, step_index=4, finished=True),
+        )
+        second = scheduler.schedule()
+
+        # The aged expensive request must overtake the younger cheap one even
+        # though the cheap one arrived (and was enqueued) first.
+        assert _new_ids(second) == [req_expensive]
+        assert second.num_waiting_reqs == 1
+
+    def test_fixed_policy_admits_in_arrival_order_not_drr_score(self) -> None:
+        """With DRR off, admission is upstream FIFO: no cost/aging reordering.
+
+        This is the switch-off contract: the scheduler must behave exactly as
+        on main, even when a later, costlier request would win the DRR score.
+        """
+        scheduler = StepScheduler()
+        scheduler.initialize(_scheduler_config(max_num_seqs=1))
+
+        req_first = scheduler.add_request(_make_step_request("first"))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_first]
+
+        req_cheap = scheduler.add_request(
+            _make_step_request(
+                "cheap",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        req_expensive = scheduler.add_request(
+            _make_step_request(
+                "expensive",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        self._age_request(scheduler, req_expensive, 120.0)
+
+        scheduler.update_from_output(
+            first,
+            _make_step_output(req_first, step_index=4, finished=True),
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_cheap]
+        assert second.num_waiting_reqs == 1
+
+    def test_explicit_max_num_seqs_ignores_compute_unit_budget(self) -> None:
+        """max_num_seqs > 1 pins the budget: 128 slots of 512x512 = 131072 units."""
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=128,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    # Deliberately small: an explicit max_num_seqs must win.
+                    "compute_unit_budget": 2048,
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=1024,
+                        width=1024,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(8)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        # User-stated budget: 128 slots * 1024 units = 131072. Qwen-Image
+        # 1024x1024 requests cost (1024 / 16)^2 = 4096 each, so all 8 fit
+        # (8 * 4096 = 32768) even though compute_unit_budget=2048 is tiny.
+        assert _new_ids(sched_output) == req_ids
+        assert sched_output.num_running_reqs == 8
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_unset_max_num_seqs_replaces_default_cap_with_computed_budget(self) -> None:
+        """max_num_seqs=1 (unset) must not pin the batch to one request."""
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=1,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(12)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        # compute_unit_budget=10240 and 512x512 -> 1024 units each: the derived
+        # cap of 10 replaces the max_num_seqs=1 sentinel.
+        assert _new_ids(sched_output) == req_ids[:10]
+        assert sched_output.num_running_reqs == 10
+        assert sched_output.num_waiting_reqs == 2
+
+    def test_profile_batching_policy_ramps_batch_size(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_seqs=4,
+                diffusion_batching_config={
+                    "policy": "profile",
+                    "profiler_interval": 1,
+                },
+            )
+        )
+
+        req_ids = [scheduler.add_request(_make_step_request(f"req-{i}")) for i in range(4)]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:2]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 2
+
     def test_step_batch_rejects_different_sampling_key(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(_scheduler_config(max_num_seqs=3))
@@ -2569,6 +2949,37 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+
+class TestBatchingPolicyResolution:
+    def _initialize(self, *, enable_mixfusion: bool, policy: str | None = None) -> BaseScheduler:
+        scheduler = StepScheduler()
+        config = DiffusionBatchingConfig() if policy is None else DiffusionBatchingConfig(policy=policy)
+        scheduler.initialize(
+            _scheduler_config(
+                enable_mixfusion=enable_mixfusion,
+                diffusion_batching_config=config,
+            )
+        )
+        return scheduler
+
+    def test_auto_enables_drr_when_mixfusion_is_on(self) -> None:
+        scheduler = self._initialize(enable_mixfusion=True)
+
+        assert scheduler.batching_config.policy == "compute_budget"
+        assert isinstance(scheduler.batching_policy, ComputeBudgetDiffusionBatchingPolicy)
+
+    def test_auto_keeps_fixed_policy_when_mixfusion_is_off(self) -> None:
+        scheduler = self._initialize(enable_mixfusion=False)
+
+        assert scheduler.batching_config.policy == "fixed"
+        assert isinstance(scheduler.batching_policy, FixedDiffusionBatchingPolicy)
+
+    def test_explicit_fixed_policy_disables_drr_with_mixfusion(self) -> None:
+        scheduler = self._initialize(enable_mixfusion=True, policy="fixed")
+
+        assert scheduler.batching_config.policy == "fixed"
+        assert isinstance(scheduler.batching_policy, FixedDiffusionBatchingPolicy)
 
 
 class TestPendingFinishedRequestIds:
