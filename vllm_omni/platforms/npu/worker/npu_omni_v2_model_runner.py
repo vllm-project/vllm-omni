@@ -368,10 +368,9 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
 
     def _call_talker_prefill(self, mode_path, model_inputs, input_batch, batch_desc):
-        use_eager = (
-            (self.vllm_config.additional_config or {}).get("minicpmo_talker_prefill_eager") is True
-            and not input_batch.is_dummy
-        )
+        use_eager = (self.vllm_config.additional_config or {}).get(
+            "minicpmo_talker_prefill_eager"
+        ) is True and not input_batch.is_dummy
         context = get_forward_context() if use_eager else None
         if context is not None:
             # Avoid blocking the Talker worker on first-use static kernel
