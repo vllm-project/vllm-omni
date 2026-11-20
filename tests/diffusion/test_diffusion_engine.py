@@ -1400,6 +1400,7 @@ class TestPreTokenizedPromptCustomPipelines:
         assert len(engine.scheduler._waiting_queue) == 1
 
 
+@pytest.mark.cpu
 def test_warmup_profile_stops_recording_when_sweep_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
