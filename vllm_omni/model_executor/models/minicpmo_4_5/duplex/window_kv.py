@@ -1108,6 +1108,10 @@ class MiniCPMO45SchedulerWindowPolicy:
         """The completed units an aborted request leaves, or None when it has none."""
         if (settled := getattr(request, "_minicpmo45_settled", None)) is not None:
             return {**settled, "source": request.request_id, "time": None}
+        if getattr(request, "_minicpmo45_replay_source", None) is not None:
+            # Only the predecessor's rows have run. Its settled snapshot still
+            # owns the session and can be claimed by the next receiver.
+            return None
         # An append the worker never ran leaves the window as it was before that append's plan.
         window = getattr(request, "_minicpmo45_window_snapshot", None) or {
             "units": getattr(request, "_minicpmo45_window_units", ()),
