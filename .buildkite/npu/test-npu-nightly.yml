@@ -236,7 +236,7 @@ steps:
             -m "full_model and diffusion and npu and A3 and cards_1"
             --run-level full_model
             --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
-      - label: ":full_moon: HunyuanImage3 Distil Performance (4 NPU)"
+      - label: ":full_moon: HunyuanImage3 Distil INT8 DiT SP4 Performance (4 NPU)"
         key: nightly-hunyuan-image3-perf-npu
         source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
@@ -250,7 +250,6 @@ steps:
           - tests/dfx/perf/results/*.json
           - tests/dfx/perf/results/logs/*.log
         commands:
-          - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_it2i.json -m "full_model and diffusion and npu and A3 and cards_4" --run-level full_model
           - pytest -sv tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json -m "full_model and diffusion and npu and A3 and cards_4" --run-level full_model
 
       - label: ":full_moon: HunyuanImage3 Accuracy (4 NPU)"
