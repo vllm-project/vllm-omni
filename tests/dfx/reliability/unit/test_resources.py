@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from tests.dfx.reliability import helpers
 from tests.dfx.reliability.unit._loader import RELIABILITY_ROOT, exec_ast_nodes
@@ -762,6 +763,116 @@ def test_linux_fd_check_includes_pids_excluded_from_alive_list(tmp_path, monkeyp
     assert helpers._linux_fd_counts([42, 999]) == {42: 1}
     fd.unlink()
     assert helpers._linux_fd_counts([42, 999]) == {}
+
+
+@pytest.mark.parametrize("state", ["zombie", "zombie_with_threads", "gone", "running", "denied"])
+def test_linux_fd_permission_error_requires_confirmed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, state: str
+) -> None:
+    monkeypatch.setattr(helpers.sys, "platform", "linux")
+    monkeypatch.setattr(helpers, "_LINUX_PROC_ROOT", tmp_path)
+    original_iterdir = Path.iterdir
+
+    def denied_fd_table(path):
+        if path == tmp_path / "42" / "fd":
+            raise PermissionError("FD table denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_fd_table)
+    process = mocker.Mock()
+    process.num_threads.return_value = 2 if state == "zombie_with_threads" else 1
+    lookup = mocker.patch.object(helpers.psutil, "Process", return_value=process)
+    if state == "gone":
+        lookup.side_effect = helpers.psutil.NoSuchProcess(42)
+    elif state == "denied":
+        process.status.side_effect = helpers.psutil.AccessDenied(42)
+    else:
+        process.status.return_value = "zombie" if state == "zombie_with_threads" else state
+
+    if state in {"zombie", "gone"}:
+        assert helpers._linux_fd_counts([42]) == {}
+    else:
+        error = helpers.psutil.AccessDenied if state == "denied" else PermissionError
+        with pytest.raises(error):
+            helpers._linux_fd_counts([42])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux zombie process state")
+def test_linux_fd_check_accepts_a_real_unreaped_child() -> None:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while helpers.psutil.Process(child.pid).status() != helpers.psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "Child did not exit"
+            time.sleep(0.01)
+        assert helpers._linux_fd_counts([child.pid]) == {}
+    finally:
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_cleanup_checks_zombie_threads_with_readable_empty_fd_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, num_threads: int
+) -> None:
+    monkeypatch.setattr(helpers.sys, "platform", "linux")
+    monkeypatch.setattr(helpers, "_LINUX_PROC_ROOT", tmp_path)
+    (tmp_path / "42" / "fd").mkdir(parents=True)
+    process = mocker.Mock()
+    process.status.return_value = helpers.psutil.STATUS_ZOMBIE
+    process.num_threads.return_value = num_threads
+    mocker.patch.object(helpers.psutil, "pid_exists", return_value=True)
+    mocker.patch.object(helpers.psutil, "Process", return_value=process)
+    server = mocker.Mock(reliability_fault_snapshot={"tree_pids": [42], "shm_objects": []})
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+
+    if num_threads > 1:
+        with pytest.raises(AssertionError, match="residual server-tree processes remain alive"):
+            helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="zombie", timeout_sec=1)
+    else:
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="zombie", timeout_sec=1)
+
+
+@pytest.mark.parametrize("residual", [None, "fd", "shm"])
+def test_cleanup_retries_transient_fd_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, residual: str | None
+) -> None:
+    owned = tmp_path / "owned"
+    owned.touch()
+    identity = owned.stat()
+    objects = [(str(owned), identity.st_dev, identity.st_ino)] if residual == "shm" else []
+    server = mocker.Mock(reliability_fault_snapshot={"tree_pids": [42], "shm_objects": objects})
+    ticks = iter([0.0, 0.0, 0.5, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "list_alive_pids", lambda _: [])
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+    counts = {42: 1} if residual == "fd" else {}
+    read_fds = mocker.Mock(side_effect=[PermissionError("exiting process"), counts])
+    monkeypatch.setattr(helpers, "_linux_fd_counts", read_fds)
+
+    if residual is None:
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="exit-race", timeout_sec=1)
+    else:
+        message = "file descriptors remain open" if residual == "fd" else "named shared memory/semaphores remain"
+        with pytest.raises(AssertionError, match=message):
+            helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="exit-race", timeout_sec=1)
+    assert read_fds.call_count == 2
+
+
+def test_cleanup_does_not_accept_unreadable_fd_tables(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
+    server = mocker.Mock(reliability_fault_snapshot={"tree_pids": [42]})
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "list_alive_pids", lambda _: [])
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+    monkeypatch.setattr(helpers, "_linux_fd_counts", mocker.Mock(side_effect=PermissionError("still unreadable")))
+
+    with pytest.raises(PermissionError, match="still unreadable"):
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="denied", timeout_sec=1)
 
 
 @pytest.mark.parametrize("resource", ["fd", "shm"])

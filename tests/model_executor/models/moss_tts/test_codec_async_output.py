@@ -214,7 +214,6 @@ def test_replays_terminal_tails_and_slot_reuse_preserve_pending_waveforms(v2, ch
             assert sum(slab.is_cuda for _, slab in payload._groups) == 1
             result = OmniModelRunnerOutput(
                 req_ids=["tail", "empty", "live"],
-                req_id_to_index={"tail": 0, "empty": 1, "live": 2},
                 sampled_token_ids=[[], [], []],
             )
             pending.append(

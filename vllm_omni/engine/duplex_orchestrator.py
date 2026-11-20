@@ -55,6 +55,8 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _build_terminal_empty_output,
     build_engine_core_request_from_tokens,
+    stamp_downstream_stage_submit,
+    stamp_stage_submit,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.outputs import OmniRequestOutput
@@ -173,6 +175,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise StageUnavailableError(f"stage {stage_id}: pinned duplex replica {replica_id} is unavailable")
         return replica_id
 
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        return super()._prewarm_downstream_resumable(stage_id, entry_request, req_state) or (
+            req_state.session_owned
+            and stage_id in self.plugin.resumable_downstream_stage_ids(stage_count=len(self.stage_pools))
+        )
+
     async def _retire_replica(self, stage_id: int, replica_id: int, reason: str) -> None:
         """Mark a replica unavailable, stop dispatch to it, and fail its sessions.
 
@@ -234,7 +244,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # raced the submit); the cancel path aborts the stale request id.
             logger.debug("[DuplexOrchestrator] stale stage binding ignored for %s stage-%s", request_id, stage_id)
             return
-        req_state.stage_submit_ts[stage_id] = _time.time()
+        stamp_stage_submit(req_state, stage_id, refresh=False)
         if req_state.request_timestamp <= 0.0:
             req_state.request_timestamp = req_state.stage_submit_ts[stage_id]
         self._register_running_request(req_state)
@@ -804,6 +814,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             pool = self.stage_pools[context.stage_id]
             if mark_submitting is not None:
                 mark_submitting()
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=False,
+            )
             try:
                 if submission.already_submitted:
                     if not submission.resumable:
@@ -821,6 +838,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 if pinned_replica_id is not None:
                     await self._handle_dead_replica(context.stage_id, pinned_replica_id, exc)
                 raise
+            stamp_downstream_stage_submit(
+                request_state,
+                context.stage_id,
+                pool,
+                already_submitted=submission.already_submitted,
+                after_submit=True,
+            )
 
         # The current-stage send has completed. Downstream prewarm
         # must not hold up another session's use of this stage's sender cache.
@@ -835,7 +859,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 )
         request_state.stage_fences[context.stage_id] = context.fence
         now = _time.time()
-        request_state.stage_submit_ts[context.stage_id] = now
         request_state.request_timestamp = now
         self._register_running_request(request_state)
         return DuplexStageSubmissionResult(

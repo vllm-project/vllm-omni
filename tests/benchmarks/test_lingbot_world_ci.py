@@ -26,6 +26,37 @@ ROOT = Path(__file__).resolve().parents[2]
 # AMD coverage lives in test_amd_cpu_timing.py with main's shared CPU runner.
 
 
+@pytest.mark.parametrize(
+    "platform,vllm_version,torch_version,error",
+    [
+        pytest.param("cuda", "0.34.0", "2.14.0+cu130", None, id="cuda-final034"),
+        pytest.param("cuda", "0.34.0+cu130", "2.14.0", None, id="cuda-local034"),
+        pytest.param("cuda", "0.33.0", "2.14.0", "vLLM", id="cuda-legacy033-rejected"),
+        pytest.param("cuda", "0.34.0rc1", "2.14.0", "vLLM", id="cuda-rc-rejected"),
+        pytest.param("cuda", "0.34.0.dev1", "2.14.0", "vLLM", id="cuda-dev-rejected"),
+        pytest.param("cuda", "0.35.0", "2.14.0", "vLLM", id="cuda-future-rejected"),
+        pytest.param("cuda", "0.34.0", "2.13.0", "Torch", id="cuda-wrong-torch"),
+        pytest.param("npu", "0.33.0", "2.14.0", None, id="npu-legacy033"),
+        pytest.param("npu", "0.34.0", "2.14.0", "vLLM", id="npu-final034-rejected"),
+        pytest.param("npu", "0.33.0rc1", "2.14.0", "vLLM", id="npu-rc033-rejected"),
+        pytest.param("npu", "0.33.0.dev1", "2.14.0", "vLLM", id="npu-dev033-rejected"),
+        pytest.param("rocm", "0.33.0", "2.14.0", "Unsupported platform", id="unsupported-platform"),
+    ],
+)
+def test_capture_runtime_matches_platform_release(monkeypatch, platform, vllm_version, torch_version, error):
+    from tests.e2e.accuracy.lingbot_world import prepare
+
+    versions = {"vllm": vllm_version, "torch": torch_version}
+    if platform == "npu":
+        versions.update({"torch-npu": torch_version, "vllm-ascend": vllm_version})
+    monkeypatch.setattr(prepare.importlib.metadata, "version", versions.__getitem__)
+    if error is not None:
+        with pytest.raises(RegressionError, match=error):
+            prepare.verify_inference_runtime(platform)
+    else:
+        assert prepare.verify_inference_runtime(platform) == {"packages": versions}
+
+
 class _DeviceProperties(NamedTuple):
     uuid: str
 
