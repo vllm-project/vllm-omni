@@ -10,6 +10,7 @@ import dataclasses
 import os
 import socket
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import connection
@@ -177,9 +178,13 @@ class OmniMasterServer:
         coordinator_router_address: str | None = None,
         on_register: OnRegisterCallback | None = None,
         head_local_replicas: dict[int, list[int]] | None = None,
+        deployment_id: str | None = None,
     ) -> None:
         self._address = master_address
         self._port = master_port
+        # One id per head. Headless processes learn it from registration
+        # instead of hashing their own spelling of this address.
+        self.deployment_id = deployment_id or uuid.uuid4().hex
         self._stage_routes: dict[StageRoute, StageAllocation] = {}
         self._stage_configs: dict[StageRoute, Any] = {}
         self._stage_coordinator_addresses: dict[StageRoute, StageCoordinatorAddresses] = {}
@@ -566,6 +571,10 @@ class OmniMasterServer:
             logger.warning("[OmniMasterServer] Failed to decode registration message: %s", exc)
             return None
 
+        if msg.get("query") == "deployment_id":
+            reg_socket.send_multipart([identity, msgspec.msgpack.encode({"deployment_id": self.deployment_id})])
+            return None
+
         stage_id_raw = msg.get("stage_id")
         if not isinstance(stage_id_raw, int) or stage_id_raw < 0:
             logger.warning(
@@ -660,6 +669,7 @@ class OmniMasterServer:
                 "output_address": alloc.output_bind_address,
                 "replica_id": replica_id,
                 "coordinator_router_address": self._coordinator_router_address,
+                "deployment_id": self.deployment_id,
             }
         )
         # ROUTER-DEALER: reply is [identity, payload] (no empty delimiter).
@@ -683,6 +693,7 @@ class StageRegistrationResponse:
     output_address: str
     replica_id: int
     coordinator_router_address: str | None
+    deployment_id: str = ""
 
 
 def _detect_local_bind_address(master_address: str, master_port: int) -> str:
@@ -777,6 +788,7 @@ def register_stage_with_omni_master(
             output_address: str = response_msg["output_address"]
             assigned_replica_id: int = int(response_msg.get("replica_id", wire_replica_id))
             coord_router_addr: str | None = response_msg.get("coordinator_router_address")
+            deployment_id: str = str(response_msg.get("deployment_id") or "")
             logger.info(
                 "Stage %d replica %d registered; handshake_address=%s",
                 omni_stage_id,
@@ -794,7 +806,38 @@ def register_stage_with_omni_master(
         output_address=output_address,
         replica_id=assigned_replica_id,
         coordinator_router_address=coord_router_addr,
+        deployment_id=deployment_id,
     )
+
+
+def fetch_deployment_id(*, omni_master_address: str, omni_master_port: int) -> str:
+    """Read the head's deployment id before this process builds connectors.
+
+    Head and ``--headless`` can name the same master differently (``127.0.0.1``
+    versus a hostname). Hashing those strings would put their shared-memory
+    markers in different directories. The head generates one id and serves it
+    on the registration socket.
+    """
+    reg_ctx = zmq.Context()
+    try:
+        reg_sock: zmq.Socket = reg_ctx.socket(zmq.DEALER)  # type: ignore[attr-defined]
+        try:
+            reg_sock.connect(f"tcp://{omni_master_address}:{omni_master_port}")
+            reg_sock.send(msgspec.msgpack.encode({"query": "deployment_id"}))
+            if not reg_sock.poll(timeout=_DEFAULT_STARTUP_TIMEOUT_S * 1_000):
+                raise RuntimeError(
+                    f"Timed out waiting for deployment id from OmniMasterServer "
+                    f"({omni_master_address}:{omni_master_port})."
+                )
+            response = msgspec.msgpack.decode(reg_sock.recv())
+            deployment_id = response.get("deployment_id") if isinstance(response, dict) else None
+            if not isinstance(deployment_id, str) or not deployment_id:
+                raise RuntimeError("OmniMasterServer registration reply did not include a deployment id")
+            return deployment_id
+        finally:
+            reg_sock.close(linger=0)
+    finally:
+        reg_ctx.term()
 
 
 @contextlib.contextmanager
@@ -1552,7 +1595,10 @@ def launch_headless_diffusion_replicas(
     omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(
         model,
         config_path,
-        deployment_scope=f"{omni_master_address}:{omni_master_port}",
+        deployment_scope=fetch_deployment_id(
+            omni_master_address=omni_master_address,
+            omni_master_port=omni_master_port,
+        ),
     )
     omni_conn_cfg, omni_from, omni_to = initialization.resolve_omni_kv_config_for_stage(
         omni_transfer_config,

@@ -10,6 +10,7 @@ import contextlib
 import copy
 import os
 import threading
+import uuid as _uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
@@ -732,12 +733,10 @@ class StageRuntime:
             self._stage_configs, local_replica_counts=self._get_local_replica_counts()
         )
         prepare_engine_environment()
-        address = getattr(self, "_omni_master_address", None)
-        port = getattr(self, "_omni_master_port", None)
-        # Head and every --headless process of this deployment pass the same
-        # master endpoint. Local single-process launch has no master and keeps
-        # one UUID for the stages this call creates.
-        deployment_scope = f"{address}:{port}" if address and port else None
+        # DistStageRuntime sets one id before this call and the master echoes
+        # it to --headless. A local launch has neither and keeps one UUID for
+        # the stages this call creates.
+        deployment_scope = getattr(self, "_deployment_id", None) or None
         omni_transfer_config = load_omni_transfer_config_for_model(
             self._model,
             self._config_path,
@@ -1612,6 +1611,8 @@ class DistStageRuntime(StageRuntime):
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
+        if not getattr(self, "_deployment_id", None):
+            self._deployment_id = _uuid.uuid4().hex
         stage_plans = super()._prepare_stage_plans()
         if all(replica.launch_mode == "remote" for plan in stage_plans for replica in plan.replicas):
             logger.info("All stage replicas are remote; running only the frontend (API server + orchestrator)")
@@ -1781,6 +1782,8 @@ class DistStageRuntime(StageRuntime):
             heartbeat_timeout=self._omni_heartbeat_timeout,
         )
 
+        if not getattr(self, "_deployment_id", None):
+            self._deployment_id = _uuid.uuid4().hex
         self._omni_master_server = OmniMasterServer(
             master_address=self._omni_master_address,
             master_port=self._omni_master_port,
@@ -1789,6 +1792,7 @@ class DistStageRuntime(StageRuntime):
             coordinator_router_address=self._coordinator_runtime.router_address,
             on_register=self._dispatch_master_register,
             head_local_replicas=head_local_replicas,
+            deployment_id=self._deployment_id,
         )
         self._omni_master_server.start()
         logger.info("[DistStageRuntime] OmniMasterServer started for stages %s", all_stage_ids)

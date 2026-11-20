@@ -442,11 +442,10 @@ def load_omni_transfer_config(
             f"{missing_str}. Define connectors or allow auto SHM creation for these edges."
         )
 
-    # One scope per deployment. A single launcher serializes it to its workers.
-    # Head and --headless each load this config, so a fresh UUID would put
-    # their markers in different directories and reject a real shared-/dev/shm
-    # transfer. Those processes already share the master address and port;
-    # the caller passes that in. An explicit extra still wins.
+    # One scope per deployment. Head generates it and registration hands the
+    # same value to --headless; hashing each side's master address would
+    # split 127.0.0.1 from a hostname for the same endpoint. An explicit
+    # extra still wins. A caller with no scope keeps one UUID for this load.
     wakeup_scope = deployment_scope or uuid.uuid4().hex
     for spec in connectors.values():
         if spec.name == "SharedMemoryConnector":

@@ -1655,10 +1655,15 @@ def run_headless(args: TrackingNamespace) -> None:
         )
         return
 
+    from vllm_omni.engine.stage_engine_startup import fetch_deployment_id
+
     omni_transfer_config = load_omni_transfer_config_for_model(
         model,
         config_path,
-        deployment_scope=f"{omni_master_address}:{omni_master_port}",
+        deployment_scope=fetch_deployment_id(
+            omni_master_address=omni_master_address,
+            omni_master_port=omni_master_port,
+        ),
     )
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
     stage_connector_spec = get_stage_connector_spec(

@@ -1272,11 +1272,38 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             started = self._recv_wait_since().get(req_id)
         if started is None or time.monotonic() - started < timeout_s:
             return False
+        # The previous poll may have returned before this deadline and left a
+        # read claim on this thread. Drop it here; the post-get path only
+        # abandons when the get itself observes the deadline.
+        self._abandon_recv_claim(req_id)
         self._record_permanent_recv_failure(
             req_id,
             f"timed out waiting for connector input after {timeout_s:g}s",
         )
         return True
+
+    def _abandon_recv_claim(self, req_id: str) -> None:
+        """Drop this thread's unresolved read claim for one request."""
+        connector = getattr(self, "_omni_connector", None)
+        abandon = getattr(connector, "abandon_get", None)
+        if not callable(abandon):
+            return
+        request = self._pending_load_reqs.get(req_id)
+        external_req_id = self._request_ids_mapping.get(req_id, req_id)
+        chunk_id = self._get_req_chunk[req_id]
+        _from_stage, _to_stage, connector_get_key, _metadata = self._stage_payload_recv_spec(
+            external_req_id,
+            str(self._stage_id - 1),
+            str(self._stage_id),
+            chunk_id,
+            getattr(request, "payload_sender_info", None),
+        )
+        if not connector_get_key:
+            return
+        try:
+            abandon(connector_get_key)
+        except Exception:
+            logger.debug("abandon_get failed for %s", connector_get_key, exc_info=True)
 
     def _record_permanent_recv_failure(self, req_id: str, reason: str) -> None:
         with self._lock:
@@ -1448,10 +1475,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if result is None and deadline is not None and time.monotonic() >= deadline and connector_get_key:
                 # The read stopped at the request deadline. Drop its claim so a
                 # later poll cannot publish the buffer after the request fails.
-                try:
-                    connector.abandon_get(connector_get_key)
-                except Exception:
-                    logger.debug("abandon_get failed for %s", connector_get_key, exc_info=True)
+                self._abandon_recv_claim(req_id)
 
         if result is None:
             return False

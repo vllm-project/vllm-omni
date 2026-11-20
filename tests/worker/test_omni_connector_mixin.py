@@ -2194,6 +2194,44 @@ def test_recv_deadline_fails_request_and_stops_polling(monkeypatch):
         host.shutdown_omni_connectors()
 
 
+def test_expired_poll_abandons_claim_left_by_an_early_empty_get(monkeypatch):
+    """A lost handshake returns before the deadline and leaves the claim for the next poll."""
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    abandoned: list[str] = []
+
+    class _EarlyNone:
+        def get(self, *args, **kwargs):
+            raise AssertionError("full-payload poll used get() without a deadline")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            return None
+
+        def abandon_get(self, key):
+            abandoned.append(key)
+
+    host._omni_connector = _EarlyNone()
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-claim")
+    try:
+        host.register_chunk_recv(request)
+        host._poll_pending_requests_once(["req-claim"])
+        assert abandoned == []
+        assert "req-claim" in host._pending_load_reqs
+        time.sleep(0.06)
+        host._poll_pending_requests_once(["req-claim"])
+        assert abandoned == ["req-claim_0_0"]
+        assert "req-claim" not in host._pending_load_reqs
+    finally:
+        host.shutdown_omni_connectors()
+
+
 def test_permanent_recv_error_fails_on_first_get():
     from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
 
