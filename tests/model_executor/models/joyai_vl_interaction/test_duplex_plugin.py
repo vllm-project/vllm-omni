@@ -813,6 +813,7 @@ def test_asr_profile_and_sampling_keep_joyai_ownership():
     normal = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr.yaml"))
     duplex = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr_duplex.yaml"))
     assert normal.stages == duplex.stages and duplex.session_mode == "duplex"
+    assert normal.async_chunk is False and duplex.async_chunk is True
 
 
 def test_speech_buffer_rolls_back_audio_but_keeps_newest_frame():
