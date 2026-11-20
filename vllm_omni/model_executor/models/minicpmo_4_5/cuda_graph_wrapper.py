@@ -738,29 +738,33 @@ def _resized_frame_view(cache: torch.Tensor, frames: int) -> torch.Tensor | None
     return cache.as_strided((*cache.shape[:-2], frames, width), cache.stride())
 
 
-def _copy_frame_segments(
-    dst: torch.Tensor, src: torch.Tensor, segments: list[tuple[int, int]], *, max_copy_bytes: int | None = None
-) -> None:
-    """Write attention history in frame order; limit temporary copy size on the secondary NPU."""
+def _copy_attention_cache(target: torch.Tensor, source: torch.Tensor, *, max_copy_bytes: int | None = None) -> None:
+    """Copy an attention view, splitting the solver-step axis on the secondary NPU."""
     if max_copy_bytes is None:
         tight_npu = (
-            dst.device.type == "npu"
+            target.device.type == "npu"
             and os.getenv("MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY") == "1"
             and os.getenv("VLLM_OMNI_REPLICA_ID") == "1"
         )
         max_copy_bytes = 64 * 2**20 if tight_npu else 0
+    if not max_copy_bytes or source.numel() * source.element_size() <= max_copy_bytes or source.shape[0] <= 1:
+        target.copy_(source)
+        return
+    bytes_per_step = source[0].numel() * source.element_size()
+    step_count = max(1, max_copy_bytes // max(1, bytes_per_step))
+    for step in range(0, int(source.shape[0]), step_count):
+        target[step : step + step_count].copy_(source[step : step + step_count])
+
+
+def _copy_frame_segments(
+    dst: torch.Tensor, src: torch.Tensor, segments: list[tuple[int, int]], *, max_copy_bytes: int | None = None
+) -> None:
+    """Write attention history in frame order."""
     position = 0
     for start, length in segments:
         target = dst[..., position : position + length, :]
         source = src[..., start : start + length, :]
-        if max_copy_bytes and source.numel() * source.element_size() > max_copy_bytes and source.shape[0] > 1:
-            # The first dimension is the CFM step. Split the D2D copy without changing the solver.
-            bytes_per_step = source[0].numel() * source.element_size()
-            slab = max(1, max_copy_bytes // max(1, bytes_per_step))
-            for row in range(0, int(source.shape[0]), slab):
-                target[row : row + slab].copy_(source[row : row + slab])
-        else:
-            target.copy_(source)
+        _copy_attention_cache(target, source, max_copy_bytes=max_copy_bytes)
         position += length
 
 
@@ -1652,13 +1656,16 @@ class WholeEulerCFMGraphWrapper:
         static_att_rows = statics.att_cache.unflatten(3, (2, graph_batch))[..., :offset, :]
         if att_rows is None:
             assert att_cache is not None
-            static_att_rows[:, :, :, :, :rows].copy_(att_cache.unflatten(3, (2, batch_size))[:, :, :, :, start:stop])
+            _copy_attention_cache(
+                static_att_rows[:, :, :, :, :rows],
+                att_cache.unflatten(3, (2, batch_size))[:, :, :, :, start:stop],
+            )
         else:
             for row, source in enumerate(_materialize_att_rows(att_rows[start:stop])):
                 # A mixed-reference batch right-pads shorter histories. Their
                 # remaining arena columns are excluded by the per-row mask.
                 row_offset = int(source.shape[5])
-                static_att_rows[:, :, :, :, row, :, :row_offset].copy_(source)
+                _copy_attention_cache(static_att_rows[:, :, :, :, row, :, :row_offset], source)
 
     def _group_fills(self, groups: list[tuple[int, int]], after=None, **inputs) -> list[Callable]:
         """Per replay group, a ``fill(statics)`` that copies the group's requests in, then runs ``after``."""

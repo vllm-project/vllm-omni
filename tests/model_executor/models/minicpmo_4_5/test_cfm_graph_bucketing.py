@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _cfm_pad_frames,
@@ -23,11 +24,33 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     _att_keep_ranges,
     _build_capture_mask,
     _capture_query_width,
+    _copy_attention_cache,
     _whole_euler_att_segments,
     _zero_padded_cnn_cache,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_secondary_cfm_attention_copy_splits_strided_history_by_solver_step():
+    source = torch.arange(5 * 2 * 8 * 4, dtype=torch.float32).reshape(5, 2, 8, 4)[:, :, ::2, :]
+    arena = torch.full((5, 2, 7, 4), -1.0)
+    target = arena[:, :, 1:5, :]
+    step_bytes = source[0].numel() * source.element_size()
+    copied_steps = []
+
+    class RecordCopies(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.copy_.default:
+                copied_steps.append(args[1].shape[0])
+            return func(*args, **(kwargs or {}))
+
+    with RecordCopies():
+        _copy_attention_cache(target, source, max_copy_bytes=2 * step_bytes)
+
+    assert copied_steps == [2, 2, 1]
+    assert torch.equal(target, source)
+    assert torch.all(arena[:, :, :1] == -1) and torch.all(arena[:, :, 5:] == -1)
 
 
 def test_pads_partial_chunk_up_to_bucket():

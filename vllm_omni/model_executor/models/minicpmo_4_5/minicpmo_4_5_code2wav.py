@@ -625,8 +625,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             result["token2wav_setup_host_cache_size"] = 64
             if os.getenv("MINICPMO_C8_SECONDARY_VOCODER_TIGHT_MEMORY") == "1":
                 result["token2wav_setup_cache_size"] = 2
-                result["micro_batch_size"] = 2
-                logger.info("[c8-vocoder-tight] setup_device=2 setup_host=64 cfm_micro_batch=2")
+                result["micro_batch_size"] = int(result.get("secondary_vocoder_micro_batch_size", 2))
+                logger.info(
+                    "[c8-vocoder-tight] setup_device=2 setup_host=64 cfm_micro_batch=%d",
+                    result["micro_batch_size"],
+                )
         return result
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
