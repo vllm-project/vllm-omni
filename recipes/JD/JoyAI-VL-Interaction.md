@@ -443,6 +443,34 @@ Silence actions still skip both TTS stages and return an empty audio output with
 samples. Playback acknowledgements, `response.cancel`, `session.close` and reconnect use
 the shared Session lifecycle.
 
+#### CUDA performance options
+
+On CUDA the duplex profile also enables five existing Qwen3-TTS options under
+`platforms.cuda.connectors`: the fused residual-codebook predictor
+(`code_predictor_kv_cache`, `code_predictor_fused_sampling`, `code_predictor_fused`)
+and the Code2Wav convolution options (`decode_cudnn_benchmark`,
+`decode_time_major_conv`). They lower the Talker and Code2Wav time per codec frame.
+See [the Qwen3-TTS options](../../docs/design/qwen3_omni_tts_performance_optimization.md#experimental-qwen3-tts-single-gpu-throughput-profile)
+for what each does.
+
+Measured on 1x H100 SXM (vLLM 0.34.0), with a text question and 8 camera frames
+per turn: server-side busy RTF fell by about a quarter at 1, 4 and 8 sessions. Time to
+first audio did not change measurably at 1 and 4 sessions, and at 8 sessions it rose by
+about 30 ms on average (about 4%). To restore the previous behavior, set the five
+options to `false` under `platforms.cuda` in an overlay.
+
+[NVIDIA MPS](../../docs/configuration/stage_configs.md#experimental-mps-deployment)
+is not enabled by default. On the same setup, adding
+`cuda_mps: true` on top of these options brought time to first audio at 8 sessions
+below the baseline, but its effect at 4 sessions varied between runs.
+Compare both settings on your own load before enabling it, for example with this
+overlay saved beside the bundled deployment files:
+
+```yaml
+base_config: joyai_vl_interaction_duplex.yaml
+cuda_mps: true
+```
+
 ### Audio input: opt-in native ASR profile
 
 A second deploy profile takes spoken input natively, without the external ASR bridge, and
