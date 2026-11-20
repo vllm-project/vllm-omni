@@ -1,6 +1,6 @@
 # Image-To-Image
 
-This example edits an input image with `Qwen/Qwen-Image-Edit` and `JoyAI-Image-Edit` using the `image_edit.py` CLI.
+This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_edit.py` CLI.
 
 ## Local CLI Usage
 
@@ -23,27 +23,6 @@ python image_edit.py \
   --cfg-scale 4.0
 ```
 
-### JoyAI-Image-Edit
-
-JoyAI-Image-Edit uses the same `image_edit.py` CLI and supports one input
-image per request. Requested dimensions are snapped to the nearest supported Joy
-bucket; for square outputs, use 1024x1024.
-
-```bash
-python image_edit.py \
-  --model jdopensource/JoyAI-Image-Edit-Diffusers \
-  --image input.png \
-  --prompt "Change the background to a clean studio while preserving the subject." \
-  --height 1024 \
-  --width 1024 \
-  --num-inference-steps 50 \
-  --guidance-scale 4.0 \
-  --output output_joyai_edit.png
-```
-
-JoyAI defaults to guidance scale `4.0`; pass `--guidance-scale` explicitly when
-you need a different value.
-
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
 
 For multiple image inputs, use `Qwen/Qwen-Image-Edit-2509` or  `Qwen/Qwen-Image-Edit-2511`:
@@ -61,7 +40,7 @@ python image_edit.py \
 
 Key arguments:
 
-- `--model`: model name or path. Use `Qwen/Qwen-Image-Edit-2509` or later for multiple image support. `jdopensource/JoyAI-Image-Edit-Diffusers` supports one input image.
+- `--model`: model name or path. Use `Qwen/Qwen-Image-Edit-2509` or later for multiple image support.
 - `--image`: path(s) to the source image(s) (PNG/JPG, converted to RGB). Can specify multiple images.
 - `--prompt` / `--negative-prompt`: text description (string).
 - `--cfg-scale`: true classifier-free guidance scale (default: 4.0). Classifier-free guidance is enabled by setting cfg_scale > 1 and providing a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, usually at the expense of lower image quality.
@@ -70,7 +49,7 @@ Key arguments:
 - `--output`: path to save the generated PNG.
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
-- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism/cfg_parallel.md).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--strength`: **Z-Image only** - controls the denoising start timestep for I2I (default: 0.6). Range: [0.0, 1.0]. Lower values preserve more of the original image; higher values allow more creative changes.
 

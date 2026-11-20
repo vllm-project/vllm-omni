@@ -25,6 +25,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pytest
@@ -32,8 +33,11 @@ import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
-from tests.e2e.accuracy.helpers import reset_artifact_dir
+from tests.e2e.accuracy.helpers import reset_artifact_dir, write_accuracy_result
 from tests.helpers.mark import hardware_test
+
+if TYPE_CHECKING:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 LTX25_OFFICIAL_REVISION = "7954dcb0d986bdc36ef272564a9789ade07fcc65"
@@ -149,6 +153,64 @@ def test_ltx_reference_runner_unwraps_audio_only_output() -> None:
 
     assert actual_audio is audio
     assert sample_rate == 48_000
+
+
+def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedTextRotaryEmbedding,
+    )
+
+    from .run_ltx25_reference import _configure_official_gemma4_rope_compatibility
+
+    @dataclass(frozen=True)
+    class LayerConfig:
+        head_dim: int
+
+    class Config:
+        is_heterogeneous = True
+        per_layer_config = {
+            "sliding_attention": LayerConfig(head_dim=256),
+            "full_attention": LayerConfig(head_dim=512),
+        }
+
+        @property
+        def head_dim(self) -> int:
+            raise AssertionError("heterogeneous global head_dim must not be read")
+
+    observed: list[tuple[object, torch.device | None, str | None, dict[str, object]]] = []
+
+    def original_compute_default_rope_parameters(
+        config: object,
+        device: torch.device | None = None,
+        layer_type: str | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, float]:
+        observed.append((config, device, layer_type, kwargs))
+        return torch.empty(0), 1.0
+
+    monkeypatch.setattr(
+        Gemma4UnifiedTextRotaryEmbedding,
+        "compute_default_rope_parameters",
+        staticmethod(original_compute_default_rope_parameters),
+    )
+
+    config = Config()
+    _configure_official_gemma4_rope_compatibility()
+    installed = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
+    device = torch.device("cpu")
+    inv_freq, attention_scaling = installed(
+        cast("Gemma4UnifiedTextConfig", config),
+        device=device,
+        layer_type="sliding_attention",
+        sentinel=True,
+    )
+
+    assert inv_freq.numel() == 0
+    assert attention_scaling == 1.0
+    assert observed == [(config.per_layer_config["sliding_attention"], device, "sliding_attention", {"sentinel": True})]
+
+    _configure_official_gemma4_rope_compatibility()
+    assert Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters is installed
 
 
 def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
@@ -444,10 +506,12 @@ def _ltx25_t2a_request() -> dict[str, object]:
 
 def test_ltx25_t2a_request_is_audio_only() -> None:
     request = _ltx25_t2a_request()
+    num_frames = request["num_frames"]
+    assert isinstance(num_frames, int)
 
     assert not any(key.startswith("video_") for key in request)
     assert "audio_modality_scale" not in request
-    assert (request["num_frames"] - 1) % 8 == 0
+    assert (num_frames - 1) % 8 == 0
     assert request["sigmas"] == _ltx25_full_request()["sigmas"]
 
 
@@ -530,6 +594,46 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
 def _assert_strict_audio_similarity(audio_metrics: dict[str, float | bool]) -> None:
     assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
     assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity
+
+
+def _write_ltx25_accuracy_result(
+    *,
+    model_id: str,
+    video_metrics: dict[str, float] | None,
+    audio_metrics: dict[str, float | bool],
+    metrics_json: Path,
+    extra: dict[str, object] | None = None,
+) -> None:
+    metrics: dict[str, object] = {
+        "audio_relative_l2": audio_metrics["relative_l2"],
+        "audio_cosine_similarity": audio_metrics["cosine_similarity"],
+    }
+    baseline: dict[str, float] = {
+        "audio_relative_l2": STRICT_THRESHOLDS.audio_relative_l2,
+        "audio_cosine_similarity": STRICT_THRESHOLDS.audio_cosine_similarity,
+    }
+    if video_metrics is not None:
+        metrics.update(
+            {
+                "video_ssim_mean": video_metrics["ssim_mean"],
+                "video_ssim_min": video_metrics["ssim_min"],
+                "video_psnr_mean_db": video_metrics["psnr_mean_db"],
+            }
+        )
+        baseline.update(
+            {
+                "video_ssim_mean": STRICT_THRESHOLDS.video_ssim_mean,
+                "video_ssim_min": STRICT_THRESHOLDS.video_ssim_min,
+                "video_psnr_mean_db": STRICT_THRESHOLDS.video_psnr_mean_db,
+            }
+        )
+    write_accuracy_result(
+        model_id=model_id,
+        dataset="video_audio_similarity",
+        metrics=metrics,
+        baseline=baseline,
+        extra={"metrics_json": str(metrics_json), **(extra or {})},
+    )
 
 
 def _assert_strict_similarity(
@@ -660,6 +764,13 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id=f"ltx25_distilled_{task}",
+        video_metrics=video_metrics,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": task, "pipeline_mode": "distilled_two_stage"},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_similarity(video_metrics, audio_metrics)
@@ -815,6 +926,13 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id=f"ltx25_{pipeline_mode}_{task}",
+        video_metrics=video_metrics,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": task, "pipeline_mode": pipeline_mode},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_similarity(video_metrics, audio_metrics)
@@ -932,6 +1050,13 @@ def test_ltx25_t2a_matches_official(accuracy_artifact_root: Path) -> None:
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id="ltx25_t2a",
+        video_metrics=None,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": "t2a"},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_audio_similarity(audio_metrics)

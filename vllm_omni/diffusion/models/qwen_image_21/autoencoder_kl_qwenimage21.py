@@ -35,6 +35,7 @@ from diffusers.utils import logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 
 from vllm_omni.diffusion.layers.vae_rms_norm import kernels_allowed, rms_norm_fastpath
+from vllm_omni.diffusion.layers.vae_rms_norm_musa import rms_norm_fastpath_musa
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -259,6 +260,10 @@ class QwenImage21RMS_norm(nn.Module):
             # This VAE uses the same F.normalize + rounded scale/gamma/bias
             # contract as Wan. Reuse its exact reduction and fused epilogue.
             output = rms_norm_fastpath(self, x)
+            if output is not None:
+                return output
+        elif x.device.type == "musa":
+            output = rms_norm_fastpath_musa(self, x)
             if output is not None:
                 return output
         needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end ModelOpt FP8 quality accuracy for video-gen DiTs.
 
 Modeled on ``test_hunyuan_image3.py``'s ``test_quantized_dit_matches_bf16_accuracy``:
@@ -34,7 +34,8 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.e2e.accuracy.helpers import CLIPScorer, model_output_dir
+from tests.e2e.accuracy.helpers import CLIPScorer, model_output_dir, write_accuracy_result
+from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
@@ -208,6 +209,7 @@ def _generate_video(
             torch.accelerator.empty_cache()
 
 
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("case", _cases())
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.accelerator.device_count() < 1,
@@ -260,6 +262,13 @@ def test_quantized_videogen_dit_matches_bf16_clip(case: _QuantCase, accuracy_art
     }
     metrics_path = out_dir / f"{case.name}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+    write_accuracy_result(
+        model_id=case.name,
+        dataset="quant_clip",
+        metrics=metrics,
+        baseline={"clip_score": CLIP_ABSOLUTE_FLOOR, "clip_score_drop": case.clip_drop},
+        extra={"metrics_json": str(metrics_path)},
+    )
 
     print(f"\n[{case.name}] BF16 {bf16_time:.2f}s | FP8 {quant_time:.2f}s (x{speedup:.2f})")
     print(f"           CLIP BF16={bf16_clip:.2f}  FP8={quant_clip:.2f}  drop={clip_drop:.2f}")
