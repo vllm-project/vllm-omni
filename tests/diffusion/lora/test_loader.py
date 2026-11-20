@@ -448,6 +448,39 @@ class TestQwenImageLoraLoaderMixin:
         pipeline.unload_lora_weights("adapter0")
         assert_close(to_out.weight, original_weight)
 
+    def test_load_flattened_lora_unet_keys_with_alpha_next_to_dotted_keys(self, mocker: MockerFixture):
+        pipeline = DummyQwenImagePipeline(2, HEAD_DIM)
+        # Flattened legacy names use Qwen's `transformer_blocks` module naming.
+        pipeline.transformer = nn.Module()
+        pipeline.transformer.transformer_blocks = nn.ModuleList(
+            [DummyTransformerBlock(HEAD_DIM), DummyTransformerBlock(HEAD_DIM)]
+        )
+        flat_out = pipeline.transformer.transformer_blocks[0].attn.to_out
+        dotted_out = pipeline.transformer.transformer_blocks[1].attn.to_out
+        original_flat = flat_out.weight.detach().clone()
+        original_dotted = dotted_out.weight.detach().clone()
+        flat_base = "lora_unet_transformer_blocks_0_attn_to_out_0"
+        flat_a, flat_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        alpha = torch.tensor(6.0)
+        dotted_base = "transformer.transformer_blocks.1.attn.to_out.0"
+        dotted_a, dotted_b = torch.randn(RANK, HEAD_DIM), torch.randn(HEAD_DIM, RANK)
+        state_dict = {
+            f"{flat_base}.lora_A.weight": flat_a,
+            f"{flat_base}.lora_B.weight": flat_b,
+            f"{flat_base}.alpha": alpha,
+            f"{dotted_base}.lora_A.weight": dotted_a,
+            f"{dotted_base}.lora_B.weight": dotted_b,
+        }
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert_close(flat_out.weight, original_flat + (flat_b @ flat_a) * (alpha.item() / RANK))
+        assert_close(dotted_out.weight, original_dotted + dotted_b @ dotted_a)
+
 
 # ======================================================
 # Test WanLoraLoaderMixin

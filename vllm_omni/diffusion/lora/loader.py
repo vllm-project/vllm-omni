@@ -495,8 +495,26 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
 
             # The converter adds the transformer prefix itself.
             state_dict = converter({k.removeprefix("transformer."): v for k, v in state_dict.items()})
-        elif has_unprefixed_keys:
-            state_dict = {k if k.startswith("transformer.") else f"transformer.{k}": v for k, v in state_dict.items()}
+        else:
+            # Flattened legacy module names (`lora_unet_*`) keep the `.lora_A.weight`
+            # suffix of diffusers keys, so they are routed to the converter by name,
+            # separately from the dotted keys in the same state dict.
+            flattened = {k: v for k, v in state_dict.items() if k.startswith("lora_unet_")}
+            if flattened:
+                converter = get_converter_by_pipeline(self)
+                if converter is None:
+                    raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
+
+                converted = converter(flattened)
+                state_dict = {k: v for k, v in state_dict.items() if k not in flattened}
+                state_dict = {
+                    k if k.startswith("transformer.") else f"transformer.{k}": v for k, v in state_dict.items()
+                }
+                state_dict.update(converted)
+            elif has_unprefixed_keys:
+                state_dict = {
+                    k if k.startswith("transformer.") else f"transformer.{k}": v for k, v in state_dict.items()
+                }
 
         state_dict = _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
 
