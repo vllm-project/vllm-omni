@@ -19,7 +19,7 @@ import torch
 import zmq
 
 from ..utils.logging import get_connector_logger
-from .base import OmniConnectorBase
+from .base import OmniConnectorBase, PermanentTransferError
 
 logger = get_connector_logger(__name__)
 
@@ -382,9 +382,10 @@ class NixlConnector(OmniConnectorBase):
         source_metadata = None
         try:
             metadata = self._resolve_metadata(get_key, metadata)
-            if not isinstance(metadata, dict) or metadata.get("schema_version") != _SCHEMA_VERSION:
-                logger.error("NixlConnector get has invalid metadata for %s", get_key)
+            if metadata is None:
                 return None
+            if not isinstance(metadata, dict) or metadata.get("schema_version") != _SCHEMA_VERSION:
+                raise PermanentTransferError(f"NixlConnector get has invalid metadata for {get_key}")
 
             source_metadata = metadata
             deadline = getattr(self._req_local, "deadline", None)
@@ -458,6 +459,8 @@ class NixlConnector(OmniConnectorBase):
             self._metrics["bytes_transferred"] += size
             logger.debug("NixlConnector get %s->%s key=%s size=%d", from_stage, to_stage, get_key, size)
             return payload, size
+        except PermanentTransferError:
+            raise
         except Exception:
             if xfer_handles and self._transfers_may_be_active(xfer_handles):
                 self._defer_transfer(
@@ -652,14 +655,12 @@ class NixlConnector(OmniConnectorBase):
         if endpoint is None and self._sender_host and self._sender_zmq_port:
             endpoint = (str(self._sender_host), int(self._sender_zmq_port))
         if endpoint is None:
-            logger.error(
-                "NixlConnector get(%s) received no usable metadata and no producer handshake "
-                "endpoint is configured. Set sender_host/sender_zmq_port on the consumer, "
-                "pass source_host/source_port for the producer rank, or forward the metadata "
-                "returned by put().",
-                get_key,
+            raise PermanentTransferError(
+                f"NixlConnector get({get_key}) received no usable metadata and no producer "
+                "handshake endpoint is configured. Set sender_host/sender_zmq_port on the "
+                "consumer, pass source_host/source_port for the producer rank, or forward "
+                "the metadata returned by put()."
             )
-            return None
         if self._zmq_ctx is None:
             with self._state_lock:
                 if self._zmq_ctx is None:

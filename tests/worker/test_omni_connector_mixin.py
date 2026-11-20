@@ -2160,3 +2160,55 @@ def test_first_stage_output_drain_does_not_broadcast_to_non_reply_tp_rank():
                 assert host.get_omni_connector_output().kv_sent_req_ids == []
     finally:
         host.shutdown_omni_connectors()
+
+
+def test_recv_deadline_fails_request_and_stops_polling(monkeypatch):
+    from vllm_omni.core.sched import omni_scheduler_mixin as sched
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport as transport
+
+    monkeypatch.setattr(sched, "DEFAULT_INPUT_WAIT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(transport, "_INPUT_WAIT_TIMEOUT_MODULE", sched)
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    connector = MagicMock()
+    connector.get.return_value = None
+    host._omni_connector = connector
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-wait")
+    request.client_index = 6
+    try:
+        host.register_chunk_recv(request)
+        time.sleep(0.02)
+        host._poll_pending_requests_once(list(host._pending_load_reqs))
+        assert "req-wait" not in host._pending_load_reqs
+        client_index, reason = host.get_omni_connector_output().permanent_recv_failures["req-wait"]
+        assert client_index == 6
+        assert reason.startswith("Stage-1")
+        assert "timed out" in reason
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_permanent_recv_error_fails_on_first_get():
+    from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
+
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=2, async_chunk=False))
+    connector = MagicMock()
+    connector.get.side_effect = PermanentTransferError("NixlConnector get has invalid metadata for req-bad_1_0")
+    host._omni_connector = connector
+    host._stage_id = 2
+    host._async_chunk = False
+    request = _make_request("req-bad")
+    request.client_index = 4
+    try:
+        host.register_chunk_recv(request)
+        host._poll_pending_requests_once(list(host._pending_load_reqs))
+        assert connector.get.call_count == 1
+        assert "req-bad" not in host._pending_load_reqs
+        _, reason = host.get_omni_connector_output().permanent_recv_failures["req-bad"]
+        assert "Stage-2" in reason
+        assert "invalid metadata" in reason
+    finally:
+        host.shutdown_omni_connectors()

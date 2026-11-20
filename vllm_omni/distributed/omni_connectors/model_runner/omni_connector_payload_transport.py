@@ -19,6 +19,7 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
+from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -53,6 +54,7 @@ def _recv_poll_seconds() -> float:
 
 
 _RECV_POLL_S = _recv_poll_seconds()
+_INPUT_WAIT_TIMEOUT_MODULE: Any = None
 # Upper bound, in drain passes, on how long a missed request waits behind a burst.
 _RECV_DRAIN_REPOLL_PASSES = 8
 
@@ -69,6 +71,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     _full_payload_replace_keys_cached: frozenset[str]
     # request_id -> (client_index, reason), drained into OmniConnectorOutput.
     _permanent_send_failures: dict[str, tuple[int, str]]
+    _permanent_recv_failures: dict[str, tuple[int, str]]
+    _recv_waiting_since: dict[str, float]
 
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
@@ -475,6 +479,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             or output.has_pending_kv_work
             or output.stage_payloads
             or output.permanent_send_failures
+            or output.permanent_recv_failures
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:
@@ -990,6 +995,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     self._stage_full_payload_locked(request_id, OmniSerializer.deserialize(request.payload_sender_info))
                 return
             self._pending_load_reqs[request_id] = request
+            self._recv_wait_since().setdefault(request_id, time.monotonic())
         self._work_available.set()
 
     def recv_chunk(self) -> dict[str, Any]:
@@ -1192,6 +1198,56 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             failures = {}
             self._permanent_send_failures = failures
         return failures
+
+    def _permanent_recv_failure_map(self) -> dict[str, tuple[int, str]]:
+        failures = getattr(self, "_permanent_recv_failures", None)
+        if failures is None:
+            failures = {}
+            self._permanent_recv_failures = failures
+        return failures
+
+    def _recv_wait_since(self) -> dict[str, float]:
+        waits = getattr(self, "_recv_waiting_since", None)
+        if waits is None:
+            waits = {}
+            self._recv_waiting_since = waits
+        return waits
+
+    def _clear_recv_delivery_state(self, req_id: str) -> None:
+        self._recv_wait_since().pop(req_id, None)
+        super()._clear_recv_delivery_state(req_id)
+
+    def _input_wait_timeout_s(self) -> float:
+        global _INPUT_WAIT_TIMEOUT_MODULE
+        if _INPUT_WAIT_TIMEOUT_MODULE is None:
+            from vllm_omni.core.sched import omni_scheduler_mixin as module
+
+            _INPUT_WAIT_TIMEOUT_MODULE = module
+        return float(_INPUT_WAIT_TIMEOUT_MODULE.DEFAULT_INPUT_WAIT_TIMEOUT_S)
+
+    def _expire_recv_if_needed(self, req_id: str) -> bool:
+        """Stop polling a receive that has waited past the stage-input deadline."""
+        timeout_s = self._input_wait_timeout_s()
+        if timeout_s <= 0:
+            return False
+        with self._lock:
+            started = self._recv_wait_since().get(req_id)
+        if started is None or time.monotonic() - started < timeout_s:
+            return False
+        self._record_permanent_recv_failure(
+            req_id,
+            f"timed out waiting for connector input after {timeout_s:g}s",
+        )
+        return True
+
+    def _record_permanent_recv_failure(self, req_id: str, reason: str) -> None:
+        with self._lock:
+            request = self._pending_load_reqs.pop(req_id, None)
+            self._recv_wait_since().pop(req_id, None)
+            stage_id = getattr(self, "_stage_id", "?")
+            message = f"Stage-{stage_id} connector receive failed for request {req_id!r}: {reason}"
+            self._permanent_recv_failure_map().setdefault(req_id, (self._task_client_index(request), message))
+        logger.error("%s", message)
 
     @staticmethod
     def _task_client_index(request: Any | None) -> int:
@@ -1715,6 +1771,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             stage_payloads, self._run_stage_payloads = self._run_stage_payloads, {}
             permanent_send_failures = dict(self._permanent_send_failure_map())
             self._permanent_send_failures.clear()
+            permanent_recv_failures = dict(self._permanent_recv_failure_map())
+            self._permanent_recv_failures.clear()
 
         output = OmniConnectorOutput(
             chunk_ready_req_ids=set(self._chunk_ready_req_ids),
@@ -1725,6 +1783,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             has_pending_kv_work=self.has_pending_kv_work(),
             stage_payloads=stage_payloads,
             permanent_send_failures=permanent_send_failures,
+            permanent_recv_failures=permanent_recv_failures,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1800,8 +1859,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if self._stop_event.is_set():
                 break
             try:
+                if self._expire_recv_if_needed(req_id):
+                    continue
                 if self._poll_single_request(req_id, publish_ready=False):
                     ready.append(req_id)
+            except PermanentTransferError as exc:
+                self._record_permanent_recv_failure(req_id, str(exc))
             except Exception:
                 logger.warning("Error receiving data for %s", req_id, exc_info=True)
         if ready and self._async_chunk:

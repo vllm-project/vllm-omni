@@ -696,6 +696,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         for output in connector_outputs:
             for req_id, failure in getattr(output, "permanent_send_failures", {}).items():
                 queued.setdefault(req_id, failure)
+            for req_id, failure in getattr(output, "permanent_recv_failures", {}).items():
+                queued.setdefault(req_id, failure)
 
     def _process_permanent_send_failures(self) -> None:
         """Turn an exhausted connector send into a client-visible ERROR.

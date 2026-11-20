@@ -664,3 +664,24 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
+
+
+def test_put_refuses_when_peer_shared_memory_is_not_visible():
+    """A sender that cannot see the receiver's IPC namespace must not report success."""
+    base = 50000 + (os.getpid() % 10000)
+    sender = SharedMemoryConnector({"stage_id": base})
+    key = f"peer_{uuid.uuid4().hex}"
+    try:
+        ok, size, meta = sender.put(str(base), str(base + 1), key, {"a": 1})
+        assert ok is False
+        assert size == 0
+        assert meta is None
+        receiver = SharedMemoryConnector({"stage_id": base + 1})
+        try:
+            assert sender.put(str(base), str(base + 1), key, {"a": 1})[0] is True
+            assert receiver.get(str(base), str(base + 1), key)[0] == {"a": 1}
+        finally:
+            receiver.close()
+        assert sender.put(str(base), str(base + 1), f"{key}-gone", {"a": 1})[0] is False
+    finally:
+        sender.close()

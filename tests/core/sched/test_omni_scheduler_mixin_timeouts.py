@@ -458,6 +458,24 @@ def test_permanent_send_failure_emits_error_after_request_left_scheduler():
     assert eco.stop_reason.startswith("Stage-1")
 
 
+def test_permanent_recv_failure_emits_error_for_waiting_request():
+    reason = "Stage-2 connector receive failed for request 'req-wait'"
+    request = SimpleNamespace(request_id="req-wait", client_index=5, stop_reason=None)
+    scheduler = _PermanentSendScheduler({"req-wait": request})
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        permanent_recv_failures={"req-wait": (5, reason)},
+    )
+
+    scheduler._process_pending_omni_inputs("ar")
+
+    assert scheduler.finish_calls
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    eco = outputs[5].outputs[0]
+    assert eco.finish_reason == FinishReason.ERROR
+    assert eco.stop_reason.startswith("Stage-2")
+
+
 def test_permanent_send_failure_finishes_request_still_scheduled():
     request = SimpleNamespace(request_id="req-live", client_index=2, stop_reason=None)
     scheduler = _PermanentSendScheduler({"req-live": request})
