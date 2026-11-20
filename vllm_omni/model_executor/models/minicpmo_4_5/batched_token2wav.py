@@ -826,11 +826,7 @@ class BatchedToken2Wav(nn.Module):
         self._prompt_features.pop(prompt_key, None)
         getattr(self, "_prompt_att_caches", {}).pop(prompt_key, None)
         getattr(self, "_prompt_att_generations", {}).pop(prompt_key, None)
-        verified = getattr(self, "_prompt_att_verified", None)
-        if isinstance(verified, dict):
-            verified.pop(prompt_key, None)
-        elif isinstance(verified, set):
-            verified.discard(prompt_key)
+        getattr(self, "_prompt_att_verified", {}).pop(prompt_key, None)
         getattr(self, "_prompt_att_rejected", set()).discard(prompt_key)
         for setup_key in list(self._setup_cache):
             if setup_key[0] == prompt_key:

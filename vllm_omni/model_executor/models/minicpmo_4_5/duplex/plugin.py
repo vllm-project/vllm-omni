@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
 # <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
@@ -621,11 +623,24 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = MiniCPMO45DataPlaneSession(encode_audio)
+        # Server-owned hierarchical context cache default (deploy.yaml duplex_session.model_custom_options).
+        self._duplex_context_caching: bool = False
         # The tokenizer is only needed for special-token ids and the session
         # context token count; it is the same for every session, so load it
         # once per model path, off the orchestrator loop.
         self._tokenizers: dict[str, PreTrainedTokenizerBase | None] = {}
         self._tokenizer_lock = asyncio.Lock()
+
+    def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Load trusted MiniCPM-o server options from deploy ``duplex_session``."""
+        custom_options = dict(runtime_config.model_custom_options)
+        context_caching = custom_options.pop("duplex_context_caching", False)
+        if custom_options or not isinstance(context_caching, bool):
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "Invalid MiniCPM-o 4.5 server model_custom_options",
+                code="invalid_model_custom_options",
+            )
+        self._duplex_context_caching = context_caching
 
     async def _tokenizer_for(self, model_config: ModelConfig | None) -> PreTrainedTokenizerBase | None:
         model_path = getattr(model_config, "model", None)
@@ -772,12 +787,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         runtime_config: dict[str, object] = {"instructions": config.instructions}
         window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
         runtime_config["duplex_window_config"] = window_config.as_dict()
-        context_caching = getattr(model_config, "duplex_context_caching", None)
-        if context_caching is None:
-            stage_conn = getattr(model_config, "stage_connector_config", {}) or {}
-            extra = stage_conn.get("extra", {}) if isinstance(stage_conn, dict) else {}
-            context_caching = extra.get("duplex_context_caching", False)
-        runtime_config["duplex_context_caching"] = bool(context_caching)
+        runtime_config["duplex_context_caching"] = self._duplex_context_caching
         # ``duplex_initial_user_text`` is the older extra_body spelling and
         # still works; the session field is the framework-level one.
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
