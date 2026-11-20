@@ -879,11 +879,12 @@ def run_fault_injection_with_rate_load(
 
 
 def list_alive_pids(pids: Sequence[int]) -> list[int]:
-    """Return PIDs from ``pids`` that still exist in the kernel and are **not** zombies.
+    """Return PIDs from ``pids`` that still have a live process or thread.
 
     After SIGTERM/SIGKILL the serve child may exit before the test harness calls
     ``Popen.wait()``; until reaped, ``psutil.pid_exists`` stays true for the defunct
     slot. Those PIDs must not count as "residual server processes" for leak checks.
+    A zombie thread-group leader with surviving threads still counts as alive.
     """
     out: list[int] = []
     for pid in pids:
@@ -891,7 +892,8 @@ def list_alive_pids(pids: Sequence[int]) -> list[int]:
         if not psutil.pid_exists(pid_i):
             continue
         try:
-            if psutil.Process(pid_i).status() == psutil.STATUS_ZOMBIE:
+            process = psutil.Process(pid_i)
+            if process.status() == psutil.STATUS_ZOMBIE and process.num_threads() == 1:
                 continue
         except psutil.Error:
             continue
@@ -1396,8 +1398,9 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     injection time), not the marker-filtered ``worker_pids`` subset — so helpers like
     ``multiprocessing.resource_tracker`` are included in the residual check.
 
-    **Zombie** PIDs (exited children not yet reaped by the test ``Popen``) are excluded
-    from the "alive" list; ``psutil.pid_exists`` alone would false-positive on them.
+    **Zombie** PIDs with no surviving threads (exited children not yet reaped by
+    the test ``Popen``) are excluded from the "alive" list; ``psutil.pid_exists``
+    alone would false-positive on them.
 
     On Linux, also require captured PIDs' FD tables to empty and the named
     /dev/shm objects referenced at injection time to disappear. Identity uses

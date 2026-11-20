@@ -810,6 +810,31 @@ def test_linux_fd_check_accepts_a_real_unreaped_child() -> None:
         child.wait(timeout=5)
 
 
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_cleanup_checks_zombie_threads_with_readable_empty_fd_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, num_threads: int
+) -> None:
+    monkeypatch.setattr(helpers.sys, "platform", "linux")
+    monkeypatch.setattr(helpers, "_LINUX_PROC_ROOT", tmp_path)
+    (tmp_path / "42" / "fd").mkdir(parents=True)
+    process = mocker.Mock()
+    process.status.return_value = helpers.psutil.STATUS_ZOMBIE
+    process.num_threads.return_value = num_threads
+    mocker.patch.object(helpers.psutil, "pid_exists", return_value=True)
+    mocker.patch.object(helpers.psutil, "Process", return_value=process)
+    server = mocker.Mock(reliability_fault_snapshot={"tree_pids": [42], "shm_objects": []})
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+
+    if num_threads > 1:
+        with pytest.raises(AssertionError, match="residual server-tree processes remain alive"):
+            helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="zombie", timeout_sec=1)
+    else:
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="zombie", timeout_sec=1)
+
+
 @pytest.mark.parametrize("residual", [None, "fd", "shm"])
 def test_cleanup_retries_transient_fd_permission_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, residual: str | None
