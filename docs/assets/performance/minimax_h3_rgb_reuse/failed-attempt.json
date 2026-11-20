@@ -1,0 +1,26 @@
+{
+  "job": "npuq-858d04c22280425a870e168320688cf6",
+  "outcome": "invalid: stopped at same-config warmup byte gate before formal timings",
+  "source": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+  "rgb_reuse": [
+    false,
+    false
+  ],
+  "encoder_fingerprints_equal_all_ranks": true,
+  "cpu_inputs_equal": true,
+  "media_sha256": [
+    "97cca6648d8eb21acfc02c8662ad605a21bcc80a2ff034583512990290f9b68f",
+    "c50c22e67ca11e2b0b8726ef5a44f138ef0dbc01650969bf997b847192809d10"
+  ],
+  "decoded_video_sha256": [
+    "e8fe052de3eb96d7c21f3ce3fa607fe0595d16798c1da60bfbd16a53724f4f26",
+    "7518f8089f81fd4c754fd2278b619fced836eebb8897ac511940020ae1441cc9"
+  ],
+  "decoded_audio_sha256": [
+    "33c3b43d4e37d5bf446f3ad3c2347aa7b6146c6f4255e058896d748c1859a740",
+    "635ee1df1188d6ea9d3bd6db2ec3cb1626f49551133e383423e347f31eaa06ec"
+  ],
+  "formal_requests": 0,
+  "drained": true,
+  "cause": "undetermined; same flag, same CPU preparation and encoder hidden, downstream output differed"
+}

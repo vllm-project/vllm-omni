@@ -1,0 +1,34 @@
+"""Recompute CPU preparation evidence with Python standard library only."""
+import json
+from pathlib import Path
+import random
+import statistics as st
+import sys
+
+data = json.loads(Path(sys.argv[1]).read_text())
+groups = [[r for r in data["requests"] if r["stage"] == name and r["phase"] == "formal"]
+          for name in ["off_before", "on", "off_after"]]
+assert all(len(g) == 3 for g in groups)
+values = [[r["seconds"] for r in g] for g in groups]
+means = [st.mean(v) for v in values]
+sd = [st.stdev(v) for v in values]
+times = [st.mean(r["started_at_unix"] for r in g) for g in groups]
+weight = (times[1] - times[0]) / (times[2] - times[0])
+control = (1 - weight) * means[0] + weight * means[2]
+saved = control - means[1]
+rng = random.Random(42)
+samples = []
+for _ in range(10000):
+    a1, b, a2 = [st.mean(rng.choices(v, k=len(v))) for v in values]
+    samples.append((1 - weight) * a1 + weight * a2 - b)
+samples.sort()
+interval = [samples[250], samples[9750]]
+actual = {"means": means, "sd": sd, "control": control, "optimized": means[1],
+          "saved": saved, "percent": saved / control * 100,
+          "control_interpolation_weight": weight, "bootstrap95_saved": interval,
+          "distinguishable": interval[0] > 0 and saved > max(sd)}
+assert actual == data["statistics"]
+assert len(data["requests"]) == 15
+for row in data["requests"]:
+    assert {k: row[k] for k in data["input_signature"]} == data["input_signature"]
+print(json.dumps(actual, indent=2))
