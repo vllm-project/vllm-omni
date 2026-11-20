@@ -123,6 +123,13 @@ def test_doc_scope_collection_preserves_cpu_examples():
     assert deselected == [excluded, mutated, unknown]
 
 
+def test_doc_scope_vace_module_imports_without_eligible_snippets():
+    from tests.examples.offline_inference import test_vace_video_generation
+
+    assert not test_vace_video_generation.TEXT_TO_VIDEO_SNIPPETS
+    assert not test_vace_video_generation.IMAGE_TO_VIDEO_SNIPPETS
+
+
 def test_doc_scope_readmes_and_ci_dependencies():
     import yaml
 
