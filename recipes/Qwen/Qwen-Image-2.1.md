@@ -631,3 +631,11 @@ it. Prefix layout must remain fixed for the lifetime of that branch's KV cache.
 Shared modulation applies to eager prefill and eager decode fallback even when
 a decode graph manager exists. Captured graph execution is unchanged; no new
 graph-mode performance improvement is claimed.
+
+### Shard the editing prefix on two Ascend NPUs
+
+Set `extras.shard_edit_prefix: true` in the diffusion stage configuration to opt into
+head-sharded prefix K/V for editing with pure Ulysses SP=2. This path uses BF16
+eager SDPA with TP=1 and native K/V storage. True CFG uses native attention.
+It preserves the existing restrictions on padded text masks. The measured configuration
+is single-request Qwen-Image-2.1-Turbo on two Ascend 910B3 NPUs.

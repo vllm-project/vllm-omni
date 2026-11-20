@@ -42,6 +42,8 @@ from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21Dec
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
+from . import ulysses_prefix
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -654,6 +656,7 @@ class QwenImage21Attention(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        prefix_layout: ulysses_prefix.PrefixLayout | None = None,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -699,6 +702,10 @@ class QwenImage21Attention(nn.Module):
             key = self.norm_k(key).to(value.dtype)
             query = self._apply_rotary_emb(query, freqs)
             key = self._apply_rotary_emb(key, freqs)
+
+        if prefix_layout is not None:
+            output = prefix_layout.attention(self.attn, query, key, value, attn_metadata, kv_cache, cache_branch)
+            return self.to_out(output.flatten(2, 3).type_as(hidden_states))
 
         cached_key = cached_value = None
         if kv_cache is not None:
@@ -836,6 +843,7 @@ class QwenImage21TransformerBlock(nn.Module):
         cache_write_len: int | None = None,
         prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         _pointwise_validated: bool = False,
+        prefix_layout: ulysses_prefix.PrefixLayout | None = None,
     ) -> torch.Tensor:
         if prepared_modulation is None:
             mod1, mod2 = modulation.chunk(2, dim=-1)
@@ -850,6 +858,7 @@ class QwenImage21TransformerBlock(nn.Module):
             attn_metadata=attn_metadata,
             sp_prefix_len=sp_prefix_len,
             sp_decode=sp_decode,
+            prefix_layout=prefix_layout,
             kv_cache=kv_cache,
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
@@ -1105,6 +1114,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # prefix K/V memory). This is independent of `diffusion_kv_cache_dtype`, which
         # quantizes attention Q/K/V *compute* per forward on supported backends.
         extras = getattr(od_config, "extras", None) or {}
+        self.shard_edit_prefix = extras.get("shard_edit_prefix", False) is True
         self.prefix_kv_cache_dtype = _normalize_prefix_kv_cache_dtype(extras.get("prefix_kv_cache_dtype"))
 
         self.pos_embed = QwenImage21Rope(theta=10000, axes_dim=list(axes_dims_rope))
@@ -1348,6 +1358,16 @@ class QwenImage21Transformer2DModel(CachedTransformer):
 
         is_decode = kv_cache is not None and len(kv_cache) > 0 and "key" in kv_cache[0].get(cache_branch, {})
 
+        prefix_group = ulysses_prefix.select_group(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            math.prod(layout[-1]),
+            kv_cache,
+            cache_branch,
+            attn_path_hint,
+            is_decode,
+        )
         if is_decode and self._decode_graph_manager is not None:
             graph_output = self._decode_graph_manager.try_decode(
                 hidden_states=hidden_states,
@@ -1408,6 +1428,21 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         ):
             sp_padding = int(ctx.sp_padding_size)
         # Local layout is always [prefix, target (shard)]: full sequence when SP is off.
+        prefix_layout = None
+        global_prefix_len = prefix_hidden_states.shape[1]
+        if prefix_group is not None:
+            prefix_layout = ulysses_prefix.make_layout(
+                prefix_group,
+                target_hidden_states,
+                math.prod(layout[-1]),
+                global_prefix_len,
+                is_decode,
+                kv_cache,
+                cache_branch,
+            )
+            if not is_decode:
+                prefix_hidden_states = prefix_layout.shard_prefix(prefix_hidden_states, 1)
+                prefix_freqs = prefix_layout.shard_prefix(prefix_freqs, -2)
         joint_hidden_states = torch.cat([prefix_hidden_states, target_hidden_states], dim=1)
         freqs = torch.cat([prefix_freqs, target_freqs], dim=-2)
         prefix_len = prefix_hidden_states.shape[1]
@@ -1440,7 +1475,11 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         if modulation_mask is not None:
             local_mask = torch.cat(
                 [
-                    modulation_mask[:prefix_len],
+                    (
+                        prefix_layout.shard_prefix(modulation_mask[:global_prefix_len], 0)
+                        if prefix_layout is not None and not is_decode
+                        else modulation_mask[:prefix_len]
+                    ),
                     torch.ones(target_hidden_states.shape[1], dtype=torch.bool, device=modulation_mask.device),
                 ]
             )
@@ -1568,6 +1607,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 attn_metadata=attn_metadata,
                 sp_prefix_len=sp_prefix_len,
                 sp_decode=sp_active and is_decode,
+                prefix_layout=prefix_layout,
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
@@ -1593,14 +1633,15 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             )
 
         if sp_active and not is_decode:
-            # Only target tokens feed proj_out under SP: the prefix is replicated on every
-            # rank and gathering it would duplicate it. Output is the (gathered) target image.
+            # Only target tokens feed proj_out under SP.
             joint_hidden_states = joint_hidden_states[:, prefix_len:]
             if local_mask is not None:
                 local_mask = local_mask[prefix_len:]
 
         joint_hidden_states = self.norm_out(joint_hidden_states, temb, local_mask)
         output = self.proj_out(joint_hidden_states)
+        if prefix_layout is not None:
+            prefix_layout.complete(kv_cache, cache_branch)
 
         if not return_dict:
             return (output,)

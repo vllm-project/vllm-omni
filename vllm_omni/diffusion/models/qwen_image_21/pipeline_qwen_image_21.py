@@ -53,6 +53,7 @@ from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21KVCache,
     QwenImage21Transformer2DModel,
 )
+from vllm_omni.diffusion.models.qwen_image_21.ulysses_prefix import cache_route_key
 from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -1380,8 +1381,9 @@ class QwenImage21Pipeline(
 
     @staticmethod
     def _decode_group_key(state: "StepRequestState") -> tuple[Any, ...]:
-        """Group decode requests by the padded VLM length baked into their KV."""
+        """Group decode requests by cache layout and the padded prompt lengths used at prefill."""
         return (
+            cache_route_key(state.extra.get("kv_cache")),
             state.extra.get("prefill_prompt_seq_len"),
             state.extra.get("prefill_negative_prompt_seq_len"),
         )
