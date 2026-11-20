@@ -31,7 +31,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 
 # Fish Speech S2 Pro
 vllm serve fishaudio/s2-pro --omni --port 8091
@@ -648,7 +648,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 ```bash
@@ -670,7 +670,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 ```bash
@@ -974,9 +974,9 @@ For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overri
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --omni --port 8091 --trust-remote-code --enforce-eager \
-    --stage-overrides '{"0":{"max_num_seqs":10,"gpu_memory_utilization":0.2},
-                        "1":{"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
+    --omni --port 8091 --trust-remote-code \
+    --stage-overrides '{"0":{"enforce_eager":true,"max_num_seqs":10,"gpu_memory_utilization":0.2},
+                        "1":{"enforce_eager":true,"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
 ```
 
 The bundled `qwen3_tts.yaml` uses a multi-request default and lets stage 1 batch chunks across in-flight requests. For latency-sensitive deployments, avoid forcing stage 1 back to `max_num_seqs: 1`; benchmark before reducing it below `10`.
@@ -1227,7 +1227,7 @@ curl http://localhost:8091/v1/audio/voices
 If you encounter OOM errors:
 
 1. Use smaller model variant: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
-2. Reduce `--gpu-memory-utilization`
+2. Reduce `gpu_memory_utilization` for the affected stage in the deploy YAML or with `--stage-overrides`.
 
 ### Unsupported Speaker
 
@@ -1288,7 +1288,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
     --uvicorn-log-level debug
 ```
 
