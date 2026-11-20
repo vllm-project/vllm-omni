@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex (Nemotron-Labs-Audex-2B) TTS pipeline topology.
 
 Stage 0: Thinker  — ChatML text prompt → <speechcodec_N> tokens (LLM AR).
@@ -38,6 +38,7 @@ AUDEX_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="audex_thinker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -57,6 +58,7 @@ AUDEX_TTS_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="audex_code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
@@ -91,6 +93,7 @@ AUDEX_S2S_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="audex_omni",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             final_output=True,
             final_output_type="text",
@@ -114,6 +117,7 @@ AUDEX_S2S_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="audex_code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
@@ -167,6 +171,7 @@ AUDEX_TTA_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="audex_tta_thinker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -183,6 +188,7 @@ AUDEX_TTA_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="audex_xcodec",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

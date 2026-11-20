@@ -4678,3 +4678,33 @@ async def test_response_create_waits_while_a_held_prefix_is_still_submitting() -
             await task
     finally:
         await close_harness(h)
+
+
+@pytest.mark.parametrize("retained_request", [False, True])
+@pytest.mark.parametrize("interrupt", ["vad", "client"])
+@pytest.mark.asyncio
+async def test_barge_in_clears_completed_response_on_retained_stream(retained_request: bool, interrupt: str) -> None:
+    h = await open_harness()
+    try:
+        h.session.config.playback_commit_policy = "ack_only"
+        request_id = await _open_active_response(h)
+        response_id = h.session.active_response_id
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", turn_end=True))
+        assert find(events, "response.done").status == "completed"
+        assert h.session.active_response_id is None
+        assert h.session.playback.sent_ms > h.session.playback.committed_ms
+        h.runner.run.stream_request_id = request_id
+        if not retained_request:
+            h.session.clear_request()
+        if interrupt == "vad":
+            assert await h.runner._barge_in_for_overlap({}, {"cancel_reason": "turn_detected"})
+            events = await h.settle()
+        else:
+            events = await h.run(commands.BargeIn())
+        cleared = [event for event in events if event.type == "output_audio_buffer.cleared"]
+        assert len(cleared) == 1, types(events)
+        assert cleared[0].response_id == response_id
+        assert "response.done" not in types(events)
+        assert h.session.epoch == 1
+    finally:
+        await close_harness(h)
