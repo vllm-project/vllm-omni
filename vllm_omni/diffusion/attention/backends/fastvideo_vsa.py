@@ -17,11 +17,21 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.ops.block_sparse import (
+    block_sparse_attn_bshd,
+    build_prefix_dense_block_map,
+    mean_pool_tiles,
+    resolve_block_sparse_provider,
+)
 from vllm_omni.diffusion.attention.ops.video_tiles import get_tile_metadata
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# ARK's 256Q routing consumes 64-token key blocks, so a 256-token Wan VSA tile
+# issues four key blocks per selected tile inside one attention reduction.
+XPU_KEY_BLOCK_SIZE = 64
 
 
 # Keep the external FastVideo pybind/CUDA kernel opaque to torch.compile.
@@ -105,6 +115,23 @@ def _get_gate_compress(attn_metadata: AttentionMetadata | None) -> torch.Tensor 
     return value if isinstance(value, torch.Tensor) else None
 
 
+_REPORTED_FALLBACK_REASONS: set[str] = set()
+
+
+def _warn_fallback_once(reason: str) -> None:
+    """Report each distinct fallback reason once.
+
+    ``logger.warning_once`` deduplicates per call site, so every later reason
+    was previously hidden behind the first one. Fallback reasons differ by
+    role (text encoder vs DiT) and by shape, which are exactly the cases a user
+    needs to see.
+    """
+    if reason in _REPORTED_FALLBACK_REASONS:
+        return
+    _REPORTED_FALLBACK_REASONS.add(reason)
+    logger.warning("FASTVIDEO_VSA falling back to SDPA: %s", reason)
+
+
 def _preserve_vsa_all_blocks(attn_metadata: AttentionMetadata | None) -> bool:
     if attn_metadata is None:
         return False
@@ -182,14 +209,21 @@ class FastVideoVSAImpl(AttentionImpl):
 
         self.provider = backend_kwargs.get("provider", "auto")
         self.precision = backend_kwargs.get("precision", "bf16")
+        self.block_size = self._parse_block_size(backend_kwargs.get("block_size", (4, 8, 8)))
+        self.block_elements = self.block_size[0] * self.block_size[1] * self.block_size[2]
         if self.provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton", "xpu") or self.precision not in (
             "bf16",
             "sage",
         ):
             raise ValueError("VSA requires provider auto/fastvideo/flashinfer/cudnn/triton/xpu and precision bf16/sage")
-        if self.provider in ("cudnn", "triton", "xpu") and not self._supports_tile64_provider:
+        # tile64 providers need explicit block routing; the XPU provider also
+        # serves Wan's native tile256 geometry, which has no other provider.
+        tile64_routing = self._supports_tile64_provider
+        if self.provider in ("cudnn", "triton") and not tile64_routing:
             raise ValueError(f"{self.provider} VSA requires an implementation with explicit block routing")
-        if self.provider == "auto" and not self._supports_tile64_provider:
+        if self.provider == "xpu" and not (tile64_routing or self.block_elements == 256):
+            raise ValueError("xpu VSA requires 64-token or 256-token block routing")
+        if self.provider == "auto" and not tile64_routing:
             self.provider = "fastvideo"
         if self.precision == "sage" and self.provider in ("fastvideo", "cudnn", "triton", "xpu"):
             raise ValueError("Sage VSA requires the FlashInfer provider")
@@ -200,8 +234,6 @@ class FastVideoVSAImpl(AttentionImpl):
         self.topk = int(backend_kwargs.get("topk", 64))
         if self.topk <= 0:
             raise ValueError("VSA topk must be positive")
-        self.block_size = self._parse_block_size(backend_kwargs.get("block_size", (4, 8, 8)))
-        self.block_elements = self.block_size[0] * self.block_size[1] * self.block_size[2]
         self.min_seq_len = int(backend_kwargs.get("min_seq_len", self.block_elements * 2))
         self.fallback_on_error = bool(backend_kwargs.get("fallback_on_error", True))
         self.disable_when_sp_active = bool(backend_kwargs.get("disable_when_sp_active", True))
@@ -247,7 +279,7 @@ class FastVideoVSAImpl(AttentionImpl):
         the structural pad rows as real keys. Slice to the valid prefix instead
         and leave the pad rows zeroed, exactly as the VSA path does.
         """
-        logger.warning_once("FASTVIDEO_VSA falling back to SDPA: %s", reason)
+        _warn_fallback_once(reason)
         packed = attn_metadata.packed_padding if attn_metadata is not None else None
         if attn_metadata is None or packed is None or attn_metadata.attn_mask is not None:
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
@@ -305,8 +337,8 @@ class FastVideoVSAImpl(AttentionImpl):
             return f"dtype {query.dtype} is not supported"
         if key.dtype != query.dtype or value.dtype != query.dtype:
             return "q/k/v dtypes must match"
-        if query.device.type != "cuda" or key.device.type != "cuda" or value.device.type != "cuda":
-            return "q/k/v must be CUDA tensors"
+        if any(tensor.device.type not in ("cuda", "xpu") for tensor in (query, key, value)):
+            return "q/k/v must be CUDA or XPU tensors"
         expected_scale = self.head_size**-0.5
         if abs(float(self.softmax_scale) - float(expected_scale)) > 1e-6:
             return f"softmax_scale {self.softmax_scale} differs from FastVideo VSA scale {expected_scale}"
@@ -453,7 +485,157 @@ class FastVideoVSAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._fallback(query, key, value, attn_metadata, "XPU VSA execution is using SDPA")
+        original_query, original_key, original_value = query, key, value
+        original_seq_len = query.shape[1]
+        valid_seq_len = original_seq_len
+        if attn_metadata is not None and attn_metadata.packed_padding is not None:
+            valid_seq_len = attn_metadata.packed_padding.q_length
+            if attn_metadata.packed_padding.kv_length != valid_seq_len:
+                return self._fallback(
+                    original_query, original_key, original_value, attn_metadata, "packed Q/KV lengths must match"
+                )
+            query = query[:, :valid_seq_len]
+            key = key[:, :valid_seq_len]
+            value = value[:, :valid_seq_len]
+
+        reason = self._fallback_reason(query, key, value, attn_metadata)
+        if reason is not None:
+            return self._fallback(original_query, original_key, original_value, attn_metadata, reason)
+
+        dit_seq_shape = _get_vsa_dit_seq_shape(attn_metadata)
+        assert dit_seq_shape is not None
+        num_blocks = math.prod(
+            math.ceil(seq_dim / tile_dim) for seq_dim, tile_dim in zip(dit_seq_shape, self.block_size)
+        )
+        preserve_all_blocks = _preserve_vsa_all_blocks(attn_metadata)
+        use_native_sdpa = self.topk == num_blocks and not preserve_all_blocks
+        route = "SDPA" if use_native_sdpa else "VSA_ALL_BLOCKS" if self.topk == num_blocks else "VSA"
+        logger.info_once(
+            "FASTVIDEO_VSA XPU routing: seq_len=%d, dit_seq_shape=%s, block_size=%s, num_blocks=%d, "
+            "topk=%d, keep_ratio=%.1f%%, checkpoint_mode=%s, route=%s, provider=xpu, "
+            "q_block=%d, k_block=%d",
+            query.shape[1],
+            dit_seq_shape,
+            self.block_size,
+            num_blocks,
+            self.topk,
+            100.0 * self.topk / num_blocks,
+            "fastvideo_dmd" if preserve_all_blocks else "native",
+            route,
+            self.block_elements,
+            XPU_KEY_BLOCK_SIZE,
+        )
+        if use_native_sdpa:
+            return self._fallback(
+                original_query,
+                original_key,
+                original_value,
+                attn_metadata,
+                f"topk {self.topk} selects all blocks for a native checkpoint",
+            )
+
+        provider = resolve_block_sparse_provider(
+            self.provider,
+            self.precision,
+            query.device,
+            query.dtype,
+            self.head_size,
+            block_size=self.block_elements,
+            key_block_size=XPU_KEY_BLOCK_SIZE,
+        )
+        try:
+            tile_partition_indices, variable_block_sizes, non_pad_index, untile_combined_index = get_tile_metadata(
+                dit_seq_shape,
+                self.block_size,
+                self.block_elements,
+                query.device,
+            )
+            padded_len = variable_block_sizes.numel() * self.block_elements
+            target_shape = (query.shape[0], padded_len, query.shape[2], query.shape[3])
+            query_tiled = torch.zeros(target_shape, device=query.device, dtype=query.dtype)
+            key_tiled = torch.zeros_like(query_tiled)
+            value_tiled = torch.zeros_like(query_tiled)
+            query_tiled[:, non_pad_index] = query[:, tile_partition_indices]
+            key_tiled[:, non_pad_index] = key[:, tile_partition_indices]
+            value_tiled[:, non_pad_index] = value[:, tile_partition_indices]
+
+            q_pool = mean_pool_tiles(query_tiled, variable_block_sizes, self.block_elements).to(query.dtype)
+            k_pool = mean_pool_tiles(key_tiled, variable_block_sizes, self.block_elements).to(query.dtype)
+            v_pool = mean_pool_tiles(value_tiled, variable_block_sizes, self.block_elements).to(query.dtype)
+            scores = torch.matmul(q_pool, k_pool.transpose(-2, -1)) * self.softmax_scale
+            if preserve_all_blocks:
+                block_map = torch.ones_like(scores, dtype=torch.bool)
+            else:
+                block_map = build_prefix_dense_block_map(scores, 0, num_blocks, self.topk)
+
+            key_sizes = (
+                torch.stack(
+                    [
+                        (variable_block_sizes - offset).clamp(0, XPU_KEY_BLOCK_SIZE)
+                        for offset in range(0, self.block_elements, XPU_KEY_BLOCK_SIZE)
+                    ],
+                    dim=-1,
+                )
+                .flatten()
+                .to(torch.int32)
+            )
+            key_map = block_map.repeat_interleave(self.block_elements // XPU_KEY_BLOCK_SIZE, dim=-1)
+            key_map &= key_sizes.view(1, 1, 1, -1) > 0
+
+            sparse = block_sparse_attn_bshd(
+                query_tiled,
+                key_tiled,
+                value_tiled,
+                key_map,
+                key_sizes,
+                self.softmax_scale,
+                provider=provider,
+                precision=self.precision,
+                block_size=self.block_elements,
+                key_block_size=XPU_KEY_BLOCK_SIZE,
+            )
+            sparse = sparse.view(query.shape[0], num_blocks, self.block_elements, query.shape[2], query.shape[3])
+
+            gate_compress = _get_gate_compress(attn_metadata)
+            if gate_compress is not None:
+                if (
+                    gate_compress.shape[0] != query.shape[0]
+                    or gate_compress.shape[2:] != query.shape[2:]
+                    or gate_compress.shape[1] < query.shape[1]
+                ):
+                    raise ValueError(
+                        f"gate_compress shape {gate_compress.shape} cannot cover query shape {query.shape}"
+                    )
+                gate_compress = gate_compress[:, : query.shape[1]]
+                gate_tiled = torch.zeros_like(query_tiled)
+                gate_tiled[:, non_pad_index] = gate_compress[:, tile_partition_indices]
+                gate_tiled = gate_tiled.view(
+                    query.shape[0], num_blocks, self.block_elements, query.shape[2], query.shape[3]
+                )
+                coarse = torch.matmul(torch.softmax(scores, dim=-1), v_pool)
+                coarse = coarse.permute(0, 2, 1, 3).unsqueeze(2)
+                sparse = sparse + coarse * gate_tiled
+
+            output = sparse.reshape(query.shape[0], padded_len, query.shape[2], query.shape[3])
+            output = output[:, untile_combined_index].contiguous()
+            if valid_seq_len == original_seq_len:
+                return output
+            restored = torch.zeros(
+                (query.shape[0], original_seq_len, query.shape[2], query.shape[3]),
+                device=query.device,
+                dtype=query.dtype,
+            )
+            restored[:, :valid_seq_len] = output
+            return restored
+        except Exception as exc:
+            if isinstance(exc, torch.AcceleratorError):
+                raise
+            requires_sparse = preserve_all_blocks or self.topk < num_blocks
+            if requires_sparse or not self.fallback_on_error:
+                raise
+            return self._fallback(
+                original_query, original_key, original_value, attn_metadata, f"XPU VSA kernel failed: {exc}"
+            )
 
     def forward_musa(
         self,

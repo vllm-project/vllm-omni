@@ -170,8 +170,15 @@ def require_fastvideo_sparse() -> None:
 
 
 @functools.lru_cache(maxsize=32)
+@torch.compiler.disable
 def resolve_block_sparse_provider(
-    provider: str, precision: str, device: torch.device, dtype: torch.dtype, head_size: int, block_size: int = 64
+    provider: str,
+    precision: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    head_size: int,
+    block_size: int = 64,
+    key_block_size: int | None = None,
 ) -> str:
     """Resolve sparse dispatch once per device/dtype/tile, without changing precision.
 
@@ -180,14 +187,14 @@ def resolve_block_sparse_provider(
     Availability checks run before any kernel launch, so execution faults are
     never treated as a reason to try another provider.
     """
-    if block_size not in (64, 128):
-        raise ValueError("block_size must be 64 or 128")
+    if block_size not in (64, 128, 256):
+        raise ValueError("block_size must be 64, 128 or 256")
     if provider == "xpu":
         from .ark_block_sparse import require_ark_sparse
 
         if precision != "bf16":
             raise ValueError("XPU VSA requires BF16 precision")
-        require_ark_sparse(device, dtype, head_size, block_size)
+        require_ark_sparse(device, dtype, head_size, block_size, key_block_size)
         return provider
     if provider == "triton":
         from .triton_block_sparse import require_triton_sparse
@@ -203,6 +210,14 @@ def resolve_block_sparse_provider(
             raise ValueError("cuDNN VSA requires BF16 with head dimension 128")
         require_cudnn_sparse(device)
         return provider
+    if block_size == 256:
+        if precision != "bf16" or dtype != torch.bfloat16 or head_size != 128:
+            raise ValueError("tile256 VSA requires BF16 with head dimension 128")
+        if device.type == "xpu":
+            return resolve_block_sparse_provider(
+                "xpu", precision, device, dtype, head_size, block_size, key_block_size=64
+            )
+        raise ValueError("tile256 VSA requires the XPU block-sparse provider")
     if block_size == 128:
         if precision != "bf16" or dtype != torch.bfloat16 or head_size != 128:
             raise ValueError("tile128 VSA requires BF16 with head dimension 128")
@@ -312,6 +327,7 @@ def block_sparse_attn_bshd(
     provider: str = "fastvideo",
     precision: str = "bf16",
     block_size: int = 64,
+    key_block_size: int | None = None,
 ) -> torch.Tensor:
     """Dispatch explicit tile64/tile128 attention without model-specific metadata.
 
@@ -320,14 +336,25 @@ def block_sparse_attn_bshd(
     attention scale. Its optional paired-CTA padding belongs to this adapter,
     so callers always receive exactly their logical query rows.
     """
-    if block_size not in (64, 128):
-        raise ValueError("block_size must be 64 or 128")
+    if block_size not in (64, 128, 256):
+        raise ValueError("block_size must be 64, 128 or 256")
     if provider == "xpu":
         from .ark_block_sparse import ark_block_sparse_attention
 
         if precision != "bf16":
             raise ValueError("XPU VSA requires BF16 precision")
-        return ark_block_sparse_attention(query, key, value, block_map, block_sizes, softmax_scale, block_size)
+        return ark_block_sparse_attention(
+            query,
+            key,
+            value,
+            block_map,
+            block_sizes,
+            softmax_scale,
+            block_size,
+            key_block_size=key_block_size,
+        )
+    if block_size == 256:
+        raise ValueError("tile256 VSA requires the XPU block-sparse provider")
     if provider == "triton":
         from .triton_block_sparse import triton_block_sparse_attention
 

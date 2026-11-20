@@ -71,15 +71,21 @@ def require_ark_sparse(
     dtype: torch.dtype,
     head_size: int,
     block_size: int,
+    key_block_size: int | None = None,
 ) -> None:
+    key_block_size = block_size if key_block_size is None else key_block_size
     if device.type != "xpu":
         raise ValueError("ARK block-sparse attention requires XPU tensors")
     if dtype != torch.bfloat16:
         raise ValueError("ARK block-sparse attention currently requires BF16")
     if head_size not in (64, 128):
         raise ValueError(f"ARK block-sparse attention requires head_dim 64 or 128, got {head_size}")
-    if block_size not in (64, 128):
-        raise ValueError(f"ARK block-sparse attention requires block_size 64 or 128, got {block_size}")
+    if block_size not in (64, 128, 256):
+        raise ValueError(f"ARK block-sparse attention requires block_size 64, 128 or 256, got {block_size}")
+    if key_block_size not in (64, 128):
+        raise ValueError(f"ARK block-sparse attention requires key_block_size 64 or 128, got {key_block_size}")
+    if block_size == 256 and key_block_size != 64:
+        raise ValueError("ARK 256Q routing requires key_block_size=64")
     _load_ark_block_sparse()
 
 
@@ -117,13 +123,14 @@ if not hasattr(torch.ops.vllm_omni, "ark_block_sparse_attn_bshd"):
         softmax_scale: float,
         q_tile_override: int,
         block_size: int,
+        key_block_size: int,
     ) -> torch.Tensor:
         kernel = _load_ark_block_sparse()
         kwargs = {
             "scale": softmax_scale,
             "q_tile_override": q_tile_override,
             "sparse_q_block_tokens": block_size,
-            "sparse_k_block_tokens": block_size,
+            "sparse_k_block_tokens": key_block_size,
             "tensor_layout": "NHD",
         }
         parameters = _ark_block_sparse_parameters()
@@ -133,13 +140,24 @@ if not hasattr(torch.ops.vllm_omni, "ark_block_sparse_attn_bshd"):
             else:
                 logger.warning_once(
                     "The installed ARK block_sparse_sdpa has no k_block_valid support; "
-                    "partial H3 edge blocks will be executed with zero-padded keys."
+                    "partial edge key blocks are executed with zero-padded keys."
                 )
         return kernel(query, key, value, lut, valid_block_num, **kwargs)
 
     @ark_block_sparse_attn_bshd.register_fake
-    def _(query, key, value, lut, valid_block_num, block_sizes, softmax_scale, q_tile_override, block_size):
-        del key, value, lut, valid_block_num, block_sizes, softmax_scale, q_tile_override, block_size
+    def _(
+        query,
+        key,
+        value,
+        lut,
+        valid_block_num,
+        block_sizes,
+        softmax_scale,
+        q_tile_override,
+        block_size,
+        key_block_size,
+    ):
+        del key, value, lut, valid_block_num, block_sizes, softmax_scale, q_tile_override, block_size, key_block_size
         return torch.empty_like(query)
 
 
@@ -154,30 +172,51 @@ def ark_block_sparse_attention(
     block_sizes: torch.Tensor | None,
     softmax_scale: float,
     block_size: int = 64,
+    key_block_size: int | None = None,
 ) -> torch.Tensor:
     """Execute an explicit H3-style block map through ARK on XPU."""
+    key_block_size = block_size if key_block_size is None else key_block_size
     if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
         raise ValueError("ARK block-sparse attention requires matching BSHD tensors")
     if query.dtype != torch.bfloat16:
         raise ValueError("ARK block-sparse attention currently requires BF16")
     if query.shape[1] % block_size:
         raise ValueError("ARK block-sparse inputs must be padded to complete tiles")
-    blocks = query.shape[1] // block_size
-    if block_map.shape != (query.shape[0], query.shape[2], blocks, blocks):
+    query_blocks = query.shape[1] // block_size
+    if block_map.ndim != 4 or block_map.shape[:3] != (query.shape[0], query.shape[2], query_blocks):
         raise ValueError("ARK block_map must be boolean [B,H,Qblocks,Kblocks]")
+    if block_map.dtype != torch.bool:
+        raise ValueError("ARK block_map must be boolean")
+    if block_size % key_block_size:
+        raise ValueError(f"key_block_size {key_block_size} must divide block_size {block_size}")
+    if key.shape[1] % key_block_size:
+        raise ValueError("ARK block-sparse keys must be padded to complete key blocks")
+    logical_key_blocks = key.shape[1] // key_block_size
+    if block_map.shape[-1] != logical_key_blocks:
+        raise ValueError(
+            "ARK block_map key dimension must match the key block count; "
+            f"got {block_map.shape[-1]} columns for {logical_key_blocks} key blocks"
+        )
+    key_blocks = block_map.shape[-1]
     if block_size == 128:
         from .block_sparse import split_tile128_map
 
         if block_sizes is None:
-            block_sizes = torch.full((blocks,), block_size, dtype=torch.int32, device=query.device)
+            block_sizes = torch.full((key_blocks,), block_size, dtype=torch.int32, device=query.device)
         block_map, block_sizes = split_tile128_map(block_map, block_sizes.to(torch.int32))
         block_size = 64
+        key_block_size = 64
+    if block_sizes is not None and block_sizes.numel() != block_map.shape[-1]:
+        raise ValueError(
+            "ARK block_sizes must provide one valid-token count per key block; "
+            f"got {block_sizes.numel()} for {block_map.shape[-1]} key blocks"
+        )
     lut, valid_block_num = block_map_to_lut(block_map)
     if block_sizes is None:
         block_sizes = torch.empty(0, dtype=torch.int32, device=query.device)
     else:
         block_sizes = block_sizes.to(torch.int32).contiguous()
-    q_tile_override = 256 if supports_ark_q256_multirow() else 64
+    q_tile_override = 256 if block_size == 256 or supports_ark_q256_multirow() else 64
     return ark_block_sparse_attn_bshd(
         query.contiguous(),
         key.contiguous(),
@@ -188,4 +227,5 @@ def ark_block_sparse_attention(
         float(softmax_scale),
         q_tile_override,
         block_size,
+        key_block_size,
     )

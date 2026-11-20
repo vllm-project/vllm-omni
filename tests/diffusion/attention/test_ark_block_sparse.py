@@ -10,6 +10,7 @@ import torch
 
 from vllm_omni.diffusion.attention.ops.ark_block_sparse import (
     _ark_block_sparse_parameters,
+    ark_block_sparse_attention,
     block_map_to_lut,
     supports_ark_q256_multirow,
 )
@@ -179,6 +180,74 @@ def test_ark_old_build_uses_q64_fallback(monkeypatch):
 
     _, _, _, kwargs = calls[0]
     assert kwargs["q_tile_override"] == 64
+
+
+def test_ark_tile256_uses_native_256q_64k(monkeypatch):
+    calls: list[Any] = []
+    _install_fake_ark(monkeypatch, calls)
+    query = torch.randn(1, 512, 2, 128, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 2, 8, dtype=torch.bool)
+
+    block_sparse_attn_bshd(
+        query,
+        query,
+        query,
+        block_map,
+        torch.full((8,), 64, dtype=torch.int32),
+        128**-0.5,
+        provider="xpu",
+        block_size=256,
+        key_block_size=64,
+    )
+
+    lut, valid, _, kwargs = calls[0]
+    assert lut.shape == (1, 2, 2, 8)
+    assert valid.shape == (1, 2, 2)
+    assert kwargs["q_tile_override"] == 256
+    assert kwargs["sparse_q_block_tokens"] == 256
+    assert kwargs["sparse_k_block_tokens"] == 64
+
+
+def test_ark_256q_rejects_mismatched_key_blocks(monkeypatch):
+    calls: list[Any] = []
+    _install_fake_ark(monkeypatch, calls)
+    query = torch.randn(1, 512, 2, 128, dtype=torch.bfloat16)
+    # 512 keys at 64 tokens per key block need eight columns, not four.
+    block_map = torch.ones(1, 2, 2, 4, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="key block count"):
+        block_sparse_attn_bshd(
+            query,
+            query,
+            query,
+            block_map,
+            torch.full((4,), 64, dtype=torch.int32),
+            128**-0.5,
+            provider="xpu",
+            block_size=256,
+            key_block_size=64,
+        )
+    assert calls == []
+
+
+def test_ark_256q_rejects_k_block_larger_than_q_block(monkeypatch):
+    calls: list[Any] = []
+    _install_fake_ark(monkeypatch, calls)
+    query = torch.randn(1, 512, 2, 128, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 8, 4, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="must divide"):
+        ark_block_sparse_attention(
+            query,
+            query,
+            query,
+            block_map,
+            None,
+            128**-0.5,
+            block_size=64,
+            key_block_size=128,
+        )
+    assert calls == []
 
 
 @pytest.mark.parametrize("block_size", [64, 128])
