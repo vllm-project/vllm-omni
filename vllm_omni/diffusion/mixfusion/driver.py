@@ -37,9 +37,7 @@ class MixFusionDriver:
             raise ValueError(f"Scheduled MixFusion runtime changed: {reason}")
         if not isinstance(input_batch.latents, list):
             raise ValueError("Scheduled MixFusion batch requires per-request latents")
-        for request_id, latent, state in zip(
-            input_batch.request_ids, input_batch.latents, input_batch.states, strict=True
-        ):
+        for request_id, _, state in zip(input_batch.request_ids, input_batch.latents, input_batch.states, strict=True):
             info = state.mixfusion_info
             if state.request_id != request_id or info is None:
                 raise ValueError(f"MixFusion request {request_id}: missing or mismatched admission metadata")

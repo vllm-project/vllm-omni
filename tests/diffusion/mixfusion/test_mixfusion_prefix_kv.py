@@ -153,7 +153,7 @@ class _Decoder(nn.Module):
         return _Output(inputs_embeds * 2)
 
 
-def test_sequence_root_restores_order_and_rebuilds_after_departure():
+def test_prefix_kv_root_restores_order_and_recomputes_chunks_after_departure():
     model = _Decoder()
     apply_mixfusion(model, model._mixfusion_plan)
     docs = []
@@ -180,7 +180,7 @@ def test_sequence_root_restores_order_and_rebuilds_after_departure():
         assert tuple(doc.request_id for doc in step.plan.documents) == tuple(d.geometry.request_id for d in active)
 
 
-def test_sequence_checks_descendant_hooks_and_allows_explicit_token_local_hook():
+def test_prefix_kv_root_checks_descendant_hooks():
     model = _Decoder()
     model.layers = nn.ModuleList([nn.Linear(8, 8)])
 

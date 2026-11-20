@@ -117,11 +117,11 @@ def build_document_plan(documents: tuple[PackedDocumentGeometry, ...], device: t
 
 
 def pack_document_queries(rows: list[torch.Tensor], plan: PackedExecutionPlan) -> torch.Tensor:
-    """Pack image chunks followed by the remaining queries in one allocation."""
+    """Pack contiguous image rows followed by the remaining queries."""
     images, others = [], []
     for row, doc in zip(rows, plan.documents, strict=True):
         start, stop = (pos - doc.prefix_length for pos in doc.image_span)
-        images.append(plan.image_chunk_rows(row[start:stop]).flatten(0, 1))
+        images.append(row[start:stop])
         if start:
             others.append(row[:start])
         if stop < doc.query_length:

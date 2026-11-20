@@ -121,7 +121,7 @@ def test_chunk_scheduler_applies_image_budget_and_refreshes_members(monkeypatch)
 
 @pytest.mark.parametrize("kind", ["step", "sigma"])
 @pytest.mark.parametrize("disabled", [False, True])
-def test_sequence_admission_preserves_effective_attention_schedules(monkeypatch, kind, disabled):
+def test_prefix_kv_admission_preserves_effective_attention_schedules(monkeypatch, kind, disabled):
     config, preprocess, _ = _preprocessor(monkeypatch)
     config.diffusion_attention_schedule = AttentionScheduleConfig(
         profiles={"p": {"default": "TORCH_SDPA"}},
@@ -149,7 +149,7 @@ def test_legacy_ar_preparation_validates_token_prefix():
 
 
 @pytest.mark.parametrize("reused", [0, 7])
-def test_first_and_later_sequence_masks_match_existing_hunyuan_masks(monkeypatch, reused):
+def test_first_and_later_packed_masks_match_existing_hunyuan_masks(monkeypatch, reused):
     pipeline = _pipeline()
     monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
     tokenizer, processor = _components([12, 14])
