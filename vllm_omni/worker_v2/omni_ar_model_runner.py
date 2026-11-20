@@ -354,9 +354,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # --- Omni: prompt logprobs ---
         assert self.prompt_logprobs_worker is not None
+        prompt_logits_fn = self._prompt_logits_fn()
         # Mirror the current parent GPUModelRunner call exactly.
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
-            self.model.compute_logits,
+            prompt_logits_fn,
             text_hidden,
             input_batch,
             self.req_states.all_token_ids.gpu,
@@ -364,7 +365,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self.req_states.prompt_len.np,
         )
         prompt_token_id_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_token_id_logprobs(
-            self.model.compute_logits,
+            prompt_logits_fn,
             text_hidden,
             input_batch,
             self.req_states.prompt_len.np,
