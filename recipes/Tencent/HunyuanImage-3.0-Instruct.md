@@ -149,8 +149,9 @@ the same checkpoint, parallelism, and image settings.
 
 #### Commands
 
-Start the DiT-only server with one of the following CLI-only configurations.
-These commands use explicit CLI flags for all parallelism and runtime settings.
+Each command selects the DiT-only deploy, which defines one diffusion stage
+on visible devices `0,1,2,3`. Each parallelism configuration below uses all
+four devices.
 
 ##### TP=4 + FP8
 
@@ -158,6 +159,7 @@ These commands use explicit CLI flags for all parallelism and runtime settings.
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 4 \
   --quantization fp8 \
   --distributed-executor-backend mp \
@@ -171,6 +173,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 2 \
   --usp 2 \
   --quantization fp8 \
@@ -185,6 +188,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 2 \
   --cfg-parallel-size 2 \
   --quantization fp8 \

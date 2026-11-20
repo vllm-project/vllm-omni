@@ -133,6 +133,7 @@ def build_stage_runtime_overrides(
     uniformly for every stage, they are not per-stage knobs. Callers can
     pass an explicit set for tests or specialized flows.
     """
+    stage_internal_keys: set[str] | frozenset[str]
     if internal_keys is None:
         from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
@@ -142,6 +143,11 @@ def build_stage_runtime_overrides(
         # allowing any field explicitly represented by the deploy schema to
         # continue flowing into per-stage overrides.
         internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
+        # The top-level object belongs to the orchestrator, but a nested
+        # per-stage parallel config is consumed by the stage builder.
+        stage_internal_keys = internal_keys - {"parallel_config"}
+    else:
+        stage_internal_keys = internal_keys
 
     result: dict[str, Any] = {}
     stage_overrides: dict[str, Any] = {}
@@ -155,7 +161,7 @@ def build_stage_runtime_overrides(
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
             if override_stage_id == stage_id:
-                if param_name not in internal_keys:
+                if param_name not in stage_internal_keys:
                     stage_overrides[param_name] = value
                 elif warn_dropped:
                     logger.warning(

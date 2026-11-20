@@ -216,12 +216,12 @@ execution paths retain their defaults.
 
 ### Optional padded DiT compilation
 
-The generic CUDA Code2Wav path can opt into DiT compilation through the existing HF override interface:
+The generic CUDA Code2Wav path reads `cosyvoice3_compile_dit` from the HF overrides for stage 1.
 
 ```bash
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 \
   --trust-remote-code --deploy-config cosyvoice3.yaml \
-  --hf-overrides '{"cosyvoice3_compile_dit": true}'
+  --stage-overrides '{"1": {"hf_overrides": {"cosyvoice3_compile_dit": true}}}'
 ```
 
 This option defaults to `false`, preserves the selected attention backend, and compiles only the padded DiT estimator after loading its weights. CUDA with CUDNN_ATTN, FLASH_ATTN, or TORCH_SDPA is required; CPU and the separately compiled packed Flow profiles reject this option. HiFT and the Talker are unchanged. It is independent of speculative decoding and introduces no environment variable.

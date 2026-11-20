@@ -497,13 +497,18 @@ platform-specific value in a user overlay, use the same platform block.
 `--stage-overrides` logs a warning and ignores deploy-only fields such
 as `session_mode` and `connectors`. Set those fields in the deploy YAML.
 
-Stage-owned flags such as `--gpu-memory-utilization`, `--max-model-len`
-and `--tensor-parallel-size` reject a flat value that would override
+Stage-owned flags such as `--gpu-memory-utilization`, `--kv-cache-memory-bytes`,
+`--max-model-len`, and `--tensor-parallel-size` reject a flat value that would override
 multiple stages in `vllm serve --omni`. Use `--stage-overrides` or a
 deploy YAML to specify the value for each intended stage. A numeric
 `--stage-id` scopes these flags to the selected stage. Flat flags with a
 single eligible recipient and pipeline-wide flags such as `--dtype`
 continue to work.
+
+A nested `parallel_config` in `--stage-overrides` takes precedence for that
+stage. For example, `'{"1":{"parallel_config":{"tensor_parallel_size":1}}}'`
+sets stage 1's tensor parallel size and lets a flat `--tensor-parallel-size`
+apply to stage 0 in a two-stage pipeline.
 
 ### Stage-Based CLI Paradigm
 

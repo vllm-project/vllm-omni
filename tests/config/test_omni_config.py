@@ -320,6 +320,70 @@ def test_serve_allows_minimax_h3_tp_when_encoder_has_its_own_flag() -> None:
     assert [stage.parallel_config.tensor_parallel_size for stage in config.stage_configs] == [2, 4]
 
 
+def test_serve_rejects_ambiguous_kv_cache_memory_budget() -> None:
+    with pytest.raises(ValueError, match=r"--kv-cache-memory-bytes .*\[0, 1\].*--stage-overrides"):
+        _from_pipeline_key(
+            "qwen3_tts",
+            cli_overrides={SERVE_CLI_SCOPE_KEY: True, "kv_cache_memory_bytes": 1048576},
+        )
+
+
+def test_serve_scopes_kv_cache_budget_and_keeps_pipeline_flags() -> None:
+    config = _from_pipeline_key(
+        "qwen3_tts",
+        cli_overrides={
+            SERVE_CLI_SCOPE_KEY: True,
+            "stage_id": 0,
+            "kv_cache_memory_bytes": 1048576,
+            "dtype": "float16",
+            "revision": "pinned-revision",
+            "served_model_name": ["custom-tts"],
+        },
+    )
+
+    assert [stage.cache_config.kv_cache_memory_bytes for stage in config.stage_configs] == [1048576, None]
+    assert [stage.model_config.dtype for stage in config.stage_configs] == ["float16", "float16"]
+    assert [stage.model_config.revision for stage in config.stage_configs] == ["pinned-revision"] * 2
+    assert [stage.model_config.served_model_name for stage in config.stage_configs] == [["custom-tts"]] * 2
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_tts", "minimax_h3_disaggregated"])
+@pytest.mark.parametrize("stage_id", ["1", "01"])
+def test_serve_nested_stage_parallel_config_masks_flat_tp(model_type: str, stage_id: str) -> None:
+    config = _from_pipeline_key(
+        model_type,
+        cli_overrides={
+            SERVE_CLI_SCOPE_KEY: True,
+            "tensor_parallel_size": 2,
+            f"stage_{stage_id}_parallel_config": {"tensor_parallel_size": 1},
+        },
+    )
+
+    assert [stage.parallel_config.tensor_parallel_size for stage in config.stage_configs] == [2, 1]
+
+
+def test_serve_nested_null_does_not_mask_flat_llm_tp() -> None:
+    with pytest.raises(ValueError, match=r"--tensor-parallel-size .*\[0, 1\].*--stage-overrides"):
+        _from_pipeline_key(
+            "qwen3_tts",
+            cli_overrides={
+                SERVE_CLI_SCOPE_KEY: True,
+                "tensor_parallel_size": 2,
+                "stage_1_parallel_config": {"tensor_parallel_size": None},
+            },
+        )
+
+
+def test_serve_keeps_diffusion_only_routing_for_global_max_cpu_loras() -> None:
+    config = _from_pipeline_key(
+        "bagel",
+        cli_overrides={SERVE_CLI_SCOPE_KEY: True, "max_cpu_loras": 4},
+    )
+
+    assert config.stage_by_id(0).lora_config is None
+    assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 4
+
+
 def test_direct_pipeline_config_keeps_global_stage_overrides() -> None:
     config = _from_pipeline_key("qwen2_5_omni", cli_overrides={"gpu_memory_utilization": 0.25})
 

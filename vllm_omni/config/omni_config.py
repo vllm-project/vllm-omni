@@ -81,6 +81,18 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
 
 _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 
+# Keep model source pins and settings shared with the serving frontend global.
+_SERVE_SHARED_CLI_FIELDS = frozenset(
+    {
+        "allowed_local_media_path",
+        "allowed_media_domains",
+        "code_revision",
+        "revision",
+        "served_model_name",
+        "tokenizer_revision",
+    }
+)
+
 _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
@@ -384,6 +396,19 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
+def _global_stage_engine_fields(
+    execution_type: StageExecutionType,
+    *,
+    stage_scoped_lora: bool,
+) -> frozenset[str]:
+    owned_fields = _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+    if execution_type == StageExecutionType.DIFFUSION:
+        return owned_fields - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+    if stage_scoped_lora:
+        owned_fields = owned_fields - _LLM_LORA_ENGINE_FIELDS
+    return owned_fields - {"step_execution"}
+
+
 def _stage_cli_overrides(
     stage_id: int,
     cli_overrides: Mapping[str, Any],
@@ -391,6 +416,11 @@ def _stage_cli_overrides(
     execution_type: StageExecutionType | None = None,
     stage_scoped_lora: bool = False,
 ) -> dict[str, Any]:
+    scoped_inputs = {
+        match[2]: value
+        for name, value in cli_overrides.items()
+        if (match := _STAGE_OVERRIDE_PATTERN.fullmatch(name)) is not None and int(match[1]) == stage_id
+    }
     if execution_type == StageExecutionType.DIFFUSION:
         stage_override_pattern = re.compile(r"^stage_\d+_")
         stage_scoped = {
@@ -404,27 +434,20 @@ def _stage_cli_overrides(
             ),
             **stage_scoped,
         }
-    elif stage_scoped_lora and execution_type is not None:
-        # Filter global LoRA inputs before merging stage-scoped values so a
-        # diffusion cache size cannot overwrite an LLM stage's explicit value.
-        cli_overrides = {name: value for name, value in cli_overrides.items() if name not in _LLM_LORA_ENGINE_FIELDS}
     runtime_overrides = build_stage_runtime_overrides(
         stage_id,
         dict(cli_overrides),
         warn_dropped=execution_type is not StageExecutionType.DIFFUSION,
     )
     global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
-    owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+    owned_fields = (
+        None
+        if execution_type is None
+        else _global_stage_engine_fields(execution_type, stage_scoped_lora=stage_scoped_lora)
+    )
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
-        stage_key = f"stage_{stage_id}_{key}"
-        stage_specific = stage_key in cli_overrides
-        if (
-            execution_type == StageExecutionType.DIFFUSION
-            and key in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
-            and not stage_specific
-        ):
-            continue
+        stage_specific = scoped_inputs.get(key) is not None
         if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
             result[key] = _copy_value(value)
 
@@ -433,25 +456,22 @@ def _stage_cli_overrides(
     if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
         result.pop("step_execution", None)
     if execution_type == StageExecutionType.DIFFUSION:
-        prefix = f"stage_{stage_id}_"
-        for key, value in cli_overrides.items():
-            if key.startswith(prefix):
-                field_name = key.removeprefix(prefix)
-                if field_name in {"model", "model_arch", "stage_id"}:
-                    raise ValueError(f"Diffusion stage {stage_id} cannot override identity field {field_name!r}.")
-                if field_name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS:
-                    raise ValueError(
-                        f"Diffusion stage {stage_id} cannot override shared engine field {field_name!r}; "
-                        "it has no diffusion stage-config consumer."
-                    )
-                if field_name in NON_STAGE_OVERRIDE_FIELDS or field_name == "default_sampling_params":
-                    logger.warning(
-                        "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
-                        stage_id,
-                        field_name,
-                    )
-                    continue
-                result.setdefault(field_name, _copy_value(value))
+        for field_name, value in scoped_inputs.items():
+            if field_name in {"model", "model_arch", "stage_id"}:
+                raise ValueError(f"Diffusion stage {stage_id} cannot override identity field {field_name!r}.")
+            if field_name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS:
+                raise ValueError(
+                    f"Diffusion stage {stage_id} cannot override shared engine field {field_name!r}; "
+                    "it has no diffusion stage-config consumer."
+                )
+            if field_name in NON_STAGE_OVERRIDE_FIELDS or field_name == "default_sampling_params":
+                logger.warning(
+                    "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
+                    stage_id,
+                    field_name,
+                )
+                continue
+            result.setdefault(field_name, _copy_value(value))
     return result
 
 
@@ -460,18 +480,32 @@ def _scope_serve_stage_flags(pipeline: PipelineConfig, cli_overrides: dict[str, 
     if len(pipeline.stages) <= 1:
         return
 
-    cli_fields = _global_stage_cli_fields() | _DIFFUSION_STAGE_CLI_ALIASES.keys()
-    stage_fields = (_STAGE_DEPLOY_FIELDS.keys() & cli_fields) - set(_PIPELINE_DEPLOY_CLI_FIELDS)
+    cli_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS | _DIFFUSION_STAGE_CLI_ALIASES.keys()
+    stage_fields = cli_fields - _SERVE_SHARED_CLI_FIELDS - set(_PIPELINE_DEPLOY_CLI_FIELDS)
     explicit_flags = {
         name: value for name, value in cli_overrides.items() if name in stage_fields and value is not None
     }
     if not explicit_flags:
         return
 
+    scoped_overrides = {name: value for name, value in cli_overrides.items() if _STAGE_OVERRIDE_PATTERN.fullmatch(name)}
     scoped_by_stage: dict[int, set[str]] = {}
-    for name, value in cli_overrides.items():
-        if value is not None and (match := _STAGE_OVERRIDE_PATTERN.fullmatch(name)) is not None:
-            scoped_by_stage.setdefault(int(match[1]), set()).add(match[2])
+    owners_by_stage: dict[int, frozenset[str]] = {}
+    for stage in pipeline.stages:
+        stage_overrides = build_stage_runtime_overrides(stage.stage_id, scoped_overrides, warn_dropped=False)
+        scoped_fields = set(stage_overrides)
+        nested_parallel = _mapping_or_empty(stage_overrides.get("parallel_config"))
+        if nested_parallel:
+            if stage.execution_type == StageExecutionType.DIFFUSION:
+                # Flat diffusion flags move into parallel_config before the
+                # scoped mapping is merged. Even a nested null replaces one.
+                scoped_fields.update(nested_parallel.keys() & _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS)
+            else:
+                field_map = _PARALLEL_CONFIG_ENGINE_FIELD_MAP
+                effective_parallel = _normalize_config_mapping(nested_parallel, field_map)
+                scoped_fields.update(field_map[field] for field in effective_parallel if field in field_map)
+        scoped_by_stage[stage.stage_id] = scoped_fields
+        owners_by_stage[stage.stage_id] = _global_stage_engine_fields(stage.execution_type, stage_scoped_lora=True)
 
     selected_id = cli_overrides.get("stage_id")
     selected = next((stage for stage in pipeline.stages if stage.stage_id == selected_id), None)
@@ -482,16 +516,15 @@ def _scope_serve_stage_flags(pipeline: PipelineConfig, cli_overrides: dict[str, 
         for stage in pipeline.stages:
             aliases = _DIFFUSION_STAGE_CLI_ALIASES if stage.execution_type == StageExecutionType.DIFFUSION else {}
             field = aliases.get(name, name)
-            if field not in _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[stage.execution_type]:
+            if field not in owners_by_stage[stage.stage_id]:
                 continue
             owners.append(stage.stage_id)
             # Diffusion globals are normalized before they are merged with raw
             # stage-scoped inputs. Only the same resulting key masks a global.
-            if field not in scoped_by_stage.get(stage.stage_id, ()):
+            if field not in scoped_by_stage[stage.stage_id]:
                 recipients.append(stage.stage_id)
 
-        # Frontend controls can be represented on StageDeployConfig even though
-        # their consumers are outside the stage engines.
+        # Leave flags consumed outside the stage engines to their own validation.
         if not owners:
             continue
         flag = "--" + name.replace("_", "-")
@@ -502,7 +535,7 @@ def _scope_serve_stage_flags(pipeline: PipelineConfig, cli_overrides: dict[str, 
                     "use --stage-overrides or set it in the owning stage's deploy YAML entry."
                 )
             del cli_overrides[name]
-            if selected.stage_id in recipients and name not in scoped_by_stage.get(selected.stage_id, ()):
+            if selected.stage_id in recipients and name not in scoped_by_stage[selected.stage_id]:
                 cli_overrides[f"stage_{selected.stage_id}_{name}"] = value
         elif len(recipients) > 1:
             ambiguous.append(f"{flag} (stages {recipients})")

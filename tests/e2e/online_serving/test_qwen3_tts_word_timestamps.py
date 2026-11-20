@@ -42,10 +42,17 @@ _PARAMS = [
             "--trust-remote-code",
             "--forced-aligner",
             "Qwen/Qwen3-ForcedAligner-0.6B",
-            "--kv-cache-memory-bytes",
-            str(512 * 1024**2),
             "--stage-overrides",
-            json.dumps({stage_id: {"max_num_seqs": 4, "max_num_batched_tokens": 2048} for stage_id in (0, 1, 2)}),
+            json.dumps(
+                {
+                    stage_id: {
+                        "max_num_seqs": 4,
+                        "max_num_batched_tokens": 2048,
+                        "kv_cache_memory_bytes": 512 * 1024**2,
+                    }
+                    for stage_id in (0, 1, 2)
+                }
+            ),
         ],
     )
 ]
