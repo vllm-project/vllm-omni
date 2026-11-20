@@ -23,8 +23,8 @@ T2I with `n > 1` keeps the serial per-image loop under tensor, sequence, CFG or
 pipeline parallelism, HSDP and cache backends, which covers every command below.
 Other configurations, including the data-parallel commands in
 [Cosmos3-DistOffload](./Cosmos3-DistOffload.md), run the images as one batched
-denoising loop, so they can differ slightly from earlier releases for the same
-seed. Start the server with `--additional-config '{"cosmos3_batch_t2i_outputs": false}'`
+denoising loop, so they can differ from earlier releases for the same seed,
+usually slightly. Start the server with `--additional-config '{"cosmos3_batch_t2i_outputs": false}'`
 to keep the serial loop everywhere.
 
 ## References

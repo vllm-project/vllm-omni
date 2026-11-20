@@ -41,8 +41,8 @@ For the larger checkpoints see [Cosmos3-Nano](./Cosmos3-Nano.md) and [Cosmos3-Su
 - **Acceleration**: `--quantization fp8` and attention-backend selection are supported. Cache-DiT and
   Sequence Parallel are inherited from the base Cosmos3 transformer (Edge overrides neither) and act on
   the shared GEN pathway — not separately benchmarked here. Tensor Parallel is untested on this checkpoint.
-- **T2I with `n > 1`** runs as one batched denoising loop, so images can differ slightly from earlier
-  releases for the same seed. Tensor, sequence, CFG or pipeline parallelism, HSDP and cache backends
+- **T2I with `n > 1`** runs as one batched denoising loop, so images can differ from earlier releases
+  for the same seed, usually slightly. Tensor, sequence, CFG or pipeline parallelism, HSDP and cache backends
   keep the serial per-image loop; data-parallel replicas still batch. Start the server with
   `--additional-config '{"cosmos3_batch_t2i_outputs": false}'` to keep the serial loop everywhere.
 

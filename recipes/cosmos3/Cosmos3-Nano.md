@@ -18,7 +18,7 @@ mode is selected per request:
 
 - **T2I** — `POST /v1/images/generations` (or a prompt carrying `modalities=["image"]`).
   With `n > 1`, the images run as one batched denoising loop, so they can differ
-  slightly from earlier releases for the same seed. Tensor, sequence, CFG or
+  from earlier releases for the same seed, usually slightly. Tensor, sequence, CFG or
   pipeline parallelism, HSDP, cache backends and distilled checkpoints keep the
   serial per-image loop; data-parallel replicas still batch. Start the server with
   `--additional-config '{"cosmos3_batch_t2i_outputs": false}'` to keep the serial
