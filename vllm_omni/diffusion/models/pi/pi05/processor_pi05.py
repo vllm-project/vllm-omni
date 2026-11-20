@@ -31,12 +31,13 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.models.pi05.config import resolve_excluded_action_indices
-from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
+from vllm_omni.diffusion.models.pi.common import image_processing
+from vllm_omni.diffusion.models.pi.common.text_processing import tokenize_fixed_length
+from vllm_omni.diffusion.models.pi.pi05.config import resolve_excluded_action_indices
+from vllm_omni.diffusion.models.pi.pi05.modeling_pi05 import (
     DEFAULT_IMAGE_RESOLUTION,
     DEFAULT_MAX_TOKEN_LEN,
     DEFAULT_STATE_NUM_BINS,
@@ -64,25 +65,12 @@ def resize_with_pad(
     [-1, 1] is what lets the padded region blend with SigLIP-normalized
     pixels without adding signal at the boundary.
     """
-    if images.ndim != 4:
-        raise ValueError(f"Expected 4-D (B,C,H,W), got {images.ndim}-D")
-    _, _, cur_h, cur_w = images.shape
-    ratio = max(cur_w / target_width, cur_h / target_height)
-    rh, rw = int(cur_h / ratio), int(cur_w / ratio)
-    align_corners = False if mode == "bilinear" else None
-    resized = F.interpolate(images, size=(rh, rw), mode=mode, align_corners=align_corners)
-    resized = resized.clamp(-1.0, 1.0)
-    ph, rem_h = divmod(target_height - rh, 2)
-    pw, rem_w = divmod(target_width - rw, 2)
-    return F.pad(resized, (pw, pw + rem_w, ph, ph + rem_h), value=-1.0)
+    return image_processing.resize_with_pad(images, target_height, target_width, mode)
 
 
 def pil_image_to_tensor(image: Image.Image) -> torch.Tensor:
     """PIL → ``(1, C, H, W)`` float32 in ``[-1, 1]`` (SigLIP normalization)."""
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    arr = np.array(image, dtype=np.float32) / 255.0 * 2.0 - 1.0
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    return image_processing.pil_image_to_tensor(image)
 
 
 class Pi05ImageProcessor:
@@ -131,7 +119,7 @@ class Pi05ImageProcessor:
 
     def make_empty_image(self) -> torch.Tensor:
         """Fill tensor for an unused camera slot — pure -1, matches OpenPI/LeRobot."""
-        return torch.full((1, 3, self.image_size, self.image_size), -1.0)
+        return image_processing.make_empty_image(self.image_size)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -300,15 +288,7 @@ def tokenize_prompt(tokenizer, text: str, max_token_len: int = DEFAULT_MAX_TOKEN
     segment is always ``max_token_len`` tokens regardless of the instruction, so
     only ``attention_mask.sum()`` varies per request.
     """
-    enc = tokenizer(
-        text,
-        padding="max_length",
-        max_length=max_token_len,
-        truncation=True,
-        add_special_tokens=True,
-        return_tensors=None,
-    )
-    return list(enc["input_ids"]), list(enc["attention_mask"])
+    return tokenize_fixed_length(tokenizer, text, max_token_len)
 
 
 # ──────────────────────────────────────────────────────────────────────

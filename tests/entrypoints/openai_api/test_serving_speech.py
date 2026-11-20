@@ -34,6 +34,7 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -1832,6 +1833,31 @@ class TestTTSMethods:
         assert response.error.type == "InternalServerError"
 
     @pytest.mark.asyncio
+    async def test_create_speech_engine_validation_error_returns_bad_request(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        # vLLM raises VLLMValidationError (a VLLMClientError, not a ValueError)
+        # from add_request when e.g. the prompt exceeds max_model_len.
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(
+                side_effect=VLLMValidationError(
+                    "The decoder prompt (length 12011) is longer than the maximum model length of 4096."
+                )
+            ),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.BAD_REQUEST
+        assert response.error.type == "BadRequestError"
+
+    @pytest.mark.asyncio
     async def test_create_speech_unexpected_failure_returns_internal_server_error(
         self,
         speech_server,
@@ -1929,6 +1955,78 @@ class TestTTSMethods:
             )
 
         assert exc_info.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_audio_synthesis_error_flag_fails_batch_item_and_stream(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ) -> None:
+        from vllm_omni.entrypoints.openai.protocol.audio import (
+            BatchSpeechRequest,
+            SpeechBatchItem,
+        )
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(side_effect=lambda *a, **k: ("speech-synth-err", mock_generate(), {})),
+        )
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(speech_server, "_validate_tts_request", return_value=None)
+        speech_server._batch_max_items = 32
+
+        adapter = mocker.MagicMock()
+        adapter.validates_generation = False
+        adapter.collect_response_metadata = lambda _audio_output, collect: collect.__setitem__(
+            "audio_synthesis_error", True
+        )
+        mocker.patch.object(speech_server, "_get_tts_adapter", return_value=adapter)
+
+        batch_resp = await speech_server.create_speech_batch(BatchSpeechRequest(items=[SpeechBatchItem(input="Hello")]))
+        assert batch_resp.results[0].status == "error"
+        assert batch_resp.failed == 1
+        assert batch_resp.succeeded == 0
+
+        with pytest.raises(TTSGenerationError, match="failed to synthesize audio"):
+            async for _ in speech_server._generate_audio_chunks(
+                generator=mock_generate(),
+                request_id="speech-stream-synth-err",
+                response_format="pcm",
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_sse_audio_synthesis_error_after_audio_discards_partial(self, speech_server) -> None:
+        """A later failed output must reject the stream without emitting its audio."""
+        speech_server._tts_model_type = "yue2"
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test(audio_sample_rate=24000)
+            failed_output = create_mock_audio_output_for_test(audio_sample_rate=24000)
+            assert failed_output.multimodal_output is not None
+            failed_output.multimodal_output["meta.error"] = torch.tensor(1)
+            yield failed_output
+
+        events = [
+            json.loads(event.split("data: ", 1)[1])
+            async for event in speech_server._generate_audio_sse_events(
+                generator=mock_generate(),
+                request_id="speech-sse-synth-err",
+                response_format="pcm",
+            )
+        ]
+
+        # Only the healthy chunk is emitted: no failed audio or success event.
+        assert [event["type"] for event in events] == ["speech.audio.delta", "speech.audio.error"]
+        assert events[0]["audio"]
+        assert events[1]["error"]["partial_audio"] is True
+        assert events[1]["error"]["action"] == "discard"
+        assert events[1]["error"]["code"] == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert "failed to synthesize audio" in events[1]["error"]["message"]
 
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
@@ -6442,6 +6540,27 @@ class TestTTSAsyncOffloading:
         request = OpenAICreateSpeechRequest(input="hello", voice="test")
         asyncio.run(voxtral_server._prepare_speech_generation(request))
         voxtral_server._adapter._build_prompt_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_voxtral_seed_sets_tts_local_seed(self, voxtral_server, mocker: MockerFixture):
+        default_params = voxtral_server.engine_client.default_sampling_params_list[0]
+        default_params.seed = None
+        default_params.extra_args = None
+        voxtral_server.engine_client.collective_rpc = mocker.AsyncMock(return_value=[False])
+        voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        stage0_params = voxtral_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert stage0_params.extra_args["omni_user_seed"] is True
+        assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
 
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):
         """Qwen3 TTS path should call _estimate_prompt_len_async."""
