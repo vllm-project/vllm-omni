@@ -1587,6 +1587,55 @@ def test_preprocess_action_image_with_explicit_size_is_stretched() -> None:
     assert bottom_red > 0.9
 
 
+def _action_frame_with_red_bottom_band() -> Image.Image:
+    # 16:10 frame, so the 480p action bucket (832x480) does not match it.
+    image = Image.new("RGB", (640, 400), (0, 255, 0))
+    image.paste((255, 0, 0), (0, 360, 640, 400))
+    return image
+
+
+def test_preprocess_action_image_without_size_is_padded() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"image": _action_frame_with_red_bottom_band()}},
+        sampling_params=make_sampling_params(
+            height=None, width=None, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    result = preprocess(request)
+    preprocessed = result.prompt["additional_information"]["preprocessed_image"]
+
+    # The size comes from the bucket and the frame is padded, not stretched:
+    # the bottom rows mirror the green content above the red band.
+    assert (result.sampling_params.height, result.sampling_params.width) == (480, 832)
+    assert tuple(preprocessed.shape[-2:]) == (480, 832)
+    bottom_red = preprocessed[0, 0, -20:].float().mean().item()
+    assert bottom_red < -0.9
+
+
+def test_preprocess_action_video_with_explicit_size_is_padded() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    frames = [_action_frame_with_red_bottom_band() for _ in range(3)]
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"video": frames}},
+        sampling_params=make_sampling_params(
+            height=480, width=832, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    preprocessed = preprocess(request).prompt["additional_information"]["preprocessed_image"]
+
+    # The serving layer never resized video frames, so the first frame is
+    # padded like before.
+    bottom_red = preprocessed[0, 0, -20:].float().mean().item()
+    assert bottom_red < -0.9
+
+
 def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
     """Serving may pass multipart uploads as /tmp/...mp4 path lists (#8073)."""
     imageio = pytest.importorskip("imageio.v3")
