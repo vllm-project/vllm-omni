@@ -420,6 +420,8 @@ class BatchedToken2Wav(nn.Module):
         if initial_frames:
             token_widths.add(left_context + initial_frames)
         self._chunk_encoder_token_widths = tuple(sorted(width for width in token_widths if width > 0))
+        self._chunk_encoder_steady_width = left_context + chunk_frames
+        self._chunk_encoder_singleton_history = encoder_cfg.get("singleton_history_frames")
         self._precapture_encoder_tails = bool(encoder_cfg.get("precapture_tails", False))
         self._tail_encoder_graph: FlowEncoderGraphs | None = None
         self._c8_mixed_tail_checks: dict[tuple, int] = {}
@@ -1084,6 +1086,15 @@ class BatchedToken2Wav(nn.Module):
         )
         # Prefer steady-state lengths for every width before transient lengths.
         keys = sorted(keys, key=lambda key: (-key[2], key[1]))[: graph.max_graphs]
+        history = self._chunk_encoder_singleton_history
+        width = self._chunk_encoder_steady_width
+        if history is not None and att.device.type == "npu" and 1 in graph.rows and width in widths:
+            # Keep the existing multi-row partition choices. The added history
+            # shapes may only serve a chunk that already has a single row.
+            seeded = set(keys)
+            added = [(1, width, length) for length in history if (1, width, length) not in seeded]
+            keys.extend(added)
+            graph.exact_only_keys = frozenset(added)
         probe = torch.zeros((1, max(widths)), dtype=torch.long, device=att.device)
         probe_att = torch.zeros(
             (*att.shape[:3], max(key[2] for key in keys), att.shape[4]), dtype=att.dtype, device=att.device

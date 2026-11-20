@@ -102,6 +102,7 @@ class FlowEncoderGraphs:
         self._precision: tuple[Any, ...] | None = None
         # (rows, tokens, cache frames) -> (graph, static views by name)
         self.graphs: dict[tuple[int, int, int], tuple[Any, dict[str, torch.Tensor]]] = {}
+        self.exact_only_keys: frozenset[tuple[int, int, int]] = frozenset()
         self.replays = 0
         self.enabled = True
         self._storage: dict[str, torch.Tensor] = {}
@@ -308,7 +309,10 @@ class FlowEncoderGraphs:
         if (entry := self.graphs.get(key)) is None:
             # Large serving batches reuse the small startup arena. Never pad
             # conformer cache lengths: relative attention depends on them.
-            sizes = sorted((r for r, w, f in self.graphs if (w, f) == key[1:]), reverse=True)
+            sizes = sorted(
+                (r for r, w, f in self.graphs if (w, f) == key[1:] and (r, w, f) not in self.exact_only_keys),
+                reverse=True,
+            )
             if not sizes or rows <= sizes[0] or 1 not in sizes:
                 return None
             outputs = None

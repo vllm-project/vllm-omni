@@ -478,7 +478,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             encoder_rows = list(range(1, int(encoder_rows) + 1))
         if not encoder_rows or any(row < 1 for row in encoder_rows):
             raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
+        history = extra.get("code2wav_encoder_graph_singleton_history_frames")
+        if history is not None:
+            if (
+                not isinstance(history, (list, tuple))
+                or len(history) != 3
+                or any(type(value) is not int or value < 1 for value in history)
+                or history[0] > history[1]
+            ):
+                raise ValueError("code2wav_encoder_graph_singleton_history_frames must be [start, stop, stride]")
+            history = range(history[0], history[1] + 1, history[2])
         self._chunk_encoder_graph_config = {
+            "singleton_history_frames": history,
             "enabled": read_bool_flag(extra, "enable_code2wav_encoder_graph", False),
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),

@@ -125,6 +125,18 @@ def test_other_shapes_and_layouts_run_eager(fake_capture, monkeypatch: pytest.Mo
     assert graphs.replays == 1
 
 
+@pytest.mark.cpu
+def test_continuation_singleton_graphs_do_not_split_a_larger_batch(fake_capture) -> None:
+    graphs, encode = _graphs("cpu", rows=(1,))
+    graphs.exact_only_keys = frozenset({(1, 6, 18)})
+
+    assert graphs.run(*_inputs(3, 6, 18, "cpu")) is None
+    assert graphs.replays == 0
+    _check_replay(graphs, encode, 1, 18, "cpu")
+    _check_replay(graphs, encode, 3, 8, "cpu")
+    assert graphs.replays == 4
+
+
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_captured_graphs_match_eager_bit_exactly_on_cuda() -> None:
@@ -214,6 +226,8 @@ def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform,
     backend = SimpleNamespace(
         _chunk_encoder_graph=graphs,
         _chunk_encoder_token_widths=(6,),
+        _chunk_encoder_steady_width=6,
+        _chunk_encoder_singleton_history=None,
         _flow_supports_graphs=lambda: True,
         _pre_lookahead_len=lambda: _LOOKAHEAD,
         _upsample_stride=lambda: 2,
