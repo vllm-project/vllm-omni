@@ -489,7 +489,7 @@ def test_speech_batch_invalid_field_values(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ``test_speech_stream_invalid_requests``: build ``session.config`` JSON with ``omni_server.model``.
-_SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_MP3_FRAMES = object()
+_SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES = object()
 
 
 @pytest.mark.parametrize(
@@ -502,9 +502,9 @@ _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_MP3_FRAMES = object()
             id="wrong_first_message_type",
         ),
         pytest.param(
-            _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_MP3_FRAMES,
+            _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES,
             ("invalid session config", "response_format", "pcm"),
-            id="session_config_stream_audio_rejects_mp3",
+            id="session_config_stream_audio_rejects_wav",
         ),
     ],
 )
@@ -516,12 +516,12 @@ def test_speech_stream_invalid_requests(
     err_message: str | tuple[str, ...],
 ) -> None:
     """Bad first WebSocket text frames: non-JSON, wrong ``type``, or invalid ``session.config``."""
-    if send_frames_spec is _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_MP3_FRAMES:
+    if send_frames_spec is _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES:
         send_frames = json.dumps(
             {
                 "type": "session.config",
                 "model": omni_server.model,
-                "response_format": "mp3",
+                "response_format": "wav",
                 "stream_audio": True,
             }
         )

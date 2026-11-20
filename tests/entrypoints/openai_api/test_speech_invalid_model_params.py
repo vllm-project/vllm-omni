@@ -227,8 +227,9 @@ def test_valid_model_parameters_are_accepted(model_type: str) -> None:
     assert adapter_cls(SpeechServingContext(server=server)).validate(request) is None
 
 
-def test_speech_stream_allows_wav_and_rejects_mp3() -> None:
-    config = StreamingSpeechSessionConfig.model_validate({"stream_audio": True, "response_format": "wav"})
-    assert config.response_format == "wav" and config.stream_audio
-    with pytest.raises(ValidationError, match="requires response_format"):
-        StreamingSpeechSessionConfig.model_validate({"stream_audio": True, "response_format": "mp3"})
+def test_speech_stream_allows_pcm_and_rejects_wav_and_mp3() -> None:
+    config = StreamingSpeechSessionConfig.model_validate({"stream_audio": True, "response_format": "pcm"})
+    assert config.response_format == "pcm" and config.stream_audio
+    for response_format in ("wav", "mp3"):
+        with pytest.raises(ValidationError, match="requires response_format='pcm'"):
+            StreamingSpeechSessionConfig.model_validate({"stream_audio": True, "response_format": response_format})
