@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import torch
+from torch.library import Library
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 # Ascend CANN limits the launch coreDim to uint16.
 _MAX_1D_GRID_SIZE = 65535
@@ -240,7 +242,7 @@ def indexed_scale_shift_(
     return x
 
 
-def indexed_gate(
+def _indexed_gate_impl(
     x: torch.Tensor,
     gate: torch.Tensor,
     other: torch.Tensor,
@@ -293,7 +295,7 @@ def indexed_gate(
     return output
 
 
-def rms_norm_indexed_scale_shift(
+def _rms_norm_indexed_scale_shift_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     shift: torch.Tensor,
@@ -334,7 +336,7 @@ def rms_norm_indexed_scale_shift(
     return output
 
 
-def indexed_gate_rms_norm_scale_shift(
+def _indexed_gate_rms_norm_scale_shift_impl(
     residual: torch.Tensor,
     gate: torch.Tensor,
     branch: torch.Tensor,
@@ -360,8 +362,8 @@ def indexed_gate_rms_norm_scale_shift(
         # The fused kernel stores the BF16-rounded residual and normalizes that value, which is exactly the
         # gate kernel followed by the RMSNorm kernel (same FP32 reduction over the same padded row). Two lean
         # passes run faster on CUDA than one program holding six full-row operands.
-        residual_out = indexed_gate(residual, gate, branch, indices)
-        return residual_out, rms_norm_indexed_scale_shift(residual_out, weight, shift, scale, indices, eps)
+        residual_out = _indexed_gate_impl(residual, gate, branch, indices)
+        return residual_out, _rms_norm_indexed_scale_shift_impl(residual_out, weight, shift, scale, indices, eps)
     residual_out = torch.empty_like(residual)
     modulated_out = torch.empty_like(residual)
     rows, hidden_size = residual.shape
@@ -391,6 +393,106 @@ def indexed_gate_rms_norm_scale_shift(
             num_warps=8,
         )
     return residual_out, modulated_out
+
+
+def _indexed_gate_fake(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def _rms_norm_indexed_scale_shift_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def _indexed_gate_rms_norm_scale_shift_fake(
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    branch: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(residual), torch.empty_like(residual)
+
+
+# The modulation kernels are opaque custom ops so torch.compile launches them as written. Traced through,
+# Inductor recompiles the user Triton kernels into slower variants: the RMSNorm ran 268 us instead of 177 us
+# and the gate 199 us instead of 182 us at MiniMax-H3's 37,824 x 5,376 rows on one B200, with identical output.
+_OP_LIB = Library("vllm_omni", "FRAGMENT")
+for _name, _impl, _fake in (
+    ("indexed_gate", _indexed_gate_impl, _indexed_gate_fake),
+    ("rms_norm_indexed_scale_shift", _rms_norm_indexed_scale_shift_impl, _rms_norm_indexed_scale_shift_fake),
+    (
+        "indexed_gate_rms_norm_scale_shift",
+        _indexed_gate_rms_norm_scale_shift_impl,
+        _indexed_gate_rms_norm_scale_shift_fake,
+    ),
+):
+    if not hasattr(torch.ops.vllm_omni, _name):
+        direct_register_custom_op(
+            op_name=_name,
+            op_func=_impl,
+            fake_impl=_fake,
+            mutates_args=[],
+            target_lib=_OP_LIB,
+        )
+
+
+def indexed_gate(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``x + gate[indices] * other`` without indexed temporaries."""
+    if x.is_cpu:
+        return _indexed_gate_impl(x, gate, other, indices)
+    return torch.ops.vllm_omni.indexed_gate(x, gate, other, indices)
+
+
+def rms_norm_indexed_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fuse RMSNorm with an indexed affine transform."""
+    if x.is_cpu:
+        return _rms_norm_indexed_scale_shift_impl(x, weight, shift, scale, indices, eps)
+    return torch.ops.vllm_omni.rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+
+
+def indexed_gate_rms_norm_scale_shift(
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    branch: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse gated residual, the following RMSNorm, and AdaLN affine."""
+    if residual.is_cpu:
+        return _indexed_gate_rms_norm_scale_shift_impl(residual, gate, branch, weight, shift, scale, indices, eps)
+    return torch.ops.vllm_omni.indexed_gate_rms_norm_scale_shift(
+        residual, gate, branch, weight, shift, scale, indices, eps
+    )
 
 
 __all__ = [
