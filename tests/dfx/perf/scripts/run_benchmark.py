@@ -436,14 +436,14 @@ def _selected_percentile_metrics(params: Mapping[str, object]) -> set[str]:
 def _assert_chat_accuracy(result: Mapping[str, object], params: Mapping[str, object]) -> None:
     min_accuracy = params.get(_MIN_DAILY_OMNI_ACCURACY)
     if min_accuracy is not None:
-        from tests.e2e.accuracy.helpers import _validate_daily_omni
+        from tests.e2e.accuracy.helpers import validate_daily_omni
 
         assert _is_finite_number(min_accuracy), "min_daily_omni_accuracy must be a finite number"
-        errs = _validate_daily_omni(dict(result), min_accuracy=float(min_accuracy))
+        errs = validate_daily_omni(dict(result), min_accuracy=float(min_accuracy))
         assert not errs, "; ".join(errs)
     if not params.get(_SEED_TTS_WER_EVAL):
         return
-    from tests.e2e.accuracy.helpers import _validate_seed_tts
+    from tests.e2e.accuracy.helpers import validate_seed_tts
 
     max_wer = params.get(_MAX_SEED_TTS_MEAN_WER)
     min_sim = params.get(_MIN_SEED_TTS_MEAN_SIM)
@@ -455,7 +455,7 @@ def _assert_chat_accuracy(result: Mapping[str, object], params: Mapping[str, obj
     ):
         if value is not None:
             assert _is_finite_number(value), f"{label} must be a finite number"
-    errs = _validate_seed_tts(
+    errs = validate_seed_tts(
         dict(result),
         max_mean_wer=float(max_wer) if max_wer is not None else None,
         min_mean_sim=float(min_sim) if min_sim is not None else None,
