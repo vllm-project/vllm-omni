@@ -57,6 +57,7 @@ platforms:
       additional_config:
         encoder_enable_npu_graph: true
         encoder_max_npu_graphs: 4
+        minicpmo_long_prefill_eager: true
       compilation_config:
         cudagraph_mode: FULL_DECODE_ONLY
     - max_num_seqs: 16

@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu import model_runner as gpu_runner
@@ -33,7 +34,8 @@ from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
+    from vllm.config import VllmConfig
+    from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
 logger = init_logger(__name__)
 
@@ -41,6 +43,21 @@ logger = init_logger(__name__)
 # it with Ascend request state. Each constructor imports its own factory.
 gpu_runner.init_speculator = scheduler_ngram_factory(gpu_runner.init_speculator)
 ascend_runner.init_speculator = scheduler_ngram_factory(ascend_runner.init_speculator)
+
+
+def _minicpmo_mixed_long_prefill(config: VllmConfig, batch: AscendInputBatch) -> bool:
+    model = config.model_config
+    if (
+        (config.additional_config or {}).get("minicpmo_long_prefill_eager") is not True
+        or model.model_stage != "llm"
+        or "MiniCPMO45OmniForConditionalGeneration" not in (model.architectures or ())
+        or not batch.has_prefill
+        or batch.is_dummy
+    ):
+        return False
+    prefill = batch.is_prefilling_np
+    long_prefill = (batch.prefill_len_np > config.scheduler_config.max_num_batched_tokens) & prefill
+    return bool(long_prefill.any() and (~prefill).any())
 
 
 def _call_without_unknown_kwargs(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -342,6 +359,16 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             kstep_output = self._run_kstep_frames(model_inputs, input_batch)
             if kstep_output is not None:
                 return kstep_output
+        if _minicpmo_mixed_long_prefill(self.vllm_config, input_batch):
+            # Pure prefill stays compiled. The mixed shape can change the point
+            # at which a near-limit request emits its stop token.
+            context = get_forward_context()
+            previous = context.skip_compiled
+            context.skip_compiled = True
+            try:
+                return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
+            finally:
+                context.skip_compiled = previous
         return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
 
     def _full_graph_step_output(self, batch_desc, *, model_inputs, input_batch):
