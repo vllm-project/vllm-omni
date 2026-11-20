@@ -130,10 +130,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # request's own submit so a queue-parked ADD cannot be admitted after
         # the abort returns.
         self._pending_submits: dict[str, asyncio.Task[None]] = {}
-        # True after pause_generation() or AR EngineCore sleep; wake_up must
-        # not reopen generate() until resume_generation(). Diffusion-only
-        # sleep uses _paused as a temporary admission gate and clears it
-        # on wake so sleep → wake → generate keeps working.
+        # True after an explicit pause_generation() or release_kv_cache_memory();
+        # wake_up must not reopen generate() until resume_generation(). Plain
+        # sleep() uses _paused as a temporary admission gate and clears it once
+        # all sleeping tags are restored, matching upstream vLLM AsyncLLM so
+        # sleep -> wake_up -> generate keeps working.
         self._hold_admission_until_resume: bool = False
         # Stages whose scheduler pause_generation closed (AR in any mode,
         # diffusion with mode="keep"); admission stays closed until
@@ -1396,11 +1397,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         in flight. This does **not** invoke EngineCore.pause_scheduler again
         (sleep already pauses the AR scheduler).
 
-        For AR / mixed engines, ``wake_up`` does **not** clear ``_paused``;
-        callers must :meth:`resume_generation` when ready (typical trainer
-        order: pause → abort → sleep → train → wake → resume). Diffusion-only
-        engines have no EngineCore pause to hold, so ``wake_up`` restores
-        admission and ``sleep → wake → generate`` keeps working.
+        Once all sleeping tags are restored via :meth:`wake_up`, frontend
+        admission reopens automatically (matching upstream vLLM ``AsyncLLM``
+        where ``EngineCore.wake_up`` auto-resumes the scheduler), unless an
+        explicit :meth:`pause_generation` (or :meth:`release_kv_cache_memory`)
+        holds admission until :meth:`resume_generation`.
         """
         # Validate before touching admission state. Raising after
         # ``_paused = True`` would wedge generate() for good: nothing was
@@ -1428,7 +1429,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         sleep_tags = [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value]
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
-            self._hold_admission_until_resume = True
             logger.info(
                 "[%s] Sleeping AR stage(s) %s via EngineCore.sleep(level=%s, mode=%s)",
                 self._name,
@@ -1527,11 +1527,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         AR/LLM stages use EngineCore.wake_up (restore memory, auto-resume
         scheduler). Diffusion stages keep the worker-level wake RPC.
 
-        Does **not** clear the frontend ``_paused`` admission gate when
-        :meth:`pause_generation` ran or AR stages were slept — call
-        :meth:`resume_generation` when the trainer is ready to admit new
-        requests. Diffusion-only ``sleep`` uses ``_paused`` only as a race
-        guard; this method restores admission after a successful wake.
+        Restores the frontend ``_paused`` admission gate once all sleeping
+        tags across all stages are warm, unless an explicit
+        :meth:`pause_generation` or :meth:`release_kv_cache_memory` holds
+        admission until :meth:`resume_generation`. Partial wakes (e.g.
+        ``tags=["weights"]`` while ``kv_cache`` is still asleep, or waking a
+        subset of sleeping stages) keep ``_paused`` closed until the remaining
+        sleeping tags are restored.
         """
         self._final_output_handler()
 
@@ -1594,17 +1596,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._name,
             ar_stage_ids + diffusion_stage_ids,
         )
-        # generate() coroutines parked on the full wake (sleeping tags in the
-        # admission-gate predicate) may now pass the gate (#8678).
+        # Sleep uses `_paused` as a temporary admission gate. Restore
+        # generate() admission once all sleeping tags are warm, unless an
+        # explicit pause_generation() / release_kv_cache_memory() holds it.
+        # Always notify parked waiters (e.g. generate() waiting on sleeping
+        # tags after wake_up(tags=["weights"]) + resume_generation(), #8678).
         async with self._pause_cond:
-            self._pause_cond.notify_all()
-        # Diffusion-only sleep uses `_paused` as a race guard. Restore
-        # generate() admission after memory is back. AR/mixed sleep and
-        # pause_generation keep the trainer hold until resume_generation.
-        if not getattr(self, "_hold_admission_until_resume", False):
-            async with self._pause_cond:
+            if not getattr(self, "_hold_admission_until_resume", False) and not getattr(self, "_sleeping_tags", None):
                 self._paused = False
-                self._pause_cond.notify_all()
+            self._pause_cond.notify_all()
         return final_acks
 
     async def _wake_diffusion(self, stage_ids: list[int], requested_tags: list[str]) -> list[OmniACK]:

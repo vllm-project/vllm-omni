@@ -207,8 +207,10 @@ promotion.
 Test request validation, protocol conversion, model-adapter routing,
 streaming, session identity, disconnect/cancellation, and error mapping for
 each affected offline or serving entrypoint. Sleep must wait for in-flight
-`generate()` admission before EngineCore offload; `wake_up` does not resume
-admission — callers must `resume_generation()`. Sleeping tags are tracked per
+`generate()` admission before EngineCore offload; `wake_up` restores
+admission once all sleeping tags are warm unless an explicit
+`pause_generation()` or `release_kv_cache_memory()` holds it until
+`resume_generation()`. Sleeping tags are tracked per
 stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`.
 Streaming input pumps take an admission slot immediately before each EngineCore
 ADD or update, not while waiting for the next client chunk. Frontend abort
