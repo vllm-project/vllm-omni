@@ -41,24 +41,20 @@ def _ark_block_sparse_parameters() -> frozenset[str]:
 def supports_ark_q256_multirow() -> bool:
     """Return whether ARK can execute independent 64Q rows in one Q256 tile."""
     module = importlib.import_module(_ARK_SPARSE_MODULE)
-    resolver = getattr(module, "_resolve_sparse_prefill_q_tile_override", None)
-    if resolver is None or "allow_multi_row_tile" not in inspect.signature(resolver).parameters:
+    probe = getattr(module, "supports_q256_multirow", None)
+    if probe is None:
         return False
-    try:
-        return (
-            resolver(
-                head_dim=128,
-                quant_block_size=64,
-                q_tile_override=256,
-                sparse_q_block_tokens=64,
-                sparse_k_block_tokens=64,
-                tensor_layout="NHD",
-                allow_multi_row_tile=True,
-            )
-            == 256
-        )
-    except (TypeError, ValueError):
+    return bool(probe())
+
+
+@functools.lru_cache(maxsize=1)
+def supports_ark_k_block_valid() -> bool:
+    """Return whether ARK can mask the zero-padded tail of a partial 64-token K block."""
+    module = importlib.import_module(_ARK_SPARSE_MODULE)
+    probe = getattr(module, "supports_k_block_valid", None)
+    if probe is None:
         return False
+    return bool(probe())
 
 
 def supports_ark_sparse() -> bool:
@@ -126,15 +122,16 @@ if not hasattr(torch.ops.vllm_omni, "ark_block_sparse_attn_bshd"):
             "sparse_k_block_tokens": block_size,
             "tensor_layout": "NHD",
         }
-        parameters = _ark_block_sparse_parameters()
         if block_sizes.numel():
-            if "k_block_valid" in parameters:
-                kwargs["k_block_valid"] = block_sizes
-            else:
-                logger.warning_once(
-                    "The installed ARK block_sparse_sdpa has no k_block_valid support; "
-                    "partial H3 edge blocks will be executed with zero-padded keys."
+            # FastH3 tiles H3's padded latent grid, so partial edge blocks are the
+            # norm. Without per-K-block valid lengths those zero-padded keys enter
+            # the softmax denominator and silently shift the attention weights.
+            if "k_block_valid" not in _ark_block_sparse_parameters() or not supports_ark_k_block_valid():
+                raise RuntimeError(
+                    "The installed auto-round-lib cannot mask zero-padded K-block tails; FastH3 on XPU "
+                    "requires block_sparse_sdpa(k_block_valid=...). Install auto-round-lib>=0.17.0."
                 )
+            kwargs["k_block_valid"] = block_sizes
         return kernel(query, key, value, lut, valid_block_num, **kwargs)
 
     @ark_block_sparse_attn_bshd.register_fake
@@ -177,7 +174,8 @@ def ark_block_sparse_attention(
         block_sizes = torch.empty(0, dtype=torch.int32, device=query.device)
     else:
         block_sizes = block_sizes.to(torch.int32).contiguous()
-    q_tile_override = 256 if supports_ark_q256_multirow() else 64
+    # Q256 multirow only exists for head_dim 128; smaller heads keep the Q64 kernel.
+    q_tile_override = 256 if query.shape[-1] == 128 and supports_ark_q256_multirow() else 64
     return ark_block_sparse_attn_bshd(
         query.contiguous(),
         key.contiguous(),

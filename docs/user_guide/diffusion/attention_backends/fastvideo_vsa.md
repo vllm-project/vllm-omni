@@ -191,16 +191,20 @@ diffusion-attention-config:
     backend: FASTVIDEO_VSA
 ```
 
-The XPU provider requires auto-round-lib with
+The XPU provider requires `auto-round-lib>=0.17.0` with
 `auto_round_kernel.sparse_attention.block_sparse_sdpa`, BF16 inputs, and
-head dimension 128. FastH3 uses ARK's Q256 multirow path: each Q256 workgroup
-consumes four independent 64Q routing rows. Omni's logical tile128 selection is
-split into two 64Q query rows and two 64K key blocks; both query halves inherit
-the same selected 128-token K tiles. This preserves FastH3 routing without a
-Q128 kernel. Startup fails with an actionable error when the installed ARK
-build does not expose Q256 multirow support. Until ARK exposes per-K-block
-valid lengths, partial H3 edge blocks are executed with zero-padded keys and
-the backend logs a warning.
+head dimension 64 or 128. FastH3 (head dimension 128) prefers ARK's Q256
+multirow path: each Q256 workgroup consumes four independent 64Q routing rows.
+Omni's logical tile128 selection is split into two 64Q query rows and two 64K
+key blocks; both query halves inherit the same selected 128-token K tiles. This
+preserves FastH3 routing without a Q128 kernel. When the installed ARK build
+does not expose Q256 multirow support the provider falls back to the Q64 kernel,
+which is correct but slower. FastH3 tiles H3's padded latent grid, so partial
+edge blocks are normal; ARK's per-K-block valid lengths
+(`block_sparse_sdpa(k_block_valid=...)`) mask the zero-padded tail tokens before
+softmax. Startup fails with an actionable error when the installed ARK build
+cannot mask those tails, because the padded keys would otherwise change the
+attention weights.
 
 ## Automatic provider selection
 

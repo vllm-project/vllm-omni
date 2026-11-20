@@ -11,6 +11,7 @@ import torch
 from vllm_omni.diffusion.attention.ops.ark_block_sparse import (
     _ark_block_sparse_parameters,
     block_map_to_lut,
+    supports_ark_k_block_valid,
     supports_ark_q256_multirow,
 )
 from vllm_omni.diffusion.attention.ops.block_sparse import (
@@ -43,29 +44,13 @@ def test_block_map_to_lut_round_trips_including_empty_rows():
     assert torch.count_nonzero(lut[invalid]) == 0
 
 
-def _install_fake_ark(monkeypatch, calls, *, with_k_block_valid=False, q256_multirow=True):
+def _install_fake_ark(monkeypatch, calls, *, with_k_block_valid=True, q256_multirow=True):
     package = types.ModuleType("auto_round_kernel")
     package.__path__ = []
     module = types.ModuleType("auto_round_kernel.sparse_attention")
 
-    if q256_multirow:
-
-        def _resolve_sparse_prefill_q_tile_override(
-            *,
-            head_dim,
-            quant_block_size,
-            q_tile_override,
-            sparse_q_block_tokens,
-            sparse_k_block_tokens,
-            tensor_layout,
-            allow_multi_row_tile=False,
-        ):
-            del head_dim, quant_block_size, sparse_k_block_tokens, tensor_layout
-            if allow_multi_row_tile and q_tile_override == 256 and sparse_q_block_tokens == 64:
-                return 256
-            raise ValueError("not a q256 multi-row configuration")
-
-        setattr(module, "_resolve_sparse_prefill_q_tile_override", _resolve_sparse_prefill_q_tile_override)
+    setattr(module, "supports_q256_multirow", lambda: q256_multirow)
+    setattr(module, "supports_k_block_valid", lambda: with_k_block_valid)
 
     if with_k_block_valid:
 
@@ -84,6 +69,7 @@ def _install_fake_ark(monkeypatch, calls, *, with_k_block_valid=False, q256_mult
     monkeypatch.setitem(sys.modules, "auto_round_kernel.sparse_attention", module)
     _ark_block_sparse_parameters.cache_clear()
     supports_ark_q256_multirow.cache_clear()
+    supports_ark_k_block_valid.cache_clear()
 
 
 def test_ark_provider_dispatches_lut_and_tile64_multirrow(monkeypatch):
@@ -107,11 +93,53 @@ def test_ark_provider_dispatches_lut_and_tile64_multirrow(monkeypatch):
     lut, valid, k_block_valid, kwargs = calls[0]
     assert lut.tolist() == [[[[0, 0], [1, 0]], [[0, 0], [1, 0]]]]
     assert valid.tolist() == [[[1, 1], [1, 1]]]
-    assert k_block_valid is None
+    assert torch.equal(k_block_valid, torch.tensor([64, 64], dtype=torch.int32))
     assert kwargs["q_tile_override"] == 256
     assert kwargs["sparse_q_block_tokens"] == 64
     assert kwargs["sparse_k_block_tokens"] == 64
     assert kwargs["tensor_layout"] == "NHD"
+
+
+def test_ark_provider_requires_k_block_valid_when_blocks_are_partial(monkeypatch):
+    calls: list[Any] = []
+    _install_fake_ark(monkeypatch, calls, with_k_block_valid=False)
+    query = torch.randn(1, 256, 2, 128, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 2, 2, dtype=torch.bool)
+
+    with pytest.raises(RuntimeError, match="auto-round-lib>=0.17.0"):
+        block_sparse_attn_bshd(
+            query,
+            query,
+            query,
+            block_map,
+            torch.tensor([128, 96], dtype=torch.int32),
+            128**-0.5,
+            provider="xpu",
+            block_size=128,
+        )
+    assert calls == []
+
+
+def test_ark_provider_skips_k_block_valid_for_full_block_grids(monkeypatch):
+    calls: list[Any] = []
+    _install_fake_ark(monkeypatch, calls, with_k_block_valid=False)
+    query = torch.randn(1, 128, 2, 128, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 2, 2, dtype=torch.bool)
+
+    block_sparse_attn_bshd(
+        query,
+        query,
+        query,
+        block_map,
+        None,
+        128**-0.5,
+        provider="xpu",
+        block_size=64,
+    )
+
+    _, _, k_block_valid, kwargs = calls[0]
+    assert k_block_valid is None
+    assert kwargs["q_tile_override"] == 256
 
 
 def test_ark_provider_passes_partial_block_sizes_when_supported(monkeypatch):
@@ -158,6 +186,27 @@ def test_ark_tile64_prefers_q256_multirow_when_supported(monkeypatch):
     _, _, _, kwargs = calls[0]
     assert kwargs["q_tile_override"] == 256
     assert kwargs["sparse_q_block_tokens"] == 64
+
+
+def test_ark_head_dim_64_keeps_q64_tile(monkeypatch):
+    calls: list[Any] = []
+    _install_fake_ark(monkeypatch, calls, q256_multirow=True)
+    query = torch.randn(1, 256, 2, 64, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 4, 4, dtype=torch.bool)
+
+    block_sparse_attn_bshd(
+        query,
+        query,
+        query,
+        block_map,
+        torch.full((4,), 64, dtype=torch.int32),
+        64**-0.5,
+        provider="xpu",
+        block_size=64,
+    )
+
+    _, _, _, kwargs = calls[0]
+    assert kwargs["q_tile_override"] == 64
 
 
 def test_ark_old_build_uses_q64_fallback(monkeypatch):
