@@ -21,11 +21,12 @@ class VoxtralTTSAdapter(ARTTSAdapter):
     # Stage-0 logits are fixed (audio-token / EOS); acoustic frames come from
     # the flow-matching transformer, so SamplingParams.temperature has no effect.
     supports_temperature = False
+    reports_length_truncation = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._build_prompt_async = make_async(self._build_prompt, executor=getattr(ctx.server, "_tts_executor", None))
-        self._encoder_loaded = None
+        self._encoder_loaded: bool | None = None
 
     def _build_prompt(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
         """Build a Voxtral prompt for either a preset voice or inline reference audio."""
@@ -48,6 +49,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         if server._tts_tokenizer is None:
             from vllm.tokenizers import cached_tokenizer_from_config
 
+            assert self.ctx.engine_client is not None
             server._tts_tokenizer = cached_tokenizer_from_config(self.ctx.engine_client.model_config).instruct
 
         if isinstance(ref_audio, str) and ref_audio.startswith("data:"):
@@ -106,6 +108,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="voxtral_tts")
 
     def _load_supported_speakers(self) -> list[str]:
+        assert self.ctx.engine_client is not None
         config = self.ctx.engine_client.model_config.hf_config.audio_config
         return load_supported_speakers(self.ctx.engine_client, config)
 
