@@ -1124,6 +1124,8 @@ source_file_dependencies:
     - tests/helpers/stage_config.py
     - vllm_omni/config/
     - vllm_omni/deploy/higgs_multimodal_qwen3.yaml
+    - vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml
+    - vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml
     - vllm_omni/engine/
     - vllm_omni/entrypoints/omni_base.py
     - vllm_omni/entrypoints/openai/tts_adapters/higgs_audio_v3.py
@@ -1294,7 +1296,7 @@ source_file_dependencies:
     - vllm_omni/outputs/
     - vllm_omni/transformers_utils/configs/minimax_music3.py
 
-  tts_yue2_weekly:
+  tts_yue2_weekly: &tts_yue2_weekly
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/assets/yue2/
     - tests/e2e/features/yue2/
@@ -1314,6 +1316,14 @@ source_file_dependencies:
     - vllm_omni/tokenizers/yue2_prompt.py
     - vllm_omni/tokenizers/yue2_tokenizer.py
     - vllm_omni/transformers_utils/configs/yue2.py
+    - vllm_omni/worker_v2/omni_ar_model_runner.py
+    - vllm_omni/worker_v2/omni_model_runner.py
+    - vllm_omni/worker_v2/model_states/omni_model_state.py
+
+  tts_yue2_function:
+    - *tts_yue2_weekly
+    - tests/e2e/offline_inference/test_yue2.py
+    - examples/offline_inference/yue2/end2end.py
 
   tts_cosyvoice3_function:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
@@ -1569,17 +1579,25 @@ source_file_dependencies:
 
   diffusion_hunyuan_image3_accuracy:
     - *hunyuan_image3
-    - tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py
+    - tests/e2e/accuracy/test_hunyuan_image3.py
+    - tests/assets/hunyuan_image3/
     - tests/e2e/accuracy/test_hunyuan_image3_lora.py
     - vllm_omni/diffusion/lora/
 
   diffusion_hunyuan_image3_perf:
     - *hunyuan_image3
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/conftest.py
+    - tests/assets/hunyuan_image3/
+    - tests/dfx/perf/tests/test_hunyuan_image3_it2i.json
+    - tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json
+    - tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
     - tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - vllm_omni/deploy/hunyuan_image_3_moe.yaml
+    - vllm_omni/deploy/hunyuan_image3_dit.yaml
 
   diffusion_hunyuan_image3_reliability:
     - *hunyuan_image3

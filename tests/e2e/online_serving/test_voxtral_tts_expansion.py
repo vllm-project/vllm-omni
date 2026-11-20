@@ -22,7 +22,12 @@ from tests.helpers.stage_config import get_deploy_config_path
 # Note this model is the public checkpoint without the encoder weights required for voice cloning
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
 STAGE_CONFIG = get_deploy_config_path("voxtral_tts.yaml")
-EXTRA_ARGS = ["--trust-remote-code", "--enforce-eager", "--disable-log-stats"]
+EXTRA_ARGS = [
+    "--trust-remote-code",
+    "--stage-overrides",
+    '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+    "--disable-log-stats",
+]
 TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG, server_args=EXTRA_ARGS)]
 _MIN_AUDIO_BYTES_BASIC = 10000
 
