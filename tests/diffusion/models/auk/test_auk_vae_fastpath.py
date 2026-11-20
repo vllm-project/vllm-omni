@@ -469,3 +469,55 @@ def test_compiled_decode_failure_falls_back_to_vae_decode(mocker) -> None:
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
     assert (2, 8) in wrapper._uncapturable_compiled_shapes
     assert (2, 8) in wrapper._cache
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_vae_capture_oom_releases_allocations_before_retry_and_eager_fallback(mocker) -> None:
+    import weakref
+
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(), tile_frames=0)
+    wrapper._compiled_decode = lambda x: x
+
+    class _Sentinel:
+        pass
+
+    refs: list[weakref.ref] = []
+    alive_at_retry: list[bool] = []
+    alive_at_eager: list[bool] = []
+    real_capture = wrapper._capture
+    real_vae_decode = vae.decode
+    capture_calls = 0
+
+    def oom_capture(*args, **kwargs):
+        nonlocal capture_calls
+        capture_calls += 1
+        sentinel = _Sentinel()
+        refs.append(weakref.ref(sentinel))
+        if capture_calls == 2:
+            # Failed compiled-capture frame must be cleared before plain retry runs.
+            alive_at_retry.append(refs[0]() is not None)
+        if capture_calls <= 2:
+            raise torch.cuda.OutOfMemoryError(f"CUDA out of memory in capture #{capture_calls}")
+        return real_capture(*args, **kwargs)
+
+    def spy_vae_decode(*args, **kwargs):
+        # Failed plain-capture frame must also be cleared before eager fallback runs.
+        alive_at_eager.append(all(ref() is None for ref in refs))
+        return real_vae_decode(*args, **kwargs)
+
+    mocker.patch.object(wrapper, "_capture", side_effect=oom_capture)
+    mocker.patch.object(vae, "decode", side_effect=spy_vae_decode)
+
+    latents = torch.randn(2, 8, vae.latent_dim, device="cuda")
+    out = wrapper(latents)
+    assert out.shape == (2, 8 * vae.hop_size)
+    assert capture_calls == 2
+    assert alive_at_retry == [False]
+    assert alive_at_eager == [True]
+    assert wrapper.last_mode == "eager"
+    assert (2, 8) in wrapper._uncapturable_compiled_shapes
+    assert (2, 8) in wrapper._uncapturable_plain_shapes
+    assert not wrapper._plain_pools

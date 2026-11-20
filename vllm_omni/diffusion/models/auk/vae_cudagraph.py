@@ -36,6 +36,8 @@ that a destroyed graph released.
 
 from __future__ import annotations
 
+import gc
+import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -48,6 +50,44 @@ from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE, SnakeBeta
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _clear_exception_tracebacks(exc: BaseException) -> None:
+    """Clear traceback frames across an exception chain so failed captures drop tensors."""
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        cur = queue.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if cur.__traceback__ is not None:
+            traceback.clear_frames(cur.__traceback__)
+        if cur.__cause__ is not None:
+            queue.append(cur.__cause__)
+        if cur.__context__ is not None:
+            queue.append(cur.__context__)
+
+
+def _is_oom_capture_error(exc: BaseException) -> bool:
+    """Return True when a capture failure is caused by CUDA out-of-memory."""
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        cur = queue.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, torch.cuda.OutOfMemoryError):
+            return True
+        if isinstance(cur, RuntimeError) and "out of memory" in str(cur).lower():
+            return True
+        if cur.__cause__ is not None:
+            queue.append(cur.__cause__)
+        if cur.__context__ is not None:
+            queue.append(cur.__context__)
+    return False
+
 
 # Latent-frame buckets for the compiled graphs, at 50 Hz: 2.56, 5.12 and
 # 10.24 s. Each bucket costs one Inductor compilation (tens of seconds) at
@@ -224,11 +264,15 @@ class AuKVAEDecodeGraph:
             else:
                 decode = self.vae.decode
             warm_iters = 5 if decode is self._compiled_decode else 2
+            retry_plain = False
+            fallback_eager = False
             try:
                 entry = self._capture(
                     bucket, latents.device, decode, warm_iters=warm_iters, pool=pool, batch_size=target_b
                 )
-            except Exception:
+            except Exception as exc:
+                if _is_oom_capture_error(exc):
+                    self._retire_plain_graphs()
                 if decode is self._compiled_decode:
                     logger.warning(
                         "Compiled AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
@@ -238,24 +282,7 @@ class AuKVAEDecodeGraph:
                         exc_info=True,
                     )
                     self._uncapturable_compiled_shapes.add((target_b, bucket))
-                    pool = torch.cuda.graph_pool_handle()
-                    self._plain_pools[target_b] = pool
-                    try:
-                        entry = self._capture(
-                            bucket, latents.device, self.vae.decode, warm_iters=2, pool=pool, batch_size=target_b
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Plain AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
-                            "falling back to eager vae.decode",
-                            target_b,
-                            bucket,
-                            exc_info=True,
-                        )
-                        self._uncapturable_plain_shapes.add((target_b, bucket))
-                        self._plain_pools.pop(target_b, None)
-                        self.last_mode = "eager"
-                        return self.vae.decode(latents)
+                    retry_plain = True
                 else:
                     logger.warning(
                         "Plain AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
@@ -266,8 +293,42 @@ class AuKVAEDecodeGraph:
                     )
                     self._uncapturable_plain_shapes.add((target_b, bucket))
                     self._plain_pools.pop(target_b, None)
-                    self.last_mode = "eager"
-                    return self.vae.decode(latents)
+                    fallback_eager = True
+                _clear_exception_tracebacks(exc)
+
+            if retry_plain:
+                gc.collect()
+                if latents.is_cuda:
+                    torch.accelerator.empty_cache()
+                pool = torch.cuda.graph_pool_handle()
+                self._plain_pools[target_b] = pool
+                try:
+                    entry = self._capture(
+                        bucket, latents.device, self.vae.decode, warm_iters=2, pool=pool, batch_size=target_b
+                    )
+                except Exception as exc:
+                    if _is_oom_capture_error(exc):
+                        self._retire_plain_graphs()
+                    logger.warning(
+                        "Plain AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
+                        "falling back to eager vae.decode",
+                        target_b,
+                        bucket,
+                        exc_info=True,
+                    )
+                    self._uncapturable_plain_shapes.add((target_b, bucket))
+                    self._plain_pools.pop(target_b, None)
+                    _clear_exception_tracebacks(exc)
+                    fallback_eager = True
+
+            if fallback_eager:
+                gc.collect()
+                if latents.is_cuda:
+                    torch.accelerator.empty_cache()
+                self.last_mode = "eager"
+                return self.vae.decode(latents)
+
+            assert entry is not None
             self._cache[(target_b, bucket)] = entry
             mode = "graph"
         self.last_mode = mode
@@ -376,11 +437,12 @@ class AuKVAEDecodeGraph:
                 key = (batch_size, size)
                 if key in self._compiled:
                     continue
+                failed = False
                 try:
                     self._compiled[key] = self._capture(
                         size, device, self._compiled_decode, warm_iters=5, pool=pool, batch_size=batch_size
                     )
-                except RuntimeError:
+                except RuntimeError as exc:
                     logger.warning(
                         "Compiled AuK codec decode failed for batch_size=%d latent_frames=%d; "
                         "the bucket will be captured on demand",
@@ -388,6 +450,11 @@ class AuKVAEDecodeGraph:
                         size,
                         exc_info=True,
                     )
+                    _clear_exception_tracebacks(exc)
+                    failed = True
+                if failed:
+                    gc.collect()
+                    torch.accelerator.empty_cache()
 
     def _capture(
         self,

@@ -1082,8 +1082,14 @@ def _sample_latents(
             cache=guided,
             timesteps=timesteps[:-1],
         )
+        step_indices = (
+            torch.arange(timesteps.shape[0] - 1, device=x.device, dtype=torch.long)
+            if ctx.modulation is not None
+            else None
+        )
         for i in range(timesteps.shape[0] - 1):
-            v = dit.step(x, timesteps[i], ctx, step_index=i)
+            step_idx = None if step_indices is None else step_indices[i]
+            v = dit.step(x, timesteps[i], ctx, step_index=step_idx)
             if guided:
                 v_cond, v_uncond = v.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength

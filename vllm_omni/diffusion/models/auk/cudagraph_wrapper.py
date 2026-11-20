@@ -39,6 +39,7 @@ class _LoopGraphEntry:
     static_x_out: torch.Tensor
     static_dts: torch.Tensor
     static_timesteps: torch.Tensor
+    static_step_indices: torch.Tensor
 
 
 class AuKCUDAGraphWrapper:
@@ -224,7 +225,10 @@ class AuKCUDAGraphWrapper:
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
             if new_request or self._eager_ctx is None:
                 self._eager_ctx = self._prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps)
-            return self._step(x, timestep, self._eager_ctx, cfg_strength, step_index)
+            step_idx: torch.Tensor | int | None = step_index
+            if step_index is not None and self._eager_ctx.modulation is not None:
+                step_idx = torch.full((), step_index, device=x.device, dtype=torch.long)
+            return self._step(x, timestep, self._eager_ctx, cfg_strength, step_idx)
 
         target_frames = x.shape[1]
         x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask, x_mask)
@@ -335,8 +339,10 @@ class AuKCUDAGraphWrapper:
             return x
         uses_cfg = cfg_strength >= 1e-5
         ctx = self._prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps[:-1])
+        step_indices = torch.arange(n_steps, device=x.device, dtype=torch.long) if ctx.modulation is not None else None
         for i in range(n_steps):
-            vel = self._step(x, timesteps[i], ctx, cfg_strength, i)
+            step_idx = None if step_indices is None else step_indices[i]
+            vel = self._step(x, timesteps[i], ctx, cfg_strength, step_idx)
             dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
             x = x + dt * vel
         return x
@@ -638,10 +644,11 @@ class AuKCUDAGraphWrapper:
         n_steps = int(timesteps.numel()) - 1
         static_timesteps = timesteps.clone().float()
         static_dts = torch.diff(static_timesteps).float()
+        static_step_indices = torch.arange(n_steps, device=x.device, dtype=torch.long)
 
         def run_loop(cur_x: torch.Tensor) -> torch.Tensor:
             for i in range(n_steps):
-                vel = self._step(cur_x, static_timesteps[i], static_ctx, scale, step_index=i)
+                vel = self._step(cur_x, static_timesteps[i], static_ctx, scale, step_index=static_step_indices[i])
                 cur_x = cur_x + static_dts[i] * vel
             return cur_x
 
@@ -672,6 +679,7 @@ class AuKCUDAGraphWrapper:
             static_x_out=static_x_out,
             static_dts=static_dts,
             static_timesteps=static_timesteps,
+            static_step_indices=static_step_indices,
         )
 
 

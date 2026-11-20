@@ -474,6 +474,60 @@ def test_loop_capture_oom_releases_allocations_before_eager_and_recovers_from_pr
     assert not wrapper._uncapturable_loop_keys
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_full_compiled_dit_step_avoids_per_step_recompilation_in_loops() -> None:
+    dit = _make_dit("cuda")
+    inputs = _sample_inputs("cuda")
+    t_grid = [i / 12.0 for i in range(13)]
+    common = dict(**inputs, gen_frames=9, t_grid=t_grid, cfg_strength=0.0)
+
+    shifted_grid = [0.0] + [(i - 0.1) / 12.0 for i in range(1, 12)] + [1.0]
+    expected = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7))
+    shifted_expected = sample_latents(
+        dit, **{**common, "t_grid": shifted_grid}, generator=torch.Generator(device="cuda").manual_seed(7)
+    )
+    try:
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        dit.step = torch.compile(dit.step, dynamic=False)
+
+        graph_wrapper = AuKCUDAGraphWrapper(dit, enabled=True)
+        graph_out = sample_latents(
+            dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=graph_wrapper
+        )
+        torch.testing.assert_close(graph_out, expected, atol=1e-4, rtol=1e-4)
+        assert dict(torch._dynamo.utils.counters.get("stats", {})).get("unique_graphs") == 1
+
+        # A second loop replay with a shifted 12-step grid must trigger 0 new compiles.
+        torch._dynamo.utils.counters.clear()
+        shifted_out = sample_latents(
+            dit,
+            **{**common, "t_grid": shifted_grid},
+            generator=torch.Generator(device="cuda").manual_seed(7),
+            sampler=graph_wrapper,
+        )
+        torch.testing.assert_close(shifted_out, shifted_expected, atol=1e-4, rtol=1e-4)
+        assert dict(torch._dynamo.utils.counters.get("frames", {})).get("total", 0) == 0
+
+        # Unbucketed 12-step _run_eager_loop compiles once for its shape, then _sample_latents reuses it.
+        torch._dynamo.utils.counters.clear()
+        eager_wrapper = AuKCUDAGraphWrapper(dit, enabled=False)
+        eager_out = sample_latents(
+            dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=eager_wrapper
+        )
+        torch.testing.assert_close(eager_out, expected, atol=1e-4, rtol=1e-4)
+        assert dict(torch._dynamo.utils.counters.get("stats", {})).get("unique_graphs") == 1
+
+        torch._dynamo.utils.counters.clear()
+        direct_out = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7))
+        torch.testing.assert_close(direct_out, expected, atol=1e-4, rtol=1e-4)
+        assert dict(torch._dynamo.utils.counters.get("frames", {})).get("total", 0) == 0
+    finally:
+        torch._dynamo.reset()
+
+
 @pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
