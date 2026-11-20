@@ -220,3 +220,13 @@ def test_deferred_scalar_span_metadata_consolidates_without_cat(key, first, last
     payload.consolidate_tensors(OutputModality.LATENT)
     assert payload[key].ndim == 0
     assert payload[key].item() == last
+
+
+def test_indextts_use_gpt_latent_scalar_consolidates_as_latest_snapshot():
+    key = "meta.use_gpt_latent"
+    payload = MultimodalPayload(tensors={key: [torch.tensor(False), torch.tensor(True)]})
+
+    payload.consolidate_tensors(OutputModality.LATENT)
+
+    assert payload[key].ndim == 0
+    assert payload[key].item() is True

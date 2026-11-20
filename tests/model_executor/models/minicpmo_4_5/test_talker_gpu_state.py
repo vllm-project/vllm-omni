@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.overrides import TorchFunctionMode
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from tests.model_executor.models.minicpmo_4_5.test_talker_batching import (
     _CodecSamplingMetadata,
@@ -321,8 +322,8 @@ def test_gpu_decode_masks_finished_request_when_new_request_joins(device):
     assert _extract_codec_delta(to_payload_element(mm, 1, 1, 2, seq_len=2), "b") == [3]
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @pytest.mark.parametrize("aux_penalty", ["neutral", "frequency", "presence", "mixed"])
 def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_penalty, mocker):
     pytest.importorskip(
@@ -359,18 +360,18 @@ def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_p
 
     def metadata():
         return SamplingMetadata(
-            temperature=torch.tensor([p.temperature for p in params], device="cuda"),
+            temperature=torch.tensor([p.temperature for p in params], device=DEVICE_TYPE),
             all_greedy=False,
             all_random=True,
-            top_p=torch.tensor([p.top_p for p in params], device="cuda"),
-            top_k=torch.tensor([p.top_k for p in params], device="cuda", dtype=torch.int32),
-            generators={row: torch.Generator(device="cuda").manual_seed(p.seed) for row, p in enumerate(params)},
+            top_p=torch.tensor([p.top_p for p in params], device=DEVICE_TYPE),
+            top_k=torch.tensor([p.top_k for p in params], device=DEVICE_TYPE, dtype=torch.int32),
+            generators={row: torch.Generator(device=DEVICE_TYPE).manual_seed(p.seed) for row, p in enumerate(params)},
             max_num_logprobs=None,
             no_penalties=False,
-            prompt_token_ids=torch.zeros(batch, 8, device="cuda", dtype=torch.long),
-            frequency_penalties=torch.tensor([p.frequency_penalty for p in params], device="cuda"),
-            presence_penalties=torch.tensor([p.presence_penalty for p in params], device="cuda"),
-            repetition_penalties=torch.tensor([p.repetition_penalty for p in params], device="cuda"),
+            prompt_token_ids=torch.zeros(batch, 8, device=DEVICE_TYPE, dtype=torch.long),
+            frequency_penalties=torch.tensor([p.frequency_penalty for p in params], device=DEVICE_TYPE),
+            presence_penalties=torch.tensor([p.presence_penalty for p in params], device=DEVICE_TYPE),
+            repetition_penalties=torch.tensor([p.repetition_penalty for p in params], device=DEVICE_TYPE),
             output_token_ids=[[row] * 32 for row in range(batch)],
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
@@ -389,11 +390,11 @@ def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_p
     requests = {rid: SimpleNamespace(sampling_params=params[row]) for row, rid in enumerate(input_batch.req_ids)}
     reference_sampler = Sampler()
     calls = mocker.spy(talker._codec_sampler, "forward")
-    raw = torch.arange(batch * vocab, device="cuda").float().reshape(batch, vocab).sin()
+    raw = torch.arange(batch * vocab, device=DEVICE_TYPE).float().reshape(batch, vocab).sin()
     for step in range(20):
-        histories = torch.tensor([ids[-16:] for ids in reference_meta.output_token_ids], device="cuda")
+        histories = torch.tensor([ids[-16:] for ids in reference_meta.output_token_ids], device=DEVICE_TYPE)
         talker._penalty_histories = histories
-        forced = torch.tensor([step == 19, False, False], device="cuda")
+        forced = torch.tensor([step == 19, False, False], device=DEVICE_TYPE)
         talker._pending_force_eos_rows = forced
         expected_logits = apply_window_penalty(raw.clone(), histories, reference_meta.repetition_penalties)
         prepared = replace(

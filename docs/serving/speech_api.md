@@ -560,7 +560,14 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 ### Session Config Parameters
 
-All REST API parameters are supported, plus:
+All REST API parameters are supported, except `input` (sent as `input.text`)
+and `stream` / `stream_format` (replaced by `stream_audio`). The REST request
+rules are checked when `session.config` arrives; checks that depend on how the
+server was started, such as `word_timestamps` without `--forced-aligner`, run
+when the first text arrives. `ref_audio` takes a single string and
+`speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
+length of a whole request, so they require `split_granularity="none"` and
+`text_input_mode="buffered"`. Session parameters:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
@@ -773,6 +780,10 @@ python examples/online_serving/text_to_speech/voxcpm2/precompute_custom_voice.py
 Only profiles whose safetensors payload can be loaded and validated are exposed
 by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 `POST /v1/audio/speech` by passing `voice="alice"` without `ref_audio`.
+
+For VoxCPM2, an explicit `ref_audio` overrides an uploaded or precomputed
+`voice`. Such requests do not reuse the named voice's conditioning cache;
+requests without an explicit reference retain the normal named-voice cache.
 
 **Configuration (environment variables):**
 

@@ -80,6 +80,7 @@ from vllm.entrypoints.speech_to_text.transcription.serving import (
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
+from vllm.exceptions import VLLMClientError
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_derenderer import OnlineDerenderer
@@ -216,14 +217,13 @@ from vllm_omni.entrypoints.openai.video.depth.helpers import (
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
-    _cleanup_timeline_guides,
+    VideoRequestResources,
     _cleanup_video,
-    _cleanup_video_references,
+    _lidar_storage_key,
     _parse_video_form,
     _persist_uploaded_reference,
     _run_video_generation_job,
     _status_code_for_video_failure,
-    _unpack_video_generation_result,
     validate_latent_continuation_source,
     video_response_from_request,
 )
@@ -539,7 +539,7 @@ async def omni_run_server_worker(
         is_pure_diffusion = vllm_config is None
         if is_pure_diffusion:
             logger.info(
-                "Starting vLLM API server (pure diffusion mode) on %s",
+                "Starting vLLM API server without a frontend LLM configuration on %s",
                 listen_address,
             )
             # The vLLM 0.27 launcher's shutdown path reads
@@ -774,9 +774,14 @@ async def build_async_omni_from_stage_config(
             kwargs.setdefault("log_stats", True)
         if client_config is not None:
             kwargs["client_config"] = client_config
+        backend_as_process = kwargs.pop("duplex_engine_backend_as_process", False)
         if _should_serve_duplex(model, kwargs):
+            if backend_as_process:
+                kwargs["duplex_engine_backend_as_process"] = True
             async_omni = DuplexOmni(model=model, **kwargs)
         else:
+            if backend_as_process:
+                raise ValueError("--duplex-engine-backend-as-process requires a session_mode: duplex deployment")
             async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -785,7 +790,10 @@ async def build_async_omni_from_stage_config(
         yield async_omni
     finally:
         if async_omni:
-            async_omni.shutdown()
+            if isinstance(async_omni, DuplexOmni) and backend_as_process:
+                await async_omni.aclose()
+            else:
+                async_omni.shutdown()
 
 
 async def _init_duplex_app_state(
@@ -799,11 +807,14 @@ async def _init_duplex_app_state(
     """Minimal app state for a duplex server: only the surfaces a duplex session backs."""
     state.vllm_config = vllm_config
     state.diffusion_engine = None
-    state.openai_serving_models = OpenAIServingModels(
-        engine_client=engine_client,  # type: ignore[arg-type]
-        base_model_paths=base_model_paths,
-        lora_modules=None,
-    )
+    if engine_client.session_only:
+        state.openai_serving_models = openai_models_serving.SessionServingModels(base_model_paths)
+    else:
+        state.openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,  # type: ignore[arg-type]
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
     state.serving_tokenization = None
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
@@ -864,7 +875,7 @@ async def _init_duplex_chat(
     answering badly. ``endpoint_restrictions`` remains the per-deployment
     opt-out on top of this.
     """
-    if not engine_client.duplex_capabilities.supports_chat_completions:
+    if engine_client.session_only or not engine_client.duplex_capabilities.supports_chat_completions:
         return None
     supported_tasks: set[str] = {"generate"}
     if hasattr(engine_client, "get_supported_tasks"):
@@ -1409,6 +1420,7 @@ async def omni_init_app_state(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
+        allowed_local_media_path=getattr(args, "allowed_local_media_path", "") or "",
     )
     # Policies whose first stage is autoregressive (for example reasoning before
     # acting) serve OpenPI too; this is None without policy_server_config.
@@ -1648,7 +1660,7 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
         return JSONResponse(content=result.model_dump(exclude_none=True))
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
-    except ValueError as e:
+    except (ValueError, VLLMClientError) as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
@@ -3159,6 +3171,7 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
+        VideoRequestResources,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
@@ -3174,12 +3187,9 @@ async def create_video(
         reference_image,
         reference_video,
         reference_audio,
+        resources,
         latent_edit_input,
     ) = ctx
-
-    def _cleanup_request_resources() -> None:
-        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
-        _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None
@@ -3196,19 +3206,20 @@ async def create_video(
                 reference_image,
                 reference_video,
                 reference_audio,
+                resources=resources,
                 app_state=raw_request.app.state,
                 latent_edit_input=latent_edit_input,
             )
         )
         # A task cancelled before its first step never enters its finally block.
-        task.add_done_callback(lambda _: _cleanup_request_resources())
+        task.add_done_callback(lambda _: resources.cleanup())
         await VIDEO_TASKS.upsert(ref.id, task)
     except BaseException:
         if task is not None:
             task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await task
-        _cleanup_request_resources()
+        resources.cleanup()
         if ref is not None:
             await VIDEO_STORE.pop(ref.id)
         raise
@@ -3233,6 +3244,7 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
+        VideoRequestResources,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
@@ -3252,25 +3264,25 @@ async def create_video_sync(
         reference_image,
         reference_video,
         reference_audio,
+        resources,
         latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        handler.reject_async_only_outputs(request)
         await validate_latent_continuation_source(handler, request)
-        video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
-            await asyncio.wait_for(
-                handler.generate_video_bytes(
-                    request,
-                    request_id,
-                    reference_image=reference_image,
-                    reference_video=reference_video,
-                    reference_audio=reference_audio,
-                    latent_edit_input=latent_edit_input,
-                ),
-                timeout=VIDEO_SYNC_TIMEOUT_S,
+        result = await asyncio.wait_for(
+            handler.generate_video_bytes(
+                request,
+                request_id,
+                reference_image=reference_image,
+                reference_video=reference_video,
+                reference_audio=reference_audio,
+                latent_edit_input=latent_edit_input,
             ),
+            timeout=VIDEO_SYNC_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         raise HTTPException(
@@ -3291,19 +3303,18 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
-        _cleanup_timeline_guides(request)
+        resources.cleanup()
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
-        content=video_bytes,
+        content=result.video_bytes,
         media_type="video/mp4",
         headers={
             "X-Request-Id": request_id,
             "X-Model": effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
-            "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
-            "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
+            "X-Stage-Durations": json.dumps(result.stage_durations, separators=(",", ":")),
+            "X-Peak-Memory-MB": f"{result.peak_memory_mb:.3f}",
         },
     )
 
@@ -3435,25 +3446,28 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
     if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
 
+    if job.lidar is not None:
+        await STORAGE_MANAGER.delete(_lidar_storage_key(video_id))
     await STORAGE_MANAGER.delete(video_id)
     await VIDEO_STORE.pop(video_id)
     return VideoDeleteResponse(id=job.id, deleted=True)
 
 
 @router.get("/v1/videos/{video_id}/content", dependencies=[Depends(_require_single_api_video_store)])
-async def download_video(video_id: str) -> Response:
-    """Download the generated file for a completed video job.
+async def download_video(video_id: str, variant: Literal["video", "lidar"] = "video") -> Response:
+    """Download a generated file for a completed video job.
 
     Args:
         video_id: Identifier of the video job whose output should be returned.
+        variant: Which downloadable asset to return. ``video`` (default) is the
+            MP4; ``lidar`` is the numeric LiDAR file of a joint generation job.
 
     Returns:
-        A ``FileResponse`` streaming the generated video file from local
-        storage.
+        A ``FileResponse`` streaming the requested file from local storage.
 
     Raises:
-        HTTPException: If the job does not exist, is still in progress, or the
-        generated file is missing from disk.
+        HTTPException: If the job does not exist, failed, is still in progress,
+        has no asset of that variant, or the file is missing from disk.
     """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
@@ -3461,22 +3475,25 @@ async def download_video(video_id: str) -> Response:
 
     if job.status == VideoGenerationStatus.FAILED:
         raise HTTPException(status_code=422, detail="Video generation failed. Check job status for error details.")
-    if not job.file_name:
+    if job.status != VideoGenerationStatus.COMPLETED:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
-    file_handle = await STORAGE_MANAGER.open(video_id)
-    if file_handle is None:
-        raise HTTPException(status_code=404, detail="Generated video file not found on disk")
-
-    file_name = job.file_name or f"{video_id}.{job.file_extension}"
-    if isinstance(file_handle, FileStorageHandle):
-        response = FileResponse(path=file_handle.path, media_type=job.media_type, filename=file_name)
+    if variant == "lidar":
+        if job.lidar is None:
+            raise HTTPException(status_code=404, detail="This job has no LiDAR output")
+        storage_key, media_type, file_name = _lidar_storage_key(video_id), job.lidar.media_type, job.lidar.file_name
     else:
+        storage_key, media_type = video_id, job.media_type
+        file_name = job.file_name or f"{video_id}.{job.file_extension}"
+
+    file_handle = await STORAGE_MANAGER.open(storage_key)
+    if file_handle is None:
+        raise HTTPException(status_code=404, detail=f"Generated {variant} file not found on disk")
+    if not isinstance(file_handle, FileStorageHandle):
         raise HTTPException(
             status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
         )
-
-    return response
+    return FileResponse(path=file_handle.path, media_type=media_type, filename=file_name)
 
 
 @profiler_router.post("/start_profile")
