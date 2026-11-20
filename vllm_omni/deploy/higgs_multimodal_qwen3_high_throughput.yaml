@@ -9,6 +9,9 @@
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
 # worth of work). Stage 1 honors meta.left_context_size + meta.right_holdback_size
 # so the per-chunk codec windows stitch into a coherent PCM stream.
+# This historical profile is a V1 opt-out and is rejected by vLLM 0.34 at
+# deploy-config merge time; use higgs_multimodal_qwen3.yaml instead.
+model_runner: v1
 async_chunk: true
 
 connectors:
