@@ -1265,6 +1265,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
         ):
             return
+        # Connector-only resumes bypass the generation bump in _update_request_as_session.
+        request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
         self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.WAITING
         self.deferred_waiting.discard(request)
