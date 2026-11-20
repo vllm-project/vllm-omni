@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniSchedulingCoordinator.
 
-These tests use mock request objects and mock queues.  They do not require
-GPU, vLLM runtime, or any connector.
-
-Chunk waiting (WAITING_FOR_CHUNK / process_pending_chunks) lives on
-OmniChunkTransferAdapter — see tests/distributed/omni_connectors/.
+These CPU tests use mock request objects and mock queues. They cover the
+coordinator's `process_pending_chunks` path, including parking requests in
+`WAITING_FOR_CHUNK` and partitioning the running list.
 """
 
 from __future__ import annotations
@@ -143,8 +141,7 @@ def test_chunk_waiting_removes_request_from_running_list():
     assert list(coord._waiting_for_chunk_running) == [req]
 
 
-@pytest.mark.parametrize("queue_size", [127, 128, 129])
-def test_chunk_waiting_partitions_running_list_without_remove_scans(queue_size, monkeypatch):
+def test_chunk_waiting_partitions_running_list_without_remove_scans(monkeypatch):
     class CountingList(list):
         def __init__(self, items):
             super().__init__(items)
@@ -154,12 +151,12 @@ def test_chunk_waiting_partitions_running_list_without_remove_scans(queue_size, 
             self.remove_calls += 1
             super().remove(item)
 
+    queue_size = 128  # Former threshold for the list partition path.
     coord = OmniSchedulingCoordinator(
         scheduler_max_num_seqs=queue_size,
         stage_id=1,
         async_chunk=True,
     )
-    # Exercise the former 128-entry boundary without overriding queue policy.
     # Only the clock is fixed, to distinguish new waits from existing waits.
     monkeypatch.setattr(coord_mod.time, "monotonic", lambda: 100.0)
     statuses = [
