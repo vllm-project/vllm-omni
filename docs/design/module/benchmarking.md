@@ -146,3 +146,12 @@ retain their legacy benchmark entry and deploy configs; the entry delegates to
 the shared serving benchmark.
 CPU tests/rendering establish implementation contracts; matching-source native
 runs are still needed to establish actual accuracy, performance and capacity.
+
+The shared DFX LingBot CUDA stability case additionally checks stop, orderly
+WebSocket close and abrupt transport loss after each rollout. Recovery requires
+complete ordered follow-up requests with distinct request IDs. Baseline and
+post-recovery device memory, per-case verdicts, original batch results and failed
+raw-session diagnostics remain under the stability result directory. The 256 MiB
+recovery growth budget applies within a batch; the existing resource monitor
+retains the sustained-run timeline. These instrumented probes do not contribute
+performance samples or establish GPU qualification through CPU testing.

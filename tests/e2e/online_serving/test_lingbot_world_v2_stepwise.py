@@ -129,6 +129,10 @@ def test_lingbot_world_v2_stepwise_streams_one_chunk_per_block(omni_server) -> N
     url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
     events, media, done = asyncio.run(_stream_session(url, omni_server.model, _first_frame()))
 
+    _assert_stream_contract(events, media, done)
+
+
+def _assert_stream_contract(events: list[dict[str, Any]], media: bytes, done: dict[str, Any]) -> None:
     started = [event for event in events if event["type"] == "video.start"]
     assert len(started) == 1, "one session.start must open exactly one rollout"
 
@@ -252,8 +256,10 @@ def _assert_paced_stop_contract(events: list[dict[str, Any]], done: dict[str, An
     assert 0 <= done["stop_latency_s"] < 30.0
     # An aborted paced session must not leave the engine paused for the next one.
     followup_events, _media, followup_done = asyncio.run(_stream_session(url, model, _first_frame()))
-    assert followup_done["stopped"] is False
-    assert any(event["type"] == "video.chunk_metadata" for event in followup_events)
+    _assert_stream_contract(followup_events, _media, followup_done)
+    assert {event["request_id"] for event in events if event["type"] == "video.start"}.isdisjoint(
+        event["request_id"] for event in followup_events if event["type"] == "video.start"
+    )
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -274,3 +280,41 @@ def test_lingbot_world_v2_stepwise_stop_during_paced_wait_releases_session(omni_
     url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
     events, done = asyncio.run(_paced_stop_session(url, omni_server.model))
     _assert_paced_stop_contract(events, done, url, omni_server.model)
+
+
+async def _paced_disconnect_session(url: str, model: str, *, abrupt: bool) -> list[dict[str, Any]]:
+    """Disconnect after the first media body, without sending session.stop."""
+    import websockets
+
+    events: list[dict[str, Any]] = []
+    async with websockets.connect(url, max_size=None, ping_interval=None, close_timeout=10) as websocket:
+        await websocket.send(json.dumps(_session_start(model, _first_frame(), _paced_overrides())))
+        while True:
+            message = await asyncio.wait_for(websocket.recv(), timeout=900)
+            if isinstance(message, bytes):
+                if any(event.get("kind") == "media" for event in events):
+                    assert message, "disconnect must follow a nonempty media body"
+                    if abrupt:
+                        websocket.transport.abort()
+                    else:
+                        await asyncio.wait_for(websocket.close(), timeout=15)
+                    return events
+                continue
+            event = json.loads(message)
+            events.append(event)
+            assert event["type"] not in {"error", "session.done"}, event
+
+
+@pytest.mark.full_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", lingbot_world_v2_stepwise_server_params, indirect=True)
+@pytest.mark.parametrize("abrupt", [False, True], ids=["close", "transport-abort"])
+def test_lingbot_world_v2_stepwise_disconnect_releases_session(omni_server, abrupt: bool) -> None:
+    """Orderly close and transport loss must both permit a complete fresh rollout."""
+    url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
+    events = asyncio.run(_paced_disconnect_session(url, omni_server.model, abrupt=abrupt))
+    followup, media, done = asyncio.run(_stream_session(url, omni_server.model, _first_frame()))
+    _assert_stream_contract(followup, media, done)
+    assert {event["request_id"] for event in events if event["type"] == "video.start"}.isdisjoint(
+        event["request_id"] for event in followup if event["type"] == "video.start"
+    )

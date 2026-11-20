@@ -88,3 +88,40 @@ echo "Report directory: $GPU_MONITOR_BUNDLE_DIR"
 - **View the report**: open `report.html` in the bundle directory with a browser to inspect memory usage curves and statistics.
 
 The script only generates `report.html` and CSV files. If you need to keep the report, archive or download it from the working directory yourself.
+
+## LingBot CUDA lifecycle checks
+
+The existing CUDA case in `tests/test_lingbot_world.json` enables
+`lifecycle_checks` after each completed rollout. It retains its 24-hour duration,
+40-chunk sessions and eight-H800 topology. The NPU case is unchanged.
+The probes stop a paced session, close an active WebSocket, and abort an active
+transport. Each interruption must permit a complete, ordered fresh rollout with
+a distinct request ID on the same server. Per-device memory after each recovery
+must stay within `lifecycle_memory_growth_budget_bytes` (256 MiB) of the warmed
+server immediately before the probes. This bounds recovery growth within a batch;
+the existing resource monitor records the complete sustained-run memory timeline.
+
+Each batch keeps a unique `lingbot-world-batch-*` directory under the runner's
+result directory, containing `benchmark.json`, the shared
+`benchmark-serve-result.json` (including failed raw sessions), client stdout/stderr,
+and `lifecycle.json` when probes run. Lifecycle reports retain passed, failed and
+unstarted cases plus baseline/recovery memory values and the failure cause.
+Errors fail the stability case; the shared `omni_server` fixture owns final
+server teardown. Archive these directories with the resource-monitor outputs.
+Probes and memory observations are stability diagnostics, not performance samples.
+
+CPU regression checks need development dependencies, no checkpoint or GPU:
+
+```bash
+python -m pytest -q tests/benchmarks/test_lingbot_world_lifecycle.py -m 'core_model and cpu' --run-level core_model
+```
+
+On the configured eight-H800 host with model access, run the existing case:
+
+```bash
+python -m pytest -sv tests/dfx/stability/scripts/run_stability_benchmark.py --test-config-file tests/dfx/stability/tests/test_lingbot_world.json -k test_lingbot_world_realtime_stability -m cuda
+```
+
+CPU and scripted WebSocket tests validate the harness only. Real-checkpoint
+sustained generation, GPU reclamation and the configured device topology require
+separate hardware execution; no new CI lane or hardware qualification is implied.
