@@ -52,6 +52,7 @@ class MiniMaxH3Model:
         # Fixed condition rows stay in this buffer; each prediction replaces
         # the target rows. Keep it for the entire request, including retries.
         self.model_rows = model_rows if model_rows is not None else tuple(row.clone() for row in rows)
+        self._indices_branch = None
 
     def rows_for(self, latents):
         """Fill reusable model inputs; valid until this request's next prediction."""
@@ -69,8 +70,18 @@ class MiniMaxH3Model:
     @property
     def indices(self):
         # Row indices of the masks, built once per branch: boolean-mask indexing on the device runs nonzero and
-        # blocks the host on its size every step.
-        return self.branch.update_idx_dev, self.branch.audio_update_idx_dev
+        # blocks the host on its size every step. H3 branches precompute them; other branches pay one nonzero.
+        if self._indices_branch is not self.branch:
+            self._indices = tuple(
+                index if index is not None else mask.nonzero().view(-1)
+                for index, mask in zip(
+                    (getattr(self.branch, "update_idx_dev", None), getattr(self.branch, "audio_update_idx_dev", None)),
+                    self.masks,
+                    strict=True,
+                )
+            )
+            self._indices_branch = self.branch
+        return self._indices
 
     def prepare(self, evaluation: ModelEvaluation):
         rows = self.rows_for(evaluation.latents)

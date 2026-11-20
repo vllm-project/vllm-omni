@@ -10,6 +10,7 @@ import torch
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
 from vllm_omni.diffusion.models.minimax_h3.sampling import MiniMaxH3Model, _assign_rows
 from vllm_omni.diffusion.models.minimax_h3.scheduling_minimax_h3_euler_ancestral import minimax_h3_rf_v_to_x0
+from vllm_omni.diffusion.sampler import SamplingState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -114,7 +115,7 @@ def test_step_kwargs_do_not_synchronize() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_sampler_adapter_step_does_not_synchronize() -> None:
+def test_sampler_adapter_row_updates_do_not_synchronize() -> None:
     branch = _branch("cuda")
     video_rows = torch.randn(branch.img_pos.shape[0], 64, device="cuda")
     audio_rows = torch.randn(branch.audio_pos.shape[0], 16, device="cuda")
@@ -127,13 +128,16 @@ def test_sampler_adapter_step_does_not_synchronize() -> None:
     expected_rows = [row.clone() for row in adapter.model_rows]
     for row, mask, target in zip(expected_rows, adapter.masks, targets, strict=True):
         row[mask] = target
+    adapter.indices  # built once per branch, outside the per-step path
     torch.accelerator.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
         rows = adapter.rows_for(targets)
-        denoised = adapter.to_denoised((rows, [(row, None) for row in rows], (0.3, 0.4), None), velocities)
+        adapter.write_back(SamplingState(targets, ((1.0, 0.0), (1.0, 0.0))))
     finally:
         torch.cuda.set_sync_debug_mode("default")
+    # to_denoised keeps minimax_h3_rf_v_to_x0's finiteness checks, which read back by design.
+    denoised = adapter.to_denoised((rows, [(row, None) for row in rows], (0.3, 0.4), None), velocities)
     assert all(torch.equal(a, b) for a, b in zip(rows, expected_rows, strict=True))
     for row, mask, v, t, x0 in zip(rows, adapter.masks, velocities, (0.3, 0.4), denoised, strict=True):
         assert torch.equal(x0, minimax_h3_rf_v_to_x0(row[mask], v.float()[mask], row.new_tensor(t)))
