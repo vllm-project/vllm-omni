@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_omni_duplex_eval",
-    "description": "CUDA nightly full-duplex C8 replay of the 120 Qwen3-aligned PR_correction IDs with the question mix, then VL judging. Prefix cache stays off on the duplex deploy. The job records the correction success rate without a numeric floor: completed==120, every session judged, and mean_all_success finite in [0, 1]. Dataset revision matches the Qwen3-Omni pin. Performance baselines start empty until a measured H100/B200 window is collected.",
+    "description": "CUDA/NPU nightly full-duplex C8 replay of the 120 Qwen3-aligned PR_correction IDs with the question mix, then VL judging. NPU MiniCPM-o topology is 1 card · 3-stage · stage2: 2 replicas (model only); pytest cards_2 is the VL-7B judge on the second card. Prefix cache stays off on the duplex deploy. The job records the correction success rate without a numeric floor: completed==120, every session judged, and mean_all_success finite in [0, 1]. Dataset revision matches the Qwen3-Omni pin. Performance baselines start empty until a measured H100/B200/A3 window is collected.",
     "mark": [
       {
         "hardware_marks": {
@@ -21,7 +21,10 @@
       ],
       "update": {
         "duplex_session.max_sessions": 8,
-        "duplex_session.collect_stats": true
+        "duplex_session.collect_stats": true,
+        "platforms.npu.stages.2.num_replicas": 2,
+        "platforms.npu.stages.2.devices": "0,0",
+        "platforms.npu.stages.2.gpu_memory_utilization": 0.11
       }
     },
     "judge_server_params": {
