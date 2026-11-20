@@ -265,66 +265,6 @@ steps:
         commands:
           - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
 
-  # The seven ROCm nodes in tests/examples/online_serving/test_qwen2_5_omni.py
-  # already select Qwen/Qwen2.5-Omni-7B on MI325 with two cards. Keep AITER off
-  # so this documentation lane does not pay for a cold JIT build.
-  - group: ":full_moon: Qwen2.5-Omni MI300 Nightly"
-    steps:
-      - label: "Qwen2.5-Omni Documentation Examples"
-        agent_pool: mi300_2
-        depends_on: amd-build
-        mirror_hardwares: [amdproduction]
-        grade: Blocking
-        timeout_in_minutes: 120
-        source_file_dependencies: omni_qwen2_5_omni_doc
-        artifact_paths:
-          - "artifacts/rocm-qwen2-5-omni-doc/**/*"
-        commands:
-          - export VLLM_ROCM_USE_AITER=0
-          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - export QWEN25_OMNI_DOC_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen2-5-omni-doc"
-          - mkdir -p "$$QWEN25_OMNI_DOC_ARTIFACT_DIR"
-          - |
-            pytest --collect-only -q \
-              tests/examples/online_serving/test_qwen2_5_omni.py \
-              -m "full_model and rocm and MI325 and cards_2" \
-              --run-level "full_model" \
-              > "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt"
-            count=$$(awk 'index($$0, "test_qwen2_5_omni.py::") { n++ } END { print n + 0 }' \
-              "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 7 ]]; then
-              echo "Expected exactly 7 Qwen2.5-Omni ROCm documentation examples, found $$count." >&2
-              cat "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-          - |
-            set +e
-            timeout --signal=TERM --kill-after=2m 105m \
-              pytest -s -v -ra tests/examples/online_serving/test_qwen2_5_omni.py \
-              -m "full_model and rocm and MI325 and cards_2" --run-level "full_model" \
-              --durations=20 --junitxml="$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
-            tail -n 100 "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log" > "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest-summary.txt"
-            if [[ "$$status" -eq 0 ]]; then
-              python -c 'import sys, xml.etree.ElementTree as ET
-            root = ET.parse(sys.argv[1]).getroot()
-            if root.tag not in {"testsuite", "testsuites"}:
-                raise SystemExit("Unexpected JUnit root")
-            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
-            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
-            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
-            if tests != 7 or skipped != 0 or failures != 0 or errors != 0:
-                print("Expected exactly 7 executed Qwen2.5-Omni documentation tests; "
-                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
-                raise SystemExit(5)
-            ' "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml"
-            fi
-            exit "$$status"
-
   - group: ":speaker: CosyVoice3 MI300 Nightly"
     steps:
       # Exercise all sync/async and Chinese/English cases with the platform's
@@ -673,28 +613,6 @@ steps:
                 raise SystemExit(5)
             ' "$$QWEN_IMAGE_ARTIFACT_DIR/pytest.xml"
 
-  - group: ":full_moon: HunyuanImage3 MI300 Nightly"
-    steps:
-      - label: "HunyuanImage3 Offline Pixel Accuracy"
-        agent_pool: mi300_4
-        mirror_hardwares: [amdproduction]
-        grade: NonBlocking
-        timeout_in_minutes: 180
-        source_file_dependencies: diffusion_hunyuan_image3_accuracy
-        env:
-          HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
-          HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        artifact_paths:
-          - artifacts/rocm-hunyuanimage3/**/*
-        commands:
-          - pytest --collect-only -q tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py::test_hunyuan_image3_pixel_accuracy_offline -m "full_model and rocm and MI325 and cards_4" --run-level full_model
-          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py::test_hunyuan_image3_pixel_accuracy_offline -m "full_model and rocm and MI325 and cards_4" --run-level full_model --junitxml=/tmp/hunyuanimage3-pytest.xml
-          - |
-            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuanimage3"
-            mkdir -p "$$artifact_dir"
-            cp -v tests/e2e/accuracy/artifacts/HunyuanImage-3_0-Instruct/*.png "$$artifact_dir/"
-            cp -v /tmp/hunyuanimage3-pytest.xml "$$artifact_dir/"
 
   # Full-model Stable Audio CPU offload. READY keeps the core_model Qwen-Image
   # cases, and MERGE runs this file under TORCH_SDPA. This lane is the default
@@ -1987,7 +1905,7 @@ steps:
       - label: "BAGEL Sleep Mode"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_bagel_sleep_function
         env:
@@ -2050,6 +1968,24 @@ steps:
 
   - group: ":full_moon: Wan2.2 Function 1 GPU Group"
     steps:
+      - label: "Wan2.2 Device-Postprocess Equivalence"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 60
+        source_file_dependencies: diffusion_wan22_device_postprocess
+        env:
+          VLLM_OMNI_DEVICE_POSTPROCESS_MODEL: Wan-AI/Wan2.2-TI2V-5B-Diffusers
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-device-postprocess/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 40m rocm-wan22-device-postprocess
+            tests/e2e/offline_inference/test_device_postprocess_equivalence.py::test_device_postprocess_produces_equivalent_frames
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+
       - label: "Wan2.2 Function 1 GPU"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]

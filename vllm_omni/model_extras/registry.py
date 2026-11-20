@@ -26,6 +26,7 @@ from vllm_omni.model_extras.bagel import build_x_to_text_prompt as build_bagel_x
 from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
+    COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS,
 )
 from vllm_omni.model_extras.cosmos3_nano_sim_bimanual import (
     COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS,
@@ -253,6 +254,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+    },
+    "Cosmos3MultiviewPipeline": {
+        "extra_body_params": COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS,
+        "extra_output_params": frozenset(),
     },
     "Cosmos3NanoSimBimanualPipeline": {
         "extra_body_params": COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS,
