@@ -2205,8 +2205,8 @@ def test_offline_model_resolution_uses_the_pinned_revision(monkeypatch, extra):
 def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
     configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
     by_name = {config["test_name"]: config for config in configs}
-    default = by_name["test_minicpmo_4_5_nightly_default"]
-    prefix = by_name["test_minicpmo_4_5_nightly_async_prefix"]
+    default = by_name["test_minicpmo_4_5_default"]
+    prefix = by_name["test_minicpmo_4_5_async_prefix"]
     default_params = default["benchmark_params"][0]
     prefix_perf, prefix_acc = prefix["benchmark_params"]
     assert default["server_params"]["update"]["async_chunk"] is False
@@ -2227,7 +2227,7 @@ def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
     assert prefix_acc["seed_tts_wer_eval"] is True
     assert prefix_acc["min_seed_tts_mean_sim"] == 0.80
     assert "test_minicpmo_4_5_nightly_seed_c1" not in by_name
-    daily = by_name["test_minicpmo_4_5_nightly_async_prefix_daily_omni"]
+    daily = by_name["test_minicpmo_4_5_async_prefix_daily_omni"]
     daily_params = daily["benchmark_params"][0]
     assert daily["mark"][0]["hardware_marks"]["num_cards"] == 2
     assert daily_params["max_concurrency"] == [8]
@@ -2244,8 +2244,8 @@ def test_minicpmo_nightly_default_and_async_prefix_seed_tts_matrix():
 def test_minicpmo_npu_nightly_seed_tts_matrix():
     configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
     by_name = {config["test_name"]: config for config in configs}
-    default = by_name["test_minicpmo_4_5_npu_nightly_default"]
-    prefix = by_name["test_minicpmo_4_5_npu_nightly_async_prefix"]
+    default = by_name["test_minicpmo_4_5_npu_default"]
+    prefix = by_name["test_minicpmo_4_5_npu_async_prefix"]
     default_params = default["benchmark_params"][0]
     prefix_by_name = {item["name"]: item for item in prefix["benchmark_params"]}
     npu_stage2 = {
@@ -2292,7 +2292,7 @@ def test_minicpmo_npu_nightly_seed_tts_matrix():
 
 def test_minicpmo_daily_omni_nightly_config_uses_c8_and_minicpm_recipe():
     configs = json.loads((Path(__file__).parent / "test_minicpmo_4_5.json").read_text())
-    config = next(item for item in configs if item["test_name"] == "test_minicpmo_4_5_nightly_async_prefix_daily_omni")
+    config = next(item for item in configs if item["test_name"] == "test_minicpmo_4_5_async_prefix_daily_omni")
     params = config["benchmark_params"][0]
     assert params["max_concurrency"] == [8]
     assert params["num_prompts"] == [1197]
