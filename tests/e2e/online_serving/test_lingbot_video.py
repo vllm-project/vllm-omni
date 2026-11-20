@@ -6,8 +6,9 @@ Online serving smoke for ``robbyant/lingbot-video-dense-1.3b``.
 
 ``test_text_to_image_001`` and ``test_video_generation_modes_001`` are the
 baseline T2I / T2V+TI2V cases (``core_model`` + ``advanced_model``) shared by
-ready (L2) and merge (L3). Heavier MoE and World coverage stays on
-``full_model`` in ``test_lingbot_video_moe.py`` / ``test_lingbot_world_v2.py``.
+ready (L2) and merge (L3). Heavier MoE coverage stays on ``full_model`` in
+``test_lingbot_video_moe.py``. LingBot-World has separate Ready/Merge steps
+for ``tests/e2e/offline_inference/test_lingbot_world_v2.py``.
 
 From ``tests/``::
 
