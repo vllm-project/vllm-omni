@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import gc
+import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -370,11 +372,11 @@ class AuKCUDAGraphWrapper:
         target_frames = x.shape[1]
         orig_batch = x.shape[0]
         orig_x_mask = x_mask
-        x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._bucket_inputs(
-            x, text, c_mask, ref, ref_mask, x_mask
-        )
-        batch_bucket = self._batch_bucket(x_buck.shape[0])
-        key = (batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
+        target_bucket = round_up(target_frames, self._TARGET_ALIGNMENT)
+        text_bucket = round_up(text.shape[1], self._TEXT_ALIGNMENT)
+        ref_bucket = round_up(ref.shape[1], self._REF_ALIGNMENT)
+        batch_bucket = self._batch_bucket(orig_batch)
+        key = (batch_bucket, target_bucket, text_bucket, ref_bucket, uses_cfg, n_steps)
         if key in self._uncapturable_loop_keys:
             return self._run_eager_loop(
                 x=x,
@@ -406,37 +408,32 @@ class AuKCUDAGraphWrapper:
         hit_key = key if entry is not None else None
         if entry is None:
             hit_key, entry = self._larger_loop_entry(
-                batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps
+                orig_batch, target_bucket, text_bucket, ref_bucket, uses_cfg, n_steps
             )
+        capture_failed = False
+        capture_is_oom = False
         if entry is None:
-            self._retire_graph_generation_if_full()
-            if batch_bucket > x_buck.shape[0]:
-                x_buck = self._pad_batch_time(x_buck, batch_bucket, x_buck.shape[1])
-                x_mask = self._pad_batch_time(x_mask, batch_bucket, x_mask.shape[1], mask=True)
-                text_buck = self._pad_batch_time(text_buck, batch_bucket, text_buck.shape[1])
-                c_mask_buck = self._pad_c_mask(c_mask_buck, batch_bucket, c_mask_buck.shape[1])
-                ref_buck = self._pad_batch_time(ref_buck, batch_bucket, ref_buck.shape[1])
-                ref_mask_buck = self._pad_batch_time(ref_mask_buck, batch_bucket, ref_mask_buck.shape[1], mask=True)
-            ctx = self._prepare(
-                x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
-            )
             try:
-                entry = self._capture_loop(
-                    x_buck,
-                    ctx,
+                entry = self._prepare_and_capture_loop(
+                    batch_bucket=batch_bucket,
+                    x=x,
+                    x_mask=orig_x_mask,
+                    text=text,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
                     timesteps=timesteps,
+                    uses_cfg=uses_cfg,
                     cfg_strength=cfg_strength,
                 )
-                self._loop_cache[key] = entry
-                self._oom_loop_cooldowns.pop(key, None)
-                self._oom_loop_retry_counts.pop(key, None)
             except Exception as exc:
                 self._cache.clear()
                 self._loop_cache.clear()
                 self._active_key = None
                 self._pool_handle = None
                 self._oom_loop_cooldowns.clear()
-                if self._is_oom_capture_error(exc):
+                capture_is_oom = self._is_oom_capture_error(exc)
+                if capture_is_oom:
                     retries = self._oom_loop_retry_counts.get(key, 0) + 1
                     self._oom_loop_retry_counts[key] = retries
                     if retries <= self._MAX_OOM_LOOP_RETRIES:
@@ -465,28 +462,50 @@ class AuKCUDAGraphWrapper:
                         key,
                         exc_info=True,
                     )
-                return self._run_eager_loop(
-                    x=x,
-                    x_mask=orig_x_mask,
-                    text=text,
-                    c_mask=c_mask,
-                    ref=ref,
-                    ref_mask=ref_mask,
-                    timesteps=timesteps,
-                    cfg_strength=cfg_strength,
-                )
+                cur_exc: BaseException | None = exc
+                seen_exc: set[int] = set()
+                while cur_exc is not None and id(cur_exc) not in seen_exc:
+                    seen_exc.add(id(cur_exc))
+                    if cur_exc.__traceback__ is not None:
+                        traceback.clear_frames(cur_exc.__traceback__)
+                    cur_exc = cur_exc.__cause__ or cur_exc.__context__
+                capture_failed = True
+            else:
+                self._loop_cache[key] = entry
+                self._oom_loop_cooldowns.pop(key, None)
+                self._oom_loop_retry_counts.pop(key, None)
         else:
             assert hit_key is not None
             self._loop_cache.move_to_end(hit_key)
-            x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._fit_loop_inputs(
-                entry, x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck
+            x_buck, x_mask_buck, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._bucket_inputs(
+                x, text, c_mask, ref, ref_mask, orig_x_mask
+            )
+            x_buck, x_mask_buck, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._fit_loop_inputs(
+                entry, x_buck, x_mask_buck, text_buck, c_mask_buck, ref_buck, ref_mask_buck
             )
             ctx = self._prepare(
-                x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
+                x_buck, x_mask_buck, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
             )
             entry.static_ctx.copy_(ctx)
+            entry.static_x_in.copy_(x_buck)
 
-        entry.static_x_in.copy_(x_buck)
+        if capture_failed:
+            if capture_is_oom:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.accelerator.empty_cache()
+            return self._run_eager_loop(
+                x=x,
+                x_mask=orig_x_mask,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timesteps=timesteps,
+                cfg_strength=cfg_strength,
+            )
+
+        assert entry is not None
         if entry.static_cfg is not None:
             entry.static_cfg.fill_(cfg_strength)
         entry.static_timesteps.copy_(timesteps.float())
@@ -494,6 +513,42 @@ class AuKCUDAGraphWrapper:
         entry.graph.replay()
         # The graph owns this buffer and overwrites it on the next replay.
         return entry.static_x_out[:orig_batch, :target_frames].clone()
+
+    def _prepare_and_capture_loop(
+        self,
+        *,
+        batch_bucket: int,
+        x: torch.Tensor,
+        x_mask: torch.Tensor | None,
+        text: torch.Tensor,
+        c_mask: torch.Tensor,
+        ref: torch.Tensor,
+        ref_mask: torch.Tensor,
+        timesteps: torch.Tensor,
+        uses_cfg: bool,
+        cfg_strength: float,
+    ) -> _LoopGraphEntry:
+        """Retire full caches, pad bucketed inputs, prepare context, and capture a loop graph."""
+        self._retire_graph_generation_if_full()
+        x_buck, x_mask_buck, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._bucket_inputs(
+            x, text, c_mask, ref, ref_mask, x_mask
+        )
+        if batch_bucket > x_buck.shape[0]:
+            x_buck = self._pad_batch_time(x_buck, batch_bucket, x_buck.shape[1])
+            x_mask_buck = self._pad_batch_time(x_mask_buck, batch_bucket, x_mask_buck.shape[1], mask=True)
+            text_buck = self._pad_batch_time(text_buck, batch_bucket, text_buck.shape[1])
+            c_mask_buck = self._pad_c_mask(c_mask_buck, batch_bucket, c_mask_buck.shape[1])
+            ref_buck = self._pad_batch_time(ref_buck, batch_bucket, ref_buck.shape[1])
+            ref_mask_buck = self._pad_batch_time(ref_mask_buck, batch_bucket, ref_mask_buck.shape[1], mask=True)
+        ctx = self._prepare(
+            x_buck, x_mask_buck, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
+        )
+        return self._capture_loop(
+            x_buck,
+            ctx,
+            timesteps=timesteps,
+            cfg_strength=cfg_strength,
+        )
 
     def _larger_loop_entry(
         self,

@@ -897,6 +897,51 @@ class TestRequestParsing:
         for batched, serial in zip(batched_outputs, serial_outputs, strict=True):
             torch.testing.assert_close(batched, serial, atol=0, rtol=0)
 
+    def test_interleaved_shared_generator_preserves_request_order(self, build_pipeline):
+        # Verify interleaved requests sharing one Generator flush to keep exact
+        # RNG draw order, whereas distinct per-request generators still batch
+        # across interleaved schedule keys.
+        pipeline, calls = build_pipeline()
+
+        def make_shared_requests(seed: int):
+            shared_gen = torch.Generator(device="cpu").manual_seed(seed)
+            reqs = [
+                _batch(
+                    _prompt(audio=_silence(0.5), knobs={"gen_seconds": seconds}),
+                    seed=None,
+                    output_type="latent",
+                ).requests[0]
+                for seconds in (2.9, 3.5, 3.1)
+            ]
+            for req in reqs:
+                req.sampling_params.generator = shared_gen
+            return reqs, shared_gen
+
+        serial_reqs, serial_gen = make_shared_requests(42)
+        serial_outputs = [pipeline.forward(DiffusionRequestBatch([req]))[0].output for req in serial_reqs]
+
+        calls.clear()
+        batched_reqs, batched_gen = make_shared_requests(42)
+        batched_outputs = [out.output for out in pipeline.forward(DiffusionRequestBatch(batched_reqs))]
+
+        assert len(calls) == 3
+        for batched, serial in zip(batched_outputs, serial_outputs, strict=True):
+            torch.testing.assert_close(batched, serial, atol=0, rtol=0)
+        assert torch.equal(batched_gen.get_state(), serial_gen.get_state())
+
+        calls.clear()
+        distinct_reqs = [
+            _batch(
+                _prompt(audio=_silence(0.5), knobs={"gen_seconds": seconds}),
+                seed=seed,
+                output_type="latent",
+            ).requests[0]
+            for seconds, seed in zip((2.9, 3.5, 3.1), (7, 11, 13), strict=True)
+        ]
+        pipeline.forward(DiffusionRequestBatch(distinct_reqs))
+        assert len(calls) == 2
+        assert [call["text"].shape[0] for call in calls] == [2, 1]
+
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
     for message in messages:

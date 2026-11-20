@@ -404,6 +404,74 @@ def test_larger_loop_entry_reuses_near_batch_and_rejects_tiny_batch() -> None:
     # Reusing a longer conditioning sequence adds work and changes bf16 rounding.
     _, entry = wrapper._larger_loop_entry(7, 160, 16, 0, True, 4)
     assert entry is None
+    # Boundary checks on unbucketed batch size: 33 (bucket 64) must not pad to 128 (~4x),
+    # while 65 (<= 128/2) and 4 (<= 8/2) may reuse the larger cached graph.
+    _, entry = wrapper._larger_loop_entry(33, 160, 32, 0, True, 4)
+    assert entry is None
+    _, entry = wrapper._larger_loop_entry(65, 160, 32, 0, True, 4)
+    assert entry is fake128
+    _, entry = wrapper._larger_loop_entry(3, 160, 32, 0, True, 4)
+    assert entry is None
+    _, entry = wrapper._larger_loop_entry(4, 160, 32, 0, True, 4)
+    assert entry is fake8
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+@torch.inference_mode()
+def test_loop_capture_oom_releases_allocations_before_eager_and_recovers_from_prepare_oom(mocker) -> None:
+    import weakref
+
+    dit = _make_dit("cuda")
+    wrapper = AuKCUDAGraphWrapper(dit, max_graphs=1)
+    inputs = _sample_inputs("cuda")
+    common = dict(**inputs, gen_frames=9, t_grid=[0.0, 0.4, 1.0], cfg_strength=0.0)
+
+    # Track when transient objects held in _prepare / _capture_loop frames are released relative to _run_eager_loop.
+    transient_ref: weakref.ref | None = None
+    transient_alive_at_eager: list[bool] = []
+    real_run_eager_loop = wrapper._run_eager_loop
+
+    class _Sentinel:
+        pass
+
+    def oom_in_capture(*args, **kwargs):
+        nonlocal transient_ref
+        sentinel = _Sentinel()
+        transient_ref = weakref.ref(sentinel)
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory inside _capture_loop")
+
+    def spy_run_eager_loop(*args, **kwargs):
+        transient_alive_at_eager.append(transient_ref is not None and transient_ref() is not None)
+        return real_run_eager_loop(*args, **kwargs)
+
+    mocker.patch.object(wrapper, "_capture_loop", side_effect=oom_in_capture)
+    mocker.patch.object(wrapper, "_run_eager_loop", side_effect=spy_run_eager_loop)
+    out = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert out is not None
+    assert transient_alive_at_eager == [False]
+    assert len(wrapper._oom_loop_cooldowns) == 1
+    assert not wrapper._uncapturable_loop_keys
+
+    # Now simulate OOM during _prepare (during bucket/prepare setup) -> recovers into cooldown + eager fallback.
+    wrapper._oom_loop_cooldowns.clear()
+    wrapper._oom_loop_retry_counts.clear()
+    real_prepare = wrapper._prepare
+    prepare_calls = 0
+
+    def oom_once_in_prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory inside _prepare")
+        return real_prepare(*args, **kwargs)
+
+    mocker.patch.object(wrapper, "_prepare", side_effect=oom_once_in_prepare)
+    out2 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    assert out2 is not None
+    assert prepare_calls == 2
+    assert len(wrapper._oom_loop_cooldowns) == 1
+    assert not wrapper._uncapturable_loop_keys
 
 
 @pytest.mark.cpu

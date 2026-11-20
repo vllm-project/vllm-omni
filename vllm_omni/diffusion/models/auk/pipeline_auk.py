@@ -669,7 +669,16 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         their padding is masked. Seeds, posterior sampling and output types
         remain request-local.
         """
-        groups: dict[_ScheduleKey, list[_RequestCondition]] = {}
+        waves: list[tuple[_ScheduleKey, list[_RequestCondition]]] = []
+        open_groups: dict[_ScheduleKey, list[_RequestCondition]] = {}
+        gen_open_key: dict[int, _ScheduleKey] = {}
+
+        def _flush_group(group_key: _ScheduleKey) -> None:
+            flushed = open_groups.pop(group_key)
+            for item in flushed:
+                gen_open_key.pop(id(item.generator), None)
+            waves.append((group_key, flushed))
+
         for index, request in enumerate(req.requests):
             prompt = _prompt_mapping(request.prompt)
             sampling_params = request.sampling_params
@@ -698,12 +707,22 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             target_bucket = round_up(gen_frames, AuKCUDAGraphWrapper._TARGET_ALIGNMENT)
             nfe, cfg, sway, t_grid = self._resolve_schedule(sampling_params, knobs)
             key = (nfe, cfg, sway, tuple(t_grid) if t_grid is not None else None, target_bucket)
-            groups.setdefault(key, []).append(
+            gen_id = id(generator)
+            prev_key = gen_open_key.get(gen_id)
+            if prev_key is not None and prev_key != key:
+                # Flush the earlier open wave when a shared generator transitions
+                # to a different schedule key so RNG consumption stays serial.
+                _flush_group(prev_key)
+            open_groups.setdefault(key, []).append(
                 _RequestCondition(index, text, ref, generator, sampling_params.output_type or "np", gen_frames)
             )
+            gen_open_key[gen_id] = key
+
+        for group_key in list(open_groups):
+            _flush_group(group_key)
 
         outputs: dict[int, DiffusionOutput] = {}
-        for (nfe, cfg, sway, t_grid, target_bucket), items in groups.items():
+        for (nfe, cfg, sway, t_grid, target_bucket), items in waves:
             text, c_mask = _pad_conditions([item.text for item in items])
             if len(items) == 1:
                 ref = items[0].ref
