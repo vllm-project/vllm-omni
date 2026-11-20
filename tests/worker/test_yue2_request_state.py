@@ -44,26 +44,26 @@ def test_pending_draw_is_discarded_after_chunked_recompute(model) -> None:
     """A preempted in-flight draw never advances history or the frame limit."""
     logits = torch.zeros((1, y.VOCAB_SIZE))
     model._step_rows = [("r", 0, 3)]
-    model.sample(logits, None)
+    model.sample(logits)
     state = model._states["r"]
     # Other requests run while r waits for KV space. Resolving the host copy
     # may resolve a tentative token, but the resumed row must roll it back.
     model._step_rows = []
-    model.sample(logits[:0], None)
+    model.sample(logits[:0])
     assert state.job is None
     # A partial recompute must neither accept the pending draw nor draw again.
     model._step_rows = [("r", 0, 2)]
     model._step_discard = [True]
-    model.sample(logits, None)
+    model.sample(logits)
     assert state.job is None
     # Completing recompute has retained zero outputs: discard the old draw.
     model._step_rows = [("r", 2, 1)]
     model._step_discard = [False]
-    model.sample(logits, None)
+    model.sample(logits)
     assert state.history == []
     # Only this new draw is retained in the next decode input.
     model._step_rows = [("r", 3, 1)]
-    model.sample(logits, None)
+    model.sample(logits)
     assert state.history == [y.CODEC_OFFSET + 7]
     assert not state.finish_ready and not state.truncated
 
@@ -76,12 +76,12 @@ def test_discarded_terminal_draw_does_not_start_synthesis(model, mocker, token: 
     mocker.patch.object(y, "sample_rows", return_value=(torch.tensor([token]), torch.tensor([False])))
     logits = torch.zeros((1, y.VOCAB_SIZE))
     model._step_rows = [("r", 4, 1)]
-    model.sample(logits, None)
+    model.sample(logits)
     model._step_rows = []
-    model.sample(logits[:0], None)
+    model.sample(logits[:0])
     assert state.job is None
     model._step_rows = [("r", 0, 5)]
-    model.sample(logits, None)
+    model.sample(logits)
     assert state.history == [y.CODEC_OFFSET + 2] * 2
     assert not state.finish_ready and not state.truncated and not state.end_drawn
     assert state.job is None and not state.finished
@@ -127,21 +127,21 @@ def test_dropped_end_step_redelivers_song_and_end(model, mocker) -> None:
 
     # Engine holds 3 frames + 2 HOLDs; this step ships the song and its end.
     model._step_rows = [("r", 7, 1)]
-    out = model.sample(logits, None)
-    assert out.sampled_token_ids.tolist() == [[y.MUSIC_END]]
+    out = model.sample(logits)
+    assert out.tolist() == [[y.MUSIC_END]]
     assert state.finished and state.end_len == 6
     assert [entry[:2] for entry in model._audio_queue] == [("r", audio)]
 
     # An async lookahead row (end token in flight) delivers nothing again.
     model._step_rows = [("r", 8, 1)]
-    model.sample(logits, None)
+    model.sample(logits)
     assert len(model._audio_queue) == 1
 
     # Preempted with the end step in flight: the resumed row lacks it.
     model._step_rows = [("r", 0, 8)]
     model._step_discard = [False]
-    out = model.sample(logits, None)
-    assert out.sampled_token_ids.tolist() == [[y.MUSIC_END]]
+    out = model.sample(logits)
+    assert out.tolist() == [[y.MUSIC_END]]
     assert [entry[:2] for entry in model._audio_queue] == [("r", audio), ("r", audio)]
     assert model._audio_queue[1][2:] == (True, False)  # truncated, not failed
     assert state.end_len == 6
@@ -153,7 +153,7 @@ def test_accepted_draw_still_reaches_frame_limit(model) -> None:
     logits = torch.zeros((1, y.VOCAB_SIZE))
     for comp, span in ((0, 3), (3, 1), (4, 1)):
         model._step_rows = [("r", comp, span)]
-        model.sample(logits, None)
+        model.sample(logits)
     state = model._states["r"]
     assert len(state.history) == 2
     model._resolve_pending()

@@ -7,7 +7,6 @@ import torch
 from vllm import SamplingParams
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
 from vllm.v1.engine import EngineCoreOutputs
-from vllm.v1.outputs import SamplerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
@@ -258,19 +257,19 @@ def test_guidance_precedes_one_native_sample_and_copies_token(monkeypatch):
     logits[0, MUSIC_END:] = 0.25
     logits[1, MUSIC_END:] = 0.5
 
-    def sample(self, guided, metadata):
+    def sample(self, guided):
         assert self._step_discard == [True, False]
         assert (guided[1, MUSIC_END:] == 0.625).all()
         assert torch.isneginf(guided[:, :MUSIC_END]).all()
-        return SamplerOutput(sampled_token_ids=torch.tensor([[0], [123]], dtype=torch.int32), logprobs_tensors=None)
+        return torch.tensor([[0], [123]], dtype=torch.int32)
 
     monkeypatch.setattr(Yue2Backbone, "sample", sample)
-    result = model.sample(logits, None)
-    assert result.sampled_token_ids.tolist() == [[123], [123]]
+    result = model.sample(logits)
+    assert result.tolist() == [[123], [123]]
     assert model._step_discard == [False, False]
     model._step_rows[1] = ("missing", 20, 1)
     with pytest.raises(RuntimeError, match="without its parent"):
-        model.sample(logits, None)
+        model.sample(logits)
 
 
 def test_child_outputs_hidden_but_worker_cleanup_preserved(monkeypatch, mocker):
@@ -354,9 +353,9 @@ def test_cfg1_sample_calls_original_sampler_directly(monkeypatch):
     model = Yue2ForCausalLM.__new__(Yue2ForCausalLM)
     torch.nn.Module.__init__(model)
     model._cfg_step = [{}, None]
-    expected = SamplerOutput(torch.tensor([[2], [3]]), None)
+    expected = torch.tensor([[2], [3]])
     monkeypatch.setattr(Yue2Backbone, "sample", lambda *args: expected)
-    assert model.sample(None, None) is expected
+    assert model.sample(None) is expected
 
 
 @pytest.mark.parametrize("limit", ["slots", "prefill", "kv", "chunked"])

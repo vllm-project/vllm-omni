@@ -35,7 +35,6 @@ from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
-from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -2398,7 +2397,7 @@ class Yue2ForCausalLM(nn.Module):
 
     # ------------------------------------------------------------ sampler
 
-    def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> SamplerOutput | None:
+    def sample(self, logits: torch.Tensor) -> torch.Tensor:
         """Draw one token per decoding row with the request's own arithmetic.
 
         The draw stays on the device: its ids reach the host through an
@@ -2408,7 +2407,6 @@ class Yue2ForCausalLM(nn.Module):
         sees the full history (the previous draw is resolved first); only
         acting on an end token or a full frame budget moves one step later.
         """
-        del sampling_metadata
         rows = int(logits.shape[0])
         # The runner's input_ids buffer is int32; long ids crash its scatter
         # when concurrent requests re-index rows.
@@ -2420,9 +2418,7 @@ class Yue2ForCausalLM(nn.Module):
         self._resolve_pending()
         self._synthesis.pump()
         if not self._step_rows:
-            return SamplerOutput(
-                sampled_token_ids=host_token_ids.to(logits.device, non_blocking=True), logprobs_tensors=None
-            )
+            return host_token_ids.to(logits.device, non_blocking=True)
 
         # Rows sharing a phase and preset are sampled as one batch.
         groups: dict[tuple, list[tuple[int, _RequestState]]] = {}
@@ -2486,7 +2482,7 @@ class Yue2ForCausalLM(nn.Module):
             groups.setdefault(key, []).append((row, state))
         token_ids = host_token_ids.to(logits.device, non_blocking=True)
         if not groups:
-            return SamplerOutput(sampled_token_ids=token_ids, logprobs_tensors=None)
+            return token_ids
 
         # Stage every small host input of this step in one pinned buffer and
         # move it with a single async copy: a pageable copy or a list index
@@ -2570,7 +2566,7 @@ class Yue2ForCausalLM(nn.Module):
         event = torch.Event()
         event.record()
         self._pending = (event, host, states)
-        return SamplerOutput(sampled_token_ids=token_ids, logprobs_tensors=None)
+        return token_ids
 
     def _sampler_graph(self, vocab, rows, logits, preset, width) -> SamplerGraph | None:
         """Use a power-of-two bucket; bound captures for custom sampling presets.

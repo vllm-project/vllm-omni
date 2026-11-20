@@ -38,6 +38,16 @@ class Yue2ModelRunnerOutput(OmniModelRunnerOutput):
 
 
 class Yue2ForCausalLM(Yue2Backbone):
+    mrv2_forward_returns_tensor = True
+
+    def create_omni_model_state(self, vllm_config, encoder_cache, device):
+        from .model_state import Yue2ModelState
+
+        return Yue2ModelState(vllm_config, self, encoder_cache, device)
+
+    def compute_prompt_logits(self, hidden_states):
+        return self.logits_processor(self.lm_head, hidden_states)
+
     def __init__(self, *, vllm_config, prefix=""):
         parallel = vllm_config.parallel_config
         if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
@@ -118,9 +128,9 @@ class Yue2ForCausalLM(Yue2Backbone):
         self._cfg_step = kwargs.get("sampling_extra_args") or []
         return result
 
-    def sample(self, logits, sampling_metadata):
+    def sample(self, logits):
         if not any((args or {}).get("yue2_cfg_parent") is not None for args in self._cfg_step):
-            return super().sample(logits, sampling_metadata)
+            return super().sample(logits)
         rows = {rid: i for i, (rid, _, _) in enumerate(self._step_rows)}
         pairs = []
         original_discard = self._step_discard
@@ -143,11 +153,11 @@ class Yue2ForCausalLM(Yue2Backbone):
             pairs.append((positive, negative))
         self._step_discard = discard
         try:
-            result = super().sample(logits, sampling_metadata)
+            result = super().sample(logits)
         finally:
             self._step_discard = original_discard
         for positive, negative in pairs:
-            result.sampled_token_ids[negative].copy_(result.sampled_token_ids[positive])
+            result[negative].copy_(result[positive])
         return result
 
 

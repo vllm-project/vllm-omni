@@ -12,9 +12,9 @@ duplicated across stages. The VAE decoder is a separate repository
 
 Sampling is model-owned. ``sampling_constraints`` pins ``detokenize`` and the
 union of both phase end tokens; ``extra_args`` carry the phase and the
-request-local sampling preset, and must be present in the stage's
-``default_sampling_params`` so ``has_sampling_extra_args`` turns on and the
-per-request args reach the model's forward.
+request-local sampling preset. ``Yue2ModelState`` reads these arguments from
+the native MRv2 intermediate buffer before forward, including graph replay.
+The deployment remains disabled until the acoustic lifecycle is migrated.
 """
 
 from vllm_omni.config.stage_config import (

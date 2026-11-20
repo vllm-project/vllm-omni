@@ -67,12 +67,12 @@ class Yue2LifecycleWorkerExtension:
                     assert emitted[state.request_id] == expected, "engine token and model history disagree"
             resolve()
 
-        def sample_tokens(logits, sampling_metadata):
-            result = sample(logits, sampling_metadata)
+        def sample_tokens(logits):
+            result = sample(logits)
             phases = {model._states[rid].constants.phase for rid, _, _ in model._step_rows if rid in model._states}
             if len(phases) == 2:
                 self.yue2_probe["mixed_steps"] += 1
-            for (rid, _, _), row in zip(model._step_rows, result.sampled_token_ids.tolist()):
+            for (rid, _, _), row in zip(model._step_rows, result.tolist()):
                 emitted[rid] = row[0]
             return result
 
