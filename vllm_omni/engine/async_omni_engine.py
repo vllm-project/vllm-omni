@@ -74,7 +74,7 @@ class AsyncOmniEngine(OmniEngineBase):
             raise ValueError(
                 "model_runner: v2 supports temperature/top-k/top-p/seed sampling only; "
                 f"request {request_id} set unsupported sampling parameter(s): {', '.join(bad)}. "
-                "Remove them or run this stage with model_runner: v1"
+                "Remove the unsupported parameters"
             )
 
     def _resolve_mm_hasher_algorithm(self) -> str:

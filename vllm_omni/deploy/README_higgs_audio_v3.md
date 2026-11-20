@@ -1,7 +1,7 @@
 # Higgs-Audio V3 Deploy Profiles
 
 With vLLM 0.34, Model Runner V2 is the only supported runner. The default
-profile is `higgs_multimodal_qwen3.yaml`.
+profile is `higgs_multimodal_qwen3.yaml`; `model_runner: v1` is rejected.
 
 ## Model Runner V2 (default)
 
