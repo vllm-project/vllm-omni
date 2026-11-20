@@ -479,16 +479,15 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
         has_alpha = any(k.endswith(".alpha") for k in state_dict)
         is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
         is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
-        has_unprefixed_weights = any(
-            k.endswith((".lora_A.weight", ".lora_B.weight")) and not k.startswith("transformer.") for k in state_dict
-        )
+        has_unprefixed_keys = any(not k.startswith("transformer.") for k in state_dict)
         if has_alpha and is_diffusers_lora_format:
             state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
 
         # The legacy converter only understands non-diffusers layouts. Already-dotted
         # diffusers keys (including a `.default` suffix normalized above) only need the
-        # module prefix. Sending the whole dict through the converter drops other
-        # tensors, such as a bias delta, and raises before any fusion.
+        # module prefix, for both the A/B pair and the bias of the same target. Sending
+        # the whole dict through the converter drops other tensors, such as a bias delta,
+        # and raises before any fusion.
         if is_non_diffusers_format or (has_alpha and not is_diffusers_lora_format):
             converter = get_converter_by_pipeline(self)
             if converter is None:
@@ -496,13 +495,8 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
 
             # The converter adds the transformer prefix itself.
             state_dict = converter({k.removeprefix("transformer."): v for k, v in state_dict.items()})
-        elif has_unprefixed_weights:
-            prefixed_state_dict = {}
-            for key, value in state_dict.items():
-                if key.endswith((".lora_A.weight", ".lora_B.weight")) and not key.startswith("transformer."):
-                    key = f"transformer.{key}"
-                prefixed_state_dict[key] = value
-            state_dict = prefixed_state_dict
+        elif has_unprefixed_keys:
+            state_dict = {k if k.startswith("transformer.") else f"transformer.{k}": v for k, v in state_dict.items()}
 
         state_dict = _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
 

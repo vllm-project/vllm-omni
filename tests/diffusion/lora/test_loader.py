@@ -359,6 +359,7 @@ class TestQwenImageLoraLoaderMixin:
         original_weight = prefixed_out.weight.detach().clone()
         original_bias = prefixed_out.bias.detach().clone()
         original_unprefixed_weight = unprefixed_out.weight.detach().clone()
+        original_unprefixed_bias = unprefixed_out.bias.detach().clone()
         prefixed, prefixed_delta = make_dummy_lora_state_dict("transformer.blocks.0.attn.to_out.0")
         bias = torch.randn(HEAD_DIM)
         prefixed["transformer.blocks.0.attn.to_out.bias"] = bias
@@ -367,6 +368,8 @@ class TestQwenImageLoraLoaderMixin:
             lora_a_suffix="lora_A.default.weight",
             lora_b_suffix="lora_B.default.weight",
         )
+        unprefixed_bias = torch.randn(HEAD_DIM)
+        unprefixed["blocks.1.attn.to_out.bias"] = unprefixed_bias
         mocker.patch(
             "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
             side_effect=AssertionError("diffusers keys must not go through the legacy converter"),
@@ -377,6 +380,7 @@ class TestQwenImageLoraLoaderMixin:
         assert_close(prefixed_out.weight, original_weight + prefixed_delta)
         assert_close(prefixed_out.bias, original_bias + bias)
         assert_close(unprefixed_out.weight, original_unprefixed_weight + unprefixed_delta)
+        assert_close(unprefixed_out.bias, original_unprefixed_bias + unprefixed_bias)
 
     def test_load_lora_rejects_zero_matches(self):
         pipeline = DummyQwenImagePipeline(1, HEAD_DIM)

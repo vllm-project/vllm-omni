@@ -164,9 +164,9 @@ single object (a single object remains valid):
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
 
-For Qwen-Image pipelines, single-file `lora_A`/`lora_B` weights may include
-the `.default` adapter suffix and may omit the `transformer.` prefix. These
-names are normalized before fusion. If no weights match the transformer,
+For Qwen-Image pipelines, single-file `lora_A`/`lora_B` weights (and any `bias`
+deltas) may include the `.default` adapter suffix and may omit the `transformer.`
+prefix. These names are normalized before fusion. If no weights match the transformer,
 loading raises an error instead of registering the adapter as fused.
 
 With tensor parallelism, the fusion loader selects each rank's portion of the
