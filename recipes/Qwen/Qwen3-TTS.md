@@ -179,15 +179,15 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
   built-in or designed voices can speak much slower per token than a cloned
   reference. Tune them under the Talker stage's `additional_config` in the
   deploy YAML (a number for all tasks, or a `{Base: ..., CustomVoice: ...}`
-  mapping); a rate of `0` disables the ceiling. If the Talker
-  reaches that ceiling without codec EOS, non-streaming serving discards the
-  incomplete audio and retries once with a fresh seed; an explicit `seed` or
-  `max_new_tokens` disables the retry. SSE and WebSocket clients receive
-  structured errors and must discard previously emitted audio when the error
-  contains `"action":"discard"`; raw PCM streams terminate with a connection
-  error after any partial bytes already sent. An explicit `max_new_tokens`
-  always wins; Base rejects audio that exhausts it, while CustomVoice and
-  VoiceDesign return it as before.
+  mapping); a rate of `0` disables the ceiling. An explicit `max_new_tokens`
+  overrides the text-scaled budget. If the Talker reaches a token or context
+  limit without codec EOS, serving returns the generated audio without a
+  retry or a generation error. Non-streaming responses set
+  `X-Audio-Truncated: true`; SSE finishes with `speech.audio.done` and
+  `truncated: true`. Raw PCM and WebSocket streams finish normally but carry
+  no truncation flag. This applies to Base, CustomVoice and VoiceDesign;
+  reaching a limit does not guarantee the entire input was spoken. See
+  [Truncated audio](../../docs/serving/speech_api.md#truncated-audio).
 - Known limitations: The server serves one model variant at a time. To switch task types (e.g., CustomVoice to Base), restart the server with the corresponding model.
 
 ## Hardware Support

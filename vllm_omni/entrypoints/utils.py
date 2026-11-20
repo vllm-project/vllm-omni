@@ -58,8 +58,8 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
         logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
-def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
-    """Parse and validate the shape of per-stage JSON overrides."""
+def parse_stage_overrides(value: Any, *, filter_deploy_fields: bool = True) -> dict[str, dict[str, Any]] | None:
+    """Validate per-stage overrides and optionally drop known deploy-only fields."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -75,6 +75,9 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             "--stage-overrides must be a JSON object mapping stage_id -> overrides, "
             f"got {type(parsed).__name__}: {parsed!r}"
         )
+    from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS
+
+    filtered: dict[str, dict[str, Any]] = {}
     for stage_id, overrides in parsed.items():
         if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
             raise ValueError(
@@ -84,8 +87,24 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             raise ValueError(
                 f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
             )
+        if not filter_deploy_fields:
+            filtered[stage_id] = overrides
+            continue
+        kept_overrides = {}
+        for key, override in overrides.items():
+            config_key = str(key).partition(".")[0]
+            if config_key in NON_STAGE_OVERRIDE_FIELDS:
+                logger.warning(
+                    "Ignoring --stage-overrides[%r][%r]: set %r in the deploy config instead.",
+                    stage_id,
+                    key,
+                    config_key,
+                )
+                continue
+            kept_overrides[key] = override
+        filtered[stage_id] = kept_overrides
 
-    return parsed
+    return filtered
 
 
 @dataclass(frozen=True)
