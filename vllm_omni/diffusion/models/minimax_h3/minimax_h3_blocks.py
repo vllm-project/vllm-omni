@@ -20,11 +20,13 @@ from vllm.model_executor.layers.linear import (
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
+    AttentionImpl,
     AttentionMetadata,
     PackedPaddingMetadata,
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+from vllm_omni.diffusion.attention.backends.utils.rocm_h3_bounds import has_packed_fmha_bounds
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -38,8 +40,10 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
+from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
+from .attention.flash_h3 import MiniMaxH3FlashAttentionImpl
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
@@ -254,6 +258,9 @@ class MiniMaxH3Attention(nn.Module):
         self._prefix = prefix
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
 
+        impl_overrides: dict[str, type[AttentionImpl]] = {"FASTVIDEO_VSA": MiniMaxH3VSAImpl}
+        if current_omni_platform.is_rocm():
+            impl_overrides["FLASH_ATTN"] = MiniMaxH3FlashAttentionImpl
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -266,7 +273,7 @@ class MiniMaxH3Attention(nn.Module):
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
-            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
+            impl_overrides=impl_overrides,
         )
 
     def enable_vsa_gate(self) -> None:
@@ -391,7 +398,27 @@ class MiniMaxH3Attention(nn.Module):
         # Read once per forward: during an active scheduled denoise step this is
         # the candidate the layer dispatches to, and the packed layout below
         # must match that backend rather than the baseline.
-        backend = self.attention.effective_attention()[1]
+        impl, backend, _ = self.attention.effective_attention()
+        grouped_fmha = (
+            isinstance(impl, MiniMaxH3FlashAttentionImpl)
+            and impl.rocm_h3_grouped_fmha
+            and not self.attention.is_paged_kv_active()
+            and self.attention._effective_kv_cache_dtype() is None
+            and not use_ring
+            and q.device.type == "cuda"
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and not (q.requires_grad or k.requires_grad or v.requires_grad)
+            and num_requests == 1
+            and reference_kv_state is None
+            and not reference_kv_compact
+            and gate_compress is None
+            and vdn_window is None
+            and self.vsa_sparsity is None
+            and packed_total == 37760
+            and q.shape == k.shape == v.shape == (9440, 56, 128)
+            and self.attention._get_active_parallel_strategy().name == "ulysses"
+            and has_packed_fmha_bounds(cu_seqlens, max_seqlen)
+        )
         if num_requests > 1:
             if not _attention_isolates_packed_requests(self.attention, backend):
                 backend_name = backend.get_name()
@@ -407,7 +434,8 @@ class MiniMaxH3Attention(nn.Module):
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
             mask_free_packed_padding = not use_ring and (
-                backend.supports_packed_mask_free()
+                grouped_fmha
+                or backend.supports_packed_mask_free()
                 or (
                     reference_kv_compact
                     and backend.get_name() == "RAINFUSION_ATTN"
@@ -434,6 +462,9 @@ class MiniMaxH3Attention(nn.Module):
             "vsa_h3_ref_policy": self.vsa_ref_policy,
             "vsa_h3_ref_keep_rate": self.vsa_ref_keep_rate,
         }
+        if grouped_fmha:
+            extra["minimax_h3_grouped_fmha"] = True
+            extra["accepts_strided_ulysses_qkv"] = True
         if gate_compress is not None:
             extra["gate_compress"] = gate_compress.unsqueeze(0)
             if video_layout is not None and video_layout.video_spans:

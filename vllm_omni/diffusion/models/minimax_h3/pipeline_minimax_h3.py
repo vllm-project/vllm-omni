@@ -713,6 +713,7 @@ class MiniMaxH3Pipeline(
     # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
     # a derived pipeline may point this at a subclass.
     _transformer_cls: ClassVar[type[MiniMaxH3DiTModel] | None] = None
+    _rocm_h3_grouped_fmha: bool = False
     load_vae_decoder: bool = True
     supports_request_cancellation: ClassVar[bool] = True
 
@@ -964,6 +965,12 @@ class MiniMaxH3Pipeline(
         # default step ranges and the latent_refine default, a pair _prepare_encoder_conditioning_inputs
         # rejects; fail here instead of on every such request.
         service_schedule = od_config.diffusion_attention_schedule
+        profiles = service_schedule.profiles.values() if service_schedule is not None else ()
+        self._rocm_h3_grouped_fmha = any(
+            spec is not None and spec.rocm_h3_grouped_fmha
+            for config in (od_config.diffusion_attention_config, *profiles)
+            for spec in (config.default, *config.per_role.values())
+        )
         additional_config = od_config.additional_config or {}
         if (
             service_schedule is not None
@@ -2166,6 +2173,7 @@ class MiniMaxH3Pipeline(
             text_embeddings=text_embeddings,
             token_tags=tags,
             device=self.device,
+            rocm_h3_grouped_fmha=self._rocm_h3_grouped_fmha,
         )
 
         if control_rows is not None:
@@ -2254,6 +2262,7 @@ class MiniMaxH3Pipeline(
                 text_embeddings=base_text_embeddings,
                 token_tags=base_tags,
                 device=self.device,
+                rocm_h3_grouped_fmha=self._rocm_h3_grouped_fmha,
             )
             if int(base_branch.update_mask.sum()) != int(branch.update_mask.sum()):
                 raise ValueError("base branch target row count differs from the full branch")

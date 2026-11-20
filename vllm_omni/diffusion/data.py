@@ -2478,10 +2478,15 @@ class AttentionSpec:
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
+    rocm_h3_grouped_fmha: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
+        if not isinstance(self.rocm_h3_grouped_fmha, bool):
+            raise TypeError("rocm_h3_grouped_fmha must be a boolean")
+        if self.rocm_h3_grouped_fmha and self.backend.upper() != "FLASH_ATTN":
+            raise ValueError("rocm_h3_grouped_fmha requires the FLASH_ATTN backend")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
@@ -2537,6 +2542,8 @@ class AttentionSpec:
     def backend_kwargs(self) -> dict[str, Any] | None:
         """Serialize typed backend config into the kwargs dict the backend impl consumes."""
         kw: dict[str, Any] = {}
+        if self.rocm_h3_grouped_fmha:
+            kw["rocm_h3_grouped_fmha"] = True
         if self.backend.upper() == "FASTVIDEO_VSA" and self.fastvideo_vsa_provider != "auto":
             kw["provider"] = self.fastvideo_vsa_provider
         if self.fastvideo_vsa_precision != "bf16":
@@ -2658,6 +2665,7 @@ class AttentionConfig:
             "fastvideo_vsa_topk",
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
+            "rocm_h3_grouped_fmha",
             "sparge",
             "block_sparse",
         }

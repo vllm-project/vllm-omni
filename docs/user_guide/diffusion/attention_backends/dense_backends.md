@@ -41,6 +41,25 @@ when a compatible package is installed.
 vllm-omni serve <model> --diffusion-attention-backend FLASH_ATTN
 ```
 
+### MiniMax-H3 grouped attention on AMD Instinct
+
+For MiniMax-H3 BF16 inference on four gfx950 GPUs with Ulysses SP4/Ring1,
+enable grouped AITER attention in the FLASH_ATTN configuration.
+
+```bash
+vllm-omni serve <model> --num-gpus 4 --usp 4 --ring 1 \
+  --diffusion-attention-config '{"default":{"backend":"FLASH_ATTN","rocm_h3_grouped_fmha":true}}'
+```
+
+The option covers the two-segment 37,760-row H3 video layouts with 128-wide
+heads. It changes the workgroup traversal of AITER's grouped BF16 kernel and
+writes a contiguous output. It accepts both dense inputs and Ulysses receive
+views. The runtime verifies the SHA-256 of the [gfx950 grouped kernel shipped
+by AITER](https://github.com/ROCm/aiter/blob/50bfa78d/hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16_group.co),
+changes three register moves in memory, and verifies the new digest before
+loading the kernel. An unknown object, an unsupported layout, or a cold HIP
+graph capture uses the standard packed FlashAttention path.
+
 ### FlashAttention 4 on Blackwell
 
 Install the optional CUDA 13 extra:
