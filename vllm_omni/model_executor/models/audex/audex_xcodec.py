@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex TTA stage 1: XCodec1 RVQ codes → waveform.
 
 Unlike the streaming causal speech decoder used for TTS, XCodec1 is a CNN
@@ -62,6 +62,7 @@ class AudexXCodec1(nn.Module):
     """Stage-1 model for Audex TTA (GenerationModelRunner)."""
 
     input_modalities = "audio"
+    logits_vocab_size = 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
