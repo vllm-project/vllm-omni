@@ -1,0 +1,22 @@
+{
+  "measured_checkout": "7602d7980d8add4277353e8bc162ac1f98d98c19",
+  "pr_head": "0683e378ba85ac8c752844d0a6ce6978bccf8081",
+  "production_code_unchanged": true,
+  "changed_paths": [
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/README.md",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/analysis.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/compat_bootstrap.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/control.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/cpu_prepare.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/lifecycle.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/observer.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/reproduce_statistics.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/request_sender.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/results.json",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/run-manifest.json",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/server.log.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/server.py.txt",
+    "docs/assets/performance/minimax_h3_encoder_weight_transfer/stage.sh.txt",
+    "docs/user_guide/diffusion/encoder_weight_transfer.md"
+  ]
+}

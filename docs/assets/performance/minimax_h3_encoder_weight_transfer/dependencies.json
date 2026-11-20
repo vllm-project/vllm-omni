@@ -1,0 +1,15 @@
+{
+  "torch": "2.10.0+cpu",
+  "torch-npu": "2.10.0.post2",
+  "vllm": "0.33.0+empty",
+  "vllm-ascend": "0.19.1rc2.dev1251",
+  "transformers": "5.19.0",
+  "diffusers": "0.40.0",
+  "numpy": "1.26.4",
+  "Pillow": "12.3.0",
+  "python": "3.12.13",
+  "platform": "Linux-5.15.152.bsk.10-amd64-x86_64-with-glibc2.35",
+  "ffmpeg": "ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers",
+  "recording_scope": "Exact measured interpreter metadata captured during the final paired arm; versions agree with preceding current-source comparison.",
+  "recorded_at": "2026-11-20T17:46:15.671741+00:00"
+}

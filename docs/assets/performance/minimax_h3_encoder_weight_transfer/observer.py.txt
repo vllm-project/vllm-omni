@@ -1,181 +1,136 @@
-"""Passive per-request counters and host timers; tensor hashes only in warmups."""
+"""Completed encoder timing and source-loop H2D counts; no formal per-copy hook."""
 from functools import wraps
-import hashlib
 import json
-import os
 from pathlib import Path
 import time
 import torch
 import torch.distributed as dist
+import observer_base as base
 
-STATE = None
-PIPELINE = None
-
-
-def active():
-    path = Path(os.environ["PERF_WINDOW"]) / "active-request.json"
-    return json.loads(path.read_text()) if path.exists() else None
-
-
-def sha_tensor(value):
-    data = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
-    return hashlib.sha256(memoryview(data.numpy())).hexdigest()
-
-
-def capture(key, value):
-    if STATE is not None and STATE["active"]["capture"] and isinstance(value, torch.Tensor):
-        STATE["tensors"][key] = {"shape": list(value.shape), "dtype": str(value.dtype), "sha256": sha_tensor(value)}
-
-
-def emit(event, elapsed, details):
-    context = active()
-    if context is None:
-        return
-    row = {"nonce": context["nonce"], "event": event, "seconds": elapsed,
-           "rank": dist.get_rank() if dist.is_initialized() else None, "pid": os.getpid(), **details}
-    folder = Path(context["stats_dir"])
-    folder.mkdir(parents=True, exist_ok=True)
-    with (folder / f"events-{os.getpid()}.jsonl").open("a") as file:
-        file.write(json.dumps(row) + "\n")
+DETAIL = None
+COPY_CONTEXT = None
 
 
 def install():
-    from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
+    base.install()
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
-    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing, reference_video
-    MiniMaxH3Qwen3VLEncoder.cudnn_sdp = False
-    original = MiniMaxH3Pipeline.forward
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager, _collect_source_groups
+    from vllm_omni.diffusion.offloader.layerwise_backend import LayerwiseOffloadHook
 
-    @wraps(original)
+    copy_original = torch.Tensor.copy_
+
+    @wraps(copy_original)
+    def traced_copy(destination, source, *args, **kwargs):
+        value = copy_original(destination, source, *args, **kwargs)
+        if COPY_CONTEXT is not None and destination.device.type == "npu" and source.device.type == "cpu":
+            COPY_CONTEXT["observed_calls"] += 1
+            COPY_CONTEXT["observed_bytes"] += source.numel() * source.element_size()
+        return value
+
+    # The original method is restored before every formal request. Trace callbacks
+    # only prove the derived source-loop counts during excluded warmups.
+    forward_original = MiniMaxH3Pipeline.forward
+
+    @wraps(forward_original)
     def forward(self, request):
-        global STATE, PIPELINE
-        PIPELINE = self
-        context = active()
+        global DETAIL
+        DETAIL = None
+        context = base.active()
         assert context is not None
-        if not hasattr(self, "_benchmark_precision"):
-            summary = {}
-            for name in ["transformer", "text_encoder"]:
-                counts = {}
-                for parameter in getattr(self, name).parameters():
-                    key = str(parameter.dtype)
-                    counts[key] = counts.get(key, 0) + parameter.numel()
-                summary[name] = counts
-            self._benchmark_precision = summary
-        STATE = {"active": context, "durations": {}, "tensors": {},
-                 "counts": {"dit": 0, "encode": 0, "prepare_packed": 0, "new_pack": 0}}
-        before = time.perf_counter()
-        output = original(self, request)
-        STATE["durations"]["forward"] = time.perf_counter() - before
-        stager = getattr(self.text_encoder, "_omni_non_block_stager", None)
-        record = {"nonce": context["nonce"], "stage": context["stage"], "rank": dist.get_rank(),
-                  "world_size": dist.get_world_size(), "counts": STATE["counts"],
-                  "durations": STATE["durations"], "tensors": STATE["tensors"],
-                  "packed_stager": bool(stager is not None and getattr(stager, "pack_by_dtype", False)),
-                  "encoder_tp": self.text_encoder.tp_size,
-                  "deterministic": torch.are_deterministic_algorithms_enabled(),
-                  "parameter_precision": self._benchmark_precision,
-                  "encoder_source": __import__(MiniMaxH3Qwen3VLEncoder.__module__, fromlist=["_"]).__file__}
-        folder = Path(context["stats_dir"])
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"rank{record['rank']}.json"
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record, indent=2))
-        temporary.replace(path)
-        print("H3_PROVENANCE_REQUEST " + json.dumps({"nonce": context["nonce"], "rank": record["rank"],
-              "counts": record["counts"], "durations": record["durations"]}), flush=True)
-        STATE = None
-        return output
+        torch.Tensor.copy_ = traced_copy if context["capture"] else copy_original
+        try:
+            value = forward_original(self, request)
+            assert DETAIL is not None
+            path = Path(context["stats_dir"]) / f"rank{dist.get_rank()}.json"
+            record = json.loads(path.read_text())
+            record["encoder_movement"] = DETAIL
+            temporary = path.with_suffix(".paired.tmp")
+            temporary.write_text(json.dumps(record, indent=2) + "\n")
+            temporary.replace(path)
+            print("H3_ENCODER_MOVEMENT " + json.dumps({"nonce": context["nonce"], "rank": dist.get_rank(), **DETAIL}), flush=True)
+            return value
+        finally:
+            torch.Tensor.copy_ = copy_original
+            DETAIL = None
 
     MiniMaxH3Pipeline.forward = forward
-    dit_original = MiniMaxH3DiTModel.forward
+    encoder_original = MiniMaxH3Pipeline._encode_text_hidden
 
-    @wraps(dit_original)
-    def dit(self, *args, **kwargs):
-        if STATE is not None and self is PIPELINE.transformer:
-            STATE["counts"]["dit"] += 1
-        return dit_original(self, *args, **kwargs)
-
-    MiniMaxH3DiTModel.forward = dit
-    encode_original = MiniMaxH3Qwen3VLEncoder.encode_ids
-
-    @wraps(encode_original)
-    def encode(self, *args, **kwargs):
-        before = time.perf_counter()
-        value = encode_original(self, *args, **kwargs)
-        elapsed = time.perf_counter() - before
-        if STATE is not None:
-            STATE["counts"]["encode"] += 1
-            STATE["durations"]["encoder_forward"] = elapsed
-            capture("encoder_output", value)
+    @wraps(encoder_original)
+    def encoder(self, *args, **kwargs):
+        global DETAIL
+        owner = self.text_encoder
+        if not hasattr(owner, "_paired_weight_profile"):
+            hooks = tuple(getattr(owner, "_omni_layerwise_hooks", ()))
+            groups = _collect_source_groups(tuple(owner._omni_non_block_modules()))
+            nonblock = sum(group.source.untyped_storage().nbytes() for group in groups)
+            block = sum(t.numel() * t.element_size() for hook in hooks for t in hook.dtype_cpu_flattened_weights.values())
+            owner._paired_weight_profile = {"nonblock_original_storage_bytes": nonblock,
+                "nonblock_original_storage_groups": len(groups), "encoder_block_host_bytes": block,
+                "encoder_host_storage_bytes": block + nonblock,
+                "nonblock_weight_share": nonblock / (block + nonblock), "encoder_layerwise_hooks": len(hooks)}
+            owner._paired_hook_ids = {id(hook) for hook in hooks}
+        DETAIL = {"profile": owner._paired_weight_profile, "nonblock_h2d_calls": 0,
+            "nonblock_h2d_bytes": 0, "block_h2d_calls": 0, "block_h2d_bytes": 0,
+            "block_prefetch_calls": 0, "nonblock_load_submit_s": 0.0, "block_prefetch_submit_s": 0.0,
+            "copy_trace_enabled": bool(base.STATE["active"]["capture"]),
+            "copy_trace_verified": bool(base.STATE["active"]["capture"]),
+            "warmup_copy_observed": {"nonblock_calls": 0, "nonblock_bytes": 0,
+                                     "block_calls": 0, "block_bytes": 0}
+                if base.STATE["active"]["capture"] else None}
+        started = time.perf_counter()
+        value = encoder_original(self, *args, **kwargs)
+        elapsed = time.perf_counter() - started
+        DETAIL["completed_encoder_s"] = elapsed
+        base.STATE["durations"]["completed_encoder"] = elapsed
+        stager = owner._omni_non_block_stager
+        DETAIL["nonblock_materialized_after_encoder"] = stager.loaded
+        DETAIL["nonblock_retained_device_storage"] = bool(stager._device_storages)
         return value
 
-    MiniMaxH3Qwen3VLEncoder.encode_ids = encode
-    if hasattr(MiniMaxH3Qwen3VLEncoder, "prepare_packed_offload"):
-        pack_original = MiniMaxH3Qwen3VLEncoder.prepare_packed_offload
+    MiniMaxH3Pipeline._encode_text_hidden = encoder
 
-        @wraps(pack_original)
-        def prepare(self, *args, **kwargs):
-            was = getattr(self, "_omni_non_block_stager", None)
-            value = pack_original(self, *args, **kwargs)
-            if STATE is not None:
-                STATE["counts"]["prepare_packed"] += 1
-                STATE["counts"]["new_pack"] += int(was is None and getattr(self, "_omni_non_block_stager", None) is not None)
-            return value
-
-        MiniMaxH3Qwen3VLEncoder.prepare_packed_offload = prepare
-    for name in ["encode_prompt", "diffuse", "decode"]:
-        function = getattr(MiniMaxH3Pipeline, name)
-
-        def wrap(function, name):
-            @wraps(function)
-            def measured(self, *args, **kwargs):
-                start = time.perf_counter()
-                value = function(self, *args, **kwargs)
-                if STATE is not None:
-                    STATE["durations"][name] = STATE["durations"].get(name, 0.0) + time.perf_counter() - start
-                return value
-            return measured
-
-        setattr(MiniMaxH3Pipeline, name, wrap(function, name))
-    reference_original = reference_video.prepare_reference_videos
-
-    @wraps(reference_original)
-    def reference(*args, **kwargs):
-        before = time.perf_counter()
-        values = reference_original(*args, **kwargs)
-        emit("prepare_reference_videos", time.perf_counter() - before,
-             {"decode_reuse": bool(kwargs.get("decode_reuse", False)),
-              "sidecars": sum("rgb_path" in x for x in values)})
-        return values
-
-    reference_video.prepare_reference_videos = reference
-    encoder_processing.prepare_reference_videos = reference
-    transcode_original = reference_video._transcode_reference_video
-
-    @wraps(transcode_original)
-    def transcode(*args, **kwargs):
-        before = time.perf_counter()
-        value = transcode_original(*args, **kwargs)
-        emit("transcode_reference_video", time.perf_counter() - before,
-             {"rgb_output": kwargs.get("rgb_output_path") is not None})
+    def trace_call(function, obj, kind, calls, byte_count, args, kwargs):
+        global COPY_CONTEXT
+        old = COPY_CONTEXT
+        local = {"observed_calls": 0, "observed_bytes": 0}
+        COPY_CONTEXT = local if base.STATE["active"]["capture"] else None
+        started = time.perf_counter()
+        try:
+            value = function(obj, *args, **kwargs)
+        finally:
+            COPY_CONTEXT = old
+        elapsed = time.perf_counter() - started
+        if base.STATE["active"]["capture"]:
+            assert local["observed_calls"] == calls and local["observed_bytes"] == byte_count, (kind, local, calls, byte_count)
+            DETAIL["warmup_copy_observed"][kind + "_calls"] += local["observed_calls"]
+            DETAIL["warmup_copy_observed"][kind + "_bytes"] += local["observed_bytes"]
+        DETAIL[kind + "_h2d_calls"] += calls
+        DETAIL[kind + "_h2d_bytes"] += byte_count
+        DETAIL[kind + ("_load_submit_s" if kind == "nonblock" else "_prefetch_submit_s")] += elapsed
         return value
 
-    reference_video._transcode_reference_video = transcode
-    inputs_original = encoder_processing.prepare_encoder_inputs
+    load_original = PinnedModuleStager._load_once
 
-    @wraps(inputs_original)
-    def inputs(*args, **kwargs):
-        before = time.perf_counter()
-        value = inputs_original(*args, **kwargs)
-        elapsed = time.perf_counter() - before
-        if STATE is not None:
-            for index, video in enumerate(value.media.videos):
-                capture(f"video_input{index}", video)
-        emit("prepare_encoder_inputs", elapsed, {"videos": len(value.media.videos)})
+    @wraps(load_original)
+    def load(self, *args, **kwargs):
+        if DETAIL is None or base.STATE is None or self is not getattr(base.PIPELINE.text_encoder, "_omni_non_block_stager", None):
+            return load_original(self, *args, **kwargs)
+        if not hasattr(self, "_paired_group_bytes"):
+            self._paired_group_bytes = sum(group.master.numel() * group.master.element_size() for group in self._groups)
+        return trace_call(load_original, self, "nonblock", len(self._groups), self._paired_group_bytes, args, kwargs)
+
+    PinnedModuleStager._load_once = load
+    prefetch_original = LayerwiseOffloadHook.prefetch_layer
+
+    @wraps(prefetch_original)
+    def prefetch(self, *args, **kwargs):
+        if DETAIL is None or base.STATE is None or id(self) not in getattr(base.PIPELINE.text_encoder, "_paired_hook_ids", set()):
+            return prefetch_original(self, *args, **kwargs)
+        if not hasattr(self, "_paired_group_bytes"):
+            self._paired_group_bytes = sum(t.numel() * t.element_size() for t in self.dtype_cpu_flattened_weights.values())
+        value = trace_call(prefetch_original, self, "block", len(self.dtype_cpu_flattened_weights), self._paired_group_bytes, args, kwargs)
+        DETAIL["block_prefetch_calls"] += 1
         return value
 
-    encoder_processing.prepare_encoder_inputs = inputs
-    pipeline_module = __import__(MiniMaxH3Pipeline.__module__, fromlist=["_"])
-    if hasattr(pipeline_module, "prepare_encoder_inputs"):
-        pipeline_module.prepare_encoder_inputs = inputs
+    LayerwiseOffloadHook.prefetch_layer = prefetch

@@ -1,0 +1,107 @@
+"""Analyze repeated closed contrasts; request SD is reported, not an effect gate."""
+import argparse
+import json
+import math
+from pathlib import Path
+import random
+import statistics as st
+
+ROOT = Path(__file__).resolve().parent
+parser = argparse.ArgumentParser()
+parser.add_argument("job")
+args = parser.parse_args()
+manifest = json.loads((ROOT / "run-manifest.json").read_text())
+groups = {}
+all_rows = []
+for stage in manifest["stages"]:
+    folder = ROOT / "jobs" / args.job / stage["name"]
+    rows = json.loads((folder / "records.json").read_text())
+    assert len(rows) == 7 and all(r["status"] == "ok" for r in rows)
+    assert sum(r["phase"] == "warmup" for r in rows) == 2
+    formal = [r for r in rows if r["phase"] == "formal"]
+    assert len(formal) == 5
+    assert all(r["stage"] == stage["name"] for r in rows)
+    assert len({r["sha256"] for r in rows}) == 1
+    groups[(stage["round"], stage["role"])] = formal
+    all_rows.extend(rows)
+assert len(all_rows) == 63 and len({r["sha256"] for r in all_rows}) == 1
+assert all(r["rank_stats"][i]["encoder_movement"]["copy_trace_verified"]
+           for r in all_rows if r["phase"] == "warmup" for i in range(8))
+
+def circular_sample(rng, values):
+    # Preserve adjacent-request correlation with length-two circular blocks.
+    output = []
+    while len(output) < len(values):
+        start = rng.randrange(len(values))
+        output.extend(values[(start + i) % len(values)] for i in range(2))
+    return output[:len(values)]
+
+def metric(key):
+    rounds = []
+    for number in range(1, 4):
+        arms = [groups[(number, role)] for role in ["A1", "B", "A2"]]
+        values = [[r[key] for r in arm] for arm in arms]
+        times = [st.mean(r["response"]["started_at_unix"] for r in arm) for arm in arms]
+        weight = (times[1] - times[0]) / (times[2] - times[0])
+        assert 0 < weight < 1
+        means = [st.mean(v) for v in values]
+        control = (1 - weight) * means[0] + weight * means[2]
+        rounds.append({"round": number, "samples": values, "means": means,
+                       "single_request_sd": [st.stdev(v) for v in values],
+                       "weight": weight, "control": control, "packed": means[1],
+                       "saved": control - means[1]})
+    effects = [r["saved"] for r in rounds]
+    effect = st.mean(effects)
+    standard_error = st.stdev(effects) / math.sqrt(3)
+    # Three round-level contrasts; df=2, do not pretend 45 requests are 45 rounds.
+    t95 = [effect - 4.302652729749464 * standard_error,
+           effect + 4.302652729749464 * standard_error]
+    rng = random.Random(42)
+    bootstrap = []
+    for _ in range(10000):
+        selected = rng.choices(rounds, k=3)
+        values = []
+        for r in selected:
+            a1, b, a2 = [st.mean(circular_sample(rng, x)) for x in r["samples"]]
+            values.append((1 - r["weight"]) * a1 + r["weight"] * a2 - b)
+        bootstrap.append(st.mean(values))
+    bootstrap.sort()
+    interval = [bootstrap[250], bootstrap[9750]]
+    control = st.mean(r["control"] for r in rounds)
+    return {"rounds": rounds, "control": control,
+            "packed": st.mean(r["packed"] for r in rounds), "saved": effect,
+            "percent": effect / control * 100, "paired_round_t95": t95,
+            "hierarchical_block_bootstrap95": interval,
+            "positive_rounds": sum(x > 0 for x in effects),
+            "benefit_confirmed": t95[0] > 0 and interval[0] > 0 and all(x > 0 for x in effects)}
+
+engagement = {}
+for mode in ["off", "packed"]:
+    selected = [r for r in all_rows if r["phase"] == "formal"
+                and next(s["packed"] for s in manifest["stages"] if s["name"] == r["stage"]) == mode]
+    engagement[mode] = {}
+    for rank in range(8):
+        details = [r["rank_stats"][rank]["encoder_movement"] for r in selected]
+        assert all(d["profile"] == details[0]["profile"] for d in details)
+        assert all(not d["copy_trace_enabled"] for d in details)
+        engagement[mode][str(rank)] = {"profile": details[0]["profile"],
+            "nonblock_h2d_calls": sorted({d["nonblock_h2d_calls"] for d in details}),
+            "nonblock_h2d_bytes": sorted({d["nonblock_h2d_bytes"] for d in details}),
+            "block_h2d_calls": sorted({d["block_h2d_calls"] for d in details}),
+            "block_h2d_bytes": sorted({d["block_h2d_bytes"] for d in details}),
+            "mean_nonblock_host_submit_s": st.mean(d["nonblock_load_submit_s"] for d in details),
+            "mean_block_host_submit_s": st.mean(d["block_prefetch_submit_s"] for d in details)}
+for rank in range(8):
+    assert engagement["off"][str(rank)]["profile"] == engagement["packed"][str(rank)]["profile"]
+result = {"job": args.job, "measured_checkout": manifest["runtimes"]["encoder"]["revision"],
+          "equivalent_pr_head": manifest["pr_head"], "rounds": 3, "warmups_per_arm": 2,
+          "formals_per_arm": 5, "media_sha256": all_rows[0]["sha256"],
+          "completed_encoder": metric("completed_encoder_s"),
+          "encode_prompt": metric("encode_prompt_s"), "http_e2e": metric("http_e2e_s"),
+          "engagement": engagement,
+          "limitations": ["Three round-level contrasts; t interval assumes approximately independent normal round effects.",
+                         "Bootstrap resamples rounds and length-two request blocks; it is not protection against all systematic drift.",
+                         "H2D host-submission times are not pure device DMA times.",
+                         "Per-copy callbacks were used only during warmups; formal counts follow verified source-loop group sizes."]}
+(ROOT / "paired-analysis.json").write_text(json.dumps(result, indent=2) + "\n")
+print(json.dumps({k: v for k, v in result.items() if k != "engagement"}, indent=2))

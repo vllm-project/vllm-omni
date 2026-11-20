@@ -1,0 +1,11 @@
+{
+  "primary": "completed_encoder_s per-request rank-max",
+  "rounds": 3,
+  "formals_per_arm": 5,
+  "confidence": [
+    "round-level t95 with df2",
+    "hierarchical circular length2 block bootstrap 10000 samples seed42"
+  ],
+  "acceptance": "both lower95 bounds positive and all three round effects positive; single-request SD is descriptive, not a minimum effect threshold",
+  "analysis_sha256": "4c80bcff1536ea333abc5adcaf72b7e04475f6cb5c9c59b8321421ecec7f5d4e"
+}

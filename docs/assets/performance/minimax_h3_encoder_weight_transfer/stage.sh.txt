@@ -2,4 +2,4 @@
 set -e
 unset PYTHONPATH
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-exec /opt/tiger/lly/.tmp/20261118-h3-pr10352-validation/venv/bin/python /opt/tiger/lsy/.tmp/20261120-pr10169-10170-perf-provenance/control.py "$@"
+exec /opt/tiger/lly/.tmp/20261118-h3-pr10352-validation/venv/bin/python /opt/tiger/lsy/.tmp/20261120-pr10169-encoder-paired-v2/control.py "$@"

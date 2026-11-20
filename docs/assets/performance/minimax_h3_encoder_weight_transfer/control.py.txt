@@ -133,7 +133,7 @@ def validate(config, stage, window, phase_dir):
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         text = (window / "server.log").read_bytes()[record["log_offset"]:].decode(errors="replace")
-        if all(p.exists() for p in files) and 'POST /v1/videos/sync' in text and '200' in text:
+        if all(p.exists() and '"encoder_movement"' in p.read_text() for p in files) and 'POST /v1/videos/sync' in text and '200' in text:
             break
         assert life.alive(json.loads((window / "owner.json").read_text()))
         time.sleep(0.5)
@@ -150,6 +150,16 @@ def validate(config, stage, window, phase_dir):
             if stage["packed"] == "packed":
                 assert row["counts"]["prepare_packed"] > 0
                 if record["phase"] == "formal":assert row["counts"]["new_pack"] == 0
+    for row in rows:
+        detail = row["encoder_movement"]
+        assert detail["nonblock_h2d_calls"] > 0 and detail["block_h2d_calls"] > 0
+        assert detail["profile"]["encoder_layerwise_hooks"] == 77
+        assert not detail["nonblock_materialized_after_encoder"] and not detail["nonblock_retained_device_storage"]
+        assert detail["copy_trace_enabled"] == (record["phase"] == "warmup")
+        if record["phase"] == "warmup":
+            assert detail["copy_trace_verified"]
+        assert detail["completed_encoder_s"] > 0
+    record["completed_encoder_s"] = max(row["encoder_movement"]["completed_encoder_s"] for row in rows)
     records = json.loads((window / "records.json").read_text()) if (window / "records.json").exists() else []
     # Each PR is its own current-source comparison. No historical clip hash is substituted.
     gate_file = window.parent / ("encoder-byte-gate.json" if stage["kind"] == "encoder" else "rgb-byte-gate.json")
