@@ -35,4 +35,5 @@ class PhononConfig(PretrainedConfig):
         self.architectures = ["PhononTalkerForConditionalGeneration"]
 
 
+# Keep Omni's talker architecture and EOS/continue token contract when Transformers registers Phonon.
 AutoConfig.register(PhononConfig.model_type, PhononConfig, exist_ok=True)
