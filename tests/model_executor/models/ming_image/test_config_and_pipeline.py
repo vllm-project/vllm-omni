@@ -8,6 +8,7 @@ import torch
 from vllm.multimodal.processing import ProcessorInputs
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.ming_flash_omni import condition_encoder
 from vllm_omni.diffusion.models.ming_image.pipeline import (
     MingImageDiffusionPipeline,
     _validate_variant_config,
@@ -37,6 +38,30 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Confi
 from vllm_omni.transformers_utils.processors.ming import MingImageProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_query_connector_default_mask_keeps_all_tokens_visible(monkeypatch, is_npu):
+    monkeypatch.setattr(condition_encoder, "current_omni_platform", SimpleNamespace(is_npu=lambda: is_npu))
+
+    class Connector(torch.nn.Module):
+        def forward(self, inputs_embeds, attention_mask, **kwargs):
+            self.mask = attention_mask
+            return SimpleNamespace(hidden_states=[inputs_embeds])
+
+    encoder = condition_encoder.MingConditionEncoder(SimpleNamespace(text_encoder_norm=False), normalize_output=False)
+    encoder.connector = Connector()
+    hidden = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+    assert torch.equal(encoder(hidden), hidden)
+    mask = encoder.connector.mask
+    assert mask.shape == (1, 1, 3, 3)
+    assert mask.dtype == (torch.bool if is_npu else hidden.dtype)
+    assert mask.all()
+    if is_npu:
+        # Match the Transformers NPU SDPA adapter: float ones would become
+        # all False here, while a boolean allow-mask passes through unchanged.
+        effective_mask = mask if mask.dtype == torch.bool else torch.logical_not(mask.bool())
+        assert effective_mask.all()
 
 
 def test_config_selects_qwen25_vision_tower():
@@ -318,7 +343,11 @@ def test_stage1_compile_uses_configured_dynamic_regional_cuda_graph(monkeypatch)
     assert pipeline._uses_cudagraph_trees
 
 
-def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatch):
+@pytest.mark.parametrize(
+    "root_config",
+    [None, {"architectures": ["BailingMM2NativeForConditionalGeneration"], "model_type": "bailingmm_moe_v2_lite"}],
+)
+def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatch, root_config):
     transformer_config = {
         "_class_name": "DiffusionTransformer",
         "alignment_padding_mode": "zero_masked",
@@ -327,7 +356,9 @@ def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatc
 
     def _get_hf_file_to_dict(filename, model, revision=None):
         del model, revision
-        return transformer_config if filename == "transformer/config.json" else None
+        if filename == "transformer/config.json":
+            return transformer_config
+        return root_config if filename == "config.json" else None
 
     monkeypatch.setattr(
         "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",

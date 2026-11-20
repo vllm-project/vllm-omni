@@ -58,6 +58,51 @@ vllm serve "$MODEL" --omni \
 SageAttention (`SAGE_ATTN`) 2.2.0 can produce black or corrupted images ([#8660](https://github.com/vllm-project/vllm-omni/issues/8660)).
 Use `FLASH_ATTN` as above or `TORCH_SDPA` with the default compilation settings instead.
 
+## NPU (Design text-to-image bring-up)
+
+The Ascend profile runs one BF16 request at a time, with eager execution on
+both stages and `TORCH_SDPA` on the diffusion stage. The A3 environment used
+for bring-up exposed two logical devices with 64 GiB each on one physical
+card. Stage 0 used device 0 and stage 1 used device 1.
+
+The tested stack was CANN 9.1.0, driver 26.1.1, PyTorch 2.10.0,
+torch-npu 2.10.0.post4, vLLM 0.32.0 and Transformers 5.19.0 on aarch64.
+The vLLM-Ascend revision was `450e556980df9f1b09392b77952d552d75e4cba2`.
+In the A3 image, initialize CANN and ATB before starting the server:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+vllm serve inclusionAI/Ming-Image-0.1-Design --omni \
+  --revision c57c49689d12ef7d4e24a170014f1dc43d3ce258 \
+  --deploy-config vllm_omni/deploy/ming_image.yaml --port 8091
+```
+
+Use the text-to-image request below. For the serving smoke test, run
+`pytest tests/e2e/online_serving/test_ming_image.py -m 'full_model and npu and A3' --run-level full_model`.
+Set `MING_IMAGE_TEST_MODEL` to use a local copy of the pinned checkpoint.
+
+### Bring-up measurements
+
+These measurements used vLLM-Omni `5917730a` with the C4 bring-up changes.
+The prompt, revision, seed, resolution, guidance scale and 12 denoising steps
+matched on both devices. Each median covers three sequential requests after
+one warmup. The H100 NVL used co-located stages; the A3 used the two devices
+described above.
+
+| Median | H100 NVL | A3 |
+| --- | ---: | ---: |
+| Client end-to-end latency (s) | 3.083 | 4.140 |
+| Stage 0 generation (ms) | 85.843 | 87.424 |
+| Stage 1 generation (ms) | 2697.153 | 3811.630 |
+| Stage 1 duration divided by 12 (ms, includes VAE and stage overhead) | 224.763 | 317.636 |
+
+All four A3 requests produced identical 1024×1024 RGBA PNGs. The repository
+RGB image helpers measured SSIM 0.899985 and PSNR 19.7015 dB against the
+CUDA image. CUDA/NPU numerical parity remains under review. Coverage here
+is limited to Design text-to-image.
+
 ## Text-to-image
 
 Note that a prompt refiner is expected to describe the prompts with details; we will refine with more example inputs soon.
