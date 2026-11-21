@@ -109,7 +109,8 @@ Content-Type: multipart/form-data
 
 URL and base64 data-URL inputs are bounded before image decoding. Image inputs
 use vLLM's `VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` limit, which defaults to 256 MiB;
-set that environment variable before starting the server to change it.
+set that environment variable before starting the server to change it. A
+non-positive value disables this general image limit.
 Oversized or continuously streamed HTTP responses are rejected with a client
 error. Remote downloads also have a 60-second total time limit. Responses with
 non-identity `Content-Encoding` are rejected before decoding.

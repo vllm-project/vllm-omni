@@ -20,10 +20,24 @@ from vllm import envs
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 
 _MIB: Final = 1024 * 1024
+
+
+def _limit_bytes_from_megabytes(megabytes: int) -> int | None:
+    return None if megabytes <= 0 else megabytes * _MIB
+
+
+def _strictest_enabled_limit(*limits: int | None) -> int | None:
+    enabled_limits = [limit for limit in limits if limit is not None]
+    return min(enabled_limits) if enabled_limits else None
+
+
 # Keep these limits aligned with the vLLM 0.34.0 media configuration.
-MAX_IMAGE_INPUT_BYTES: Final = envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * _MIB
-MAX_VIDEO_INPUT_BYTES: Final = envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * _MIB
-MAX_AUDIO_INPUT_BYTES: Final = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * _MIB
+MAX_IMAGE_INPUT_BYTES: Final[int | None] = _limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
+MAX_VIDEO_INPUT_BYTES: Final[int | None] = _limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
+MAX_AUDIO_INPUT_BYTES: Final[int | None] = _strictest_enabled_limit(
+    _limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB),
+    _limit_bytes_from_megabytes(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB),
+)
 MEDIA_DOWNLOAD_TIMEOUT_S: Final = 60.0
 _READ_CHUNK_SIZE: Final = 64 * 1024
 _MAX_REDIRECTS: Final = 20
@@ -37,12 +51,13 @@ class MediaInputTimeoutError(InvalidInputReferenceError):
     """An input media payload exceeded its total download time limit."""
 
 
-def decode_base64_media(data: str, *, max_bytes: int, source: str) -> bytes:
+def decode_base64_media(data: str, *, max_bytes: int | None, source: str) -> bytes:
     """Decode base64 media while bounding the decoded payload size.
 
     Args:
         data: Base64 payload without a data-URL prefix.
-        max_bytes: Maximum number of decoded bytes permitted.
+        max_bytes: Maximum number of decoded bytes permitted, or ``None`` to
+            disable the byte limit.
         source: User-facing input name for error messages.
 
     Returns:
@@ -52,23 +67,24 @@ def decode_base64_media(data: str, *, max_bytes: int, source: str) -> bytes:
         InvalidInputReferenceError: If the payload is malformed or empty.
         MediaInputTooLargeError: If the encoded or decoded payload exceeds the limit.
     """
-    if max_bytes <= 0:
+    if max_bytes is not None and max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
     if not data:
         raise InvalidInputReferenceError(f"Invalid {source}: media data is empty.")
 
-    max_encoded_length = 4 * ((max_bytes + 2) // 3)
-    if len(data) > max_encoded_length:
-        raise MediaInputTooLargeError(
-            f"Invalid {source}: media data exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
-        )
+    if max_bytes is not None:
+        max_encoded_length = 4 * ((max_bytes + 2) // 3)
+        if len(data) > max_encoded_length:
+            raise MediaInputTooLargeError(
+                f"Invalid {source}: media data exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
+            )
 
     try:
         decoded = base64.b64decode(data)
     except (binascii.Error, ValueError) as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: media data is not valid base64.") from exc
 
-    if len(decoded) > max_bytes:
+    if max_bytes is not None and len(decoded) > max_bytes:
         raise MediaInputTooLargeError(
             f"Invalid {source}: media data exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
         )
@@ -78,7 +94,7 @@ def decode_base64_media(data: str, *, max_bytes: int, source: str) -> bytes:
 async def download_media_bytes(
     url: str,
     *,
-    max_bytes: int,
+    max_bytes: int | None,
     source: str,
     follow_redirects: bool = False,
     timeout_s: float = MEDIA_DOWNLOAD_TIMEOUT_S,
@@ -95,7 +111,8 @@ async def download_media_bytes(
 
     Args:
         url: HTTP(S) media URL.
-        max_bytes: Maximum number of decoded response bytes permitted.
+        max_bytes: Maximum number of decoded response bytes permitted, or
+            ``None`` to disable the byte limit.
         source: User-facing input name for error messages.
         follow_redirects: Whether to follow redirects one at a time.
         timeout_s: Total time permitted for connection and body download.
@@ -108,7 +125,7 @@ async def download_media_bytes(
         MediaInputTooLargeError: If the response exceeds ``max_bytes``.
         MediaInputTimeoutError: If the total download time is exceeded.
     """
-    if max_bytes <= 0:
+    if max_bytes is not None and max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
     if timeout_s <= 0:
         raise ValueError("timeout_s must be positive")
@@ -144,20 +161,20 @@ async def download_media_bytes(
                             )
 
                         content_length = response.headers.get("content-length")
+                        declared_length = None
                         if content_length is not None:
                             try:
                                 declared_length = int(content_length)
                             except ValueError:
                                 declared_length = None
-                            if declared_length is not None and declared_length > max_bytes:
-                                raise MediaInputTooLargeError(
-                                    f"Invalid {source}: response exceeds the "
-                                    f"{max_bytes // (1024 * 1024)} MiB size limit."
-                                )
+                        if max_bytes is not None and declared_length is not None and declared_length > max_bytes:
+                            raise MediaInputTooLargeError(
+                                f"Invalid {source}: response exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
+                            )
 
                         payload = bytearray()
                         async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
-                            if len(payload) + len(chunk) > max_bytes:
+                            if max_bytes is not None and len(payload) + len(chunk) > max_bytes:
                                 raise MediaInputTooLargeError(
                                     f"Invalid {source}: response exceeds the "
                                     f"{max_bytes // (1024 * 1024)} MiB size limit."

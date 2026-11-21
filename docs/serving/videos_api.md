@@ -249,7 +249,9 @@ URL access policy.
 Remote and base64 data-URL references are bounded before decoding. Images and
 videos use vLLM's `VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` limit (256 MiB by default),
 while audio uses `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` (25 MiB by default). Set
-these environment variables before starting the server to change the limits.
+these environment variables before starting the server to change the limits. A
+non-positive general media limit disables that ceiling; audio still uses the
+strictest enabled general and audio-specific limit.
 HTTP responses are read incrementally and rejected when they exceed the
 applicable limit, including responses without `Content-Length`. The same
 limits apply to the URL fields in `image_reference`, `video_reference`, and

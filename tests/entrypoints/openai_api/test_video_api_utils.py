@@ -54,11 +54,23 @@ def _install_http_transport(monkeypatch, handler, client_kwargs):
 
 
 def test_media_input_limits_follow_vllm_configuration():
-    mib = 1024 * 1024
+    general_limit = media_input._limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
+    audio_limit = media_input._limit_bytes_from_megabytes(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB)
 
-    assert media_input.MAX_IMAGE_INPUT_BYTES == envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * mib
-    assert media_input.MAX_VIDEO_INPUT_BYTES == envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * mib
-    assert media_input.MAX_AUDIO_INPUT_BYTES == envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * mib
+    assert media_input.MAX_IMAGE_INPUT_BYTES == general_limit
+    assert media_input.MAX_VIDEO_INPUT_BYTES == general_limit
+    assert media_input.MAX_AUDIO_INPUT_BYTES == media_input._strictest_enabled_limit(general_limit, audio_limit)
+
+
+@pytest.mark.parametrize("megabytes", [0, -1])
+def test_non_positive_media_limit_disables_the_limit(megabytes):
+    assert media_input._limit_bytes_from_megabytes(megabytes) is None
+
+
+def test_audio_uses_the_strictest_enabled_limit():
+    assert media_input._strictest_enabled_limit(25, 1) == 1
+    assert media_input._strictest_enabled_limit(None, 25) == 25
+    assert media_input._strictest_enabled_limit(None, None) is None
 
 
 @pytest.mark.asyncio
@@ -205,6 +217,20 @@ async def test_decode_image_url_reads_bounded_chunked_image(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decode_image_url_allows_disabled_size_limit(monkeypatch):
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", None)
+    _install_http_transport(
+        monkeypatch,
+        lambda request: httpx.Response(200, content=_png_bytes(), headers={"content-type": "image/png"}),
+        [],
+    )
+
+    image = await video_api_utils.decode_image_url("https://example.com/unlimited.png")
+
+    assert image.size == (2, 1)
+
+
+@pytest.mark.asyncio
 async def test_decode_image_url_rejects_compressed_response_before_read(monkeypatch):
     stream = _ChunkedStream([_png_bytes()])
 
@@ -258,6 +284,17 @@ def test_decode_base64_image_rejects_oversized_data_url_before_decode(monkeypatc
             f"data:image/png;base64,{encoded}",
             source="image_reference.image_url",
         )
+
+
+def test_decode_base64_image_allows_disabled_size_limit(monkeypatch):
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", None)
+    encoded = base64.b64encode(_png_bytes()).decode()
+
+    image = video_api_utils._decode_base64_image(
+        f"data:image/png;base64,{encoded}",
+        source="image_reference.image_url",
+    )
+    assert image.size == (2, 1)
 
 
 def test_decode_base64_video_rejects_oversized_data_url_before_decode(monkeypatch):

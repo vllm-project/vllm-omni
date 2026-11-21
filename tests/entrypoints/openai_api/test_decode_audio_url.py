@@ -179,7 +179,7 @@ class TestDecodeAudioUrlHttp:
         with pytest.raises(InvalidInputReferenceError, match="failed to download audio"):
             _run(decode_audio_url("https://example.com/missing.mp3"))
 
-    def test_declared_response_size_is_rejected_before_read(self, monkeypatch):
+    def test_declared_response_size_uses_combined_audio_limit(self, monkeypatch):
         class FailingStream(httpx.AsyncByteStream):
             async def __aiter__(self):
                 raise AssertionError("the oversized response must be rejected before reading")
