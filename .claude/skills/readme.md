@@ -45,6 +45,9 @@ self-check.
   shared feature-guide links, exact commands, and qualification evidence
 - [`add-tts-model`](add-tts-model/SKILL.md): covers integration of new TTS
   models and related serving workflows
+- [`add-world-model`](add-world-model/SKILL.md): guides causal and stateful
+  world-model integration, including strict loading, shared AR-Diffusion
+  state, conditioning, and requested continuation or streaming output
 - [`diffusion-perf-opt`](diffusion-perf-opt/SKILL.md): guides diffusion model
   performance optimization, including profiling traces, parallel strategies,
   stage timing analysis, and benchmark-driven tuning
