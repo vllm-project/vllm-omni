@@ -134,3 +134,21 @@ auto-round \
 Use the generated output directory directly as the `model` argument. See the
 [AutoRound documentation](https://github.com/intel/auto-round) for all
 available schemes and options.
+
+
+## AutoRound NVFP4 Hadamard (local development)
+
+Loading AutoRound NVFP4 with deterministic per-linear Hadamard rotation requires
+vLLM with native INC NVFP4 and the input-transform support introduced by #54006.
+This local development version reads `rotation_config` from the checkpoint; no
+process-level patch is needed. CUDA Hadacore rotates floating activations before
+NVFP4 activation quantization. Non-quantized excluded layers remain unchanged.
+
+The supported format is symmetric NVFP4 W4A4 with group size 16,
+`packing_format="auto_round:llm_compressor"`, and
+`act_data_type="nv_fp4_with_static_gs"`. Rotation uses `backend="transform"`
+(or `auto`), `hadamard_type="hadamard"`, and a power-of-two block size that
+fits every local input shard. Fused Q/K/V must share both weight and input global
+scales; incompatible scales fail at loading. This does not require per-group
+weight scales to match. Current end-to-end validation targets single-GPU B200
+and eager mode; it does not establish TP, graph, or other-device support.
