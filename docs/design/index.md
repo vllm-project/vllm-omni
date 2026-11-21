@@ -30,6 +30,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Model-local KV Caches](feature/model_local_kv_caches.md)
 - [Hunyuan AR VAE Request RNG](feature/mm_request_rng.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
+- [Hy-SimulMT Streaming Session Contract](feature/hy_simulmt_streaming.md)
 
 ### Communication
 
