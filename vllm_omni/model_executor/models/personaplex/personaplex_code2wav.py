@@ -29,7 +29,6 @@ part of the vLLM weights iterator (the codec owns its own checkpoint; see the
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -533,14 +532,17 @@ class PersonaPlexCode2Wav(nn.Module):
 
         from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
             PersonaPlexMimiCodec,
+            model_mimi_checkpoint,
         )
 
-        checkpoint = Path(self.model_path) / (self._mimi_name or "tokenizer-e351c8d8-checkpoint125.safetensors")
+        checkpoint = model_mimi_checkpoint(
+            self.model_path,
+            getattr(self.vllm_config.model_config, "revision", None),
+            self._mimi_name,
+            getattr(getattr(self.vllm_config, "load_config", None), "download_dir", None),
+        )
         with set_default_torch_dtype(torch.float32):
-            codec = PersonaPlexMimiCodec(
-                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-                device=str(device),
-            ).eval()
+            codec = PersonaPlexMimiCodec(checkpoint=checkpoint, device=str(device)).eval()
         # Allocate the streaming state and the decode graph's pool here, not on
         # the first request, so vLLM's memory profiling sees them.
         codec_device = torch.device(str(device))

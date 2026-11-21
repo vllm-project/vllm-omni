@@ -493,18 +493,24 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
         if runtime is not None:
             return runtime
+        from vllm_omni.model_executor.models.personaplex.duplex.policy import MOSHI_DEPFORMER_STEPS
         from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
             PersonaPlexStage0DuplexRuntime,
         )
 
-        model_path = str(getattr(self.vllm_config.model_config, "model", ""))
+        model_config = self.vllm_config.model_config
+        model_path = str(getattr(model_config, "model", ""))
         device = str(next(self.parameters()).device)
+        steps = getattr(self, "_checkpoint_depformer_steps", None)
         runtime = PersonaPlexStage0DuplexRuntime(
             self,
             model_path=model_path,
             device=device,
-            max_sessions=int(getattr(self.vllm_config.model_config, "duplex_max_sessions", 1)),
+            max_sessions=int(getattr(model_config, "duplex_max_sessions", 1)),
             codec_cuda_graphs=bool(getattr(self.config, "mimi_cuda_graphs", False)),
+            moshi=None if steps is None else steps == MOSHI_DEPFORMER_STEPS,
+            revision=getattr(model_config, "revision", None),
+            download_dir=getattr(getattr(self.vllm_config, "load_config", None), "download_dir", None),
         )
         self._personaplex_duplex_stage0_runtime = runtime
         return runtime
@@ -715,6 +721,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             for tgt in module.load_weights(sub_w):
                 loaded.add(f"{sub}.{tgt}")
         if getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
+            from vllm_omni.model_executor.models.personaplex.duplex.stage0 import depformer_steps
+
+            # Moshi or PersonaPlex from the weights just loaded, so Stage 0 does
+            # not depend on finding the checkpoint again.
+            self._checkpoint_depformer_steps = depformer_steps(name for name, _ in dep_w)
             runtime = self._duplex_stage0_runtime()
             runtime.load_encoder(cuda_graph=bool(getattr(self.config, "mimi_cuda_graphs", False)))
             self._warm_duplex_prefill()

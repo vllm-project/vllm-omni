@@ -6,6 +6,10 @@ PersonaPlex is a pure-lockstep model. Engine policy is one 80 ms frame per
 resumable Stage 0 append with greedy one-token decoding; session policy is
 the bundled voice prompt and the persona text, resolved once at open into the
 server-owned runtime configuration the worker replays as its prefill.
+
+A kyutai Moshi checkpoint runs on the same plugin with no prompt: it has no
+voice bundle and takes no instructions, so a session starts from Moshi's
+initial-token frame (see ``stage0.is_moshi_checkpoint``).
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from vllm_omni.model_executor.models.personaplex.duplex.config import (
 )
 from vllm_omni.model_executor.models.personaplex.duplex.data_plane import PersonaPlexDataPlaneSession
 from vllm_omni.model_executor.models.personaplex.duplex.input import PersonaPlexPcmAppendBuffer
+from vllm_omni.model_executor.models.personaplex.duplex.policy import MOSHI_DEPFORMER_STEPS
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -78,6 +83,16 @@ def persona_text(value: object) -> str:
     return str(value) if isinstance(value, str) and value else DEFAULT_PERSONA
 
 
+def reject_prompt_fields(config: DuplexSessionConfig) -> None:
+    """Moshi sessions have no voice or persona prompt; refuse them rather than ignore them."""
+    if isinstance(config.voice, str) and config.voice.strip():
+        raise DuplexRuntimeConfigError("Moshi has no voice prompts; leave voice unset", code="voice_unsupported")
+    if isinstance(config.instructions, str) and config.instructions.strip():
+        raise DuplexRuntimeConfigError(
+            "Moshi takes no instructions; leave instructions unset", code="instructions_unsupported"
+        )
+
+
 def prefill_slot_count(runtime_config: Mapping[str, object]) -> int:
     raw = runtime_config.get("personaplex_prefill_slots", 0)
     try:
@@ -102,6 +117,8 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         # voice bundle and tokenizer are read once per distinct triple.
         self._prefill_slots: dict[tuple[str, str, str], int] = {}
         self._prefill_lock = asyncio.Lock()
+        # Depformer steps per (model, revision); a checkpoint that can't be read yet isn't stored.
+        self._depformer_steps: dict[tuple[str, str | None], int] = {}
 
     # ---- engine policy (the resumable Stage 0 request) ----
 
@@ -209,6 +226,14 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         model_path = getattr(model_config, "model", None)
         if not isinstance(model_path, str) or not model_path:
             raise DuplexRuntimeConfigError("PersonaPlex model path is unavailable", code="model_path_unavailable")
+        if await self._is_moshi(model_path, getattr(model_config, "revision", None)):
+            reject_prompt_fields(config)
+            return {
+                "personaplex_model_path": model_path,
+                "personaplex_voice_prompt": None,
+                "personaplex_persona": None,
+                "personaplex_prefill_slots": 0,
+            }
         voice = voice_name(config.voice)
         persona = persona_text(config.instructions)
         prefill_slots = await self._prefill_slots_for(model_path, voice, persona)
@@ -218,6 +243,18 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
             "personaplex_persona": persona,
             "personaplex_prefill_slots": prefill_slots,
         }
+
+    async def _is_moshi(self, model_path: str, revision: str | None) -> bool:
+        key = (model_path, revision)
+        steps = self._depformer_steps.get(key)
+        if steps is None:
+            from vllm_omni.model_executor.models.personaplex.duplex.stage0 import checkpoint_depformer_steps
+
+            # Reads the checkpoint header: off the orchestrator loop.
+            steps = await asyncio.to_thread(checkpoint_depformer_steps, model_path, revision)
+            if steps is not None:
+                self._depformer_steps[key] = steps
+        return steps == MOSHI_DEPFORMER_STEPS
 
     async def _prefill_slots_for(self, model_path: str, voice: str, persona: str) -> int:
         key = (model_path, voice, persona)
@@ -247,6 +284,10 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         current: Mapping[str, object],
     ) -> dict[str, object]:
         self.validate_client_extra_body(config.extra_body)
+        if "personaplex_voice_prompt" in current and current["personaplex_voice_prompt"] is None:
+            # A Moshi session: nothing to update.
+            reject_prompt_fields(config)
+            return deepcopy(dict(current))
         new_persona = persona_text(config.instructions)
         reject_changed_runtime_value(
             new_persona,
@@ -273,5 +314,6 @@ __all__ = [
     "PersonaPlexSessionState",
     "persona_text",
     "prefill_slot_count",
+    "reject_prompt_fields",
     "voice_name",
 ]

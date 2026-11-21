@@ -46,6 +46,33 @@ async with DuplexClient("ws://127.0.0.1:8000/v1/realtime?duplex=1", model="/path
 
 Voice and persona are fixed for the session (`session.update` cannot change them).
 
+## Kyutai Moshi
+
+The same deployment serves kyutai's Moshi
+([`kyutai/moshiko-pytorch-bf16`](https://huggingface.co/kyutai/moshiko-pytorch-bf16),
+ungated, CC-BY 4.0), the model PersonaPlex is fine-tuned from:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
+  kyutai/moshiko-pytorch-bf16 \
+  --omni \
+  --deploy-config vllm_omni/deploy/personaplex.yaml
+```
+
+A checkpoint with an 8-step depformer is served as Moshi, following kyutai's
+`moshi.server`: a session starts from Moshi's initial-token frame, with no voice
+prompt or persona. Leave `voice` and `instructions` unset; a session that sets
+them is refused (`voice_unsupported`, `instructions_unsupported`). Decoding is
+greedy, as for PersonaPlex.
+
+```python
+from vllm_omni.clients.duplex import AudioFormat, DuplexClient, SessionConfig
+
+cfg = SessionConfig(input_audio=AudioFormat("pcm_f32le", 24_000), output_audio=AudioFormat("pcm16", 24_000))
+async with DuplexClient("ws://127.0.0.1:8000/v1/realtime?duplex=1", model="kyutai/moshiko-pytorch-bf16", config=cfg) as c:
+    await c.stream_pcm(pcm_f32le_24k, chunk_ms=80)
+```
+
 ## Validate the serving path
 
 Validate the `/v1/realtime?duplex=1` scheduler path with paced 24 kHz

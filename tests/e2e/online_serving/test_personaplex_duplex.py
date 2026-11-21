@@ -8,6 +8,8 @@ the strict Realtime driver (``personaplex_realtime_duplex.py``): two paced
 24 kHz sessions, admission overflow, per-session slot recycling, audible
 whole-frame output. The checkpoint is gated, so the test runs only when
 ``PERSONAPLEX_MODEL_PATH`` points at a local copy of ``nvidia/personaplex-7b-v1``.
+The same deploy and driver also run kyutai Moshi (``kyutai/moshiko-pytorch-bf16``,
+ungated), with no voice or persona.
 """
 
 from __future__ import annotations
@@ -37,6 +39,19 @@ SERVER_PARAMS = [
             server_args=["--trust-remote-code"],
         ),
         id="two-stage-single-gpu",
+    )
+]
+
+MOSHI_MODEL = "kyutai/moshiko-pytorch-bf16"
+MOSHI_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MOSHI_MODEL,
+            stage_config_path=DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        ),
+        id="moshi-two-stage-single-gpu",
     )
 ]
 
@@ -74,8 +89,33 @@ def test_personaplex_realtime_duplex_sessions(omni_server, tmp_path: Path) -> No
         ]
     )
 
-    result = asyncio.run(driver.run(args))
+    _assert_distinct_sessions(asyncio.run(driver.run(args)))
 
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", MOSHI_SERVER_PARAMS, indirect=True)
+def test_moshi_realtime_duplex_sessions(omni_server, tmp_path: Path) -> None:
+    # Moshi takes no voice prompt or instructions: every session opens with them unset.
+    no_prompt = ["--voice", "", "--persona", "", "--secondary-persona", "", "--replacement-persona", ""]
+    args = driver.parse_args(
+        [
+            "--url",
+            f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1",
+            "--model",
+            MOSHI_MODEL,
+            "--input-wav",
+            str(_speech_wav()),
+            "--output-dir",
+            str(tmp_path / "out"),
+            *no_prompt,
+        ]
+    )
+
+    _assert_distinct_sessions(asyncio.run(driver.run(args)))
+
+
+def _assert_distinct_sessions(result: dict[str, object]) -> None:
     sessions = {name: result[name] for name in ("primary", "secondary", "replacement")}
     assert all(isinstance(session, dict) for session in sessions.values())
     ids = {name: session["session_id"] for name, session in sessions.items() if isinstance(session, dict)}
