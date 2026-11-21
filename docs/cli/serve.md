@@ -1,5 +1,44 @@
 # vllm-omni serve
 
+Start an Omni server through the vLLM CLI:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+The model must be supplied positionally or with `--model`. `--deploy-config`
+selects deployment settings and does not supply the model.
+
+## Reference scope and version
+
+The [Arguments](#arguments) section below is generated from Omni's parser and
+covers its additions and overrides. For inherited server and engine options,
+consult the [vLLM 0.32.0 serve reference](https://docs.vllm.ai/en/v0.32.0/cli/serve/),
+which matches this checkout's vLLM dependency. Omni can constrain inherited
+options, particularly parallelism settings; upstream acceptance alone does not
+establish support in an Omni deployment.
+
+The documentation's `latest` version follows development; a released package
+can expose different flags or defaults. Check the installed parser with:
+
+```bash
+vllm serve --omni --help=all
+```
+
+## Common validation rules
+
+| Configuration | Requirement |
+| --- | --- |
+| `--stage-id` | Supply both `--omni-master-address` and `--omni-master-port`. |
+| `--stage-id none` | Run the frontend without a local stage; cannot be combined with `--headless`. |
+| `--omni-replica-address` | Requires `--headless`. |
+| `--api-server-count` | Must be at least 1 for a non-headless server; positive values cannot be combined with `--headless`. |
+| `--api-server-count > 1` | Requires the local EngineCore configuration described below; cannot be combined with distributed stage arguments. |
+| `--no-collect-stage-metrics` | On the head, also set `--disable-log-stats`. |
+
+These are common startup constraints, not an exhaustive list of model- or
+deployment-specific validation.
+
 ## Multiple API frontends
 
 For local EngineCore pipelines with one or more stages, `--api-server-count` starts
