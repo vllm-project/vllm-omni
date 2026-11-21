@@ -657,6 +657,17 @@ vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors 
   (validated with 10Eros-Max beta5: TP1 + Ulysses 4 with HSDP, TP2 +
   distributed layerwise offload, TP4 for Turbo, single-GPU layerwise offload).
 
+The [disaggregated deployments](MiniMax-H3-Disaggregated.md) accept a single
+file the same way. The DiT stage loads the file; the encoder and VAE-decode
+stages load the shared components from `base_model` / `base_revision`:
+
+```bash
+vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors \
+  --omni --model-class-name MiniMaxH3Pipeline --trust-remote-code \
+  --task-type fl2va \
+  --deploy-config vllm_omni/deploy/minimax_h3_disaggregated.yaml
+```
+
 ## AMD ROCm (gfx942 / gfx950)
 
 The sections above describe the NVIDIA CUDA path. This section covers the AMD
