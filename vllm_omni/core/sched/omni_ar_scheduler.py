@@ -24,6 +24,7 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.dtps_scheduler import _DEFAULT_DIT_LOAD_THRESHOLD, DTPSScheduler
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import (
@@ -38,6 +39,7 @@ from vllm_omni.core.sched.utils import (
     streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
+from vllm_omni.engine.dit_load_state import DitLoadSnapshot
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
 from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, use_scheduler_ngram
@@ -247,6 +249,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
             logger.info("MiniCPM-o Thinker MRv2 uses scheduler-side Ngram.")
         install_decode_allocate_fast_path(self.kv_cache_manager)
+        self._dtps: DTPSScheduler | None = None
+        self._init_dtps_scheduler()
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -434,6 +438,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if cache is not None:
             cache[rid] = (payload_id, is_final, force_kv)
         return is_final, force_kv
+
+    def _init_dtps_scheduler(self) -> None:
+        if not hasattr(self, "vllm_config"):
+            return
+        _dtps_config = getattr(self.vllm_config.model_config, "dit_load_aware_config", None)
+        if not _dtps_config:
+            return
+        stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+        threshold = _dtps_config.get("threshold", _DEFAULT_DIT_LOAD_THRESHOLD)
+        try:
+            self._dtps = DTPSScheduler(
+                stage_id=stage_id,
+                dit_load_threshold=threshold,
+            )
+            logger.info(
+                "[OmniDTPS] AR stage %s: aging_threshold=%.1fs, dit_load_threshold=%d",
+                stage_id,
+                self._dtps.aging_s,
+                self._dtps.dit_load_threshold,
+            )
+        except Exception:
+            logger.exception(
+                "[OmniDTPS] Failed to construct DTPSScheduler; falling back to FCFS on AR stage %s",
+                stage_id,
+            )
+            self._dtps = None
+
+    def update_dit_load(self, dit_load: DitLoadSnapshot) -> None:
+        """Receive DiT load snapshot from the Orchestrator."""
+        if self._dtps is not None:
+            self._dtps.update_dit_load(dit_load)
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
         """True when this stage-zero-final request does not need downstream KV."""
@@ -1167,6 +1202,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         original_max_num_active_reqs = self.max_num_active_reqs
         self.max_num_active_reqs = step.limit
         scheduled_any = False
+        if self._dtps is not None:
+            self._dtps.maybe_reorder_waiting(self.waiting, self.running)
         try:
             scheduler_output = super().schedule(throttle_prefills)
             scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)

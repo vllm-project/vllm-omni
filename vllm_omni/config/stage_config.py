@@ -1609,6 +1609,49 @@ def _resolve_pipeline_async_chunk_enabled(
     return supports_async_chunk and not has_kv_transfer_cfg
 
 
+def derive_dtps_config(
+    pipeline: PipelineConfig,
+    deploy_by_id: dict[int, StageDeployConfig],
+    ar_stage_id: int,
+    stage_deploy: StageDeployConfig | None,
+) -> dict[str, Any] | None:
+    """Derive DTPS config for an AR stage.
+
+    DTPS is only supported for a single AR→DiT topology (one AR stage
+    feeding exactly one downstream DIFFUSION stage). Returns ``None`` if
+    DTPS is disabled, or a dict carrying the AR↔DiT pairing and DTPS
+    parameters if enabled.
+    """
+    dit_load_aware = bool(stage_deploy.dit_load_aware) if stage_deploy is not None else False
+    if not dit_load_aware:
+        return None
+    dit_stages = [
+        s
+        for s in pipeline.stages
+        if s.execution_type == StageExecutionType.DIFFUSION and ar_stage_id in (s.input_sources or ())
+    ]
+    if not dit_stages:
+        logger.warning(
+            "[OmniDTPS] dit_load_aware on AR stage %d has no downstream DIFFUSION; ignoring.",
+            ar_stage_id,
+        )
+        return None
+    if len(dit_stages) > 1:
+        logger.warning(
+            "[OmniDTPS] dit_load_aware on AR stage %d has multiple downstream DIFFUSION stages; "
+            "DTPS only supports single AR→DiT topology. ignoring.",
+            ar_stage_id,
+        )
+        return None
+    dit_ds = deploy_by_id.get(dit_stages[0].stage_id)
+    threshold = (getattr(dit_ds, "max_num_seqs", None) or 1) + 1
+    return {
+        "ar_stage_id": ar_stage_id,
+        "dit_stage_id": dit_stages[0].stage_id,
+        "threshold": threshold,
+    }
+
+
 def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
     stages = {stage.stage_id: stage for stage in pipeline.stages}
     deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
@@ -1658,6 +1701,9 @@ def merge_pipeline_deploy(
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+            _dtps_config = derive_dtps_config(pipeline, deploy_by_id, ps.stage_id, ds)
+            if _dtps_config is not None:
+                engine_args["dit_load_aware_config"] = _dtps_config
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:

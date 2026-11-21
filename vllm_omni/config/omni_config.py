@@ -58,6 +58,7 @@ from vllm_omni.config.stage_config import (
     _scheduler_path,
     _select_processor_funcs,
     build_stage_runtime_overrides,
+    derive_dtps_config,
     load_deploy_config,
     merge_pipeline_deploy,
     merge_sampling_constraints,
@@ -241,6 +242,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     generation_config: str
     override_generation_config: dict[str, Any]
     enable_prompt_embeds: bool
+    dit_load_aware_config: dict[str, Any] | None
 
 
 class _PoolingEngineOverrides(TypedDict, total=False):
@@ -698,6 +700,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     generation_config: str | None = None
     override_generation_config: dict[str, Any] | None = None
     enable_prompt_embeds: bool | None = None
+    dit_load_aware_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
@@ -2176,6 +2179,10 @@ def _build_ar_stage_config(
     *,
     model: str | None,
 ) -> VllmOmniARStageConfig:
+    deploy_by_id = {s.stage_id: s for s in deploy.stages}
+    _dtps_config = derive_dtps_config(pipeline, deploy_by_id, topology.stage_id, stage_deploy)
+    if _dtps_config is not None:
+        engine.model["dit_load_aware_config"] = _dtps_config
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         pipeline,
         deploy,
@@ -2203,6 +2210,10 @@ def _build_generation_stage_config(
     *,
     model: str | None,
 ) -> VllmOmniGenerationStageConfig:
+    deploy_by_id = {s.stage_id: s for s in deploy.stages}
+    _dtps_config = derive_dtps_config(pipeline, deploy_by_id, topology.stage_id, stage_deploy)
+    if _dtps_config is not None:
+        engine.model["dit_load_aware_config"] = _dtps_config
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         pipeline,
         deploy,
@@ -2230,6 +2241,10 @@ def _build_diffusion_stage_config(
     *,
     model: str | None,
 ) -> VllmOmniDiffusionStageConfig:
+    deploy_by_id = {s.stage_id: s for s in deploy.stages}
+    _dtps_config = derive_dtps_config(pipeline, deploy_by_id, topology.stage_id, stage_deploy)
+    if _dtps_config is not None:
+        engine.model["dit_load_aware_config"] = _dtps_config
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         pipeline,
         deploy,

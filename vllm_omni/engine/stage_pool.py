@@ -38,6 +38,7 @@ from vllm_omni.engine import (
     OmniEngineCoreOutputs,
     PayloadSenderInfo,
 )
+from vllm_omni.engine.dit_load_state import DitLoadSnapshot
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -1924,6 +1925,69 @@ class StagePool:
                 replica_id,
             )
             raise
+
+    async def push_dit_load(self, snapshot: DitLoadSnapshot) -> bool:
+        """Push DiT load snapshot to all live AR replicas via UTILITY ZMQ."""
+        payload = dict(snapshot)
+        all_ok = True
+        for replica_id in self.live_replica_ids():
+            client = self.clients[replica_id]
+            if client is None:
+                continue
+            call_utility = getattr(client, "call_utility_async", None)
+            if call_utility is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    call_utility("omni_update_dit_load", payload),
+                    timeout=self._DIT_LOAD_PUSH_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "[StagePool] push_dit_load timed out (%ss) for stage=%s replica=%s",
+                    self._DIT_LOAD_PUSH_TIMEOUT_S,
+                    self.stage_id,
+                    replica_id,
+                )
+                all_ok = False
+            except Exception:
+                logger.warning(
+                    "[StagePool] push_dit_load failed for stage=%s replica=%s",
+                    self.stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
+                all_ok = False
+        return all_ok
+
+    async def poll_dit_load(self, replica_id: int) -> tuple[int, int, list[str], list[str]] | None:
+        """Query one DiT replica's ``(waiting, running, waiting_ids, running_ids)``."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None or not hasattr(raw_client, "get_dit_load_async"):
+            return None
+        try:
+            return await raw_client.get_dit_load_async()
+        except Exception:
+            logger.debug(
+                "[StagePool] poll_dit_load failed for stage=%s replica=%s",
+                self.stage_id,
+                replica_id,
+                exc_info=True,
+            )
+            return None
+
+    def check_dit_health(self, replica_id: int) -> bool:
+        """Check if a DiT replica is alive and responsive."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return False
+        check_fn = getattr(raw_client, "check_health", None)
+        if check_fn is None:
+            return True
+        try:
+            return bool(check_fn())
+        except Exception:
+            return False
 
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""
