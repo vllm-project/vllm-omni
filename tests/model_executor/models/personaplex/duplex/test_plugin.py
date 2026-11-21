@@ -119,8 +119,9 @@ def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches() -> None:
     assert overrides["mimi_cuda_graphs"] is True
     assert overrides["depformer_cuda_graphs"] is True
 
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
+    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
+    assert len(stages) == 2
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
 
 def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_path: Path) -> None:
