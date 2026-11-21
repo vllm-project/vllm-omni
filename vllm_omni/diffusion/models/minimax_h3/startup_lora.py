@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -149,41 +149,39 @@ class MiniMaxH3StartupLoRA:
         if key in self._consumed:
             raise ValueError(f"Duplicate startup-merge checkpoint target: {key}")
         dtype = weight.dtype if output_dtype is None else output_dtype
-        if merge_device.type == "npu":
-            result = self._merge_npu(weight, factors, dtype, merge_device, name)
-        else:
-            result = torch.empty_like(weight, dtype=dtype, device="cpu")
-            for start in range(0, weight.shape[0], self._ROWS_PER_TILE):
-                end = min(start + self._ROWS_PER_TILE, weight.shape[0])
-                merged = torch.addmm(
-                    weight[start:end].float().cpu(), factors.b[start:end], factors.a, alpha=factors.strength
-                )
-                value = merged.to(dtype)
-                if not torch.isfinite(value).all():
-                    raise ValueError(f"startup-merge produced non-finite weights: {name}")
-                result[start:end].copy_(value)
+        result = self._merge_tiles(weight, factors, dtype, merge_device, name)
         self._consumed.add(key)
         return result
 
-    def _merge_npu(
-        self, weight: torch.Tensor, factors: _Factors, dtype: torch.dtype, device: torch.device, name: str
+    def _merge_tiles(
+        self, source: torch.Tensor, factors: _Factors, dtype: torch.dtype, device: torch.device, name: str
     ) -> torch.Tensor:
-        # Upload each floating matrix/factor once; keep the fused result on the
-        # device for the original TP loader and its one online quantization.
-        source = weight.to(device)
-        a, b = factors.a.to(device), factors.b.to(device)
-        result = torch.empty_like(source, dtype=dtype)
-        checks: list[torch.Tensor] = []
-        with _npu_fp32_matmul():
-            for start in range(0, source.shape[0], self._NPU_ROWS_PER_TILE):
-                end = min(start + self._NPU_ROWS_PER_TILE, source.shape[0])
-                merged = torch.addmm(source[start:end].float(), b[start:end], a, alpha=factors.strength)
-                value = merged.to(dtype)
-                checks.append(torch.isfinite(value).all())
+        """Apply the same FP32 tile calculation with backend-specific staging."""
+        on_npu = device.type == "npu"
+        a, b = factors.a, factors.b
+        if on_npu:
+            # Upload once and keep the merged tensor on the device for TP and quantization.
+            source, a, b = source.to(device), a.to(device), b.to(device)
+        rows = self._NPU_ROWS_PER_TILE if on_npu else self._ROWS_PER_TILE
+        result = torch.empty_like(source, dtype=dtype, device=device)
+        npu_checks: list[torch.Tensor] = []
+        error = f"startup-merge produced non-finite weights: {name}"
+        with _npu_fp32_matmul() if on_npu else nullcontext():
+            for start in range(0, source.shape[0], rows):
+                end = min(start + rows, source.shape[0])
+                base = source[start:end].float()
+                if not on_npu:
+                    base = base.cpu()
+                value = torch.addmm(base, b[start:end], a, alpha=factors.strength).to(dtype)
+                finite = torch.isfinite(value).all()
+                if on_npu:
+                    npu_checks.append(finite)
+                elif not finite:
+                    raise ValueError(error)
                 result[start:end].copy_(value)
-            # Synchronize only the combined scalar check, never whole weights.
-            if not torch.stack(checks).all().item():
-                raise ValueError(f"startup-merge produced non-finite weights: {name}")
+            # Do not synchronize the NPU between tiles.
+            if on_npu and not torch.stack(npu_checks).all().item():
+                raise ValueError(error)
         return result
 
     def load_weight(

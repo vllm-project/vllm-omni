@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
-from itertools import groupby, zip_longest
+from itertools import chain, groupby, zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
@@ -747,13 +747,12 @@ class MiniMaxH3Pipeline(
     # Set from --lora-path when it names an Open-H3-Regenerate release.
     _regenerate: MiniMaxH3RegenerateAdapter | None = None
 
-    _startup_lora_request: LoRARequest | None = None
+    _fixed_startup_lora: tuple[LoRARequest, float] | None = None
     _startup_lora_fusion: MiniMaxH3StartupLoRA | None = None
-    _startup_lora_scale: float = 1.0
 
     def prepare_startup_lora(self) -> None:
         """Parse the fixed adapter before original floating weights are streamed."""
-        if self._startup_lora_request is not None:
+        if self._fixed_startup_lora is not None:
             return
         if self.partition == "combined":
             raise ValueError("startup-merge requires one MiniMax-H3 partition; set --task-type fl2va or ref2va")
@@ -771,18 +770,18 @@ class MiniMaxH3Pipeline(
             model = load_startup_peft_adapter(path, request)
         else:
             model, _ = loaded
-        self._startup_lora_fusion = MiniMaxH3StartupLoRA(model, self.od_config.lora_scale)
-        self._startup_lora_scale = self.od_config.lora_scale
-        self._startup_lora_request = request
+        scale = self.od_config.lora_scale
+        self._startup_lora_fusion = MiniMaxH3StartupLoRA(model, scale)
+        self._fixed_startup_lora = request, scale
         logger.info("MiniMax-H3 startup LoRA will be fused into floating checkpoint weights before TP/quantization")
 
     def _request_lora_selection(self, sampling: OmniDiffusionSamplingParams) -> tuple[LoRARequest | None, float]:
-        fixed = self._startup_lora_request
-        if fixed is not None:
-            if sampling.lora_request is not None:
-                raise OmniClientError("startup-merge uses a fixed LoRA; omit the request lora field")
-            return fixed, self._startup_lora_scale
-        return sampling.lora_request, float(getattr(sampling, "lora_scale", 1.0))
+        fixed = self._fixed_startup_lora
+        if fixed is None:
+            return sampling.lora_request, float(getattr(sampling, "lora_scale", 1.0))
+        if sampling.lora_request is not None:
+            raise OmniClientError("startup-merge uses a fixed LoRA; omit the request lora field")
+        return fixed
 
     def _load_diffusion_lora_adapter(
         self,
@@ -1492,7 +1491,7 @@ class MiniMaxH3Pipeline(
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
         return (
-            self._startup_lora_request is not None
+            self._fixed_startup_lora is not None
             or self._fasth3 is not None
             or self._vdn is not None
             or self._regenerate is not None
@@ -1501,8 +1500,7 @@ class MiniMaxH3Pipeline(
     @torch.no_grad()
     def warmup_startup_adaln_cache(self) -> None:
         """Populate exact AdaLN results using the final, startup-fused modules."""
-        fixed = self._startup_lora_request
-        if fixed is None:
+        if self._fixed_startup_lora is None:
             return
         if self._startup_lora_fusion is not None:
             raise RuntimeError("AdaLN warmup requires completed startup LoRA fusion")
@@ -1547,28 +1545,27 @@ class MiniMaxH3Pipeline(
         # Budget whole plans from the gathered BF16 output sizes. Using planned
         # bytes keeps every TP rank on the same collective path, even if one
         # rank cannot store a result. Round-robin avoids starving later modes.
-        bytes_per_row = torch.bfloat16.itemsize * sum(
-            p.expand_ratio * p.modality_num * p.hidden_size for p in projections
-        )
+        bytes_per_row = torch.bfloat16.itemsize * sum(projection.linear.output_size for projection in projections)
         bytes_left = cache.max_bytes
         warmed_plans: set[tuple[float, ...]] = set()
+        plans = (plan for plan in chain.from_iterable(zip_longest(*schedules)) if plan is not None)
         # The cache must own ordinary tensors even if startup is in inference mode.
         with torch.inference_mode(False), torch.no_grad():
-            for round_plans in zip_longest(*schedules):
+            for plan in plans:
                 if bytes_left < bytes_per_row:
                     break
-                for plan in round_plans:
-                    if plan is None or plan.numel() * bytes_per_row > bytes_left:
-                        continue
-                    key = tuple(plan.tolist())
-                    if key in warmed_plans:
-                        continue
-                    warmed_plans.add(key)
-                    bytes_left -= plan.numel() * bytes_per_row
-                    embedding = self.transformer.time_embedder(plan.to(device))
-                    cache.prepare(embedding)
-                    for projection in projections:
-                        projection(embedding)
+                plan_bytes = plan.numel() * bytes_per_row
+                if plan_bytes > bytes_left:
+                    continue
+                key = tuple(plan.tolist())
+                if key in warmed_plans:
+                    continue
+                warmed_plans.add(key)
+                bytes_left -= plan_bytes
+                embedding = self.transformer.time_embedder(plan.to(device))
+                cache.prepare(embedding)
+                for projection in projections:
+                    projection(embedding)
         logger.info(
             "MiniMax-H3 startup AdaLN cache warmed: %d projections computed, %d reused",
             cache.misses - misses,

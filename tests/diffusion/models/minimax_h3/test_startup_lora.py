@@ -30,12 +30,12 @@ def cpu_adapter_loading_does_not_allocate_accelerator_pinned_memory(monkeypatch)
     monkeypatch.setattr(lora_model, "PIN_MEMORY", False)
 
 
-def _adapter(name="transformer.blocks.0.attn.qkv_proj", rows=6):
+def _adapter(name="transformer.blocks.0.attn.qkv_proj", rows=6, rank=2):
     generator = torch.Generator().manual_seed(281)
-    a = torch.randn(2, 4, generator=generator)
-    b = torch.randn(rows, 2, generator=generator)
-    weights = LoRALayerWeights(name, 2, 3, a, b)
-    return LoRAModel(1, 2, {name: weights}), a, b
+    a = torch.randn(rank, 4, generator=generator)
+    b = torch.randn(rows, rank, generator=generator)
+    weights = LoRALayerWeights(name, rank, 3, a, b)
+    return LoRAModel(1, rank, {name: weights}), a, b
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -234,8 +234,7 @@ def test_fixed_native_adapter_keeps_sampling_schedule_without_request_lora(tmp_p
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = OmniDiffusionConfig(model=str(tmp_path), num_gpus=1)
-    pipeline._startup_lora_request = LoRARequest("fixed", 37, "unused")
-    pipeline._startup_lora_scale = 0.8
+    pipeline._fixed_startup_lora = LoRARequest("fixed", 37, "unused"), 0.8
     pipeline._native_lora_adapter_ids = {37}
     schedule = DMD2SigmaSchedule.from_positions([1.0, 0.9, 0.6, 0.2, 0.0])
     pipeline._lora_sigma_schedules = {37: schedule}
@@ -258,13 +257,15 @@ def test_invalid_or_overflowing_factors_fail():
         MiniMaxH3StartupLoRA(model, 1.0)
 
 
-def test_startup_peft_directory_uses_original_alpha_and_no_runtime_manager(tmp_path):
+@pytest.mark.parametrize("rank", [2, 513], ids=["ordinary", "above-runtime-limit"])
+def test_startup_peft_directory_uses_original_alpha_and_no_runtime_manager(tmp_path, rank):
     import json
 
     from safetensors.torch import save_file
 
-    _, a, b = _adapter()
-    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 2, "lora_alpha": 3, "target_modules": ["qkv_proj"]}))
+    _, a, b = _adapter(rank=rank)
+    config = {"r": rank, "lora_alpha": 3, "target_modules": ["qkv_proj"]}
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
     save_file(
         {
             "base_model.model.transformer.blocks.0.attn.qkv_proj.lora_A.weight": a,
@@ -285,7 +286,7 @@ def test_startup_peft_directory_uses_original_alpha_and_no_runtime_manager(tmp_p
     assert pipeline.lora_is_fused
     fusion = pipeline._startup_lora_fusion
     original = torch.zeros(6, 4)
-    expected = torch.addmm(original, b, a, alpha=1.05)
+    expected = torch.addmm(original, b, a, alpha=0.7 * 3 / rank)
     actual = fusion.merge("blocks.0.attn.qkv_proj.weight", original)
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
     fusion.validate()
@@ -309,27 +310,6 @@ def test_startup_peft_rejects_unsupported_semantics_before_reading_weights(tmp_p
 
     with pytest.raises(ValueError, match=message):
         load_startup_peft_adapter(str(tmp_path), LoRARequest("startup", 1, str(tmp_path)))
-
-
-def test_startup_peft_has_no_runtime_kernel_rank_limit(tmp_path):
-    import json
-
-    from safetensors.torch import save_file
-
-    rank = 513
-    name = "blocks.0.attn.qkv_proj"
-    prefix = f"base_model.model.transformer.{name}"
-    config = {"r": rank, "lora_alpha": rank, "target_modules": ["qkv_proj"]}
-    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-    save_file(
-        {f"{prefix}.lora_A.weight": torch.ones(rank, 4), f"{prefix}.lora_B.weight": torch.ones(6, rank)},
-        str(tmp_path / "adapter_model.safetensors"),
-    )
-
-    adapter = load_startup_peft_adapter(str(tmp_path), LoRARequest("startup", 1, str(tmp_path)))
-    fusion = MiniMaxH3StartupLoRA(adapter, 1.0)
-    torch.testing.assert_close(fusion.merge(f"{name}.weight", torch.zeros(6, 4)), torch.full((6, 4), float(rank)))
-    fusion.validate()
 
 
 def test_packed_mlp_keeps_gate_and_up_scaling_independent(monkeypatch):
@@ -423,8 +403,7 @@ def _adaln_warmup_pipeline(monkeypatch, tmp_path, *, mode="t2va", device=torch.d
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = OmniDiffusionConfig(model=str(tmp_path), num_gpus=1)
-    pipeline._startup_lora_request = LoRARequest("fixed", 37, "unused")
-    pipeline._startup_lora_scale = 0.7
+    pipeline._fixed_startup_lora = LoRARequest("fixed", 37, "unused"), 0.7
     pipeline._startup_lora_fusion = None
     pipeline._native_lora_adapter_ids = {37} if mode == "t2va" else set()
     pipeline._lora_sigma_schedules = {37: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
@@ -592,7 +571,7 @@ def test_startup_warmup_respects_cache_disable_and_fusion_lifecycle(monkeypatch,
     pipeline._startup_lora_fusion = object()
     with pytest.raises(RuntimeError, match="completed startup LoRA fusion"):
         pipeline.warmup_startup_adaln_cache()
-    pipeline._startup_lora_request = None
+    pipeline._fixed_startup_lora = None
     pipeline.warmup_startup_adaln_cache()
 
 

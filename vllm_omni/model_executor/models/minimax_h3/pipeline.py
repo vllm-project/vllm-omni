@@ -59,12 +59,10 @@ MINIMAX_H3_PIPELINE = PipelineConfig(
 )
 
 
-MINIMAX_H3_DECODE_PIPELINE = PipelineConfig(
+MINIMAX_H3_DECODE_PIPELINE = replace(
+    MINIMAX_H3_PIPELINE,
     model_type="minimax_h3_disaggregated_decode",
     default_deploy_config_name="minimax_h3_disaggregated_decode.yaml",
-    startup_lora_stage_id=1,
-    stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},
-    model_arch="MiniMaxH3Encoder",
     stages=(
         replace(
             MINIMAX_H3_PIPELINE.stages[0],
