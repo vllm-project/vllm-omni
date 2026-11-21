@@ -151,7 +151,6 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export MINDIE_SD_FA_TYPE="ascend_laser_attention"
-export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
   --omni \
@@ -173,6 +172,12 @@ vllm serve "${MODEL}" \
 
 Notes:
 
+- Do not set `HCCL_NPU_SOCKET_PORT_RANGE=auto`. Automatic NPU-side socket port
+  allocation has been observed to make the first request fail with `EI0006
+  Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose NPUs sit
+  in more than one interconnect domain, such as a host with two four-NPU UB
+  domains. Leave the variable unset; the default port allocation works on
+  every topology.
 - Do not add `--enforce-eager`. The first request includes regional
   compilation; warm the server once before measuring steady-state latency.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.

@@ -55,7 +55,6 @@ export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
   --omni \
@@ -79,6 +78,14 @@ H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1. The first
 request includes regional compilation; warm the server once before measuring
 steady-state latency.
 
+> [!NOTE]
+> Do not set `HCCL_NPU_SOCKET_PORT_RANGE=auto` here. Automatic NPU-side socket
+> port allocation has been observed to make the first request fail with
+> `EI0006 Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose
+> NPUs sit in more than one interconnect domain, such as a two-domain
+> 950PR/950DT host. Leave the variable unset; the default port allocation
+> works on every topology.
+
 ### Recommended lossy configuration (Ascend 950PR / 950DT)
 
 Adds EQBSA sparse attention (block-sparse with Q/K INT8 + V FP8 mixed
@@ -93,7 +100,6 @@ export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
   --omni \
@@ -115,6 +121,14 @@ vllm serve "${MODEL}" \
 
 The recommended lossy configuration uses a **start=8 / end=12** dense-fallback
 window; see below for more aggressive settings.
+
+> [!NOTE]
+> Do not set `HCCL_NPU_SOCKET_PORT_RANGE=auto` here. Automatic NPU-side socket
+> port allocation has been observed to make the first request fail with
+> `EI0006 Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose
+> NPUs sit in more than one interconnect domain, such as a two-domain
+> 950PR/950DT host. Leave the variable unset; the default port allocation
+> works on every topology.
 
 ### Ref2VA on a 950PR that reports ~86 GB HBM
 

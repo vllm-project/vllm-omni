@@ -594,6 +594,25 @@ def _dit_rank_world() -> tuple[Any, int, int]:
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
+def _dit_cpu_rank_world() -> tuple[Any, int, int]:
+    """Return the CPU (gloo) group with the DiT ranks' view of rank and world size.
+
+    ``broadcast_object_list`` serializes Python objects and runs two
+    collectives, so it needs a group that can carry host buffers. On a device
+    group it instead allocates device buffers and drives the device backend,
+    which is what fails with ``EI0006 Communication_Error_Get_Socket`` on
+    ``HcclBroadcast`` when the device backend has to reach across interconnect
+    domains (issue #10645). The CPU group keeps the transfer host-side.
+
+    The ranks and the world size are the same as the device group's; only the
+    backend differs, so the two views stay consistent.
+    """
+    if not dist.is_initialized():
+        return None, 0, 1
+    group = get_world_group().cpu_group
+    return group, dist.get_rank(group), dist.get_world_size(group)
+
+
 def _broadcast_rank0_exception(exc: Exception | None) -> None:
     """Synchronize a rank-0-only exception across every DiT rank.
 
@@ -605,7 +624,7 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
     rank-0-only work, before any subsequent collective, so all ranks either
     raise the same error together or all continue.
     """
-    group, rank, world_size = _dit_rank_world()
+    group, rank, world_size = _dit_cpu_rank_world()
     if world_size == 1:
         if exc is not None:
             raise exc
@@ -2957,7 +2976,7 @@ class MiniMaxH3Pipeline(
         )
 
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         if world_size == 1:
             assert media is not None
             return media
@@ -2979,7 +2998,7 @@ class MiniMaxH3Pipeline(
     def _broadcast_media_conditioning(
         self, conditioning: MiniMaxH3EncoderMediaConditioning | None
     ) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         if world_size == 1:
             assert conditioning is not None
             return conditioning
@@ -3178,7 +3197,7 @@ class MiniMaxH3Pipeline(
         Returns initial conditioning and optional request-owned window embeddings.
         Invalid continuation prompts are broadcast before any encoder collective.
         """
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = _dit_cpu_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
         prepared = text_conditioning = None
         initial_noise_params = None

@@ -32,6 +32,7 @@ def _collective_worker(rank, rendezvous, backend):
     )
     try:
         module._dit_rank_world = lambda: (dist.group.WORLD, rank, 2)
+        module._dit_cpu_rank_world = lambda: (dist.group.WORLD, rank, 2)
 
         class VisualCodec:
             fail = False
@@ -146,6 +147,40 @@ def _run_collectives(tmp_path, backend):
 @pytest.mark.cpu
 def test_two_rank_conditioning_and_errors_gloo(tmp_path):
     _run_collectives(tmp_path, "gloo")
+
+
+@pytest.mark.cpu
+def test_object_broadcasts_use_the_cpu_group(monkeypatch):
+    """Object broadcasts must not run on the device (HCCL) group.
+
+    ``broadcast_object_list`` serializes the payload and runs two
+    collectives. On a device group it allocates device buffers and drives the
+    device backend, which is what fails with ``EI0006
+    Communication_Error_Get_Socket`` on ``HcclBroadcast`` when the device
+    backend has to cross an interconnect domain (issue #10645). The payload
+    has to travel host-side over the gloo group instead.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    device_group = object()
+    cpu_group = object()
+    world = SimpleNamespace(device_group=device_group, cpu_group=cpu_group)
+    monkeypatch.setattr(module, "get_world_group", lambda: world)
+
+    seen: list[object] = []
+
+    def fake_broadcast_object_list(obj_list, src=0, group=None, **kwargs):
+        seen.append(group)
+
+    monkeypatch.setattr(module.dist, "broadcast_object_list", fake_broadcast_object_list)
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(module.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
+
+    module._broadcast_rank0_exception(None)
+
+    assert seen == [cpu_group]
+    assert device_group not in seen
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=2)
