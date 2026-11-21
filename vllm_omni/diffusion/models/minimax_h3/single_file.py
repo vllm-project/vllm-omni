@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Validate native ComfyUI-layout H3 files without materializing their weights."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,21 @@ from safetensors import safe_open
 
 MINIMAX_H3_BASE_MODEL = "MiniMaxAI/MiniMax-H3"
 MINIMAX_H3_BASE_REVISION = "42ed227ee7df40d41602854ae760620d6eb651fe"
+
+
+def resolve_minimax_h3_base_source(custom_pipeline_args: Mapping[str, Any] | None) -> tuple[str, str | None]:
+    """Return the repository and revision that supply a single file's shared components.
+
+    ``base_model`` (a Hub ID or a local tree containing ``FL2VA/``) defaults to
+    the official release. ``base_revision`` defaults to the pinned release
+    revision only when that default repository is used.
+    """
+    args = custom_pipeline_args or {}
+    model = str(args.get("base_model", MINIMAX_H3_BASE_MODEL))
+    revision = args.get("base_revision")
+    if revision is None and model == MINIMAX_H3_BASE_MODEL:
+        revision = MINIMAX_H3_BASE_REVISION
+    return model, revision
 
 
 @dataclass(frozen=True)

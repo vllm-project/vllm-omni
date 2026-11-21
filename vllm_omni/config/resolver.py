@@ -253,16 +253,11 @@ def resolve_omni_config(
                 "minimax_h3_disaggregated",
                 "minimax_h3_disaggregated_decode",
             }:
-                from vllm_omni.diffusion.models.minimax_h3.single_file import (
-                    MINIMAX_H3_BASE_MODEL,
-                    MINIMAX_H3_BASE_REVISION,
-                )
+                from vllm_omni.diffusion.models.minimax_h3.single_file import resolve_minimax_h3_base_source
 
-                custom_args = normalized_overrides.get("custom_pipeline_args") or {}
-                base_model = str(custom_args.get("base_model", MINIMAX_H3_BASE_MODEL))
-                base_revision = custom_args.get("base_revision")
-                if base_revision is None and base_model == MINIMAX_H3_BASE_MODEL:
-                    base_revision = MINIMAX_H3_BASE_REVISION
+                base_model, base_revision = resolve_minimax_h3_base_source(
+                    normalized_overrides.get("custom_pipeline_args")
+                )
                 for stage in structured_config.stage_configs:
                     if stage.model_stage not in {"encoder", "vae_decode"}:
                         continue

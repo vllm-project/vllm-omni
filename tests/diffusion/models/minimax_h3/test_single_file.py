@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.minimax_h3.single_file import (
     MINIMAX_H3_BASE_MODEL,
     MINIMAX_H3_BASE_REVISION,
     MiniMaxH3SingleFileSpec,
+    resolve_minimax_h3_base_source,
 )
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import DistributedLayerwiseOffloadBackend
 from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent
@@ -393,3 +394,17 @@ def test_single_file_base_download_excludes_dense_dits(monkeypatch, tmp_path, pa
     for component in ("text_encoder", "video_vae", "audio_vae", "tokenizer", "processor"):
         assert any(fnmatch(f"{shared}/{component}/config.json", p) for p in patterns)
     assert captured["revision"] == "pinned-base-revision"
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (None, (MINIMAX_H3_BASE_MODEL, MINIMAX_H3_BASE_REVISION)),
+        ({"base_model": MINIMAX_H3_BASE_MODEL}, (MINIMAX_H3_BASE_MODEL, MINIMAX_H3_BASE_REVISION)),
+        ({"base_revision": "main"}, (MINIMAX_H3_BASE_MODEL, "main")),
+        ({"base_model": "/models/minimax-h3"}, ("/models/minimax-h3", None)),
+        ({"base_model": "org/fork", "base_revision": "abc"}, ("org/fork", "abc")),
+    ],
+)
+def test_base_source_pins_only_the_default_repository(args, expected):
+    assert resolve_minimax_h3_base_source(args) == expected
