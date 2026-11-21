@@ -1924,6 +1924,49 @@ def test_recorded_video_json_keeps_raw_metrics_hardware_and_recipe(tmp_path, mon
         assert saved[key] == record[key]
 
 
+@pytest.mark.parametrize("exit_code,write_result", [(0, True), (1, True), (1, False)])
+def test_result_transform_persists_failure_diagnostics(tmp_path, monkeypatch, exit_code, write_result):
+    """A failed CLI must still publish the callback's annotations for review."""
+    import io
+
+    from tests.dfx import conftest as dfx
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout, self.stderr = io.StringIO(""), io.StringIO("")
+            if write_result:
+                path = (
+                    Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+                )
+                path.write_text(json.dumps({"completed": 1, "raw_marker": "retained"}))
+
+        def wait(self):
+            return exit_code
+
+    def annotate(result, returncode):
+        assert result["Hardware"] == "H200"
+        assert returncode == exit_code
+        return {
+            **result,
+            "benchmark_exit_code": returncode,
+            "validation_errors": ["incomplete workload"],
+            "qualification_scope": "smoke",
+        }
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    result = dfx.run_benchmark(
+        [], "test_dataset_callback", 1, "seed-tts", 4, resource_label="H200", result_transform=annotate
+    )
+    [saved_path] = tmp_path.glob("result_*.json")
+    saved = json.loads(saved_path.read_text())
+    assert saved == result
+    assert saved["validation_errors"] == ["incomplete workload"]
+    assert saved["benchmark_exit_code"] == exit_code
+    if write_result:
+        assert saved["raw_marker"] == "retained"
+
+
 def _response_performance_result(dataset_name):
     result = {"completed": 16, "duplex_metric_aggregation": "response"}
     if dataset_name == "omni-duplex-eval":
@@ -2040,6 +2083,35 @@ def test_qwen3_correction_run_rejects_boolean_coverage_count(field):
     accuracy[field] = False
     with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
         assert_result(result, params, count)
+
+
+@pytest.mark.parametrize(("case_index", "hardware"), [(0, "H100"), (1, "910"), (0, "B200")])
+def test_qwen3_correction_score_floor(case_index, hardware, monkeypatch, pytestconfig):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    configs = json.loads(Path(__file__).with_name("test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())
+    config = configs[case_index]
+    result, _, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    expected_label = "A3" if hardware == "910" else hardware
+
+    def benchmark(**kwargs):
+        assert kwargs["resource_label"] == expected_label
+        assert "--runtime-resource-aliases" not in kwargs["args"]
+        result["Hardware"] = kwargs["resource_label"]
+        return result
+
+    monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: hardware)
+    monkeypatch.setattr(runner, "run_benchmark", benchmark)
+    server = ServerEndpoint(judge_base_url="http://localhost:8001")
+    case = {"test_name": config["test_name"], "params": config["benchmark_params"][0]}
+    accuracy["pr"]["mean_all_success"] = 84 / count
+    runner.test_performance_benchmark(server, case, pytestconfig)
+    accuracy["pr"]["mean_all_success"] = 83 / count
+    if hardware == "B200":
+        runner.test_performance_benchmark(server, case, pytestconfig)
+    else:
+        with pytest.raises(AssertionError, match="PR correction mean_all_success"):
+            runner.test_performance_benchmark(server, case, pytestconfig)
 
 
 @pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, -0.1, 1.1])

@@ -69,6 +69,23 @@ matching baseline. Existing `--assert-baseline` callers retain their warning and
 skip behavior for missing calibration. Baselines are selected by runtime device
 labels; a pytest selection marker does not establish physical hardware identity.
 
+## Qwen3-Omni dataset accuracy and performance
+
+Qwen3-Omni's dataset scenarios use the shared DFX JSON runner. An explicit
+accuracy flag selects scoring independently of concurrency. Accuracy scenarios
+share their measured inference requests with performance collection and use the
+complete pinned dataset. Performance-only Seed-TTS tiers use fixed manifest
+prefixes with explicit sample counts. The shared DFX parameter fixture prepares
+pinned sources through the existing dataset modules. JSON declares evaluator
+environment, input packing, score thresholds and deployment metadata. The
+ordinary runner and result writer check complete requests, audio, scoring and
+metric samples, and persist diagnostics before asserting. Smoke subsets are identified
+separately from full-dataset accuracy and regular performance subsets.
+Numerical performance floors require
+hardware-specific calibration; collect mode still checks measurement validity.
+The [scenario contract](../../contributing/ci/qwen3_omni_benchmark.md) defines
+the matrix, scoring, placement and reproduction commands.
+
 ## LingBot performance and accuracy
 
 The packaged `realtime-video` backend uses the existing `vllm bench serve
