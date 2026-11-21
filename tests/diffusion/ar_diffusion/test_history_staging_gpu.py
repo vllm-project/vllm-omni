@@ -28,7 +28,7 @@ def _require_cuda_flash_attn() -> None:
     _require_gpu_flash_attn()
 
 
-@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100"], "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("window_chunks", [2, 4])
 @torch.inference_mode()
 def test_staged_attention_updates_only_the_active_window_gpu(monkeypatch, window_chunks):
@@ -69,7 +69,7 @@ def test_staged_attention_updates_only_the_active_window_gpu(monkeypatch, window
             assert (staged[inputs.max_seq_len :] == -7).all()
 
 
-@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100"], "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("window_chunks", [2, 4])
 @pytest.mark.parametrize("reuse_history", [False, True])
 @torch.inference_mode()

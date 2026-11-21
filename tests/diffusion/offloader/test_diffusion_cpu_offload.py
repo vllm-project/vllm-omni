@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import gc
+import os
 from typing import Any
 
 import numpy as np
@@ -16,7 +17,12 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 AUDIO_MODEL: dict[str, dict[str, int | None]] = {
-    "stabilityai/stable-audio-open-1.0": {"cuda": 150, "rocm": None},
+    "stabilityai/stable-audio-open-1.0": {
+        "cuda": 150,
+        # The default-backend AMD NIGHTLY measured 213.8–214.4 MiB saved on MI300X.
+        # MERGE uses TORCH_SDPA, whose floor still needs calibration.
+        "rocm": 150 if os.getenv("STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK") == "1" else None,
+    },
 }
 
 IMAGE_MODELS: dict[str, dict[str, int | None]] = {

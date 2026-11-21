@@ -66,6 +66,13 @@ Models such as Qwen3-TTS whose `forward()` returns a tensor and whose
 `mrv2_forward_returns_tensor = True`. Their multimodal-output capability does
 not require excluding FULL capture.
 
+MRv2 computes prompt logprobs after sampling and may split prompt hidden states
+into arbitrary row chunks. A model whose sampling logits depend on request-local
+state or full-batch row spans can expose `compute_prompt_logits(hidden_states)`
+for stateless prompt chunks and the startup sampler profiling pass. The runner
+otherwise falls back to `compute_logits`; real sampling keeps the model's normal
+request-state validation and updates.
+
 Request-batched MTP uses its own FULL graph wrapper. Capture and replay select
 the same FULL descriptor from the MTP capture sizes, bounded by
 `max_num_seqs`, independently of the backbone's graph mode. A backbone that
@@ -140,6 +147,22 @@ adapter, not injected through unrelated scheduler state.
 ### AR-INV-003: Workers execute assigned work
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
+
+## Model-owned request lifecycle
+
+Model states can implement `get_request_lifecycle(scheduler_output)` to return
+a `RequestLifecycleUpdate` before the runner admits new requests. Reset IDs
+clear both model-owned state and native slots before the same IDs enter a new
+phase. Release IDs free only native slots, leaving model-owned jobs alive.
+Real finished/aborted IDs still notify the model even after a slot was released.
+These worker transitions do not mutate the scheduler's completion metadata.
+
+`finalize_runner_output(output, idle=...)` runs on the AR worker thread after
+sampling and on no-forward steps, outside graph capture/profiling. It can
+publish work that outlives native slots. Ordinary model states preserve the
+original deferred output without synchronizing it. YuE2 uses these hooks for
+ABC phase replacement and request-keyed NAR/VAE completion, through the shared
+`OmniARModelRunner` and standard worker.
 
 ## Token-only output payloads
 

@@ -1753,6 +1753,17 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return [padded[row, :, : length * self.total_upsample] for row, length in enumerate(lengths)]
 
 
+# Speech checkpoints retain Mimi's flat names; Transformers 5.22 groups the
+# SEANet, transformer and downsample under the encoder.
+_NESTED_MIMI_ENCODER_MAPPER = WeightsMapper(
+    orig_to_new_prefix={
+        "encoder.layers.": "encoder.encoder_seanet.layers.",
+        "encoder_transformer.": "encoder.encoder_transformer.",
+        "downsample.": "encoder.downsample.",
+    }
+)
+
+
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
     def __init__(self, config: MimiConfig):
         config = copy.deepcopy(config)
@@ -1764,19 +1775,17 @@ class Qwen3TTSTokenizerV2Encoder(MimiModel):
             self.decoder_transformer = None
             self.upsample = None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Speech checkpoints retain Mimi's flat names; Transformers 5.22
-        # groups the SEANet, transformer and downsample under the encoder.
-        mapper = None
+    def flat_checkpoint_mapper(self) -> WeightsMapper:
+        return _NESTED_MIMI_ENCODER_MAPPER if hasattr(self.encoder, "encoder_seanet") else WeightsMapper()
+
+    def encoder_stages(self) -> tuple[nn.Module, nn.Module, nn.Module]:
+        """SEANet, transformer and downsample, without 5.22's deprecated aliases."""
         if hasattr(self.encoder, "encoder_seanet"):
-            mapper = WeightsMapper(
-                orig_to_new_prefix={
-                    "encoder.layers.": "encoder.encoder_seanet.layers.",
-                    "encoder_transformer.": "encoder.encoder_transformer.",
-                    "downsample.": "encoder.downsample.",
-                }
-            )
-        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
+            return self.encoder.encoder_seanet, self.encoder.encoder_transformer, self.encoder.downsample
+        return self.encoder, self.encoder_transformer, self.downsample
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return AutoWeightsLoader(self).load_weights(weights, mapper=self.flat_checkpoint_mapper())
 
 
 @auto_docstring
