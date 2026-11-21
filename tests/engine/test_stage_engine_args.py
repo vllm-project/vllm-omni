@@ -1001,6 +1001,9 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
     [
         ("indextts2", "indextts2.yaml"),
         ("indextts2", "indextts2_low_latency.yaml"),
+        ("indextts2", "indextts2_mrv2.yaml"),
+        ("indextts2_5", "indextts2_5.yaml"),
+        ("indextts2_5", "indextts2_5_mrv2.yaml"),
         ("yue2", "yue2.yaml"),
     ],
 )
