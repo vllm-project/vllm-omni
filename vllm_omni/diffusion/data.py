@@ -103,6 +103,44 @@ def _move_diffusion_alias(
     normalized[canonical_name] = legacy_value
 
 
+def validate_diffusion_weight_stack(config: object) -> str:
+    """Validate the selector and temporary unified admission limits (RFC 01-2)."""
+    from vllm_omni.diffusion.weight_management.errors import ConfigError
+    from vllm_omni.diffusion.weight_management.startup import WeightStack, parse_weight_stack
+
+    values = config if isinstance(config, Mapping) else vars(config)
+    stack = parse_weight_stack(values.get("diffusion_weight_stack"))
+    if stack is WeightStack.UNIFIED:
+        unsupported = [
+            name
+            for name in (
+                "enable_cpu_offload",
+                "enable_layerwise_offload",
+                "enable_distributed_layerwise_offload",
+            )
+            if values.get(name, False)
+        ]
+        if values.get("diffusion_offload_config", None) is not None:
+            unsupported.append("diffusion_offload_config")
+        if values.get("dlo_host_registration_limit_gib", 0) > 0:
+            unsupported.append("dlo_host_registration_limit_gib")
+        if values.get("host_weight_runtime_mode", "disabled") != "disabled":
+            unsupported.append("host_weight_runtime_mode")
+        if values.get("host_weight_runtime_root", None) is not None:
+            unsupported.append("host_weight_runtime_root")
+        unsupported.extend(
+            name
+            for name in ("OMNI_DIFFUSION_PROMPT_EMBED_CACHE", "OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE")
+            if name in os.environ
+        )
+        if unsupported:
+            raise ConfigError(
+                f"unified does not yet support {', '.join(unsupported)}",
+                fix="use --diffusion-weight-stack legacy",
+            )
+    return stack.value
+
+
 def normalize_omni_diffusion_kwargs(
     raw_kwargs: Mapping[str, Any],
     *,
@@ -1135,6 +1173,7 @@ class OmniDiffusionConfig:
     num_weight_load_threads: int = 4
 
     # Shard meta parameters before reading rank-local HF safetensors slices.
+    diffusion_weight_stack: str = "legacy"
     hsdp_weight_load_strategy: str = "full"
 
     # Enable sleep mode
@@ -1367,6 +1406,7 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        self.diffusion_weight_stack = validate_diffusion_weight_stack(self)
         from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
 
         if type(self.dlo_chunk_size_mb) is not int or self.dlo_chunk_size_mb <= 0:
@@ -1525,7 +1565,9 @@ class OmniDiffusionConfig:
             )
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
-        offload_strategy = materialize_legacy_offload_flags(self)
+        from vllm_omni.diffusion.weight_management.startup import is_unified
+
+        offload_strategy = OffloadStrategy.NONE if is_unified(self) else materialize_legacy_offload_flags(self)
         # Parsed before the 'full' check, which needs the normalized value: a schedule without
         # profiles parses to None.
         self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)

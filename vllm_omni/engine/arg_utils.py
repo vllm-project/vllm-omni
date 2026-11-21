@@ -385,6 +385,7 @@ class OmniEngineArgs(EngineArgs):
     # ``SHARED_FIELDS`` since both classes now declare them.
     num_gpus: int | None = None
     model_class_name: str | None = None
+    diffusion_weight_stack: str | None = None
     hsdp_weight_load_strategy: str | None = None
     diffusion_load_format: str | None = None
     lora_path: list[str] | None = None
@@ -797,6 +798,7 @@ class OrchestratorArgs:
     # === Diffusion model config ===
     num_gpus: int | None = None
     model_class_name: str | None = None
+    diffusion_weight_stack: str | None = None
     hsdp_weight_load_strategy: str | None = None
     diffusion_load_format: str | None = None
     controlnet_model_path: str | None = None
@@ -898,6 +900,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         # #8037 join this set via #8041.
         "num_gpus",
         "model_class_name",
+        "diffusion_weight_stack",
         "hsdp_weight_load_strategy",
         "diffusion_load_format",
         "lora_path",

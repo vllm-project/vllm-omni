@@ -202,12 +202,19 @@ class TestWorkerUsesHook:
         mock_platform.get_diffusion_model_runner_cls.return_value = "custom.path"
         mock_resolve.return_value = mock_runner_cls
 
-        with patch.object(DiffusionWorker, "init_device"):
-            worker = DiffusionWorker(local_rank=0, rank=0, od_config=Mock(), skip_load_model=True)
-
-        assert worker.model_runner is mock_runner_instance
-        mock_platform.get_diffusion_model_runner_cls.assert_called_once()
-        mock_resolve.assert_called_once_with("custom.path")
+        with (
+            patch.object(DiffusionWorker, "init_device"),
+            patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env"),
+        ):
+            worker = DiffusionWorker(
+                local_rank=0, rank=0, od_config=Mock(diffusion_weight_stack="legacy"), skip_load_model=True
+            )
+            try:
+                assert worker.model_runner is mock_runner_instance
+                mock_platform.get_diffusion_model_runner_cls.assert_called_once()
+                mock_resolve.assert_called_once_with("custom.path")
+            finally:
+                worker.shutdown()
 
     @patch("vllm_omni.diffusion.worker.diffusion_worker.get_diffusion_ir_op_priority_func")
     @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")

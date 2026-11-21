@@ -1091,6 +1091,13 @@ class OmniServeCommand(CLISubcommand):
             help="Number of threads for parallel weight loading (default: 4).",
         )
 
+        omni_config_group.add_argument(
+            "--diffusion-weight-stack",
+            choices=["legacy", "unified"],
+            default=None,
+            help="Diffusion weight implementation (default: legacy).",
+        )
+
         # diffusion model offload parameters
         omni_config_group.add_argument(
             "--diffusion-offload-config",
