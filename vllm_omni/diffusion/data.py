@@ -320,12 +320,14 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use platform symmetric memory for eligible strict Ulysses exchanges.
+    """Use platform-specific transport for eligible strict Ulysses exchanges.
 
     On CUDA, enables CE (copy engines) on a single NVLink-connected node;
     when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
     implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
-    allocator, Triton-Ascend and a symmetric-memory runtime.
+    allocator, Triton-Ascend and a symmetric-memory runtime. On ROCm, four
+    Ulysses ranks can fuse Q/K/V packing before RCCL for BF16 tensors with
+    batch size one, 56 heads and head size 128.
     """
 
     cfg_parallel_size: int = 1

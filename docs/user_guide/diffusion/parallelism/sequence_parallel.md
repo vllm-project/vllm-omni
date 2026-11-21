@@ -231,7 +231,7 @@ In `DiffusionParallelConfig`:
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
-| `ulysses_a2a_permute` | bool | `False` | Enable CUDA copy engines (CE) for strict Ulysses; disabled uses NCCL. On NPU, use platform SHMEM. |
+| `ulysses_a2a_permute` | bool | `False` | Optimize eligible strict Ulysses exchanges with CUDA copy engines, ROCm packed RCCL, or NPU SHMEM. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -239,6 +239,18 @@ In `DiffusionParallelConfig`:
 - Total sequence parallel size equals `ulysses_degree × ring_degree × allgather_degree`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
+
+On ROCm, use `--ulysses-degree 4 --ring-degree 1 --ulysses-a2a-permute` to enable
+packed RCCL exchanges. This path supports strict self-attention with per-rank
+BF16 Q, K and V of shape `[1, local_sequence, 56, 128]` and `allgather_degree=1`.
+Other shapes, joint attention and gate compression use the usual Ulysses path.
+The first initialization builds two HIP layout kernels using the ROCm PyTorch
+toolchain. Install `hipcc` and Ninja and provide a writable PyTorch extensions
+cache (optionally set `TORCH_EXTENSIONS_DIR`). To compare the transport on
+your own host using H3 input strides, run
+`torchrun --standalone --nproc-per-node=4 benchmarks/diffusion/bench_rocm_ulysses.py`
+from the repository root. It reports forward-plus-reverse exchange times and
+excludes attention computation.
 
 On CUDA, set `ulysses_a2a_permute=True` (CLI: `--ulysses-a2a-permute`) to use CE.
 This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and peer-accessible

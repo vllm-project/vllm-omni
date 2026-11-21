@@ -45,6 +45,18 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
 | `sp_gather()` | Manual tensor gathering | Gathers sharded tensors from all workers |
 
+### ROCm packed Ulysses
+
+For four strict Ulysses ranks with BF16 Q/K/V of shape `[1, S, 56, 128]`,
+a HIP kernel packs each destination's 14 heads into `[4, S, 3, 14, 128]`.
+One RCCL all-to-all delivers all three slots. Consumers normally receive
+contiguous tensors. A backend that opts into strided BSND can read the receive
+buffer directly with sequence stride `3 * 14 * 128` elements. The reverse
+exchange sends `[4, S, 14, 128]`, then a vectorized HIP kernel restores
+`[1, S, 56, 128]`. A rank with misaligned or irregular input strides packs
+the same packet using tensor copies, so its peers can still use vector loads.
+The local consumer's stride requirement never changes the collective sequence.
+
 ### NPU symmetric-memory Ulysses
 
 On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer

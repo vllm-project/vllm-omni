@@ -158,6 +158,10 @@ def ensure_a2a_permute_available() -> None:
         )
 
         ensure_npu()
+    elif current_omni_platform.is_rocm():
+        from vllm_omni.diffusion.distributed.rocm_ulysses import prepare
+
+        prepare()
     else:
         _ce_runtime()
 
