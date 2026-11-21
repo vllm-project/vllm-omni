@@ -299,6 +299,14 @@ weight and scale sharding contracts are qualified.
 The available `ignored_layers` names depend on the model architecture, for
 example `to_qkv`, `to_out`, `img_mlp`, or `txt_mlp`.
 
+An entry names a layer's **full prefix** by default, so a short module name
+covers nothing on its own. A pipeline that documents short names as patterns
+raises the match mode for its own components — Qwen-Image-2.1 does, which is
+what makes `img_mlp` there stand for every block's `img_mlp.*` and keeps whole
+subtrees such as the text encoder's vision tower out of FP8. Check the model
+recipe before relying on a short name, and give the full prefix
+(`transformer_blocks.3.attn.to_qkv`) for a model that does not document one.
+
 ## Validation and Notes
 
 FP8 quantization can be combined with cache acceleration:
