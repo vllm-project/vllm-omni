@@ -237,6 +237,8 @@ When a request arrives, `Orchestrator._prewarm_async_chunk_stages` submits every
 - it carries no multimodal data;
 - it waits in `WAITING_FOR_CHUNK` until chunk 0 arrives.
 
+For native MRv2 AR receivers with an explicit `async_chunk_prewarm_prompt_len > 1`, the declared length owns the initial prefill. Per-chunk `meta.next_stage_prompt_len` increments must not resize that placeholder; resumable request updates extend the prompt. This lets VoiceChat process its speaker prefill together instead of advancing one position per microphone frame. Generation receivers and AR receivers without an explicit prefill retain payload-driven sizing.
+
 As a result, the downstream request already exists when the first chunk lands. Stages that only send chunks are not prewarmed, because their first real input comes from the orchestrator.
 
 #### Prewarm payload

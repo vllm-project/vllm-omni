@@ -18,7 +18,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from transformers import PretrainedConfig
+from vllm import SamplingParams
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
@@ -31,6 +34,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+from vllm_omni.request import OmniRequest
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
@@ -108,6 +112,53 @@ class MixinHost(OmniConnectorModelRunnerMixin):
     """Minimal class that mixes in the mixin for testing."""
 
     pass
+
+
+@pytest.mark.parametrize(("prewarm_len", "computed"), [(37, 0), (37, 12), (9, 0)])
+def test_native_async_metadata_preserves_explicit_ar_prefill(prewarm_len: int, computed: int) -> None:
+    config = _make_model_config(async_chunk=True)
+    config.hf_config = PretrainedConfig(async_chunk_prewarm_prompt_len=prewarm_len)
+    host = MixinHost()
+    host.model_config = config
+    host.init_omni_connectors(config)
+    request = OmniRequest("speaker-prefill", [0] * prewarm_len, SamplingParams(max_tokens=1), pooling_params=None)
+    request.num_computed_tokens = computed
+    payload = {"meta": {"next_stage_prompt_len": 1, "duplex_perf_chunk": [0, 1], "finished": True}}
+    try:
+        update = host._extract_scheduling_metadata_update(payload)
+        assert update is not None
+        assert update == SchedulingMetadataUpdate(input_terminal=True, duplex_perf_chunk=(0, 1))
+        coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
+        coordinator.update_request_metadata({request.request_id: request}, {request.request_id: update})
+
+        assert request.prompt_token_ids == [0] * prewarm_len
+        assert request.num_prompt_tokens == prewarm_len
+        assert request.num_computed_tokens == computed
+        assert list(request._all_token_ids) == [0] * prewarm_len
+        assert request.request_id in coordinator.input_terminal_req_ids
+        assert payload["meta"]["next_stage_prompt_len"] == 1
+    finally:
+        host.shutdown_omni_connectors()
+
+
+@pytest.mark.parametrize(
+    ("async_chunk", "worker_type", "prewarm_len"),
+    [(True, "ar", None), (True, "ar", 1), (True, "generation", 37), (False, "ar", 37)],
+)
+def test_other_receivers_keep_payload_prompt_resize(
+    async_chunk: bool, worker_type: str, prewarm_len: int | None
+) -> None:
+    config = _make_model_config(async_chunk=async_chunk, worker_type=worker_type)
+    config.hf_config = PretrainedConfig(async_chunk_prewarm_prompt_len=prewarm_len)
+    host = MixinHost()
+    host.model_config = config
+    host.init_omni_connectors(config)
+    try:
+        assert host._extract_scheduling_metadata_update({"meta": {"next_stage_prompt_len": 1}}) == (
+            SchedulingMetadataUpdate(resize_prompt_to=1)
+        )
+    finally:
+        host.shutdown_omni_connectors()
 
 
 def test_stage_payload_recv_spec_preserves_external_id_edge_and_handle():

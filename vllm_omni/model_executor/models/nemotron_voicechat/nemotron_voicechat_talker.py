@@ -48,6 +48,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     require_request_id,
     scalar_bool,
 )
+from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import MoGStepGraph
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -115,8 +116,8 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
 
         # The vendored (eager / captured-step) paths share single-session
         # buffers (StaticCache, capture-time addresses) and stay batch=1; the
-        # NATIVE path keeps all per-request state in _sessions (paged KV,
-        # per-request MoG on each request's own hidden slice) and supports
+        # NATIVE path keeps per-request feedback in _sessions and batches
+        # MoG sampling over ready hidden rows. It supports
         # multi-session batching (validated at max_num_seqs<=4). The native
         # flag is read below, so peek at it here for the guard.
         max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
@@ -155,9 +156,9 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         self._native_guidance = self._use_native_backbone and bool(
             getattr(self.config, "native_talker_guidance", False)
         )
-        # Captured MoG sampling step (built lazily on the first decode frame;
-        # falls back to eager sampling if capture fails).
-        self._mog_graph: Any | None = None
+        # Fixed-shape MoG graphs are warmed at load time; failed captures retain eager sampling.
+        self._mog_max_batch_size = max_num_seqs
+        self._mog_graphs: dict[int, MoGStepGraph] = {}
         self._uncond_graph: Any | None = None
         self.backbone: nn.Module | None = None
         if self._use_native_backbone:
@@ -727,6 +728,20 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             )[0]
         return embeds.to(self._dtype)
 
+    def _sample_native_mog(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Sample already-ready requests with the existing fixed-shape MoG graphs."""
+        guidance_rows = 2 if self._native_guidance else 1
+        rows = hidden.shape[0] // guidance_rows
+        bucket = next(size for size in self._mog_graphs if size >= rows)
+        if bucket != rows:
+            padding = (0, 0, 0, 0, 0, bucket - rows)
+            if self._native_guidance:
+                cond, uncond = hidden.chunk(2, dim=0)
+                hidden = torch.cat([nn.functional.pad(cond, padding), nn.functional.pad(uncond, padding)], dim=0)
+            else:
+                hidden = nn.functional.pad(hidden, padding)
+        return self._mog_graphs[bucket].run(hidden)[:rows]
+
     def _native_make_omni_output(self, hidden: torch.Tensor, **kwargs: Any) -> OmniOutput:
         infos = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         spans = kwargs.get("request_token_spans")
@@ -752,6 +767,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             streaming_list[index] = torch.tensor([bool(session_state["codec_streaming"])], dtype=torch.bool)
             emitted = True
 
+        ready = []
         for i, info in enumerate(infos):
             if not isinstance(info, dict):
                 continue
@@ -774,44 +790,34 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                 if session.get("codes_rows"):
                     _emit(i, session)
                 continue
-            session["pending_step"] = None
             if spans is None:
                 raise RuntimeError("NemotronVoiceChat native talker needs request_token_spans from the runner.")
+            if self._native_guidance and session["uncond_hidden"] is None:
+                raise RuntimeError(
+                    "NemotronVoiceChat native talker CFG desynchronized: no unconditional "
+                    "hidden row for this frame (preprocess/make_omni_output mismatch)."
+                )
+            ready.append((i, info, session))
+
+        if ready:
+            cond_rows = [hidden[spans[i][1] - 1 : spans[i][1]].reshape(1, 1, -1) for i, _, _ in ready]
+            sample_hidden = cond_rows[0] if len(ready) == 1 else torch.cat(cond_rows, dim=0)
+            if self._native_guidance:
+                uncond_rows = [session["uncond_hidden"].reshape(1, 1, -1) for _, _, session in ready]
+                uncond_hidden = uncond_rows[0] if len(ready) == 1 else torch.cat(uncond_rows, dim=0)
+                # generate_step expects all conditional rows before all unconditional rows.
+                sample_hidden = torch.cat([sample_hidden, uncond_hidden], dim=0).to(self._dtype)
+            codes = self._sample_native_mog(sample_hidden)
+
+        for row, (i, info, session) in enumerate(ready):
+            pending = session["pending_step"]
+            session["pending_step"] = None
+            session["uncond_hidden"] = None
             start, end = spans[i]
-            model = self.tts.tts_model
-            if session["uncond_stream"] is not None:
-                # CFG: pair the conditional row with this frame's uncond row
-                # ([cond; uncond] order — generate_step chunks in that order)
-                # and let generate_step apply NeMo's hidden-space blends
-                # (lm_head EOS blend + the post-MLP blend inside MoGHead.infer).
-                uncond_hidden = session["uncond_hidden"]
-                if uncond_hidden is None:
-                    raise RuntimeError(
-                        "NemotronVoiceChat native talker CFG desynchronized: no unconditional "
-                        "hidden row for this frame (preprocess/make_omni_output mismatch)."
-                    )
-                session["uncond_hidden"] = None
-                pair = torch.cat(
-                    [hidden[end - 1 : end].reshape(1, 1, -1), uncond_hidden.reshape(1, 1, -1)],
-                    dim=0,
-                ).to(self._dtype)
-                if self._mog_graph is None:
-                    from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
-                        MoGStepGraph,
-                    )
-
-                    self._mog_graph = MoGStepGraph(model, session["generation_config"], batch=2)
-                codes = self._mog_graph.run(pair)
-            else:
-                if self._mog_graph is None:
-                    from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
-                        MoGStepGraph,
-                    )
-
-                    self._mog_graph = MoGStepGraph(model, session["generation_config"], batch=1)
-                codes = self._mog_graph.run(hidden[end - 1 : end].reshape(1, 1, -1))
-            session["code"] = codes
-            session["codes_rows"].append(codes.reshape(1, -1).to(torch.long))
+            # Own each row so a session history cannot retain another cohort's storage.
+            row_codes = codes if len(ready) == 1 else codes[row : row + 1].clone()
+            session["code"] = row_codes
+            session["codes_rows"].append(row_codes.reshape(1, -1).to(torch.long))
             session["step"] = int(pending) + 1
             # Duplex (codec_streaming) sessions stop per segment when the
             # received timeline is exhausted and resume with KV intact when
@@ -1132,15 +1138,17 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             # Capture the per-frame MoG sampling graph at load time; a lazy
             # first-frame capture would otherwise cost the first session a
             # few hundred ms of first-packet latency.
-            from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
-                MoGStepGraph,
-            )
-
-            mog_batch = 2 if self._native_guidance else 1
-            self._mog_graph = MoGStepGraph(
-                self.tts.tts_model,
-                self.tts._get_generation_config(self._native_guidance),
-                batch=mog_batch,
-            )
-            self._mog_graph.ensure_captured(torch.zeros(mog_batch, 1, self._hidden, dtype=self._dtype, device=device))
+            batch_sizes = [1 << power for power in range(self._mog_max_batch_size.bit_length())]
+            if batch_sizes[-1] != self._mog_max_batch_size:
+                batch_sizes.append(self._mog_max_batch_size)
+            self._mog_graphs.clear()
+            for rows in batch_sizes:
+                mog_batch = rows * (2 if self._native_guidance else 1)
+                graph = MoGStepGraph(
+                    self.tts.tts_model,
+                    self.tts._get_generation_config(self._native_guidance),
+                    batch=mog_batch,
+                )
+                graph.ensure_captured(torch.zeros(mog_batch, 1, self._hidden, dtype=self._dtype, device=device))
+                self._mog_graphs[rows] = graph
         return {name for name, _ in self.named_parameters()}
