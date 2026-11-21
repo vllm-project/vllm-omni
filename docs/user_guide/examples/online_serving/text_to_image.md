@@ -250,7 +250,7 @@ directly. For image dimensions and count, use `size` and `n` rather than
 | ------------------------ | ----- | ------- | ------------------------------ |
 | `height`                 | int   | None    | Image height in pixels         |
 | `width`                  | int   | None    | Image width in pixels          |
-| `size`                   | str   | None    | Image size (e.g., "1024x1024") |
+| `size`                   | str   | None    | Image size in WxH format (e.g., "1024x1024") or aspect-ratio format (e.g., "16:9", resolved to ~1 megapixel with 32-pixel alignment) |
 | `num_inference_steps`    | int   | 50      | Number of denoising steps      |
 | `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale           |
 | `seed`                   | int   | None    | Random seed (reproducible)     |

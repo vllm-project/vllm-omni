@@ -77,7 +77,9 @@ class ImageGenerationRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=10, description="Number of images to generate")
     size: str | None = Field(
         default=None,
-        description="Image dimensions in WIDTHxHEIGHT format (e.g., '1024x1024', uses model defaults if omitted)",
+        description="Image dimensions in WIDTHxHEIGHT format (e.g., '1024x1024') or aspect-ratio "
+        "format (e.g., '1:1', '16:9'); ratio sizes resolve to ~1 megapixel with 32-pixel alignment. "
+        "Uses model defaults if omitted.",
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.B64_JSON, description="Format of the returned image")
     user: str | None = Field(default=None, description="User identifier for tracking")
@@ -91,14 +93,16 @@ class ImageGenerationRequest(BaseModel):
     def validate_size(cls, v):
         """Validate size parameter.
 
-        Accepts any string in 'WIDTHxHEIGHT' format (e.g., '1024x1024', '512x768').
-        No restrictions on specific dimensions - models can handle arbitrary sizes.
+        Accepts any string in 'WIDTHxHEIGHT' format (e.g., '1024x1024',
+        '512x768') or aspect-ratio format (e.g., '1:1', '16:9'). No
+        restrictions on specific dimensions - models can handle arbitrary
+        sizes.
         """
         if v is None:
             return None
         # Validate string format
-        if not isinstance(v, str) or "x" not in v:
-            raise ValueError("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')")
+        if not isinstance(v, str) or ("x" not in v and ":" not in v):
+            raise ValueError("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024') or 'W:H' (e.g., '16:9')")
         return v
 
     @field_validator("response_format")

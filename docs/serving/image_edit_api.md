@@ -86,7 +86,7 @@ Content-Type: multipart/form-data
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `image` | string or array | **required** | The image(s) to edit. |
 | `n` | integer | 1 | Number of images to generate (1-10) |
-| `size` | string | "auto" | Image dimensions in WxH format (e.g., "1024x1024", "512x512"), when set to auto, it decide size from first input image. |
+| `size` | string | "auto" | Image dimensions in WxH format (e.g., "1024x1024", "512x512") or aspect-ratio format (e.g., "1:1", "16:9", resolved to ~1 megapixel with 32-pixel alignment, see [Size formats](image_generation_api.md#size-formats)), when set to auto, it decide size from first input image. |
 | `response_format` | string | "b64_json" | Response format (only "b64_json" supported) |
 | `user` | string | null | User identifier for tracking |
 | `output_format` | string | "png" | The format in which the generated images are returned. Must be one of "png", "jpg", "jpeg", "webp". |
@@ -216,7 +216,7 @@ edited image.
 The API passes parameters directly to the diffusion pipeline without model-specific transformation:
 
 - **Default values**: When parameters are not specified, the underlying model uses its own defaults
-- **Pass-through design**: User-provided values are forwarded directly to the diffusion engine
+- **Pass-through design**: Explicit `WIDTHxHEIGHT` values are forwarded directly to the diffusion engine; aspect-ratio `size` values are resolved to concrete dimensions in the API layer (see [Size Formats](image_generation_api.md#size-formats))
 - **Minimal validation**: Only basic type checking and range validation at the API level
 
 ### Parameter Compatibility
@@ -237,7 +237,7 @@ Invalid parameters (e.g., model mismatch):
 
 ```json
 {
-  "detail": "Invalid size format: '1024x'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024')."
+  "detail": "Invalid size format: '1024'. Expected format: 'WIDTHxHEIGHT' (e.g., '1024x1024') or aspect-ratio 'W:H' (e.g., '16:9'). Did you mean to use 'x' as separator?"
 }
 ```
 
