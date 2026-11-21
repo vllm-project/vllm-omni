@@ -32,7 +32,7 @@ from .diffusion import (
     VIBEVOICE_DEFAULT_GUIDANCE_SCALE,
     VIBEVOICE_DEFAULT_NUM_DIFFUSION_STEPS,
     VibeVoiceDiffusionHead,
-    create_dpm_scheduler,
+    VibeVoiceDPMSolverLoop,
 )
 from .negative_kv import VibeVoiceNegativeKV
 from .processing_vibevoice import (
@@ -127,6 +127,8 @@ class VibeVoiceModel(nn.Module):
         self.latent_scaling_factor = nn.Parameter(torch.tensor(1.0))
         self.latent_bias_factor = nn.Parameter(torch.tensor(0.0))
         self.samples_per_token = math.prod(config.audio_config.decoder_config.upsampling_ratios)
+        # Template solver state, keyed by (steps, device); see VibeVoiceDPMSolverLoop.
+        self._dpm_loops: dict[tuple[int, torch.device], VibeVoiceDPMSolverLoop] = {}
 
     def reference_embeddings(
         self,
@@ -177,15 +179,22 @@ class VibeVoiceModel(nn.Module):
             raise ValueError(f"VibeVoice noise must have shape (2B, latent), got {tuple(noise.shape)}.")
         condition = torch.cat([positive_condition, negative_condition], dim=0)
         latent = noise.to(condition)
-        scheduler = create_dpm_scheduler()
-        scheduler.set_timesteps(num_inference_steps=num_inference_steps)
-        for timestep in scheduler.timesteps:
+        loop = self._dpm_loops.get((num_inference_steps, condition.device))
+        if loop is None:
+            loop = self._dpm_loops[(num_inference_steps, condition.device)] = VibeVoiceDPMSolverLoop(
+                num_inference_steps, condition.device
+            )
+        loop.begin()
+        for step_index in range(len(loop.timesteps)):
+            # Device-resident timestep; the cast matches the previous
+            # host-side cast-then-upload exactly (same round-to-nearest value).
+            timestep = loop.timestep(step_index)
             shared = latent[:batch_size]
             combined = torch.cat([shared, shared], dim=0)
             prediction = self.diffusion_head(combined, timestep.repeat(2 * batch_size).to(combined), condition)
             cond, uncond = prediction[:batch_size], prediction[batch_size:]
             guided = uncond + guidance_scale * (cond - uncond)
-            latent = scheduler.step(torch.cat([guided, guided], dim=0), timestep, latent).prev_sample
+            latent = loop.step(torch.cat([guided, guided], dim=0), step_index, latent)
         return latent[:batch_size].unsqueeze(1)
 
     def decode_audio_tokens(
