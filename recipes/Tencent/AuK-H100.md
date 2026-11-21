@@ -118,7 +118,8 @@ Requests in the same Euler schedule and target bucket share a DiT/VAE pass;
 seeds, reference clips, target lengths, and output ordering remain
 request-local. `AuKPipeline` executes one wave at a time without cooperative
 mid-wave cancellation (`supports_request_cancellation` is False), so client
-aborts take effect at wave boundaries. Larger graph buckets cost startup time
+aborts take effect at wave boundaries (bounded by the active wave forward
+duration before aborted replies are dropped without affecting surviving peers). Larger graph buckets cost startup time
 and GPU memory; uncaptured shapes can still pay a capture cost on their first
 request.
 

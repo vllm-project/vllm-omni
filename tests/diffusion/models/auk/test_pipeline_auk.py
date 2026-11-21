@@ -489,7 +489,7 @@ class TestRequestParsing:
 
     def test_stereo_source_is_mixed_to_mono(self, build_pipeline):
         pipeline, _ = build_pipeline()
-        stereo = np.zeros((2, SAMPLE_RATE), dtype=np.float32)
+        stereo: Any = np.zeros((2, SAMPLE_RATE), dtype=np.float32)
 
         pipeline.forward(_batch(_prompt(audio=(stereo, SAMPLE_RATE), knobs={"gen_seconds": 1.0}), seed=1))
 
@@ -723,7 +723,7 @@ class TestRequestParsing:
     def test_reference_cache_is_bounded(self, build_pipeline):
         pipeline, _ = build_pipeline(model_config={"auk_ref_cache_size": 2})
         for level in (0.1, 0.2, 0.3):
-            clip = (np.full(SAMPLE_RATE, level, dtype=np.float32), SAMPLE_RATE)
+            clip: Any = (np.full(SAMPLE_RATE, level, dtype=np.float32), SAMPLE_RATE)
             pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
         assert len(pipeline._ref_cache) == 2
 
@@ -866,12 +866,14 @@ class TestRequestParsing:
         decode_calls = []
         original_decode = pipeline.vae_decode
 
-        def record_decode(latents):
-            decode_calls.append(latents.clone())
-            return original_decode(latents)
+        class _RecordDecode:
+            pad_for = staticmethod(original_decode.pad_for)
 
-        record_decode.pad_for = original_decode.pad_for
-        pipeline.vae_decode = record_decode
+            def __call__(self, latents: torch.Tensor) -> torch.Tensor:
+                decode_calls.append(latents.clone())
+                return original_decode(latents)
+
+        pipeline.vae_decode = _RecordDecode()
         req1 = _batch(
             _prompt(audio=_silence(0.5), knobs={"gen_seconds": 2.9}),
             seed=7,
@@ -966,6 +968,164 @@ class TestRequestParsing:
         pipeline.forward(DiffusionRequestBatch(distinct_reqs))
         assert len(calls) == 2
         assert [call["text"].shape[0] for call in calls] == [2, 1]
+
+    @pytest.mark.asyncio
+    async def test_mid_forward_abort_completes_survivor_and_skips_preaborted_capture(
+        self, build_pipeline, monkeypatch, mocker
+    ):
+        import asyncio
+        import queue
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+        from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
+        from vllm_omni.diffusion.sched import RequestScheduler
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+        pipeline, _calls = build_pipeline(model_config={"auk_dit_loop_graph": True})
+        loop = asyncio.get_running_loop()
+        od_config = OmniDiffusionConfig(
+            model=pipeline.od_config.model,
+            model_class_name="AuKPipeline",
+            max_num_seqs=4,
+            request_batch_max_wait_ms=0.0,
+            diffusion_attention_schedule=None,
+        )
+        scheduler = RequestScheduler()
+        scheduler.initialize(od_config)
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = od_config
+        engine.scheduler = scheduler
+        engine.step_execution = False
+        engine.supports_request_batch = True
+        engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
+        engine._request_cancellations = None
+        engine._supports_pre_tokenized_prompt_ids = False
+        engine._diffusion_kv_profile_limits = None
+        engine.pre_process_func = None
+        engine.post_process_func = None
+        engine._post_process_accepts_sampling_params = False
+        engine.prefix_cache_func = None
+        engine._request_chunk_states = {}
+        engine._streaming_playback = {}
+        engine.executor = SimpleNamespace(drop_output=Mock(), shutdown=Mock())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._out_streams = {}
+        engine._unclaimed_async_outputs = {}
+        engine._shutdown_output_futures = {}
+        engine._closed = False
+        engine._shutting_down = False
+        engine._shutdown_complete = False
+        engine.abort_queue = queue.Queue()
+        engine._rpc_queue = queue.Queue()
+        engine._scheduling_paused = True
+        engine.main_loop = loop
+        engine.stop_event = threading.Event()
+
+        in_forward = threading.Event()
+        release_forward = threading.Event()
+        original_sample = pipeline_auk.sample_latents
+
+        def blocking_sample(*args, **kwargs):
+            in_forward.set()
+            assert release_forward.wait(timeout=5.0)
+            return original_sample(*args, **kwargs)
+
+        monkeypatch.setattr(pipeline_auk, "sample_latents", blocking_sample)
+
+        forward_waves: list[list[str]] = []
+
+        def execute_batch(sched_output):
+            reqs = [nr.req for nr in sched_output.scheduled_new_reqs]
+            forward_waves.append([r.request_id for r in reqs])
+            outs = pipeline.forward(DiffusionRequestBatch(reqs))
+            return BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(request_id=req.request_id, step_index=None, finished=True, result=out)
+                    for req, out in zip(reqs, outs, strict=True)
+                ]
+            )
+
+        engine.execute_fn = execute_batch
+        engine._loop_started = True
+        engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
+        engine.worker_thread.start()
+        try:
+            req_keep = OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0}),
+                sampling_params=OmniDiffusionSamplingParams(seed=7, output_type="latent"),
+                request_id="req-keep",
+            )
+            req_abort = OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0}),
+                sampling_params=OmniDiffusionSamplingParams(seed=11, output_type="latent"),
+                request_id="req-abort",
+            )
+            stream_keep = engine.async_add_req_and_stream_response(req_keep)
+            stream_abort = engine.async_add_req_and_stream_response(req_abort)
+
+            with engine._cv:
+                engine._scheduling_paused = False
+                engine._cv.notify_all()
+
+            assert await asyncio.to_thread(in_forward.wait, 5.0)
+            engine.abort("req-abort")
+            release_forward.set()
+
+            out_keep = await anext(stream_keep)
+            out_abort = await anext(stream_abort)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream_keep)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream_abort)
+
+            assert forward_waves == [["req-keep", "req-abort"]]
+            assert not out_keep.aborted
+            expected_keep = torch.randn(1, 50, LATENT_DIM, generator=torch.Generator().manual_seed(7))
+            torch.testing.assert_close(out_keep.output, expected_keep, atol=0, rtol=0)
+
+            assert out_abort.aborted is True
+            assert out_abort.output is None
+            with pytest.raises(DiffusionRequestAbortedError):
+                engine.postprocess_output(req_abort, out_abort)
+
+            pipeline.cudagraph_wrapper.enabled = True
+            capture_spy = mocker.patch.object(pipeline.cudagraph_wrapper, "_capture_loop")
+            sample_spy = mocker.spy(pipeline.cudagraph_wrapper, "sample_loop")
+
+            with engine._cv:
+                engine._scheduling_paused = True
+
+            req_preaborted = OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0}),
+                sampling_params=OmniDiffusionSamplingParams(seed=13, output_type="latent"),
+                request_id="req-preaborted",
+            )
+            stream_preaborted = engine.async_add_req_and_stream_response(req_preaborted)
+            engine.abort("req-preaborted")
+
+            with engine._cv:
+                engine._scheduling_paused = False
+                engine._cv.notify_all()
+
+            out_pre = await anext(stream_preaborted)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream_preaborted)
+
+            assert out_pre.aborted is True
+            assert out_pre.output is None
+            with pytest.raises(DiffusionRequestAbortedError):
+                engine.postprocess_output(req_preaborted, out_pre)
+            assert len(forward_waves) == 1
+            sample_spy.assert_not_called()
+            capture_spy.assert_not_called()
+        finally:
+            release_forward.set()
+            engine.close()
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
