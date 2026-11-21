@@ -408,7 +408,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "910": {
+            "mean_duplex_busy_rtf": [
+              0.724857
+            ]
+          }
+        }
       }
     ],
     "judge_server_params": {

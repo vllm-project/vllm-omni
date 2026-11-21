@@ -104,6 +104,11 @@ See [build 20013](https://buildkite.com/vllm/vllm-omni/builds/20013),
 [build 20145](https://buildkite.com/vllm/vllm-omni/builds/20145) and
 [build 20463](https://buildkite.com/vllm/vllm-omni/builds/20463).
 
+For A3 DuplexEval, the two completed runs in [NPU build 12466](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/12466)
+measured response-level mean busy RTFs of 0.716089 and 0.733625 at merge commit `541da19a71`.
+Both evaluated all 120 `PR_correction` samples at concurrency 8. Their mean, 0.724857,
+is the reference under `910`, the runtime hardware label in both result files.
+
 The shared runner persists one `result_test_*.json` for each dataset case,
 including quality, performance, software/data revisions, qualification scope
 and validation errors, before asserting success. HTML/Excel readers consume
