@@ -35,3 +35,17 @@ def test_profiler_endpoint_forwards_selected_stages(path: str, engine_method: st
     assert response.status_code == 200
     assert response.json() == {"status": "SUCCESS"}
     getattr(engine_client, engine_method).assert_awaited_once_with(stages=[1])
+
+
+def test_start_profile_endpoint_rejects_invalid_prefix_with_400() -> None:
+    engine_client = SimpleNamespace(start_profile=AsyncMock(side_effect=ValueError("bad profile_prefix")))
+
+    app = FastAPI()
+    app.include_router(api_server.profiler_router)
+    app.state.engine_client = engine_client
+
+    response = TestClient(app).post("/start_profile", json={"profile_prefix": "../outside"})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "bad profile_prefix"}
+    engine_client.start_profile.assert_awaited_once_with(stages=None, profile_prefix="../outside")
