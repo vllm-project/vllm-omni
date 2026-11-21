@@ -1,11 +1,13 @@
 # SPARGE Attention
 
-`SPARGE_ATTN` is an Intel XPU diffusion attention backend based on the
-training-free sparse attention algorithm from
-[SpargeAttn](https://github.com/thu-ml/SpargeAttn). The backend calls ARK's
-`sparge_sage2_attn_meansim_topk_xpu` operator from
-[auto-round](https://github.com/intel/auto-round), rather than the upstream CUDA
-extension.
+`SPARGE_ATTN` is a diffusion attention backend based on the training-free
+sparse attention algorithm from
+[SpargeAttn](https://github.com/thu-ml/SpargeAttn). It runs on two platforms:
+
+- **Intel XPU** calls ARK's `sparge_sage2_attn_meansim_topk_xpu` operator from
+  [auto-round](https://github.com/intel/auto-round).
+- **NVIDIA CUDA (SM80/86/87/89/90)** calls upstream
+  `spas_sage2_attn_meansim_topk_cuda` from the SpargeAttn CUDA extension.
 
 The original algorithm was introduced in
 [SpargeAttention: Accurate Sparse Attention Accelerating Any Model Inference](https://arxiv.org/abs/2502.18137)
@@ -56,26 +58,105 @@ but it does not expose every upstream tuning option:
   blocks. This backend exposes its own routing geometry through
   `q_block_tokens` and `k_block_tokens`; defaults are shown below.
 
+### CUDA implementation mapping
+
+The CUDA path calls
+`spas_sage2_attn_meansim_topk_cuda(q, k, v, is_causal=False, scale=..., smooth_k=True, topk=...)`
+with `tensor_layout="NHD"` and maps the upstream design as follows:
+
+- Routing tiling comes from SpargeAttn's architecture-specific build:
+  `BLKQ=64, BLKK=128` on SM90 and `BLKQ=128, BLKK=64` on SM80/86/87/89. The
+  `q_block_tokens`, `k_block_tokens`, and `q_tile_override` knobs are XPU-only
+  and ignored on CUDA.
+- The kernel requires at least 128 query rows. Shorter calls (for example a
+  text-only token refiner on a very short prompt) run through
+  `torch.nn.functional.scaled_dot_product_attention` on the exact rows instead
+  of being zero-padded: pad rows would join the first meansim query tile and
+  change which KV blocks the real rows select.
+- Packed `[real, pad]` callers must publish `AttentionMetadata.packed_padding`.
+  Raw `cu_seqlens_q`/`cu_seqlens_k`/`max_seqlen_*` without it are rejected,
+  because those describe a multi-document packing whose real rows are not a
+  prefix. Pad rows are sliced off before the kernel and restored as zeros
+  afterwards.
+- Causal attention is rejected on CUDA. SpargeAttn uses `is_causal` for block
+  selection but the kernel does not mask future tokens inside a selected block,
+  so a causal request would silently attend forward.
+- Only equal Q/KV head counts (MHA) are supported on CUDA.
+
+The SM90 kernel can deadlock when the sparse-PV filter skips a block; see
+[thu-ml/SpargeAttn#127](https://github.com/thu-ml/SpargeAttn/issues/127) and the
+build instructions below.
+
 This is an approximate attention backend. Validate image or video quality
 against `TORCH_SDPA` at the same seed and step count before using it in
 production.
 
 ## Requirements
 
-- Intel XPU with a working PyTorch XPU build and Triton XPU runtime.
-- `auto-round-lib` installed in the same environment as vLLM-Omni.
-- FP16 or BF16 Q/K/V with `head_dim` 64 or 128.
-- Query heads equal to KV heads, or a positive multiple of KV heads (MHA/GQA).
-- No attention mask, packed variable-length input, paged KV cache, dropout, or
-  ring sequence parallelism. Ulysses SP is not yet advertised for
-  guaranteed-fullgraph execution.
+Common to both platforms:
 
-Install the kernel package:
+- FP16 or BF16 Q/K/V with `head_dim` 64 or 128.
+- No attention mask, paged KV cache, dropout, or ring sequence parallelism.
+  Ulysses SP is not yet advertised for guaranteed-fullgraph execution.
+
+Intel XPU:
+
+- A working PyTorch XPU build and Triton XPU runtime.
+- `auto-round-lib` installed in the same environment as vLLM-Omni.
+- Query heads equal to KV heads, or a positive multiple of KV heads (MHA/GQA).
+- Packed variable-length input is not supported.
+
+NVIDIA CUDA:
+
+- An NVIDIA GPU with compute capability 8.0, 8.6, 8.7, 8.9 or 9.0, and a
+  SpargeAttn build that includes the matching native kernel. Hopper needs the
+  SM90 sparse entry point (checked at backend selection).
+- Query heads equal to KV heads (MHA); GQA is not supported by the CUDA kernel.
+- Packed calls must publish `AttentionMetadata.packed_padding` (see above).
+- Causal attention is rejected (see above).
+
+Install the XPU kernel package:
 
 ```bash
 pip install auto-round-lib
 python -c "import auto_round_kernel as ark; print(ark.sparge_sage2_attn_meansim_topk_xpu)"
 ```
+
+Build the CUDA extension from source. It must be compiled against the same CUDA
+major version as the PyTorch wheel, with the target architecture in
+`TORCH_CUDA_ARCH_LIST`:
+
+```bash
+git clone https://github.com/thu-ml/SpargeAttn
+cd SpargeAttn
+
+# Until thu-ml/SpargeAttn#127 lands upstream, add a CTA-wide barrier before the
+# V load in csrc/qattn/qk_int_sv_f8_cuda_sm90.cuh, otherwise the SM90 kernel can
+# hang on H100/H200:
+#     // load V
+#     __syncthreads();
+#     if (threadIdx.x == 0)
+#     ...
+
+# Same CUDA major version as the torch wheel; 12.8+ enables the Sage2++ path.
+export CUDA_HOME=/path/to/cuda
+export TORCH_CUDA_ARCH_LIST=9.0                # 8.0, 8.6, 8.7, 8.9 or 9.0
+MAX_JOBS=16 pip install --no-build-isolation .
+```
+
+On GCC 13 with CUDA 13, dropping `-Xcompiler -include,cassert` from
+`setup.py` avoids `std::__terminate` redefinition errors.
+
+Verify the build exposes the SM90 entry point on Hopper:
+
+```bash
+python -c "from spas_sage_attn import _qattn; \
+print(_qattn.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90)"
+```
+
+vLLM-Omni checks this entry point during backend selection on SM90, so an
+importable but SM80/89-only build fails with a rebuild hint instead of failing
+at the first sparse call.
 
 Select it globally:
 
@@ -90,9 +171,9 @@ SPARGE options live in the typed `sparge` block:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `topk` | `0.5` | Fraction of logical K blocks retained per query block; must be in `(0, 1]`. The measured selected ratio can differ slightly because of routing geometry and boundary blocks. |
-| `q_block_tokens` | `256` for `head_dim=128`, `64` for `head_dim=64` | Query-row granularity used for sparse routing. |
-| `k_block_tokens` | `64` | K-block granularity; the current kernel requires `64`. |
-| `q_tile_override` | Derived from `q_block_tokens`; see below | Query prefill tile size. |
+| `q_block_tokens` | `256` for `head_dim=128`, `64` for `head_dim=64` | Query-row granularity used for sparse routing (XPU only; ignored on CUDA). |
+| `k_block_tokens` | `64` | K-block granularity (XPU only; ignored on CUDA). |
+| `q_tile_override` | Derived from `q_block_tokens`; see below | Query prefill tile size (XPU only; ignored on CUDA). |
 
 Lower `topk` values increase sparsity and speed but reduce the number of key
 blocks available to softmax. Start from the default and compare several values
