@@ -195,6 +195,9 @@
           "duplex_busy_rtf",
           "duplex_stall_ratio"
         ],
+        "duplex_eval_min_pr_mean_all_success": {
+          "H100": 0.70
+        },
         "baseline": {
           "H100": {
             "mean_duplex_busy_rtf": [
@@ -409,6 +412,9 @@
           "duplex_busy_rtf",
           "duplex_stall_ratio"
         ],
+        "duplex_eval_min_pr_mean_all_success": {
+          "910": 0.70
+        },
         "baseline": {
           "910": {
             "mean_duplex_busy_rtf": [

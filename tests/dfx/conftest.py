@@ -932,6 +932,7 @@ def run_benchmark(
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
     accuracy_baseline: dict[str, Any] | None = None,
+    check_duplex_eval_exit_code: bool = True,
     result_transform: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
@@ -1102,7 +1103,7 @@ def run_benchmark(
             accuracy=accuracy,
         )
         print(f"Accuracy result saved to {accuracy_path}")
-        if accuracy_baseline is not None:
+        if check_duplex_eval_exit_code and accuracy_baseline is not None:
             from vllm_omni.platforms import current_omni_platform
 
             # Keep the accuracy-config CLI policy, including the NPU shutdown

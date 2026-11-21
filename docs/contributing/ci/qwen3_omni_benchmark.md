@@ -111,8 +111,11 @@ is the reference under `910`, the runtime hardware label in both result files.
 
 The judge scored 89/120 (74.17%) on each run, with zero skipped or failed
 evaluations. The accuracy artifacts report aggregate scores for this split.
-Nightly checks scoring coverage and score validity. Its numerical performance
-check uses mean busy RTF. The other measurements below are recorded for comparison.
+The three H100 runs above each scored 90/120. For both H100 and A3, nightly
+requires `pr.mean_all_success >= 0.70` (at least 84/120). This allows five
+fewer successes on A3 and six on H100 relative to the calibration runs.
+The accuracy artifact records the selected floor in `baseline.min_pr_mean_all_success`.
+The numerical performance check uses mean busy RTF. The other measurements below are recorded for comparison.
 
 | A3 DuplexEval metric | [First run](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/12466#01a1fa05-f45f-45e7-8c50-511a9e51735d) | [Second run](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/12466#01a1fb8d-e346-4894-a80d-66c93b09168d) | Relative change |
 | --- | ---: | ---: | ---: |

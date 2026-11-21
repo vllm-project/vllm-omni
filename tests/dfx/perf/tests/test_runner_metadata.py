@@ -2060,6 +2060,24 @@ def test_qwen3_correction_run_rejects_boolean_coverage_count(field):
         assert_result(result, params, count)
 
 
+@pytest.mark.parametrize(("case_index", "hardware"), [(0, "H100"), (1, "910"), (0, "B200")])
+def test_qwen3_correction_score_floor(case_index, hardware):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    configs = json.loads(Path(__file__).with_name("test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())
+    result, _, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    result["Hardware"] = hardware
+    params = configs[case_index]["benchmark_params"][0]
+    accuracy["pr"]["mean_all_success"] = 84 / count
+    assert_result(result, params, count)
+    accuracy["pr"]["mean_all_success"] = 83 / count
+    if hardware == "B200":
+        assert_result(result, params, count)
+    else:
+        with pytest.raises(AssertionError, match="PR correction mean_all_success"):
+            assert_result(result, params, count)
+
+
 @pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, -0.1, 1.1])
 def test_qwen3_correction_run_requires_valid_accuracy_score(value):
     from tests.dfx.perf.scripts.run_benchmark import assert_result

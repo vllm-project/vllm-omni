@@ -680,6 +680,15 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     return accuracy_path
 
 
+def _pr_correction_accuracy_baseline(params: dict, hardware: str | None) -> dict | None:
+    floor = params.get("duplex_eval_min_pr_mean_all_success", {}).get(hardware)
+    if floor is None:
+        return None
+    if not _is_finite_number(floor) or not 0 < floor <= 1:
+        raise ValueError(f"Invalid PR correction score floor for {hardware}: {floor!r}")
+    return {"min_pr_mean_all_success": floor}
+
+
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
     summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
@@ -738,6 +747,9 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             )
             score = scores.get("mean_all_success")
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
+            if baseline := _pr_correction_accuracy_baseline(params, result.get("Hardware")):
+                minimum = baseline["min_pr_mean_all_success"]
+                assert score >= minimum, f"PR correction mean_all_success {score} is below {minimum}"
 
 
 def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
@@ -893,6 +905,8 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         accuracy_baseline = select_duplex_eval_baseline(
             accuracy_config, resource_label, required=params.get("duplex_eval_require_score_floors", False)
         )
+    elif params.get("duplex_eval_split") == "PR_correction" and params.get("duplex_eval_evaluate"):
+        accuracy_baseline = _pr_correction_accuracy_baseline(params, resource_label)
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
@@ -959,6 +973,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         "duplex_eval_accuracy_config",
         "duplex_eval_require_score_floors",
         "duplex_eval_score_floor_hardware",
+        "duplex_eval_min_pr_mean_all_success",
         "duplex_performance_only",
         "required_duplex_metrics",
         "require_speculative_stage",
@@ -1019,6 +1034,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 num_warmups=_resolve_num_warmups(params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)),
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
+                check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
                 result_transform=result_transform,
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
@@ -1062,6 +1078,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 ),
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
+                check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
                 result_transform=result_transform,
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
