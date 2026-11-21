@@ -1484,10 +1484,10 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "artifact_path": "artifacts/rocm-wan22-reliability/**/*",
             "artifact_env": "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "expected_nodes": 13,
-            "expected_skipped": 1,
+            "expected_skipped": 0,
             "timeout": "220m",
             "collection_message": "Expected exactly 13 Wan2.2 reliability nodes",
-            "junit_message": "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
+            "junit_message": "Expected exactly 13 executed Wan2.2 reliability tests with no skips",
         },
         "Reliability Test · minicpmo-4.5": {
             "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
@@ -1501,11 +1501,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
-            "expected_nodes": 30,
+            "expected_nodes": 37,
             "expected_skipped": 5,
             "timeout": "75m",
-            "collection_message": "Expected exactly 30 single-GPU invalid-parameter nodes",
-            "junit_message": "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
+            "collection_message": "Expected exactly 37 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 37 single-GPU invalid-parameter tests with 5 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
@@ -1597,8 +1597,16 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "wan22-reliability-guard",
             13,
-            1,
-            "Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip",
+            0,
+            "Expected exactly 13 executed Wan2.2 reliability tests with no skips",
+        ),
+        (
+            "Reliability Test · hunyuan-image",
+            "ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR",
+            "hunyuan-reliability-guard",
+            13,
+            0,
+            "Expected exactly 13 executed HunyuanImage reliability tests with no skips",
         ),
         (
             "Reliability Test · minicpmo-4.5",
@@ -1612,9 +1620,9 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
             "invalid-parameters-single-reliability-guard",
-            30,
+            37,
             5,
-            "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
+            "Expected exactly 37 single-GPU invalid-parameter tests with 5 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
@@ -1633,7 +1641,15 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         ),
     ),
-    ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
+    ids=(
+        "qwen3-omni",
+        "wan22",
+        "hunyuan-image",
+        "minicpmo",
+        "invalid-parameters-single",
+        "invalid-parameters-2gpu",
+        "audio",
+    ),
 )
 def test_weekly_reliability_executes_junit_guard_before_exit(
     tmp_path: Path,
@@ -1733,8 +1749,8 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert reliability_step["artifact_paths"] == ["artifacts/rocm-hunyuan-image-reliability/**/*"]
     assert reliability_command.count("--shard-id=0 --num-shards=1") == 2
     assert "Expected exactly 13 HunyuanImage reliability nodes" in reliability_command
-    assert "Expected exactly 13 executed HunyuanImage reliability tests" in reliability_command
-    assert "skipped != 1" in reliability_command
+    assert "Expected exactly 13 executed HunyuanImage reliability tests with no skips" in reliability_command
+    assert "skipped != 0" in reliability_command
     assert "vllm_omni/deploy/hunyuan_image3_dit_rocm_reliability.yaml" not in dependencies
     assert "tests/dfx/reliability/test_hunyuan_image_ep_startup.py" in dependencies
     assert "env" not in step

@@ -1031,6 +1031,10 @@ def test_gepard_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch)
         assert len(matching_steps) == 1
         assert matching_steps[0]["source_file_dependencies"] == dependency
 
+    command = "\n".join(matching_steps[0]["commands"])
+    assert '"protobuf>=6.33.6,<7"' in command
+    assert "--overrides /tmp/gepard-overrides.txt" in command
+
     group = next(step for step in doc["steps"] if "Gepard Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
 

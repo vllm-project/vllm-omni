@@ -135,6 +135,14 @@ def _assert_valid_inference(client, server, module):
         if model_id == "stabilityai/stable-audio-open-1.0":
             body.update(input="Rain falling on a roof", audio_length=1.0, num_inference_steps=2)
             response = client.send_audio_generate_http_request({"json": body, "timeout": 180})[0]
+        elif model_id == "MiniMaxAI/MiniMax-Music3":
+            body.update(
+                input=module._MINIMAX_MUSIC3_LYRICS,
+                instructions=module._MINIMAX_MUSIC3_CAPTION,
+                seed=1,
+                max_new_tokens=25,
+            )
+            response = client.send_audio_speech_http_request({"json": body, "timeout": 180})[0]
         else:
             assert model_id == "Qwen/Qwen3-TTS-12Hz-0.6B-Base", f"Unexpected speech deployment: {model}"
             body.update(ref_audio=module.REF_AUDIO_URL, ref_text=module.REF_TEXT, voice="clone", language="English")
