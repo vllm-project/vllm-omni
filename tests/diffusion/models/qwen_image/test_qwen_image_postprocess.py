@@ -48,3 +48,37 @@ def test_qwen_image_postprocess_preserves_output_envelope(
         "payload": {"image": processed},
         "metadata": {"prompt_embeddings": {"present": True}},
     }
+
+
+def test_qwen_image_postprocess_temporal_downsample_scale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """The temporal_downsample key must drive the scale factor (2 ** 2 = 4,
+    doubled to 8 by the factory), not the missing-key default (8 -> 16)."""
+    model_path = tmp_path / "model"
+    vae_path = model_path / "vae"
+    vae_path.mkdir(parents=True)
+    (vae_path / "config.json").write_text(json.dumps({"temporal_downsample": [True, True]}), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    class FakeImageProcessor:
+        def __init__(self, *, vae_scale_factor: int) -> None:
+            captured["vae_scale_factor"] = vae_scale_factor
+
+        def postprocess(self, images: torch.Tensor) -> object:
+            return images
+
+    monkeypatch.setattr(qwen_image, "VaeImageProcessor", FakeImageProcessor)
+    postprocess = qwen_image.get_qwen_image_post_process_func(SimpleNamespace(model=str(model_path)))
+
+    image = torch.zeros(1, 3, 4, 4)
+    postprocess(
+        {
+            "payload": {"image": image},
+            "metadata": {"prompt_embeddings": {"present": True}},
+        }
+    )
+
+    assert captured["vae_scale_factor"] == 8
