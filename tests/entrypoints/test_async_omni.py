@@ -557,6 +557,66 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("priority", [None, 0, -7, 7], ids=["default", "zero", "negative", "positive"])
+@pytest.mark.parametrize("input_kind", ["ordinary", "stream", "empty_stream"])
+def test_generate_forwards_priority(mocker, input_kind, priority):
+    """Preserve request priority on every stage-0 ADD path."""
+
+    async def run():
+        add_request = mocker.AsyncMock()
+        omni = get_async_omni_instance(fake_add_request=add_request)
+        omni.engine.add_streaming_update_async = mocker.AsyncMock()
+        omni.engine.model_config = object()
+        mocker.patch(
+            "vllm_omni.entrypoints.async_omni.extract_prompt_components",
+            return_value=(None, None, None),
+        )
+
+        async def input_stream():
+            if input_kind == "stream":
+                yield StreamingInput(prompt={"prompt_token_ids": [1, 2]})
+                yield StreamingInput(prompt={"prompt_token_ids": [3, 4]})
+
+        async def process_results(request_id, *args):
+            state = omni.request_states[request_id]
+            if state.input_stream_task is not None:
+                await state.input_stream_task
+            assert state.queue.empty(), "unexpected streaming input failure"
+            async for output in fake_process_results(request_id, *args):
+                yield output
+
+        omni._process_orchestrator_results = process_results
+        prompt = {"prompt_token_ids": [1, 2]} if input_kind == "ordinary" else input_stream()
+        priority_kwargs = {} if priority is None else {"priority": priority}
+        outputs = [
+            output
+            async for output in omni.generate(
+                prompt=prompt,
+                request_id="priority-test",
+                sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.DELTA)],
+                output_modalities=["text"],
+                **priority_kwargs,
+            )
+        ]
+
+        assert len(outputs) == 1
+        add_request.assert_awaited_once()
+        submitted = add_request.await_args.kwargs
+        if input_kind == "stream":
+            assert submitted["resumable"] is True
+            assert submitted["prompt"] == {"prompt_token_ids": [1, 2]}
+            assert omni.engine.add_streaming_update_async.await_count == 2
+        elif input_kind == "empty_stream":
+            assert submitted["resumable"] is False
+            assert submitted["prompt"] == {"prompt_token_ids": [0]}
+            omni.engine.add_streaming_update_async.assert_not_awaited()
+        assert omni.request_states == {}
+        assert submitted.get("priority", 0) == (0 if priority is None else priority)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5.0))
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("has_chunk", [False, True])
 @pytest.mark.parametrize("input_fails", [False, True])
 def test_streaming_input_terminal_submit_failure_reaches_generate(mocker, has_chunk, input_fails):
