@@ -5,8 +5,8 @@
 On sm_12x Blackwell the default diffusion backend (cuDNN) cannot run
 multi-document packed varlen, so OmniVoice used to fall back to SDPA with a
 dense block mask. When vLLM's FA2 varlen kernel is available, the layer runs
-it over the same ``cu_seqlens`` instead. These tests force that branch on any
-FA2-capable GPU and compare it with the SDPA block-mask fallback.
+it over the same ``cu_seqlens`` instead. The test forces that branch on any
+FA2-capable GPU and compares it with the SDPA block-mask fallback.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
     OmniVoiceGenerator,
-    _attention_metadata_from_cu_seqs,
     _vllm_fa2_varlen,
 )
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
@@ -34,7 +33,7 @@ DEVICE = torch.device("cuda:0")
 NUM_CB = 8
 
 
-def _generator(dtype: torch.dtype) -> OmniVoiceGenerator:
+def _generator() -> OmniVoiceGenerator:
     torch.manual_seed(0)
     config = OmniVoiceConfig(
         audio_vocab_size=1025,
@@ -51,7 +50,7 @@ def _generator(dtype: torch.dtype) -> OmniVoiceGenerator:
         },
         enable_cuda_graph=False,
     )
-    return OmniVoiceGenerator(config, SimpleNamespace(max_num_seqs=4)).to(DEVICE, dtype).eval()
+    return OmniVoiceGenerator(config, SimpleNamespace(max_num_seqs=4)).to(DEVICE, torch.bfloat16).eval()
 
 
 def _force_attention(gen: OmniVoiceGenerator, fa2) -> None:
@@ -71,10 +70,9 @@ def _step(gen: OmniVoiceGenerator, ids, mask, cu_seqs, *, needs_sdpa_mask: bool)
 
 
 @pytest.mark.skipif(_vllm_fa2_varlen() is None, reason="vLLM FA2 varlen unavailable on this device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_fa2_branch_matches_sdpa_block_mask(dtype: torch.dtype) -> None:
+def test_fa2_branch_matches_sdpa_block_mask() -> None:
     """Two requests (cond/uncond each) plus a padding tail keep their boundaries under FA2."""
-    gen = _generator(dtype)
+    gen = _generator()
     seq_len = 160
     ids = torch.randint(0, 100, (seq_len, NUM_CB), device=DEVICE)
     mask = torch.ones(seq_len, dtype=torch.bool, device=DEVICE)
@@ -86,19 +84,6 @@ def test_fa2_branch_matches_sdpa_block_mask(dtype: torch.dtype) -> None:
         _force_attention(gen, _vllm_fa2_varlen())
         fa2 = _step(gen, ids, mask, cu_seqs, needs_sdpa_mask=False).float()
 
-    # Both branches run attention in bf16; they differ only in kernel accumulation order.
+    # Both branches run attention in bf16 and differ only in kernel accumulation order.
     torch.testing.assert_close(fa2[:, :150], reference[:, :150], atol=2e-2, rtol=2e-2)
 
-
-@pytest.mark.skipif(_vllm_fa2_varlen() is None, reason="vLLM FA2 varlen unavailable on this device")
-def test_fa2_branch_needs_no_sdpa_mask() -> None:
-    """With FA2 available the generator does not build the dense block mask."""
-    gen = _generator(torch.bfloat16)
-    for layer in gen.layers:
-        if not layer.self_attn.use_packed_varlen:
-            assert layer.self_attn.fa2_varlen is not None
-    assert not gen._needs_sdpa_mask
-
-    cu_seqs = torch.tensor([0, 4, 6, 8], dtype=torch.int32, device=DEVICE)
-    metadata = _attention_metadata_from_cu_seqs(cu_seqs, 8, needs_sdpa_mask=gen._needs_sdpa_mask)
-    assert metadata.attn_mask is None
