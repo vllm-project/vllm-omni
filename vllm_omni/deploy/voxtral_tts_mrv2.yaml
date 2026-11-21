@@ -1,0 +1,14 @@
+# Explicit CUDA Model Runner V2 profile, following the Qwen3 TTS MRV2 overlay.
+# V1 remains selected on platforms without CUDA MRV2 support.
+base_config: voxtral_tts.yaml
+model_runner: v2
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

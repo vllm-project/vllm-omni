@@ -2,8 +2,8 @@
 
 A model-agnostic serving benchmark for TTS models in vllm-omni. One CLI
 (`bench_tts.py`) + one YAML registry (`model_configs.yaml`) drive perf and
-quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice / VoiceDesign)
-and **VoxCPM2** today, more to come.
+quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice / VoiceDesign),
+**VoxCPM2**, and **Voxtral TTS** (preset voice).
 
 The same three task types — `voice_clone`, `default_voice`, `voice_design` —
 are wired into both the manual CLI and the DFX nightly CI matrix
