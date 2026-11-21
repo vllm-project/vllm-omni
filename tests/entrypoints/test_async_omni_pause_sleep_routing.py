@@ -32,6 +32,8 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
     omni._final_output_handler = lambda: None
+    omni._check_frontend_admission = lambda: None
+    omni._frontend_shutting_down = False
     omni._clear_frontend_mm_cache = AsyncMock()
 
     stage_configs = [SimpleNamespace(stage_type=stage_type) for stage_type in stage_types]
