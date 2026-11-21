@@ -326,6 +326,9 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     @staticmethod
     def _is_blackwell_gpu() -> bool:
         """Return True on Blackwell-class CUDA GPUs (sm_10x / sm_11x / sm_12x)."""
+        # ROCm gfx11xx/gfx12xx also report major 11/12.
+        if not current_omni_platform.is_cuda():
+            return False
         capability = None
         try:
             capability = current_omni_platform.get_device_capability()
@@ -372,7 +375,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 attention_backend_attempts.extend(CUDA_FLASH_ATTN_HUB_ATTEMPTS)
             case "FLASH_ATTN" | None:
                 if current_omni_platform.is_rocm():
-                    attention_backend_attempts.append("aiter")
+                    attention_backend_attempts.append("aiter_fa2_hub")
                 elif current_omni_platform.is_xpu():
                     attention_backend_attempts.append("_native_xla")
                 elif current_omni_platform.is_musa():
