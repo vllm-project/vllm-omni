@@ -1060,6 +1060,20 @@ def test_duplex_eval_result_rejects_missing_measurements(field, metric):
         assert_result(result, {"dataset_name": "omni-duplex-eval"}, 1)
 
 
+def test_minicpmo_duplex_eval_skips_per_session_client_latency():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, _, count, _ = _qwen3_joint_result("omni_duplex_eval")
+    params = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0][
+        "benchmark_params"
+    ][0]
+    result["test_name"] = "test_minicpmo_4_5_omni_duplex_eval"
+    for session in result["duplex_session_metrics"]:
+        session["client_ttft_ms"] = {"count": 0, "mean": 0.0}
+        session["client_ttfp_ms"] = {"count": 0, "mean": 0.0}
+    assert_result(result, params, count)
+
+
 @pytest.mark.parametrize("prefix", ["omniinteract", "duplex_eval"])
 @pytest.mark.parametrize("judge_url", [None, "http://127.0.0.1:8001"])
 def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url, pytestconfig):

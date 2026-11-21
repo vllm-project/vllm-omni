@@ -5,7 +5,10 @@ generates responses once, then evaluates those same responses. Performance
 timing ends before judging. Pass conditions match Qwen3-Omni: complete
 generation and judging, with a finite correction success rate and **no numeric
 score floor**. The DFX runner writes the performance artifact; MiniCPM no longer
-opts into `duplex_eval_accuracy_config`.
+opts into `duplex_eval_accuracy_config`. MiniCPM-o also skips the per-session
+`client_ttft_ms` / `client_ttfp_ms` gates (native duplex may finish audio
+without a non-empty transcript); run-level `required_duplex_metrics` still
+require some samples for the batch.
 
 The shared `omni_duplex_eval_ci_config.json` still describes the earlier **66
 soundtrack IDs** (30 RTD + 36 PR) and their calibrated floors. Callers that set
