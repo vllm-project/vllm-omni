@@ -204,6 +204,7 @@ from .regenerate import (
     resolve_regenerate_adapter,
 )
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
+from .single_file import MINIMAX_H3_BASE_MODEL, MINIMAX_H3_BASE_REVISION, MiniMaxH3SingleFileSpec
 from .time_request import (
     MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS,
     MINIMAX_H3_SHAPE_PLANNER,
@@ -1034,12 +1035,6 @@ class MiniMaxH3Pipeline(
         component_revision = od_config.revision
         checkpoint_path = None
         if single_file:
-            from .single_file import (
-                MINIMAX_H3_BASE_MODEL,
-                MINIMAX_H3_BASE_REVISION,
-                MiniMaxH3SingleFileSpec,
-            )
-
             # Keep the snapshot filename: Hub cache files are symlinks to blobs.
             checkpoint_path = Path(str(od_config.model)).absolute()
             spec = MiniMaxH3SingleFileSpec.from_file(checkpoint_path)
