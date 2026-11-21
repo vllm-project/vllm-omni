@@ -16,17 +16,21 @@ Both endpoints derive the same head/block order and payload length. Each
 sender packs those blocks into contiguous K/V packets and the receiver
 places them in the layout used by sparse attention. The `manifest` planner
 compacts indices in one GPU pass and reads back only the packet lengths.
-Planning overlaps with local Q/K quantization and V layout preparation.
+After sparse selection is ready, the local attention pass can also run
+while demand exchange and compact layout preparation are in flight.
 NCCL packet lengths are copied into pinned host memory on the planning
-stream. The first two hops can use separate slots, and a later hop
+stream. Initial packets can pack directly from the GPU plan while the host
+reads lengths for NCCL. The first two hops can use separate slots, and a later hop
 reuses its slot once placement has consumed the previous packet.
 The union over local queries determines traffic savings.
 
 With four Ring ranks, `selective_pair_relay` groups ranks 0–1 and 2–3.
 Place each pair on the same CPU socket and use the manifest planner.
 One packet crosses sockets per producer and includes the union of both
-remote consumers' demands. The ingress rank forwards the second
-consumer's contiguous prefix to its same-socket peer. The independent
+remote consumers' demands. Each socket chooses between the two cross-socket
+rank matchings using the manifest to minimize the number of blocks that
+need forwarding. The ingress rank forwards the second consumer's
+contiguous prefix to its same-socket peer. The independent
 within-pair and cross-pair exchanges share a single NCCL batch. Forwarding
 can run while attention consumes the first two received packets.
 

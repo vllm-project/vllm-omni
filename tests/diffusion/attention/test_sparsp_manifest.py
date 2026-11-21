@@ -33,14 +33,21 @@ def check_pair_relay_layout(device):
     heads, blocks = 7, 13
     manifests = [PairRelayManifest(rank, heads, blocks, device) for rank in range(4)]
     indices = torch.arange(16 * heads * blocks, device=device).reshape(4, 4, heads, blocks)
-    for demand in (indices % 11 < 7, indices % 11 < 3, indices < 0, indices >= 0):
+    asymmetric = torch.zeros_like(indices, dtype=torch.bool)
+    asymmetric[3, 0] = True
+    asymmetric[2, 1] = True
+    asymmetric[3, 2] = True
+    for demand in (indices % 11 < 7, indices % 11 < 3, asymmetric, indices < 0, indices >= 0):
         for manifest in manifests:
             manifest.wants.copy_(demand)
             manifest.compact()
         torch.cuda.current_stream(device).synchronize()
         plans = [manifest.plan() for manifest in manifests]
         for rank, plan in enumerate(plans):
-            within, across, forwarded = rank ^ 1, rank ^ 2, rank ^ 3
+            within, across = rank ^ 1, plan.cross_source
+            forwarded = across ^ 1
+            assert plans[across].cross_destination == rank
+            assert plans[plan.cross_destination].cross_source == rank
             assert torch.equal(plan.local_send, demand[within, rank].nonzero().T)
             assert torch.equal(plan.local_receive, plans[within].local_send)
             assert torch.equal(plan.cross_receive, plans[across].cross_send)
@@ -54,6 +61,11 @@ def check_pair_relay_layout(device):
                 plan.forward_receive,
                 plans[within].cross_receive[:, : plans[within].forward_count],
             )
+        for first in (0, 2):
+            owners = (first, first + 1)
+            fixed = sum(demand[r ^ 3, r].sum().item() for r in owners)
+            alternate = sum(demand[r ^ 2, r].sum().item() for r in owners)
+            assert sum(plans[plans[r].cross_destination].forward_count for r in owners) == min(fixed, alternate)
 
 
 def test_pair_relay_keeps_forwarded_prefix_contiguous_on_reuse():

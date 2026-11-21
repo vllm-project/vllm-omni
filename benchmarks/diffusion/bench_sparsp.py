@@ -85,6 +85,7 @@ def benchmark(args, device):
                 executor.payload_bytes,
                 executor.dense_payload_bytes,
                 executor.cross_pair_payload_bytes,
+                executor.forwarded_payload_bytes,
             ],
             dtype=torch.int64,
             device=device,
@@ -106,6 +107,7 @@ def benchmark(args, device):
                 "kv_payload_bytes_global": counters[0].item(),
                 "relay_kv_payload_bytes_global": counters[1].item(),
                 "cross_pair_kv_payload_bytes_global": counters[2].item() if world == 4 else None,
+                "forwarded_kv_payload_bytes_global": counters[3].item() if world == 4 else None,
                 "bitwise_equal": True,
             }
         )

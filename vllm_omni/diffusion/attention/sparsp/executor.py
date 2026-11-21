@@ -35,6 +35,7 @@ class SparseRingExecutor:
         self._closed = self._poisoned = False
         self.payload_bytes = 0
         self.cross_pair_payload_bytes = 0
+        self.forwarded_payload_bytes = 0
         self.dense_payload_bytes = 0
 
     def _buffers(self, tokens: int, wire_dtype: torch.dtype) -> None:
@@ -248,7 +249,8 @@ class SparseRingExecutor:
         planning = self.planning
         assert manifest is not None and planning is not None
         plan = manifest.plan()
-        within, across, forwarded = self.rank ^ 1, self.rank ^ 2, self.rank ^ 3
+        within = self.rank ^ 1
+        forwarded = plan.cross_source ^ 1
         block_bytes = kv_block_bytes(self.dim)
 
         def attend_packet(owner: int, inbox: torch.Tensor, indices: torch.Tensor) -> None:
@@ -265,7 +267,12 @@ class SparseRingExecutor:
             self.send[0], self.receive[0], within, within, local_bytes, plan.local_receive.shape[1] * block_bytes
         )
         cross_ops = self._packet_ops(
-            self.send[1], self.receive[1], across, across, cross_bytes, plan.cross_receive.shape[1] * block_bytes
+            self.send[1],
+            self.receive[1],
+            plan.cross_destination,
+            plan.cross_source,
+            cross_bytes,
+            plan.cross_receive.shape[1] * block_bytes,
         )
         first_event = self._post_packets(local_ops + cross_ops, planning)
         forward_bytes = plan.forward_count * block_bytes
@@ -280,11 +287,12 @@ class SparseRingExecutor:
         attend_packet(within, self.receive[0], plan.local_receive)
         # A prefix may include blocks wanted only by the next receiver. The
         # local attention mask still selects exactly the original subset.
-        attend_packet(across, self.receive[1], plan.cross_receive)
+        attend_packet(plan.cross_source, self.receive[1], plan.cross_receive)
         self.compute.wait_event(forward_event)
         attend_packet(forwarded, self.send[0], plan.forward_receive)
         self.payload_bytes = local_bytes + cross_bytes + forward_bytes
         self.cross_pair_payload_bytes = cross_bytes
+        self.forwarded_payload_bytes = forward_bytes
 
     def _relay(self, q, qs, k, v, local_k, selected, scale) -> None:
         comm = RingComm(self.group)
