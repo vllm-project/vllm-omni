@@ -653,6 +653,7 @@ class DuplexSessionManager:
             capabilities = apply_input_clock_capabilities(
                 apply_session_stats_capability(self.plugin.capabilities(max_sessions=max_sessions), collect_stats),
                 config.extra_body,
+                input_modalities=self.plugin.input_clock_input_modalities,
             )
             validate_session_tools(capabilities, config.extra_body)
             session = DuplexEngineSession(

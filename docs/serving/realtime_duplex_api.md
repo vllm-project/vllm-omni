@@ -1389,9 +1389,36 @@ Input clocking is available only for models whose plugin declares it
 model's real unit boundaries to know when a unit's output is complete. On any
 other model, a session with `clock: "input"` is refused with error
 `input_clock_unsupported` — at session creation, or on a `session.update`
-that sets it. No model shipped with vLLM-Omni declares it yet: the option is
-for plugins that opt in once their unit boundaries are mapped (see
-*Input-clocked sessions* in the model's entry when it does).
+that sets it.
+
+Models that support input-clocked sessions, and how each maps onto units:
+
+| Model | Unit | Decision | A speaking unit is complete when | Input |
+| --- | --- | --- | --- | --- |
+| MiniCPM-o 4.5 | 1 s audio chunk (an append submits every whole chunk it completes) | Stage 0 `listen` ends the unit; any other Stage-0 segment end makes it a speaking unit | its Talker segment has ended and Code2Wav has emitted the chunk that flushes the unit's remaining codes (`tts_is_last_chunk`) | audio only |
+
+For a speaking MiniCPM-o 4.5 unit, the acknowledgement guarantees that the
+unit's text (unless the unit has 5 or fewer codec frames in all, whose text
+can follow with the next unit's audio) and all of its audio that the
+vocoder could synthesise by then have been emitted. The last codec frames
+of a speaking unit that does not end the turn are synthesised together with
+the next unit's codes, because of the vocoder's lookahead and because a
+remainder shorter than 5 frames is carried into the next unit's first
+chunk, so that audio goes out after the unit's acknowledgement, exactly
+when real-time operation emits it: usually 200–440 ms (p10–p90), measured
+up to about 0.76 s, and it can exceed 1 s under concurrent load. There is
+no structural bound on it. The next unit is a speaking unit of the same
+turn because the model rewrites a `<|listen|>` sampled while the turn is
+open to `<|tts_bos|>`; a model change that allowed a listen mid-turn would
+let the tail wait across listen units. The unit that ends the turn is
+flushed completely before its acknowledgement.
+
+An input-clocked MiniCPM-o 4.5 session takes audio only: its capabilities
+list no `video` input modality, and an `input_audio_buffer.append` with
+`video_frames` is refused with `invalid_input_modality` and acknowledged as
+`rejected`. A committed turn with video frames is split into separate vision
+units, which the clock does not account for when the commit is deferred
+behind a response. Sessions without the clock are unchanged.
 
 An input-clocked session never overlaps turns: a commit during a response
 waits for that response, also on a model that otherwise runs concurrent turn

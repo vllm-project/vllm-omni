@@ -188,7 +188,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             text = ""
 
         finished = bool(getattr(output, "finished", False))
-        tts_is_last_chunk = _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
+        tts_is_last_chunk = is_last_tts_chunk(mm_output)
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
@@ -735,6 +735,11 @@ def _audio_num_samples(audio_data: object) -> int | None:
         return int(np.asarray(audio_data, dtype=np.float32).size)
     except Exception:
         return None
+
+
+def is_last_tts_chunk(mm_output: dict[str, object]) -> bool:
+    """Whether a Code2Wav output carries the connector's flush of a unit's remaining codes (``tts_is_last_chunk``)."""
+    return _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
 
 
 def _bool_metadata(
