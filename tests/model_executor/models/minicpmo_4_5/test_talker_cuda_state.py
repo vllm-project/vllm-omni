@@ -482,6 +482,191 @@ def test_model_binding_commit_and_batch_compaction():
     assert [flag.item() for flag in output.multimodal_outputs["meta"]["finished"]] == [True, False]
 
 
+def _binding_model():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        _request_audio_states={},
+        _request_codec_history={},
+        _request_generators={},
+        _codec_min_tokens=0,
+        _codec_max_tokens=10,
+        _codec_temperature=0,
+        _codec_repetition_penalty=1,
+        _codec_top_k=0,
+        _codec_top_p=1,
+        _codec_seed=7,
+        _codec_eos_id=VOCAB_SIZE - 1,
+        _codec_fused_prelude=True,
+        _codec_fused_tail=True,
+        _merge_request_codec_params=lambda *args, **kwargs: None,
+    )
+
+
+def _duplex_info(request_id, *, epoch, turn_id, condition_seq, text):
+    return {
+        "request_id": request_id,
+        "native_duplex": True,
+        "duplex": {"epoch": epoch, "turn_id": turn_id},
+        "meta": {"streaming_condition_seq": condition_seq, "native_duplex_segment_text": text},
+    }
+
+
+def test_model_binding_fuses_native_duplex_rows_with_step_metadata():
+    """Native duplex decode rows take the fused K-step and still report their duplex fence.
+
+    The fused commit returns one output per step, so the per-request duplex
+    metadata the eager frame loop reports (and merge_frame_outputs keeps from
+    the last frame) has to come from the commit itself.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    hidden = torch.zeros(2, 4)
+    infos = [
+        _duplex_info("a", epoch=1, turn_id=3, condition_seq=5, text="hi"),
+        _duplex_info("b", epoch=0, turn_id=0, condition_seq=2, text="\u4f60\u597d"),
+    ]
+    kwargs = {"model_intermediate_buffer": infos, "request_token_spans": [(0, 1), (1, 2)]}
+    state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(model, hidden, 2, **kwargs)
+    assert state is not None
+    state.sample(logits([3, 4]), 0, VOCAB_SIZE - 1)
+    state.sample(logits([5, 6]), 1, VOCAB_SIZE - 1)
+    output = MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+
+    meta = output.multimodal_outputs["meta"]
+    assert [v.item() for v in meta["native_duplex"]] == [True, True]
+    assert [v.item() for v in meta["duplex_epoch"]] == [1, 0]
+    assert [v.item() for v in meta["duplex_turn_id"]] == [3, 0]
+    assert [v.item() for v in meta["streaming_condition_seq"]] == [5, 2]
+    assert [bytes(v.tolist()).decode("utf-8") for v in meta["llm_output_text_utf8"]] == ["hi", "\u4f60\u597d"]
+    assert [v.item() for v in meta["turn_end"]] == [False, False]
+    assert [d.flatten().tolist() for d in output.multimodal_outputs["codes"]["audio"]] == [[3, 5], [4, 6]]
+
+
+def test_model_binding_rebinds_a_new_duplex_condition_for_the_same_request():
+    """A duplex request moves to its next condition between fused steps.
+
+    The condition setup installs a fresh state dict under the same request id;
+    the bank rebinds it from the host state (step 0, not finished, confirmed
+    codec history) and the next commit reports the new condition sequence.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    hidden = torch.zeros(1, 4)
+    first = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=3, text="one")]
+    state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+        model, hidden, 2, model_intermediate_buffer=first, request_token_spans=[(0, 1)]
+    )
+    state.sample(logits([3]), 0, VOCAB_SIZE - 1)
+    state.sample(logits([VOCAB_SIZE - 1]), 1, VOCAB_SIZE - 1)
+    MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    assert model._request_audio_states["a"]["finished"]
+    model._request_codec_history["a"] = [3]
+
+    model._request_audio_states["a"] = {"step": 0, "finished": False, "max_tokens": 10}
+    second = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=4, text="two")]
+    rebound = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+        model, hidden, 2, model_intermediate_buffer=second, request_token_spans=[(0, 1)]
+    )
+    assert rebound is state
+    assert rebound.steps.tolist() == [0]
+    assert not rebound.finished.any()
+    assert rebound.history[0, -1].item() == 3
+    rebound.sample(logits([5]), 0, VOCAB_SIZE - 1)
+    rebound.sample(logits([6]), 1, VOCAB_SIZE - 1)
+    output = MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    meta = output.multimodal_outputs["meta"]
+    assert [v.item() for v in meta["streaming_condition_seq"]] == [4]
+    assert bytes(meta["llm_output_text_utf8"][0].tolist()).decode("utf-8") == "two"
+    assert output.multimodal_outputs["codes"]["audio"][0].flatten().tolist() == [5, 6]
+    assert model._request_audio_states["a"]["step"] == 2
+
+
+def test_fused_duplex_steps_keep_every_frame_a_prompt_recompute_reads():
+    """Fused steps confirm a whole duplex chunk; the next condition's recompute reads all of it.
+
+    The sampling window is 16 frames, but streaming prompt recompute rebuilds
+    the prompt from every frame confirmed since the current prompt (25 on a
+    normal chunk), so the fused host bookkeeping must not trim the confirmed
+    history to the window.
+    """
+    from torch import nn
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    model._request_audio_states["a"] = {"step": 0, "finished": False, "max_tokens": 40}
+    hidden = torch.zeros(1, 4)
+    infos = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=3, text="one")]
+    frames, confirmed = 8, 25
+    sampled = [1 + index % (VOCAB_SIZE - 2) for index in range(frames * 4)]
+    for start in range(0, len(sampled), frames):
+        state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+            model, hidden, frames, model_intermediate_buffer=infos, request_token_spans=[(0, 1)]
+        )
+        assert state is not None
+        for frame, token in enumerate(sampled[start : start + frames]):
+            state.sample(logits([token]), frame, VOCAB_SIZE - 1)
+        MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    assert model._request_codec_history["a"][-confirmed:] == sampled[-confirmed:]
+
+    model._request_condition_states = {
+        "a": {"condition_seq": 3, "condition": torch.zeros(2, 4), "base_recent_codes": ()}
+    }
+    model._k_step_frames = frames
+    model.emb_code = nn.ModuleList([nn.Embedding(VOCAB_SIZE, 4)])
+    with torch.no_grad():
+        model.emb_code[0].weight.copy_(torch.arange(VOCAB_SIZE, dtype=torch.float).unsqueeze(1).expand(-1, 4))
+    embeds = MiniCPMO45OmniTTSForConditionalGeneration._build_streaming_recompute_embeddings(
+        model,
+        torch.ones(3, 4),
+        request_id="a",
+        # The scheduler's confirmed slice holds the K-step head's 0/1 control rows.
+        info_dict={"ids": {"streaming_prompt_previous_codes": [0] * confirmed}},
+        meta={"streaming_condition_seq": 4, "streaming_prompt_recompute": True},
+    )
+    assert embeds.shape == (2 + confirmed + 3, 4)
+    assert embeds[2 : 2 + confirmed, 0].long().tolist() == sampled[-confirmed:]
+
+
+def test_model_binding_turn_mode_commit_carries_no_duplex_metadata():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    hidden = torch.zeros(1, 4)
+    kwargs = {"model_intermediate_buffer": [{"request_id": "a"}], "request_token_spans": [(0, 1)]}
+    state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(model, hidden, 1, **kwargs)
+    state.sample(logits([3]), 0, VOCAB_SIZE - 1)
+    output = MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    assert set(output.multimodal_outputs["meta"]) == {"finished", "codec_frame_valid"}
+
+
+def test_model_binding_keeps_duplex_turn_end_drain_on_the_frame_loop():
+    """A duplex turn-end condition drains with per-frame host checks, so it stays eager."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    model._request_audio_states["a"] = {"step": 3, "turn_end_drain": 1}
+    infos = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=4, text="")]
+    result = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+        model, torch.zeros(1, 4), 2, model_intermediate_buffer=infos, request_token_spans=[(0, 1)]
+    )
+    assert result is None
+    assert not hasattr(model, "_cuda_kstep_workspaces")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("eos_frame", [0, 1, 2])
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
