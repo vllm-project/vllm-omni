@@ -16,7 +16,6 @@ import sys
 import tempfile
 import threading
 import time
-from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -200,8 +199,8 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded ring buffer of child stderr for early-exit diagnostics.
-        self._server_error_lines: deque[str] = deque(maxlen=100)
+        # Preserve child stderr so later tracebacks cannot overwrite the root cause.
+        self._server_error_lines: list[str] = []
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -276,7 +275,7 @@ class OmniServer:
         if self._port_lock is not None:
             self._port_lock.release()
             self._port_lock = None
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = []
 
     def _start_server(self) -> None:
         attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
@@ -332,11 +331,11 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout; tee stderr to pytest and the startup diagnostic tail.
+        # Inherit stdout; tee stderr to pytest and preserve the full diagnostics.
         # Request failures after readiness also need the child traceback.
         # errors=replace keeps the reader alive on undecodable bytes so a full
         # pipe cannot hang serve.
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = []
         self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,
@@ -1083,7 +1082,8 @@ class OmniRunner(_EngineWorkerOwner):
         if is_tts_model and modalities == ["audio"]:
             tts_kw = mm_processor_kwargs or {}
             task_type = tts_kw.get("task_type", "CustomVoice")
-            speaker = tts_kw.get("speaker", "Vivian")
+            # Only CustomVoice needs a built-in speaker; for Base it names a stored voice.
+            speaker = tts_kw.get("speaker", "Vivian" if task_type == "CustomVoice" else None)
             language = tts_kw.get("language", "Auto")
             max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
             ref_audio = tts_kw.get("ref_audio", None)
@@ -1096,9 +1096,10 @@ class OmniRunner(_EngineWorkerOwner):
                     "task_type": [task_type],
                     "text": [text_str],
                     "language": [language],
-                    "speaker": [speaker],
                     "max_new_tokens": [max_new_tokens],
                 }
+                if speaker is not None:
+                    additional_information["speaker"] = [speaker]
                 if ref_audio is not None:
                     additional_information["ref_audio"] = [ref_audio]
                 if ref_text is not None:

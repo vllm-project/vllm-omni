@@ -86,9 +86,12 @@ def assert_baseline_within_tolerance(
     unless ``required=True`` requests a failure instead.
     """
     baseline_hardware = hardware
-    # Ascend runtime labels use the A2 resource bucket when no exact bucket exists.
-    if isinstance(baseline, dict) and hardware in ("910B", "910B4") and hardware not in baseline and "A2" in baseline:
-        baseline_hardware = "A2"
+    # Ascend runtime labels use the A2/A3 resource buckets when no exact bucket exists.
+    if isinstance(baseline, dict) and hardware not in baseline:
+        if hardware in ("910B", "910B4") and "A2" in baseline:
+            baseline_hardware = "A2"
+        elif hardware == "910" and "A3" in baseline:
+            baseline_hardware = "A3"
     if (
         not isinstance(baseline, dict)
         or not baseline

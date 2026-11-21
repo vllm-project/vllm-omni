@@ -977,7 +977,7 @@ async def test_asr_evicts_memory_blocks_before_rebudgeting_history(monkeypatch, 
                 {"role": "system", "content": context["system"]},
                 {"role": "user", "content": retained_memory},
                 {"role": "user", "content": instruction},
-                *context["history"][-2:],
+                *({"role": item["role"], "content": item["content"]} for item in context["history"][-2:]),
                 {
                     "role": "user",
                     "content": [{"type": "text", "text": f"{joyai_bridge.USER_QUERY_HEADER}\n{transcript}"}],

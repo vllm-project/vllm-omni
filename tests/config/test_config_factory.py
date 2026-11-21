@@ -3446,6 +3446,8 @@ class TestPlatformOverrides:
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
+            ("minimax_music3.yaml", "minimax_music3", "v2", ()),
+            ("minimax_music3_2gpu.yaml", "minimax_music3", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3454,9 +3456,10 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # MOSS realtime and Nano inherit V2 on every platform; other profiles
-        # retain their explicit platform overrides.
+        # MOSS realtime, MOSS Nano and Music3 inherit V2 on every platform.
         all_platforms_mrv2 = filename in (
+            "minimax_music3.yaml",
+            "minimax_music3_2gpu.yaml",
             "moss_tts_nano.yaml",
             "moss_tts_realtime.yaml",
         )
