@@ -93,10 +93,12 @@ class StepBatchSamplingParamsKey:
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
 
-    # LoRA identity. Requests with different adapters or scales must run in
-    # separate batches so the worker can activate exactly one adapter per step.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. Requests with different adapter combinations or scales
+    # must run in separate batches so the worker can activate exactly one
+    # adapter (or one composed multi-LoRA adapter) per step. Normalized via
+    # ``build_lora_batch_key``; None when no LoRA is active.
+    lora_key: tuple[tuple[int, float], ...] | None = None
+
     # Same resolved request schedules, and step-range source, as the request-batch key.
     attention_schedule: AttentionSchedule = ()
     attention_schedule_explicit: bool = False
@@ -158,14 +160,28 @@ class RequestBatchSamplingParamsKey:
     sample_solver: str | None = None
     flow_shift: float | None = None
 
+    # Names of non-None ``negative_*`` prompt fields. Negative text,
+    # embeddings, masks, and pooled embeddings can select a pipeline's CFG
+    # branches independently of do_classifier_free_guidance. Compare their
+    # presence conservatively alongside guidance fields to align forward counts.
+    negative_conditioning: frozenset[str] = frozenset()
+
     # Pipeline-specific condition structure populated during preprocessing.
     # It prevents independently valid requests with incompatible conditions
     # from being admitted to the same request batch.
     condition_key: tuple[Any, ...] | None = None
 
-    # LoRA identity.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. See StepBatchSamplingParamsKey.lora_key.
+    lora_key: tuple[tuple[int, float], ...] | None = None
+
+    # Rank-local DP shares weight collectives across requests and requires
+    # identical full extra_args. The scheduler caches this at request addition;
+    # ordinary request batching leaves it unset to allow request-local values.
+    rank_local_dp_extra_args_signature: str | None = None
+
+    # Text-encoder AllGather requires matching encoder forward counts across
+    # DP ranks. Cached only when that mode is active.
+    text_encoder_input_signature: tuple[bool, bool] | None = None
 
     # Request schedule resolved against the service default; () runs the baseline. Different ranges
     # must not share a batch.
@@ -190,6 +206,8 @@ class SchedulerRequestState:
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
     queued_at: float = 0.0
+    # Request-mode admission must leave this request alone in its wave.
+    requires_single_request: bool = False
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)

@@ -283,6 +283,89 @@ def _with_sample_identity(payload: dict[str, object], sample: DuplexSample) -> d
     return {"sample_id": sample.id, "split": sample.split, **payload}
 
 
+def _session_stats_diagnostics(stats: object) -> dict[str, object]:
+    """Keep timing evidence from the existing snapshot, excluding content/configuration."""
+    if not isinstance(stats, dict):
+        return {}
+    result: dict[str, object] = {
+        key: stats[key] for key in ("dropped_turns", "dropped_spans") if type(stats.get(key)) is int
+    }
+    stages = stats.get("stages")
+    if isinstance(stages, list):
+        result["stages"] = [
+            {"stage_id": stage["stage_id"]}
+            for stage in stages
+            if isinstance(stage, dict) and type(stage.get("stage_id")) is int
+        ]
+    turns = stats.get("turns")
+    if not isinstance(turns, list):
+        return result
+    retained_turns = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        retained: dict[str, object] = {
+            key: turn[key] for key in ("epoch", "turn_id", "late_spans") if type(turn.get(key)) is int
+        }
+        if type(turn.get("final")) is bool:
+            retained["final"] = turn["final"]
+        status = turn.get("status")
+        if isinstance(status, str) and status in {"open", "done", "cancelled", "listen"}:
+            retained["status"] = status
+        response_ids = turn.get("response_ids")
+        if isinstance(response_ids, list):
+            retained["response_ids"] = [value for value in response_ids if isinstance(value, str)]
+        chunks = turn.get("chunks")
+        retained_chunks = []
+        for chunk in chunks if isinstance(chunks, list) else ():
+            if not isinstance(chunk, dict):
+                continue
+            item: dict[str, object] = {
+                key: chunk[key] for key in ("seq", "turn_seq", "submitted_ns") if type(chunk.get(key)) is int
+            }
+            if chunk.get("done_ns") is None or type(chunk.get("done_ns")) is int:
+                item["done_ns"] = chunk.get("done_ns")
+            item.update({key: chunk[key] for key in ("complete", "truncated") if type(chunk.get(key)) is bool})
+            work = chunk.get("stage_work")
+            retained_work = []
+            for stage in work if isinstance(work, list) else ():
+                if not isinstance(stage, dict) or type(stage.get("stage_id")) is not int:
+                    continue
+                spans = stage.get("spans")
+                retained_work.append(
+                    {
+                        "stage_id": stage["stage_id"],
+                        "spans": [
+                            list(span)
+                            for span in spans
+                            if isinstance(span, list) and len(span) == 2 and all(type(value) is int for value in span)
+                        ]
+                        if isinstance(spans, list)
+                        else [],
+                    }
+                )
+            item["stage_work"] = retained_work
+            retained_chunks.append(item)
+        retained["chunks"] = retained_chunks
+        audio = turn.get("audio")
+        retained_audio = []
+        for piece in audio if isinstance(audio, list) else ():
+            if not isinstance(piece, dict):
+                continue
+            emitted = piece.get("emitted_ns")
+            duration = piece.get("duration_ms")
+            response_id = piece.get("response_id")
+            if type(emitted) is int and (type(duration) is int or type(duration) is float and math.isfinite(duration)):
+                item = {"emitted_ns": emitted, "duration_ms": duration}
+                if response_id is None or isinstance(response_id, str):
+                    item["response_id"] = response_id
+                retained_audio.append(item)
+        retained["audio"] = retained_audio
+        retained_turns.append(retained)
+    result["turns"] = retained_turns
+    return result
+
+
 def _event_related_ids(event: dict[str, object]) -> tuple[str, ...]:
     ids: list[str] = []
     for key in ("related_event_id", "event_id"):
@@ -579,8 +662,10 @@ async def _bounded_ack_join(task: asyncio.Task) -> None:
     if pending:
         task.add_done_callback(_consume_task_exception)
         logger.warning("DuplexEval: the periodic playback ack ignored cancellation")
-    elif not task.cancelled() and (error := task.exception()) is not None:
-        raise error
+    elif not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            raise error
 
 
 async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: float = _FINAL_CLOSE_TIMEOUT_S) -> None:
@@ -999,10 +1084,13 @@ async def generate_sample(
     # boundary in metadata; drain/close timeouts and server errors above still
     # fail the sample instead of silently publishing a broken session.
     meta["unfinished_response_ids"] = sorted(set(client.events.response_ids) - finished)
+    session_metrics = _with_sample_identity(bundle.session_metrics, sample)
+    if server_stats := _session_stats_diagnostics(session_stats):
+        session_metrics["server_stats"] = server_stats
     result = GenerateSampleResult(
         output=output,
         request_metrics=[_with_sample_identity(metric, sample) for metric in bundle.request_metrics],
-        session_metrics=_with_sample_identity(bundle.session_metrics, sample),
+        session_metrics=session_metrics,
         timed_sentences=timed,
         timed_chunks=chunks,
         metadata=meta,

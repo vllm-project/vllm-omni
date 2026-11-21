@@ -34,7 +34,7 @@ from .batched_token2wav import (
     state_shape_signature,
 )
 from .code2wav_watchdog import Code2WavWatchdog
-from .config_flags import read_bool_flag
+from .config_flags import read_bool_flag, resolve_token2wav_trt_config
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
 if TYPE_CHECKING:
@@ -424,6 +424,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # competes with the thinker's decode on a shared GPU.
         self._ref_prefetch_enabled = read_bool_flag(extra, "token2wav_ref_prefetch", True)
         self._ref_prefetch_setup = read_bool_flag(extra, "token2wav_ref_prefetch_setup", False)
+        self._ref_cpu_prefetch_workers = int(extra.get("token2wav_ref_cpu_prefetch_workers", 0))
+        if self._ref_cpu_prefetch_workers < 0:
+            raise ValueError("token2wav_ref_cpu_prefetch_workers must be >= 0")
         self._ref_prefetch_max_waiters = int(extra.get("token2wav_ref_prefetch_max_waiters", 1))
         if self._ref_prefetch_max_waiters < 1:
             raise ValueError("token2wav_ref_prefetch_max_waiters must be >= 1")
@@ -522,6 +525,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._ref_setup_batch_size = int(extra.get("ref_setup_batch_size", 1))
+        if self._ref_setup_batch_size < 1:
+            raise ValueError("ref_setup_batch_size must be positive")
         self._initial_batch_size = int(extra.get("code2wav_initial_batch_size", 0))
         if self._initial_batch_size < 0:
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
@@ -1043,6 +1049,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             features.append(prompts[key])
             if states[row] is None:
                 fresh.setdefault(key, []).append(row)
+        if self._ref_setup_batch_size > 1 and fresh:
+            keys = list(fresh)
+            initial = self.backend.setup_prompts([prompts[key] for key in keys], self._ref_setup_batch_size)
+            for key, state in zip(keys, initial, strict=True):
+                for row in fresh[key]:
+                    states[row] = state
+            fresh = {}
         for key, rows in fresh.items():
             self._watchdog.phase(
                 "setup/cfm",
@@ -1591,8 +1604,9 @@ class MiniCPMO45Code2Wav(nn.Module):
     def on_requests_added(self, prewarms: list[OmniRequestPrewarm]) -> None:
         """Queue reference prefetches for new async-chunk placeholders.
 
-        Only validates and enqueues; :meth:`run_idle_prefetch` does the work
-        (the prompt, plus the setup with ``token2wav_ref_prefetch_setup``).
+        By default only validates and enqueues; :meth:`run_idle_prefetch` does
+        the work (plus setup with ``token2wav_ref_prefetch_setup``). Optional
+        CPU workers materialize and pin references within the same pin budget.
         A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
         GPU and NPU generation runners call this hook and
         :meth:`run_idle_prefetch`; runners without these optional hooks prepare
@@ -1635,6 +1649,21 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 continue
             self._prefetch_queue[state_id] = _RefPrefetch(ref_audio=ref_audio, sample_rate=sample_rate)
+            workers = getattr(self, "_ref_cpu_prefetch_workers", 0)
+            if workers and ref_audio.device.type == "cpu":
+                if not self._prefetch_pin_available(state_id):
+                    continue
+                try:
+                    cache_key, entry = self._materialize_runtime_prompt(ref_audio, sample_rate)
+                    entry.pins.add(state_id)
+                    self._prefetch_pins[state_id] = cache_key
+                    if not self.backend.prefetch_prompt_cpu(entry.cache_id, entry.path, workers):
+                        self._drop_prefetch(state_id)
+                        continue
+                    self._trim_runtime_prompts()
+                except Exception:
+                    logger.exception("MiniCPM-o CPU reference prefetch failed for %s", state_id)
+                    self._drop_prefetch(state_id)
 
     @torch.inference_mode()
     def run_idle_prefetch(self) -> bool:
@@ -1682,6 +1711,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         ):
             return self._run_prefetch_phase(state_id, record)
 
+    def _prefetch_pin_available(self, state_id: str) -> bool:
+        # An accepted CPU job already holds this request's pin. Its later idle
+        # phase may reuse that pin even when the budget is full.
+        return state_id in self._prefetch_pins or len(self._prefetch_pins) < max(1, self._runtime_prompt_cache_size)
+
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
         """Run the next phase of ``record``; see ``run_idle_prefetch``."""
         entry = record.entry
@@ -1691,7 +1725,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # pinned entries are never trimmed. The record waits at the
                 # head until a pin is released; its own chunk 0 or finish
                 # still drops it as usual.
-                if len(self._prefetch_pins) >= max(1, self._runtime_prompt_cache_size):
+                if not self._prefetch_pin_available(state_id):
                     return False
                 # Phase A. The pin keeps the entry (and with it the backend's
                 # prompt features) alive until chunk 0 or finish releases it.
@@ -1837,7 +1871,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         device_spk = read_bool_flag(
             extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
         )
-        use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
+        # An explicit stage key wins over its legacy MINICPMO_TOKEN2WAV_TRT* env
+        # var (#6232). Keys are validated on every platform; the env vars are
+        # read (and warn) only where they take effect.
+        trt_config = resolve_token2wav_trt_config(extra, cuda=current_omni_platform.is_cuda())
+        use_trt = trt_config.enabled
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
         # when it cannot apply, including explicit overrides that predate it:
@@ -1870,10 +1908,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
-            dtype_name = str(
-                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
-            ).lower()
-            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            dtype_name = trt_config.dtype
+            trt_dtype = torch.float32 if dtype_name == "fp32" else torch.float16
             max_batch = int(extra.get("token2wav_trt_max_batch", 16))
             device = next(token2wav.flow.parameters()).device
             trt_stepper = build_dit_trt_stepper(
@@ -1881,6 +1917,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 device=device,
                 dtype=trt_dtype,
                 max_batch=max_batch,
+                cache_dir=trt_config.cache_dir,
             )
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()
@@ -1918,8 +1955,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "(token2wav_device_spk=false)"
             )
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
-            token2wav.enable_speaker_cuda_graph(self.vllm_config)
-            logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
+            if token2wav.enable_speaker_cuda_graph(self.vllm_config):
+                logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
+        if read_bool_flag(extra, "token2wav_s3_cuda_graph", False):
+            if token2wav.enable_s3_cuda_graph(self.vllm_config):
+                logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,

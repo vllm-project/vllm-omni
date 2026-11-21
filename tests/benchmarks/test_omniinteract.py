@@ -1216,6 +1216,62 @@ def _request(case: data.OmniInteractCase, options: data.OmniInteractSessionOptio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["server_vad_unavailable", "semantic_vad_unavailable"])
+@pytest.mark.parametrize("phase", ["handshake", "stream", "adapter"])
+async def test_adapter_preserves_unavailable_vad_from_the_case_runner(tmp_path, monkeypatch, code, phase):
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
+    class UnavailableVadClient(_ServerVadClient):
+        async def __aenter__(self):
+            if phase == "handshake":
+                raise DuplexProtocolError("missing VAD backend", code=code)
+            return await super().__aenter__()
+
+        async def send(self, event):
+            self.sent.append(event)
+            if event["type"] == "input_audio_buffer.append":
+                self.events.add({"type": "error", "error": {"code": code, "message": "missing VAD backend"}})
+
+    options = data.OmniInteractSessionOptions(tmp_path / "artifacts", 10.0, 5.0, None, turn_detection="server_vad")
+    request = _request(_case(tmp_path), options)
+    request.omniinteract_prepared_input = data.OmniInteractPreparedInput(1.0, b"\0\0\0\0", ("frame",), None)
+    monkeypatch.setattr(oi, "_RealtimeSession", UnavailableVadClient)
+    monkeypatch.setattr(oi, "SERVER_VAD_TAIL_S", 0.0)
+    if phase == "adapter":
+
+        async def fail(*args, **kwargs):
+            raise DuplexProtocolError("missing VAD backend", code=code)
+
+        monkeypatch.setattr(benchmark_patch, "run_omniinteract_case", fail)
+
+    output = await asyncio.wait_for(
+        benchmark_patch.async_request_openai_realtime_duplex(request, session=None), timeout=1.0
+    )
+    assert not output.success
+    assert output.duplex_fatal_error_code == code
+    assert output.error == f"{code}: missing VAD backend"
+    assert output.omniinteract_case_result.error_code == code
+
+
+@pytest.mark.asyncio
+async def test_realtime_consumer_preserves_protocol_error_code():
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
+    client = oi._RealtimeSession(oi.OmniInteractBenchmarkConfig(model=MODEL), None)
+    error = DuplexProtocolError("missing VAD backend", code="server_vad_unavailable")
+
+    async def fail():
+        raise error
+
+    client._consume_task = asyncio.create_task(fail())
+    with pytest.raises(DuplexProtocolError):
+        await client._consume_task
+    with pytest.raises(DuplexProtocolError) as caught:
+        client.raise_if_reader_stopped()
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
 async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     case, options = _case(tmp_path), _session_options(tmp_path)
     request = _request(case, options)
@@ -1556,7 +1612,7 @@ def test_whole_benchmark_lock_serializes_a_shared_output_root(tmp_path: Path, mo
             await asyncio.to_thread(release.wait)
         return {"total": 1}
 
-    monkeypatch.setattr(benchmark_serve, "main_async", fake_main_async)
+    monkeypatch.setattr(benchmark_serve, "vllm_main_async", fake_main_async)
     args = argparse.Namespace(dataset_name="omniinteract", omniinteract_output_dir=tmp_path, extra_body=None)
     with ThreadPoolExecutor(2) as executor:
         first = executor.submit(benchmark_serve.main, args)

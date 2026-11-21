@@ -3,6 +3,17 @@
 This example uses the custom WebSocket endpoint `WS /v1/realtime/video` to receive a video byte stream as chunks are produced.
 It covers text-to-video, and image-conditioned models through `--image-reference`.
 
+The Python client disables WebSocket compression because MP4 chunks are already
+compressed. Recompressing them can delay delivery and return of playback credit
+while saving little bandwidth. Browser clients negotiate compression separately;
+this Python client setting does not change the server or browser defaults.
+
+For browser video streaming, add `--disable-websocket-compression` to the server
+command, for example `vllm serve MODEL --omni --disable-websocket-compression`.
+This opts out of per-message deflate on **all WebSocket routes** served by that
+process, including every frontend with `--api-server-count`; it preserves the
+video codec compression. Without the flag, existing negotiation defaults apply.
+
 ## Start The Server
 
 Start a diffusion video model with streaming output enabled:
@@ -66,7 +77,7 @@ pip install 'vllm-omni[demo]' websockets
 The command-line client needs only `av` and `websockets`, including when saving
 video; it does not require PyTorch or a local vLLM/vLLM-Omni installation.
 
-For the Gradio demo in this 0.33 source checkout, install `.[demo]` with the temporary Gradio wheel
+For the Gradio demo in this 0.34 source checkout, install `.[demo]` with the temporary Gradio wheel
 using the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
 from the repository root, while retaining the `av` and `websockets` client
 dependencies above. The published-package command above applies to released

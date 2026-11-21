@@ -43,6 +43,22 @@ TEST_PARAMS = [
     )
 ]
 
+# The explicit CUDA profiles must boot the same MRV2 audio path as the
+# auto-discovered default; a valid request also checks codec payload delivery.
+CUDA_PROFILE_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path(f"higgs_multimodal_qwen3_{profile}.yaml"),
+            server_args=SERVER_ARGS,
+            env_dict=SERVER_ENV,
+        ),
+        id=f"higgs_audio_v3_{profile}",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="Profile requires CUDA FlashInfer"),
+    )
+    for profile in ("high_throughput", "low_latency")
+]
+
 DEFAULT_SPEECH_TIMEOUT_S = 180.0
 # Floor for ~0.5 s of 24 kHz mono PCM_16: 24000 * 0.5 * 2 bytes ~= 24 KiB.
 # A WAV header adds 44 bytes; conservative floor catches truncated /
@@ -172,6 +188,29 @@ class TestHiggsAudioV3OnlineHappyPath:
             },
             request_num=3,
         )
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", CUDA_PROFILE_PARAMS, indirect=True)
+@pytest.mark.parametrize("stream", [False, True], ids=["wav", "concurrent_pcm"])
+def test_mrv2_profile_audio(omni_server, online_client, stream) -> None:
+    """Explicit profiles boot MRV2 and deliver audio through both stages."""
+    online_client.send_audio_speech_request(
+        {
+            "model": omni_server.model,
+            "input": "She sells seashells by the seashore.",
+            "stream": stream,
+            "stream_format": "audio",
+            "response_format": "pcm" if stream else "wav",
+            "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+            "min_audio_bytes": _MIN_AUDIO_BYTES,
+            # Match the concurrent-streaming codec quality gate above.
+            "min_hnr_db": -2.0,
+        },
+        request_num=3 if stream else 1,
+    )
 
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
@@ -324,7 +363,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     [

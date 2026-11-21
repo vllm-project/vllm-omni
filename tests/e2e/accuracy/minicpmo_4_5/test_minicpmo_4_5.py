@@ -4,8 +4,8 @@
 
 Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
 ~77% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
-text modalities, and server ``--interleave-mm-strings`` + 1fps / 128-frame
-media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
+text modalities, and interleaved multimodal strings with video at 1 fps and
+128 frames on stage 0, also pinned in ``minicpmo_4_5.yaml``).
 
 Seed-TTS WER, speaker similarity (SIM), and UTMOS are gated over
 ``/v1/chat/completions`` (whole-utterance TTS) on the duplex deploy config
@@ -70,15 +70,12 @@ _SEED_EXTRA_BODY = {
         "use_tts_template": True,
     },
 }
-# Server flags required for MiniCPM interleaved image/audio packs (Daily-Omni only).
-# Do not reuse these for Seed-TTS: ``--interleave-mm-strings`` + TTS ref_audio can trip
-# msgspec ValidationError and kill the orchestrator mid-suite.
-# Also pinned in ``minicpmo_4_5.yaml`` stage 0 so they survive config-path routing.
+# Daily-Omni's interleaved image/audio packs are handled by the Thinker.
+# Interleaving TTS ref_audio can raise a msgspec ValidationError in the orchestrator.
 _DAILY_OMNI_SERVER_ARGS = [
     "--trust-remote-code",
-    "--interleave-mm-strings",
-    "--media-io-kwargs",
-    '{"video":{"fps":1,"num_frames":128}}',
+    "--stage-overrides",
+    '{"0":{"interleave_mm_strings":true,"media_io_kwargs":{"video":{"fps":1,"num_frames":128}}}}',
 ]
 _SEED_TTS_SERVER_ARGS = [
     "--trust-remote-code",

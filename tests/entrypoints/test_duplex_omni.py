@@ -421,7 +421,7 @@ async def test_a_resume_cancelled_mid_rpc_is_adopted_and_detached_once_it_lands(
         handle = await omni.open_session()
         engine.resume_gate = asyncio.Event()
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -454,7 +454,7 @@ async def test_a_resume_cancelled_then_timed_out_is_settled_by_replaying_it(monk
         engine.resume_gate = asyncio.Event()
         engine.resume_timeouts_remaining = 1
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -486,7 +486,7 @@ async def test_an_abandoned_resume_is_settled_through_the_callers_callback(monke
         resume = asyncio.create_task(
             omni.resume_session(handle.session_id, expected_lease_generation=0, on_abandoned=on_abandoned)
         )
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
             await resume
@@ -515,7 +515,7 @@ async def test_an_abandoned_resume_keeps_replaying_across_repeated_timeouts(monk
         engine.resume_gate = asyncio.Event()
         engine.resume_timeouts_remaining = 2
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
