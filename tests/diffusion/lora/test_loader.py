@@ -324,6 +324,25 @@ class TestLoraLoaderMixin:
         # validate the weights are restored
         assert_params_equal(pipeline.transformer, original_params)
 
+    @pytest.mark.parametrize("quant_dtype", [torch.int8, torch.float8_e4m3fn], ids=["int8", "fp8"])
+    def test_load_lora_into_module_rejects_quantized_weight(self, quant_dtype: torch.dtype):
+        """A LoRA delta cast to int8/fp8 and added to quantized (K, N) data is wrong,
+        so fusion must fail and leave the quantized weight unchanged."""
+        pipeline = DummyPipeline(1, HEAD_DIM)
+        to_out = pipeline.transformer.blocks[0].attn.to_out
+        # Square, so a transposed (K, N) layout still matches the delta shape.
+        to_out.weight = nn.Parameter(torch.zeros(HEAD_DIM, HEAD_DIM).to(quant_dtype), requires_grad=False)
+        weight_before = to_out.weight.detach().view(torch.uint8).clone()
+        state_dict = {
+            "transformer.blocks.0.attn.to_out.lora_A.weight": torch.randn(RANK, HEAD_DIM),
+            "transformer.blocks.0.attn.to_out.lora_B.weight": torch.randn(HEAD_DIM, RANK),
+        }
+
+        with pytest.raises(ValueError, match=r"transformer\.blocks\.0\.attn\.to_out\.weight"):
+            pipeline.load_lora_into_module(state_dict, pipeline.transformer)
+
+        assert torch.equal(to_out.weight.detach().view(torch.uint8), weight_before)
+
 
 # ======================================================
 # Test QwenImageLoraLoaderMixin
