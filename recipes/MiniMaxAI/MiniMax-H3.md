@@ -668,6 +668,11 @@ vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors 
   --deploy-config vllm_omni/deploy/minimax_h3_disaggregated.yaml
 ```
 
+This deployment defaults to 50 steps. For a Turbo file, send
+`num_inference_steps: 8` with each request. Do not use the `_turbo`
+deployments: they carry LightX2V's 5-step defaults for the official
+checkpoint.
+
 ## AMD ROCm (gfx942 / gfx950)
 
 The sections above describe the NVIDIA CUDA path. This section covers the AMD
