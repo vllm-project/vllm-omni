@@ -2341,6 +2341,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         request_id = request_id or f"speech-{random_uuid()}"
 
+        # Resolve precedence and apply vLLM's temperature validation/floor
+        # before adapters consume sampling metadata from extra_params.
+        temperature = request.temperature
+        if temperature is None and request.extra_params is not None:
+            temperature = request.extra_params.get("temperature")
+        if temperature is not None:
+            temperature = SamplingParams(temperature=temperature).temperature
+            updates: dict[str, object] = {"extra_params": {**(request.extra_params or {}), "temperature": temperature}}
+            if request.temperature is not None:
+                updates["temperature"] = temperature
+            request = request.model_copy(update=updates)
+
         # If this is a streaming request with real async chunks, we need to
         # coerce cumulative outputs to delta outputs; this ensures we don't
         # emit redundant MM data & drain after emitting. Qwen3-TTS full-payload
@@ -2369,6 +2381,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         segment_silence_ms = 200
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if (adapter := self._get_tts_adapter()) is not None:
+            if request.temperature is not None and not adapter.supports_temperature:
+                raise ValueError(f"Model '{adapter.name}' does not support 'temperature'")
             adapter.normalize(request)
             validation_error = validate_tts_request(adapter, request)
             if validation_error:
@@ -2422,9 +2436,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             text = request.input[: max(cap - base_len, 0)]
             logger.debug("TTS speech request %s: text=%r", request_id, text)
 
+        extra_params = request.extra_params
+
         # Apply model-specific extra parameters
-        if request.extra_params is not None and sampling_params_list:
-            if not isinstance(request.extra_params, dict):
+        if extra_params is not None and sampling_params_list:
+            if not isinstance(extra_params, dict):
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
@@ -2433,7 +2449,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
             for name in ("temperature", "top_p", "top_k"):
-                if (value := request.extra_params.get(name)) is not None:
+                if (value := extra_params.get(name)) is not None:
                     setattr(sampling_params_list[0], name, value)
             if sampling_params_list[0].extra_args is None:
                 sampling_params_list[0].extra_args = {}
@@ -2441,9 +2457,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # seeded-request isolation policy, not a client knob: copying it
             # from extra_params would let a request serialize the engine without
             # asking for reproducibility.
-            applied_extra_params = {
-                key: value for key, value in request.extra_params.items() if key != "omni_user_seed"
-            }
+            applied_extra_params = {key: value for key, value in extra_params.items() if key != "omni_user_seed"}
             sampling_params_list[0].extra_args.update(applied_extra_params)
             logger.info("Applied extra_params: %s", applied_extra_params)
 
@@ -2770,6 +2784,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             adapter = self._get_tts_adapter()
             if adapter is None:
                 raise ValueError(f"Model {self._diffusion_model_name!r} does not provide a diffusion TTS adapter.")
+
+            if request.temperature is not None:
+                raise ValueError("Diffusion TTS models do not support 'temperature'")
 
             adapter.normalize(request)
 
