@@ -19,7 +19,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.sampling_params import SamplingParams
 
 from tests.model_executor.models.csm.test_csm_talker import _build_talker, _config
-from vllm_omni.model_executor.models.csm.csm_talker import CsmTalkerForConditionalGeneration
+from vllm_omni.model_executor.models.csm.csm_talker import REFERENCE_AUDIO_KEY, CsmTalkerForConditionalGeneration
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -58,6 +58,7 @@ class _Engine:
         self.frame_calls: list[dict] = []
         self.first_codes: list[torch.Tensor] = []
         self.decode_inputs: list[tuple[str, torch.Tensor]] = []
+        self.prefill_inputs: dict[str, torch.Tensor] = {}
         hidden_size = talker.config.hidden_size
 
         # lm_head scores planned code ``c`` from hidden direction ``PLANNED_CODES.index(c)``.
@@ -104,15 +105,25 @@ class _Engine:
         state._has_mtp = True
         self.state = state
 
-    def add(self, req_id: str, slot: int, plan: list[int], *, seed: int | None = None, prompt_len: int = 3) -> None:
+    def add(
+        self,
+        req_id: str,
+        slot: int,
+        plan: list[int],
+        *,
+        seed: int | None = None,
+        prompt_len: int = 3,
+        prompt: list[int] | None = None,
+        **request_fields,
+    ) -> None:
         extra_args = {"tts_local_seed": seed} if seed is not None else None
         self.state.intermediate_buffer.buffers[slot] = {
             "req_id": req_id,
             "sampling_params": SamplingParams(max_tokens=64, extra_args=extra_args),
+            **request_fields,
         }
-        self.requests[req_id] = SimpleNamespace(
-            slot=slot, plan=plan, prompt=list(range(100, 100 + prompt_len)), computed=0, tokens=[], frames=[]
-        )
+        prompt = list(range(100, 100 + prompt_len)) if prompt is None else prompt
+        self.requests[req_id] = SimpleNamespace(slot=slot, plan=plan, prompt=prompt, computed=0, tokens=[], frames=[])
 
     def finish(self, req_id: str) -> None:
         """What the runner does for a finished or aborted request."""
@@ -138,6 +149,9 @@ class _Engine:
         for row, request in enumerate(requests):
             if request.tokens:
                 self.decode_inputs.append((order[row], inputs["inputs_embeds"][batch.logits_indices[row]].clone()))
+            else:
+                span = slice(batch.query_start_loc_np[row], int(batch.logits_indices[row]) + 1)
+                self.prefill_inputs[order[row]] = inputs["inputs_embeds"][span].clone()
 
         # Stand-in backbone: each request's last position points at its planned first codebook.
         hidden = torch.zeros((batch.num_tokens, talker.config.hidden_size))
@@ -246,6 +260,34 @@ def test_the_step_after_the_stop_token_publishes_nothing(engine: _Engine) -> Non
     assert set(talker._stop_flags) == {"b"}
     engine.finish("b")
     assert talker._stop_flags == {}
+
+
+def test_reference_audio_is_embedded_at_prefill_through_the_model_state(engine: _Engine) -> None:
+    talker = engine.talker
+    audio, audio_eos = talker.config.audio_token_id, talker.config.audio_eos_token_id
+    prompt = [100, 101, audio, audio, audio_eos, 102, 103]
+    waveform = 0.1 * torch.randn(1920 * 2, generator=torch.Generator().manual_seed(0))
+    engine.add("with_reference", slot=0, plan=[7, 9], prompt=prompt, **{REFERENCE_AUDIO_KEY: waveform})
+    engine.add("text_only", slot=1, plan=[9, 9])
+
+    with torch.no_grad():
+        engine.step(["with_reference", "text_only"])
+        codes = talker.codec_model.encode(waveform[None, None]).audio_codes[0].T
+        frames = talker.embed_audio_frames(codes)
+        audio_eos_frame = talker.embed_audio_frames(torch.zeros((1, talker.num_codebooks), dtype=torch.long))
+        text = talker.embed_input_ids(torch.tensor(prompt))
+
+    embeds = engine.prefill_inputs["with_reference"]
+    torch.testing.assert_close(embeds[2:4], frames)
+    torch.testing.assert_close(embeds[4:5], audio_eos_frame)
+    assert torch.equal(embeds[:2], text[:2]) and torch.equal(embeds[5:], text[5:])
+    assert not torch.isclose(embeds[2:5], text[2:5]).all(dim=-1).any()
+    # The other request of the batch is untouched, and nothing is kept after the prefill.
+    assert torch.equal(engine.prefill_inputs["text_only"], talker.embed_input_ids(torch.tensor([100, 101, 102])))
+    assert talker._references == {}
+
+    engine.step(["with_reference", "text_only"])
+    assert [int(frame[0]) for frame in engine.requests["with_reference"].frames] == [7, 9]
 
 
 def test_decode_input_is_the_previous_frame_embedding(engine: _Engine) -> None:

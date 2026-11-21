@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Incremental Mimi decoding: each call decodes only new frames, using state kept from earlier ones.
+"""Mimi codec helpers for CSM: checkpoint weight names and incremental decoding.
 
-Mimi's decoder is causal, so decoding a sequence in pieces gives the same
-waveform as decoding it at once, provided three kinds of state carry over:
-the decoder transformer's keys and values, the left context of every causal
-convolution, and the overlapping tail of every transposed convolution.
+Incremental decoding: each call decodes only new frames, using state kept from
+earlier ones. Mimi's decoder is causal, so decoding a sequence in pieces gives
+the same waveform as decoding it at once, provided three kinds of state carry
+over: the decoder transformer's keys and values, the left context of every
+causal convolution, and the overlapping tail of every transposed convolution.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,6 +22,37 @@ from transformers.models.mimi.modeling_mimi import (
     MimiConvTranspose1d,
     MimiResnetBlock,
 )
+
+CODEC_PREFIX = "codec_model."
+
+# transformers 5.21 moved Mimi's encoder and decoder halves into submodules;
+# sesame/csm-1b stores the earlier flat names.
+_FLAT_TO_NESTED = {
+    "encoder.layers.": "encoder.encoder_seanet.layers.",
+    "encoder_transformer.": "encoder.encoder_transformer.",
+    "downsample.": "encoder.downsample.",
+    "decoder.layers.": "decoder.decoder_seanet.layers.",
+    "decoder_transformer.": "decoder.decoder_transformer.",
+    "upsample.": "decoder.upsample.",
+}
+
+
+def codec_weight_name(name: str, *, nested: bool) -> str:
+    """Rename a Mimi weight (relative to the codec) to the installed module layout."""
+    pairs = _FLAT_TO_NESTED.items() if nested else ((new, old) for old, new in _FLAT_TO_NESTED.items())
+    for source, target in pairs:
+        if name.startswith(source):
+            return target + name[len(source) :]
+    return name
+
+
+def rename_codec_weights(weights: Iterable[tuple[str, torch.Tensor]], codec: Any) -> Iterator[tuple[str, torch.Tensor]]:
+    """Rename the codec weights of a CSM checkpoint to ``codec``'s layout; other weights pass through."""
+    nested = hasattr(codec.encoder, "encoder_seanet")
+    for name, tensor in weights:
+        if name.startswith(CODEC_PREFIX):
+            name = CODEC_PREFIX + codec_weight_name(name[len(CODEC_PREFIX) :], nested=nested)
+        yield name, tensor
 
 
 @dataclass

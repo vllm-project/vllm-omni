@@ -16,7 +16,9 @@ import vllm.distributed.parallel_state as parallel_state
 from transformers import CsmConfig, CsmForConditionalGeneration
 from vllm.config import VllmConfig, set_current_vllm_config
 
+from vllm_omni.model_executor.models.csm.csm_mimi import CODEC_PREFIX, codec_weight_name
 from vllm_omni.model_executor.models.csm.csm_talker import (
+    REFERENCE_AUDIO_KEY,
     CsmTalkerForConditionalGeneration,
     empty_frame_mask,
     stop_frame_mask,
@@ -102,7 +104,13 @@ def _build_talker(
 @pytest.fixture(scope="module")
 def reference() -> CsmForConditionalGeneration:
     torch.manual_seed(0)
-    return CsmForConditionalGeneration(_config()).eval()
+    model = CsmForConditionalGeneration(_config()).eval()
+    with torch.no_grad():
+        # A fresh Mimi codebook encodes every frame to code 0; give it content.
+        for name, buffer in model.codec_model.named_buffers():
+            if name.endswith("embed_sum"):
+                buffer.normal_()
+    return model
 
 
 @pytest.fixture(scope="module")
@@ -135,9 +143,9 @@ def test_every_parameter_is_loaded_and_every_weight_is_used(
     own = {name for name, _ in talker.named_parameters()}
     assert own <= names
 
-    stage_weights = {name for name in reference.state_dict() if not name.startswith("codec_model.")}
-    assert {_expected_target(name) for name in stage_weights} == names
-    assert not any(name.startswith("codec_model.") for name in names)
+    assert {_expected_target(name) for name in reference.state_dict()} == names
+    # The codec is loaded for reference audio.
+    assert sum(name.startswith(CODEC_PREFIX) for name in names) == len(reference.codec_model.state_dict())
 
 
 def test_loaded_tensors_equal_the_checkpoint(
@@ -148,8 +156,10 @@ def test_loaded_tensors_equal_the_checkpoint(
     own = dict(talker.named_parameters())
     own.update({f"depth_decoder.{name}": tensor for name, tensor in talker.depth_decoder.state_dict().items()})
 
+    own.update({CODEC_PREFIX + name: tensor for name, tensor in talker.codec_model.state_dict().items()})
+
     for name, tensor in state.items():
-        if name.startswith("codec_model.") or _expected_target(name) != name:
+        if _expected_target(name) != name:
             continue
         assert torch.equal(own[name], tensor), name
 
@@ -276,3 +286,163 @@ def test_talker_mtp_computes_a_stop_token_row_on_a_valid_code(
     # The discarded row does not change the live one.
     assert int(codes[1, 0]) == 7 and codes[1, 1:].any()
     assert torch.equal(codes[1], alone[0])
+
+
+def test_codec_loads_from_the_flat_names_of_the_checkpoint(
+    reference: CsmForConditionalGeneration, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sesame/csm-1b stores the Mimi weights under the names used before transformers 5.21."""
+    flat = {
+        (CODEC_PREFIX + codec_weight_name(name[len(CODEC_PREFIX) :], nested=False))
+        if name.startswith(CODEC_PREFIX)
+        else name: tensor
+        for name, tensor in reference.state_dict().items()
+    }
+    talker = _build_talker(reference.config, monkeypatch)
+
+    talker.load_weights(flat.items())
+
+    assert talker.codec_model.encoder.downsample.conv.weight.dtype == torch.float32
+    for name, tensor in reference.codec_model.state_dict().items():
+        assert torch.equal(talker.codec_model.state_dict()[name], tensor), name
+
+
+def _reference_prompt(config: CsmConfig, frames: int) -> torch.Tensor:
+    """Token ids of a reference turn, its audio placeholders and audio-EOS, then the turn to speak."""
+    return torch.tensor([11, 12, 13, *[config.audio_token_id] * frames, config.audio_eos_token_id, 21, 22, 23, 24])
+
+
+def _waveform(samples: int, seed: int = 4) -> torch.Tensor:
+    return 0.1 * torch.randn(samples, generator=torch.Generator().manual_seed(seed))
+
+
+def _transformers_prompt_embeds(
+    reference: CsmForConditionalGeneration, input_ids: torch.Tensor, waveform: torch.Tensor
+) -> torch.Tensor:
+    return reference._merge_input_ids_with_input_values(
+        input_ids=input_ids[None],
+        input_values=waveform[None, None],
+        input_values_cutoffs=torch.tensor([[waveform.shape[0]]]),
+    )["inputs_embeds"][0]
+
+
+@pytest.mark.parametrize("samples", [1920 * 6, 1920 * 6 + 1, 5000])
+def test_reference_audio_prompt_embeddings_match_transformers(
+    reference: CsmForConditionalGeneration, loaded: tuple[CsmTalkerForConditionalGeneration, set[str]], samples: int
+) -> None:
+    talker, _ = loaded
+    waveform = _waveform(samples)
+    frames = -(-samples // 1920)
+    input_ids = _reference_prompt(reference.config, frames)
+    with torch.no_grad():
+        expected = _transformers_prompt_embeds(reference, input_ids, waveform)
+        # The reference frames differ from each other and from the audio-EOS frame.
+        codes = reference.codec_model.encode(waveform[None, None]).audio_codes
+        assert codes.shape == (1, 32, frames) and codes.unique().numel() > 1
+        _, embeds, update = talker.preprocess(
+            input_ids,
+            None,
+            req_id="a",
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=input_ids.shape[0],
+            **{REFERENCE_AUDIO_KEY: waveform},
+        )
+
+    torch.testing.assert_close(embeds, expected)
+    assert update == {}
+    # Text positions keep their text embeddings; the placeholders do not.
+    text_embeds = talker.embed_input_ids(input_ids)
+    assert torch.equal(embeds[:3], text_embeds[:3]) and torch.equal(embeds[-4:], text_embeds[-4:])
+    assert not torch.isclose(embeds[3:-4], text_embeds[3:-4]).all(dim=-1).any()
+    # Nothing is kept once the whole prompt is embedded.
+    assert talker._references == {}
+
+
+@pytest.mark.parametrize("cuts", [(2,), (5,), (3, 9), (4, 10, 12), (1, 2, 3, 9, 10)])
+def test_reference_audio_survives_a_prefill_split_across_steps(
+    reference: CsmForConditionalGeneration,
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]],
+    cuts: tuple[int, ...],
+) -> None:
+    talker, _ = loaded
+    waveform = _waveform(1920 * 6)
+    input_ids = _reference_prompt(reference.config, 6)
+    bounds = [0, *cuts, input_ids.shape[0]]
+    spans = []
+    with torch.no_grad():
+        expected = _transformers_prompt_embeds(reference, input_ids, waveform)
+        for begin, end in zip(bounds[:-1], bounds[1:]):
+            _, embeds, _ = talker.preprocess(
+                input_ids[begin:end],
+                None,
+                req_id="a",
+                _omni_is_prefill=True,
+                _omni_num_computed_tokens=begin,
+                _omni_prompt_len=input_ids.shape[0],
+                **{REFERENCE_AUDIO_KEY: waveform},
+            )
+            spans.append(embeds)
+            assert ("a" in talker._references) == (end < input_ids.shape[0])
+
+    torch.testing.assert_close(torch.cat(spans), expected)
+
+
+def test_audio_tokens_without_a_recording_keep_their_text_embeddings(
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]],
+) -> None:
+    talker, _ = loaded
+    input_ids = _reference_prompt(talker.config, 2)
+    with torch.no_grad():
+        _, embeds, _ = talker.preprocess(input_ids, None, req_id="a", _omni_is_prefill=True)
+        assert torch.equal(embeds, talker.embed_input_ids(input_ids))
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda ids, config: torch.cat((ids[:3], ids[4:])),  # one placeholder short
+        lambda ids, config: torch.cat((ids[:3], ids[3:4], ids[3:])),  # one placeholder too many
+        lambda ids, config: ids[ids != config.audio_eos_token_id],  # no audio-EOS token
+        lambda ids, config: torch.cat((ids, ids[3:4])),  # a stray placeholder after the turn
+        lambda ids, config: ids[(ids != config.audio_token_id) & (ids != config.audio_eos_token_id)],  # text only
+        lambda ids, config: ids[:6],  # the prompt ends inside the recording
+    ],
+)
+def test_prompt_that_does_not_match_the_recording_is_rejected(
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]], edit
+) -> None:
+    talker, _ = loaded
+    input_ids = edit(_reference_prompt(talker.config, 6), talker.config)
+    with torch.no_grad(), pytest.raises(ValueError, match="does not match its reference audio"):
+        talker.preprocess(
+            input_ids,
+            None,
+            req_id="a",
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=input_ids.shape[0],
+            **{REFERENCE_AUDIO_KEY: _waveform(1920 * 6)},
+        )
+    assert talker._references == {}
+
+
+def test_finished_requests_drop_their_reference(loaded: tuple[CsmTalkerForConditionalGeneration, set[str]]) -> None:
+    talker, _ = loaded
+    input_ids = _reference_prompt(talker.config, 6)
+    with torch.no_grad():
+        # Aborted after the first prefill span.
+        talker.preprocess(
+            input_ids[:5],
+            None,
+            req_id="a",
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=input_ids.shape[0],
+            **{REFERENCE_AUDIO_KEY: _waveform(1920 * 6)},
+        )
+    assert set(talker._references) == {"a"}
+
+    talker.on_requests_finished(["a"])
+
+    assert talker._references == {}

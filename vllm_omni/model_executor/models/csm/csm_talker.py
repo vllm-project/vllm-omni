@@ -10,6 +10,10 @@ Generation ends on a frame whose codebooks, except the last, are all the EOS id.
 That cannot be seen from the first codebook alone, so the step after such a
 frame is forced to emit ``stop_token_id``, an engine-only id one past the
 codebook vocabulary.
+
+A prompt may carry one reference recording. Its waveform arrives with the
+request, is encoded with the Mimi codec at prefill, and the resulting frame
+embeddings replace the prompt's audio placeholders.
 """
 
 from __future__ import annotations
@@ -22,18 +26,22 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import MimiModel
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaModel
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, make_layers, maybe_prefix
+from vllm.model_executor.models.utils import AutoWeightsLoader, make_layers, maybe_prefix
 
 from vllm_omni.model_executor.models.csm.csm_depth_decoder import CsmDepthDecoder, draw_frame_uniforms
+from vllm_omni.model_executor.models.csm.csm_mimi import rename_codec_weights
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 # Depth-decoder sampling of sesame/csm-1b's generation_config.json (depth_decoder_*).
 _DEFAULT_DEPTH_SAMPLING = {"do_sample": True, "temperature": 0.9, "top_k": 50, "top_p": 1.0}
+# Request field holding the reference recording: a mono waveform at the codec's sample rate.
+REFERENCE_AUDIO_KEY = "csm_ref_audio"
 
 
 def stop_frame_mask(codes: torch.Tensor, codebook_eos_token_id: int = 0) -> torch.Tensor:
@@ -97,9 +105,6 @@ class CsmTalkerForConditionalGeneration(nn.Module):
     allow_patterns_overrides = ["transformers-*.safetensors"]
     fall_back_to_pt_during_load = False
 
-    # The Mimi codec is unused in this stage.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"codec_model.": None})
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -123,6 +128,10 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         self.depth_decoder = CsmDepthDecoder(config.depth_decoder_config)
         # Tied in the checkpoint (tie_codebooks_embeddings).
         self.depth_decoder.model.embed_tokens.weight = self.backbone_model.embed_tokens.embed_audio_tokens.weight
+        # Encodes reference audio; runs in float32 whatever dtype the stage is configured with.
+        self.codec_model = MimiModel(config.codec_config).to(torch.float32)
+        self.audio_token_id = int(config.audio_token_id)
+        self.audio_eos_token_id = int(config.audio_eos_token_id)
 
         self.have_multimodal_outputs = True
         self.has_preprocess = True
@@ -147,6 +156,9 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         self.register_buffer("_zero_text_step", torch.zeros((1, config.hidden_size)), persistent=False)
         self._stop_flags: dict[str, torch.Tensor] = {}
         self._forced_stop_mask: torch.Tensor | None = None
+        # Per request: reference frame embeddings followed by the audio-EOS embedding, and the prompt
+        # position of the first placeholder (None until a prefill span reaches it).
+        self._references: dict[str, tuple[torch.Tensor, int | None]] = {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         """Embed prompt text tokens."""
@@ -213,16 +225,78 @@ class CsmTalkerForConditionalGeneration(nn.Module):
     def preprocess(
         self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info: Any
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Per-request input hook: prompt rows pass through, decode rows take the stored frame embedding."""
+        """Per-request input hook.
+
+        Prompt rows keep their text embeddings, except the audio placeholders of
+        a reference recording; decode rows take the stored frame embedding.
+        """
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
         is_prefill = info.get("_omni_is_prefill")
         if is_prefill is None:
             is_prefill = input_ids.shape[0] != 1
         if is_prefill:
+            waveform = info.get(REFERENCE_AUDIO_KEY)
+            if waveform is not None:
+                input_embeds = self._embed_reference_audio(input_ids, input_embeds, waveform, info)
             return input_ids, input_embeds, {}
         # CSM adds nothing to the frame embedding on decode steps.
         return input_ids, input_embeds, {"mtp_inputs": (self._zero_text_step, self._zero_text_step)}
+
+    def _embed_reference_audio(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor, waveform: Any, info: Mapping[str, Any]
+    ) -> torch.Tensor:
+        """Put the reference recording's frame embeddings on this prompt span's audio placeholders.
+
+        The prompt holds one placeholder per frame followed by the audio-EOS
+        token, which takes the embedding of an all-EOS frame. A prompt that
+        does not match the recording's frame count is rejected.
+        """
+        req_id = info.get("req_id")
+        frames, start = self._references.get(req_id, (None, None))
+        if frames is None:
+            samples = torch.as_tensor(waveform, dtype=torch.float32).to(input_embeds.device).reshape(1, 1, -1)
+            codes = self.codec_model.encode(samples).audio_codes[0].T
+            audio_eos = codes.new_full((1, self.num_codebooks), self.codebook_eos_token_id)
+            frames = self.embed_audio_frames(torch.cat((codes, audio_eos)))
+        num_frames = frames.shape[0] - 1
+
+        is_audio = input_ids == self.audio_token_id
+        is_audio_eos = input_ids == self.audio_eos_token_id
+        computed = int(info.get("_omni_num_computed_tokens") or 0)
+        if start is None and bool(is_audio.any()):
+            start = computed + int(is_audio.int().argmax())
+        if start is None:
+            expected_audio = expected_audio_eos = torch.zeros_like(is_audio)
+            index = None
+        else:
+            index = computed + torch.arange(input_ids.shape[0], device=input_ids.device) - start
+            expected_audio = (index >= 0) & (index < num_frames)
+            expected_audio_eos = index == num_frames
+        prompt_len = info.get("_omni_prompt_len")
+        prompt_done = prompt_len is not None and computed + input_ids.shape[0] >= int(prompt_len)
+        matches = torch.equal(is_audio, expected_audio) and torch.equal(is_audio_eos, expected_audio_eos)
+        # By the end of the prompt every frame and the audio-EOS token must have had a position.
+        if prompt_done and (start is None or start + num_frames >= int(prompt_len)):
+            matches = False
+        if not matches:
+            self._references.pop(req_id, None)
+            raise ValueError(
+                f"The CSM prompt of request {req_id} does not match its reference audio: the recording has "
+                f"{num_frames} frames, which need as many audio placeholders followed by one audio-EOS token"
+            )
+        if index is not None:
+            replaced = (is_audio | is_audio_eos)[:, None]
+            reference = frames.index_select(0, index.clamp(0, num_frames)).to(input_embeds.dtype)
+            input_embeds = torch.where(replaced, reference, input_embeds)
+
+        if req_id is not None:
+            if prompt_done:
+                # The whole prompt is embedded; the frames are not needed again.
+                self._references.pop(req_id, None)
+            else:
+                self._references[req_id] = (frames, start)
+        return input_embeds
 
     def mtp_frame_valid(self, layer0: torch.Tensor) -> torch.Tensor:
         """Rows whose first codebook is a code rather than the stop token."""
@@ -287,9 +361,10 @@ class CsmTalkerForConditionalGeneration(nn.Module):
     get_mtp_seed = staticmethod(get_tts_local_seed)
 
     def on_requests_finished(self, req_ids: Iterable[str]) -> None:
-        """Drop the stop flags of finished or aborted requests."""
+        """Drop the per-request state of finished or aborted requests."""
         for req_id in req_ids:
             self._stop_flags.pop(req_id, None)
+            self._references.pop(req_id, None)
 
     def generate_frame(
         self,
@@ -314,5 +389,5 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load a transformers-format CSM checkpoint."""
-        return AutoWeightsLoader(self).load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        """Load a transformers-format CSM checkpoint, whichever Mimi layout it and transformers use."""
+        return AutoWeightsLoader(self).load_weights(rename_codec_weights(weights, self.codec_model))

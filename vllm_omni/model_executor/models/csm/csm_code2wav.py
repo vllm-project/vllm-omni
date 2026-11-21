@@ -14,33 +14,17 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.model_executor.models.csm.csm_mimi import CsmMimiStreamingDecoder, MimiDecoderState
+from vllm_omni.model_executor.models.csm.csm_mimi import (
+    CODEC_PREFIX,
+    CsmMimiStreamingDecoder,
+    MimiDecoderState,
+    rename_codec_weights,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-_CODEC_PREFIX = "codec_model."
 _DUMMY_PROFILE_KEY = "csm_dummy_profile"
-
-# transformers 5.21 moved Mimi's encoder and decoder halves into submodules;
-# sesame/csm-1b stores the earlier flat names.
-_FLAT_TO_NESTED = {
-    "encoder.layers.": "encoder.encoder_seanet.layers.",
-    "encoder_transformer.": "encoder.encoder_transformer.",
-    "downsample.": "encoder.downsample.",
-    "decoder.layers.": "decoder.decoder_seanet.layers.",
-    "decoder_transformer.": "decoder.decoder_transformer.",
-    "upsample.": "decoder.upsample.",
-}
-
-
-def codec_weight_name(name: str, *, nested: bool) -> str:
-    """Rename a Mimi weight (relative to the codec) to the installed module layout."""
-    pairs = _FLAT_TO_NESTED.items() if nested else ((new, old) for old, new in _FLAT_TO_NESTED.items())
-    for source, target in pairs:
-        if name.startswith(source):
-            return target + name[len(source) :]
-    return name
 
 
 def _split_by_request(ids: torch.Tensor, seq_token_counts: Sequence[int] | None) -> list[torch.Tensor]:
@@ -207,11 +191,5 @@ class CsmCode2Wav(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the codec from a CSM checkpoint, whichever Mimi layout it and transformers use."""
-        nested = hasattr(self.codec_model.encoder, "encoder_seanet")
-
-        def codec_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            for name, tensor in weights:
-                if name.startswith(_CODEC_PREFIX):
-                    yield _CODEC_PREFIX + codec_weight_name(name[len(_CODEC_PREFIX) :], nested=nested), tensor
-
-        return AutoWeightsLoader(self).load_weights(codec_weights())
+        renamed = rename_codec_weights(weights, self.codec_model)
+        return AutoWeightsLoader(self).load_weights(item for item in renamed if item[0].startswith(CODEC_PREFIX))

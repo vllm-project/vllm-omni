@@ -10,7 +10,8 @@ import torch
 from transformers import CsmConfig, MimiModel
 
 from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmAdapter
-from vllm_omni.model_executor.models.csm.csm_code2wav import CsmCode2Wav, codec_weight_name
+from vllm_omni.model_executor.models.csm.csm_code2wav import CsmCode2Wav
+from vllm_omni.model_executor.models.csm.csm_mimi import codec_weight_name
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.csm import talker2code2wav_async_chunk
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
