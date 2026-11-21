@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .taeh3 import TAEH3Decoder, decode_taeh3_chunks
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -353,6 +354,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # Set from ``tae_decoder_path``; absent means the checkpoint's own decoder.
+    tae_decoder: TAEH3Decoder | None = None
 
     def __init__(
         self,
@@ -365,6 +368,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
+        tae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
     ) -> None:
         super().__init__()
@@ -375,6 +379,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
         if lightvae_decoder_path is not None and decoder_source is not None:
             raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
+        if tae_decoder_path is not None and (decoder_source is not None or lightvae_decoder_path is not None):
+            raise ValueError("tae_decoder_path cannot be combined with video_vae_decoder or lightvae_decoder_path")
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -405,6 +411,20 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                     device,
                 )
                 del checkpoint
+            if tae_decoder_path is not None:
+                # Keep the tiny decoder outside the registered module tree: it
+                # stays resident on the target device and must not follow the
+                # checkpoint halves through staging or offload.
+                object.__setattr__(self, "tae_decoder", TAEH3Decoder(tae_decoder_path, device=device))
+                # It replaces the decode half outright. Dropping that half
+                # keeps it off the device and out of the stagers.
+                _remove_modules(self.remote.model, ("post_quant_conv", "decoder"))
+                logger.info(
+                    "Loaded H3 tiny video decoder (TAEH3): path=%s dtype=%s device=%s",
+                    tae_decoder_path,
+                    self.tae_decoder.dtype,
+                    device,
+                )
         # Match the reference loader contract before installing inference-only
         # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
         # weights may be materialized in FP16 because reference decode casts
@@ -529,6 +549,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         raise ValueError(f"unknown video VAE part {part!r}")
 
     def _load_part_to_device(self, part: str) -> None:
+        if part == "decoder" and self.tae_decoder is not None:
+            # The tiny decoder is resident. Without the decode half the stagers
+            # cover the encoder only, which a decode must not pull in.
+            return
         stager = self._part_stager(part)
         if stager is not None:
             stager.load()
@@ -540,6 +564,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.remote.to(self._device_target)
 
     def _offload_part_to_cpu(self, part: str) -> None:
+        if part == "decoder" and self.tae_decoder is not None:
+            return
         stager = self._part_stager(part)
         if stager is not None:
             stager.offload()
@@ -1247,6 +1273,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
+        if self.tae_decoder is not None:
+            # No tiles and no collectives: every rank of a VAE group decodes
+            # the whole video itself, as the gathered full decode leaves it.
+            return self.tae_decoder.decode(latent)
         # Record the gather-protocol decision for this decode before any tile
         # is dispatched. It comes from the grid geometry alone, so every rank
         # records the same value and the gather never has to choose a
@@ -1307,13 +1337,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
         if not callable(on_chunk):
             raise TypeError("on_chunk must be callable")
-        if not callable(getattr(self.model, "_adaptive_decode", None)):
+        if self.tae_decoder is None and not callable(getattr(self.model, "_adaptive_decode", None)):
             raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
         group = None
         if self.is_distributed_enabled():
             group = self._native_parallel_state().get("sp_process_group")
             if group is None or dist.get_world_size(group) != self.parallel_size:
                 raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
+        if self.tae_decoder is not None:
+            decode_taeh3_chunks(self.tae_decoder, z, on_chunk, group=group)
+            return
         # Native H3 tiling performs its own collectives for every temporal clip,
         # so this path needs the same too-few-tiles fallback as the complete
         # decode: without it a shape that leaves some ranks tileless hangs the

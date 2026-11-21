@@ -44,6 +44,11 @@ VAE. Omit `video_vae_decoder` when selecting LiteVAE. See the
 [LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for checkpoint
 requirements, decoder selection, and quality review.
 
+For previews or low-memory hosts, the much smaller TAEH3 decoder is selected
+with `--additional-config '{"tae_decoder_path":"/weights/taeh3.safetensors"}'`.
+It is an approximation of the original decoder; see the
+[TAEH3 guide](../../docs/user_guide/diffusion/tae_decoder.md).
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;

@@ -26,6 +26,7 @@ from .pipeline_minimax_h3 import (
     _prepare_minimax_h3_video_output,
     get_minimax_h3_post_process_func,
 )
+from .taeh3 import resolve_h3_tae_decoder_path
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 
 
@@ -86,6 +87,7 @@ class MiniMaxH3DecoderPipeline(
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
             lightvae_decoder_path=resolve_h3_lightvae_decoder_path(od_config.additional_config),
+            tae_decoder_path=resolve_h3_tae_decoder_path(od_config.additional_config),
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             str(model_path / "audio_vae"),
