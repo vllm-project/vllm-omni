@@ -442,6 +442,55 @@ steps:
             mkdir -p "$$artifact_dir"
             cp -v /tmp/lingbot-pytest.xml "$$artifact_dir/"
 
+      - label: "LingBot-Video Dense Batch CFG"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: diffusion_lingbot_function
+        artifact_paths:
+          - artifacts/rocm-lingbot-dense-batch-cfg/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 75m rocm-lingbot-dense-batch-cfg
+            tests/e2e/online_serving/test_lingbot_video_expansion.py::test_batch_cfg_extra_params
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+
+      # Keep the full-resident MoE boot separate from dense and offload cases
+      # so startup, memory and cleanup qualification have independent artifacts.
+      - label: "LingBot-Video MoE Image and Video Modes"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: diffusion_lingbot_function
+        artifact_paths:
+          - artifacts/rocm-lingbot-moe-modes/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 75m rocm-lingbot-moe-modes
+            tests/e2e/online_serving/test_lingbot_video_moe.py::test_text_to_image_moe
+            tests/e2e/online_serving/test_lingbot_video_moe.py::test_video_generation_modes_moe
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+
+      - label: "LingBot-Video MoE Layerwise and CPU Offload"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: diffusion_lingbot_function
+        artifact_paths:
+          - artifacts/rocm-lingbot-moe-offload/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 75m rocm-lingbot-moe-offload
+            tests/e2e/online_serving/test_lingbot_video_offload.py::test_text_to_video_moe_layerwise_offload
+            tests/e2e/online_serving/test_lingbot_video_offload.py::test_text_to_video_moe_cpu_offload
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+
   - group: ":full_moon: HunyuanVideo-1.5 MI300 Nightly"
     steps:
       - label: "HunyuanVideo-1.5 Default T2V Smoke"
