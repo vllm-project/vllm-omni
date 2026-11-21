@@ -230,7 +230,7 @@ class ModelChannel:
             "session_id": session.session_id,
             "response_id": response_id,
             "epoch": epoch,
-            "modalities": list(response_config.modalities),
+            "modalities": list(response_config.modalities or ()),
         }
         if request_id is not None:
             payload["request_id"] = request_id
@@ -444,7 +444,7 @@ class ModelChannel:
                 # as read-only; only the session writes authoritative history.
                 "conversation": list(history),
                 "conversation_item_ids": item_ids,
-                "modalities": list(session.response_config.modalities),
+                "modalities": list(session.response_config.modalities or ()),
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
@@ -666,7 +666,7 @@ class ModelChannel:
             auto_responds=self._out.auto_responds(),
             response_format=response_config.response_format,
             speed=response_config.speed,
-            modalities=tuple(response_config.modalities),
+            modalities=tuple(response_config.modalities or ()),
         )
 
     # ------------------------------------------------------------------ #
@@ -1133,15 +1133,26 @@ class ModelChannel:
                         completed_turn_id = session.active_response_turn_id
                     if completed_turn_id is not None:
                         session.complete_model_turn(completed_turn_id)
-            session.end_response(commit_text=False, preserve_request=auto_response)
-            settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id)
+            should_commit = self.should_commit_response_to_history(session, response_id)
+            committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
+            committed = self._settle_finished_response(
+                session,
+                response_id,
+                should_commit=should_commit,
+                committed_message=committed_message,
+            )
+            if not should_commit:
+                playback = session.playback_for_response(response_id)
+                if max(playback.sent_ms, playback.generated_ms) == 0:
+                    session.release_response_history_snapshot(response_id)
+                    session.release_response_playback(response_id)
             self._out.emit(
                 {
                     "type": "response.done",
                     "session_id": session.session_id,
                     "response_id": response_id,
                     "epoch": session.epoch,
-                    "committed": False,
+                    "committed": committed,
                     "playback": session.playback.as_dict(),
                 }
             )
@@ -1555,7 +1566,21 @@ class ModelChannel:
             stage_metrics=response_stage_metrics,
             response_request_metrics=response_request_metrics,
         )
-        self._out.emit(payload)
+        if not session.capabilities.emits_audio:
+            # The data plane supplies text and native turn boundaries. Reuse
+            # the existing text projector without synthesizing audio events.
+            if has_text:
+                self._out.emit(
+                    {
+                        "type": "response.text.delta",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": session.epoch,
+                        "delta": text,
+                    }
+                )
+        else:
+            self._out.emit(payload)
         if session.perf is not None and mark_duration_ms is not None and isinstance(response_id, str):
             session.perf.record_audio(response_id=response_id, duration_ms=mark_duration_ms - previous_sent_ms)
         if self._ctx.run.closing:

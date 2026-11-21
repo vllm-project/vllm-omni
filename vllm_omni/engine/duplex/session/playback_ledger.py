@@ -26,6 +26,8 @@ def apply_playback_ack(
     require_audio_complete: bool = False,
 ) -> list[DuplexEvent]:
     """Apply an ACK, retaining incomplete replies when calibration is enabled."""
+    if not session.capabilities.supports_playback_ack:
+        return [error_event("unsupported_operation", "This deployment does not produce audio to acknowledge")]
     played_ms = event.get("played_ms", event.get("audio_ms", 0))
     committed_ms = event.get("committed_ms")
     if not isinstance(played_ms, int | float):
@@ -70,6 +72,12 @@ def apply_playback_ack(
             return [
                 error_event("playback_item_not_found", f"No assistant response item is registered for {response_id}.")
             ]
+        if (
+            event.get("truncate") is not True
+            and not session.history_item_has_audio(item_id)
+            and (response_id != session.active_response_id or "audio" not in (session.response_config.modalities or ()))
+        ):
+            return [error_event("unsupported_operation", "Text-only items do not support playback acknowledgements")]
         history_is_late = session.playback_ack_is_too_late(response_id, item_id)
         if history_is_late and not audio_only:
             return [

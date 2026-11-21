@@ -143,6 +143,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._async_chunk_streaming = True
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        super().configure_pipeline(pipeline_config)
         stages = {stage.model_stage: stage.stage_id for stage in pipeline_config.stages}
         self.joyai_stage_id = stages["joyvl"]
         self.asr_stage_id = stages.get("asr")
