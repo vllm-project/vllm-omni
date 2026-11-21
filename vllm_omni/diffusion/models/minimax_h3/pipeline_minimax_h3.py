@@ -50,7 +50,6 @@ from vllm_omni.diffusion.models.interface import (
     SupportAudioOutput,
     SupportImageInput,
     SupportsComponentDiscovery,
-    supports_chunked_vae_decode,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import (
@@ -3825,7 +3824,6 @@ class MiniMaxH3Pipeline(
             )
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         cache_key = extra.get(LATENT_CACHE_KEY)
-        preencode_mp4 = bool(extra.get("preencode_mp4", supports_chunked_vae_decode(getattr(self, "video_vae", None))))
         return {
             "continuation": continuation,
             "latent_continuation": latent_continuation,
@@ -3874,12 +3872,16 @@ class MiniMaxH3Pipeline(
                 else None
             ),
             "num_outputs": num_outputs,
-            "preencode_mp4": preencode_mp4,
+            "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": (
-                normalize_preencode_batch_frames(extra.get("preencode_batch_frames", 17)) if preencode_mp4 else 17
+                normalize_preencode_batch_frames(extra.get("preencode_batch_frames", 17))
+                if extra.get("preencode_mp4", False)
+                else 17
             ),
             "video_codec_options": normalize_video_codec_options(
-                extra.get("video_codec_options", {"preset": "ultrafast", "threads": "0"}) if preencode_mp4 else None
+                extra.get("video_codec_options", {"preset": "ultrafast", "threads": "0"})
+                if extra.get("preencode_mp4", False)
+                else None
             ),
             **latent_edit,
         }
