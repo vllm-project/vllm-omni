@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from:
 # https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/qwen3_forced_aligner.py
 #
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import unicodedata
+from bisect import bisect_right
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -210,22 +211,26 @@ def fix_timestamp(values: list[int]) -> list[int]:
     if n == 0:
         return []
 
-    dp = [1] * n
-    parent = [-1] * n
-    for i in range(1, n):
-        for j in range(i):
-            if values[j] <= values[i] and dp[j] + 1 > dp[i]:
-                dp[i] = dp[j] + 1
-                parent[i] = j
+    # Find subsequence lengths in O(n log n). Equal bins extend the sequence.
+    tails: list[int] = []
+    levels: list[list[int]] = []
+    for i, value in enumerate(values):
+        length = bisect_right(tails, value)
+        if length == len(tails):
+            tails.append(value)
+            levels.append([])
+        else:
+            tails[length] = value
+        levels[length].append(i)
 
-    idx = dp.index(max(dp))
-    lis: list[int] = []
-    while idx != -1:
-        lis.append(idx)
-        idx = parent[idx]
+    # Keep the first endpoint and first valid predecessor, as in the original
+    # forward scan. A minimum-tail predecessor can select different bins.
     is_normal = [False] * n
-    for k in lis:
-        is_normal[k] = True
+    idx = levels[-1][0]
+    is_normal[idx] = True
+    for level in reversed(levels[:-1]):
+        idx = next(i for i in level if values[i] <= values[idx])
+        is_normal[idx] = True
 
     result = [float(v) for v in values]
     i = 0
@@ -242,6 +247,7 @@ def fix_timestamp(values: list[int]) -> list[int]:
         if count <= 2:
             for k in range(i, j):
                 if left is None:
+                    assert right is not None
                     result[k] = right
                 elif right is None:
                     result[k] = left

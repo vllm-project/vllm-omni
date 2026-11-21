@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import numpy as np
 import pytest
 
@@ -90,6 +93,30 @@ def test_decode_timestamps_rejects_marker_count_mismatch():
     )
 
     assert timestamps == []
+
+
+@pytest.mark.parametrize("classes, stride", [(4095, 1), (4096, 1), (4096, 2)])
+def test_decode_timestamps_preserves_first_maximum_and_nan(classes, stride):
+    logits = np.full((7, classes * stride), -1.0, dtype=np.float32)[:, ::stride]
+    logits[0, 0] = np.nan  # This row is not a timestamp marker.
+    logits[1, 1:3] = 1.0
+    logits[3, 2:4] = np.nan
+    logits[5, 4] = np.inf
+    logits[6, [4, 6]] = np.inf
+
+    timestamps = forced_aligner._decode_timestamps(
+        logits=logits,
+        words=["a", "b"],
+        timestamp_positions=[1, 3, 5, 6],
+        classify_num=classes,
+        timestamp_segment_time_ms=80,
+        audio_duration_ms=1000,
+    )
+
+    assert timestamps == [
+        forced_aligner.WordTimestamp("a", 80, 160),
+        forced_aligner.WordTimestamp("b", 320, 320),
+    ]
 
 
 def test_build_config_from_yaml(tmp_path):
