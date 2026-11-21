@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from vllm.config.compilation import CUDAGraphMode
@@ -18,6 +19,7 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, set_dummy_context
@@ -763,11 +765,40 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         supports_multi_frame_decode(self.model, mrv2=frames > 1)
         return frames
 
+    def _prompt_logits_fn(self) -> Any:
+        """Resolve stateless logits for prompt chunks and sampler warmup."""
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        return prompt_logits_fn if callable(prompt_logits_fn) else self.model.compute_logits
+
+    @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: Any) -> Any:
-        """The Talker's two control logits cannot satisfy profiling's top-k request."""
+        """Warm the sampler without consuming request-local model state."""
         if self._kstep_frames > 1:
             return None
-        return super()._dummy_sampler_run(hidden_states)
+        prompt_logits_fn = getattr(self.model, "compute_prompt_logits", None)
+        if not callable(prompt_logits_fn):
+            return super()._dummy_sampler_run(hidden_states)
+
+        assert self.sampler is not None
+        if self.model_state.dummy_sampler_run(self.sampler, hidden_states):
+            return None
+
+        num_reqs = hidden_states.shape[0]
+        logits = prompt_logits_fn(hidden_states)
+        dummy_input_batch = InputBatch.make_dummy(num_reqs, num_reqs, self.input_buffers)
+
+        # Mirror vLLM 0.34's default sampler profiling passes. Only the logits
+        # projection differs: dummy rows have no request-local sampling state.
+        self.sampler(logits, dummy_input_batch)
+        if current_omni_platform.is_cpu():
+            return None
+
+        warmup_params = SamplingParams.for_sampler_warmup()
+        for req_idx in range(num_reqs):
+            self.sampler.add_request(req_idx, warmup_params)
+        self.sampler.apply_staged_writes()
+        self.sampler(logits, dummy_input_batch)
+        return None
 
     def _build_kstep_model_kwargs_extra(self, model_inputs: dict[str, Any], input_batch: InputBatch) -> dict[str, Any]:
         """Build per-request spans and codec state for the multi-frame loop."""
@@ -856,6 +887,16 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
         finally:
             narrow.restore()
+
+    def _set_lora_inputs(self, input_batch: InputBatch) -> None:
+        """Activate the step's adapters: one adapter id per scheduled token and one per logits row."""
+        lora_inputs = self.lora_state.make_lora_inputs(
+            input_batch.req_ids,
+            input_batch.idx_mapping_np,
+            input_batch.num_scheduled_tokens,
+            np.diff(input_batch.cu_num_logits_np),
+        )
+        self._set_active_loras(*lora_inputs)
 
     @torch.inference_mode()
     @staged_writes.runner_context
@@ -979,12 +1020,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
 
             if self.lora_config:
-                lora_inputs = self.lora_state.make_lora_inputs(
-                    input_batch.req_ids,
-                    input_batch.idx_mapping_np,
-                    input_batch.num_scheduled_tokens,
-                )
-                self._set_active_loras(*lora_inputs)
+                self._set_lora_inputs(input_batch)
             # Encode vision and audio before language-model attention metadata.
             # A long video's ViT FlashAttention workspace and the prefill's FA3
             # scheduler workspace do not fit together; V1 runs the encoder first.
@@ -1258,6 +1294,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        lifecycle_hook = getattr(type(self.model_state), "get_request_lifecycle", None)
+        lifecycle = lifecycle_hook(self.model_state, scheduler_output) if lifecycle_hook is not None else None
+        if lifecycle is not None and lifecycle.reset_req_ids:
+            # Keep scheduler-owned completion metadata unchanged. Only the
+            # worker resets the old phase before add_requests admits its reuse.
+            scheduler_output = replace(
+                scheduler_output,
+                finished_req_ids=scheduler_output.finished_req_ids | lifecycle.reset_req_ids,
+            )
         # IMPORTANT: Must query req_id_to_index BEFORE super().finish_requests()
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
@@ -1286,3 +1331,6 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        if lifecycle is not None:
+            for req_id in sorted(lifecycle.release_req_ids - all_done):
+                self._remove_request(req_id)
