@@ -22,6 +22,7 @@ See ``openai/README.md`` and ``images/README.md`` (utils vs helpers, no overlap)
 """
 
 import io
+import os
 import struct
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -147,6 +148,17 @@ def _png_pool() -> ThreadPoolExecutor:
     if _PNG_POOL is None:
         _PNG_POOL = ThreadPoolExecutor(max_workers=_PNG_THREADS, thread_name_prefix="png-encode")
     return _PNG_POOL
+
+
+def _drop_png_pool_after_fork() -> None:
+    # A forked child inherits the pool but none of its threads. Once the parent
+    # has started every worker, the inherited pool never runs new work.
+    global _PNG_POOL
+    _PNG_POOL = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_png_pool_after_fork)
 
 
 def _parallel_ranges(fn, total: int) -> None:
