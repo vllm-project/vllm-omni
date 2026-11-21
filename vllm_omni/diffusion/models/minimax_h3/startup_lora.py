@@ -227,6 +227,12 @@ def load_startup_peft_adapter(path: str, request: LoRARequest) -> LoRAModel:
     helper = PEFTHelper.from_local_dir(path, max_position_embeddings=None)
     if helper.modules_to_save:
         raise ValueError("startup-merge supports A/B adapters without modules_to_save")
+    # Validate the PEFT transformation without imposing the runtime kernel's rank limit.
+    unsupported = helper._validate_features()
+    if helper.bias != "none":
+        unsupported.append("Adapter bias is not supported.")
+    if unsupported:
+        raise ValueError(f"startup-merge cannot load this PEFT adapter: {' '.join(unsupported)}")
     return LoRAModel.from_local_checkpoint(
         path,
         expected_lora_modules={"qkv_proj", "to_q", "to_k", "to_v", "out_proj", "fc1", "fc2", "linear"},

@@ -107,13 +107,15 @@ HF32 and suspends any explicit reduced-precision cube policy, restoring the
 original precision settings before the loader processes the fused tensor.
 Unadapted slices of packed projections are copied to the same device before
 concatenation. CPU and other accelerator backends retain CPU fusion.
-All adapter targets must be consumed; invalid shapes, non-finite values and
-serialized quantization tensors fail startup. Request selection is fixed and
-the pipeline retains the adapter's task and sampler metadata.
+All adapter targets must be consumed. Unsupported PEFT transformations, invalid
+shapes, non-finite values and serialized quantization tensors fail startup.
+Split H3 topologies route global startup options to the DiT stage. Request
+selection is fixed and the pipeline retains the adapter's task and sampler
+metadata.
 After the worker finishes loading, quantization, device placement and kernel
-selection, the pipeline evaluates each supported conditioning timestep plan with
-the final time embedder and AdaLN modules. The blocks and final output layer
-populate the bounded exact runtime projection cache. The initial fixed-adapter
+selection, the pipeline alternates supported conditioning modes and precomputes
+whole timestep plans within the exact projection cache budget. The plan budget
+uses gathered output sizes, so tensor-parallel ranks take the same collectives. The initial fixed-adapter
 identity is recorded so request admission does not evict the startup results.
 Weight versions, exact embeddings and numerical settings retain the runtime
 cache's invalidation rules; disabling that cache also disables this warmup.
@@ -121,8 +123,8 @@ cache's invalidation rules; disabling that cache also disables this warmup.
 The mode leaves the live module tree unwrapped and releases factors after the
 transformer loads. Request-mode DLO materializes the fused policy through the
 ordinary loader before constructing offload storage. Direct checkpoint mmap
-would read the unfused policy and is bypassed. When offload is enabled, the
-exact AdaLN cache populates during requests after weight placement.
+would read the unfused policy and is bypassed. The exact AdaLN cache populates
+during requests when weight offload, including independent AdaLN offload, is enabled.
 Model-level and standard layerwise offload may select the text encoder alone.
 The mode requires a single H3 checkpoint partition and excludes sleep, HSDP,
 weight transfer, and reusable host artifacts. Additional request adapters are

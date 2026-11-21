@@ -151,6 +151,13 @@ def normalize_pipeline_cli_overrides(
 ) -> dict[str, Any]:
     """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
     normalized = dict(cli_overrides)
+    if normalized.get("lora_application") == "startup-merge" and pipeline.startup_lora_stage_id is not None:
+        # A fixed adapter is fused only where the DiT checkpoint is loaded.
+        for name in ("lora_application", "lora_backend", "lora_path", "lora_scale"):
+            value = normalized.pop(name, None)
+            stage_key = f"stage_{pipeline.startup_lora_stage_id}_{name}"
+            if value is not None and normalized.get(stage_key) is None:
+                normalized[stage_key] = value
     for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
         invalid_stage_keys = [
             key
@@ -494,6 +501,8 @@ class PipelineConfig:
     default_deploy_config_name: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
+    # Owner of top-level startup-merge options in split diffusion pipelines.
+    startup_lora_stage_id: int | None = None
 
     def __post_init__(self) -> None:
         errors = self.get_validation_errors()
@@ -519,6 +528,10 @@ class PipelineConfig:
         if not self.stages:
             errors.append("Pipeline has no stages defined")
             return errors
+        if self.startup_lora_stage_id is not None:
+            owner = self.get_stage(self.startup_lora_stage_id)
+            if owner is None or owner.execution_type != StageExecutionType.DIFFUSION:
+                errors.append("startup_lora_stage_id must identify a diffusion stage")
         stage_ids = [s.stage_id for s in self.stages]
         if len(stage_ids) != len(set(stage_ids)):
             errors.append("Duplicate stage IDs found")

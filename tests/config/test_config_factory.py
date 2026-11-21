@@ -2014,6 +2014,40 @@ stages:
         assert diffusion_args.parallel_config.vae_patch_parallel_size == 4
         assert tuple(diffusion_args.stage_input_payload_keys) == ("encoder_output",)
 
+    @pytest.mark.parametrize("structured", [False, True])
+    @pytest.mark.parametrize("application", ["startup-merge", "runtime", "merged"])
+    def test_minimax_h3_decode_routes_only_fixed_startup_lora_to_dit(self, structured, application):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated_decode"]
+        flags = {
+            "lora_application": application,
+            "lora_backend": "peft",
+            "lora_path": "/global/adapter",
+            "lora_scale": 0.75,
+            "stage_1_lora_path": "/stage-1/adapter",
+            "stage_1_enable_distributed_layerwise_offload": False,
+        }
+        if structured:
+            config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=flags)
+            dit = config.stage_by_id(1).diffusion_config
+            decoder = config.stage_by_id(2).diffusion_config
+        else:
+            stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, flags)
+            dit = stages[1].to_omegaconf().engine_args
+            decoder = stages[2].to_omegaconf().engine_args
+
+        assert dit.lora_application == application
+        assert dit.lora_backend == "peft"
+        assert dit.lora_path == "/stage-1/adapter"
+        assert dit.lora_scale == 0.75
+        if application == "startup-merge":
+            assert getattr(decoder, "lora_application", "runtime") == "runtime"
+            assert getattr(decoder, "lora_path", None) is None
+            assert getattr(decoder, "lora_scale", 1.0) == 1.0
+        else:
+            assert decoder.lora_application == application
+            assert decoder.lora_path == "/global/adapter"
+            assert decoder.lora_scale == 0.75
+
     def test_minimax_h3_text_encoder_tp_alias_targets_stage_zero(self):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
 

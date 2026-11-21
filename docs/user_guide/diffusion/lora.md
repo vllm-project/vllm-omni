@@ -27,8 +27,10 @@ Select `--lora-backend peft --lora-application startup-merge` and provide
 exactly one `--lora-path` and a finite `--lora-scale`. This opt-in mode is
 supported by the native MiniMax-H3 pipeline for ordinary PEFT directories,
 LightX2V Turbo, and native FlashGen adapters. Select a single checkpoint
-partition with `--task-type fl2va` or `--task-type ref2va`. `runtime` remains the default
-and preserves request-level adapter switching.
+partition with `--task-type fl2va` or `--task-type ref2va`. The bundled
+disaggregated H3 topologies route global startup-merge options to their DiT
+stage. In a deploy file, place these options on the DiT stage. `runtime`
+remains the default and preserves request-level adapter switching.
 
 Startup fusion follows this order:
 
@@ -66,14 +68,13 @@ Fixed startup fusion does not stack additional request adapters. Offline AdaLN
 sidecars are skipped because they describe the original policy. Without weight
 offload, startup precomputes the blocks' and final layer's AdaLN projections
 after fusion, quantization, placement, and kernel selection. With weight
-offload, requests populate the cache after the offloader places the weights. FlashGen uses its adapter-defined sigma
-schedule; Turbo uses its required step count and video/audio shifts. Ordinary
-PEFT adapters warm the checkpoint schedule, or the default 50-step schedule.
-The first request keeps these entries and reuses matching timestep embeddings.
-Changed inputs, weights or numerical settings still compute exact cache misses.
-The existing 256 MiB cache budget bounds retained results; longer schedules may
-retain only a subset. Setting `minimax_h3_adaln_cache=false` disables both startup
-precomputation and runtime reuse.
+offload, including `minimax_h3_adaln_offload`, requests fill the cache as needed.
+FlashGen uses its adapter-defined sigma schedule; Turbo uses its required step
+count and video/audio shifts. Ordinary PEFT adapters use the checkpoint schedule,
+or the default 50-step schedule. Startup alternates between supported modes and
+precomputes only complete timestep plans that fit the 256 MiB budget. Requests
+reuse matching results and compute other projections on demand. Setting
+`minimax_h3_adaln_cache=false` disables startup precomputation and runtime reuse.
 
 Like MiniMax-H3's runtime native/Turbo adapters, fixed startup fusion supports
 distributed layerwise offload (DLO) in request mode. Rank-local and AllGather DiT
@@ -85,7 +86,9 @@ Model-level and standard layerwise offload can select the text encoder alone;
 offloading the DiT requires DLO. HSDP, sleep mode, weight transfer, and Host
 Weight Runtime artifacts are unsupported. Startup fusion
 also requires original floating checkpoints and does not support pre-quantized
-or already fused/distilled checkpoints or adapters with `modules_to_save`.
+or already fused/distilled checkpoints. PEFT adapters must be plain A/B factors
+without bias or `modules_to_save`. Variants with a different transformation,
+such as PiSSA and aLoRA, are rejected.
 Fusion streams one matrix at a time with bounded FP32 row tiles and retains
 neither a pristine full-model copy nor runtime LoRA buffers.
 

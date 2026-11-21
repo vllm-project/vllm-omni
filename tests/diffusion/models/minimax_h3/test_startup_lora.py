@@ -14,7 +14,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTArchConfig
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-from vllm_omni.diffusion.models.minimax_h3.startup_lora import MiniMaxH3StartupLoRA
+from vllm_omni.diffusion.models.minimax_h3.startup_lora import MiniMaxH3StartupLoRA, load_startup_peft_adapter
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -292,6 +292,46 @@ def test_startup_peft_directory_uses_original_alpha_and_no_runtime_manager(tmp_p
     assert pipeline._request_lora_selection(OmniDiffusionSamplingParams())[1] == 0.7
 
 
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"init_lora_weights": "pissa"}, "pissa"),
+        ({"alora_invocation_tokens": [1, 2]}, "Activated LoRA"),
+        ({"bias": "all"}, "Adapter bias"),
+        ({"modules_to_save": ["classifier"]}, "without modules_to_save"),
+    ],
+)
+def test_startup_peft_rejects_unsupported_semantics_before_reading_weights(tmp_path, options, message):
+    import json
+
+    config = {"r": 2, "lora_alpha": 3, "target_modules": ["qkv_proj"], **options}
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match=message):
+        load_startup_peft_adapter(str(tmp_path), LoRARequest("startup", 1, str(tmp_path)))
+
+
+def test_startup_peft_has_no_runtime_kernel_rank_limit(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    rank = 513
+    name = "blocks.0.attn.qkv_proj"
+    prefix = f"base_model.model.transformer.{name}"
+    config = {"r": rank, "lora_alpha": rank, "target_modules": ["qkv_proj"]}
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+    save_file(
+        {f"{prefix}.lora_A.weight": torch.ones(rank, 4), f"{prefix}.lora_B.weight": torch.ones(6, rank)},
+        str(tmp_path / "adapter_model.safetensors"),
+    )
+
+    adapter = load_startup_peft_adapter(str(tmp_path), LoRARequest("startup", 1, str(tmp_path)))
+    fusion = MiniMaxH3StartupLoRA(adapter, 1.0)
+    torch.testing.assert_close(fusion.merge(f"{name}.weight", torch.zeros(6, 4)), torch.full((6, 4), float(rank)))
+    fusion.validate()
+
+
 def test_packed_mlp_keeps_gate_and_up_scaling_independent(monkeypatch):
     from vllm.lora.lora_weights import PackedLoRALayerWeights
 
@@ -482,15 +522,46 @@ def test_startup_warmup_covers_conditioning_timestep_plans(monkeypatch, mode, tm
     pipeline = _adaln_warmup_pipeline(monkeypatch, tmp_path, mode=mode)
     pipeline.warmup_startup_adaln_cache()
     cache = pipeline.transformer.adaln_cache
-    misses = cache.misses
+    hits, misses = cache.hits, cache.misses
+    plans = _warmup_plans(pipeline, mode)
     with torch.inference_mode():
-        for plan in _warmup_plans(pipeline, mode):
+        for plan in plans:
             embedding = pipeline.transformer.time_embedder(plan)
             cache.prepare(embedding)
             pipeline.transformer.blocks[0].adaln_proj(embedding)
             pipeline.transformer.final_layer.adaln_proj(embedding)
     assert cache.misses == misses
-    assert cache.hits >= 8
+    assert cache.hits - hits == 2 * len(plans)
+
+
+def test_startup_warmup_shares_budget_and_leaves_unwarmed_projections_for_requests(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.adaln_cache import schedule_contract, timestep_plans
+
+    pipeline = _adaln_warmup_pipeline(monkeypatch, tmp_path, mode="fl2va")
+    pipeline._lora_sigma_schedules.clear()
+    transformer = pipeline.transformer
+    cache = transformer.adaln_cache
+    plans = {
+        mode: timestep_plans(
+            schedule_contract(mode=mode, num_steps=50, base_schedule=None, flow_shift=12.0, audio_flow_shift=3.0)
+        )
+        for mode in ("t2va", "fl2va")
+    }
+    assert not torch.equal(plans["t2va"][0], plans["fl2va"][0])
+    # The fixture projects 72 block and 8 final BF16 values per timestep row.
+    cache.max_bytes = (len(plans["t2va"][0]) + len(plans["fl2va"][0])) * 80 * 2
+
+    pipeline.warmup_startup_adaln_cache()
+    assert cache.misses == 4
+
+    with torch.inference_mode():
+        for plan in (plans["t2va"][0], plans["fl2va"][0], plans["fl2va"][1]):
+            embedding = transformer.time_embedder(plan)
+            cache.prepare(embedding)
+            transformer.blocks[0].adaln_proj(embedding)
+            transformer.final_layer.adaln_proj(embedding)
+    assert cache.hits == 4
+    assert cache.misses == 6
 
 
 def test_startup_warmup_invalidates_changed_weights_and_inputs(monkeypatch, tmp_path):
@@ -569,11 +640,15 @@ def test_worker_warms_fixed_adaln_after_final_runner_setup(monkeypatch, applicat
         {"enable_distributed_layerwise_offload": True, "dlo_use_allgather": False},
         {"diffusion_offload_config": {"mode": "module", "components": ["text_encoder"]}},
         {"diffusion_offload_config": {"mode": "layer", "components": ["text_encoder"]}},
+        pytest.param(None, id="adaln-weights"),
     ],
 )
 def test_startup_adaln_cache_defers_prewarm_with_weight_offload(monkeypatch, offload_options, tmp_path):
     pipeline = _adaln_warmup_pipeline(monkeypatch, tmp_path)
-    pipeline.od_config = OmniDiffusionConfig(model=str(tmp_path), num_gpus=1, **offload_options)
+    if offload_options is None:
+        pipeline.transformer.adaln_cache.offload_weights = True
+    else:
+        pipeline.od_config = OmniDiffusionConfig(model=str(tmp_path), num_gpus=1, **offload_options)
 
     def unexpected_projection(*args, **kwargs):
         pytest.fail("startup must not call the time embedder ahead of weight placement")

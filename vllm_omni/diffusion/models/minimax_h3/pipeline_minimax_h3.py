@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
-from itertools import groupby
+from itertools import groupby, zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
@@ -1509,42 +1509,62 @@ class MiniMaxH3Pipeline(
         cache = self.transformer.adaln_cache
         if not cache.max_bytes:
             return
-        if resolve_offload_strategy(self.od_config) is not OffloadStrategy.NONE:
+        if cache.offload_weights or resolve_offload_strategy(self.od_config) is not OffloadStrategy.NONE:
             # With offload, weights reach their compute device through the
             # normal request lifecycle, even if only the text encoder streams.
             logger.info("MiniMax-H3 startup AdaLN cache will fill during requests with weight offload")
             return
         from .adaln_cache import MODES, schedule_contract, timestep_plans
 
-        spec = self._turbo_lora_specs.get(fixed.lora_int_id)
-        native = fixed.lora_int_id in self._native_lora_adapter_ids
+        sampling = OmniDiffusionSamplingParams()
+        spec = self._active_turbo_spec(sampling)
         tasks = {"ref2va"} if self.partition == "ref2va" else {"t2va", "fl2va"}
-        if native:
+        if self._has_active_native_lora(sampling):
             tasks.intersection_update({"t2va"})
         if spec is not None:
             tasks.intersection_update(spec.supported_tasks)
-        sampling = OmniDiffusionSamplingParams(num_inference_steps=spec.denoise_steps if spec is not None else None)
+            sampling.num_inference_steps = spec.denoise_steps
         self._prepare_adaln_adapter(sampling)
         projections = [block.adaln_proj for block in self.transformer.blocks]
         projections.append(self.transformer.final_layer.adaln_proj)
         device = next(self.transformer.time_embedder.parameters()).device
         hits, misses = cache.hits, cache.misses
-        # Own ordinary cached tensors even when startup is called in inference mode.
-        # Use each serving module's actual GEMM/TP path, after kernel selection.
+        schedules = []
+        for mode in MODES:
+            task = "ref2va" if mode.startswith("ref2va") else mode
+            if task not in tasks:
+                continue
+            positions, steps = self._resolve_sigma_positions(task, sampling)
+            contract = schedule_contract(
+                mode=mode,
+                num_steps=steps,
+                base_schedule=positions,
+                flow_shift=spec.video_shift if spec is not None else self.default_video_shift,
+                audio_flow_shift=spec.audio_shift if spec is not None else self.default_audio_shift,
+            )
+            schedules.append(timestep_plans(contract))
+
+        # Budget whole plans from the gathered BF16 output sizes. Using planned
+        # bytes keeps every TP rank on the same collective path, even if one
+        # rank cannot store a result. Round-robin avoids starving later modes.
+        bytes_per_row = torch.bfloat16.itemsize * sum(
+            p.expand_ratio * p.modality_num * p.hidden_size for p in projections
+        )
+        bytes_left = cache.max_bytes
+        warmed_plans: set[tuple[float, ...]] = set()
+        # The cache must own ordinary tensors even if startup is in inference mode.
         with torch.inference_mode(False), torch.no_grad():
-            for mode in MODES:
-                task = "ref2va" if mode.startswith("ref2va") else mode
-                if task not in tasks:
-                    continue
-                positions, steps = self._resolve_sigma_positions(task, sampling)
-                contract = schedule_contract(
-                    mode=mode,
-                    num_steps=steps,
-                    base_schedule=positions,
-                    flow_shift=spec.video_shift if spec is not None else self.default_video_shift,
-                    audio_flow_shift=spec.audio_shift if spec is not None else self.default_audio_shift,
-                )
-                for plan in timestep_plans(contract):
+            for round_plans in zip_longest(*schedules):
+                if bytes_left < bytes_per_row:
+                    break
+                for plan in round_plans:
+                    if plan is None or plan.numel() * bytes_per_row > bytes_left:
+                        continue
+                    key = tuple(plan.tolist())
+                    if key in warmed_plans:
+                        continue
+                    warmed_plans.add(key)
+                    bytes_left -= plan.numel() * bytes_per_row
                     embedding = self.transformer.time_embedder(plan.to(device))
                     cache.prepare(embedding)
                     for projection in projections:
