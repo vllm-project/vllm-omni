@@ -223,7 +223,9 @@ def _omni_server_env() -> dict[str, str]:
 
 
 def _cli_flag_value(args: tuple[str, ...] | list[str], flag: str) -> str | None:
-    for index, arg in enumerate(args):
+    # Match argparse when extra_cli_args overrides a serve_args default.
+    for index in range(len(args) - 1, -1, -1):
+        arg = args[index]
         if arg == flag and index + 1 < len(args):
             return args[index + 1]
         if arg.startswith(f"{flag}="):
@@ -272,10 +274,6 @@ def _resolve_offline_model(model: str, revision: str | None = None) -> str:
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
     extra = tuple(extra_cli_args or ())
-    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
-
-    print(f"Starting OmniServer with test: {test_name}, model: {model}")
-
     server_args: list[str] = _merge_omni_default_server_args(extra, use_omni=use_omni)
     # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
     # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
@@ -285,6 +283,10 @@ def _start_omni_server(server_param):
         server_args = ["--stage-overrides", stage_overrides] + server_args
     if extra:
         server_args = list(extra) + server_args
+    if use_omni:
+        _preflight_server_vad(test_name, server_args)
+    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
+    print(f"Starting OmniServer with test: {test_name}, model: {model}")
     judge_params = _judge_server_params_for_test(test_name)
     with OmniServer(model, server_args, use_omni=use_omni, env_dict=_omni_server_env()) as server:
         server.test_name = test_name
@@ -299,6 +301,36 @@ def _start_omni_server(server_param):
         print("OmniServer stopping...")
 
     print("OmniServer stopped")
+
+
+def _preflight_server_vad(test_name: str, server_args: list[str]) -> None:
+    """Validate a required local VAD backend before allocating model GPUs."""
+    config = _config_for_test(test_name)
+    if config is None:
+        return
+    benchmark_params = config.get("benchmark_params") or []
+    if not isinstance(benchmark_params, list):
+        raise TypeError(f"benchmark_params for {test_name} must be a list")
+    if not any(
+        isinstance(params, dict)
+        and params.get("enabled", True)
+        and (
+            params.get("duplex_eval_turn_detection") == "server_vad"
+            or params.get("omniinteract_turn_detection") == "server_vad"
+        )
+        for params in benchmark_params
+    ):
+        return
+
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+    from vllm_omni.engine.duplex.vad import SileroVADBackendProvider
+
+    model_path = None
+    if deploy_path := _cli_flag_value(server_args, "--deploy-config"):
+        model_path = (resolve_deploy_yaml(deploy_path).get("duplex_session") or {}).get("server_vad_model_path")
+    print(f"Checking server_vad before model startup: {model_path or 'local cache / silero-vad package'}", flush=True)
+    backend = SileroVADBackendProvider(model_path=model_path).get()
+    print(f"server_vad preflight passed: {type(backend).__name__}", flush=True)
 
 
 @pytest.fixture(scope="module")
@@ -394,11 +426,54 @@ def _is_finite_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _selected_percentile_metrics(params: Mapping[str, object]) -> set[str]:
+    raw = params.get("percentile-metrics") or params.get("percentile_metrics") or ""
+    if not isinstance(raw, str):
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _assert_chat_accuracy(result: Mapping[str, object], params: Mapping[str, object]) -> None:
+    min_accuracy = params.get(_MIN_DAILY_OMNI_ACCURACY)
+    if min_accuracy is not None:
+        from tests.e2e.accuracy.helpers import validate_daily_omni
+
+        assert _is_finite_number(min_accuracy), "min_daily_omni_accuracy must be a finite number"
+        errs = validate_daily_omni(dict(result), min_accuracy=float(min_accuracy))
+        assert not errs, "; ".join(errs)
+    if not params.get(_SEED_TTS_WER_EVAL):
+        return
+    from tests.e2e.accuracy.helpers import validate_seed_tts
+
+    max_wer = params.get(_MAX_SEED_TTS_MEAN_WER)
+    min_sim = params.get(_MIN_SEED_TTS_MEAN_SIM)
+    min_utmos = params.get(_MIN_SEED_TTS_MEAN_UTMOS)
+    for label, value in (
+        (_MAX_SEED_TTS_MEAN_WER, max_wer),
+        (_MIN_SEED_TTS_MEAN_SIM, min_sim),
+        (_MIN_SEED_TTS_MEAN_UTMOS, min_utmos),
+    ):
+        if value is not None:
+            assert _is_finite_number(value), f"{label} must be a finite number"
+    errs = validate_seed_tts(
+        dict(result),
+        max_mean_wer=float(max_wer) if max_wer is not None else None,
+        min_mean_sim=float(min_sim) if min_sim is not None else None,
+        min_mean_utmos=float(min_utmos) if min_utmos is not None else None,
+    )
+    assert not errs, "; ".join(errs)
+
+
 _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1 = "omniinteract_aggregate_min_ia_qtf1"
 _OMNIINTERACT_AGGREGATE_SUBSETS = "omniinteract_aggregate_subsets"
 _OMNIINTERACT_AGGREGATE_GROUP = "omniinteract_aggregate_group"
 _OMNIINTERACT_PERSIST_ARTIFACTS = "omniinteract_persist_artifacts"
 _OMNIINTERACT_MIN_EVALUATED_CASES = 1
+_MIN_DAILY_OMNI_ACCURACY = "min_daily_omni_accuracy"
+_MAX_SEED_TTS_MEAN_WER = "max_seed_tts_mean_wer"
+_MIN_SEED_TTS_MEAN_SIM = "min_seed_tts_mean_sim"
+_MIN_SEED_TTS_MEAN_UTMOS = "min_seed_tts_mean_utmos"
+_SEED_TTS_WER_EVAL = "seed_tts_wer_eval"
 
 
 class _OmniInteractSubsetCounts(NamedTuple):
@@ -642,6 +717,27 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     return accuracy_path
 
 
+def _is_minicpmo_duplex_eval(result: dict, params: dict) -> bool:
+    """True for MiniCPM-o Omni-DuplexEval nightly (native duplex).
+
+    That path may finish a session with audio and an empty transcript, or
+    text without PCM. Run-level ``required_duplex_metrics`` still require
+    some client TTFT/TTFP samples for the batch.
+    """
+    blob = " ".join(
+        str(value)
+        for value in (
+            result.get("test_name"),
+            result.get("model_id"),
+            params.get("test_name"),
+            params.get("model"),
+        )
+        if value
+    ).lower()
+    compact = blob.replace("_", "-")
+    return "minicpm-o" in compact or "minicpmo" in compact.replace("-", "")
+
+
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
     summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
@@ -673,12 +769,13 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         )
         return
     assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
-    for session in sessions:
-        for name in ("client_ttft_ms", "client_ttfp_ms"):
-            metric = session.get(name, {})
-            assert metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")), (
-                f"Omni-DuplexEval session has no measured {name}"
-            )
+    if not _is_minicpmo_duplex_eval(result, params):
+        for session in sessions:
+            for name in ("client_ttft_ms", "client_ttfp_ms"):
+                metric = session.get(name, {})
+                assert metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")), (
+                    f"Omni-DuplexEval session has no measured {name}"
+                )
     if params.get("duplex_eval_evaluate"):
         accuracy = summary.get("accuracy")
         assert isinstance(accuracy, dict), "Omni-DuplexEval accuracy is missing"
@@ -703,7 +800,11 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 
 
 def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
-    assert result["completed"] == num_prompt, "Request failures exist"
+    if result["completed"] != num_prompt:
+        first_error = next((error for error in result.get("errors", []) if error), "No per-request error recorded")
+        raise AssertionError(
+            f"Request failures exist: {result['completed']}/{num_prompt} completed. First request error: {first_error}"
+        )
     if params.get("dataset_name") == "realtime-video":
         video = result.get("realtime_video")
         assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"
@@ -787,6 +888,14 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
                     f"OmniInteract All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
                 )
             _maybe_assert_aggregate_ia_qtf1(params, acc_summary, result, num_prompt)
+    if "tpot" in _selected_percentile_metrics(params):
+        num_tpot_samples = result.get("num_tpot_samples")
+        mean_tpot_ms = result.get("mean_tpot_ms")
+        assert isinstance(num_tpot_samples, int) and not isinstance(num_tpot_samples, bool) and num_tpot_samples > 0, (
+            "No measured tpot samples"
+        )
+        assert _is_finite_number(mean_tpot_ms) and mean_tpot_ms >= 0, "Missing or invalid mean_tpot_ms"
+    _assert_chat_accuracy(result, params)
     baseline = params.get("baseline")
     hardware = result.get("Hardware")
     hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None
@@ -836,6 +945,17 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         )
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
+    elif params.get(_MIN_DAILY_OMNI_ACCURACY) is not None or params.get(_SEED_TTS_WER_EVAL):
+        accuracy_baseline = {
+            key: value
+            for key, value in (
+                (_MIN_DAILY_OMNI_ACCURACY, params.get(_MIN_DAILY_OMNI_ACCURACY)),
+                (_MAX_SEED_TTS_MEAN_WER, params.get(_MAX_SEED_TTS_MEAN_WER)),
+                (_MIN_SEED_TTS_MEAN_SIM, params.get(_MIN_SEED_TTS_MEAN_SIM)),
+                (_MIN_SEED_TTS_MEAN_UTMOS, params.get(_MIN_SEED_TTS_MEAN_UTMOS)),
+            )
+            if value is not None
+        }
     for dataset_prefix in ("omniinteract", "duplex_eval"):
         if params.get(f"{dataset_prefix}_evaluate"):
             judge_base_url = getattr(omni_server, "judge_base_url", None)
@@ -898,6 +1018,10 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
         "required_duplex_metrics",
+        _MIN_DAILY_OMNI_ACCURACY,
+        _MAX_SEED_TTS_MEAN_WER,
+        _MIN_SEED_TTS_MEAN_SIM,
+        _MIN_SEED_TTS_MEAN_UTMOS,
         "require_speculative_stage",
         "name",
         "enable_negative_prompt",
@@ -957,7 +1081,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
             )
-            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
                     result,
@@ -999,7 +1123,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
             )
-            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
                     result,
