@@ -57,6 +57,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
+from vllm_omni.model_executor.models.confucius4_tts.pipeline import CONFUCIUS4_TTS_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
@@ -175,6 +176,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
     "causvid_wan": CAUSVID_WAN_PIPELINE,
+    "confucius4": CONFUCIUS4_TTS_PIPELINE,
+    "confucius4_tts": CONFUCIUS4_TTS_PIPELINE,
     "cosmos3_nano_sim_bimanual": COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),

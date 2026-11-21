@@ -138,6 +138,8 @@ _PIPELINE_STAGES = [
     "breeze_tts_2",
     "breeze_tts_2_codec",
     "code2wav",
+    "confucius4_tts_decoder",
+    "confucius4_tts_talker",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
     "dac_decoder",
@@ -186,6 +188,7 @@ _ARCHS = [
     "BreezeForConditionalGeneration",
     "MingTTSForConditionalGeneration",
     "CovoAudioForConditionalGeneration",
+    "Confucius4TTSTalkerForConditionalGeneration",
     "MyCovoAudioThing",
     "Qwen3TTSForConditionalGeneration",
 ]

@@ -377,9 +377,22 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     }
 
 
-def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+@pytest.mark.parametrize(
+    ("model", "model_arch", "subfolder"),
+    [
+        ("remote/cosyvoice3", "CosyVoice3Model", "CosyVoice-BlankEN"),
+    ],
+)
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(
+    tmp_path,
+    monkeypatch,
+    mocker,
+    model,
+    model_arch,
+    subfolder,
+):
     """A successful remote tokenizer download must not enter the error path."""
-    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir = tmp_path / subfolder
     tokenizer_dir.mkdir()
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
@@ -393,30 +406,44 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
         classmethod(lambda cls, model_config, **omni_kwargs: model_config),
     )
 
-    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    args = OmniEngineArgs(model=model, model_arch=model_arch)
     assert args.create_model_config() is baseline_config
     assert args.tokenizer == str(tokenizer_dir)
     warning.assert_not_called()
 
 
-def test_patch_missing_local_hf_config(tmp_path):
+@pytest.mark.parametrize(
+    ("model_arch", "model_type"),
+    [
+        ("IndexTTS25TalkerForConditionalGeneration", "indextts2_5"),
+        (
+            "Confucius4TTSTalkerForConditionalGeneration",
+            "confucius4_tts",
+        ),
+    ],
+)
+def test_patch_missing_local_hf_config(
+    tmp_path,
+    model_arch,
+    model_type,
+):
     """Native model bundles may only contain a checkpoints/ directory."""
     (tmp_path / "checkpoints").mkdir()
     args = object.__new__(OmniEngineArgs)
     args.model = str(tmp_path)
-    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.model_arch = model_arch
     args.hf_config_path = None
 
     try:
-        args._patch_empty_hf_config("indextts2_5")
+        args._patch_empty_hf_config(model_type)
 
         assert args.hf_config_path is not None
         config_path = args.hf_config_path + "/config.json"
         with open(config_path, encoding="utf-8") as config_file:
             config = json.load(config_file)
         assert config == {
-            "model_type": "indextts2_5",
-            "architectures": ["IndexTTS25TalkerForConditionalGeneration"],
+            "model_type": model_type,
+            "architectures": [model_arch],
         }
     finally:
         if hasattr(args, "_temp_config_dir"):
@@ -518,6 +545,8 @@ def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
     """Remote resolution failures must stay on vLLM's normal error path."""
     loader_error = OSError("remote config resolution failed")
     parent_inputs = {}
+
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, _revision=None: model)
 
     def controlled_get_config_dict(cls, model, **kwargs):
         raise loader_error
