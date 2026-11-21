@@ -456,7 +456,9 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         residual = hidden_states
         hidden_states = self.adaLN_sa_ln(hidden_states)
         hidden_states = (hidden_states.float() * (1 + scale_msa.float()) + shift_msa.float()).to(hidden_states.dtype)
-        hidden_states_bsh = hidden_states.permute(1, 0, 2)
+        # FP8 linear layers flatten their inputs with view(), which requires
+        # a compatible layout after swapping the sequence and batch dimensions.
+        hidden_states_bsh = hidden_states.permute(1, 0, 2).contiguous()
 
         attn_out = self.self_attention(
             hidden_states_bsh, attention_mask=attention_mask, image_rotary_emb=rotary_pos_emb
