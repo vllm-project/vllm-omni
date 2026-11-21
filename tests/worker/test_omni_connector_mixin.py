@@ -2232,6 +2232,42 @@ def test_expired_poll_abandons_claim_left_by_an_early_empty_get(monkeypatch):
         host.shutdown_omni_connectors()
 
 
+def test_cancel_pending_receive_abandons_claim_left_by_empty_get():
+    """Runner cleanup must queue the retained key for the receive thread."""
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    abandoned: list[str] = []
+
+    class _EarlyNone:
+        def get(self, *args, **kwargs):
+            raise AssertionError("full-payload poll used get() without a deadline")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            return None
+
+        def abandon_get(self, key):
+            abandoned.append(key)
+
+    host._omni_connector = _EarlyNone()
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-cancel")
+    try:
+        host.register_chunk_recv(request)
+        host._poll_pending_requests_once(["req-cancel"])
+        assert abandoned == []
+        assert host._active_recv_claim_keys["req-cancel"] == "req-cancel_0_0"
+        host.cleanup_finished_request("req-cancel")
+        assert "req-cancel" not in host._pending_load_reqs
+        assert abandoned == []
+        assert list(host._recv_claim_abandons) == ["req-cancel_0_0"]
+        host._drain_recv_claim_abandons()
+        assert abandoned == ["req-cancel_0_0"]
+        assert list(host._recv_claim_abandons) == []
+    finally:
+        host.shutdown_omni_connectors()
+
+
 def test_permanent_recv_error_fails_on_first_get():
     from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
 

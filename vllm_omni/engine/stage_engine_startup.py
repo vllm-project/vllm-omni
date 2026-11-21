@@ -840,6 +840,22 @@ def fetch_deployment_id(*, omni_master_address: str, omni_master_port: int) -> s
         reg_ctx.term()
 
 
+def ensure_matching_deployment_id(*, expected: str, actual: str) -> None:
+    """Fail before spawning if registration saw a different master generation.
+
+    Headless builds connector config from a prefetched id, then registers.
+    A master restart on the same endpoint can accept the later registration
+    with a new id while this process still holds the old scope.
+    """
+    if actual == expected:
+        return
+    raise RuntimeError(
+        "OmniMasterServer deployment id changed between connector setup and "
+        f"registration (expected {expected!r}, got {actual!r}). Restart this "
+        "headless worker so it loads the current deployment id."
+    )
+
+
 @contextlib.contextmanager
 def connect_remote_engine_cores(
     vllm_config: VllmConfig,
@@ -1308,6 +1324,7 @@ def launch_headless_llm_replica(
     stage_config: Any,
     coordinator: DPCoordinator | None = None,
     replica_bind_address: str | None = None,
+    expected_deployment_id: str | None = None,
 ) -> CoreEngineProcManager:
     """Register and launch one headless LLM replica.
 
@@ -1333,6 +1350,8 @@ def launch_headless_llm_replica(
         replica_id=None,
         replica_bind_address=replica_bind_address,
     )
+    if expected_deployment_id is not None:
+        ensure_matching_deployment_id(expected=expected_deployment_id, actual=response.deployment_id)
 
     manager = StageEngineCoreProcManager(
         local_engine_count=local_engine_count,
@@ -1368,6 +1387,7 @@ def launch_headless_llm_replicas(
     omni_dp_size_local: int,
     per_replica_devices: list[str | None],
     replica_bind_address: str | None = None,
+    expected_deployment_id: str | None = None,
 ) -> None:
     """Launch, monitor, and clean up all local headless LLM replicas."""
     parallel_config = vllm_config.parallel_config
@@ -1411,6 +1431,7 @@ def launch_headless_llm_replicas(
                 stage_config=stage_config,
                 coordinator=coordinator,
                 replica_bind_address=replica_bind_address,
+                expected_deployment_id=expected_deployment_id,
             )
 
         launch_headless_replica_group(
@@ -1433,6 +1454,7 @@ def launch_headless_diffusion_replica(
     omni_master_address: str,
     omni_master_port: int,
     replica_bind_address: str | None = None,
+    expected_deployment_id: str | None = None,
 ) -> Any:
     """Register and launch one headless diffusion replica.
 
@@ -1447,6 +1469,8 @@ def launch_headless_diffusion_replica(
         replica_id=None,
         replica_bind_address=replica_bind_address,
     )
+    if expected_deployment_id is not None:
+        ensure_matching_deployment_id(expected=expected_deployment_id, actual=response.deployment_id)
     from vllm_omni.diffusion import stage_diffusion_proc
 
     manager = stage_diffusion_proc.StageDiffusionProcManager.launch_headless(
@@ -1592,13 +1616,14 @@ def launch_headless_diffusion_replicas(
     replica_bind_address: str | None = None,
 ) -> None:
     """Prepare diffusion config, launch replicas, monitor, and clean up."""
+    expected_deployment_id = fetch_deployment_id(
+        omni_master_address=omni_master_address,
+        omni_master_port=omni_master_port,
+    )
     omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(
         model,
         config_path,
-        deployment_scope=fetch_deployment_id(
-            omni_master_address=omni_master_address,
-            omni_master_port=omni_master_port,
-        ),
+        deployment_scope=expected_deployment_id,
     )
     omni_conn_cfg, omni_from, omni_to = initialization.resolve_omni_kv_config_for_stage(
         omni_transfer_config,
@@ -1644,6 +1669,7 @@ def launch_headless_diffusion_replicas(
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
             replica_bind_address=replica_bind_address,
+            expected_deployment_id=expected_deployment_id,
         )
 
     launch_headless_replica_group(

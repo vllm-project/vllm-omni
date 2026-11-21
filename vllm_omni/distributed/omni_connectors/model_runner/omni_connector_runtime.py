@@ -137,6 +137,8 @@ class _OmniConnectorRuntimeMixin:
     _pending_save_reqs: dict[str, deque[Any]]
     _pending_save_counts: dict[str, int]
     _deferred_send_cleanup: set[str]
+    _active_recv_claim_keys: dict[str, str]
+    _recv_claim_abandons: deque[str]
     _chunk_ready_req_ids: set[str]
     _chunk_finished_req_ids: set[str]
     _stage_recv_req_ids: set[str]
@@ -170,6 +172,7 @@ class _OmniConnectorRuntimeMixin:
     _recv_loop: Any
     _save_loop: Any
     flush_full_payload_outputs: Any
+    _drop_full_payload_token_end: Any
     _custom_process_supports_is_finished_kwarg: Any
     _get_local_tp_group: Any
 
@@ -280,6 +283,11 @@ class _OmniConnectorRuntimeMixin:
         self._pending_save_reqs: dict[str, deque] = {}
         self._pending_save_counts: dict[str, int] = defaultdict(int)
         self._deferred_send_cleanup: set[str] = set()
+        # NIXL claims are thread-local to the receive poller. Remember the
+        # connector key while a get may still hold a claim, and hand that key
+        # to the poller when the runner cancels the receive.
+        self._active_recv_claim_keys: dict[str, str] = {}
+        self._recv_claim_abandons: deque[str] = deque()
         self._connector_send_error_sink: Callable[[BaseException], None] | None = None
         # -- per-cycle output accumulator --
         self._chunk_ready_req_ids: set[str] = set()
@@ -465,6 +473,15 @@ class _OmniConnectorRuntimeMixin:
             self._clear_recv_delivery_state(req_id)
 
     def _clear_recv_delivery_state(self, req_id: str) -> None:
+        claim_key = self._active_recv_claim_keys.pop(req_id, None)
+        if claim_key:
+            # The scheduler/runner may cancel the receive before the poller
+            # sees expiry. Queue the exact key so the receive thread can drop
+            # its thread-local claim; abandon_get is not safe from this thread.
+            self._recv_claim_abandons.append(claim_key)
+            work = getattr(self, "_work_available", None)
+            if work is not None:
+                work.set()
         self._get_req_chunk.pop(req_id, None)
         self._pending_load_reqs.pop(req_id, None)
         self._finished_load_reqs.discard(req_id)

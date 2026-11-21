@@ -777,6 +777,8 @@ def test_head_deployment_id_matches_across_master_address_spellings():
     sender = receiver = literal_sender = literal_receiver = None
     ctx = zmq.Context()
     try:
+        from vllm_omni.engine.stage_engine_startup import ensure_matching_deployment_id
+
         via_ip = fetch_deployment_id(omni_master_address="127.0.0.1", omni_master_port=port)
         via_name = fetch_deployment_id(omni_master_address="localhost", omni_master_port=port)
         assert via_ip == via_name == server.deployment_id
@@ -784,7 +786,9 @@ def test_head_deployment_id_matches_across_master_address_spellings():
         sock.connect(f"tcp://localhost:{port}")
         sock.send(msgspec.msgpack.encode({"stage_id": 0}))
         assert sock.poll(timeout=5_000)
-        assert msgspec.msgpack.decode(sock.recv())["deployment_id"] == server.deployment_id
+        registered = msgspec.msgpack.decode(sock.recv())["deployment_id"]
+        assert registered == server.deployment_id
+        ensure_matching_deployment_id(expected=via_ip, actual=registered)
         sock.close(linger=0)
 
         head = load_omni_transfer_config(config_dict=config, deployment_scope=via_ip)
@@ -824,3 +828,12 @@ def test_head_deployment_id_matches_across_master_address_spellings():
                 connector.close()
         ctx.term()
         server.stop()
+
+
+def test_registration_rejects_stale_prefetched_deployment_id():
+    """Headless must not spawn after the master id drifts from the prefetch."""
+    from vllm_omni.engine.stage_engine_startup import ensure_matching_deployment_id
+
+    ensure_matching_deployment_id(expected="same-id", actual="same-id")
+    with pytest.raises(RuntimeError, match="deployment id changed"):
+        ensure_matching_deployment_id(expected="prefetch-old", actual="register-new")

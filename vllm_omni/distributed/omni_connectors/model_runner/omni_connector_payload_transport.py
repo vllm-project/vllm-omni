@@ -1137,6 +1137,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         while not self._stop_event.is_set():
             snapshot = getattr(self._omni_connector, "get_wakeup_generation", None)
             generation = snapshot() if callable(snapshot) else None
+            self._drain_recv_claim_abandons()
             with self._lock:
                 pending_ids = list(self._pending_load_reqs.keys())
 
@@ -1282,22 +1283,49 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         )
         return True
 
+    def _remember_recv_claim_key(self, req_id: str, connector_get_key: str | None) -> None:
+        if not connector_get_key:
+            return
+        with self._lock:
+            self._active_recv_claim_keys[req_id] = connector_get_key
+
+    def _drain_recv_claim_abandons(self) -> None:
+        """Drop queued read claims on the receive thread."""
+        connector = getattr(self, "_omni_connector", None)
+        abandon = getattr(connector, "abandon_get", None)
+        if not callable(abandon):
+            with self._lock:
+                self._recv_claim_abandons.clear()
+            return
+        while True:
+            with self._lock:
+                if not self._recv_claim_abandons:
+                    return
+                connector_get_key = self._recv_claim_abandons.popleft()
+            try:
+                abandon(connector_get_key)
+            except Exception:
+                logger.debug("abandon_get failed for %s", connector_get_key, exc_info=True)
+
     def _abandon_recv_claim(self, req_id: str) -> None:
         """Drop this thread's unresolved read claim for one request."""
         connector = getattr(self, "_omni_connector", None)
         abandon = getattr(connector, "abandon_get", None)
         if not callable(abandon):
             return
-        request = self._pending_load_reqs.get(req_id)
-        external_req_id = self._request_ids_mapping.get(req_id, req_id)
-        chunk_id = self._get_req_chunk[req_id]
-        _from_stage, _to_stage, connector_get_key, _metadata = self._stage_payload_recv_spec(
-            external_req_id,
-            str(self._stage_id - 1),
-            str(self._stage_id),
-            chunk_id,
-            getattr(request, "payload_sender_info", None),
-        )
+        with self._lock:
+            connector_get_key = self._active_recv_claim_keys.pop(req_id, None)
+        if not connector_get_key:
+            request = self._pending_load_reqs.get(req_id)
+            external_req_id = self._request_ids_mapping.get(req_id, req_id)
+            chunk_id = self._get_req_chunk[req_id]
+            _from_stage, _to_stage, connector_get_key, _metadata = self._stage_payload_recv_spec(
+                external_req_id,
+                str(self._stage_id - 1),
+                str(self._stage_id),
+                chunk_id,
+                getattr(request, "payload_sender_info", None),
+            )
         if not connector_get_key:
             return
         try:
@@ -1453,6 +1481,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             chunk_id,
             getattr(request, "payload_sender_info", None),
         )
+        # Retain the key before get: a lost handshake reply leaves a claim on
+        # this thread, and runner cleanup may remove the pending receive before
+        # the next poll can recompute the key.
+        self._remember_recv_claim_key(req_id, connector_get_key)
 
         if self._async_chunk:
             result = self._recv_async_chunk_result(
@@ -1479,6 +1511,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         if result is None:
             return False
+
+        with self._lock:
+            self._active_recv_claim_keys.pop(req_id, None)
 
         payload_data, _size = result
         if not payload_data:
@@ -1931,6 +1966,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         so the drain does not poll it again. Ready requests are published as
         one cohort.
         """
+        self._drain_recv_claim_abandons()
         ready: list[str] = []
         for req_id in pending_ids:
             if self._stop_event.is_set():

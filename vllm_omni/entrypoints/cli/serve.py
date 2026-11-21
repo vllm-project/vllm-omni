@@ -1657,13 +1657,14 @@ def run_headless(args: TrackingNamespace) -> None:
 
     from vllm_omni.engine.stage_engine_startup import fetch_deployment_id
 
+    expected_deployment_id = fetch_deployment_id(
+        omni_master_address=omni_master_address,
+        omni_master_port=omni_master_port,
+    )
     omni_transfer_config = load_omni_transfer_config_for_model(
         model,
         config_path,
-        deployment_scope=fetch_deployment_id(
-            omni_master_address=omni_master_address,
-            omni_master_port=omni_master_port,
-        ),
+        deployment_scope=expected_deployment_id,
     )
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
     stage_connector_spec = get_stage_connector_spec(
@@ -1739,6 +1740,7 @@ def run_headless(args: TrackingNamespace) -> None:
         omni_dp_size_local=omni_dp_size_local,
         per_replica_devices=per_replica_devices,
         replica_bind_address=omni_replica_address,
+        expected_deployment_id=expected_deployment_id,
     )
 
 
