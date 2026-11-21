@@ -18,6 +18,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 )
 
 if TYPE_CHECKING:
+    from flashinfer import BatchPrefillWithPagedKVCacheWrapper
     from vllm.v1.attention.backend import MultipleOf
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
@@ -729,6 +730,111 @@ def _resolve_fa_version(head_size: int) -> int:
     return version
 
 
+# Whether a device takes FlashInfer's paged prefill, decided once per device.
+_FLASHINFER_PAGED_BY_DEVICE: dict[torch.device, bool] = {}
+_FLASHINFER_PAGED_HEAD_SIZES = (64, 128, 256)
+_FLASHINFER_WORKSPACE_BYTES = 128 << 20
+
+
+@dataclass
+class _FlashInferPagedPlan:
+    wrapper: BatchPrefillWithPagedKVCacheWrapper
+    # (block_table, kv_len, geometry) of the current plan. The tensor is held so
+    # that the identity check cannot match a new tensor at a freed one's address.
+    planned_for: tuple[torch.Tensor, int, tuple[Any, ...]] | None = None
+
+
+_FLASHINFER_PAGED_PLANS: dict[torch.device, _FlashInferPagedPlan] = {}
+
+
+def _use_flashinfer_paged(query: torch.Tensor, block_table: torch.Tensor, causal: bool) -> bool:
+    """Whether non-causal paged attention should run FlashInfer's paged prefill instead of FA2.
+
+    SM12x has no FA3/FA4, so vLLM's FlashAttention resolves to FA2, whose paged-KV
+    path always launches its split-KV kernel. FlashInfer's paged prefill reads the
+    same pages faster at AR-Diffusion block shapes. Other architectures keep
+    FA2/FA3/FA4. ``plan`` needs the K/V length on the host, which cannot be read
+    while a CUDA graph is being captured, so capture keeps FA2.
+    """
+    if causal or block_table.shape[0] != 1 or query.shape[-1] not in _FLASHINFER_PAGED_HEAD_SIZES:
+        return False
+    device = query.device
+    supported = _FLASHINFER_PAGED_BY_DEVICE.get(device)
+    if supported is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        capability = current_omni_platform.get_device_capability(device.index or 0)
+        supported = capability is not None and capability.major == 12
+        if supported:
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError:
+                supported = False
+        _FLASHINFER_PAGED_BY_DEVICE[device] = supported
+    return supported and not torch.cuda.is_current_stream_capturing()
+
+
+def _flashinfer_paged_attention(
+    query_flat: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """FlashInfer paged prefill over one sequence's block table (NHD pages).
+
+    ``plan`` takes the K/V length on the host, so it is read from ``seq_lens`` on
+    every call: noisy-KV preparation rewrites ``seq_lens`` and ``block_table`` in
+    place between tasks, so neither the tensor objects nor an earlier read can
+    stand in for it. The plan is rebuilt only when that length, the block-table
+    tensor or the geometry changes. FlashInfer keeps the device index tensor it
+    is given rather than a copy, so page ids rewritten in place are read at run
+    time without a new plan.
+    """
+    device = query_flat.device
+    plan = _FLASHINFER_PAGED_PLANS.get(device)
+    if plan is None:
+        import flashinfer
+
+        workspace = torch.empty(_FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        plan = _FlashInferPagedPlan(flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD"))
+        _FLASHINFER_PAGED_PLANS[device] = plan
+    num_q_tokens, num_heads, head_size = query_flat.shape
+    page_size, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
+    geometry = (
+        num_q_tokens,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        page_size,
+        float(softmax_scale),
+        query_flat.dtype,
+        key_cache.dtype,
+    )
+    kv_len = int(seq_lens[0])
+    planned = plan.planned_for
+    if planned is None or planned[0] is not block_table or planned[1] != kv_len or planned[2] != geometry:
+        num_pages = -(-kv_len // page_size)
+        plan.wrapper.plan(
+            torch.tensor([0, num_q_tokens], dtype=torch.int32),
+            torch.tensor([0, num_pages], dtype=torch.int32),
+            # A no-op view for int32 tables, which FlashInfer then keeps (see docstring).
+            block_table[0, :num_pages].to(torch.int32),
+            torch.tensor([kv_len - (num_pages - 1) * page_size], dtype=torch.int32),
+            num_heads,
+            num_kv_heads,
+            head_size,
+            page_size,
+            causal=False,
+            sm_scale=float(softmax_scale),
+            q_data_type=query_flat.dtype,
+            kv_data_type=key_cache.dtype,
+        )
+        plan.planned_for = (block_table, kv_len, geometry)
+    return plan.wrapper.run(query_flat, (key_cache, value_cache))
+
+
 def supported_kernel_block_sizes() -> list[int | MultipleOf]:
     """Block sizes the kernel this module dispatches to will accept.
 
@@ -737,12 +843,14 @@ def supported_kernel_block_sizes() -> list[int | MultipleOf]:
     multiple of ``b`` -- but answered here rather than read off a backend,
     because AR-Diffusion does not go through backend selection. It calls
     ``flash_attn_varlen_func`` itself, choosing between vLLM's CUDA build and
-    ROCm's AITER a few lines below, and only this module knows which.
+    ROCm's AITER a few lines below, or FlashInfer's paged prefill on SM12x, and
+    only this module knows which.
 
     It lives next to that choice so there is one place to change. The
     constraint is a property of the kernel, not of the card, and the kernels
     reachable from here agree on 16 today: vLLM's CUDA FlashAttention, ROCm
-    AITER, and upstream ``flash_attn`` all advertise ``MultipleOf(16)``. Other
+    AITER, and upstream ``flash_attn`` all advertise ``MultipleOf(16)``, and
+    FlashInfer's paged prefill takes any page size. Other
     backends in the same tree do not -- ``hpc_attn`` accepts only 64, and
     FlashInfer advertises pages of 128 or more solely on Blackwell -- so a
     caller must treat this as data to be queried, never as the number 16.
@@ -983,6 +1091,8 @@ def ar_diffusion_paged_attention(
             causal=causal,
             fa_version=fa_version,
         )
+    elif _use_flashinfer_paged(query_flat, block_table, causal):
+        out = _flashinfer_paged_attention(query_flat, key_cache, value_cache, block_table, seq_lens, softmax_scale)
     else:
         from vllm.vllm_flash_attn import flash_attn_varlen_func as paged_flash_attn_varlen_func
 
