@@ -234,7 +234,16 @@ def test_asr_query_filter_preserves_image_parts_with_text_metadata(mocker, image
     assert result["multi_modal_data"] == {"image": ["green"]}
 
 
-def test_asr_context_budget_evicts_frames_with_their_turns_without_mutating_handoff(mocker):
+@pytest.mark.parametrize(
+    ("old_text", "retain_text"),
+    [
+        ("<0.0 seconds>", False),
+        ("The event started at <2 seconds>", True),
+        ("The event started at <2.0 seconds>", True),
+    ],
+    ids=["timestamp", "caption-integer", "caption-decimal"],
+)
+def test_asr_context_budget_evicts_frames_with_their_turns_without_mutating_handoff(mocker, old_text, retain_text):
     processor = Processor()
     mocker.patch(
         "vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction.cached_processor_from_config",
@@ -248,6 +257,8 @@ def test_asr_context_budget_evicts_frames_with_their_turns_without_mutating_hand
         {"role": "user", "content": "Keep answers short."},
         {"role": "user", "content": [*current, {"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"}]},
     ]
+    if retain_text:
+        expected.insert(2, {"role": "user", "content": [{"type": "text", "text": old_text}]})
     minimum = processor.apply_chat_template(expected)
     prompt = {
         "additional_information": {
@@ -258,7 +269,7 @@ def test_asr_context_budget_evicts_frames_with_their_turns_without_mutating_hand
                 "working_messages": [
                     {
                         "role": "user",
-                        "content": [{"type": "text", "text": "<0.0 seconds>"}, {"type": "image"}],
+                        "content": [{"type": "text", "text": old_text}, {"type": "image"}],
                         "_response_item_id": "cancelled",
                     },
                     {"role": "user", "content": current, "_current": True},
