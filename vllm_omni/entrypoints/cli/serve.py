@@ -1261,8 +1261,11 @@ class OmniServeCommand(CLISubcommand):
             "'tile' (default) uses patch/tile parallel decode; "
             "'batch' distributes complete images for AutoencoderKL/Flux2 with DP/PP/CFG sizes of 1; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
-            "decoder feature maps along height/width and exchanges halo regions. The "
-            "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size. "
+            "decoder feature maps along height/width and exchanges halo regions. "
+            "Wan requires vae_patch_parallel_size to match the DiT group size; a mismatch uses "
+            "its tile-parallel fallback for non-streaming decode above the tile threshold. "
+            "Qwen-Image VAEs (including Ming-Image) require the size to match the VAE executor "
+            "process-group size and raise ValueError on mismatch, without tile fallback. "
             "Equivalent to setting DiffusionParallelConfig.vae_parallel_mode.",
         )
 
