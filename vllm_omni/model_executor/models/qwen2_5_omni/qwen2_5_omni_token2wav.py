@@ -38,6 +38,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
+from vllm_omni.model_executor.models.common.ops.bigvgan_cuda_graph import BigVGANCUDAGraphWrapper
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
 
@@ -518,6 +519,10 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         super().__init__(config)
         self.num_residual_blocks = len(config.resblock_kernel_sizes)
         self.num_upsample_layers = len(config.upsample_rates)
+        # min-level tensors for amplitude_to_db, keyed by (device, dtype,
+        # level): built once instead of a pageable H2D scalar per vocode
+        # (a blocking sync and a CUDA-graph capture blocker).
+        self._min_level_cache: dict[tuple[str, torch.dtype, float], torch.Tensor] = {}
 
         self.conv_pre = nn.Conv1d(config.mel_dim, config.upsample_initial_channel, 7, 1, padding=3)
 
@@ -570,13 +575,17 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         )
 
     def amplitude_to_db(self, amplitude, min_db_level):
-        min_level = torch.exp(
-            torch.tensor(
-                min_db_level / 20.0 * np.log(10),
-                device=amplitude.device,
-                dtype=amplitude.dtype,
+        key = (str(amplitude.device), amplitude.dtype, float(min_db_level))
+        min_level = self._min_level_cache.get(key)
+        if min_level is None:
+            min_level = torch.exp(
+                torch.tensor(
+                    min_db_level / 20.0 * np.log(10),
+                    device=amplitude.device,
+                    dtype=amplitude.dtype,
+                )
             )
-        )
+            self._min_level_cache[key] = min_level
         return 20 * torch.log10(torch.clamp(amplitude, min=min_level))
 
     def process_mel_spectrogram(self, mel_spectrogram):
@@ -584,7 +593,13 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         decibel_spectrum = self.amplitude_to_db(amplitude_spectrum, -115) - 20
         return self.normalize_spectrogram(decibel_spectrum, 1, -115)
 
-    def forward(self, mel_spectrogram):
+    def vocode(self, mel_spectrogram):
+        """GPU-only vocode: mel ``[B, mel_dim, T]`` -> waveform ``[B, 1, T*hop]``.
+
+        Split out of ``forward`` so the CUDA-graph wrapper can capture the
+        compute without the trailing device-to-host copy; ``forward`` keeps
+        its historical contract (``[B, T]`` on CPU).
+        """
         processed_spectrogram = self.process_mel_spectrogram(mel_spectrogram)
         hidden_representation = self.conv_pre(processed_spectrogram)
 
@@ -599,7 +614,10 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
 
         hidden_representation = self.activation_post(hidden_representation)
         output_waveform = self.conv_post(hidden_representation)
-        return torch.clamp(output_waveform, min=-1.0, max=1.0).squeeze().cpu()
+        return torch.clamp(output_waveform, min=-1.0, max=1.0)
+
+    def forward(self, mel_spectrogram):
+        return self.vocode(mel_spectrogram).squeeze().cpu()
 
 
 class RungeKutta4ODESolver:
@@ -944,6 +962,51 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         return loaded_params
 
 
+# Mel-frame buckets captured by the vocoder CUDA graph, in addition to the
+# exact streaming widths. Lengths above the largest bucket fall back to eager
+# (full-sequence requests are compute-bound there anyway).
+_DEFAULT_VOCODER_GRAPH_LADDER = [128, 256, 512, 1024, 2048]
+
+
+def _vocoder_graph_capture_sizes(chunk_size: int, future_size: int, ladder: list[int]) -> list[int]:
+    """Bucket sizes for the vocoder graph: the ladder plus the recurring
+    streaming mel widths as exact-shape hits.
+
+    The first chunk vocodes ``chunk_size`` mel frames; every middle chunk
+    vocodes ``chunk_size + 2 * future_size`` (the past/future cache slices
+    cancel against the window). Exact hits replay bit-stably instead of
+    padding, which keeps chunk boundaries free of padding leakage.
+    """
+    exact = {int(chunk_size), int(chunk_size) + 2 * int(future_size)}
+    return sorted(exact | set(int(size) for size in ladder))
+
+
+def _maybe_enable_vocoder_cuda_graph(model: "Qwen2_5OmniToken2WavModel") -> None:
+    """Attach the BigVGAN CUDA-graph wrapper when the config enables it.
+
+    ``vocoder_cuda_graph`` (default off) opts in; capture itself is lazy on
+    the first eligible vocode, so wiring does no CUDA work at load time.
+    """
+    if not getattr(model.config, "vocoder_cuda_graph", False):
+        model._bigvgan_graph = None
+        return
+    ladder = getattr(model.config, "vocoder_cuda_graph_capture_sizes", None)
+    if not ladder:
+        ladder = list(_DEFAULT_VOCODER_GRAPH_LADDER)
+    vocoder = model.code2wav_bigvgan_model
+    model._bigvgan_graph = BigVGANCUDAGraphWrapper(
+        vocoder,
+        capture_fn=vocoder.vocode,
+        num_mels=vocoder.config.mel_dim,
+        upsample_factor=model.vocoder_hop,
+        capture_sizes=_vocoder_graph_capture_sizes(model.chunk_size, model.future_size, ladder),
+    )
+    logger.info(
+        "Qwen2.5-Omni vocoder CUDA graph enabled (capture sizes: %s)",
+        model._bigvgan_graph.capture_sizes,
+    )
+
+
 @auto_docstring(
     custom_intro="""
     The full Qwen2.5Omni Token2Wav model. Consists a DiT model take speech
@@ -1010,6 +1073,20 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             # fallback to commonly used value
             self.vocoder_hop = 240
 
+        # Opt-in CUDA-graph replay for the vocoder (see
+        # _maybe_enable_vocoder_cuda_graph); None means always-eager.
+        _maybe_enable_vocoder_cuda_graph(self)
+
+    def _vocode(self, mel_spectrogram: torch.Tensor) -> torch.Tensor:
+        """Vocode mel to a CPU waveform, routing through the CUDA graph when
+        enabled. Matches the raw ``code2wav_bigvgan_model`` forward contract
+        (``[B, T]`` on CPU) either way."""
+        if self._bigvgan_graph is not None:
+            wav = self._bigvgan_graph(mel_spectrogram)
+        else:
+            wav = self.code2wav_bigvgan_model.vocode(mel_spectrogram)
+        return wav.squeeze().cpu()
+
     def forward(
         self,
         code,
@@ -1033,7 +1110,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             max_mel_frames=max_mel_frames,
         ).to(self.code2wav_bigvgan_model.dtype)
 
-        waveform = self.code2wav_bigvgan_model(mel_spectrogram).to(self.dtype)
+        waveform = self._vocode(mel_spectrogram).to(self.dtype)
 
         return waveform
 
@@ -1066,7 +1143,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
     @torch.inference_mode()
     def process_chunk_bigvgan_batch(self, mel_batch: torch.Tensor) -> torch.Tensor:
         """Vocoder batch: mel -> waveform."""
-        return self.code2wav_bigvgan_model(mel_batch)
+        return self._vocode(mel_batch)
 
     @torch.inference_mode()
     def process_little_chunk(
@@ -1170,7 +1247,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
                 mel_trim = generated[:, :, self.past_cache_size : -self.future_cache_size]
             mel = torch.cat([prev_generated[:, :, -self.future_size * 2 :], mel_trim], dim=2)
 
-        audio = self.code2wav_bigvgan_model(mel)
+        audio = self._vocode(mel)
         if i == 0:
             audio_output = audio[: -self.future_size * self.vocoder_hop]
         elif finished:

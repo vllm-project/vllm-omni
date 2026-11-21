@@ -34,7 +34,7 @@ from torch.nn.utils import weight_norm as _apply_weight_norm
 from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON
 
-from vllm_omni.diffusion.models.auk.alias_free_triton import alias_free_snake
+from vllm_omni.model_executor.models.common.ops.alias_free_triton import alias_free_snake
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta as _SharedSnakeBeta
 
 logger = init_logger(__name__)
