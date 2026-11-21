@@ -182,6 +182,7 @@ class OmniServer:
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
         wait_for_device_memory: bool = True,
+        defer_stderr: bool = False,
     ) -> None:
         self.wait_for_device_memory = wait_for_device_memory
         if self.wait_for_device_memory:
@@ -194,14 +195,16 @@ class OmniServer:
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
+        self.defer_stderr = defer_stderr
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Preserve child stderr so later tracebacks cannot overwrite the root cause.
+        # Preserve child stderr for startup and request-failure diagnostics.
         self._server_error_lines: list[str] = []
         self._server_log_thread: threading.Thread | None = None
+        self._server_ready = False
 
     def _reserve_port(self) -> None:
         # bind(0)/close does not reserve a port across concurrent pytest workers.
@@ -276,6 +279,7 @@ class OmniServer:
             self._port_lock.release()
             self._port_lock = None
         self._server_error_lines = []
+        self._server_ready = False
 
     def _start_server(self) -> None:
         attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
@@ -331,12 +335,15 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout; tee stderr to pytest and preserve the full diagnostics.
-        # Request failures after readiness also need the child traceback.
+        # Inherit stdout and preserve stderr in the diagnostic buffer. Functional
+        # tests tee each line immediately so a shared server's traceback stays
+        # attached to the failing test. Performance tests can opt into a single
+        # teardown replay to avoid synchronous writes during measurement.
         # errors=replace keeps the reader alive on undecodable bytes so a full
         # pipe cannot hang serve.
         self._server_error_lines = []
         self._server_log_thread = None
+        self._server_ready = False
         self.proc = subprocess.Popen(
             cmd,
             env=env,
@@ -355,12 +362,13 @@ class OmniServer:
                 try:
                     for line in stderr:
                         error_lines.append(line)
-                        try:
-                            sys.stderr.write(line)
-                            sys.stderr.flush()
-                        except (OSError, ValueError):
-                            # A closed capture must not stop draining the pipe.
-                            pass
+                        if not self.defer_stderr:
+                            try:
+                                sys.stderr.write(line)
+                                sys.stderr.flush()
+                            except (OSError, ValueError):
+                                # A closed capture must not stop draining the pipe.
+                                pass
                 except Exception:
                     pass
 
@@ -390,6 +398,7 @@ class OmniServer:
                             f"Server ready on {self.host}:{self.port} (OmniServer startup took {startup_s:.3f}s)",
                             flush=True,
                         )
+                    self._server_ready = True
                     return
             time.sleep(2)
         raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._server_error_tail()}")
@@ -539,6 +548,17 @@ class OmniServer:
             return ""
         return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
 
+    def _replay_server_error_tail(self) -> None:
+        tail = self._server_error_tail()
+        if not tail:
+            return
+        try:
+            sys.stderr.write(tail)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            # A closed pytest capture must not make teardown fail.
+            pass
+
     def _stop_stderr_reader(self) -> None:
         """Join the drain thread; close stderr only if the reader has stopped.
 
@@ -574,6 +594,9 @@ class OmniServer:
                 self._kill_process_tree(self.proc.pid)
         finally:
             self._stop_stderr_reader()
+            if self.defer_stderr and self._server_ready:
+                self._replay_server_error_tail()
+            self._server_ready = False
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
