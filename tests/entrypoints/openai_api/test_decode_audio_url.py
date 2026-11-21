@@ -164,7 +164,7 @@ class TestDecodeAudioUrlHttp:
         audio_bytes = b"\xff\xfb\x90\x00" * 50
         _install_http_transport(monkeypatch, lambda request: httpx.Response(200, content=audio_bytes))
 
-        path = _run(decode_audio_url("https://example.com/audio.mp3"))
+        path = _run(decode_audio_url("https://93.184.216.34/audio.mp3"))
         try:
             assert os.path.isfile(path)
             assert path.endswith(".wav")
@@ -177,7 +177,7 @@ class TestDecodeAudioUrlHttp:
         _install_http_transport(monkeypatch, lambda request: httpx.Response(404))
 
         with pytest.raises(InvalidInputReferenceError, match="failed to download audio"):
-            _run(decode_audio_url("https://example.com/missing.mp3"))
+            _run(decode_audio_url("https://93.184.216.34/missing.mp3"))
 
     def test_declared_response_size_uses_combined_audio_limit(self, monkeypatch):
         class FailingStream(httpx.AsyncByteStream):
@@ -195,7 +195,7 @@ class TestDecodeAudioUrlHttp:
         )
 
         with pytest.raises(InvalidInputReferenceError, match="exceeds"):
-            _run(decode_audio_url("https://example.com/large.mp3"))
+            _run(decode_audio_url("https://93.184.216.34/large.mp3"))
 
 
 class TestDecodeAudioUrlInvalid:

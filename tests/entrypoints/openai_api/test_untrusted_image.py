@@ -78,7 +78,7 @@ def test_load_input_images_rejects_oversized_http_response_before_decode(monkeyp
     monkeypatch.setattr(media_input.httpx, "AsyncClient", _client_factory)
 
     with pytest.raises(ValueError, match="exceeds"):
-        asyncio.run(_load_input_images(["https://example.com/large.png"]))
+        asyncio.run(_load_input_images(["https://93.184.216.34/large.png"]))
 
 
 def test_minimax_h3_upload_validator_rejects_disallowed_eps(monkeypatch):

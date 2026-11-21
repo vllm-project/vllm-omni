@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import ipaddress
+import socket
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Final
 
 import httpx
@@ -91,6 +95,54 @@ def decode_base64_media(data: str, *, max_bytes: int | None, source: str) -> byt
     return decoded
 
 
+@asynccontextmanager
+async def _stream_media_response(
+    client: httpx.AsyncClient, url: httpx.URL, *, source: str
+) -> AsyncIterator[httpx.Response]:
+    if url.scheme not in ("http", "https") or not url.host or url.userinfo:
+        raise InvalidInputReferenceError(f"Invalid {source}: expected an HTTP(S) URL without credentials.")
+
+    hostname = url.raw_host.decode("ascii")
+    try:
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            hostname, url.port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+        )
+    except OSError as exc:
+        raise InvalidInputReferenceError(f"Invalid {source}: could not resolve the media host.") from exc
+
+    connect_error: httpx.ConnectError | None = None
+    async with AsyncExitStack() as stack:
+        for _, _, _, _, sockaddr in addresses:
+            address = ipaddress.ip_address(sockaddr[0])
+            if isinstance(address, ipaddress.IPv6Address):
+                if address.is_site_local or address.sixtofour is not None:
+                    continue
+                address = address.ipv4_mapped or address
+            if not address.is_global or address.is_multicast or address.is_reserved:
+                continue
+
+            # Connect to the checked address while preserving HTTP routing and TLS verification.
+            target = httpx.URL(scheme=url.scheme, host=str(address), port=url.port, raw_path=url.raw_path)
+            try:
+                response = await stack.enter_async_context(
+                    client.stream(
+                        "GET",
+                        target,
+                        headers={"Accept-Encoding": "identity", "Host": url.netloc.decode("ascii")},
+                        extensions={"sni_hostname": hostname},
+                    )
+                )
+            except httpx.ConnectError as exc:
+                connect_error = exc
+            else:
+                yield response
+                return
+
+    if connect_error is not None:
+        raise connect_error
+    raise InvalidInputReferenceError(f"Invalid {source}: media URL must resolve to a public IP address.")
+
+
 async def download_media_bytes(
     url: str,
     *,
@@ -99,7 +151,7 @@ async def download_media_bytes(
     follow_redirects: bool = False,
     timeout_s: float = MEDIA_DOWNLOAD_TIMEOUT_S,
 ) -> bytes:
-    """Download media with response-size, compression, and total-time limits.
+    """Download public HTTP(S) media with response-size and total-time limits.
 
     ``Content-Length`` is checked before the body is read. Responses without a
     trustworthy length are counted incrementally, so chunked and streaming
@@ -107,7 +159,7 @@ async def download_media_bytes(
     time so an intermediate response body is never read or decompressed. The
     request advertises identity encoding and rejects non-identity final
     responses before HTTPX can decompress them, so compressed payloads cannot
-    bypass the limit.
+    bypass the limit. Each hop connects directly to a validated public address.
 
     Args:
         url: HTTP(S) media URL.
@@ -122,6 +174,7 @@ async def download_media_bytes(
 
     Raises:
         httpx.HTTPError: For HTTP status and transport failures.
+        InvalidInputReferenceError: If a URL or response violates the media policy.
         MediaInputTooLargeError: If the response exceeds ``max_bytes``.
         MediaInputTimeoutError: If the total download time is exceeded.
     """
@@ -132,15 +185,18 @@ async def download_media_bytes(
 
     try:
         async with asyncio.timeout(timeout_s):
-            async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=False) as client:
-                current_url = url
+            async with httpx.AsyncClient(
+                timeout=timeout_s,
+                follow_redirects=False,
+                trust_env=False,
+                verify=httpx.create_ssl_context(),
+                # Different hostnames can resolve to the same address and need distinct TLS connections.
+                limits=httpx.Limits(max_keepalive_connections=0),
+            ) as client:
+                current_url = httpx.URL(url)
                 redirect_count = 0
                 while True:
-                    async with client.stream(
-                        "GET",
-                        current_url,
-                        headers={"Accept-Encoding": "identity"},
-                    ) as response:
+                    async with _stream_media_response(client, current_url, source=source) as response:
                         if response.has_redirect_location:
                             if not follow_redirects:
                                 response.raise_for_status()
@@ -149,7 +205,9 @@ async def download_media_bytes(
                                     f"Exceeded {_MAX_REDIRECTS} redirects.",
                                     request=response.request,
                                 )
-                            current_url = response.url.join(response.headers["location"])
+                            current_url = current_url.join(response.headers["location"])
+                            # The cookie jar would otherwise scope cookies to the pinned IP.
+                            client.cookies.clear()
                             redirect_count += 1
                             continue
 
@@ -181,6 +239,8 @@ async def download_media_bytes(
                                 )
                             payload.extend(chunk)
                         return bytes(payload)
+    except httpx.InvalidURL as exc:
+        raise InvalidInputReferenceError(f"Invalid {source}: invalid media URL.") from exc
     except TimeoutError as exc:
         raise MediaInputTimeoutError(f"Invalid {source}: download exceeded the {timeout_s:g}s time limit.") from exc
 

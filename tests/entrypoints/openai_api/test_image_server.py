@@ -1785,7 +1785,7 @@ def test_image_edit_rejects_oversized_http_url_before_decode(async_omni_test_cli
 
     response = async_omni_test_client.post(
         "/v1/images/edits",
-        data={"prompt": "reject oversized input", "url": "https://example.com/large.png"},
+        data={"prompt": "reject oversized input", "url": "https://93.184.216.34/large.png"},
     )
 
     assert response.status_code == 400

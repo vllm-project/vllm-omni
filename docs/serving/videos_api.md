@@ -240,11 +240,10 @@ curl -s http://localhost:8091/v1/videos/sync \
 
 HTTP redirects for `image_reference.image_url` follow vLLM's
 `VLLM_MEDIA_URL_ALLOW_REDIRECTS` setting. Before starting the server, set it to
-`1` (the default) to allow redirects or `0` to reject them. A redirect target
-can differ from the original host, and vLLM-Omni does not yet fully implement
-upstream vLLM's media URL allowlist protection. Deployments should therefore
-treat remote media URLs as untrusted and choose this setting as part of their
-URL access policy.
+`1` (the default) to allow redirects or `0` to reject them. Each remote media
+URL must resolve to a public IP address, including every redirect target.
+Downloads connect directly to a checked address. For private media, use an
+upload where supported or a data URL.
 
 Remote and base64 data-URL references are bounded before decoding. Images and
 videos use vLLM's `VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` limit (256 MiB by default),

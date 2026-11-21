@@ -1264,7 +1264,7 @@ def test_i2v_video_generation_rejects_oversized_image_url(test_client, monkeypat
         "/v1/videos",
         data={
             "prompt": "reject oversized reference",
-            "image_reference": json.dumps({"image_url": "https://example.com/large.png"}),
+            "image_reference": json.dumps({"image_url": "https://93.184.216.34/large.png"}),
         },
     )
 
@@ -1296,7 +1296,7 @@ def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker
         "/v1/videos",
         data={
             "prompt": "A fox running through snow.",
-            "image_reference": json.dumps({"image_url": "https://example.com/redirect.png"}),
+            "image_reference": json.dumps({"image_url": "https://93.184.216.34/redirect.png"}),
         },
     )
 

@@ -87,12 +87,15 @@ async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
     _install_http_transport(monkeypatch, _handler, client_kwargs)
 
-    image = await video_api_utils.decode_image_url("https://example.com/redirect.png")
+    image = await video_api_utils.decode_image_url("https://93.184.216.34/redirect.png")
 
     assert image.size == (2, 1)
     assert image.mode == "RGB"
     assert requested_paths == ["/redirect.png", "/image.png"]
-    assert client_kwargs == [{"timeout": 60, "follow_redirects": False}]
+    assert len(client_kwargs) == 1
+    assert client_kwargs[0]["timeout"] == 60
+    assert client_kwargs[0]["follow_redirects"] is False
+    assert client_kwargs[0]["trust_env"] is False
 
 
 @pytest.mark.asyncio
@@ -115,7 +118,7 @@ async def test_decode_image_url_does_not_read_redirect_response_body(monkeypatch
     monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
     _install_http_transport(monkeypatch, _handler, [])
 
-    image = await video_api_utils.decode_image_url("https://example.com/redirect.png")
+    image = await video_api_utils.decode_image_url("https://93.184.216.34/redirect.png")
 
     assert image.size == (2, 1)
     assert not redirect_stream.started
@@ -134,10 +137,13 @@ async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
     _install_http_transport(monkeypatch, _handler, client_kwargs)
 
     with pytest.raises(InvalidInputReferenceError, match="redirect.*VLLM_MEDIA_URL_ALLOW_REDIRECTS"):
-        await video_api_utils.decode_image_url("https://example.com/redirect.png")
+        await video_api_utils.decode_image_url("https://93.184.216.34/redirect.png")
 
     assert requested_paths == ["/redirect.png"]
-    assert client_kwargs == [{"timeout": 60, "follow_redirects": False}]
+    assert len(client_kwargs) == 1
+    assert client_kwargs[0]["timeout"] == 60
+    assert client_kwargs[0]["follow_redirects"] is False
+    assert client_kwargs[0]["trust_env"] is False
 
 
 @pytest.mark.asyncio
@@ -151,7 +157,7 @@ async def test_decode_image_url_reports_http_status(monkeypatch):
     _install_http_transport(monkeypatch, _handler, client_kwargs)
 
     with pytest.raises(InvalidInputReferenceError, match="server returned HTTP 404"):
-        await video_api_utils.decode_image_url("https://example.com/missing.png")
+        await video_api_utils.decode_image_url("https://93.184.216.34/missing.png")
 
 
 @pytest.mark.asyncio
@@ -165,7 +171,7 @@ async def test_decode_image_url_reports_connection_failure(monkeypatch):
     _install_http_transport(monkeypatch, _handler, client_kwargs)
 
     with pytest.raises(InvalidInputReferenceError, match="failed to download image"):
-        await video_api_utils.decode_image_url("https://example.com/unreachable.png")
+        await video_api_utils.decode_image_url("https://93.184.216.34/unreachable.png")
 
 
 @pytest.mark.asyncio
@@ -179,7 +185,7 @@ async def test_decode_image_url_rejects_declared_response_size_before_read(monke
     _install_http_transport(monkeypatch, _handler, [])
 
     with pytest.raises(InvalidInputReferenceError, match="exceeds"):
-        await video_api_utils.decode_image_url("https://example.com/large.png")
+        await video_api_utils.decode_image_url("https://93.184.216.34/large.png")
 
     assert not stream.started
 
@@ -195,7 +201,7 @@ async def test_decode_image_url_rejects_chunked_response_after_limit(monkeypatch
     _install_http_transport(monkeypatch, _handler, [])
 
     with pytest.raises(InvalidInputReferenceError, match="exceeds"):
-        await video_api_utils.decode_image_url("https://example.com/stream.png")
+        await video_api_utils.decode_image_url("https://93.184.216.34/stream.png")
 
     assert stream.started
 
@@ -210,7 +216,7 @@ async def test_decode_image_url_reads_bounded_chunked_image(monkeypatch):
 
     _install_http_transport(monkeypatch, _handler, [])
 
-    image = await video_api_utils.decode_image_url("https://example.com/stream.png")
+    image = await video_api_utils.decode_image_url("https://93.184.216.34/stream.png")
 
     assert image.size == (2, 1)
     assert stream.started
@@ -225,7 +231,7 @@ async def test_decode_image_url_allows_disabled_size_limit(monkeypatch):
         [],
     )
 
-    image = await video_api_utils.decode_image_url("https://example.com/unlimited.png")
+    image = await video_api_utils.decode_image_url("https://93.184.216.34/unlimited.png")
 
     assert image.size == (2, 1)
 
@@ -240,7 +246,7 @@ async def test_decode_image_url_rejects_compressed_response_before_read(monkeypa
     _install_http_transport(monkeypatch, _handler, [])
 
     with pytest.raises(InvalidInputReferenceError, match="compressed responses"):
-        await video_api_utils.decode_image_url("https://example.com/compressed.png")
+        await video_api_utils.decode_image_url("https://93.184.216.34/compressed.png")
 
     assert not stream.started
 
@@ -256,7 +262,7 @@ async def test_decode_video_url_rejects_declared_response_size_before_tempfile(m
     _install_http_transport(monkeypatch, _handler, [])
 
     with pytest.raises(InvalidInputReferenceError, match="exceeds"):
-        await video_api_utils.decode_video_url("https://example.com/large.mp4")
+        await video_api_utils.decode_video_url("https://93.184.216.34/large.mp4")
 
     assert not stream.started
 
