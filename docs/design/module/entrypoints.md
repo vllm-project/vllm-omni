@@ -114,6 +114,11 @@ return HTTP 503 before reaching the engine. Diffusion image models also support
 image generation through Chat Completions. Segmentation and depth routes check
 their own model capabilities.
 
+Diffusion pipelines can declare additional output modalities alongside their
+default output. LingBot Video serves both images and videos; its image requests
+must set `num_frames=1` to override shared video defaults. LingBot World retains
+video-only serving capabilities because it requires causal multi-frame blocks.
+
 An optional `--video-output-warmup` request runs through the streaming video
 handler before HTTP serving starts. The frontend owns request validation,
 draining generation and encoding, and the startup deadline. It does not expose
