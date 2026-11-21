@@ -23,7 +23,10 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import HiggsAudioRVQ
+from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
+    HiggsAudioRVQ,
+    build_higgs_audio_acoustic_decoder,
+)
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
@@ -83,17 +86,9 @@ class OmniVoiceDecoder(nn.Module):
 
         return audio.to(device)
 
-    def _adjust_output_padding(self, decoder: nn.Module):
-        """Adjust ConvTranspose1d output_padding (HiggsAudioV2 modification)."""
-        for module in decoder.modules():
-            if isinstance(module, nn.ConvTranspose1d):
-                stride = module.stride[0] if isinstance(module.stride, tuple) else module.stride
-                module.output_padding = (stride % 2,)
-
     def load_weights(self, model_dir: str, device: torch.device) -> None:
         """Load decoder components from audio_tokenizer/model.safetensors."""
         from safetensors.torch import load_file
-        from transformers import DacConfig, DacModel
 
         audio_tokenizer_path = os.path.join(model_dir, "audio_tokenizer")
         config_path = os.path.join(audio_tokenizer_path, "config.json")
@@ -143,10 +138,16 @@ class OmniVoiceDecoder(nn.Module):
         self.fc2.weight.data.copy_(fc2_w)
         self.fc2.bias.data.copy_(fc2_b)
 
-        # 3. Build DAC acoustic decoder
-        dac_cfg = DacConfig(**tokenizer_config["acoustic_model_config"])
-        dac_model = DacModel(dac_cfg)
-        self.acoustic_decoder = dac_model.decoder.to(device)
+        # 3. Build DAC acoustic decoder via the shared higgs-audio v2 builder.
+        # It constructs the same transformers DacModel decoder with the
+        # HiggsAudioV2 output-padding fix and tanh -> Identity this class used
+        # to hand-roll, and additionally swaps Snake1d for the fused
+        # bit-identical Triton kernel with conv biases and residual adds
+        # folded in. Measured on H100 at the default 15 s chunk: ~2x faster
+        # decode, bit-identical output. Falls back to the eager Snake
+        # expression on non-CUDA/fallback dtypes and to the stock DAC forward
+        # when the decoder layout does not match.
+        self.acoustic_decoder = build_higgs_audio_acoustic_decoder(tokenizer_config, device)
 
         # Load acoustic decoder weights
         loaded = 0
@@ -160,13 +161,6 @@ class OmniVoiceDecoder(nn.Module):
         # upsampling doesn't overflow (fp16 max ~65504 is too small for
         # intermediate activations in the DAC upsampling chain).
         self.acoustic_decoder.float()
-
-        # Apply HiggsAudioV2 output padding adjustment
-        self._adjust_output_padding(self.acoustic_decoder)
-
-        # Remove tanh if present (HiggsAudioV2 uses Identity instead)
-        if hasattr(self.acoustic_decoder, "tanh"):
-            self.acoustic_decoder.tanh = nn.Identity()
 
         self.acoustic_decoder.eval()
         self._loaded = True
