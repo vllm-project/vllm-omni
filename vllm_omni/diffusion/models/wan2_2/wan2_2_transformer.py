@@ -44,6 +44,13 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.fused_add_norm_quant import (
+    can_fuse_add_layernorm_quant,
+    can_fuse_layernorm_quant,
+    fused_add_layernorm_quant,
+    fused_layernorm_quant,
+)
+from vllm_omni.diffusion.layers.fused_gelu_quant import fused_gelu_quant
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
@@ -155,7 +162,10 @@ class WanFeedForward(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.net_0(hidden_states)
+        hidden_states = self.net_0.proj(hidden_states)
+        # GELU and net_2's MXFP8 input quantization in one pass where the
+        # platform has the fused kernel; otherwise plain GELU.
+        hidden_states = fused_gelu_quant(self.net_2, hidden_states, self.net_0.approximate)
         hidden_states = self.net_1(hidden_states)
         hidden_states = self.net_2(hidden_states)
         return hidden_states
@@ -778,8 +788,16 @@ class WanTransformerBlock(nn.Module):
                 self.scale_shift_table + temb
             ).chunk(6, dim=1)
 
-        # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
+        # 1. Self-attention. norm1's modulated output goes straight into
+        # attn1.to_qkv as its MXFP8 input where the kernels allow.
+        if self.attn1.to_gate_compress is None and can_fuse_layernorm_quant(
+            self.attn1.to_qkv, hidden_states, scale_msa, shift_msa
+        ):
+            norm_hidden_states = fused_layernorm_quant(
+                self.attn1.to_qkv, hidden_states, 1 + scale_msa, shift_msa, self.norm1.eps
+            )
+        else:
+            norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
         self_attn_extra = {}
         if vsa_dit_seq_shape is not None:
             self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
@@ -795,15 +813,31 @@ class WanTransformerBlock(nn.Module):
             attn_mask=hidden_states_mask, extra=self_attn_extra, video_layout=video_layout
         )
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
-        hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
-        # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
+        # 2. Cross-attention. The gated residual add, norm2 and attn2.to_q's
+        # MXFP8 input quantization run as one kernel where available.
+        norm2 = self.norm2 if isinstance(self.norm2, nn.LayerNorm) else None
+        if norm2 is not None and can_fuse_add_layernorm_quant(
+            self.attn2.to_q, hidden_states, gate_msa, norm2.weight, norm2.bias
+        ):
+            # hidden_states is the block input, which hooks may still hold.
+            hidden_states, norm_hidden_states = fused_add_layernorm_quant(
+                self.attn2.to_q, hidden_states.clone(), attn_output, gate_msa, norm2.weight, norm2.bias, norm2.eps
+            )
+        else:
+            hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
+            norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None)
-        hidden_states = hidden_states + attn_output
 
-        # 3. Feed-forward
-        norm_hidden_states = self.norm3(hidden_states, c_scale_msa, c_shift_msa).type_as(hidden_states)
+        # 3. Feed-forward, same fusion for the residual add, norm3 modulation
+        # and the FFN input quantization. hidden_states is ours here.
+        if can_fuse_add_layernorm_quant(self.ffn.net_0.proj, hidden_states, c_scale_msa, c_shift_msa):
+            hidden_states, norm_hidden_states = fused_add_layernorm_quant(
+                self.ffn.net_0.proj, hidden_states, attn_output, None, 1 + c_scale_msa, c_shift_msa, self.norm3.eps
+            )
+        else:
+            hidden_states = hidden_states + attn_output
+            norm_hidden_states = self.norm3(hidden_states, c_scale_msa, c_shift_msa).type_as(hidden_states)
         ff_output = self.ffn(norm_hidden_states)
         hidden_states = (hidden_states + ff_output * c_gate_msa).type_as(hidden_states)
 

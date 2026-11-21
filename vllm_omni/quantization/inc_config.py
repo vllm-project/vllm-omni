@@ -263,6 +263,11 @@ class _MXFlattenedLinearMethod(INCLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if not isinstance(x, torch.Tensor):
+            # A QuantizedActivation from a fused activation+quant producer: its
+            # data is already 2-D; restore the producer's leading dims.
+            output = super().apply(layer, x, bias)
+            return output.reshape(*x.orig_shape[:-1], -1)
         if x.dim() <= 2:
             return super().apply(layer, x, bias)
         ori_shape = x.shape
