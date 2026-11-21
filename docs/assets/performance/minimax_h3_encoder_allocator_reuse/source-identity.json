@@ -1,0 +1,11 @@
+{
+  "actual_baseline_checkout": "7602d7980d8add4277353e8bc162ac1f98d98c19",
+  "actual_local_candidate_checkout": "b8918a7465491d3a2fb1c00dafc6ae18a9157a20",
+  "baseline_pr_head": "4f68b8047569ae1100e525c326d1fd09312edfa9",
+  "candidate_encoder_sha256": "a51ccfc9d60145611b21c0257baa553011f05937221461b272921b307fcccd14",
+  "candidate_encoder_git_blob": "235d69a226344c20e299b4037ead84bccaa7b693",
+  "scope": "Only encoder allocator policy changed in production; all other production files match baseline.",
+  "delivery_parent": "4f68b8047569ae1100e525c326d1fd09312edfa9",
+  "delivered_encoder_git_blob": "235d69a226344c20e299b4037ead84bccaa7b693",
+  "delivered_encoder_matches_measured": true
+}

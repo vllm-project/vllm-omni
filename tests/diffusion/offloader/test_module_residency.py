@@ -63,6 +63,42 @@ def _aliased_modules() -> tuple[nn.Module, nn.Module]:
     return left, right
 
 
+@pytest.mark.parametrize(
+    "allocation_error", [RuntimeError("pinned slab exhausted"), MemoryError("pinned slab exhausted")]
+)
+def test_packed_allocation_failure_uses_separate_pinned_masters(monkeypatch, patched_runtime, mocker, allocation_error):
+    left, right = _aliased_modules()
+    expected = [tensor.detach().clone() for tensor in (left.weight, right.weight, left.state, right.state)]
+    original_empty = torch.empty
+    pinned_sizes = []
+
+    def fail_packed_allocation(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise allocation_error
+        return original_empty(*args, **kwargs)
+
+    def pin_separate_master(tensor):
+        pinned_sizes.append(tensor.numel())
+        return tensor.clone()
+
+    monkeypatch.setattr(torch, "empty", fail_packed_allocation)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", pin_separate_master)
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=True,
+        pack_by_dtype=True,
+        cache_retention=mocker.Mock(spec=BoundedAllocatorCache),
+    )
+    assert pinned_sizes == [48, 64]
+    for transition in (stager.load, stager.offload):
+        transition()
+        assert left.weight.untyped_storage().data_ptr() == right.weight.untyped_storage().data_ptr()
+        assert left.state.untyped_storage().data_ptr() == right.state.untyped_storage().data_ptr()
+        for actual, reference in zip((left.weight, right.weight, left.state, right.state), expected, strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("inference_parameter", [False, True])
 def test_inference_staging_preserves_parameter_version_tracking(patched_runtime, mocker, inference_parameter):
     with torch.inference_mode(inference_parameter):
@@ -97,7 +133,8 @@ def test_inference_staging_preserves_projection_cache_invalidation(patched_runti
             assert ExactProjectionCache._signature(module) != signature
 
 
-def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_runtime, mocker):
+@pytest.mark.parametrize("pack_by_dtype", [False, True])
+def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_runtime, mocker, pack_by_dtype):
     left, right = _aliased_modules()
     expected_left_weight = left.weight.detach().clone()
     expected_right_weight = right.weight.detach().clone()
@@ -109,6 +146,7 @@ def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_run
         torch.device("cpu"),
         pin_memory=False,
         cache_retention=retention,
+        pack_by_dtype=pack_by_dtype,
     )
 
     master_weight_ptr = left.weight.untyped_storage().data_ptr()
@@ -138,6 +176,62 @@ def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_run
     assert torch.equal(right.weight, expected_right_weight)
     assert torch.equal(left.state, expected_left_state)
     assert torch.equal(right.state, expected_right_state)
+    retention.release_if_needed.assert_called_once_with(force=False)
+
+
+def test_packed_offload_preserves_strided_offset_aliases_across_requests(patched_runtime, mocker):
+    """Slab offsets must not overwrite a strided view or its cross-module alias."""
+    storage = torch.arange(16, dtype=torch.float32)
+    left, right = nn.Module(), nn.Module()
+    left.bias = nn.Parameter(torch.tensor([101.0, 102.0]))
+    left.weight = nn.Parameter(storage[2:14].reshape(3, 4).t())
+    right.weight = nn.Parameter(storage[6:14].reshape(2, 4))
+    expected = torch.tensor([[2.0, 6.0, 10.0], [3.0, 7.0, 11.0], [4.0, 8.0, 12.0], [5.0, 9.0, 13.0]])
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=False,
+        cache_retention=mocker.Mock(spec=BoundedAllocatorCache),
+        pack_by_dtype=True,
+    )
+    for _ in range(3):
+        stager.load()
+        assert left.weight.stride() == (1, 4)
+        assert left.weight.untyped_storage().data_ptr() == right.weight.untyped_storage().data_ptr()
+        assert right.weight.storage_offset() - left.weight.storage_offset() == 4
+        torch.testing.assert_close(left.weight, expected, rtol=0, atol=0)
+        left.weight.data[0, 1] = -99
+        assert right.weight[0, 0].item() == -99
+        stager.offload()
+        torch.testing.assert_close(left.weight, expected, rtol=0, atol=0)
+        torch.testing.assert_close(left.bias, torch.tensor([101.0, 102.0]), rtol=0, atol=0)
+
+
+def test_pack_by_dtype_keeps_module_boundaries_and_values(patched_runtime, mocker):
+    left = nn.Linear(4, 2)
+    right = nn.Linear(4, 2)
+    left.register_buffer("position_ids", torch.arange(4, dtype=torch.int64))
+    expected = [
+        tensor.detach().clone() for module in (left, right) for tensor in (*module.parameters(), *module.buffers())
+    ]
+    retention = mocker.Mock(spec=BoundedAllocatorCache)
+
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=False,
+        cache_retention=retention,
+        pack_by_dtype=True,
+    )
+
+    # left float, left int64, and right float are separate transfer groups.
+    assert len(stager._groups) == 3
+    assert sorted(len(group.bindings) for group in stager._groups) == [1, 2, 2]
+    stager.load()
+    stager.offload()
+
+    actual = [tensor for module in (left, right) for tensor in (*module.parameters(), *module.buffers())]
+    assert all(torch.equal(value, reference) for value, reference in zip(actual, expected, strict=True))
     retention.release_if_needed.assert_called_once_with(force=False)
 
 

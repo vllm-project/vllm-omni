@@ -1,0 +1,41 @@
+"""Real current-code Ref2VA input preparation; timing excludes digest checks."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parent
+manifest = json.loads((ROOT / "run-manifest.json").read_text())
+runtime = Path(manifest["runtimes"]["rgb"]["path"])
+sys.path[:0] = [str(runtime), str(ROOT)]
+import torch
+import compat_bootstrap
+if (runtime / "vllm_omni/worker_v2/ngram_adapter.py").exists():
+    compat_bootstrap.install(runtime)
+from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepare_encoder_inputs
+
+def digest(value):
+    if isinstance(value, torch.Tensor):
+        data = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+    else:
+        data = value.reshape(-1).view("uint8")
+    return hashlib.sha256(memoryview(data)).hexdigest()
+
+reuse = sys.argv[1] == "true"
+output = Path(sys.argv[2])
+sampling = SimpleNamespace(height=864, width=480, num_frames=294, fps=24,
+    extra_args={"task": "ref2va", "duration_seconds": 12, "reference_video_decode_reuse": reuse})
+case, = [x for x in json.loads(Path(manifest["case_manifest"]).read_text())["cases"] if x["case_id"] == "case01"]
+payload = {"prompt": case["prompt"], "multi_modal_data": {"video": manifest["reference_video"]}}
+started = time.perf_counter()
+value = prepare_encoder_inputs(payload, sampling)
+elapsed = time.perf_counter() - started
+record = {"seconds": elapsed, "reuse": reuse, "video_sha256": [digest(x) for x in value.media.videos],
+          "video_shapes": [list(x.shape) for x in value.media.videos],
+          "qwen_sha256": [digest(x[0]) for x in value.qwen_videos], "timestamps": value.video_timestamps,
+          "audio_sha256": [digest(x[0]) for x in value.media.video_audios if x is not None],
+          "source_commit": manifest["runtimes"]["rgb"]["revision"]}
+output.write_text(json.dumps(record, indent=2))
+print(json.dumps(record))

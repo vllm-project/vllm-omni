@@ -1,0 +1,22 @@
+import json
+import os
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parent
+assert os.environ.get("NPUQ_JOB_ID"), "managed execution required"
+manifest = json.loads((ROOT / "run-manifest.json").read_text())
+kind = os.environ["PERF_KIND"]
+runtime = Path(manifest["runtimes"][os.environ["PERF_RUNTIME"]]["path"])
+sys.path[:0] = [str(runtime), str(ROOT)]
+import torch
+import torch_npu
+import compat_bootstrap
+if (runtime / "vllm_omni/worker_v2/ngram_adapter.py").exists():
+    compat_bootstrap.install(runtime)
+torch.use_deterministic_algorithms(True)
+import observer
+observer.install()
+from vllm_omni.entrypoints.cli.main import main
+if __name__ == "__main__":
+    main()

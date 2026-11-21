@@ -1,0 +1,14 @@
+diff --git a/vllm_omni/diffusion/models/minimax_h3/encoder.py b/vllm_omni/diffusion/models/minimax_h3/encoder.py
+index d8df17b3c..235d69a22 100644
+--- a/vllm_omni/diffusion/models/minimax_h3/encoder.py
++++ b/vllm_omni/diffusion/models/minimax_h3/encoder.py
+@@ -1302,0 +1303,6 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
++        # Keep freed allocator blocks reusable after discarding the live GPU
++        # weights. Native layerwise deployments have no component cache,
++        # unlike DLO; without this policy every packed offload empties it.
++        cache_retention = getattr(self, "_omni_component_cache", None)
++        if cache_retention is None:
++            cache_retention = BoundedAllocatorCache(self.device_target)
+@@ -1307 +1313 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
+-            cache_retention=getattr(self, "_omni_component_cache", None),
++            cache_retention=cache_retention,

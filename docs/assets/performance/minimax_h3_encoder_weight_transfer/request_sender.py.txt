@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Replay every saved v13 input at both resolutions against the Ref2VA VDN service.
+
+The data directory contains the two extracted datasets and their saved
+manifest.context-ir.json files. No Context-IR service is contacted. Generated
+media and result JSON belong in an external results directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from fractions import Fraction
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+import traceback
+import urllib.error
+import urllib.request
+
+
+HERE = Path(__file__).resolve().parent
+CONFIG_PATH = HERE / "config" / "v13.json"
+_helper_spec = importlib.util.spec_from_file_location(
+    "ref2va_vdn_benchmark_helpers", HERE.parent / "scripts" / "run_benchmark.py"
+)
+benchmark = importlib.util.module_from_spec(_helper_spec)
+_helper_spec.loader.exec_module(benchmark)
+
+
+def build_plan(data_dir: Path, config: dict) -> list[dict]:
+    jobs = []
+    for dataset in config["datasets"]:
+        directory = Path(data_dir) / dataset["name"]
+        manifest_path = directory / dataset["manifest"]
+        raw = manifest_path.read_bytes()
+        manifest_sha = hashlib.sha256(raw).hexdigest()
+        if manifest_sha != dataset["manifest_sha256"]:
+            raise ValueError(f"manifest SHA256 mismatch: {manifest_path}: {manifest_sha}")
+        cases = json.loads(raw)["cases"]
+        if len(cases) != dataset["case_count"]:
+            raise ValueError(f"{dataset['name']}: expected {dataset['case_count']} cases, got {len(cases)}")
+        for case in cases:
+            if case["request"]["duration"] != dataset["seconds"]:
+                raise ValueError(f"{dataset['name']}/{case['case_id']}: duration differs from v13")
+            for resolution in config["resolutions"]:
+                jobs.append({
+                    "dataset": dataset["name"],
+                    "case": case,
+                    "data_dir": directory,
+                    "seconds": dataset["seconds"],
+                    "resolution": resolution,
+                    "manifest_sha256": manifest_sha,
+                })
+    return jobs
+
+
+def send_request(base_url, data_dir, case, seconds, width, height, settings, timeout_s):
+    if os.environ.get("BENCH_DROP_REFERENCES") == "1":
+        raise ValueError("v13 requires every reference; BENCH_DROP_REFERENCES=1 is unsupported")
+    fields = {
+        "prompt": case["prompt"], "seconds": str(seconds),
+        "width": str(width), "height": str(height),
+        "seed": str(settings["seed"]),
+        "num_inference_steps": str(settings["num_inference_steps"]),
+        "flow_shift": str(settings["flow_shift"]),
+        "extra_params": json.dumps({"audio_flow_shift": settings["audio_flow_shift"]}),
+    }
+    media = {
+        item["file"]: item
+        for kind in ("images", "audios", "videos") for item in case.get(kind, [])
+    }
+    references = benchmark.reference_parts(case)
+    expected_count = sum(len(case.get(kind, [])) for kind in ("images", "audios", "videos"))
+    if not references or len(references) != expected_count:
+        raise ValueError(f"{case['case_id']}: reference list is incomplete")
+    files, reference_records = [], []
+    for file, mime in references:
+        payload = (Path(data_dir) / file).read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != media[file]["sha256"]:
+            raise ValueError(f"reference SHA256 mismatch: {file}: {digest}")
+        files.append(("input_references", Path(file).name, mime, payload))
+        reference_records.append({"file": file, "mime_type": mime, "bytes": len(payload), "sha256": digest})
+    body, content_type = benchmark.encode_multipart(fields, files)
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/videos/sync", data=body, method="POST",
+        headers={"Content-Type": content_type},
+    )
+    started_at = time.time()
+    started = time.monotonic()
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        video = response.read()
+        headers = dict(response.headers.items())
+    return video, {
+        "request": fields,
+        "references": reference_records,
+        "response_headers": headers,
+        "http_seconds": time.monotonic() - started,
+        "started_at_unix": started_at,
+        "ended_at_unix": time.time(),
+    }
+
+
+def validate_media(report, width, height, seconds):
+    video = [stream for stream in report["streams"] if stream.get("codec_type") == "video"]
+    audio = [stream for stream in report["streams"] if stream.get("codec_type") == "audio"]
+    if not video:
+        raise ValueError("output has no video stream")
+    if not audio:
+        raise ValueError("output has no audio stream")
+    if any((stream["width"], stream["height"]) != (width, height) for stream in video):
+        raise ValueError(f"output dimensions differ from requested {width}x{height}")
+    # The deployed H3 contract fixes 24 FPS and aligns the two v13 durations
+    # upward to 17n+5 frames: 12s -> 294, 15s -> 362.
+    frames = {12: 294, 15: 362}[seconds]
+    duration = Fraction(frames, 24)
+    tolerance = Fraction(1, 24)
+    for stream in video:
+        if Fraction(stream["avg_frame_rate"]) != 24 or Fraction(stream["r_frame_rate"]) != 24:
+            raise ValueError("output video fps differs from the required 24 FPS")
+        if int(stream["nb_read_frames"]) != frames:
+            raise ValueError(f"output video frame count differs from required {frames}")
+    # Audio is quantized at 40 Hz; MP4 duration fields also round. One video
+    # frame covers those boundaries without accepting a shortened clip.
+    for stream in [*video, *audio, report["format"]]:
+        if abs(Fraction(stream["duration"]) - duration) > tolerance:
+            raise ValueError(f"output duration differs from required {float(duration)} seconds")
+    return {"expected_video_frames": frames, "expected_fps": 24,
+            "expected_duration_seconds": float(duration),
+            "duration_tolerance_seconds": float(tolerance)}
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
+    temporary.replace(path)
+
+
+def execute_case(base_url, job, settings, results_dir, tos_prefix, uploader, timeout_s):
+    case, resolution = job["case"], job["resolution"]
+    relative = Path(job["dataset"]) / resolution["name"] / case["case_id"]
+    stem = Path(results_dir) / relative
+    record_path, video_path = stem.with_suffix(".json"), stem.with_suffix(".mp4")
+    if record_path.exists() or video_path.exists():
+        raise FileExistsError(f"refusing to overwrite a previous v13 result: {stem}")
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    key = f"{tos_prefix.rstrip('/')}/{relative.as_posix()}"
+    record = {
+        "schema_version": "ref2va-vdn-910b4-v13-result/v1",
+        "status": "running",
+        "dataset": job["dataset"],
+        "case_id": case["case_id"],
+        "input": case,
+        "manifest_sha256": job["manifest_sha256"],
+        "seconds": job["seconds"],
+        "resolution": resolution,
+        "sampling": settings,
+        "subjective_quality": "not_evaluated",
+        "video_file": str(video_path),
+        "tos_video_key": key + ".mp4",
+        "tos_record_key": key + ".json",
+    }
+    write_json(record_path, record)
+    try:
+        video, response_record = send_request(
+            base_url, job["data_dir"], case, job["seconds"],
+            resolution["width"], resolution["height"], settings, timeout_s,
+        )
+        record.update(response_record)
+        partial = video_path.with_suffix(".partial.mp4")
+        partial.write_bytes(video)
+        partial.replace(video_path)
+        record["video_bytes"] = len(video)
+        record["video_sha256"] = hashlib.sha256(video).hexdigest()
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", "-show_streams", "-show_format", "-of", "json", str(video_path)],
+            text=True, capture_output=True, check=True,
+        )
+        record["ffprobe"] = json.loads(probe.stdout)
+        write_json(record_path, record)
+        decode = subprocess.run(
+            ["ffmpeg", "-v", "error", "-xerror", "-i", str(video_path), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"],
+            text=True, capture_output=True, check=True,
+        )
+        record["decode_validation"] = {
+            "command": decode.args, "returncode": decode.returncode,
+            "stdout": decode.stdout, "stderr": decode.stderr,
+        }
+        record["media_validation"] = validate_media(
+            record["ffprobe"], resolution["width"], resolution["height"], job["seconds"],
+        )
+        write_json(record_path, record)
+        record["tos_video_url"] = uploader.upload_file(key + ".mp4", video_path, "video/mp4", record["video_sha256"])
+        record["status"] = "ok"
+        write_json(record_path, record)
+        uploader.upload(key + ".json", record_path.read_bytes(), "application/json")
+    except Exception as error:
+        details = {"type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()}
+        if isinstance(error, urllib.error.HTTPError):
+            with error:
+                error_body = error.read()
+            details.update({
+                "http_status": error.code,
+                "http_headers": dict(error.headers.items()),
+                "http_body_base64": base64.b64encode(error_body).decode("ascii"),
+            })
+        if isinstance(error, subprocess.CalledProcessError):
+            details.update({"command": error.cmd, "returncode": error.returncode, "stdout": error.stdout, "stderr": error.stderr})
+        record.update(status="error", error=details)
+        write_json(record_path, record)
+        try:
+            uploader.upload(key + ".json", record_path.read_bytes(), "application/json")
+        except Exception as upload_error:
+            record["error_record_upload"] = {
+                "type": type(upload_error).__name__, "message": str(upload_error), "traceback": traceback.format_exc(),
+            }
+            write_json(record_path, record)
+            raise ExceptionGroup("v13 case failed and its error record could not upload", [error, upload_error]) from error
+        raise
+    return record
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--results-dir", type=Path, required=True)
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--tos-prefix", required=True)
+    parser.add_argument("--timeout", type=float, default=7200)
+    parser.add_argument("--case", help="explicit diagnostic identity, e.g. ref2va-v13-avatar12s/case01")
+    parser.add_argument("--resolution", choices=("480p", "768p"), help="explicit diagnostic resolution")
+    args = parser.parse_args()
+    config = json.loads(CONFIG_PATH.read_text())
+    plan = build_plan(args.data_dir, config)
+    selected = [job for job in plan
+                if (args.case is None or f"{job['dataset']}/{job['case']['case_id']}" == args.case)
+                and (args.resolution is None or job["resolution"]["name"] == args.resolution)]
+    if not selected:
+        raise ValueError("diagnostic selection matches no v13 case")
+    uploader = benchmark.TosUploader()
+    if not uploader.enabled:
+        raise ValueError("TOS_ACCESS_KEY and TOS_SECRET_KEY are required before v13 generation")
+    run_path = args.results_dir / "run.json"
+    if run_path.exists():
+        raise FileExistsError(f"use a new results directory; run record already exists: {run_path}")
+    run = {
+        "schema_version": config["schema_version"],
+        "mode": "diagnostic" if args.case is not None or args.resolution is not None else "full_v13",
+        "base_url": args.base_url,
+        "sampling": config["request"],
+        "total_v13_outputs": len(plan),
+        "selected_outputs": len(selected),
+        "status": "running",
+        "completed": [],
+    }
+    write_json(run_path, run)
+    for job in selected:
+        identity = f"{job['dataset']}/{job['case']['case_id']}"
+        print(json.dumps({"state": "started", "identity": identity, "resolution": job["resolution"]["name"]}), flush=True)
+        try:
+            record = execute_case(args.base_url, job, config["request"], args.results_dir,
+                                  args.tos_prefix, uploader, args.timeout)
+        except Exception:
+            run.update(status="error", failed={"identity": identity, "resolution": job["resolution"]["name"]})
+            write_json(run_path, run)
+            raise
+        run["completed"].append({"identity": identity, "resolution": job["resolution"]["name"], "status": record["status"]})
+        write_json(run_path, run)
+        print(json.dumps({"state": "completed", "identity": identity, "resolution": job["resolution"]["name"]}), flush=True)
+    run["status"] = "complete"
+    write_json(run_path, run)
+    uploader.upload(f"{args.tos_prefix.rstrip('/')}/run.json", run_path.read_bytes(), "application/json")
+
+
+if __name__ == "__main__":
+    main()

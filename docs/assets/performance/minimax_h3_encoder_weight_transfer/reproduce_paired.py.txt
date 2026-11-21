@@ -1,0 +1,47 @@
+"""Recompute all published paired effects from public records with stdlib."""
+import ast
+import hashlib
+import json
+import math
+from pathlib import Path
+import random
+import re
+import statistics as st
+import sys
+
+root = Path(__file__).resolve().parent
+data = json.loads(Path(sys.argv[1]).read_text())
+source = (root / "analyze_paired.py.txt").read_bytes()
+contract = json.loads((root / "analysis-contract.json").read_text())
+assert hashlib.sha256(source).hexdigest() == contract["analysis_sha256"]
+assert len(data["requests"]) == 63
+assert all(r["status"] == "ok" and r["http_status"] == 200 for r in data["requests"])
+assert len({r["sha256"] for r in data["requests"]}) == 1
+groups = {}
+for number in range(1, 4):
+    for role in ["A1", "B", "A2"]:
+        rows = [r for r in data["requests"] if r["stage"] == f"encoder_r{number}_{role}"]
+        assert len(rows) == 7 and sum(r["phase"] == "warmup" for r in rows) == 2
+        formal = [r for r in rows if r["phase"] == "formal"]
+        assert len(formal) == 5
+        groups[(number, role)] = [dict(r, response={"started_at_unix": r["started_at_unix"]}) for r in formal]
+        for row in rows:
+            for rank in row["rank_stats"]:
+                movement = rank["encoder_movement"]
+                assert movement["copy_trace_enabled"] == (row["phase"] == "warmup")
+                if movement["copy_trace_enabled"]:
+                    assert movement["copy_trace_verified"]
+                    actual = movement["warmup_copy_observed"]
+                    for kind in ["nonblock", "block"]:
+                        assert actual[kind + "_calls"] == movement[kind + "_h2d_calls"]
+                        assert actual[kind + "_bytes"] == movement[kind + "_h2d_bytes"]
+tree = ast.parse(source)
+functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ["circular_sample", "metric"]]
+assert len(functions) == 2
+namespace = {"math": math, "random": random, "st": st, "groups": groups}
+exec(compile(ast.Module(body=functions, type_ignores=[]), "archived-analysis", "exec"), namespace)
+for label, key in [("completed_encoder", "completed_encoder_s"),
+                   ("encode_prompt", "encode_prompt_s"), ("http_e2e", "http_e2e_s")]:
+    result = namespace["metric"](key)
+    assert result == data["analysis"][label]
+    print(label, json.dumps({k: v for k, v in result.items() if k != "rounds"}))

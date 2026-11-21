@@ -1,0 +1,86 @@
+"""Observe live-weight release, allocator cache decisions and host release time."""
+from functools import wraps
+import json
+from pathlib import Path
+import time
+import torch
+import torch.distributed as dist
+import paired_observer as paired
+
+ACTIVE = None
+LAST = None
+
+def install():
+    paired.install()
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+    from vllm_omni.platforms import current_omni_platform as platform
+
+    def memory(device):
+        module = torch.get_device_module(device)
+        reserved = int(module.memory_reserved(device))
+        allocated = int(module.memory_allocated(device))
+        free, total = platform.get_device_memory(device)
+        return {"reserved": reserved, "allocated": allocated,
+                "cached": max(0, reserved - allocated), "free": int(free), "total": int(total)}
+
+    empty_original = platform.empty_cache
+    @wraps(empty_original)
+    def empty(*args, **kwargs):
+        if ACTIVE is not None:
+            ACTIVE["empty_cache_calls"] += 1
+        return empty_original(*args, **kwargs)
+    platform.empty_cache = empty
+
+    release_original = PinnedModuleStager._release_cache
+    @wraps(release_original)
+    def release(self, *args, **kwargs):
+        if ACTIVE is None or self is not getattr(paired.base.PIPELINE.text_encoder, "_omni_non_block_stager", None):
+            return release_original(self, *args, **kwargs)
+        before = memory(self.device)
+        calls = ACTIVE["empty_cache_calls"]
+        started = time.perf_counter()
+        value = release_original(self, *args, **kwargs)
+        elapsed = time.perf_counter() - started
+        ACTIVE["events"].append({"force": bool(kwargs.get("force", False)),
+            "policy_present": self.cache_retention is not None,
+            "before": before, "after": memory(self.device),
+            "host_release_s": elapsed, "empty_cache_calls": ACTIVE["empty_cache_calls"] - calls})
+        return value
+    PinnedModuleStager._release_cache = release
+
+    encoder_original = MiniMaxH3Pipeline._encode_text_hidden
+    @wraps(encoder_original)
+    def encoder(self, *args, **kwargs):
+        global ACTIVE, LAST
+        ACTIVE = {"events": [], "empty_cache_calls": 0, "encoder_entry": memory(self.device)}
+        try:
+            value = encoder_original(self, *args, **kwargs)
+            stager = self.text_encoder._omni_non_block_stager
+            ACTIVE.update(policy_present=stager.cache_retention is not None,
+                policy_type=type(stager.cache_retention).__name__ if stager.cache_retention else None,
+                live_weight_storage_released=not stager.loaded and not stager._device_storages,
+                encoder_exit=memory(self.device))
+            LAST = ACTIVE
+            return value
+        finally:
+            ACTIVE = None
+    MiniMaxH3Pipeline._encode_text_hidden = encoder
+
+    forward_original = MiniMaxH3Pipeline.forward
+    @wraps(forward_original)
+    def forward(self, request):
+        global LAST
+        LAST = None
+        context = paired.base.active()
+        value = forward_original(self, request)
+        assert LAST is not None
+        path = Path(context["stats_dir"]) / f"rank{dist.get_rank()}.json"
+        row = json.loads(path.read_text())
+        row["allocator_reuse"] = LAST
+        temporary = path.with_suffix(".cache.tmp")
+        temporary.write_text(json.dumps(row, indent=2) + "\n")
+        temporary.replace(path)
+        print("H3_ALLOCATOR_REUSE " + json.dumps({"nonce": context["nonce"], "rank": dist.get_rank(), **LAST}), flush=True)
+        return value
+    MiniMaxH3Pipeline.forward = forward

@@ -102,6 +102,66 @@ def test_encoder_non_block_children_use_one_shared_snapshot_stager(monkeypatch, 
     hook.offload_layer.assert_called_once_with()
 
 
+@pytest.mark.parametrize("layerwise_enabled", [False, True])
+def test_prepare_packed_offload_builds_packed_stager(monkeypatch, mocker, layerwise_enabled):
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+
+    class VisionStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = torch.nn.Linear(2, 2)
+            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+
+    class TextStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(4, 2)
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+
+    encoder = object.__new__(encoder_module.MiniMaxH3Qwen3VLEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.device_target = SimpleNamespace(type="npu")
+    encoder.vision = VisionStack()
+    encoder.text_model = TextStack()
+    hook = mocker.Mock()
+    hook.pin_memory = False
+    encoder._omni_layerwise_hooks = [hook] if layerwise_enabled else []
+    encoder._omni_layerwise_enabled = layerwise_enabled
+    cache = mocker.Mock()
+    encoder.set_omni_component_cache(cache)
+    stager = mocker.Mock()
+    stager.pack_by_dtype = True
+    stager_cls = mocker.Mock(return_value=stager)
+    monkeypatch.setattr(encoder_module, "PinnedModuleStager", stager_cls)
+
+    encoder.prepare_packed_offload()
+    encoder.prepare_packed_offload()
+
+    expected_modules = [encoder.vision.patch_embed, encoder.text_model.embed_tokens]
+    if not layerwise_enabled:
+        expected_modules += [*encoder.vision.blocks, *encoder.text_model.layers]
+    stager_cls.assert_called_once_with(
+        expected_modules,
+        encoder.device_target,
+        pin_memory=not layerwise_enabled,
+        cache_retention=cache,
+        pack_by_dtype=True,
+    )
+
+
+def test_prepare_packed_offload_rejects_existing_non_packed_stager(mocker):
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+
+    encoder = object.__new__(encoder_module.MiniMaxH3Qwen3VLEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.device_target = SimpleNamespace(type="npu")
+    encoder.text_model = torch.nn.Linear(2, 2)
+    encoder._omni_non_block_stager = mocker.Mock(pack_by_dtype=False)
+
+    with pytest.raises(RuntimeError, match="packed encoder offload must be prepared"):
+        encoder.prepare_packed_offload()
+
+
 def test_manual_component_failure_forces_retained_cache_release(mocker):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 

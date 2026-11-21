@@ -1,0 +1,181 @@
+"""Passive per-request counters and host timers; tensor hashes only in warmups."""
+from functools import wraps
+import hashlib
+import json
+import os
+from pathlib import Path
+import time
+import torch
+import torch.distributed as dist
+
+STATE = None
+PIPELINE = None
+
+
+def active():
+    path = Path(os.environ["PERF_WINDOW"]) / "active-request.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def sha_tensor(value):
+    data = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    return hashlib.sha256(memoryview(data.numpy())).hexdigest()
+
+
+def capture(key, value):
+    if STATE is not None and STATE["active"]["capture"] and isinstance(value, torch.Tensor):
+        STATE["tensors"][key] = {"shape": list(value.shape), "dtype": str(value.dtype), "sha256": sha_tensor(value)}
+
+
+def emit(event, elapsed, details):
+    context = active()
+    if context is None:
+        return
+    row = {"nonce": context["nonce"], "event": event, "seconds": elapsed,
+           "rank": dist.get_rank() if dist.is_initialized() else None, "pid": os.getpid(), **details}
+    folder = Path(context["stats_dir"])
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / f"events-{os.getpid()}.jsonl").open("a") as file:
+        file.write(json.dumps(row) + "\n")
+
+
+def install():
+    from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing, reference_video
+    MiniMaxH3Qwen3VLEncoder.cudnn_sdp = False
+    original = MiniMaxH3Pipeline.forward
+
+    @wraps(original)
+    def forward(self, request):
+        global STATE, PIPELINE
+        PIPELINE = self
+        context = active()
+        assert context is not None
+        if not hasattr(self, "_benchmark_precision"):
+            summary = {}
+            for name in ["transformer", "text_encoder"]:
+                counts = {}
+                for parameter in getattr(self, name).parameters():
+                    key = str(parameter.dtype)
+                    counts[key] = counts.get(key, 0) + parameter.numel()
+                summary[name] = counts
+            self._benchmark_precision = summary
+        STATE = {"active": context, "durations": {}, "tensors": {},
+                 "counts": {"dit": 0, "encode": 0, "prepare_packed": 0, "new_pack": 0}}
+        before = time.perf_counter()
+        output = original(self, request)
+        STATE["durations"]["forward"] = time.perf_counter() - before
+        stager = getattr(self.text_encoder, "_omni_non_block_stager", None)
+        record = {"nonce": context["nonce"], "stage": context["stage"], "rank": dist.get_rank(),
+                  "world_size": dist.get_world_size(), "counts": STATE["counts"],
+                  "durations": STATE["durations"], "tensors": STATE["tensors"],
+                  "packed_stager": bool(stager is not None and getattr(stager, "pack_by_dtype", False)),
+                  "encoder_tp": self.text_encoder.tp_size,
+                  "deterministic": torch.are_deterministic_algorithms_enabled(),
+                  "parameter_precision": self._benchmark_precision,
+                  "encoder_source": __import__(MiniMaxH3Qwen3VLEncoder.__module__, fromlist=["_"]).__file__}
+        folder = Path(context["stats_dir"])
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"rank{record['rank']}.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record, indent=2))
+        temporary.replace(path)
+        print("H3_PROVENANCE_REQUEST " + json.dumps({"nonce": context["nonce"], "rank": record["rank"],
+              "counts": record["counts"], "durations": record["durations"]}), flush=True)
+        STATE = None
+        return output
+
+    MiniMaxH3Pipeline.forward = forward
+    dit_original = MiniMaxH3DiTModel.forward
+
+    @wraps(dit_original)
+    def dit(self, *args, **kwargs):
+        if STATE is not None and self is PIPELINE.transformer:
+            STATE["counts"]["dit"] += 1
+        return dit_original(self, *args, **kwargs)
+
+    MiniMaxH3DiTModel.forward = dit
+    encode_original = MiniMaxH3Qwen3VLEncoder.encode_ids
+
+    @wraps(encode_original)
+    def encode(self, *args, **kwargs):
+        before = time.perf_counter()
+        value = encode_original(self, *args, **kwargs)
+        elapsed = time.perf_counter() - before
+        if STATE is not None:
+            STATE["counts"]["encode"] += 1
+            STATE["durations"]["encoder_forward"] = elapsed
+            capture("encoder_output", value)
+        return value
+
+    MiniMaxH3Qwen3VLEncoder.encode_ids = encode
+    if hasattr(MiniMaxH3Qwen3VLEncoder, "prepare_packed_offload"):
+        pack_original = MiniMaxH3Qwen3VLEncoder.prepare_packed_offload
+
+        @wraps(pack_original)
+        def prepare(self, *args, **kwargs):
+            was = getattr(self, "_omni_non_block_stager", None)
+            value = pack_original(self, *args, **kwargs)
+            if STATE is not None:
+                STATE["counts"]["prepare_packed"] += 1
+                STATE["counts"]["new_pack"] += int(was is None and getattr(self, "_omni_non_block_stager", None) is not None)
+            return value
+
+        MiniMaxH3Qwen3VLEncoder.prepare_packed_offload = prepare
+    for name in ["encode_prompt", "diffuse", "decode"]:
+        function = getattr(MiniMaxH3Pipeline, name)
+
+        def wrap(function, name):
+            @wraps(function)
+            def measured(self, *args, **kwargs):
+                start = time.perf_counter()
+                value = function(self, *args, **kwargs)
+                if STATE is not None:
+                    STATE["durations"][name] = STATE["durations"].get(name, 0.0) + time.perf_counter() - start
+                return value
+            return measured
+
+        setattr(MiniMaxH3Pipeline, name, wrap(function, name))
+    reference_original = reference_video.prepare_reference_videos
+
+    @wraps(reference_original)
+    def reference(*args, **kwargs):
+        before = time.perf_counter()
+        values = reference_original(*args, **kwargs)
+        emit("prepare_reference_videos", time.perf_counter() - before,
+             {"decode_reuse": bool(kwargs.get("decode_reuse", False)),
+              "sidecars": sum("rgb_path" in x for x in values)})
+        return values
+
+    reference_video.prepare_reference_videos = reference
+    encoder_processing.prepare_reference_videos = reference
+    transcode_original = reference_video._transcode_reference_video
+
+    @wraps(transcode_original)
+    def transcode(*args, **kwargs):
+        before = time.perf_counter()
+        value = transcode_original(*args, **kwargs)
+        emit("transcode_reference_video", time.perf_counter() - before,
+             {"rgb_output": kwargs.get("rgb_output_path") is not None})
+        return value
+
+    reference_video._transcode_reference_video = transcode
+    inputs_original = encoder_processing.prepare_encoder_inputs
+
+    @wraps(inputs_original)
+    def inputs(*args, **kwargs):
+        before = time.perf_counter()
+        value = inputs_original(*args, **kwargs)
+        elapsed = time.perf_counter() - before
+        if STATE is not None:
+            for index, video in enumerate(value.media.videos):
+                capture(f"video_input{index}", video)
+        emit("prepare_encoder_inputs", elapsed, {"videos": len(value.media.videos)})
+        return value
+
+    encoder_processing.prepare_encoder_inputs = inputs
+    pipeline_module = __import__(MiniMaxH3Pipeline.__module__, fromlist=["_"])
+    if hasattr(pipeline_module, "prepare_encoder_inputs"):
+        pipeline_module.prepare_encoder_inputs = inputs
