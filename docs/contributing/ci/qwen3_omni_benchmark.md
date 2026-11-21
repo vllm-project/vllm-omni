@@ -3,7 +3,8 @@
 Qwen3-Omni uses the shared `tests/dfx/perf/scripts/run_benchmark.py` runner
 with `tests/dfx/perf/tests/test_qwen3_omni_non_full_duplex.json`. Explicit accuracy
 cases reuse their inference requests for performance and scoring. Accuracy
-is independent of concurrency. Every non-duplex request generates text and audio.
+is independent of concurrency. Daily-Omni takes video and audio as input and
+requests a text answer. Seed-TTS requests both text and audio output.
 
 The two combined CUDA jobs have 120-minute timeouts. Their labels include both
 `Accuracy Test` and `Perf Test`, so `tools/nightly/run_nightly_jobs.sh` selects
@@ -65,8 +66,9 @@ results identify their actual hardware and do not establish A3/H100 results.
 
 ## Completeness, accuracy and performance
 
-Every dataset run requires its exact submitted/completed/audio count, no
-request failures or timeouts, and complete positive finite performance samples.
+Every dataset run requires the configured number of submitted and completed requests,
+zero request failures or timeouts, and complete positive finite performance samples.
+Seed-TTS also requires audio output for every request.
 Accuracy cases also require complete scorer coverage and finite quality scores.
 Invalid Daily answers count as wrong answers; they do not become missing
 requests. Shared AMD and legacy accuracy helpers retain their behavior.
@@ -83,11 +85,12 @@ readiness and warmups use separate salts. Reuse inside a measured group remains
 possible. Multimodal processor caches retain existing behavior. The benchmark
 measures a warmed service. Use the recorded case order when comparing revisions.
 
-TTFT, TTFP, TPOT, E2E, audio duration and request throughput are retained.
-Daily performance references use TTFT/RTF/TTFP; Seed-TTS references use RTF/TTFP.
+Daily-Omni records TTFT, TPOT, ITL, E2E latency and request throughput.
+The text-only case collects a new TTFT reference. Seed-TTS also records audio
+duration and uses audio RTF and TTFP for performance regression checks.
 Throughput is an aggregate metric, not a per-request percentile.
 `result_validation.metrics` checks that each metric has a valid value and
-the expected number of samples. The H100 references in
+the expected number of samples. The H100 Seed-TTS references in
 `benchmark_params[].baseline` use the arithmetic mean for each scenario in
 [build 20463](https://buildkite.com/vllm/vllm-omni/builds/20463), running
 [commit `9d86d17f12`](https://github.com/vllm-project/vllm-omni/commit/9d86d17f1223f77c713b04dd398c24257b6c53e5).
@@ -155,9 +158,9 @@ unchanged.
 Copy selected JSON entries into a separate smoke configuration, omitting the
 performance `baseline` field. Set a small
 `num_prompts`, reduce `num_warmups`, and set
-`result_validation.smoke` to true. Accuracy-enabled smoke runs still require
-all selected requests to have valid audio and complete finite scores, but do
-not apply full-dataset quality or calibrated performance floors. Their results
+`result_validation.smoke` to true. Accuracy-enabled smoke runs require complete finite scores for all selected
+requests. Seed-TTS smoke also requires valid audio for each request. Full-dataset
+quality and calibrated performance floors apply to qualification runs. Their results
 are marked `qualification_scope: smoke` and cannot qualify a full dataset.
 Daily smoke can use explicit `dataset_source.sample_indices`, for example `[0, 647]`, to
 exercise both clip durations. Other runs use the source manifest order.

@@ -176,11 +176,10 @@
         "disable_shuffle": true,
         "omni_isolate_prefix_cache": true,
         "omni_fail_fast_on_timeout": true,
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "percentile-metrics": "ttft,tpot,itl,e2el",
         "extra_body": {
           "modalities": [
-            "text",
-            "audio"
+            "text"
           ]
         },
         "dataset_source": {
@@ -193,11 +192,9 @@
         },
         "result_validation": {
           "accuracy": true,
-          "require_audio": true,
+          "require_audio": false,
           "metrics": {
-            "mean_ttft_ms": "num_ttft_samples",
-            "mean_audio_rtf": "num_audio_rtf_samples",
-            "mean_audio_ttfp_ms": "num_audio_ttfp_samples"
+            "mean_ttft_ms": "num_ttft_samples"
           },
           "accuracy_baseline": {
             "min_daily_omni_accuracy": 0.69
@@ -211,8 +208,7 @@
           "model_runner": "v2",
           "inference_devices": 2,
           "modalities": [
-            "text",
-            "audio"
+            "text"
           ]
         },
         "benchmark_env": {
@@ -220,14 +216,7 @@
           "SEED_TTS_SIM_EVAL": "0",
           "SEED_TTS_UTMOS_EVAL": "0"
         },
-        "daily_omni_pack_mode": "qwen",
-        "baseline": {
-          "H100": {
-            "mean_ttft_ms": 3647.318585,
-            "mean_audio_ttfp_ms": 4068.385943,
-            "mean_audio_rtf": 7.82516
-          }
-        }
+        "daily_omni_pack_mode": "qwen"
       }
     ]
   },
