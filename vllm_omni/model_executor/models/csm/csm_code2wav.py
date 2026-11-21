@@ -135,24 +135,29 @@ class CsmCode2Wav(nn.Module):
         ``[num_codebooks * frames]``, continuing where its previous call
         stopped; the decoder state is kept per request id, so every frame
         must arrive exactly once. A request whose codes are invalid produces
-        no audio from then on; the other requests of the batch are unaffected.
+        no audio from then on and carries ``meta.error`` set, which the serving
+        adapter turns into a failed response; the other requests of the batch
+        are unaffected.
         """
         sample_rate = torch.tensor(self.sample_rate, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
         if input_ids is None or input_ids.numel() == 0:
-            outputs = {"model_outputs": [empty], "sr": [sample_rate]}
-            return OmniOutput(text_hidden_states=None, multimodal_outputs=outputs)
+            return self._output([empty], [False], sample_rate)
 
         infos = runtime_additional_information or model_intermediate_buffer or []
         request_ids = kwargs.get("request_ids") or []
         segments = _split_by_request(input_ids.reshape(-1), kwargs.get("seq_token_counts"))
         audios = [empty] * len(segments)
+        failed = [False] * len(segments)
         for index, segment in enumerate(segments):
             info = infos[index] if index < len(infos) else None
             meta = info.get("meta") if isinstance(info, Mapping) else None
             meta = meta if isinstance(meta, Mapping) else {}
             request_id = request_ids[index] if index < len(request_ids) else None
-            if meta.get(_DUMMY_PROFILE_KEY) or request_id in self._failed:
+            if meta.get(_DUMMY_PROFILE_KEY):
+                continue
+            if request_id in self._failed:
+                failed[index] = True
                 continue
             payload = _payload_codes(info)
             flat = (segment if payload is None else payload).reshape(-1)
@@ -163,6 +168,7 @@ class CsmCode2Wav(nn.Module):
                 self._validate_codes(flat)
             except ValueError as error:
                 logger.warning("CSM code2wav: request %s produces no more audio (%s)", request_id, error)
+                failed[index] = True
                 if request_id is not None:
                     self._failed.add(request_id)
                     self._streams.pop(request_id, None)
@@ -176,9 +182,15 @@ class CsmCode2Wav(nn.Module):
                     self._streams[request_id] = state
             audios[index] = self._decoder.decode(codes, state).to(torch.float32)
 
+        return self._output(audios, failed, sample_rate)
+
+    @staticmethod
+    def _output(audios: list[torch.Tensor], failed: list[bool], sample_rate: torch.Tensor) -> OmniOutput:
+        """One audio, sample rate and failure flag per request, in batch order."""
+        errors = [torch.tensor([int(flag)], dtype=torch.int32) for flag in failed]
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": [sample_rate] * len(segments)},
+            multimodal_outputs={"model_outputs": audios, "sr": [sample_rate] * len(audios), "meta": {"error": errors}},
         )
 
     def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:

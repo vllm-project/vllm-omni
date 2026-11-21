@@ -140,6 +140,8 @@ _PIPELINE_STAGES = [
     "code2wav",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
+    "csm_code2wav",
+    "csm_talker",
     "dac_decoder",
     "diffusion",
     "dit",

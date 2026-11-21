@@ -9,9 +9,11 @@ import pytest
 import torch
 from transformers import CsmConfig, MimiModel
 
+from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmAdapter
 from vllm_omni.model_executor.models.csm.csm_code2wav import CsmCode2Wav, codec_weight_name
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.csm import talker2code2wav_async_chunk
+from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
@@ -259,6 +261,38 @@ def test_invalid_codes_fail_only_their_request(model: CsmCode2Wav, reference: Mi
 
     model.on_requests_finished({"bad", "good"})
     assert model._failed == set() and model._streams == {}
+
+
+def test_a_failed_request_reaches_the_serving_adapter_as_a_synthesis_error(model: CsmCode2Wav) -> None:
+    """The flag is split per request the way the generation runner does it, then read by the adapter."""
+    good, bad = _codes(frames=4, seed=9), _codes(frames=4, seed=10)
+    bad[1, 5] = 2048
+    adapter = object.__new__(CsmAdapter)
+
+    def reported(output: OmniOutput, num_requests: int) -> list[bool]:
+        flags = []
+        for payload in OmniGenerationModelRunner._build_pooler_output(output, num_requests):
+            collect: dict = {}
+            adapter.collect_response_metadata(payload, collect)
+            flags.append(collect.get("audio_synthesis_error", False))
+        return flags
+
+    def step(bad_codes: torch.Tensor, good_codes: torch.Tensor) -> OmniOutput:
+        segments = [_flat(bad_codes), _flat(good_codes)]
+        return model(
+            input_ids=torch.cat(segments),
+            seq_token_counts=[segment.numel() for segment in segments],
+            request_ids=["bad", "good"],
+        )
+
+    first = step(bad[:2], good[:2])
+    assert [int(flag) for flag in first.multimodal_outputs["meta"]["error"]] == [1, 0]
+    assert reported(first, 2) == [True, False]
+    # The request stays marked on its later chunks, whose own codes are valid.
+    assert reported(step(_codes(frames=2, seed=11), good[2:]), 2) == [True, False]
+    # A request alone in its batch, and a step without input.
+    assert reported(model(input_ids=_flat(bad), request_ids=["alone"]), 1) == [True]
+    assert reported(model(input_ids=torch.empty(0, dtype=torch.long)), 1) == [False]
 
 
 @pytest.mark.parametrize("value", [-1, 2048, 2050])
