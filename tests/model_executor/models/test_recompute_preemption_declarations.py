@@ -8,7 +8,7 @@ different KV than the one that produced the audio already delivered
 (vllm-project/vllm-omni#6179):
 
 - a sampled RVQ codebook folded into `inputs_embeds` (Qwen3-Omni talker,
-  VoxCPM2, audio8_tts, fish_speech, qwen3_tts, moss_tts),
+  VoxCPM2, audio8_tts, fish_speech, qwen3_tts, moss_tts, csm),
 - a per-frame temporal hidden plus codebook (personaplex),
 - 31 side-channel FSQ codes per frame (Gepard).
 
@@ -26,6 +26,7 @@ from __future__ import annotations
 import pytest
 
 from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
+from vllm_omni.model_executor.models.csm.pipeline import CSM_PIPELINE
 from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
@@ -64,6 +65,7 @@ _FAIL = [
     (MOSS_TTS_PIPELINE, "moss_tts"),
     (MOSS_TTS_REALTIME_PIPELINE, "moss_tts"),
     (MOSS_TTS_LOCAL_PIPELINE, "moss_tts_local"),
+    (CSM_PIPELINE, "csm_talker"),
 ]
 
 _ALLOW = [

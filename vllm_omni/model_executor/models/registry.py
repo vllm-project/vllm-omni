@@ -15,6 +15,8 @@ _OMNI_MODELS = {
     "Lfm3AudioForConditionalGeneration": ("lfm3_audio", "model", "Lfm3AudioForConditionalGeneration"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
+    "CsmTalkerForConditionalGeneration": ("csm", "csm_talker", "CsmTalkerForConditionalGeneration"),
+    "CsmCode2Wav": ("csm", "csm_code2wav", "CsmCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",

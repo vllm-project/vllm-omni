@@ -56,6 +56,7 @@ class _Engine:
         self.talker = talker
         self.requests: dict[str, SimpleNamespace] = {}
         self.frame_calls: list[dict] = []
+        self.first_codes: list[torch.Tensor] = []
         self.decode_inputs: list[tuple[str, torch.Tensor]] = []
         hidden_size = talker.config.hidden_size
 
@@ -67,6 +68,7 @@ class _Engine:
 
         def generate_frame(backbone_hidden, first_codes, **sampling):
             self.frame_calls.append(sampling)
+            self.first_codes.append(first_codes.clone())
             steps = torch.arange(talker.num_codebooks)
             codes = (first_codes[:, None] + steps) % talker.codebook_vocab_size
             # A planned first code of 0 completes a stop frame; its last codebook is not zero.
@@ -213,10 +215,37 @@ def test_stop_frame_forces_the_stop_token_on_the_next_step(engine: _Engine) -> N
     assert len(request.frames) == 2
     assert request.frames[1][:-1].eq(0).all() and int(request.frames[1][-1]) == 5
 
-    # An overrun step after the stop token stays stopped and publishes no frame.
-    engine.step(["a"])
-    assert request.tokens[-1] == engine.talker.stop_token_id
-    assert len(request.frames) == 2
+
+def test_the_step_after_the_stop_token_publishes_nothing(engine: _Engine) -> None:
+    """Async scheduling runs one more step on a request that already sampled the stop token."""
+    talker = engine.talker
+    engine.add("a", slot=0, plan=[7, 0, 11, 11])
+    engine.add("b", slot=1, plan=[9, 9, 9, 9, 9])
+    for _ in range(3):
+        engine.step(["a", "b"])
+    stopped, other = engine.requests["a"], engine.requests["b"]
+    assert stopped.tokens == [7, 0, talker.stop_token_id]
+    assert len(stopped.frames) == 2
+
+    # The scheduler issued this step before it saw the stop token, so the stop token is the input.
+    sampled = engine.step(["a", "b"])
+
+    assert sampled.tolist() == [talker.stop_token_id, 9]
+    assert len(stopped.frames) == 2
+    assert [int(frame[0]) for frame in other.frames] == [9, 9, 9, 9]
+    # The depth decoder only ever sees codes: the stop token is replaced before the lookup.
+    assert len(engine.first_codes) == 4
+    for first_codes in engine.first_codes:
+        assert int(first_codes.min()) >= 0 and int(first_codes.max()) < talker.codebook_vocab_size
+    assert engine.first_codes[-1].tolist() == [0, 9]
+
+    # The runner reports the request finished only after that step; nothing of it stays behind.
+    engine.finish("a")
+    assert set(talker._stop_flags) == {"b"}
+    assert engine.step(["b"]).tolist() == [9]
+    assert set(talker._stop_flags) == {"b"}
+    engine.finish("b")
+    assert talker._stop_flags == {}
 
 
 def test_decode_input_is_the_previous_frame_embedding(engine: _Engine) -> None:

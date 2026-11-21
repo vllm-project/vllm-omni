@@ -239,3 +239,40 @@ def test_stop_and_empty_frame_rules() -> None:
     assert stop_frame_mask(frames).tolist() == [True, True, False, False]
     assert empty_frame_mask(frames).tolist() == [True, False, False, False]
     assert stop_frame_mask(frames[None]).shape == (1, 4)
+
+
+def test_talker_mtp_computes_a_stop_token_row_on_a_valid_code(
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Async scheduling hands the stop token back as a first codebook; it is never embedded."""
+    talker, _ = loaded
+    hidden_size = talker.config.hidden_size
+    hidden = torch.randn((2, hidden_size), generator=torch.Generator().manual_seed(3))
+    zeros = torch.zeros((2, hidden_size))
+    seen: list[torch.Tensor] = []
+    generate_frame = talker.generate_frame
+
+    def recording(backbone_hidden, first_codes, **sampling):
+        seen.append(first_codes.clone())
+        return generate_frame(backbone_hidden, first_codes, **sampling)
+
+    monkeypatch.setattr(talker, "generate_frame", recording)
+    first = torch.tensor([[talker.stop_token_id], [7]])
+    try:
+        with torch.no_grad():
+            embeds, codes = talker.talker_mtp(first, zeros, hidden, zeros, do_sample=False, req_ids=["stopped", "live"])
+            flags = {req_id: bool(flag) for req_id, flag in talker._stop_flags.items()}
+            _, alone = talker.talker_mtp(first[1:], zeros[1:], hidden[1:], zeros[1:], do_sample=False)
+            discarded, _ = generate_frame(hidden[:1], torch.tensor([0]))
+    finally:
+        talker.on_requests_finished(["stopped", "live"])
+
+    assert seen[0].tolist() == [0, 7]
+    assert codes.shape == (2, talker.num_codebooks) and not codes[0].any()
+    assert torch.isfinite(embeds).all()
+    # The row that received the stop token stays stopped although its discarded frame was no stop frame.
+    assert not stop_frame_mask(discarded).any()
+    assert flags == {"stopped": True, "live": False}
+    # The discarded row does not change the live one.
+    assert int(codes[1, 0]) == 7 and codes[1, 1:].any()
+    assert torch.equal(codes[1], alone[0])

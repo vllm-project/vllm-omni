@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU tests for the CSM stage-1 Mimi decoder against transformers' MimiModel."""
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from transformers import CsmConfig, MimiModel
 
 from vllm_omni.model_executor.models.csm.csm_code2wav import CsmCode2Wav, codec_weight_name
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.csm import talker2code2wav_async_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
@@ -97,8 +99,8 @@ def _assert_same_audio(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert float(error.abs().max() / rms) < 1e-3
 
 
-def _decode(model: CsmCode2Wav, request_id: str, codes: torch.Tensor, **meta) -> torch.Tensor:
-    output = model(input_ids=_flat(codes), runtime_additional_information=[{"meta": meta}], request_ids=[request_id])
+def _decode(model: CsmCode2Wav, request_id: str, codes: torch.Tensor) -> torch.Tensor:
+    output = model(input_ids=_flat(codes), request_ids=[request_id])
     return _audios(output)[0]
 
 
@@ -173,6 +175,28 @@ def test_chunks_match_past_the_attention_window(
     _assert_same_audio(torch.cat(pieces), _reference_audio(strong_reference, codes))
 
 
+def test_chunks_built_by_the_stage_input_processor_decode_to_the_whole_sequence(
+    model: CsmCode2Wav, reference: MimiModel
+) -> None:
+    manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        request_payload={},
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 5, "initial_codec_chunk_frames": 1}}),
+    )
+    codes = _codes(frames=23, seed=11)
+    payloads = []
+    for index, frame in enumerate(codes):
+        last = index == len(codes) - 1
+        request = SimpleNamespace(external_req_id="a", is_finished=lambda last=last: last)
+        step = {"codes": {"audio": frame[None]}, "meta": {"codec_frame_valid": torch.ones(1, dtype=torch.int8)}}
+        payloads.append(talker2code2wav_async_chunk(manager, step, request))
+    chunks = [payload.codes.audio for payload in payloads if payload is not None]
+
+    assert [chunk.numel() // NUM_CODEBOOKS for chunk in chunks] == [1, 5, 5, 5, 5, 2]
+    pieces = [_audios(model(input_ids=chunk, request_ids=["a"]))[0] for chunk in chunks]
+    _assert_same_audio(torch.cat(pieces), _reference_audio(reference, codes))
+
+
 def test_requests_in_one_batch_keep_separate_state(model: CsmCode2Wav, reference: MimiModel) -> None:
     first, second = _codes(frames=9, seed=3), _codes(frames=6, seed=4)
     audio: dict[str, list[torch.Tensor]] = {"a": [], "b": []}
@@ -210,16 +234,6 @@ def test_requests_without_an_id_keep_no_state(model: CsmCode2Wav, reference: Mim
         output = model(input_ids=_flat(codes), runtime_additional_information=[{}])
         _assert_same_audio(_audios(output)[0], _reference_audio(reference, codes))
     assert model._streams == {}
-
-
-def test_left_context_frames_are_not_decoded_again(model: CsmCode2Wav, reference: MimiModel) -> None:
-    codes = _codes(frames=8, seed=8)
-    head = _decode(model, "a", codes[:3])
-    # The second chunk repeats the three frames already decoded.
-    tail = _decode(model, "a", codes, left_context_size=torch.tensor([3]))
-
-    assert tail.shape == (5 * SAMPLES_PER_FRAME,)
-    _assert_same_audio(torch.cat((head, tail)), _reference_audio(reference, codes))
 
 
 def test_invalid_codes_fail_only_their_request(model: CsmCode2Wav, reference: MimiModel) -> None:

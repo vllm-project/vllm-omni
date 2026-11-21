@@ -64,14 +64,6 @@ def _payload_codes(info: Any) -> torch.Tensor | None:
     return None
 
 
-def _as_int(value: Any) -> int:
-    if isinstance(value, torch.Tensor):
-        return int(value.reshape(-1)[-1]) if value.numel() else 0
-    if isinstance(value, (list, tuple)):
-        return int(value[-1]) if value else 0
-    return int(value or 0)
-
-
 class CsmCode2Wav(nn.Module):
     """Stage-1 model for ``sesame/csm-1b``: incremental Mimi decoding under the generation runner."""
 
@@ -141,10 +133,9 @@ class CsmCode2Wav(nn.Module):
 
         A request's ``input_ids`` are codebook-major flat codes,
         ``[num_codebooks * frames]``, continuing where its previous call
-        stopped; the decoder state is kept per request id. Leading frames
-        counted by ``meta["left_context_size"]`` were already decoded and are
-        skipped. A request whose codes are invalid produces no audio from
-        then on; the other requests of the batch are unaffected.
+        stopped; the decoder state is kept per request id, so every frame
+        must arrive exactly once. A request whose codes are invalid produces
+        no audio from then on; the other requests of the batch are unaffected.
         """
         sample_rate = torch.tensor(self.sample_rate, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
@@ -178,9 +169,6 @@ class CsmCode2Wav(nn.Module):
                 continue
 
             codes = flat.to(device=segment.device, dtype=torch.long).reshape(1, self.num_codebooks, -1)
-            codes = codes[:, :, _as_int(meta.get("left_context_size")) :]
-            if codes.shape[-1] == 0:
-                continue
             state = self._streams.get(request_id) if request_id is not None else None
             if state is None:
                 state = MimiDecoderState()
