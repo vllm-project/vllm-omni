@@ -1792,7 +1792,11 @@ class Cosmos3OmniDiffusersPipeline(
         (and Cache-DiT counts forwards for CFG parity); PP forwards the UND
         cache across stages; TP, SP, CFG-parallel and HSDP are not validated
         with a broadcast UND cache yet. DP replicas each run the whole GEN
-        forward on one GPU, so they stay batched.
+        forward on one GPU, so they stay batched. Layerwise offload stays
+        batched too: in eager mode it is bitwise equal to batching without
+        offload. Under torch.compile it can start a rounding-level difference,
+        from an op not yet identified, that grows into slightly different
+        images.
         """
         return (
             _cosmos3_batch_t2i_outputs_enabled(self.od_config)

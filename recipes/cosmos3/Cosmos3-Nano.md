@@ -20,7 +20,9 @@ mode is selected per request:
   With `n > 1`, the images run as one batched denoising loop, so they can differ
   from earlier releases for the same seed, usually slightly. Tensor, sequence, CFG or
   pipeline parallelism, HSDP, cache backends and distilled checkpoints keep the
-  serial per-image loop; data-parallel replicas still batch. Start the server with
+  serial per-image loop; data-parallel replicas still batch. With layerwise offload
+  under `torch.compile`, batched images can also differ slightly from batched
+  images without offload. Start the server with
   `--additional-config '{"cosmos3_batch_t2i_outputs": false}'` to keep the serial
   loop everywhere.
 - **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image/video.

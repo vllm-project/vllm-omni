@@ -3606,7 +3606,7 @@ class TestForwardRouting:
         return [randn_tensor((1, 2, 1, 2, 2), generator=generator, dtype=torch.float32) for _ in range(num_outputs)]
 
     @staticmethod
-    def _t2i_od_config(*, additional_config=None, cache_backend=None, **parallel_kwargs):
+    def _t2i_od_config(*, additional_config=None, cache_backend=None, offload=None, **parallel_kwargs):
         from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 
         return OmniDiffusionConfig(
@@ -3614,6 +3614,7 @@ class TestForwardRouting:
             additional_config=additional_config or {},
             cache_backend=cache_backend,
             parallel_config=DiffusionParallelConfig(**parallel_kwargs),
+            **({offload: True} if offload else {}),
         )
 
     @pytest.mark.parametrize(
@@ -3623,6 +3624,12 @@ class TestForwardRouting:
             pytest.param({"additional_config": {"cosmos3_batch_t2i_outputs": True}}, id="opt_in"),
             # DP replicas each run the whole GEN forward on one GPU.
             pytest.param({"data_parallel_size": 2}, id="data_parallel"),
+            # Offload only changes where GEN weights live, not the batched path.
+            pytest.param({"offload": "enable_layerwise_offload"}, id="layerwise_offload"),
+            pytest.param(
+                {"offload": "enable_distributed_layerwise_offload", "data_parallel_size": 2},
+                id="distributed_layerwise_offload",
+            ),
         ],
     )
     def test_t2i_outputs_share_one_batched_diffusion(self, make_cosmos3_pipeline, od_config_kwargs) -> None:
@@ -5337,32 +5344,10 @@ def test_pipeline_init_rejects_cache_backend_under_pp_before_loading(monkeypatch
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
 
-@pytest.mark.parametrize(
-    ("additional_config", "expected"),
-    [({}, True), ({"cosmos3_batch_t2i_outputs": True}, True), ({"cosmos3_batch_t2i_outputs": False}, False)],
-)
-def test_cosmos3_batch_t2i_outputs_enabled(additional_config, expected) -> None:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _cosmos3_batch_t2i_outputs_enabled
-
-    od_config = OmniDiffusionConfig(model=None, additional_config=additional_config)
-    assert _cosmos3_batch_t2i_outputs_enabled(od_config) is expected
-
-
 @pytest.mark.parametrize("value", ["false", 0])
-def test_cosmos3_batch_t2i_outputs_rejects_non_bool(value) -> None:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
-        COSMOS3_BATCH_T2I_OUTPUTS_KEY,
-        _cosmos3_batch_t2i_outputs_enabled,
-    )
-
-    od_config = OmniDiffusionConfig(model=None, additional_config={COSMOS3_BATCH_T2I_OUTPUTS_KEY: value})
-    with pytest.raises(TypeError, match=COSMOS3_BATCH_T2I_OUTPUTS_KEY):
-        _cosmos3_batch_t2i_outputs_enabled(od_config)
-
-
-def test_pipeline_init_rejects_non_bool_batch_t2i_outputs_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pipeline_init_rejects_non_bool_batch_t2i_outputs_before_loading(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
 
@@ -5371,7 +5356,7 @@ def test_pipeline_init_rejects_non_bool_batch_t2i_outputs_before_loading(monkeyp
         "load_config",
         lambda *args, **kwargs: pytest.fail("component loading must not start for a non-bool batching switch"),
     )
-    od_config = OmniDiffusionConfig(model=None, additional_config={"cosmos3_batch_t2i_outputs": "false"})
+    od_config = OmniDiffusionConfig(model=None, additional_config={"cosmos3_batch_t2i_outputs": value})
     with pytest.raises(TypeError, match="cosmos3_batch_t2i_outputs"):
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
