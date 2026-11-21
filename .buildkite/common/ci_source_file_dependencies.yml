@@ -1626,6 +1626,8 @@ source_file_dependencies:
     - tests/helpers/runtime.py
 
   diffusion_minimax_h3_function:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *minimax_h3
     - tests/helpers/assertions.py
     - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
@@ -1705,6 +1707,8 @@ source_file_dependencies:
     - tests/diffusion/models/pi05/test_pi05_units.py
 
   diffusion_lingbot_function:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *lingbot_video
     - *lingbot_world
     - vllm_omni/diffusion/model_metadata.py

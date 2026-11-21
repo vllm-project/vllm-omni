@@ -4,9 +4,10 @@
 import json
 import math
 import os
+import statistics
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,9 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    BASELINE_REGRESSION_TOLERANCE,
+    BENCHMARK_RESULT_PATH_KEY,
+    PerformanceBaselineRegressionError,
     annotate_dataset_result,
     assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
@@ -71,7 +75,7 @@ else:
             f"skipped {skipped} remaining diffusion case(s) (chat completions / custom jsonl)"
         )
 
-DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
+DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 
@@ -170,6 +174,7 @@ def _start_judge_server(judge_params: dict[str, object]):
         # The primary model is alive on another visible device. Its outer
         # OmniServer owns the final device-memory wait after both servers exit.
         wait_for_device_memory=False,
+        defer_stderr=True,
     ) as judge:
         print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
@@ -290,7 +295,13 @@ def _start_omni_server(server_param):
     model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
     judge_params = _judge_server_params_for_test(test_name)
-    with OmniServer(model, server_args, use_omni=use_omni, env_dict=_omni_server_env()) as server:
+    with OmniServer(
+        model,
+        server_args,
+        use_omni=use_omni,
+        env_dict=_omni_server_env(),
+        defer_stderr=True,
+    ) as server:
         server.test_name = test_name
         server.judge_base_url = None
         print("OmniServer started successfully")
@@ -463,9 +474,9 @@ def _assert_chat_accuracy(result: Mapping[str, object], params: Mapping[str, obj
             assert _is_finite_number(value), f"{label} must be a finite number"
     errs = validate_seed_tts(
         dict(result),
-        max_mean_wer=float(max_wer) if max_wer is not None else None,
-        min_mean_sim=float(min_sim) if min_sim is not None else None,
-        min_mean_utmos=float(min_utmos) if min_utmos is not None else None,
+        max_mean_wer=float(max_wer) if _is_finite_number(max_wer) else None,
+        min_mean_sim=float(min_sim) if _is_finite_number(min_sim) else None,
+        min_mean_utmos=float(min_utmos) if _is_finite_number(min_utmos) else None,
     )
     assert not errs, "; ".join(errs)
 
@@ -817,7 +828,15 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
                 assert score >= minimum, f"PR correction mean_all_success {score} is below {minimum}"
 
 
-def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
+def assert_result(
+    result,
+    params,
+    num_prompt,
+    *,
+    check_baseline: bool = False,
+    require_baseline: bool = False,
+    baseline_tolerance: float = BASELINE_REGRESSION_TOLERANCE,
+) -> None:
     if result["completed"] != num_prompt:
         first_error = next((error for error in result.get("errors", []) if error), "No per-request error recorded")
         raise AssertionError(
@@ -869,15 +888,22 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
                     f"Missing or invalid P{percentile} {metric}"
                 )
     hardware = result.get("Hardware")
+    baseline_regression: PerformanceBaselineRegressionError | None = None
     if check_baseline or require_baseline:
         baseline = result.get("baseline")
-        assert_baseline_within_tolerance(
-            result,
-            baseline if isinstance(baseline, dict) else None,
-            hardware if isinstance(hardware, str) else None,
-            required=require_baseline,
-        )
+        try:
+            assert_baseline_within_tolerance(
+                result,
+                baseline if isinstance(baseline, dict) else None,
+                hardware if isinstance(hardware, str) else None,
+                tolerance=baseline_tolerance,
+                required=require_baseline,
+            )
+        except PerformanceBaselineRegressionError as exc:
+            baseline_regression = exc
     if params.get("duplex_performance_only"):
+        if baseline_regression is not None:
+            raise baseline_regression
         return
     if params.get("dataset_name") == "omni-duplex-eval":
         _assert_duplex_eval_result(result, params, num_prompt)
@@ -942,6 +968,201 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
             isinstance(metric, dict) and metric.get("audio_turn_count") == expected_audio_turns
             for metric in session_metrics
         ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
+    if baseline_regression is not None:
+        raise baseline_regression
+
+
+def _assert_sweep_result(
+    result: dict[str, Any],
+    params: dict[str, Any],
+    num_prompt: int,
+    pytestconfig: pytest.Config,
+    *,
+    context: str,
+    baseline_regressions: list[str],
+    baseline_tolerance: float = BASELINE_REGRESSION_TOLERANCE,
+) -> PerformanceBaselineRegressionError | None:
+    baseline_kwargs: dict[str, float] = {}
+    if baseline_tolerance != BASELINE_REGRESSION_TOLERANCE:
+        baseline_kwargs["baseline_tolerance"] = baseline_tolerance
+    try:
+        assert_result(
+            result,
+            params,
+            num_prompt,
+            check_baseline=pytestconfig.getoption("assert_baseline"),
+            require_baseline=pytestconfig.getoption("require_baseline"),
+            **baseline_kwargs,
+        )
+    except PerformanceBaselineRegressionError as exc:
+        baseline_regressions.append(f"{context}\n{exc}")
+        print(
+            f"[baseline-check] DEFER {context}; continuing remaining sweeps to preserve diagnostic artifacts",
+            flush=True,
+        )
+        return exc
+    return None
+
+
+def _baseline_confirmation_policy(
+    params: Mapping[str, Any],
+    result: Mapping[str, Any],
+    regression: PerformanceBaselineRegressionError,
+    *,
+    sweep_index: int = 0,
+    sweep_size: int = 1,
+) -> tuple[frozenset[str], int, float] | None:
+    """Return a confirmation policy for a pure threshold regression, if configured."""
+    policies = params.get("baseline_confirmation")
+    hardware = result.get("Hardware")
+    if not isinstance(policies, dict) or not isinstance(hardware, str):
+        return None
+    policy = policies.get(hardware)
+    if not isinstance(policy, dict):
+        return None
+    raw_metrics = policy.get("metrics")
+    attempts = policy.get("attempts", 3)
+    raw_tolerance = policy.get("tolerance", BASELINE_REGRESSION_TOLERANCE)
+    assert isinstance(raw_metrics, list) and raw_metrics and all(isinstance(metric, str) for metric in raw_metrics), (
+        f"baseline_confirmation[{hardware!r}].metrics must be a non-empty string list"
+    )
+    assert isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 2, (
+        f"baseline_confirmation[{hardware!r}].attempts must be an integer of at least 2"
+    )
+    tolerances = raw_tolerance if isinstance(raw_tolerance, list) else [raw_tolerance]
+    assert not isinstance(raw_tolerance, list) or len(tolerances) == sweep_size, (
+        f"baseline_confirmation[{hardware!r}].tolerance must contain one value per sweep point"
+    )
+    assert all(
+        isinstance(tolerance, int | float)
+        and not isinstance(tolerance, bool)
+        and math.isfinite(tolerance)
+        and tolerance >= 0
+        for tolerance in tolerances
+    ), f"baseline_confirmation[{hardware!r}].tolerance must be a non-negative finite number or list of them"
+    tolerance = float(tolerances[sweep_index] if isinstance(raw_tolerance, list) else raw_tolerance)
+    metrics = frozenset(raw_metrics)
+    failed_metrics = regression.failed_metrics
+    if not failed_metrics or failed_metrics != regression.threshold_metrics or not failed_metrics <= metrics:
+        return None
+    return metrics, attempts, tolerance
+
+
+def _without_confirmed_baseline_metrics(result: Mapping[str, Any], metrics: frozenset[str]) -> dict[str, Any]:
+    """Keep hard baseline checks active while confirmation-only metrics are repeated."""
+    filtered = dict(result)
+    baseline = result.get("baseline")
+    hardware = result.get("Hardware")
+    if not isinstance(baseline, dict) or not isinstance(hardware, str):
+        return filtered
+    bucket = baseline.get(hardware)
+    if not isinstance(bucket, dict):
+        return filtered
+    filtered["baseline"] = {
+        **baseline,
+        hardware: {name: expected for name, expected in bucket.items() if name not in metrics},
+    }
+    return filtered
+
+
+def _with_only_confirmed_baseline_metrics(result: Mapping[str, Any], metrics: frozenset[str]) -> dict[str, Any]:
+    """Limit the final relaxed comparison to the metrics selected for confirmation."""
+    filtered = dict(result)
+    baseline = result.get("baseline")
+    hardware = result.get("Hardware")
+    if not isinstance(baseline, dict) or not isinstance(hardware, str):
+        return filtered
+    bucket = baseline.get(hardware)
+    if not isinstance(bucket, dict):
+        return filtered
+    filtered["baseline"] = {
+        **baseline,
+        hardware: {name: expected for name, expected in bucket.items() if name in metrics},
+    }
+    return filtered
+
+
+def _median_confirmation_result(results: Sequence[Mapping[str, Any]], metrics: frozenset[str]) -> dict[str, Any]:
+    """Replace confirmation metrics with their median across repeated sweep runs."""
+    assert len(results) >= 2
+    confirmed = dict(results[0])
+    for metric in sorted(metrics):
+        values = [result.get(metric) for result in results]
+        numeric_values = [
+            float(value)
+            for value in values
+            if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+        ]
+        if len(numeric_values) != len(values):
+            confirmed[metric] = math.nan
+            continue
+        confirmed[metric] = statistics.median(numeric_values)
+        print(
+            f"[baseline-check] CONFIRM {metric}: values={values} median={confirmed[metric]}",
+            flush=True,
+        )
+    return confirmed
+
+
+def _confirmation_result_path(result: Mapping[str, object]) -> Path | None:
+    value = getattr(result, "result_path", None)
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, str):
+        return Path(value)
+    # Unit-level test doubles may expose the path as private mapping metadata.
+    value = result.get(BENCHMARK_RESULT_PATH_KEY)
+    return Path(value) if isinstance(value, str) else None
+
+
+def _persist_confirmation_result(
+    results: Sequence[Mapping[str, object]],
+    selected_result: Mapping[str, object],
+    metrics: frozenset[str],
+    *,
+    configured_attempts: int,
+    tolerance: float,
+    status: str,
+) -> None:
+    """Replace repeated confirmation artifacts with one canonical result JSON."""
+    paths = [_confirmation_result_path(result) for result in results]
+    if not any(paths):
+        # Unit-level runner fakes do not need to materialize benchmark JSON.
+        return
+    assert all(path is not None for path in paths), "every confirmation attempt must expose its result path"
+    concrete_paths = [path for path in paths if path is not None]
+    canonical_path = concrete_paths[0]
+    persisted = {key: value for key, value in selected_result.items() if key != BENCHMARK_RESULT_PATH_KEY}
+    metric_evidence = {}
+    for metric in sorted(metrics):
+        values = [result.get(metric) for result in results]
+        numeric_values = [
+            float(value)
+            for value in values
+            if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+        ]
+        metric_evidence[metric] = {
+            "values": values,
+            "median": statistics.median(numeric_values) if len(numeric_values) == len(values) else None,
+        }
+    persisted["baseline_confirmation_result"] = {
+        "status": status,
+        "attempts_completed": len(results),
+        "attempts_configured": configured_attempts,
+        "tolerance": tolerance,
+        "metrics": metric_evidence,
+    }
+    temporary_path = canonical_path.with_name(f".{canonical_path.name}.confirmation.tmp")
+    with temporary_path.open("w", encoding="utf-8") as stream:
+        json.dump(persisted, stream, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, canonical_path)
+    for path in concrete_paths[1:]:
+        path.unlink(missing_ok=True)
+    print(
+        f"[baseline-check] persisted {status} confirmation result to {canonical_path} "
+        f"and removed {len(concrete_paths) - 1} retry artifact(s)",
+        flush=True,
+    )
 
 
 @pytest.mark.benchmark
@@ -1012,6 +1233,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
 
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
+    baseline_regressions: list[str] = []
 
     def to_list(value, default=None):
         if value is None:
@@ -1042,6 +1264,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         "benchmark_env",
         "request_rate",
         "baseline",
+        "baseline_confirmation",
         "num_prompts",
         "max_concurrency",
         "num_warmups",
@@ -1129,12 +1352,13 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             )
             assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(
+                _assert_sweep_result(
                     result,
                     assert_params,
                     num_prompt,
-                    check_baseline=pytestconfig.getoption("assert_baseline"),
-                    require_baseline=pytestconfig.getoption("require_baseline"),
+                    pytestconfig,
+                    context=f"request_rate={qps!r} num_prompts={num_prompt}",
+                    baseline_regressions=baseline_regressions,
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
@@ -1173,15 +1397,125 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             )
             assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                assert_result(
+                initial_regressions: list[str] = []
+                regression = _assert_sweep_result(
                     result,
                     assert_params,
                     num_prompt,
-                    check_baseline=pytestconfig.getoption("assert_baseline"),
-                    require_baseline=pytestconfig.getoption("require_baseline"),
+                    pytestconfig,
+                    context=f"max_concurrency={concurrency!r} num_prompts={num_prompt}",
+                    baseline_regressions=initial_regressions,
+                )
+                if regression is None:
+                    continue
+                policy = _baseline_confirmation_policy(
+                    assert_params,
+                    result,
+                    regression,
+                    sweep_index=sweep_index,
+                    sweep_size=len(max_concurrency_list),
+                )
+                if policy is None:
+                    baseline_regressions.extend(initial_regressions)
+                    continue
+                confirmation_metrics, attempts, confirmation_tolerance = policy
+                confirmation_results = [result]
+                hard_regression = False
+                last_result = result
+                for attempt in range(2, attempts + 1):
+                    print(
+                        f"[baseline-check] RETRY confirmation attempt {attempt}/{attempts} "
+                        f"for max_concurrency={concurrency!r}",
+                        flush=True,
+                    )
+                    retry_result = run_benchmark(
+                        args=args,
+                        test_name=test_name,
+                        flow=concurrency,
+                        dataset_name=dataset_name,
+                        num_prompt=num_prompt,
+                        baseline_config=params.get("baseline"),
+                        sweep_index=sweep_index,
+                        random_input_len=params.get("random_input_len"),
+                        random_output_len=params.get("random_output_len"),
+                        resource_label=resource_label,
+                        num_warmups=_resolve_num_warmups(
+                            params,
+                            default=max(2, int(concurrency)),
+                            sweep_index=sweep_index,
+                            sweep_size=len(max_concurrency_list),
+                        ),
+                        benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                        result_filename_suffix=f"confirmation-{attempt}",
+                        accuracy_baseline=accuracy_baseline,
+                        check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
+                        result_transform=result_transform,
+                    )
+                    confirmation_results.append(retry_result)
+                    last_result = retry_result
+                    retry_regressions: list[str] = []
+                    retry_regression = _assert_sweep_result(
+                        _without_confirmed_baseline_metrics(retry_result, confirmation_metrics),
+                        assert_params,
+                        num_prompt,
+                        pytestconfig,
+                        context=(
+                            f"max_concurrency={concurrency!r} num_prompts={num_prompt} confirmation_attempt={attempt}"
+                        ),
+                        baseline_regressions=retry_regressions,
+                    )
+                    if retry_regression is not None:
+                        baseline_regressions.extend(retry_regressions)
+                        hard_regression = True
+                        break
+                if hard_regression:
+                    _persist_confirmation_result(
+                        confirmation_results,
+                        last_result,
+                        confirmation_metrics,
+                        configured_attempts=attempts,
+                        tolerance=confirmation_tolerance,
+                        status="aborted_hard_regression",
+                    )
+                    continue
+                confirmed_regressions: list[str] = []
+                confirmed_result = _median_confirmation_result(confirmation_results, confirmation_metrics)
+                confirmed_regression = _assert_sweep_result(
+                    _with_only_confirmed_baseline_metrics(confirmed_result, confirmation_metrics),
+                    assert_params,
+                    num_prompt,
+                    pytestconfig,
+                    context=(
+                        f"max_concurrency={concurrency!r} num_prompts={num_prompt} confirmed_median_of={attempts}"
+                    ),
+                    baseline_regressions=confirmed_regressions,
+                    baseline_tolerance=confirmation_tolerance,
+                )
+                if confirmed_regression is not None:
+                    baseline_regressions.extend(confirmed_regressions)
+                    confirmation_status = "failed"
+                else:
+                    confirmation_status = "passed"
+                    print(
+                        f"[baseline-check] PASS confirmed median across {attempts} runs "
+                        f"at tolerance={confirmation_tolerance:.0%} for max_concurrency={concurrency!r}",
+                        flush=True,
+                    )
+                _persist_confirmation_result(
+                    confirmation_results,
+                    confirmed_result,
+                    confirmation_metrics,
+                    configured_attempts=attempts,
+                    tolerance=confirmation_tolerance,
+                    status=confirmation_status,
                 )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+        if baseline_regressions:
+            raise PerformanceBaselineRegressionError(
+                f"performance baseline regression across {len(baseline_regressions)} sweep(s); "
+                "all configured sweeps completed:\n\n" + "\n\n".join(baseline_regressions)
+            )
         if (stage_id := params.get("require_speculative_stage")) is not None:
             import httpx
             from prometheus_client.parser import text_string_to_metric_families

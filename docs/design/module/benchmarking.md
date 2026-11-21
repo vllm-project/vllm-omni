@@ -69,6 +69,19 @@ matching baseline. Existing `--assert-baseline` callers retain their warning and
 skip behavior for missing calibration. Baselines are selected by runtime device
 labels; a pytest selection marker does not establish physical hardware identity.
 
+An opt-in baseline confirmation repeats only the configured sweep point and
+metrics. Repeated attempts are internal evidence, not independent report rows:
+the runner replaces the first attempt's JSON with one canonical result whose
+configured metrics contain the confirmed median and whose
+`baseline_confirmation_result` records every attempt value, applied tolerance,
+and verdict. Retry
+JSON files are removed after consolidation, so nightly collection observes one
+result for one sweep point. Non-confirmed baseline metrics remain hard failures
+on every attempt at the standard tolerance. A confirmation policy may provide a
+scalar `tolerance` or one value per sweep point; that tolerance applies only to
+the configured metrics after their repeated values have been reduced to the
+confirmed median.
+
 ## Qwen3-Omni dataset accuracy and performance
 
 Qwen3-Omni's dataset scenarios use the shared DFX JSON runner. An explicit

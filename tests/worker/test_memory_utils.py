@@ -38,6 +38,14 @@ def test_passes_through_requested_when_free_suffices():
     assert out == math.ceil(40 * GIB * 0.5)
 
 
+@pytest.mark.parametrize(("extensible", "expected_utilization"), [(False, 0.92), (True, 1.0)])
+def test_uses_upstream_default_when_utilization_is_omitted(extensible: bool, expected_utilization: float):
+    total = 40 * GIB
+    cfg = CacheConfig(enable_extensible_kv_cache=extensible)
+    assert cfg.gpu_memory_utilization is None
+    assert request_memory_tolerant(_snapshot(total, total), cfg) == math.ceil(total * expected_utilization)
+
+
 @pytest.mark.parametrize("free_memory", [0, 10 * GIB])
 def test_caps_to_free_when_insufficient(free_memory: int):
     cfg = _cache_config(0.9)
