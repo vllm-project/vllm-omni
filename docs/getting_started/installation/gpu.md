@@ -8,7 +8,8 @@ vLLM-Omni is a Python library that supports the following GPU variants. The libr
 - Python: 3.12
 
 !!! note
-    vLLM-Omni is currently not natively supported on Windows.
+    vLLM-Omni is currently not natively supported on Windows. For NVIDIA GPUs
+    on Windows, see the [WSL2 installation guide](wsl2.md).
 
 === "NVIDIA CUDA"
 
@@ -52,7 +53,7 @@ Note: Pre-built wheels are currently available for vLLM-Omni 0.11.0rc1, 0.12.0rc
 
     --8<-- "docs/getting_started/installation/gpu/musa.inc.md:pre-built-wheels"
 
-[](){ #build-from-source }
+<a id="build-from-source"></a>
 
 ### Build wheel from source
 
