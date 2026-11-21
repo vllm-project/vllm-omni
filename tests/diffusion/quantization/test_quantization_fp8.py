@@ -30,6 +30,7 @@ import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -403,24 +404,24 @@ def test_bagel_bf16_generates_image():
 
 
 @hardware_test(res={"cuda": ["L4", "B200"]})
-def test_quantization_key_maps_to_quantization_config():
+def test_quantization_key_maps_to_quantization_config(tmp_path: Path):
     """The old 'quantization' kwarg should map to 'quantization_config'
     in OmniDiffusionConfig.from_kwargs for backwards compatibility."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    config = OmniDiffusionConfig.from_kwargs(model="test", quantization="fp8")
+    config = OmniDiffusionConfig.from_kwargs(model=str(tmp_path), quantization="fp8")
     assert config.quantization_config is not None
     assert config.quantization_config.get_name() == "fp8"
 
 
 @hardware_test(res={"cuda": ["L4", "B200"]})
-def test_quantization_and_quantization_config_conflict():
+def test_quantization_and_quantization_config_conflict(tmp_path: Path):
     """Two explicit quantization sources are rejected instead of silently merged."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     with pytest.raises(ValueError, match=r"quantization.*quantization_config"):
         OmniDiffusionConfig.from_kwargs(
-            model="test",
+            model=str(tmp_path),
             quantization="fp8",
             quantization_config={"method": "fp8", "activation_scheme": "static"},
         )

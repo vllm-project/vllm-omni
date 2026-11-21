@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -63,7 +64,9 @@ def _make_omni_config(sp_size: int, cfg_size: int, dtype: torch.dtype, tp_size: 
         cfg_parallel_size=cfg_size,
     )
     return OmniDiffusionConfig(
-        model="test",
+        # The transformer is built locally with random weights. Use an existing
+        # directory so offline config initialization skips Hub snapshot lookup.
+        model=str(Path(__file__).resolve().parent),
         dtype=dtype,
         parallel_config=parallel_config,
         # Backend-agnostic gate; SDPA also avoids platform quirks of the
