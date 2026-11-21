@@ -32,6 +32,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionImpl
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import ExecutionContext, ExecutionPathResult
 from vllm_omni.platforms import current_omni_platform
 
@@ -176,7 +177,7 @@ class VDNAttentionBackend(FlashAttentionBackend):
 
     supports_paged_kv: bool = False
     supports_piecewise_spans: bool = False
-    supported_platforms = ("cuda",)
+    supported_platforms = ("cuda", "xpu")
 
     @classmethod
     def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
@@ -185,6 +186,10 @@ class VDNAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def validate_available(cls) -> None:
+        if current_omni_platform.is_xpu():
+            # The window is exact dense attention; SDPA is always available on
+            # XPU, while vLLM XPU FlashAttention is preferred when present.
+            return
         if not current_omni_platform.supports_diffusion_dense_flash_attention():
             raise ImportError(
                 "VDNH3_ATTN runs its window as dense FlashAttention calls; FlashAttention is not available"
@@ -205,9 +210,75 @@ class VDNAttentionBackend(FlashAttentionBackend):
 
 
 class VDNAttentionImpl(FlashAttentionImpl):
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        softmax_scale: float,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
+        prefix: str = "",
+        qkv_layout: str | None = None,
+        backend_kwargs: dict | None = None,
+        role: str = "self",
+        **extra_impl_args,
+    ) -> None:
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            qkv_layout=qkv_layout,
+            backend_kwargs=backend_kwargs,
+            role=role,
+            **extra_impl_args,
+        )
+        self._sdpa_fallback = SDPAImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            backend_kwargs=backend_kwargs,
+        )
+
     def _dense(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         # With no metadata the parent runs one plain flash_attn_func call.
         return super().forward_cuda(query, key, value)
+
+    def _dense_xpu(self, query, key, value, attn_metadata):
+        from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN
+
+        if HAS_FLASH_ATTN:
+            return super().forward_xpu(query, key, value, attn_metadata)
+        return self._sdpa_fallback.forward_xpu(query, key, value, attn_metadata)
+
+    def _dense_window_xpu(self, query, key, value):
+        from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN
+
+        if HAS_FLASH_ATTN:
+            return super().forward_xpu(query, key, value, None)
+        return self._sdpa_fallback.forward_xpu(query, key, value, None)
+
+    def _forward_window(self, query, key, value, window, dense) -> torch.Tensor:
+        if query.shape[0] != 1 or query.shape[1] < window.used or key.shape[1] != query.shape[1]:
+            raise ValueError(
+                f"VDNH3_ATTN expects one packed document of >= {window.used} rows, got {tuple(query.shape)}"
+            )
+        logger.info_once(
+            "VDNH3_ATTN window: frames=%d tokens/frame=%d video_start=%d used=%d chunk=%d radius=%d anchors=%s",
+            window.num_frames,
+            window.tokens_per_frame,
+            window.video_start,
+            window.used,
+            window.chunk,
+            window.radius,
+            window.anchor_frames,
+        )
+        return windowed_attention(query, key, value, window, dense)
 
     def resolve_execution_path(
         self,
@@ -231,18 +302,16 @@ class VDNAttentionImpl(FlashAttentionImpl):
         window = attn_metadata.extra.get("vdn_window") if attn_metadata is not None else None
         if window is None:
             return super().forward_cuda(query, key, value, attn_metadata)
-        if query.shape[0] != 1 or query.shape[1] < window.used or key.shape[1] != query.shape[1]:
-            raise ValueError(
-                f"VDNH3_ATTN expects one packed document of >= {window.used} rows, got {tuple(query.shape)}"
-            )
-        logger.info_once(
-            "VDNH3_ATTN window: frames=%d tokens/frame=%d video_start=%d used=%d chunk=%d radius=%d anchors=%s",
-            window.num_frames,
-            window.tokens_per_frame,
-            window.video_start,
-            window.used,
-            window.chunk,
-            window.radius,
-            window.anchor_frames,
-        )
-        return windowed_attention(query, key, value, window, self._dense)
+        return self._forward_window(query, key, value, window, self._dense)
+
+    def forward_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        window = attn_metadata.extra.get("vdn_window") if attn_metadata is not None else None
+        if window is None:
+            return self._dense_xpu(query, key, value, attn_metadata)
+        return self._forward_window(query, key, value, window, self._dense_window_xpu)

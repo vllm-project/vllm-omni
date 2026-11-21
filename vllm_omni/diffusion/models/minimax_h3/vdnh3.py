@@ -301,8 +301,10 @@ class VDNCheckpoint:
         if any(int(getattr(parallel, key, 1) or 1) != 1 for key in ("ulysses_degree", "ring_degree")):
             raise ValueError("VDN-H3 does not support sequence parallelism; use --tensor-parallel-size")
         if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
-            # Its host-weight plan installs the DiT without load_weights(), where the fusion lives.
-            raise ValueError("VDN-H3 is fused while the weights stream in; use a non-distributed offload mode")
+            # DLO may stream the fused tensors, but the loader must materialize
+            # them through load_weights() first. The host-weight planner rejects
+            # a direct-mmap plan for load-time fusion (``lora_is_fused``).
+            logger.info("VDN-H3: DLO will use the ordinary fused loader before streaming blocks")
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, task: str) -> None:
         if task not in VDN_TASKS:
@@ -432,11 +434,16 @@ def _frame_statistics(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor) -> t
 def _delta_factors(a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """S' = (S diag(alpha) + B)(I + A)^-1 as S' = S @ transition + injection (a, b = A, B)."""
     eye = torch.eye(a.shape[-1], device=a.device, dtype=a.dtype).expand_as(a)
-    # I + A is SPD by construction; the _ex form skips the error check's host sync.
-    lower = torch.linalg.cholesky_ex(a + eye).L
-    # (I + A)^-1 = L^-T L^-1: one triangular solve and a matmul.
-    lower_inv = torch.linalg.solve_triangular(lower, eye, upper=False)
-    inverse = lower_inv.transpose(-1, -2) @ lower_inv
+    if a.device.type == "xpu":
+        # XPU has no native triangular solve in this stack; solve() is native.
+        inverse = torch.linalg.solve(a + eye, eye)
+        inverse = 0.5 * (inverse + inverse.transpose(-1, -2))
+    else:
+        # I + A is SPD by construction; the _ex form skips the error check's host sync.
+        lower = torch.linalg.cholesky_ex(a + eye).L
+        # (I + A)^-1 = L^-T L^-1: one triangular solve and a matmul.
+        lower_inv = torch.linalg.solve_triangular(lower, eye, upper=False)
+        inverse = lower_inv.transpose(-1, -2) @ lower_inv
     return alpha.unsqueeze(-1) * inverse, b @ inverse
 
 

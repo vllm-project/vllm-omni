@@ -151,6 +151,10 @@ DLO may still consume those TP-local tensors, but this is a compatibility path:
 it does not share checkpoint-backed runtime weights across DP replicas and
 provides no shared-mmap host-memory guarantee.
 
+Models that fuse adapters while `load_weights()` streams the base checkpoint
+(for example, VDN-H3) also use the ordinary loader. This preserves the fusion
+before DLO wraps the blocks; it only gives up the shared-mmap optimization.
+
 The mmap plan skips only dedicated DiT weight sources. Other component sources,
 such as a text encoder loaded through the shared diffusion loader, continue to
 use their ordinary component loader. A checkpoint source that mixes DiT and
