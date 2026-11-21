@@ -136,7 +136,12 @@
               "median_audio_ttfp_ms",
               "mean_audio_ttfp_ms"
             ],
-            "attempts": 3
+            "attempts": 3,
+            "tolerance": [
+              0.1,
+              0.1,
+              0.2
+            ]
           }
         },
         "baseline": {
@@ -403,7 +408,12 @@
               "median_audio_ttfp_ms",
               "mean_audio_ttfp_ms"
             ],
-            "attempts": 3
+            "attempts": 3,
+            "tolerance": [
+              0.1,
+              0.1,
+              0.2
+            ]
           }
         },
         "baseline": {
@@ -705,7 +715,12 @@
               "median_audio_ttfp_ms",
               "mean_audio_ttfp_ms"
             ],
-            "attempts": 3
+            "attempts": 3,
+            "tolerance": [
+              0.1,
+              0.1,
+              0.2
+            ]
           }
         },
         "baseline": {

@@ -17,8 +17,10 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    BASELINE_REGRESSION_TOLERANCE,
     BENCHMARK_RESULT_PATH_KEY,
     PerformanceBaselineRegressionError,
+    annotate_dataset_result,
     assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
@@ -26,6 +28,7 @@ from tests.dfx.conftest import (
     get_runtime_resource_label,
     is_diffusion_perf_config,
     load_benchmark_configs,
+    prepare_dataset_benchmark,
     run_benchmark,
 )
 from tests.helpers.assertions import assert_duplex_artifact_publication
@@ -381,10 +384,14 @@ def benchmark_params(request):
 
     params = dict(all_params[param_index])
     with ExitStack() as stack:
+        params = prepare_dataset_benchmark(params, stack)
         if params.get("duplex_eval_accuracy_config"):
             # The judge reads these files during evaluation. Keep the temporary
             # directory under the configured root, within its allowed media path.
-            root = Path(params.get("duplex_eval_response_root", "omni-duplex-eval-output")).expanduser().resolve()
+            response_root = params.get("duplex_eval_response_root", "omni-duplex-eval-output")
+            if not isinstance(response_root, str):
+                raise ValueError("duplex_eval_response_root must be a string")
+            root = Path(response_root).expanduser().resolve()
             root.mkdir(parents=True, exist_ok=True)
             params["duplex_eval_response_root"] = stack.enter_context(TemporaryDirectory(prefix="tmp-", dir=root))
         yield {"test_name": test_name, "params": params}
@@ -436,11 +443,54 @@ def _is_finite_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _selected_percentile_metrics(params: Mapping[str, object]) -> set[str]:
+    raw = params.get("percentile-metrics") or params.get("percentile_metrics") or ""
+    if not isinstance(raw, str):
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _assert_chat_accuracy(result: Mapping[str, object], params: Mapping[str, object]) -> None:
+    min_accuracy = params.get(_MIN_DAILY_OMNI_ACCURACY)
+    if min_accuracy is not None:
+        from tests.e2e.accuracy.helpers import validate_daily_omni
+
+        assert _is_finite_number(min_accuracy), "min_daily_omni_accuracy must be a finite number"
+        errs = validate_daily_omni(dict(result), min_accuracy=float(min_accuracy))
+        assert not errs, "; ".join(errs)
+    if not params.get(_SEED_TTS_WER_EVAL):
+        return
+    from tests.e2e.accuracy.helpers import validate_seed_tts
+
+    max_wer = params.get(_MAX_SEED_TTS_MEAN_WER)
+    min_sim = params.get(_MIN_SEED_TTS_MEAN_SIM)
+    min_utmos = params.get(_MIN_SEED_TTS_MEAN_UTMOS)
+    for label, value in (
+        (_MAX_SEED_TTS_MEAN_WER, max_wer),
+        (_MIN_SEED_TTS_MEAN_SIM, min_sim),
+        (_MIN_SEED_TTS_MEAN_UTMOS, min_utmos),
+    ):
+        if value is not None:
+            assert _is_finite_number(value), f"{label} must be a finite number"
+    errs = validate_seed_tts(
+        dict(result),
+        max_mean_wer=float(max_wer) if _is_finite_number(max_wer) else None,
+        min_mean_sim=float(min_sim) if _is_finite_number(min_sim) else None,
+        min_mean_utmos=float(min_utmos) if _is_finite_number(min_utmos) else None,
+    )
+    assert not errs, "; ".join(errs)
+
+
 _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1 = "omniinteract_aggregate_min_ia_qtf1"
 _OMNIINTERACT_AGGREGATE_SUBSETS = "omniinteract_aggregate_subsets"
 _OMNIINTERACT_AGGREGATE_GROUP = "omniinteract_aggregate_group"
 _OMNIINTERACT_PERSIST_ARTIFACTS = "omniinteract_persist_artifacts"
 _OMNIINTERACT_MIN_EVALUATED_CASES = 1
+_MIN_DAILY_OMNI_ACCURACY = "min_daily_omni_accuracy"
+_MAX_SEED_TTS_MEAN_WER = "max_seed_tts_mean_wer"
+_MIN_SEED_TTS_MEAN_SIM = "min_seed_tts_mean_sim"
+_MIN_SEED_TTS_MEAN_UTMOS = "min_seed_tts_mean_utmos"
+_SEED_TTS_WER_EVAL = "seed_tts_wer_eval"
 
 
 class _OmniInteractSubsetCounts(NamedTuple):
@@ -684,6 +734,36 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     return accuracy_path
 
 
+def _pr_correction_accuracy_baseline(params: dict, hardware: str | None) -> dict | None:
+    floor = params.get("duplex_eval_min_pr_mean_all_success", {}).get(hardware)
+    if floor is None:
+        return None
+    if not _is_finite_number(floor) or not 0 < floor <= 1:
+        raise ValueError(f"Invalid PR correction score floor for {hardware}: {floor!r}")
+    return {"min_pr_mean_all_success": floor}
+
+
+def _is_minicpmo_duplex_eval(result: dict, params: dict) -> bool:
+    """True for MiniCPM-o Omni-DuplexEval nightly (native duplex).
+
+    That path may finish a session with audio and an empty transcript, or
+    text without PCM. Run-level ``required_duplex_metrics`` still require
+    some client TTFT/TTFP samples for the batch.
+    """
+    blob = " ".join(
+        str(value)
+        for value in (
+            result.get("test_name"),
+            result.get("model_id"),
+            params.get("test_name"),
+            params.get("model"),
+        )
+        if value
+    ).lower()
+    compact = blob.replace("_", "-")
+    return "minicpm-o" in compact or "minicpmo" in compact.replace("-", "")
+
+
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
     summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
@@ -715,12 +795,13 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         )
         return
     assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
-    for session in sessions:
-        for name in ("client_ttft_ms", "client_ttfp_ms"):
-            metric = session.get(name, {})
-            assert metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")), (
-                f"Omni-DuplexEval session has no measured {name}"
-            )
+    if not _is_minicpmo_duplex_eval(result, params):
+        for session in sessions:
+            for name in ("client_ttft_ms", "client_ttfp_ms"):
+                metric = session.get(name, {})
+                assert metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")), (
+                    f"Omni-DuplexEval session has no measured {name}"
+                )
     if params.get("duplex_eval_evaluate"):
         accuracy = summary.get("accuracy")
         assert isinstance(accuracy, dict), "Omni-DuplexEval accuracy is missing"
@@ -742,14 +823,29 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             )
             score = scores.get("mean_all_success")
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
+            if baseline := _pr_correction_accuracy_baseline(params, result.get("Hardware")):
+                minimum = baseline["min_pr_mean_all_success"]
+                assert score >= minimum, f"PR correction mean_all_success {score} is below {minimum}"
 
 
-def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
+def assert_result(
+    result,
+    params,
+    num_prompt,
+    *,
+    check_baseline: bool = False,
+    require_baseline: bool = False,
+    baseline_tolerance: float = BASELINE_REGRESSION_TOLERANCE,
+) -> None:
     if result["completed"] != num_prompt:
         first_error = next((error for error in result.get("errors", []) if error), "No per-request error recorded")
         raise AssertionError(
             f"Request failures exist: {result['completed']}/{num_prompt} completed. First request error: {first_error}"
         )
+    if params.get("result_validation") is not None:
+        errors = result.get("validation_errors")
+        assert isinstance(errors, list), "Dataset validation diagnostics are missing"
+        assert not errors, "\n".join(errors)
     if params.get("dataset_name") == "realtime-video":
         video = result.get("realtime_video")
         assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"
@@ -800,6 +896,7 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
                 result,
                 baseline if isinstance(baseline, dict) else None,
                 hardware if isinstance(hardware, str) else None,
+                tolerance=baseline_tolerance,
                 required=require_baseline,
             )
         except PerformanceBaselineRegressionError as exc:
@@ -839,6 +936,15 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
                     f"OmniInteract All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
                 )
             _maybe_assert_aggregate_ia_qtf1(params, acc_summary, result, num_prompt)
+    # Dataset cases declare required metrics separately from the percentiles they report.
+    if params.get("result_validation") is None and "tpot" in _selected_percentile_metrics(params):
+        num_tpot_samples = result.get("num_tpot_samples")
+        mean_tpot_ms = result.get("mean_tpot_ms")
+        assert isinstance(num_tpot_samples, int) and not isinstance(num_tpot_samples, bool) and num_tpot_samples > 0, (
+            "No measured tpot samples"
+        )
+        assert _is_finite_number(mean_tpot_ms) and mean_tpot_ms >= 0, "Missing or invalid mean_tpot_ms"
+    _assert_chat_accuracy(result, params)
     baseline = params.get("baseline")
     hardware = result.get("Hardware")
     hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None
@@ -874,6 +980,7 @@ def _assert_sweep_result(
     *,
     context: str,
     baseline_regressions: list[str],
+    baseline_tolerance: float = BASELINE_REGRESSION_TOLERANCE,
 ) -> PerformanceBaselineRegressionError | None:
     try:
         assert_result(
@@ -882,6 +989,7 @@ def _assert_sweep_result(
             num_prompt,
             check_baseline=pytestconfig.getoption("assert_baseline"),
             require_baseline=pytestconfig.getoption("require_baseline"),
+            baseline_tolerance=baseline_tolerance,
         )
     except PerformanceBaselineRegressionError as exc:
         baseline_regressions.append(f"{context}\n{exc}")
@@ -897,7 +1005,10 @@ def _baseline_confirmation_policy(
     params: Mapping[str, Any],
     result: Mapping[str, Any],
     regression: PerformanceBaselineRegressionError,
-) -> tuple[frozenset[str], int] | None:
+    *,
+    sweep_index: int = 0,
+    sweep_size: int = 1,
+) -> tuple[frozenset[str], int, float] | None:
     """Return a confirmation policy for a pure threshold regression, if configured."""
     policies = params.get("baseline_confirmation")
     hardware = result.get("Hardware")
@@ -908,17 +1019,30 @@ def _baseline_confirmation_policy(
         return None
     raw_metrics = policy.get("metrics")
     attempts = policy.get("attempts", 3)
+    raw_tolerance = policy.get("tolerance", BASELINE_REGRESSION_TOLERANCE)
     assert isinstance(raw_metrics, list) and raw_metrics and all(isinstance(metric, str) for metric in raw_metrics), (
         f"baseline_confirmation[{hardware!r}].metrics must be a non-empty string list"
     )
     assert isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 2, (
         f"baseline_confirmation[{hardware!r}].attempts must be an integer of at least 2"
     )
+    tolerances = raw_tolerance if isinstance(raw_tolerance, list) else [raw_tolerance]
+    assert not isinstance(raw_tolerance, list) or len(tolerances) == sweep_size, (
+        f"baseline_confirmation[{hardware!r}].tolerance must contain one value per sweep point"
+    )
+    assert all(
+        isinstance(tolerance, int | float)
+        and not isinstance(tolerance, bool)
+        and math.isfinite(tolerance)
+        and tolerance >= 0
+        for tolerance in tolerances
+    ), f"baseline_confirmation[{hardware!r}].tolerance must be a non-negative finite number or list of them"
+    tolerance = float(tolerances[sweep_index] if isinstance(raw_tolerance, list) else raw_tolerance)
     metrics = frozenset(raw_metrics)
     failed_metrics = regression.failed_metrics
     if not failed_metrics or failed_metrics != regression.threshold_metrics or not failed_metrics <= metrics:
         return None
-    return metrics, attempts
+    return metrics, attempts, tolerance
 
 
 def _without_confirmed_baseline_metrics(result: Mapping[str, Any], metrics: frozenset[str]) -> dict[str, Any]:
@@ -934,6 +1058,23 @@ def _without_confirmed_baseline_metrics(result: Mapping[str, Any], metrics: froz
     filtered["baseline"] = {
         **baseline,
         hardware: {name: expected for name, expected in bucket.items() if name not in metrics},
+    }
+    return filtered
+
+
+def _with_only_confirmed_baseline_metrics(result: Mapping[str, Any], metrics: frozenset[str]) -> dict[str, Any]:
+    """Limit the final relaxed comparison to the metrics selected for confirmation."""
+    filtered = dict(result)
+    baseline = result.get("baseline")
+    hardware = result.get("Hardware")
+    if not isinstance(baseline, dict) or not isinstance(hardware, str):
+        return filtered
+    bucket = baseline.get(hardware)
+    if not isinstance(bucket, dict):
+        return filtered
+    filtered["baseline"] = {
+        **baseline,
+        hardware: {name: expected for name, expected in bucket.items() if name in metrics},
     }
     return filtered
 
@@ -977,6 +1118,7 @@ def _persist_confirmation_result(
     metrics: frozenset[str],
     *,
     configured_attempts: int,
+    tolerance: float,
     status: str,
 ) -> None:
     """Replace repeated confirmation artifacts with one canonical result JSON."""
@@ -1004,6 +1146,7 @@ def _persist_confirmation_result(
         "status": status,
         "attempts_completed": len(results),
         "attempts_configured": configured_attempts,
+        "tolerance": tolerance,
         "metrics": metric_evidence,
     }
     temporary_path = canonical_path.with_name(f".{canonical_path.name}.confirmation.tmp")
@@ -1030,6 +1173,20 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
     resource_label = get_runtime_resource_label()
+    resource_label = params.pop("runtime_resource_aliases", {}).get(resource_label, resource_label)
+    check_baseline = pytestconfig.getoption("assert_baseline")
+    require_baseline = pytestconfig.getoption("require_baseline")
+    result_transform: Callable[[dict[str, object], int], dict[str, object]] | None = None
+    if params.get("result_validation") is not None:
+        if params["result_validation"].get("smoke", False) and require_baseline:
+            raise ValueError("Smoke cannot qualify a full-dataset performance baseline")
+
+        def transform(result: dict[str, object], code: int) -> dict[str, object]:
+            return annotate_dataset_result(
+                result, code, params, check_baseline=check_baseline, require_baseline=require_baseline
+            )
+
+        result_transform = transform
     accuracy_baseline = None
     if path := params.get("duplex_eval_accuracy_config"):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline
@@ -1041,8 +1198,21 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         accuracy_baseline = select_duplex_eval_baseline(
             accuracy_config, resource_label, required=params.get("duplex_eval_require_score_floors", False)
         )
+    elif params.get("duplex_eval_split") == "PR_correction" and params.get("duplex_eval_evaluate"):
+        accuracy_baseline = _pr_correction_accuracy_baseline(params, resource_label)
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
+    elif params.get(_MIN_DAILY_OMNI_ACCURACY) is not None or params.get(_SEED_TTS_WER_EVAL):
+        accuracy_baseline = {
+            key: value
+            for key, value in (
+                (_MIN_DAILY_OMNI_ACCURACY, params.get(_MIN_DAILY_OMNI_ACCURACY)),
+                (_MAX_SEED_TTS_MEAN_WER, params.get(_MAX_SEED_TTS_MEAN_WER)),
+                (_MIN_SEED_TTS_MEAN_SIM, params.get(_MIN_SEED_TTS_MEAN_SIM)),
+                (_MIN_SEED_TTS_MEAN_UTMOS, params.get(_MIN_SEED_TTS_MEAN_UTMOS)),
+            )
+            if value is not None
+        }
     for dataset_prefix in ("omniinteract", "duplex_eval"):
         if params.get(f"{dataset_prefix}_evaluate"):
             judge_base_url = getattr(omni_server, "judge_base_url", None)
@@ -1085,6 +1255,10 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
 
     args = ["--host", host, "--port", str(port)]
     exclude_keys = {
+        "dataset_source",
+        "result_validation",
+        "result_metadata",
+        "benchmark_env",
         "request_rate",
         "baseline",
         "baseline_confirmation",
@@ -1105,8 +1279,13 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         "duplex_eval_accuracy_config",
         "duplex_eval_require_score_floors",
         "duplex_eval_score_floor_hardware",
+        "duplex_eval_min_pr_mean_all_success",
         "duplex_performance_only",
         "required_duplex_metrics",
+        _MIN_DAILY_OMNI_ACCURACY,
+        _MAX_SEED_TTS_MEAN_WER,
+        _MIN_SEED_TTS_MEAN_SIM,
+        _MIN_SEED_TTS_MEAN_UTMOS,
         "require_speculative_stage",
         "name",
         "enable_negative_prompt",
@@ -1165,8 +1344,10 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 num_warmups=_resolve_num_warmups(params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)),
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
+                check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
+                result_transform=result_transform,
             )
-            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 _assert_sweep_result(
                     result,
@@ -1208,8 +1389,10 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 ),
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
+                check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
+                result_transform=result_transform,
             )
-            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 initial_regressions: list[str] = []
                 regression = _assert_sweep_result(
@@ -1222,11 +1405,17 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 )
                 if regression is None:
                     continue
-                policy = _baseline_confirmation_policy(assert_params, result, regression)
+                policy = _baseline_confirmation_policy(
+                    assert_params,
+                    result,
+                    regression,
+                    sweep_index=sweep_index,
+                    sweep_size=len(max_concurrency_list),
+                )
                 if policy is None:
                     baseline_regressions.extend(initial_regressions)
                     continue
-                confirmation_metrics, attempts = policy
+                confirmation_metrics, attempts, confirmation_tolerance = policy
                 confirmation_results = [result]
                 hard_regression = False
                 last_result = result
@@ -1256,6 +1445,8 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                         benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                         result_filename_suffix=f"confirmation-{attempt}",
                         accuracy_baseline=accuracy_baseline,
+                        check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
+                        result_transform=result_transform,
                     )
                     confirmation_results.append(retry_result)
                     last_result = retry_result
@@ -1280,13 +1471,14 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                         last_result,
                         confirmation_metrics,
                         configured_attempts=attempts,
+                        tolerance=confirmation_tolerance,
                         status="aborted_hard_regression",
                     )
                     continue
                 confirmed_regressions: list[str] = []
                 confirmed_result = _median_confirmation_result(confirmation_results, confirmation_metrics)
                 confirmed_regression = _assert_sweep_result(
-                    confirmed_result,
+                    _with_only_confirmed_baseline_metrics(confirmed_result, confirmation_metrics),
                     assert_params,
                     num_prompt,
                     pytestconfig,
@@ -1294,6 +1486,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                         f"max_concurrency={concurrency!r} num_prompts={num_prompt} confirmed_median_of={attempts}"
                     ),
                     baseline_regressions=confirmed_regressions,
+                    baseline_tolerance=confirmation_tolerance,
                 )
                 if confirmed_regression is not None:
                     baseline_regressions.extend(confirmed_regressions)
@@ -1302,7 +1495,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                     confirmation_status = "passed"
                     print(
                         f"[baseline-check] PASS confirmed median across {attempts} runs "
-                        f"for max_concurrency={concurrency!r}",
+                        f"at tolerance={confirmation_tolerance:.0%} for max_concurrency={concurrency!r}",
                         flush=True,
                     )
                 _persist_confirmation_result(
@@ -1310,6 +1503,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                     confirmed_result,
                     confirmation_metrics,
                     configured_attempts=attempts,
+                    tolerance=confirmation_tolerance,
                     status=confirmation_status,
                 )
             finally:
