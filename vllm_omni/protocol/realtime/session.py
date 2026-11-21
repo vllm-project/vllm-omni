@@ -51,6 +51,7 @@ class RealtimeInputDefaults:
 
     input_audio_format: str = "pcm16"
     input_sample_rate_hz: int = 16000
+    input_sample_rate_declared: bool = False
     output_audio_format: str = "pcm16"
     output_sample_rate_hz: int | None = None
     overlap_silence_rms: float = 0.003
@@ -59,6 +60,11 @@ class RealtimeInputDefaults:
         """Return defaults updated from a Realtime ``session`` object (session.update)."""
         values = apply_realtime_session_defaults(self, session_payload)
         return values
+
+
+def _native_input_rate(input_format: str) -> int:
+    """Sample rate an input encoding uses when the session does not declare one."""
+    return 8_000 if input_format.lower().startswith("g711") else 16_000
 
 
 def apply_realtime_session_defaults(
@@ -90,6 +96,12 @@ def apply_realtime_session_defaults(
     updates: dict[str, Any] = {}
     if isinstance(input_format, str) and input_format.lower() in REALTIME_INPUT_AUDIO_FORMATS:
         updates["input_audio_format"] = input_format
+        # A rate only carries over while the encoding stays the same. Switching
+        # format without a rate must fall back to that format's own default
+        # instead of inheriting the previous encoding's rate.
+        if input_rate is None and input_format.lower() != defaults.input_audio_format:
+            updates["input_sample_rate_hz"] = _native_input_rate(input_format)
+            updates["input_sample_rate_declared"] = False
     output_format: object = session_payload.get("output_audio_format") or session_payload.get("response_format")
     output_rate_raw: object | None = None
     if output_format is None and isinstance(audio_config, dict):
@@ -111,6 +123,10 @@ def apply_realtime_session_defaults(
         sample_rate = input_rate
     if isinstance(sample_rate, int | float) and sample_rate > 0:
         updates["input_sample_rate_hz"] = int(sample_rate)
+        # Remember that this rate came from the wire (directly or through a
+        # format object) rather than from the 16000 Hz default, and keep it
+        # declared when a later update inherits it.
+        updates["input_sample_rate_declared"] = True
     if isinstance(output_rate, int | float) and output_rate > 0:
         updates["output_sample_rate_hz"] = int(output_rate)
     overlap_fields = realtime_overlap_fields(session_payload)
