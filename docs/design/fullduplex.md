@@ -35,6 +35,10 @@ the model plugins.
 
 ## Playback completion ownership
 
+Cancellation of a retained model stream identifies the response owning its
+queued audio, even after generation completes. The Realtime projection clears
+that playback without emitting a second terminal for the completed response.
+
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.
 `finalize_response_playback` is the shared check used by ACK processing,
@@ -1298,6 +1302,13 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
+The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
+on CUDA, ROCm and NPU. The ROCm override changes runner selection while
+preserving the shared duplex session, async-chunk, device, connector and stage
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph,
+speculation and fused-kernel behavior described below does not apply to ROCm;
+runner selection alone does not establish ROCm runtime or quality qualification.
+
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
 so the default length limit is the official 20-token budget; sampled chunk
@@ -1317,6 +1328,15 @@ scheduler's accepted span. The scheduler still supplies the canonical unit
 content and terminator for the next append, including with sliding windows off.
 Sentence-ending punctuation remains a Talker drain hint; it does not decide
 whether the Thinker may end a turn.
+
+An explicit `response.create` may open a latched assistant turn on its first
+silence unit. The sampler consumes that opening marker once per request/unit,
+even if the turn was already open, so repeated decode steps cannot undo a later
+`<|turn_eos|>` decision. The consumed identity lives in the session state.
+A forced response opened this way waits for content across empty chunk
+boundaries. Before content starts, a listen decision closes the response
+without audio. The listen-to-TTS continuation rewrite still applies to
+already-speaking turns and seeded assistant prefixes.
 
 `<|turn_eos|>` does not terminate the input unit. The Thinker continues until
 a chunk terminator, and the Talker receives all forwarded tokens and their

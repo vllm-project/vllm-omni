@@ -106,10 +106,12 @@ Cache-DiT are not currently supported together with BAGEL step execution.
 
 ### Tensor Parallelism (TP)
 
-For larger models or multi-GPU environments, enable TP via CLI:
+For larger models or multi-GPU environments, set TP on each stage that uses it.
+Set `devices` to match the requested TP degree:
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --tensor-parallel-size 2
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --stage-overrides '{"0":{"tensor_parallel_size":2,"devices":"0,1"},"1":{"tensor_parallel_size":2,"devices":"0,1"}}'
 ```
 
 Or set `tensor_parallel_size` per stage in a custom deploy YAML.

@@ -20,8 +20,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import anyio
+import av
 import numpy as np
 import pytest
+import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
@@ -32,7 +34,9 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput
+from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
@@ -75,7 +79,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supporte
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
-from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
+from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -328,6 +332,34 @@ def _wav_data_url(samples: np.ndarray, sample_rate: int) -> str:
         wav.writeframes(pcm.tobytes())
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:audio/wav;base64,{encoded}"
+
+
+def _encode_tone(fmt: str, sample_rate: int = 16000, seconds: float = 2.0) -> bytes:
+    """Encode a mono test tone as a real file in one of the upload formats."""
+    t = np.arange(int(sample_rate * seconds)) / sample_rate
+    tone = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    buf = io.BytesIO()
+    if fmt in ("wav", "flac", "ogg", "mp3"):
+        sf.write(buf, tone, sample_rate, format=fmt.upper())
+        return buf.getvalue()
+    # libsndfile cannot write (or read) AAC/WebM/MP4; encode them with PyAV.
+    container, codec, rate = {
+        "aac": ("adts", "aac", sample_rate),
+        "webm": ("webm", "libopus", 48000),
+        "mp4": ("mp4", "aac", sample_rate),
+    }[fmt]
+    with av.open(buf, "w", format=container) as out:
+        stream = out.add_stream(codec, rate=rate, layout="mono")
+        frame = av.AudioFrame.from_ndarray(tone[None, :], format="flt", layout="mono")
+        frame.sample_rate = sample_rate
+        resampler = av.AudioResampler(format=stream.format.name, layout="mono", rate=rate)
+        for resampled in resampler.resample(frame) + resampler.resample(None):
+            out.mux(stream.encode(resampled))
+        out.mux(stream.encode(None))
+    return buf.getvalue()
+
+
+_REAL_SF_READ = sf.read
 
 
 @pytest.fixture
@@ -671,6 +703,11 @@ class TestSpeechAPI:
         mock_safe_open.return_value.__enter__.return_value = mock_ctx
         mocker.patch("safetensors.safe_open", mock_safe_open)
 
+    @pytest.fixture
+    def real_audio_decoder(self, mocker: MockerFixture):
+        """Undo the soundfile stub of ``_mock_upload_io`` so uploads decode real bytes."""
+        mocker.patch("soundfile.read", _REAL_SF_READ)
+
     def test_create_speech_success(self, client):
         payload = {
             "input": "Hello world",
@@ -958,33 +995,80 @@ class TestSpeechAPI:
             assert "reserved" in response.json()["detail"]
         assert not handler.uploaded_speakers
 
-    def test_upload_voice_rejects_mp4_with_conversion_hint(self, client):
-        """MP4/M4A must be rejected at validation with the WAV conversion hint.
+    @pytest.mark.parametrize(
+        ("fmt", "content_type", "sample_rate"),
+        [
+            ("wav", "audio/wav", 16000),
+            ("flac", "audio/flac", 16000),
+            ("ogg", "audio/ogg", 16000),
+            ("mp3", "audio/mpeg", 16000),
+            ("aac", "audio/aac", 16000),
+            ("webm", "audio/webm", 48000),
+            ("mp4", "audio/mp4", 16000),
+        ],
+    )
+    def test_upload_voice_decodes_every_documented_format(
+        self, client, real_audio_decoder, fmt, content_type, sample_rate
+    ):
+        """Every documented upload format decodes, as it does for inline ref_audio."""
+        files = {"audio_sample": (f"ref.{fmt}", _encode_tone(fmt), content_type)}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": f"tone_{fmt}"})
+        assert response.status_code == 200, response.text
+        assert response.json()["voice"]["mime_type"] == content_type
+        assert client.app.state.openai_serving_speech.uploaded_speakers[f"tone_{fmt}"]["sample_rate"] == sample_rate
+        client.delete(f"/v1/audio/voices/tone_{fmt}")
 
-        soundfile cannot decode the MP4 container, so letting the upload pass
-        the MIME whitelist would fail later at the decode step with a
-        misleading "Could not decode audio file" instead of the real cause.
-        """
-        mp4_bytes = b"fake mp4 bytes" * 100
-        response = client.post(
-            "/v1/audio/voices",
-            files={"audio_sample": ("clip.mp4", mp4_bytes, "audio/mp4")},
-            data={"consent": "c1", "name": "mp4_voice"},
-        )
-        assert response.status_code == 400
-        detail = response.json()["detail"]
-        assert "MP4" in detail
-        assert "ffmpeg" in detail
+    @pytest.mark.parametrize(
+        ("filename", "expected_mime"),
+        [("ref.wav", "audio/wav"), ("ref.flac", "audio/flac"), ("ref.webm", "audio/webm"), ("ref.m4a", "audio/mp4")],
+    )
+    def test_upload_voice_without_content_type_uses_extension(self, client, mocker, filename, expected_mime):
+        """A part without Content-Type (``requests`` with a bare file) uses the extension."""
+        audio_file = mocker.MagicMock()
+        audio_file.filename = filename
+        audio_file.content_type = None
+        audio_file.file = io.BytesIO(b"fake audio")
+        audio_file.read = mocker.AsyncMock(return_value=b"fake audio")
+        handler = client.app.state.openai_serving_speech
 
-        # An .m4a file with a generic content type must be caught via its
-        # filename extension, not silently classified as the WAV default.
-        response = client.post(
-            "/v1/audio/voices",
-            files={"audio_sample": ("clip.m4a", mp4_bytes, "application/octet-stream")},
-            data={"consent": "c1", "name": "m4a_voice"},
-        )
+        result = asyncio.run(handler.upload_voice(audio_file, consent="c1", name="no_type"))
+
+        assert result["mime_type"] == expected_mime
+        client.delete("/v1/audio/voices/no_type")
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "expected_mime"),
+        [
+            ("ref.wav", "audio/x-wav", "audio/wav"),
+            ("ref.webm", "video/webm", "audio/webm"),
+            ("ref.wav", "Audio/WAV", "audio/wav"),
+            ("ref.webm", "audio/webm;codecs=opus", "audio/webm"),
+            ("ref.flac", "application/octet-stream", "audio/flac"),
+        ],
+    )
+    def test_upload_voice_normalizes_mime_type(self, client, filename, content_type, expected_mime):
+        """Aliases, case and parameters normalize to the canonical type."""
+        files = {"audio_sample": (filename, b"fake audio content", content_type)}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "alias"})
+        assert response.status_code == 200, response.text
+        assert response.json()["voice"]["mime_type"] == expected_mime
+        client.delete("/v1/audio/voices/alias")
+
+    def test_upload_voice_undecodable_audio_returns_400(self, client, real_audio_decoder):
+        files = {"audio_sample": ("ref.wav", b"definitely not audio" * 500, "audio/wav")}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "garbage"})
         assert response.status_code == 400
-        assert "ffmpeg" in response.json()["detail"]
+        assert "Could not decode audio file" in response.json()["detail"]
+        assert not client.app.state.openai_serving_speech.uploaded_speakers
+
+    def test_upload_voice_unrecognized_payload_skips_vllm_loader(self, client, real_audio_decoder, mocker):
+        """Only AAC/WebM/MP4 content falls through to the vLLM loader after soundfile fails."""
+        loader = mocker.patch.object(serving_speech_module, "AudioMediaIO")
+        files = {"audio_sample": ("ref.aac", b"ffconcat version 1.0\nfile ref.wav\n", "audio/aac")}
+        response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": "text_payload"})
+        assert response.status_code == 400
+        assert "Could not decode audio file" in response.json()["detail"]
+        loader.assert_not_called()
         assert not client.app.state.openai_serving_speech.uploaded_speakers
 
     def test_upload_voice_overwrites_same_name_by_default(self, client):
@@ -1748,6 +1832,31 @@ class TestTTSMethods:
         assert isinstance(response, ErrorResponse)
         assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_engine_validation_error_returns_bad_request(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        # vLLM raises VLLMValidationError (a VLLMClientError, not a ValueError)
+        # from add_request when e.g. the prompt exceeds max_model_len.
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(
+                side_effect=VLLMValidationError(
+                    "The decoder prompt (length 12011) is longer than the maximum model length of 4096."
+                )
+            ),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.BAD_REQUEST
+        assert response.error.type == "BadRequestError"
 
     @pytest.mark.asyncio
     async def test_create_speech_unexpected_failure_returns_internal_server_error(
@@ -4416,9 +4525,9 @@ class TestStreamingResponse:
         assert len(response.content) > 0
 
     def test_raw_stream_passes_tts_params_to_common_guard(self, streaming_app, monkeypatch):
-        """The raw route must not bypass the shared Qwen3-TTS EOS guard."""
+        """The raw route passes finalized TTS parameters to the shared generator."""
         speech_server = streaming_app.state.speech_server
-        finalized_tts_params = {"_qwen3_tts_effective_max_tokens": [192]}
+        finalized_tts_params = {"task_type": ["Base"]}
         captured: dict = {}
 
         async def prepare(_request, request_id=None, arrival_time=None):
@@ -6433,6 +6542,26 @@ class TestTTSAsyncOffloading:
         asyncio.run(voxtral_server._prepare_speech_generation(request))
         voxtral_server._adapter._build_prompt_async.assert_awaited_once()
 
+    def test_prepare_speech_generation_voxtral_seed_sets_tts_local_seed(self, voxtral_server, mocker: MockerFixture):
+        default_params = voxtral_server.engine_client.default_sampling_params_list[0]
+        default_params.seed = None
+        default_params.extra_args = None
+        voxtral_server.engine_client.collective_rpc = mocker.AsyncMock(return_value=[False])
+        voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        stage0_params = voxtral_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
+
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):
         """Qwen3 TTS path should call _estimate_prompt_len_async."""
         qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
@@ -6772,11 +6901,13 @@ class TestTTSAsyncOffloading:
         assert prompt["additional_information"] is tts_params
 
     @pytest.mark.asyncio
-    async def test_qwen3_tts_nonstream_retries_codec_limit_once(self, qwen3_tts_server, mocker: MockerFixture) -> None:
+    async def test_nonstream_retries_retryable_generation_error_once(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ) -> None:
         qwen3_tts_server._check_model = mocker.AsyncMock(return_value=None)
         qwen3_tts_server._generate_audio_bytes = mocker.AsyncMock(
             side_effect=[
-                Qwen3TTSCodecLimitError("codec limit"),
+                TTSGenerationError("invalid generation", retryable=True),
                 (b"RIFF" + b"\x00" * 32, "audio/wav"),
             ]
         )
@@ -6806,14 +6937,16 @@ class TestTTSAsyncOffloading:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("request_kwargs", [{"seed": 100423}, {"max_new_tokens": 192}])
-    async def test_qwen3_tts_nonstream_does_not_retry_explicit_sampling_controls(
+    async def test_nonstream_does_not_retry_explicit_sampling_controls(
         self,
         qwen3_tts_server,
         mocker: MockerFixture,
         request_kwargs: dict[str, int],
     ) -> None:
         qwen3_tts_server._check_model = mocker.AsyncMock(return_value=None)
-        qwen3_tts_server._generate_audio_bytes = mocker.AsyncMock(side_effect=Qwen3TTSCodecLimitError("codec limit"))
+        qwen3_tts_server._generate_audio_bytes = mocker.AsyncMock(
+            side_effect=TTSGenerationError("invalid generation", retryable=True)
+        )
 
         response = await qwen3_tts_server.create_speech(
             OpenAICreateSpeechRequest(input="Hello", task_type="Base", **request_kwargs)
@@ -6832,32 +6965,37 @@ class TestTTSAsyncOffloading:
             await anext(qwen3_tts_server._generate_audio_chunks(failing_generator(), "req-fail"))
 
     @pytest.mark.asyncio
-    async def test_generate_audio_chunks_rejects_qwen3_codec_limit_before_success(
-        self, qwen3_tts_server, qwen3_stage_output
+    async def test_generate_audio_chunks_propagates_validation_error(
+        self, qwen3_tts_server, qwen3_stage_output, mocker: MockerFixture
     ):
+        adapter = qwen3_tts_server._get_tts_adapter()
+        adapter.validates_generation = True
+        mocker.patch.object(adapter, "validate_generation", side_effect=TTSGenerationError("invalid generation"))
+
         async def length_limited_generator():
             yield qwen3_stage_output("req-codec-limit", "length")
 
         chunks = qwen3_tts_server._generate_audio_chunks(
             length_limited_generator(),
             "req-codec-limit",
-            tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+            tts_params={"task_type": ["Base"]},
         )
-        with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
+        with pytest.raises(TTSGenerationError, match="invalid generation"):
             async for _ in chunks:
                 pass
 
     @pytest.mark.asyncio
-    async def test_sse_codec_limit_marks_partial_audio_for_discard(self, qwen3_tts_server, qwen3_stage_output):
+    async def test_sse_generator_error_marks_partial_audio_for_discard(self, qwen3_tts_server, qwen3_stage_output):
         async def length_limited_generator():
-            yield qwen3_stage_output("req-sse-codec-limit", "length")
+            yield qwen3_stage_output("req-sse-codec-limit", "stop")
+            raise RuntimeError("generation failed after audio")
 
         events = [
             event
             async for event in qwen3_tts_server._generate_audio_sse_events(
                 length_limited_generator(),
                 "req-sse-codec-limit",
-                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+                tts_params={"task_type": ["Base"]},
             )
         ]
 
@@ -6876,7 +7014,7 @@ class TestTTSAsyncOffloading:
         async def generator():
             yield qwen3_stage_output("req-base-usage", finish_reason)
 
-        params = {"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]}
+        params = {"task_type": ["Base"]}
         mocker.patch.object(
             qwen3_tts_server, "_prepare_speech_generation", return_value=("req-base-usage", generator(), params)
         )
@@ -6884,18 +7022,13 @@ class TestTTSAsyncOffloading:
         usage: list[SpeechTokenUsage] = []
         request = OpenAICreateSpeechRequest(input="Hello", task_type="Base")
 
-        if finish_reason == "length":
-            with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
-                await qwen3_tts_server._generate_audio_bytes(request, usage_out=usage)
-            assert usage == []
-        else:
-            audio, media_type = await qwen3_tts_server._generate_audio_bytes(request, usage_out=usage)
-            assert audio
-            assert media_type == "audio/wav"
-            assert len(usage) == 1
-            assert usage[0].output_tokens == 191
-            assert usage[0].input_tokens == 2
-            assert usage[0].total_tokens == 193
+        audio, media_type = await qwen3_tts_server._generate_audio_bytes(request, usage_out=usage)
+        assert audio
+        assert media_type == "audio/wav"
+        assert len(usage) == 1
+        assert usage[0].output_tokens == 191
+        assert usage[0].input_tokens == 2
+        assert usage[0].total_tokens == 193
 
     @pytest.mark.asyncio
     async def test_qwen3_tts_base_sse_completion_usage(
@@ -6911,7 +7044,7 @@ class TestTTSAsyncOffloading:
                 generator(),
                 "req-base-sse-usage",
                 request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
-                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+                tts_params={"task_type": ["Base"]},
             )
         ]
 
@@ -6937,7 +7070,7 @@ class TestTTSAsyncOffloading:
                 generator(),
                 "req-base-sse-duration",
                 request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
-                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+                tts_params={"task_type": ["Base"]},
             )
         ]
 
@@ -7266,6 +7399,69 @@ class TestLengthTruncationSignal:
     def _exposed(response) -> set[str]:
         return {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("task_type", ["Base", "CustomVoice", "VoiceDesign"])
+    @pytest.mark.parametrize("stream_format", [None, "audio", "sse"])
+    @pytest.mark.parametrize(
+        ("finish_reason", "output_tokens"),
+        [("length", 3204), ("length", 4096), ("stop", 3204)],
+        ids=["context-limit", "output-limit", "eos"],
+    )
+    async def test_qwen3_budget_completion_returns_audio(
+        self, make_server, mocker: MockerFixture, task_type, stream_format, finish_reason, output_tokens
+    ):
+        server = make_server("qwen3_tts")
+        mocker.patch.object(server, "_count_usage_text_tokens", return_value=881)
+        request = OpenAICreateSpeechRequest(
+            input="Long text",
+            task_type=task_type,
+            response_format="pcm",
+            stream=stream_format is not None,
+            stream_format=stream_format,
+        )
+        prompt = {"additional_information": {"task_type": [task_type]}}
+        # Exercise the real automatic budget, including the stage-limit clamp.
+        sampling = server._get_tts_adapter().apply_sampling_overrides(
+            [SamplingParams(max_tokens=4096)], request, prompt
+        )
+        assert sampling[0].max_tokens == 4096
+
+        async def generator():
+            yield create_mock_audio_output_for_test(
+                "req-qwen3-budget",
+                metrics={"stage_metrics": {"0": {"num_tokens_out": output_tokens, "finish_reason": finish_reason}}},
+            )
+
+        prepare = mocker.patch.object(
+            server,
+            "_prepare_speech_generation",
+            return_value=("req-qwen3-budget", generator(), prompt["additional_information"]),
+        )
+        response = await server.create_speech(request)
+        assert response.status_code == 200
+        prepare.assert_awaited_once()  # A length finish must not trigger a retry.
+        if stream_format is None:
+            assert response.body
+            assert response.headers["x-audio-truncated"] == str(finish_reason == "length").lower()
+            return
+
+        send = mocker.AsyncMock()
+        await response.stream_response(send)
+        messages = [call.args[0] for call in send.await_args_list]
+        assert messages[0]["type"] == "http.response.start"
+        assert messages[0]["status"] == 200
+        assert messages[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+        body = b"".join(message["body"] for message in messages if message["type"] == "http.response.body")
+        assert body
+        if stream_format == "sse":
+            assert b"event: speech.audio.error" not in body
+            events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith(b"data: ")]
+            assert any(event["type"] == "speech.audio.delta" for event in events)
+            done = [event for event in events if event["type"] == "speech.audio.done"]
+            assert len(done) == 1
+            assert done[0]["truncated"] is (finish_reason == "length")
+            assert done[0]["usage"]["output_tokens"] == output_tokens
+
     @pytest.mark.parametrize("model_stage", OPTED_IN)
     def test_opted_in_adapters(self, make_server, model_stage: str):
         assert make_server(model_stage)._get_tts_adapter().reports_length_truncation is True
@@ -7301,33 +7497,36 @@ class TestLengthTruncationSignal:
         assert "truncated" not in payload
 
     @pytest.mark.asyncio
-    async def test_qwen3_rejected_generation_is_not_flagged(self, make_server, mocker: MockerFixture):
+    async def test_validation_error_takes_precedence_over_truncation(self, make_server, mocker: MockerFixture):
         # validate_generation runs first: a rejected generation returns no
         # audio, so it never carries the truncation flag.
         server = make_server("qwen3_tts")
+        mocker.patch.object(
+            server._get_tts_adapter(), "validate_generation", side_effect=TTSGenerationError("invalid generation")
+        )
 
         async def generator():
             yield self._output("req-qwen3-base", "length")
 
-        params = {"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [5]}
+        params = {"task_type": ["Base"]}
         mocker.patch.object(server, "_prepare_speech_generation", return_value=("req-qwen3-base", generator(), params))
         collect: dict = {}
-        with pytest.raises(Qwen3TTSCodecLimitError):
+        with pytest.raises(TTSGenerationError, match="invalid generation"):
             await server._generate_audio_bytes(
                 OpenAICreateSpeechRequest(input="Hello", task_type="Base"), collect=collect
             )
         assert "audio_truncated" not in collect
 
     @pytest.mark.asyncio
-    async def test_qwen3_explicit_budget_is_flagged(self, make_server, mocker: MockerFixture):
-        # A caller budget on a non-Base task passes validation and returns the
-        # audio; before this flag the client could not tell it was cut off.
-        params = {"task_type": ["CustomVoice"], "_qwen3_tts_effective_max_tokens": [5]}
+    @pytest.mark.parametrize("task_type", ["Base", "CustomVoice", "VoiceDesign"])
+    async def test_qwen3_explicit_budget_is_flagged(self, make_server, mocker: MockerFixture, task_type):
+        params = {"task_type": [task_type]}
         response = await self._create_speech(
             make_server("qwen3_tts"),
             mocker,
             self._output("req-qwen3-explicit", "length"),
             tts_params=params,
+            task_type=task_type,
             max_new_tokens=5,
         )
         assert response.status_code == 200
@@ -7364,10 +7563,13 @@ class TestLengthTruncationSignal:
         assert "truncated" not in await self._sse_done(server, sse_output)
 
     @pytest.mark.asyncio
-    async def test_qwen3_rejected_sse_generation_is_not_flagged(self, make_server):
+    async def test_sse_validation_error_takes_precedence_over_truncation(self, make_server, mocker: MockerFixture):
         # On SSE, validate_generation fails the stream before the done event,
         # so a rejected generation never reports ``truncated``.
         server = make_server("qwen3_tts")
+        mocker.patch.object(
+            server._get_tts_adapter(), "validate_generation", side_effect=TTSGenerationError("invalid generation")
+        )
 
         async def generator():
             yield self._output("req-qwen3-base-sse", "length")
@@ -7378,7 +7580,7 @@ class TestLengthTruncationSignal:
                 generator(),
                 "req-qwen3-base-sse",
                 request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
-                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [5]},
+                tts_params={"task_type": ["Base"]},
             )
         ]
         assert not any("event: speech.audio.done" in event for event in events)
