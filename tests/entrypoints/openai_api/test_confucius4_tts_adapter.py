@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import torch
 from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -257,3 +258,28 @@ def test_request_max_new_tokens_is_validated_and_applied(
     overridden = adapter.apply_sampling_overrides(defaults, request)
     assert overridden[0].max_tokens == 64
     assert defaults[0].max_tokens == 1518
+
+
+@pytest.mark.parametrize(
+    ("audio_output", "rejected"),
+    [
+        ({"model_outputs": [torch.zeros(0)]}, True),
+        ({"audio": torch.zeros(0)}, True),
+        ({"model_outputs": [torch.zeros(0), torch.zeros(0)]}, True),
+        ({"model_outputs": [torch.zeros(8)]}, False),
+        ({"audio": torch.zeros(8)}, False),
+        ({"sr": 22050}, False),
+    ],
+)
+def test_empty_audio_is_rejected_instead_of_served(
+    adapter: Confucius4TTSAdapter,
+    audio_output: dict,
+    rejected: bool,
+) -> None:
+    # An immediate EOS yields an empty waveform for that request. It must become
+    # a failed request, not a successful zero-length audio file.
+    collect: dict = {}
+
+    adapter.collect_response_metadata(audio_output, collect)
+
+    assert bool(collect.get("audio_synthesis_error")) is rejected

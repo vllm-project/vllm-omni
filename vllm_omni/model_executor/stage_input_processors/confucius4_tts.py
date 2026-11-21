@@ -122,7 +122,20 @@ def talker2decoder_full_payload(
         )
     semantic_seq = _sanitize_semantic_sequence(torch.tensor(output_token_ids, dtype=torch.long))
     if semantic_seq.numel() == 0:
-        raise ValueError(f"Confucius4-TTS generated no semantic codes before EOS for req={request_id}")
+        # An immediate EOS (or only BOS under a one-token budget) is a legal
+        # sampling outcome, not a pipeline fault. Raising here would be latched
+        # on the shared Stage 0 output worker and fail every later request, so
+        # hand Stage 1 an explicit empty sequence; it returns an empty waveform
+        # for this request only.
+        logger.warning(
+            "Confucius4-TTS req=%s generated no semantic codes before EOS; returning empty audio.",
+            request_id,
+        )
+        empty: dict[str, Any] = {"semantic_codes": torch.empty(0, dtype=torch.long)}
+        seed = _request_seed(request)
+        if seed is not None:
+            empty["seed"] = seed
+        return empty
 
     result: dict[str, Any] = {"semantic_codes": _cpu_copy(semantic_seq)}
     for key in _CONDITIONING_KEYS:

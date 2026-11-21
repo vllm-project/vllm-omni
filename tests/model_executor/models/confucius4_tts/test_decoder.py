@@ -186,6 +186,30 @@ def test_forward_invokes_s2a_and_bigvgan(
     assert output.multimodal_outputs["sr"][0].item() == 22050
 
 
+def test_forward_returns_empty_audio_for_an_empty_semantic_sequence_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An empty request must not abort the batch or touch the S2A model, and a
+    # normal request batched with it must still be synthesized.
+    decoder = _decoder()
+    decoder.model_path = "/model"
+    decoder._resolved_vocoder_source = None
+    decoder.s2a_model = _FakeS2A()
+    decoder.t2s_recompute = _FakeRecompute()
+    monkeypatch.setattr(decoder_module, "_resolve_bigvgan_source", lambda *_args: "/bigvgan")
+    monkeypatch.setattr(decoder_module, "_load_bigvgan", lambda *_args: _FakeBigVGAN())
+    empty = {"semantic_codes": torch.empty(0, dtype=torch.long)}
+    normal = {"semantic_codes": torch.tensor([1, 2]), **_conditioning(), "seed": 7}
+
+    output = decoder.forward(torch.tensor([0, 0]), model_intermediate_buffer=[empty, normal])
+
+    waveforms = output.multimodal_outputs["model_outputs"]
+    assert waveforms[0].numel() == 0
+    assert waveforms[1].tolist() == list(range(8))
+    assert len(output.multimodal_outputs["sr"]) == 2
+    assert decoder.s2a_model.call["target_feat_len"].tolist() == [3]
+
+
 def test_load_weights_uses_safe_tensor_only_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

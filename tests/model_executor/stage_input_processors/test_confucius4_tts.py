@@ -108,11 +108,24 @@ def test_full_payload_accepts_flat_dotted_keys() -> None:
     assert talker2decoder_full_payload(None, flat, request)["semantic_codes"].tolist() == [3]
 
 
-@pytest.mark.parametrize("token_ids", [None, [], [8193], [8192, 8193]])
-def test_full_payload_rejects_requests_without_semantic_codes(token_ids) -> None:
+@pytest.mark.parametrize("token_ids", [None, []])
+def test_full_payload_rejects_requests_without_output_ids(token_ids) -> None:
     request = _RequestStub("request", None, output_token_ids=token_ids)
-    with pytest.raises(ValueError, match="output_token_ids|no semantic codes"):
+    with pytest.raises(ValueError, match="output_token_ids"):
         talker2decoder_full_payload(None, _payload(), request)
+
+
+@pytest.mark.parametrize("token_ids", [[8193], [8192, 8193], [8192]])
+def test_full_payload_returns_empty_codes_instead_of_raising(token_ids) -> None:
+    # An immediate EOS, or only BOS under a one-token budget, is a legal sampling
+    # outcome. Raising from this hook is latched on the shared Stage 0 output
+    # worker and fails later, valid requests, so it must be a per-request result.
+    request = _RequestStub("request", SamplingParams(seed=3), output_token_ids=token_ids)
+
+    result = talker2decoder_full_payload(None, _payload(), request)
+
+    assert result["semantic_codes"].numel() == 0
+    assert result["seed"] == 3
 
 
 @pytest.mark.parametrize("missing", ["text_token_ids", "condition_vector", "ref_mel", "style"])

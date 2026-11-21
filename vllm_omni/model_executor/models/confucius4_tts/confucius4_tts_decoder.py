@@ -283,6 +283,12 @@ class Confucius4TTSS2ADecoder(nn.Module):
 
         waveforms: list[torch.Tensor] = []
         for info in request_infos:
+            codes = info.get("semantic_codes")
+            if isinstance(codes, torch.Tensor) and codes.numel() == 0:
+                # Stage 0 produced no semantic code (immediate EOS): nothing to
+                # synthesize, and this must stay a per-request outcome.
+                waveforms.append(torch.zeros(0, dtype=torch.float32))
+                continue
             semantic, latent, ref_mel, style, seed = self._prepare_request(
                 info,
                 device=device,

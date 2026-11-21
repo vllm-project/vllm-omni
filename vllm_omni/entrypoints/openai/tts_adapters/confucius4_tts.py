@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from vllm.inputs import tokens_input
@@ -189,6 +190,23 @@ class Confucius4TTSAdapter(ARTTSAdapter):
         if request.max_new_tokens is None:
             return sampling_params_list
         return apply_max_new_tokens(sampling_params_list, request)
+
+    def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
+        """Reject a request whose Stage 0 produced no semantic code.
+
+        An immediate EOS is a legal sampling outcome; Stage 1 answers it with an
+        empty waveform so the failure stays local to that request. Serving then
+        returns a 500 instead of a successful zero-length audio file.
+        """
+        for key in ("audio", "model_outputs"):
+            if key not in audio_output:
+                continue
+            value = audio_output[key]
+            chunks = value if isinstance(value, (list, tuple)) else [value]
+            sizes = [int(chunk.numel()) for chunk in chunks if hasattr(chunk, "numel")]
+            if sizes and sum(sizes) == 0:
+                collect["audio_synthesis_error"] = True
+            return
 
     def _load_supported_speakers(self) -> list[str]:
         return []
