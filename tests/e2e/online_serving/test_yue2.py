@@ -89,7 +89,14 @@ tts_server_params = [
 ]
 
 
-def _http_speech(omni_server, *, seed: int, frames: int) -> bytes:
+def _http_speech(
+    omni_server,
+    *,
+    seed: int,
+    frames: int,
+    extra_params: dict | None = None,
+    expected_truncated: bool | None = None,
+) -> bytes:
     """Raw-HTTP speech request returning (and structurally checking) the WAV.
 
     The OpenAI SDK client swallows response headers, so the truncation flag is
@@ -107,13 +114,17 @@ def _http_speech(omni_server, *, seed: int, frames: int) -> bytes:
             "max_new_tokens": frames,
             "stream": False,
             "response_format": "wav",
-            "extra_params": {"cot": "off"},
+            "extra_params": {"cot": "off"} if extra_params is None else extra_params,
         },
         timeout=DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
     )
     assert response.status_code == 200, response.text[:500]
     truncated = response.headers.get("X-Audio-Truncated")
     assert truncated in ("true", "false"), f"X-Audio-Truncated missing/invalid: {truncated!r}"
+    if expected_truncated is not None:
+        assert truncated == str(expected_truncated).lower(), (
+            f"X-Audio-Truncated={truncated}, expected {expected_truncated}"
+        )
     audio = response.content
     with wave.open(io.BytesIO(audio)) as wav:
         assert wav.getnchannels() == 2
@@ -124,6 +135,28 @@ def _http_speech(omni_server, *, seed: int, frames: int) -> bytes:
         f"X-Audio-Truncated={truncated} but duration={duration:.2f}s vs {frames / 25:.1f}s budget"
     )
     return audio
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("cfg_scale", [1.0, 1.5], ids=["unguided", "paired-cfg"])
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_yue2_automatic_abc_to_audio(omni_server, cfg_scale: float) -> None:
+    """Replace an ABC prompt under the same ID, then synthesize on V2.
+
+    A short ABC budget exercises truncation propagation. The semantic budget
+    equals its minimum length, so the truncation flag must be true regardless
+    of whether the ABC phase ended naturally or exhausted its own budget.
+    """
+    audio = _http_speech(
+        omni_server,
+        seed=SEED,
+        frames=200,
+        extra_params={"cot": "melody", "abc_max_tokens": 64, "cfg_scale": cfg_scale},
+        expected_truncated=True,
+    )
+    assert len(audio) > _MIN_BYTES
 
 
 @pytest.mark.slow
@@ -317,7 +350,7 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monke
                         "cudagraph_mode": "NONE" if enforce_eager else "FULL_AND_PIECEWISE",
                     },
                     "enable_chunked_prefill": chunked,
-                    "async_scheduling": True,
+                    "async_scheduling": False,
                     "max_num_batched_tokens": 256 if chunked else 1024,
                     "max_model_len": 1000,
                     "num_gpu_blocks_override": 64,

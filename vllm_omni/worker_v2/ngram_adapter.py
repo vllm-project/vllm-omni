@@ -12,26 +12,29 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-def is_npu_thinker_ngram(config: VllmConfig) -> bool:
+def is_thinker_ngram(config: VllmConfig) -> bool:
     spec = config.speculative_config
     model = config.model_config
     return (
         spec is not None
         and spec.method in ("ngram", "ngram_gpu")
-        and config.device_config.device_type == "npu"
         and getattr(model, "model_stage", None) == "llm"
         and model.architecture == "MiniCPMO45OmniForConditionalGeneration"
     )
 
 
 def use_scheduler_ngram(config: VllmConfig) -> bool:
-    if not is_npu_thinker_ngram(config) or not getattr(config.model_config, "use_v2_model_runner", False):
+    if (
+        not is_thinker_ngram(config)
+        or config.device_config.device_type != "npu"
+        or not getattr(config.model_config, "use_v2_model_runner", False)
+    ):
         return False
     spec = config.speculative_config
     assert spec is not None
     if spec.method == "ngram_gpu":
         raise ValueError(
-            "MiniCPM-o stage 0 speculative_config.method=ngram_gpu on Ascend requires model_runner: v1. "
+            "MiniCPM-o stage 0 speculative_config.method=ngram_gpu is unsupported on Ascend MRv2. "
             "Use method: ngram for MRv2."
         )
 
@@ -57,6 +60,16 @@ class _SchedulerNgramSpeculator:
     draft_logits = None
     num_query_per_req = 1
     num_extra_query_per_req = 0
+
+    # The scheduler tracks request state and context limits for this proposer.
+    def add_request(self, req_index: int) -> None:
+        pass
+
+    def on_requests_finished(self, finished_req_ids: set[str]) -> None:
+        pass
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        pass
 
     def init_cudagraph_manager(self, cudagraph_mode: object) -> None:
         pass
@@ -87,7 +100,9 @@ def allow_ascend_scheduler_ngram() -> None:
     except ImportError:
         return
 
-    original = mrv2_utils._v2_blacklist
+    original = getattr(mrv2_utils, "_v2_blacklist", None)
+    if original is None:
+        return
 
     @wraps(original)
     def blacklist(config: VllmConfig) -> list[str]:

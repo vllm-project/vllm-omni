@@ -12,6 +12,13 @@ Qwen-Image request through the standard Images API.
 ```bash
 vllm serve Qwen/Qwen-Image --omni --port 8091
 ```
+
+The same clients also support Qwen-Image 2.1. To use that checkpoint instead:
+
+```bash
+vllm serve Qwen/Qwen-Image-2.1 --omni --port 8091
+```
+
 !!! note
     If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
 
@@ -44,7 +51,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
 ```
 
-For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](../../diffusion/parallelism_acceleration.md).
+For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](../../../docs/user_guide/diffusion/parallelism/overview.md).
 
 ## API Calls
 
@@ -179,7 +186,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
 
 LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
@@ -240,18 +247,18 @@ generation controls as top-level JSON fields directly. For image dimensions and
 count, use `size` and `n` rather than `height`, `width`, or
 `num_outputs_per_prompt`.
 
-| Parameter                | Type  | Default | Description                    |
-| ------------------------ | ----- | ------- | ------------------------------ |
-| `height`                 | int   | None    | Image height in pixels         |
-| `width`                  | int   | None    | Image width in pixels          |
-| `size`                   | str   | None    | Image size (e.g., "1024x1024") |
-| `num_inference_steps`    | int   | model   | Number of denoising steps      |
-| `true_cfg_scale`         | float | model   | True CFG scale when supported  |
-| `seed`                   | int   | None    | Random seed (reproducible)     |
-| `negative_prompt`        | str   | None    | Negative prompt                |
-| `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
-| `use_system_prompt` | str | None | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text string. Only for HunyuanImage-3.0. |
-| `system_prompt` | str | None | Custom system prompt text. Only used when `use_system_prompt` is set to `custom`. Only for HunyuanImage-3.0. |
+| Parameter                | Type  | Default | Description                                                                                                                                                  |
+| ------------------------ | ----- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `height`                 | int   | None    | Image height in pixels                                                                                                                                       |
+| `width`                  | int   | None    | Image width in pixels                                                                                                                                        |
+| `size`                   | str   | None    | Image size (e.g., "1024x1024")                                                                                                                               |
+| `num_inference_steps`    | int   | model   | Number of denoising steps                                                                                                                                    |
+| `true_cfg_scale`         | float | model   | True CFG scale when supported                                                                                                                                |
+| `seed`                   | int   | None    | Random seed (reproducible)                                                                                                                                   |
+| `negative_prompt`        | str   | None    | Negative prompt                                                                                                                                              |
+| `num_outputs_per_prompt` | int   | 1       | Number of images to generate                                                                                                                                 |
+| `use_system_prompt`      | str   | None    | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text string. Only for HunyuanImage-3.0. |
+| `system_prompt`          | str   | None    | Custom system prompt text. Only used when `use_system_prompt` is set to `custom`. Only for HunyuanImage-3.0.                                                 |
 
 ## Response Format
 

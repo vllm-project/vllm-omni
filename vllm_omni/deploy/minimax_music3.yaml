@@ -9,6 +9,8 @@
 # extra_args block below is what turns on has_sampling_extra_args (so per-row
 # sampling extra args reach the model's forward) and is also how the CFG
 # scheduler patches learn this stage is paired.
+#
+# Both stages inherit the vLLM 0.34 Model Runner V2 default.
 pipeline: minimax_music3
 async_chunk: true
 
@@ -116,10 +118,15 @@ stages:
     # input batch, which breaks when chunk arrival staggers requests.
     async_scheduling: false
     enable_prefix_caching: false
-    # One placeholder prompt token per arriving window, so a six-minute song
-    # (90 windows) needs a tiny context.
+    # Each V2 window replaces the stage-1 prompt (200 frames x 8 codebooks
+    # = 1600 tokens), so the context only needs to hold one window.
     max_model_len: 4096
-    max_num_batched_tokens: 4096
+    # On V2 one step should fit a window for every request: a window is 1600
+    # tokens and a song's last window at most 1608, so 8 x 1608 = 12864.
+    # A window is never split, and the scheduler stops at the first window
+    # that does not fit, so a smaller budget lets the same few requests take
+    # every step.
+    max_num_batched_tokens: 16384
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
@@ -139,5 +146,7 @@ platforms:
       - stage_id: 1
         # Acoustic decoder on the second card.
         max_num_seqs: 2
+        # Two maximum-size V2 windows fit in this step (2 x 1608 tokens).
+        max_num_batched_tokens: 4096
         gpu_memory_utilization: 0.9
         devices: "1"

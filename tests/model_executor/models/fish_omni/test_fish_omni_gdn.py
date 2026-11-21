@@ -48,11 +48,15 @@ def _layer(device, pools):
     )
 
     def chunk(**kw):
+        # The ChunkGatedDeltaRule dispatch layer takes the gate in log space
+        # (both callers pass output_g_exp=False) and exponentiates before the
+        # FlashInfer kernel; the direct FlashInfer paths bypass this stub.
+        g = torch.exp(kw["g"].to(torch.float32))
         return fi_chunk_gated_delta_rule(
             q=kw["q"],
             k=kw["k"],
             v=kw["v"],
-            g=kw["g"],
+            g=g,
             beta=kw["beta"],
             initial_state=kw["initial_state"],
             output_final_state=kw["output_final_state"],
@@ -61,7 +65,14 @@ def _layer(device, pools):
         )
 
     layer.chunk_gated_delta_rule = _CallableNamespace(chunk, gdn_prefill_backend="flashinfer")
+    # Upstream QwenGatedDeltaNetAttention copies the chunk module's resolved
+    # backend onto the layer (self.gdn_prefill_backend); _forward_core reads
+    # the layer-level attribute when picking the prefill kernel.
+    layer.gdn_prefill_backend = "flashinfer"
     layer.rearrange_mixed_qkv = types.MethodType(QwenGatedDeltaNetAttention.rearrange_mixed_qkv, layer)
+    # FlashInfer prefills now route through this layer method (plan-less path
+    # only needs the kernel itself; the test metadata has no checkpoint plan).
+    layer._forward_flashinfer_prefill = types.MethodType(QwenGatedDeltaNetAttention._forward_flashinfer_prefill, layer)
     return layer, dim
 
 
@@ -139,6 +150,7 @@ def test_drama3_gdn_core_matches_standard_path(monkeypatch, prefill_backend, dec
         pools = (conv_pool.clone(), ssm_pool.clone())
         layer, dim = _layer(device, pools)
         layer.chunk_gated_delta_rule.gdn_prefill_backend = prefill_backend
+        layer.gdn_prefill_backend = prefill_backend
         torch.manual_seed(2)
         mixed_qkv = (torch.randn(tokens, dim, device=device) * 0.5).to(torch.bfloat16)
         b = torch.randn(tokens, V_HEADS, device=device).to(torch.bfloat16)

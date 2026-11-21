@@ -350,10 +350,18 @@ def test_empty_score_directory(tmp_path):
     ],
 )
 @pytest.mark.parametrize("accuracy_dir_override", [False, True])
-@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3"])
+@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3", "MI300"])
 @pytest.mark.parametrize("benchmark_params_name", [None, "rtd-pr-c8"])
 def test_dfx_writes_both_artifacts_before_quality_gate(
-    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override, resource_label, benchmark_params_name
+    tmp_path,
+    monkeypatch,
+    result,
+    config,
+    failure,
+    accuracy_dir_override,
+    resource_label,
+    benchmark_params_name,
+    pytestconfig,
 ):
     from tests.dfx import conftest as dfx
     from tests.dfx.perf.scripts import run_benchmark as runner
@@ -430,9 +438,9 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     if expect_failure:
         message = "benchmark exited with unexpected code" if returncode else ""
         with pytest.raises(AssertionError, match=message):
-            runner.test_performance_benchmark(ServerEndpoint(), case)
+            runner.test_performance_benchmark(ServerEndpoint(), case, pytestconfig=pytestconfig)
     else:
-        runner.test_performance_benchmark(ServerEndpoint(), case)
+        runner.test_performance_benchmark(ServerEndpoint(), case, pytestconfig=pytestconfig)
 
     assert len(commands) == 1
     accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))
