@@ -3824,6 +3824,45 @@ def test_lingbot_expansion_source_dependencies_include_runner_guards() -> None:
         assert f".buildkite/amd/scripts/{script}" in dependencies["diffusion_lingbot_function"]
 
 
+def test_minimax_h3_ref2va_partition_is_one_blocking_nightly_job() -> None:
+    label = "MiniMax-H3 Ref2VA Partition DP2 DLO"
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == "mi300_2"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 120
+    assert step["source_file_dependencies"] == "diffusion_minimax_h3_function"
+    assert step["env"] == {
+        "VLLM_ROCM_USE_AITER": "1",
+        "DIFFUSION_ATTENTION_BACKEND": "FLASH_ATTN",
+    }
+    assert step["artifact_paths"] == ["artifacts/rocm-minimax-h3-ref2va-partition/**/*"]
+    assert "retry" not in step
+    assert len(step["commands"]) == 1
+    assert split(step["commands"][0]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        "2",
+        "1",
+        "105m",
+        "rocm-minimax-h3-ref2va-partition",
+        "tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va_ref2va.py::test_minimax_h3_ref2va_partition",
+        "-m",
+        "full_model and diffusion and rocm and MI325 and cards_2",
+    ]
+
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        assert label not in pipeline_path.read_text(encoding="utf-8")
+
+
+def test_minimax_h3_ref2va_partition_source_dependencies_include_runner_guards() -> None:
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    for script in ("run-rocm-diffusion-nightly.sh", "assert-pytest-collection.sh"):
+        assert f".buildkite/amd/scripts/{script}" in dependencies["diffusion_minimax_h3_function"]
+
+
 def test_minicpmo_duplex_function_is_one_blocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o 4.5 Duplex Function", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "Blocking"
