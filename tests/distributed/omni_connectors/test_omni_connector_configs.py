@@ -46,6 +46,23 @@ def test_platform_connector_overrides_merge_without_mutating_input(monkeypatch, 
     assert config == original
 
 
+@pytest.mark.parametrize(
+    ("platform", "connector_name"),
+    [
+        ("xpu", "SharedMemoryConnector"),
+        ("cuda", "MooncakeTransferEngineConnector"),
+        ("npu", "MooncakeTransferEngineConnector"),
+    ],
+)
+def test_hunyuan_xpu_connector_uses_the_platform_overlay(monkeypatch, platform, connector_name):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    deploy = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "hunyuan_image_3_moe.yaml"
+    config = load_omni_transfer_config(config_path=deploy)
+    assert config.connectors[("0", "1")].name == connector_name
+
+
 def get_config_files():
     """Helper to find config files."""
     # Go up two levels from 'tests/distributed/omni_connectors' (approx) to 'vllm-omni' root

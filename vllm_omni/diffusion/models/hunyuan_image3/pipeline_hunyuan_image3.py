@@ -1364,10 +1364,10 @@ class HunyuanImage3Pipeline(
             cfg_factor["gen_image"] = 1
         bot_task = kwargs.pop("bot_task", "auto")
         if prepared_layout is None:
-            # Pull template options from generation_config only when the
-            # Worker must tokenize locally.
             drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
-            sequence_template = getattr(self.generation_config, "sequence_template", "pretrain")
+            sequence_template = request_layout_utils.hunyuan_sequence_template(
+                self.generation_config, batch_ar_token_ids
+            )
             # Apply batched prompt or batched message_list to build input
             # sequence with associated info.
             out = self._tkwrapper.apply_chat_template(
