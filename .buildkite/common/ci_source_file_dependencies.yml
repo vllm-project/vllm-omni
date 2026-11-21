@@ -520,6 +520,10 @@ source_file_dependencies:
     - vllm_omni/inputs/
     - vllm_omni/outputs/
 
+  rocm_diffusion_nightly_runner:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+
   # Tiny-model diffusion jobs (shared across many model trees under models/).
   diffusion_tiny_model:
     - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
@@ -1301,7 +1305,7 @@ source_file_dependencies:
     - vllm_omni/outputs/
     - vllm_omni/transformers_utils/configs/minimax_music3.py
 
-  tts_yue2_weekly:
+  tts_yue2_weekly: &tts_yue2_weekly
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/assets/yue2/
     - tests/e2e/features/yue2/
@@ -1321,6 +1325,14 @@ source_file_dependencies:
     - vllm_omni/tokenizers/yue2_prompt.py
     - vllm_omni/tokenizers/yue2_tokenizer.py
     - vllm_omni/transformers_utils/configs/yue2.py
+    - vllm_omni/worker_v2/omni_ar_model_runner.py
+    - vllm_omni/worker_v2/omni_model_runner.py
+    - vllm_omni/worker_v2/model_states/omni_model_state.py
+
+  tts_yue2_function:
+    - *tts_yue2_weekly
+    - tests/e2e/offline_inference/test_yue2.py
+    - examples/offline_inference/yue2/end2end.py
 
   tts_cosyvoice3_function:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
@@ -1689,6 +1701,7 @@ source_file_dependencies:
   diffusion_lingbot_function:
     - *lingbot_video
     - *lingbot_world
+    - vllm_omni/diffusion/model_metadata.py
     - vllm_omni/diffusion/offloader/
     - tests/e2e/online_serving/test_lingbot_video.py
     - tests/e2e/online_serving/test_lingbot_video_expansion.py

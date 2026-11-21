@@ -232,6 +232,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             target_barge_in_latency_ms=None,
         )
 
+    def prewarms_downstream_stages(self, request_id: str) -> bool:
+        # A turn without audio output always ends at JoyAI (decide_output answers
+        # it directly), so the Talker and Code2Wav never run. Prewarming Code2Wav
+        # for it would only create a request that the turn end aborts.
+        observation = self.data_plane.requests.get(request_id)
+        return observation is None or "audio" in observation.modalities
+
     def create_session_state(self) -> JoyAISessionState:
         return JoyAISessionState(audio_buffer=JoyAIFrameBuffer(accepts_audio=self.asr_stage_id is not None))
 
@@ -376,12 +383,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     @staticmethod
     def _system_prompt(runtime_config: Mapping[str, object]) -> str:
-        """Session system prompt: optional extra_body override, else silence persona."""
+        """Session system prompt: persona, then the delegate action, then instructions.
+
+        The persona is the optional extra_body override, else the silence persona.
+        Session instructions come last, after the delegate action they may refer to.
+        """
         override = runtime_config.get("joyai_system_prompt")
         if isinstance(override, str) and override.strip():
             system = override.strip()
         else:
             system = SILENT_SYSTEM_PROMPT
+        if JoyAIDuplexPlugin.delegation_enabled(runtime_config):
+            system += "\n\n" + delegation_system_section()
         instructions = runtime_config.get("instructions")
         if instructions:
             system += "\n\n" + str(instructions)
@@ -1349,7 +1362,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
-            system += "\n\n" + delegation_system_section()
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
@@ -1447,7 +1459,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
-            system += "\n\n" + delegation_system_section()
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )

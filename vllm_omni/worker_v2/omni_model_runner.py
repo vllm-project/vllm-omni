@@ -1294,6 +1294,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        lifecycle_hook = getattr(type(self.model_state), "get_request_lifecycle", None)
+        lifecycle = lifecycle_hook(self.model_state, scheduler_output) if lifecycle_hook is not None else None
+        if lifecycle is not None and lifecycle.reset_req_ids:
+            # Keep scheduler-owned completion metadata unchanged. Only the
+            # worker resets the old phase before add_requests admits its reuse.
+            scheduler_output = replace(
+                scheduler_output,
+                finished_req_ids=scheduler_output.finished_req_ids | lifecycle.reset_req_ids,
+            )
         # IMPORTANT: Must query req_id_to_index BEFORE super().finish_requests()
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
@@ -1322,3 +1331,6 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        if lifecycle is not None:
+            for req_id in sorted(lifecycle.release_req_ids - all_done):
+                self._remove_request(req_id)
