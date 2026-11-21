@@ -7,6 +7,7 @@
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
 - [Batch Parallel Decode](#batch-parallel-decode)
+- [Adaptive Temporal Scheduling (MiniMax-H3, NPU)](#adaptive-temporal-scheduling-minimax-h3-npu)
 - [Spatially-Sharded Decode (Wan)](#spatially-sharded-decode-wan)
 - [Distributed Encode Split (Wan)](#distributed-encode-split-wan)
 - [Best Practices](#best-practices)
@@ -124,6 +125,55 @@ Additional requirements:
 
 !!! note "Automatic VAE Tiling"
     When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), tile mode automatically enables `vae_use_tiling`. Spatial-shard and batch modes preserve the requested tiling setting: spatial-shard decode is full-frame and does not need tiling. In spatial-shard modes the **encode** is distributed only through the tiled path, so set `vae_use_tiling=True` (`--vae-use-tiling`) explicitly if you also want a multi-rank encode; the decode stays spatially sharded either way.
+
+---
+
+## Adaptive Temporal Scheduling (MiniMax-H3, NPU)
+
+Enable with `--enable-vae-temporal-scheduling`, or
+`enable_vae_temporal_scheduling=True` in Python / diffusion stage engine arguments.
+The default is **off**: native per-clip decoding runs without the planner,
+extra device memory queries, or planning collectives. Omit the flag to roll back.
+The previous candidate-only `--vae-temporal-window-size` option is removed;
+it was not present in the checked published releases through v0.32.0rc1.
+Window size is now an internal, per-request decision.
+
+```bash
+vllm serve "$MODEL" --omni --trust-remote-code --task-type fl2va \
+  --num-gpus 4 --usp 4 --ring 1 --text-encoder-tp-size 4 \
+  --vae-parallel-mode tile --vae-use-tiling --vae-patch-parallel-size 4 \
+  --enable-vae-temporal-scheduling
+```
+
+Keep the deployment's precision, attention, and offload options unchanged.
+The scheduler uses the actual video tile process group, including non-power-of-two
+sizes. It does not create workers or relax existing model parallelism constraints.
+Only NPU full-video streaming uint8 decode is optimized. Other backends keep the
+native path and log `unsupported_backend` when explicitly enabled. Incremental
+output, audio decode, Encoder/DiT, and offload are unchanged.
+
+The scheduler groups context-complete tiles across temporal clips, preserving
+original batch size, precision, temporal context and spatial/temporal stitch
+order. Equal-shaped tasks share a collective; a bucket smaller than the group
+runs replicated to avoid empty-rank gathers. Stacked tiling and unsupported
+checkpoint contracts retain the native path.
+
+Window selection considers W=1 through min(16, clip count), including short
+tails. If the fixed2GiB cap already selects W1, the native path skips the
+device memory query and group reduction; a smaller free-memory budget cannot
+make a larger window preferable. It minimizes integer assignment waste within an incremental memory
+budget of at most 2 GiB and one quarter of the minimum free memory across
+video ranks. The reserve accounts for tile outputs, stitching, gather storage
+and input context copies; it is not a universal allocator/workspace bound.
+No trial decode or timing model runs during selection, and plans are not
+cached across requests.
+
+Info logs report selection, window, memory budget and fallback reason. Enable
+DEBUG for candidate geometry and per-bucket task/work details. Selection alone
+does not prove cross-rank execution or a latency improvement. A matched
+component comparison must include selection, memory queries, collectives and
+stitching, and compare each request's maximum-rank wall time. Report full-flow
+latency separately from this decoder component.
 
 ---
 
