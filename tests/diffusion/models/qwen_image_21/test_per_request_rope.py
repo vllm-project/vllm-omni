@@ -86,7 +86,7 @@ def test_singleton_decode_after_mixed_prefill_keeps_target_frame_position():
 @pytest.mark.parametrize("device,sp_active", [("cpu", False), ("cuda", True)])
 def test_unsupported_mixed_padding_is_rejected(device, sp_active):
     text_mask = torch.tensor([[0, 1, 1]])
-    with pytest.raises(ValueError, match="mixed-length text padding requires CUDA without sequence parallelism"):
+    with pytest.raises(ValueError, match="mixed-length text padding requires CUDA or NPU without sequence parallelism"):
         _qwen_image21_rope_text_mask(text_mask, torch.device(device), sp_active)
 
 

@@ -670,6 +670,12 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
         raw_image = multi_modal_data.get("image")
         raw_video = multi_modal_data.get("video")
         sp = request.sampling_params
+        # Recorded before missing sizes are filled in below: only an action
+        # reference image with an explicit size used to be resized by the
+        # serving layer.
+        stretch_action_image = (
+            action_mode is not None and raw_image is not None and sp.height is not None and sp.width is not None
+        )
         crop_image = crop_action_image and raw_image is not None and sp.height is None and sp.width is None
         if crop_image:
             if raw_video is not None:
@@ -765,6 +771,11 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
         target_w = request.sampling_params.width
         target_h = request.sampling_params.height
         if action_mode is not None:
+            if stretch_action_image and image.size != (int(target_w), int(target_h)):
+                # Action reference images with an explicit size are stretched
+                # to it, as the serving layer did before Cosmos3 received them
+                # unresized.
+                image = image.resize((int(target_w), int(target_h)), PIL.Image.Resampling.LANCZOS)
             prompt["additional_information"]["preprocessed_image"] = _preprocess_action_image(
                 image,
                 int(target_h),
@@ -4221,6 +4232,11 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
         if video_tensor is not None and is_t2i:
             raise ValueError("Cosmos3 video-to-video generation is supported only for video outputs.")
+        if image_tensor is not None and is_t2i:
+            raise ValueError(
+                "Cosmos3 image-conditioned image generation is unsupported; "
+                "image inputs are supported only for video outputs (image-to-video)."
+            )
 
         # T2I and T2V share the same model and forward path; their defaults are:
         #   T2I: regular 1024x1024, Edge 640x640; 50 steps, shift=3.0,

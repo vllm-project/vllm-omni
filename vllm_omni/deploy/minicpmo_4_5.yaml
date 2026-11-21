@@ -224,6 +224,9 @@ platforms:
       - stage_id: 1
         # K-step advances one codec frame per FlashAttention query.
         attention_backend: FLASH_ATTN
+        # K-step exposes two control logits, not codec prompt logprobs.
+        # Automatic KV sizing must not request generic prompt logprobs.
+        max_logprobs: 0
         # Cover 16 full 4096-token requests while leaving room for Code2Wav.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         # Fifteen continuation drafts reserve sixteen codec positions per step.
