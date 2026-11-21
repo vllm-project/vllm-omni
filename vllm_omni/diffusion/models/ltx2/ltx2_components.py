@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -652,13 +654,20 @@ def _load_ltx_vocoder(
         "revision": revision,
         "prefetch_list": prefetch_list,
     }
-    try:
-        return _load_component(profile.vocoder_cls, model, "vocoder", **component_kwargs)
-    except (TypeError, OSError, ValueError):
-        fallback_cls = profile.vocoder_fallback_cls
-        if fallback_cls is None or fallback_cls is profile.vocoder_cls:
-            raise
-        return _load_component(fallback_cls, model, "vocoder", **component_kwargs)
+    # The BWE vocoder builds its anti-alias filters with torch.kaiser_window
+    # at construction time. Platforms without that kernel build the vocoder
+    # on CPU; _place_aux_components moves it to the pipeline device afterwards.
+    build_ctx: AbstractContextManager[Any] = (
+        nullcontext() if current_omni_platform.supports_signal_window_ops() else torch.device("cpu")
+    )
+    with build_ctx:
+        try:
+            return _load_component(profile.vocoder_cls, model, "vocoder", **component_kwargs)
+        except (TypeError, OSError, ValueError):
+            fallback_cls = profile.vocoder_fallback_cls
+            if fallback_cls is None or fallback_cls is profile.vocoder_cls:
+                raise
+            return _load_component(fallback_cls, model, "vocoder", **component_kwargs)
 
 
 def _load_ltx25_native_diffusion_decoder(
