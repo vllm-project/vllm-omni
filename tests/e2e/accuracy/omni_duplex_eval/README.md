@@ -2,10 +2,8 @@
 
 The MiniCPM-o nightly runs **120 `PR_correction` samples at concurrency 8**,
 generates responses once, then evaluates those same responses. Performance
-timing ends before judging. Pass conditions match Qwen3-Omni: complete
-generation and judging, with a finite correction success rate and **no numeric
-score floor**. The DFX runner writes the performance artifact; MiniCPM no longer
-opts into `duplex_eval_accuracy_config`. MiniCPM-o also skips the per-session
+timing ends before judging. MiniCPM requires complete generation and judging
+and a finite correction success rate. MiniCPM-o skips the per-session
 `client_ttft_ms` / `client_ttfp_ms` gates (native duplex may finish audio
 without a non-empty transcript); run-level `required_duplex_metrics` still
 require some samples for the batch.
@@ -37,16 +35,16 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 
 For A3, use `-m "full_model and npu and A3 and cards_2"`.
 The existing CUDA and NPU nightly jobs use this same JSON configuration.
-Setting `duplex_eval_accuracy_config` opts a DFX case into the 66-ID soundtrack
-accuracy artifact and CLI-exit guard. MiniCPM-o and Qwen3-Omni nightly
-`PR_correction` cases omit that field and keep the record-only judging path.
+Setting `duplex_eval_evaluate: true` writes a separate accuracy artifact from
+the same responses and judge scores. The MiniCPM nightly records its
+120 correction scores on CUDA, NPU and AMD. The Qwen3-Omni nightly also
+checks a 70% correction success floor on H100 and A3.
 
-The AMD MiniCPM job runs the same MiniCPM JSON, so it also records 120
-correction scores without a floor. Local DFX configurations can still set
-`duplex_eval_accuracy_config` and `duplex_eval_require_score_floors: true`
-when they want the 66-ID soundtrack floors. The AMD queue currently reports
-MI300X, normalized to `MI300`; the `MI325` pytest marker is a selection label,
-not evidence for an MI325 baseline.
+Local DFX configurations can set `duplex_eval_accuracy_config` to select the
+66-ID soundtrack contract and its CLI exit-code checks. Setting
+`duplex_eval_require_score_floors: true` requires a floor for the runtime
+hardware. The AMD queue reports MI300X (`MI300` in results) and uses the
+`MI325` pytest marker for scheduling.
 See [AMD qualification](../../../../.buildkite/amd/nightly-qualification.md)
 for the provisional MI300 floors used by the optional accuracy-config path.
 
@@ -72,9 +70,9 @@ without a mix counts as `question`.
 ## Results
 
 The MiniCPM-o `PR_correction` nightly writes the performance JSON under
-`BENCHMARK_DIR` and records judge scores inside that artifact. The optional
-66-ID soundtrack path that sets `duplex_eval_accuracy_config` also writes a
-separate accuracy JSON under `ACC_BENCH_RESULT_DIR`. The defaults are:
+`BENCHMARK_DIR` with embedded judge scores and publishes a separate accuracy JSON
+under `ACC_BENCH_RESULT_DIR`. The optional 66-ID soundtrack path uses the
+same artifact directories. The defaults are:
 
 ```text
 tests/dfx/perf/results/

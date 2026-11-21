@@ -97,6 +97,14 @@ Specify to save benchmark results to a json file
   clocks and timezones must agree. Older result files without `benchmark_end_time`
   cannot establish a sampling window from `date` alone.
 
+- `--omni-isolate-prefix-cache`
+  Give the measured chat/completions requests a fresh, shared `cache_salt`
+  for each benchmark invocation. Ready checks and individual warmup requests
+  use separate salts. Requests within the measured run can still reuse common
+  prefixes. This option rejects an explicit `cache_salt` and does not clear
+  multimodal processor caches or measure cold service startup. Failed warmup
+  requests abort the measurement when this option is enabled.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."

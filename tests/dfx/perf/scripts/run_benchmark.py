@@ -16,6 +16,7 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    annotate_dataset_result,
     assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
@@ -23,6 +24,7 @@ from tests.dfx.conftest import (
     get_runtime_resource_label,
     is_diffusion_perf_config,
     load_benchmark_configs,
+    prepare_dataset_benchmark,
     run_benchmark,
 )
 from tests.helpers.assertions import assert_duplex_artifact_publication
@@ -371,10 +373,14 @@ def benchmark_params(request):
 
     params = dict(all_params[param_index])
     with ExitStack() as stack:
+        params = prepare_dataset_benchmark(params, stack)
         if params.get("duplex_eval_accuracy_config"):
             # The judge reads these files during evaluation. Keep the temporary
             # directory under the configured root, within its allowed media path.
-            root = Path(params.get("duplex_eval_response_root", "omni-duplex-eval-output")).expanduser().resolve()
+            response_root = params.get("duplex_eval_response_root", "omni-duplex-eval-output")
+            if not isinstance(response_root, str):
+                raise ValueError("duplex_eval_response_root must be a string")
+            root = Path(response_root).expanduser().resolve()
             root.mkdir(parents=True, exist_ok=True)
             params["duplex_eval_response_root"] = stack.enter_context(TemporaryDirectory(prefix="tmp-", dir=root))
         yield {"test_name": test_name, "params": params}
@@ -717,6 +723,15 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     return accuracy_path
 
 
+def _pr_correction_accuracy_baseline(params: dict, hardware: str | None) -> dict | None:
+    floor = params.get("duplex_eval_min_pr_mean_all_success", {}).get(hardware)
+    if floor is None:
+        return None
+    if not _is_finite_number(floor) or not 0 < floor <= 1:
+        raise ValueError(f"Invalid PR correction score floor for {hardware}: {floor!r}")
+    return {"min_pr_mean_all_success": floor}
+
+
 def _is_minicpmo_duplex_eval(result: dict, params: dict) -> bool:
     """True for MiniCPM-o Omni-DuplexEval nightly (native duplex).
 
@@ -797,6 +812,9 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             )
             score = scores.get("mean_all_success")
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
+            if baseline := _pr_correction_accuracy_baseline(params, result.get("Hardware")):
+                minimum = baseline["min_pr_mean_all_success"]
+                assert score >= minimum, f"PR correction mean_all_success {score} is below {minimum}"
 
 
 def assert_result(result, params, num_prompt, *, check_baseline: bool = False, require_baseline: bool = False) -> None:
@@ -805,6 +823,10 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
         raise AssertionError(
             f"Request failures exist: {result['completed']}/{num_prompt} completed. First request error: {first_error}"
         )
+    if params.get("result_validation") is not None:
+        errors = result.get("validation_errors")
+        assert isinstance(errors, list), "Dataset validation diagnostics are missing"
+        assert not errors, "\n".join(errors)
     if params.get("dataset_name") == "realtime-video":
         video = result.get("realtime_video")
         assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"
@@ -888,7 +910,8 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False, r
                     f"OmniInteract All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
                 )
             _maybe_assert_aggregate_ia_qtf1(params, acc_summary, result, num_prompt)
-    if "tpot" in _selected_percentile_metrics(params):
+    # Dataset cases declare required metrics separately from the percentiles they report.
+    if params.get("result_validation") is None and "tpot" in _selected_percentile_metrics(params):
         num_tpot_samples = result.get("num_tpot_samples")
         mean_tpot_ms = result.get("mean_tpot_ms")
         assert isinstance(num_tpot_samples, int) and not isinstance(num_tpot_samples, bool) and num_tpot_samples > 0, (
@@ -932,6 +955,20 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
     resource_label = get_runtime_resource_label()
+    resource_label = params.pop("runtime_resource_aliases", {}).get(resource_label, resource_label)
+    check_baseline = pytestconfig.getoption("assert_baseline")
+    require_baseline = pytestconfig.getoption("require_baseline")
+    result_transform: Callable[[dict[str, object], int], dict[str, object]] | None = None
+    if params.get("result_validation") is not None:
+        if params["result_validation"].get("smoke", False) and require_baseline:
+            raise ValueError("Smoke cannot qualify a full-dataset performance baseline")
+
+        def transform(result: dict[str, object], code: int) -> dict[str, object]:
+            return annotate_dataset_result(
+                result, code, params, check_baseline=check_baseline, require_baseline=require_baseline
+            )
+
+        result_transform = transform
     accuracy_baseline = None
     if path := params.get("duplex_eval_accuracy_config"):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline
@@ -943,6 +980,8 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         accuracy_baseline = select_duplex_eval_baseline(
             accuracy_config, resource_label, required=params.get("duplex_eval_require_score_floors", False)
         )
+    elif params.get("duplex_eval_split") == "PR_correction" and params.get("duplex_eval_evaluate"):
+        accuracy_baseline = _pr_correction_accuracy_baseline(params, resource_label)
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     elif params.get(_MIN_DAILY_OMNI_ACCURACY) is not None or params.get(_SEED_TTS_WER_EVAL):
@@ -997,6 +1036,10 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
 
     args = ["--host", host, "--port", str(port)]
     exclude_keys = {
+        "dataset_source",
+        "result_validation",
+        "result_metadata",
+        "benchmark_env",
         "request_rate",
         "baseline",
         "num_prompts",
@@ -1016,6 +1059,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
         "duplex_eval_accuracy_config",
         "duplex_eval_require_score_floors",
         "duplex_eval_score_floor_hardware",
+        "duplex_eval_min_pr_mean_all_success",
         "duplex_performance_only",
         "required_duplex_metrics",
         _MIN_DAILY_OMNI_ACCURACY,
@@ -1080,6 +1124,8 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 num_warmups=_resolve_num_warmups(params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)),
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
+                check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
+                result_transform=result_transform,
             )
             assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
@@ -1122,6 +1168,8 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 ),
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
+                check_duplex_eval_exit_code=bool(params.get("duplex_eval_accuracy_config")),
+                result_transform=result_transform,
             )
             assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
