@@ -109,6 +109,26 @@ measured response-level mean busy RTFs of 0.716089 and 0.733625 at merge commit 
 Both evaluated all 120 `PR_correction` samples at concurrency 8. Their mean, 0.724857,
 is the reference under `910`, the runtime hardware label in both result files.
 
+The judge scored 89/120 (74.17%) on each run, with zero skipped or failed
+evaluations. The accuracy artifacts report aggregate scores for this split.
+Nightly checks scoring coverage and score validity. Its numerical performance
+check uses mean busy RTF. The other measurements below are recorded for comparison.
+
+| A3 DuplexEval metric | [First run](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/12466#01a1fa05-f45f-45e7-8c50-511a9e51735d) | [Second run](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/12466#01a1fb8d-e346-4894-a80d-66c93b09168d) | Relative change |
+| --- | ---: | ---: | ---: |
+| Request throughput (requests/s) | 0.170779 | 0.170158 | −0.36% |
+| Mean client RTF | 0.777752 | 0.794242 | +2.12% |
+| Mean audio RTF | 0.771014 | 0.788487 | +2.27% |
+| Mean stall ratio | 0.053411 | 0.053518 | +0.20% |
+| Mean client TTFT (ms) | 529.631 | 576.200 | +8.79% |
+| Mean client TTFP (ms) | 812.461 | 884.290 | +8.84% |
+| Mean response TTFT (ms) | 400.083 | 449.960 | +12.47% |
+| Mean response TTFP (ms) | 661.450 | 738.439 | +11.64% |
+| P95 response TTFT (ms) | 520.642 | 688.189 | +32.18% |
+| P95 response TTFP (ms) | 954.779 | 1427.107 | +49.47% |
+| P99 response TTFT (ms) | 751.679 | 1636.654 | +117.73% |
+| P99 response TTFP (ms) | 1072.009 | 2058.277 | +92.00% |
+
 The shared runner persists one `result_test_*.json` for each dataset case,
 including quality, performance, software/data revisions, qualification scope
 and validation errors, before asserting success. HTML/Excel readers consume
