@@ -366,9 +366,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
+        stack_decode_tiles: bool = True,
     ) -> None:
         super().__init__()
         self._device_target = device
+        self.stack_decode_tiles = bool(stack_decode_tiles)
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
@@ -1246,7 +1248,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     @contextmanager
     def _stacked_decode_tiles(self, tiling: AbstractContextManager) -> Iterator[None]:
         """Decode a rank's spatial tiles as one batch (the checkpoint's ``stack_tiling``)."""
-        if not hasattr(self.model, "stack_tiling"):
+        if not self.stack_decode_tiles or not hasattr(self.model, "stack_tiling"):
             with tiling:
                 yield
             return

@@ -292,6 +292,11 @@ def test_invalid_vae_fast_path_is_rejected():
         OmniDiffusionConfig(model="x", vae_fast_path="fast")
 
 
+def test_vae_stack_tiles_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_stack_tiles is True
+    assert _roundtrip_diffusion_config(model="x", vae_stack_tiles=False).vae_stack_tiles is False
+
+
 def test_vae_encode_fast_path_roundtrip():
     assert _roundtrip_diffusion_config(model="x").vae_encode_fast_path == "lossless"
     od = _roundtrip_diffusion_config(model="x", vae_fast_path="off", vae_encode_fast_path="channels_last")
