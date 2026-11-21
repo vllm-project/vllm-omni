@@ -108,6 +108,8 @@ def _model_default_backend() -> str | None:
     metadata = get_diffusion_model_metadata(getattr(config, "model_class_name", None))
     if not metadata.default_attention_backends or not current_omni_platform.is_cuda():
         return None
+    if getattr(config, "step_execution", False) and getattr(config, "max_num_seqs", 1) > 1:
+        return None
     capability = current_omni_platform.get_device_capability()
     return metadata.default_attention_backend(capability.major if capability is not None else None)
 

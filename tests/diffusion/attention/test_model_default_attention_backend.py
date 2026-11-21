@@ -60,20 +60,27 @@ def test_models_without_a_default_keep_the_platform_default() -> None:
 
 
 @pytest.mark.parametrize(
-    ("model", "cuda", "major", "expected"),
+    ("model", "cuda", "major", "batching", "expected"),
     [
-        ("MiniMaxH3Pipeline", True, 10, "FLASHINFER_ATTN"),
-        ("MiniMaxH3Pipeline", True, 9, None),
-        ("MiniMaxH3Pipeline", False, 10, None),
-        ("MiniMaxH3ImagePipeline", True, 10, None),
-        (None, True, 10, None),
+        ("MiniMaxH3Pipeline", True, 10, {}, "FLASHINFER_ATTN"),
+        ("MiniMaxH3Pipeline", True, 10, {"step_execution": True}, "FLASHINFER_ATTN"),
+        ("MiniMaxH3Pipeline", True, 10, {"step_execution": True, "max_num_seqs": 2}, None),
+        ("MiniMaxH3Pipeline", True, 9, {}, None),
+        ("MiniMaxH3Pipeline", False, 10, {}, None),
+        ("MiniMaxH3ImagePipeline", True, 10, {}, None),
+        (None, True, 10, {}, None),
     ],
 )
 def test_model_default_follows_the_configured_model_and_device(
-    monkeypatch: pytest.MonkeyPatch, model: str | None, cuda: bool, major: int, expected: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+    cuda: bool,
+    major: int,
+    batching: dict[str, object],
+    expected: str | None,
 ) -> None:
     monkeypatch.setattr(platforms_mod, "current_omni_platform", _Platform(cuda=cuda, major=major))
-    config = OmniDiffusionConfig(model_class_name=model) if model is not None else None
+    config = OmniDiffusionConfig(model_class_name=model, **batching) if model is not None else None
     monkeypatch.setattr(config_mod, "get_current_diffusion_config_or_none", lambda: config)
     assert selector_mod._model_default_backend() == expected
 
