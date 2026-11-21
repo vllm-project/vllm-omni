@@ -157,6 +157,10 @@ and content endpoints return 404. A record may remain visible between its
 `expires_at` timestamp and the next sweep. If file deletion fails, its metadata
 is retained and deletion is retried on a later sweep.
 
+The sweeper expires an artifact using the object's `last_modified` timestamp when
+the storage backend exposes one, and otherwise falls back to reading `expires_at`
+from the job record.
+
 ## Examples
 
 ### Image-to-Video
@@ -683,6 +687,18 @@ stored:
 ```bash
 export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
+
+Two object families live under that root:
+
+```
+artifacts/{video_id}        # the generated video payload
+meta/{video_id}.json        # the job record (status, created_at, expires_at, ...)
+```
+
+Because the job record is persisted, `GET /v1/videos/{video_id}` and
+`GET /v1/videos` keep returning jobs after a server restart. Jobs that were still
+`queued`/`in_progress` when the previous process exited are reported as `failed`
+on startup, and any partially written artifact for them is removed.
 
 > `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
 > use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.

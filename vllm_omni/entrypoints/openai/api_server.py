@@ -510,6 +510,9 @@ async def omni_run_server_worker(
         # Start background processes
         await STORAGE_MANAGER.start(on_expire=VIDEO_STORE.remove_many)
         server_lifecycle.push_async_callback(STORAGE_MANAGER.stop)
+        # Fail jobs interrupted by a previous process: their persisted records
+        # would otherwise look like jobs that are still running.
+        await VIDEO_STORE.reconcile_orphans()
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
