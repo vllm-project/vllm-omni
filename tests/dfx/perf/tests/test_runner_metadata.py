@@ -949,6 +949,139 @@ def test_perf_sweep_collects_all_baseline_regressions(monkeypatch, pytestconfig)
 
 
 @pytest.mark.parametrize(
+    "ttfp_values,passes",
+    [
+        ([120.0, 105.0, 100.0], True),
+        ([120.0, 125.0, 105.0], False),
+    ],
+)
+def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, ttfp_values, passes):
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_confirm_h100_ttfp",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+    results = [
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": value,
+            "mean_audio_ttfp_ms": value,
+            "request_throughput": 1.0,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        }
+        for value in ttfp_values
+    ]
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [100.0],
+                    "mean_audio_ttfp_ms": [100.0],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = SimpleNamespace(getoption=lambda name: name == "assert_baseline")
+
+    if passes:
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+    else:
+        with pytest.raises(PerformanceBaselineRegressionError, match="confirmed_median_of=3"):
+            run_benchmark.test_performance_benchmark(
+                ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig
+            )
+
+    assert len(calls) == 3
+    assert all("--baseline-confirmation" not in call["args"] for call in calls)
+
+
+def test_perf_sweep_does_not_retry_a_hard_throughput_regression(monkeypatch):
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_hard_h100_regression",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 120.0,
+            "mean_audio_ttfp_ms": 120.0,
+            "request_throughput": 0.8,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        }
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [100.0],
+                    "mean_audio_ttfp_ms": [100.0],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = SimpleNamespace(getoption=lambda name: name == "assert_baseline")
+
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
     "warmups,message",
     [
         ([], "one value per sweep point"),

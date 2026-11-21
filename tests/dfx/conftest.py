@@ -31,6 +31,17 @@ _HIGHER_IS_BETTER_TOKENS = ("throughput", "qps", "fps")
 class PerformanceBaselineRegressionError(AssertionError):
     """One or more measured metrics exceeded their configured envelope."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_metrics: set[str] | frozenset[str] = frozenset(),
+        threshold_metrics: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
+        super().__init__(message)
+        self.failed_metrics = frozenset(failed_metrics)
+        self.threshold_metrics = frozenset(threshold_metrics)
+
 
 def metric_lower_is_better(name: str) -> bool:
     """Return whether a smaller measured value is the better one."""
@@ -117,27 +128,35 @@ def assert_baseline_within_tolerance(
         flush=True,
     )
     failures: list[str] = []
+    failed_metrics: set[str] = set()
+    threshold_metrics: set[str] = set()
     for name, expected in bucket.items():
         if isinstance(expected, (list, tuple)):
             failures.append(f"{name}: baseline is still a sweep list; resolve the sweep step before comparing")
+            failed_metrics.add(str(name))
             continue
         if not _is_finite_number(expected):
             failures.append(f"{name}: baseline {expected!r} is not a finite number")
+            failed_metrics.add(str(name))
             continue
         if expected < 0:
             failures.append(f"{name}: negative baseline {expected} is not supported")
+            failed_metrics.add(str(name))
             continue
         actual = measured.get(name)
         if not _is_finite_number(actual):
             failures.append(f"{name}: measured value {actual!r} is not a finite number")
+            failed_metrics.add(str(name))
             continue
         if actual < 0:
             failures.append(f"{name}: negative measured value {actual} is not supported")
+            failed_metrics.add(str(name))
             continue
         try:
             lower_is_better = metric_lower_is_better(str(name))
         except ValueError as exc:
             failures.append(str(exc))
+            failed_metrics.add(str(name))
             continue
         ratio = _worse_ratio(float(actual), float(expected), lower_is_better=lower_is_better)
         regressed = _regressed(ratio, tolerance)
@@ -158,9 +177,15 @@ def assert_baseline_within_tolerance(
             f"{name}: measured {actual} is more than {tolerance:.0%} {direction} "
             f"baseline {expected} on {hardware} (limit {limit})"
         )
+        failed_metrics.add(str(name))
+        threshold_metrics.add(str(name))
     if failures:
         logging.getLogger(__name__).error("[baseline-check] FAIL hardware=%s: %s", hardware, "; ".join(failures))
-        raise PerformanceBaselineRegressionError("performance baseline regression:\n" + "\n".join(failures))
+        raise PerformanceBaselineRegressionError(
+            "performance baseline regression:\n" + "\n".join(failures),
+            failed_metrics=failed_metrics,
+            threshold_metrics=threshold_metrics,
+        )
     print(f"[baseline-check] PASS hardware={hardware}: all {len(bucket)} metrics passed", flush=True)
 
 

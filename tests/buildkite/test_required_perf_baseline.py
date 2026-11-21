@@ -4,7 +4,6 @@
 """Execute DFX baseline logic on CPU without importing the serving runtime."""
 
 import ast
-import json
 import logging
 import math
 import typing
@@ -16,44 +15,6 @@ import pytest
 from tests.helpers.mark import get_hardware_mark_list
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_qwen3_tts_h100_throughput_gates_stable_metrics_only():
-    config = json.loads(Path("tests/dfx/perf/tests/test_tts.json").read_text(encoding="utf-8"))
-    qwen3_tts = {
-        case["test_name"]: case
-        for case in config
-        if case["test_name"]
-        in {
-            "test_qwen3_tts_base",
-            "test_qwen3_tts_customvoice",
-            "test_qwen3_tts_voicedesign",
-        }
-    }
-    assert set(qwen3_tts) == {
-        "test_qwen3_tts_base",
-        "test_qwen3_tts_customvoice",
-        "test_qwen3_tts_voicedesign",
-    }
-
-    stable_throughput_metrics = {
-        "median_audio_rtf",
-        "audio_throughput",
-        "request_throughput",
-        "mean_e2el_ms",
-        "mean_audio_rtf",
-    }
-    ttfp_metrics = {"median_audio_ttfp_ms", "mean_audio_ttfp_ms"}
-    for case in qwen3_tts.values():
-        for phase in case["benchmark_params"]:
-            h100 = phase.get("baseline", {}).get("H100")
-            if not isinstance(h100, dict):
-                continue
-            if phase.get("eval_phase") == "throughput":
-                assert stable_throughput_metrics <= set(h100)
-                assert ttfp_metrics.isdisjoint(h100)
-            elif phase.get("eval_phase") in {"latency", "stress"}:
-                assert ttfp_metrics <= set(h100)
 
 
 @pytest.fixture

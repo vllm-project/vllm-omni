@@ -4,9 +4,10 @@
 import json
 import math
 import os
+import statistics
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -872,7 +873,7 @@ def _assert_sweep_result(
     *,
     context: str,
     baseline_regressions: list[str],
-) -> None:
+) -> PerformanceBaselineRegressionError | None:
     try:
         assert_result(
             result,
@@ -887,6 +888,75 @@ def _assert_sweep_result(
             f"[baseline-check] DEFER {context}; continuing remaining sweeps to preserve diagnostic artifacts",
             flush=True,
         )
+        return exc
+    return None
+
+
+def _baseline_confirmation_policy(
+    params: Mapping[str, Any],
+    result: Mapping[str, Any],
+    regression: PerformanceBaselineRegressionError,
+) -> tuple[frozenset[str], int] | None:
+    """Return a confirmation policy for a pure threshold regression, if configured."""
+    policies = params.get("baseline_confirmation")
+    hardware = result.get("Hardware")
+    if not isinstance(policies, dict) or not isinstance(hardware, str):
+        return None
+    policy = policies.get(hardware)
+    if not isinstance(policy, dict):
+        return None
+    raw_metrics = policy.get("metrics")
+    attempts = policy.get("attempts", 3)
+    assert isinstance(raw_metrics, list) and raw_metrics and all(isinstance(metric, str) for metric in raw_metrics), (
+        f"baseline_confirmation[{hardware!r}].metrics must be a non-empty string list"
+    )
+    assert isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 2, (
+        f"baseline_confirmation[{hardware!r}].attempts must be an integer of at least 2"
+    )
+    metrics = frozenset(raw_metrics)
+    failed_metrics = regression.failed_metrics
+    if not failed_metrics or failed_metrics != regression.threshold_metrics or not failed_metrics <= metrics:
+        return None
+    return metrics, attempts
+
+
+def _without_confirmed_baseline_metrics(result: Mapping[str, Any], metrics: frozenset[str]) -> dict[str, Any]:
+    """Keep hard baseline checks active while confirmation-only metrics are repeated."""
+    filtered = dict(result)
+    baseline = result.get("baseline")
+    hardware = result.get("Hardware")
+    if not isinstance(baseline, dict) or not isinstance(hardware, str):
+        return filtered
+    bucket = baseline.get(hardware)
+    if not isinstance(bucket, dict):
+        return filtered
+    filtered["baseline"] = {
+        **baseline,
+        hardware: {name: expected for name, expected in bucket.items() if name not in metrics},
+    }
+    return filtered
+
+
+def _median_confirmation_result(results: Sequence[Mapping[str, Any]], metrics: frozenset[str]) -> dict[str, Any]:
+    """Replace confirmation metrics with their median across repeated sweep runs."""
+    assert len(results) >= 2
+    confirmed = dict(results[0])
+    for metric in sorted(metrics):
+        values = [result.get(metric) for result in results]
+        numeric_values = [
+            float(value)
+            for value in values
+            if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+        ]
+        if len(numeric_values) != len(values):
+            confirmed[metric] = math.nan
+            continue
+        confirmed[metric] = statistics.median(numeric_values)
+        print(
+            f"[baseline-check] CONFIRM {metric}: values={values} median={confirmed[metric]}",
+            flush=True,
+        )
+    return confirmed
 
 
 @pytest.mark.benchmark
@@ -957,6 +1027,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
     exclude_keys = {
         "request_rate",
         "baseline",
+        "baseline_confirmation",
         "num_prompts",
         "max_concurrency",
         "num_warmups",
@@ -1080,14 +1151,87 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
             )
             assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
             try:
-                _assert_sweep_result(
+                initial_regressions: list[str] = []
+                regression = _assert_sweep_result(
                     result,
                     assert_params,
                     num_prompt,
                     pytestconfig,
                     context=f"max_concurrency={concurrency!r} num_prompts={num_prompt}",
-                    baseline_regressions=baseline_regressions,
+                    baseline_regressions=initial_regressions,
                 )
+                if regression is None:
+                    continue
+                policy = _baseline_confirmation_policy(assert_params, result, regression)
+                if policy is None:
+                    baseline_regressions.extend(initial_regressions)
+                    continue
+                confirmation_metrics, attempts = policy
+                confirmation_results = [result]
+                hard_regression = False
+                for attempt in range(2, attempts + 1):
+                    print(
+                        f"[baseline-check] RETRY confirmation attempt {attempt}/{attempts} "
+                        f"for max_concurrency={concurrency!r}",
+                        flush=True,
+                    )
+                    retry_result = run_benchmark(
+                        args=args,
+                        test_name=test_name,
+                        flow=concurrency,
+                        dataset_name=dataset_name,
+                        num_prompt=num_prompt,
+                        baseline_config=params.get("baseline"),
+                        sweep_index=sweep_index,
+                        random_input_len=params.get("random_input_len"),
+                        random_output_len=params.get("random_output_len"),
+                        resource_label=resource_label,
+                        num_warmups=_resolve_num_warmups(
+                            params,
+                            default=max(2, int(concurrency)),
+                            sweep_index=sweep_index,
+                            sweep_size=len(max_concurrency_list),
+                        ),
+                        benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                        accuracy_baseline=accuracy_baseline,
+                    )
+                    confirmation_results.append(retry_result)
+                    retry_regressions: list[str] = []
+                    retry_regression = _assert_sweep_result(
+                        _without_confirmed_baseline_metrics(retry_result, confirmation_metrics),
+                        assert_params,
+                        num_prompt,
+                        pytestconfig,
+                        context=(
+                            f"max_concurrency={concurrency!r} num_prompts={num_prompt} confirmation_attempt={attempt}"
+                        ),
+                        baseline_regressions=retry_regressions,
+                    )
+                    if retry_regression is not None:
+                        baseline_regressions.extend(retry_regressions)
+                        hard_regression = True
+                        break
+                if hard_regression:
+                    continue
+                confirmed_regressions: list[str] = []
+                confirmed_regression = _assert_sweep_result(
+                    _median_confirmation_result(confirmation_results, confirmation_metrics),
+                    assert_params,
+                    num_prompt,
+                    pytestconfig,
+                    context=(
+                        f"max_concurrency={concurrency!r} num_prompts={num_prompt} confirmed_median_of={attempts}"
+                    ),
+                    baseline_regressions=confirmed_regressions,
+                )
+                if confirmed_regression is not None:
+                    baseline_regressions.extend(confirmed_regressions)
+                else:
+                    print(
+                        f"[baseline-check] PASS confirmed median across {attempts} runs "
+                        f"for max_concurrency={concurrency!r}",
+                        flush=True,
+                    )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
         if baseline_regressions:

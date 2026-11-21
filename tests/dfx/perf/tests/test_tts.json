@@ -130,6 +130,15 @@
         ],
         "seed_tts_locale": "en",
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline_confirmation": {
+          "H100": {
+            "metrics": [
+              "median_audio_ttfp_ms",
+              "mean_audio_ttfp_ms"
+            ],
+            "attempts": 3
+          }
+        },
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
@@ -169,6 +178,11 @@
             ]
           },
           "H100": {
+            "median_audio_ttfp_ms": [
+              130.2628,
+              74.8594,
+              596.889
+            ],
             "median_audio_rtf": [
               0.2057,
               0.1344,
@@ -188,6 +202,11 @@
               828.2049,
               667.4215,
               1579.9485
+            ],
+            "mean_audio_ttfp_ms": [
+              140.3161,
+              102.533,
+              629.0015
             ],
             "mean_audio_rtf": [
               0.1946,
@@ -378,6 +397,15 @@
           "task_type": "CustomVoice"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline_confirmation": {
+          "H100": {
+            "metrics": [
+              "median_audio_ttfp_ms",
+              "mean_audio_ttfp_ms"
+            ],
+            "attempts": 3
+          }
+        },
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
@@ -417,6 +445,11 @@
             ]
           },
           "H100": {
+            "median_audio_ttfp_ms": [
+              29.6018,
+              33.5364,
+              129.2319
+            ],
             "median_audio_rtf": [
               0.1034,
               0.1212,
@@ -436,6 +469,11 @@
               581.5505,
               678.9494,
               1480.2301
+            ],
+            "mean_audio_ttfp_ms": [
+              32.2869,
+              39.5704,
+              140.4855
             ],
             "mean_audio_rtf": [
               0.1033,
@@ -661,6 +699,15 @@
           "language": "English"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline_confirmation": {
+          "H100": {
+            "metrics": [
+              "median_audio_ttfp_ms",
+              "mean_audio_ttfp_ms"
+            ],
+            "attempts": 3
+          }
+        },
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
@@ -700,6 +747,11 @@
             ]
           },
           "H100": {
+            "median_audio_ttfp_ms": [
+              33.4549,
+              36.392,
+              114.5276
+            ],
             "median_audio_rtf": [
               0.1122,
               0.134,
@@ -719,6 +771,11 @@
               505.5975,
               591.5199,
               1183.4333
+            ],
+            "mean_audio_ttfp_ms": [
+              37.131,
+              43.8621,
+              143.9237
             ],
             "mean_audio_rtf": [
               0.1119,
