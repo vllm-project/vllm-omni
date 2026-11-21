@@ -38,3 +38,27 @@ def test_constructor_rejects_teacache_before_model_download(mocker, cache_config
         MingImagePipeline(od_config=od_config)
 
     download_weights.assert_not_called()
+
+
+def test_ming_image_postprocess_defaults_when_vae_config_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Ming's Flux-format VAE config is optional: a missing file must fall
+    back to the default scale factor instead of failing fast."""
+
+    class FakeImageProcessor:
+        def __init__(self, *, vae_scale_factor: int, **kwargs) -> None:
+            FakeImageProcessor.captured = vae_scale_factor
+
+        def postprocess(self, images):
+            return images
+
+    import vllm_omni.diffusion.models.ming_flash_omni.pipeline_ming_imagegen as ming
+
+    monkeypatch.setattr(ming, "VaeImageProcessor", FakeImageProcessor)
+    postprocess = ming.get_ming_image_post_process_func(OmniDiffusionConfig(model=str(tmp_path), output_type="pil"))
+    import torch
+
+    postprocess(torch.zeros(1, 3, 4, 4))
+    assert FakeImageProcessor.captured == 16  # default 8, doubled by the factory
