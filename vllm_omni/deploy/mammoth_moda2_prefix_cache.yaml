@@ -1,0 +1,12 @@
+# MammothModa2 AR→DiT with opt-in automatic prefix caching.
+#
+# Prefix-cache hits preserve token/hidden alignment, but BF16 attention can
+# produce non-bitwise-equivalent tail hidden states. See the prefix caching
+# design document for the numerical-equivalence contract.
+
+base_config: mammoth_moda2.yaml
+pipeline: mammoth_moda2
+
+stages:
+  - stage_id: 0
+    enable_prefix_caching: true
