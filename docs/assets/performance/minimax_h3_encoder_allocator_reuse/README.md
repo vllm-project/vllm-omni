@@ -27,3 +27,5 @@ Recalculate public metrics and memory-policy gates using Python standard library
 ```bash
 python reproduce_cache.py.txt cache-results.json
 ```
+
+Apply the archived production patch to the recorded baseline with `git apply --unidiff-zero code-fix.patch.txt`. Its zero-context format preserves the exact code change without whitespace-only context lines.
