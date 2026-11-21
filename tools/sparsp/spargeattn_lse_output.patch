@@ -1,0 +1,129 @@
+diff --git a/csrc/qattn/attn_cuda.h b/csrc/qattn/attn_cuda.h
+index 7be002..d898d7f 100644
+--- a/csrc/qattn/attn_cuda.h
++++ b/csrc/qattn/attn_cuda.h
+@@ -47 +47 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
+-                    int return_lse);
++                    torch::Tensor lse);
+@@ -130 +130 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f8_accum_f32_block_sparse_att
+-    int return_lse);
+\ No newline at end of file
++    int return_lse);
+diff --git a/csrc/qattn/pybind.cpp b/csrc/qattn/pybind.cpp
+index d54667b..d5cc612 100644
+--- a/csrc/qattn/pybind.cpp
++++ b/csrc/qattn/pybind.cpp
+@@ -21,0 +22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
++  m.attr("sparsp_lse_current_stream") = 1;
+@@ -23,14 +24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+-  m.def("qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf", &qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf);
+-
+-  m.def("qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale", &qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale);
+-  m.def("qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold", &qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold);
+-
+-#ifdef SAGE2PP_ENABLED
+-  m.def("qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold", &qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold);
+-#endif
+-
+-#ifdef HAS_SM90
+-  m.def("qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90", &qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90);
+-  m.def("qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90", &qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90);
+-#endif
+-}
+\ No newline at end of file
++}
+diff --git a/csrc/qattn/qk_int_sv_f16_cuda_sm80.cu b/csrc/qattn/qk_int_sv_f16_cuda_sm80.cu
+index 6fdb647..c96021f 100644
+--- a/csrc/qattn/qk_int_sv_f16_cuda_sm80.cu
++++ b/csrc/qattn/qk_int_sv_f16_cuda_sm80.cu
+@@ -213 +213 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
+-                    int return_lse)
++                    torch::Tensor lse)
+@@ -223,0 +224 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
++  CHECK_CUDA(lse);
+@@ -233,0 +235 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
++  CHECK_CONTIGUOUS(lse);
+@@ -242,0 +245 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
++  CHECK_DTYPE(lse, at::ScalarType::Float);
+@@ -252,0 +256 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
++  CHECK_DIMS(lse, 3);
+@@ -321,4 +325,2 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
+-  torch::Tensor lse = torch::empty({0});
+-  if (return_lse) {
+-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
+-  }
++  CHECK_SHAPE(lse, batch_size, num_qo_heads, qo_len);
++  constexpr int return_lse = 1;
+@@ -392 +394 @@ std::pair<torch::Tensor, torch::Tensor> qk_int8_sv_f16_accum_f16_block_sparse_at
+-}
+\ No newline at end of file
++}
+diff --git a/csrc/qattn/qk_int_sv_f16_cuda_sm80.cuh b/csrc/qattn/qk_int_sv_f16_cuda_sm80.cuh
+index 4a393a6..b3ebdcd 100644
+--- a/csrc/qattn/qk_int_sv_f16_cuda_sm80.cuh
++++ b/csrc/qattn/qk_int_sv_f16_cuda_sm80.cuh
+@@ -17,0 +18 @@
++#include <ATen/cuda/CUDAContext.h>
+@@ -680 +681 @@ __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, i
+-      lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k]);
++      lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k]) * math::log2e_recp;
+@@ -711 +712 @@ void SpargeAttentionSM80Dispatched(
+-  kernel_func<<<grid, block, smem_max>>>(
++  kernel_func<<<grid, block, smem_max, at::cuda::getCurrentCUDAStream()>>>(
+@@ -731 +732 @@ void SpargeAttentionSM80Dispatched(
+-}
+\ No newline at end of file
++}
+diff --git a/setup.py b/setup.py
+index 3e6b13b..4fb6af7 100644
+--- a/setup.py
++++ b/setup.py
+@@ -52 +52 @@ def get_instantiations(src_dir: str):
+-SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0"}
++SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0", "12.0"}
+@@ -55 +55 @@ SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0"}
+-CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
++CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-DENABLE_BF16"]
+@@ -58 +57,0 @@ NVCC_FLAGS = [
+-    "-std=c++17",
+@@ -65 +64,0 @@ NVCC_FLAGS = [
+-    "-Xcompiler", "-include,cassert", # fix error occurs when compiling for SM90+ with newer CUDA toolkits
+@@ -173,2 +171,0 @@ run_instantiations("csrc/qattn/instantiations_sm80")
+-run_instantiations("csrc/qattn/instantiations_sm89")
+-run_instantiations("csrc/qattn/instantiations_sm90")
+@@ -179,6 +176 @@ sources = [
+-    "csrc/qattn/qk_int_sv_f8_cuda_sm89.cu",
+-] + get_instantiations("csrc/qattn/instantiations_sm80") + get_instantiations("csrc/qattn/instantiations_sm89")
+-
+-if HAS_SM90:
+-    sources += ["csrc/qattn/qk_int_sv_f8_cuda_sm90.cu", ]
+-    sources += get_instantiations("csrc/qattn/instantiations_sm90")
++] + get_instantiations("csrc/qattn/instantiations_sm80")
+@@ -187 +179 @@ qattn_extension = CUDAExtension(
+-    name="spas_sage_attn._qattn",
++    name="spas_sparsp._qattn",
+@@ -198 +190 @@ fused_extension = CUDAExtension(
+-    name="spas_sage_attn._fused",
++    name="spas_sparsp._fused",
+@@ -207 +199 @@ ext_modules.append(fused_extension)
+-setup(
++metadata = dict(
+@@ -232,0 +225,5 @@ setup(
++
++# Keep this experimental provider isolated from the stock distribution.
++metadata.update(name="spas_sparsp", packages=["spas_sparsp"],
++                package_dir={"spas_sparsp": "spas_sage_attn"})
++setup(**metadata)
+diff --git a/spas_sage_attn/__init__.py b/spas_sage_attn/__init__.py
+index a5949df..2a0893a 100644
+--- a/spas_sage_attn/__init__.py
++++ b/spas_sage_attn/__init__.py
+@@ -1,7 +1 @@
+-from .core import (
+-    spas_sage_attn_meansim_cuda,
+-    spas_sage2_attn_meansim_cuda,
+-    block_sparse_sage2_attn_cuda,
+-    spas_sage_attn_meansim_topk_cuda,
+-    spas_sage2_attn_meansim_topk_cuda
+-)
++"""Isolated SparSP native provider; stock spas_sage_attn remains unchanged."""

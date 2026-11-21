@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -5,7 +8,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -14,6 +17,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.sparsp.config import SparSPSpec
+    from vllm_omni.diffusion.attention.sparsp.executor import SparseRingExecutor
 
 logger = init_logger(__name__)
 
@@ -1036,6 +1043,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
+        self.sparsp_executors: dict[tuple[int, int, SparSPSpec], SparseRingExecutor] = {}
         self.allgather_group = allgather_group
 
         self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
@@ -1046,6 +1054,9 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.allgather_rank = torch.distributed.get_rank(self.allgather_group)
 
     def destroy(self):
+        for executor in self.sparsp_executors.values():
+            executor.close()
+        self.sparsp_executors.clear()
         groups = [self.ulysses_group, self.ring_group, self.allgather_group]
         seen = {id(self.device_group), id(self.cpu_group)}
         for group in groups:
