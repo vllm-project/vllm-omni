@@ -122,20 +122,85 @@ steps:
           # runner cache and no A3 MOS baseline exists yet, so the test skips the
           # MOS floor on NPU. Re-enable both once the asset is cached.
           - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and npu and A3" --run-level full_model
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Default Seed-TTS Accuracy and Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
-        key: nightly-omni-performance-minicpmo-4-5-npu
-        timeout_in_minutes: 180
+        key: nightly-omni-minicpmo-4-5-npu-default-seed-tts
+        timeout_in_minutes: 240
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_UTMOS_EVAL=0
+          - export SEED_TTS_EVAL_DEVICE=npu:1
+          - export SEED_TTS_SIM_DEVICE=npu:1
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+              -k test_minicpmo_4_5_npu_default \
+              -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Duplex Omni-DuplexEval Accuracy and Perf Test"
+        source_file_dependencies: omni_duplex_eval_ci
+        key: nightly-omni-minicpmo-4-5-npu-async-duplex-eval
+        timeout_in_minutes: 240
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/*.json
+        commands:
+          # The wheel bundles the CPU VAD weights used when the ONNX cache is empty.
+          - >-
+            python3 -m pip install --no-deps silero-vad==6.2.3
+            --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+            --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json \
+              -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Prefix Seed-TTS Accuracy and Perf Test"
+        source_file_dependencies: omni_minicpmo_4_5_perf
+        key: nightly-omni-minicpmo-4-5-npu-async-prefix
+        timeout_in_minutes: 360
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_UTMOS_EVAL=0
+          - export SEED_TTS_EVAL_DEVICE=npu:1
+          - export SEED_TTS_SIM_DEVICE=npu:1
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+              -k test_minicpmo_4_5_npu_async_prefix \
+              -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -161,24 +226,6 @@ steps:
                 -m "full_model and omni and npu and A3 and cards_2" \
                 --run-level full_model 2>&1 | tee "$$BENCHMARK_DIR/pytest.log"
             '
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test (A2)"
-        source_file_dependencies: omni_minicpmo_4_5_perf
-        key: nightly-omni-performance-minicpmo-4-5-npu-a2
-        timeout_in_minutes: 180
-        mirror_hardwares: a2b3_npu_1
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          HF_TOKEN: "${HF_TOKEN}"
-          HF_HUB_OFFLINE: "1"
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m "npu and A2" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
     depends_on: upload-nightly-pipeline

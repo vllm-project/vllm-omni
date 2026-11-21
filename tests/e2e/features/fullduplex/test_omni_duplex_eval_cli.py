@@ -514,14 +514,19 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
 async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detection, duration, audio_duration, fps):
     import websockets
 
+    from tests.benchmarks.duplex.test_omni_duplex_eval_media import _make_synthetic_mp4
     from vllm_omni.protocol.realtime.items import validate_realtime_video_frames
 
     pcm = b"\x01\x00" * round(audio_duration * 16000)
-    # Keep the real frame-time generator; only JPEG decoding is replaced here.
-    monkeypatch.setattr(
-        media, "extract_jpeg", lambda path, *, timestamp, quality: b"\xff\xd8" + str(timestamp).encode()
+    # Keep the real timestamp grid. iter_jpegs opens the container (it no longer
+    # calls extract_jpeg), so the clip must exist. JPEG bytes stay timestamp-tagged
+    # so each sample remains unique on the wire.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(_make_synthetic_mp4(duration=duration + 1.0))
+    frames = tuple(
+        (timestamp, b"\xff\xd8" + str(timestamp).encode())
+        for timestamp, _ in media.iter_jpegs(clip, fps=fps, duration=duration)
     )
-    frames = tuple(media.iter_jpegs("unused.mp4", fps=fps, duration=duration))
     prepared = runner.PreparedSample(pcm, frames, duration, None, None)
     received = []
     server_turns = turn_detection == "server_vad"
