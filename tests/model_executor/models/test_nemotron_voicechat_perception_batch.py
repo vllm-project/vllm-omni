@@ -5,6 +5,7 @@
 
 import base64
 import copy
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
     NemotronVoiceChatThinkerForConditionalGeneration,
     slice_perception_streaming_mel,
 )
+from vllm_omni.model_executor.models.nemotron_voicechat.perception_cudagraph import perception_step
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 DEVICE = torch.device("cpu")
@@ -35,6 +37,7 @@ def thinker():
         )
         nn.Module.__init__(model)
         model._dtype = torch.float32
+        model._perception_graph = None
         model._hidden = 16
         model._sessions = {}
         model._duplex_previous_text_tokens = {}
@@ -159,6 +162,43 @@ def test_frames_and_caches_match_independent_full_history(thinker, batch):
         assert all(s["duplex_audio"].numel() < 4 * 16000 for s in sessions)
         for key in CACHE_KEYS:
             assert len({s[key].untyped_storage().data_ptr() for s in sessions}) == batch
+
+
+@pytest.mark.parametrize("batches", [(1, 2, 1), (2, 1, 2)])
+def test_batch_hook_routes_perception_graph_across_batch_sizes(thinker, batches):
+    requests = ["a", "b"]
+    buffer = {request: {"duplex": append(row, 1)} for row, request in enumerate(requests)}
+    thinker.preprocess_batch(req_ids=requests, model_intermediate_buffer=buffer, device=DEVICE)
+    references: list[dict[str, Any]] = [{}, {}]
+    for row in range(2):
+        serial_reference(thinker, references[row], row, 1)
+    calls = []
+
+    def run(mel, caches, drop):
+        calls.append((mel.shape[0], drop))
+        return perception_step(thinker.perception, mel, caches, drop)
+
+    thinker._perception_graph = SimpleNamespace(run=run)
+    for batch in batches:
+        rows = range(batch)
+        buffer = {
+            requests[row]: {"duplex": append(row, thinker._sessions[requests[row]]["last_input_seq"] + 1)}
+            for row in rows
+        }
+        thinker.preprocess_batch(req_ids=list(buffer), model_intermediate_buffer=buffer, device=DEVICE)
+        for row in rows:
+            state = thinker._sessions[requests[row]]
+            expected = serial_reference(thinker, references[row], row, state["last_input_seq"])
+            torch.testing.assert_close(state["duplex_frame"], expected, atol=5e-6, rtol=3e-5)
+            for key, cache in zip(CACHE_KEYS, references[row]["caches"]):
+                torch.testing.assert_close(state[key], cache, atol=5e-6, rtol=3e-5)
+    drop = thinker.perception.encoder.streaming_cfg.drop_extra_pre_encoded
+    assert calls == [(batch, drop) for batch in batches]
+    for key in CACHE_KEYS:
+        assert (
+            thinker._sessions["a"][key].untyped_storage().data_ptr()
+            != thinker._sessions["b"][key].untyped_storage().data_ptr()
+        )
 
 
 @pytest.mark.parametrize("repeat_session_metadata", [True, False])
@@ -346,6 +386,7 @@ def test_duplicate_request_does_not_publish_a_session(thinker):
     assert not thinker._sessions
 
 
+@pytest.mark.parametrize("use_graph", [False, True])
 @pytest.mark.parametrize(
     ("fault", "error", "message"),
     [
@@ -353,7 +394,13 @@ def test_duplicate_request_does_not_publish_a_session(thinker):
         ("oom", torch.OutOfMemoryError, "injected second encoder group failure"),
     ],
 )
-def test_later_encoder_group_failure_preserves_sessions_for_retry(thinker, monkeypatch, fault, error, message):
+def test_later_encoder_group_failure_preserves_sessions_for_retry(
+    thinker, monkeypatch, fault, error, message, use_graph
+):
+    if use_graph:
+        thinker._perception_graph = SimpleNamespace(
+            run=lambda mel, caches, drop: perception_step(thinker.perception, mel, caches, drop)
+        )
     thinker.preprocess_batch(
         req_ids=["old"], model_intermediate_buffer={"old": {"duplex": append(0, 1)}}, device=DEVICE
     )
