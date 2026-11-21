@@ -159,3 +159,69 @@ def test_flashinfer_real_init_selects_fa2_on_sm80():
     )
 
     assert impl.flashinfer_backend == "fa2"
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("backend", "dtype_qk", "dtype_vo"),
+    [
+        ("fa2", None, torch.float8_e4m3fn),
+        ("fa3", None, torch.float8_e4m3fn),
+        # An unset dtype follows the BF16 inputs, so FP16 Q/K also mismatch V.
+        ("fa2", torch.float16, None),
+    ],
+)
+def test_mixed_kv_dtype_is_rejected_before_quantizing(monkeypatch, backend, dtype_qk, dtype_vo):
+    # plan() takes one kv_data_type; these kernels would read V as K's dtype.
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    impl = _impl()
+    impl.device = torch.device("cpu")
+    impl.flashinfer_backend = backend
+    impl.dtype_qk = dtype_qk
+    impl.dtype_vo = dtype_vo
+    impl._per_tensor_quantize = lambda *args, **kwargs: pytest.fail("quantized before the dtype check")
+    query = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="same dtype"):
+        impl.forward_cuda(query, query, query, None)
+
+
+@pytest.mark.cpu
+def test_cute_dsl_still_runs_qk16_v8(monkeypatch):
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    impl = _impl()
+    impl.device = torch.device("cpu")
+    impl.flashinfer_backend = "cute-dsl"
+    impl.dtype_vo = torch.float8_e4m3fn
+    impl._ensure_plan = lambda *args, **kwargs: None
+    seen = []
+
+    def run_wrapper(q, k, v, q_scale, k_scale, v_scale):
+        seen.append((k.dtype, v.dtype))
+        return torch.zeros_like(q)
+
+    impl._run_wrapper = run_wrapper
+    query = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+
+    out = impl.forward_cuda(query, query, query, None)
+
+    assert seen == [(torch.bfloat16, torch.float8_e4m3fn)]
+    assert out.shape == query.shape
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_flashinfer_real_init_rejects_qk16_v8_off_cute_dsl():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for real FlashInfer initialization")
+    if not flashinfer_attn.HAS_FLASHINFER:
+        pytest.skip("FlashInfer is not installed")
+    if FlashInferAttentionImpl._select_backend("auto") == "cute-dsl":
+        pytest.skip("cute-dsl accepts a V dtype different from K")
+
+    with pytest.raises(ValueError, match="same dtype"):
+        FlashInferAttentionImpl(
+            num_heads=2,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            backend_kwargs={"quant": {"dtype_qk": "bfloat16", "dtype_vo": "fp8_e4m3"}},
+        )
