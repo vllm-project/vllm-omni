@@ -82,3 +82,32 @@ def test_correct_transcript_does_not_hide_protocol_failure(failure: str) -> None
     assert report["missing_scenes"] == []
     assert report["protocol_errors"]
     assert not report["passed"]
+
+
+@pytest.mark.parametrize("unrelated_error_index", [None, 0, 6, 8])
+def test_replay_refusals_are_scoped_to_each_forced_commit(unrelated_error_index):
+    refusal: dict[str, object] = {"type": "error", "error": {"code": "response_create_without_input"}}
+    events: list[dict[str, object]] = [
+        {"type": "session.created"},
+        {"type": "response.created", "response": {"id": "one"}},
+        {"type": "response.output_audio.delta", "delta": "AAAA"},
+        {"type": "input_audio_buffer.committed"},
+        {"type": "response.done", "response": {"id": "one", "status": "completed"}},
+        refusal,
+        {"type": "input_audio_buffer.append"},
+        {"type": "input_audio_buffer.committed"},
+        refusal,
+        {"type": "session.closed"},
+    ]
+    if unrelated_error_index is not None:
+        events[unrelated_error_index] = (
+            refusal if unrelated_error_index != 8 else {"type": "error", "error": {"code": "internal_error"}}
+        )
+    report = evaluate_session(
+        _recordings()["omni_final_clean"]["transcript"],
+        events,
+        load_manifest()["scenes"],
+        forced_response_windows=[(3, 6), (7, 9)],
+    )
+    assert report["passed"] is (unrelated_error_index is None)
+    assert bool(report["protocol_errors"]) is (unrelated_error_index is not None)

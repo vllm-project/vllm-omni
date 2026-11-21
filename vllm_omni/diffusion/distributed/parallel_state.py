@@ -63,6 +63,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _HSDP_REPLICATE: GroupCoordinator | None = None  # HSDP replica dimension
+_TEXT_ENCODER_TP: GroupCoordinator | None = None  # generic HF text-encoder TP
 
 # Rank-layout metadata for expert parallelism. This is not a process group;
 # it is reused by platform-specific runtimes that must build companion groups
@@ -380,6 +381,50 @@ def is_dp_last_group():
 
 
 # * SET
+
+
+def get_text_encoder_tp_group(tp_size: int) -> GroupCoordinator:
+    """Return the text-encoder tensor-parallel group, creating it on first use.
+
+    The groups tile each data-parallel replica into consecutive blocks of
+    ``tp_size`` ranks (``[0..n-1], [n..2n-1], ...``), so every rank belongs to
+    exactly one group and gets the full encoder output without a broadcast.
+    Groups never span replicas: different DP replicas encode different
+    requests, and a shared all-reduce would mix their activations.  Creation
+    is a collective: every world rank must call this with the same ``tp_size``.
+    """
+    global _TEXT_ENCODER_TP
+    if _TEXT_ENCODER_TP is not None:
+        if _TEXT_ENCODER_TP.world_size != tp_size:
+            raise ValueError(
+                f"text encoder TP group already initialized with size {_TEXT_ENCODER_TP.world_size}, got {tp_size}"
+            )
+        return _TEXT_ENCODER_TP
+    world = get_world_group()
+    dp_size = _DP.world_size if _DP is not None else 1
+    replica_size = world.world_size // dp_size
+    if tp_size < 1 or replica_size % tp_size != 0:
+        raise ValueError(
+            f"text_encoder_tp_size ({tp_size}) must evenly divide the ranks of one data-parallel replica "
+            f"({replica_size} = world size {world.world_size} / data_parallel_size {dp_size})"
+        )
+    # DP is the outermost rank dimension ("tp-sp-pp-cfg-dp"), so replica r owns
+    # world ranks [r * replica_size, (r + 1) * replica_size) and tiles of a
+    # divisor of replica_size stay inside one replica.  Check that layout.
+    if _DP is not None and dp_size > 1:
+        expected_dp_ranks = world.ranks[world.rank_in_group % replica_size :: replica_size]
+        if list(_DP.ranks) != expected_dp_ranks:
+            raise RuntimeError(
+                f"text encoder TP expects DP-outermost rank layout; DP group {_DP.ranks} != {expected_dp_ranks}"
+            )
+    group_ranks = [world.ranks[i : i + tp_size] for i in range(0, world.world_size, tp_size)]
+    _TEXT_ENCODER_TP = init_model_parallel_group(
+        group_ranks=group_ranks,
+        local_rank=world.local_rank,
+        backend=torch.distributed.get_backend(world.device_group),
+        parallel_mode="tensor",
+    )
+    return _TEXT_ENCODER_TP
 
 
 def init_world_group(ranks: list[int], local_rank: int, backend: str) -> GroupCoordinator:
@@ -817,6 +862,7 @@ def _initialize_model_parallel(
     fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
+    hsdp_data_parallel: bool = False,
     backend: str | None = None,
 ) -> None:
     global _FS, _HSDP_REPLICATE
@@ -899,18 +945,33 @@ def _initialize_model_parallel(
     non_dp_size = cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     if world_size % non_dp_size != 0:
         raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
+    if hsdp_data_parallel and not use_hsdp:
+        raise ValueError("hsdp_data_parallel requires use_hsdp=True")
     if use_hsdp:
-        if data_parallel_size not in (None, 1):
-            raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
-        if non_dp_size not in (1, world_size):
-            raise ValueError(f"HSDP non-DP parallel size must be 1 or WORLD size ({world_size}), but got {non_dp_size}")
+        if hsdp_data_parallel:
+            if non_dp_size != 1:
+                raise ValueError(
+                    "HSDP data-parallel requests require tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
+            if data_parallel_size not in (None, 1, world_size):
+                raise ValueError(
+                    f"HSDP data-parallel request size must be WORLD size ({world_size}), but got {data_parallel_size}"
+                )
+            data_parallel_size = world_size
+        else:
+            if data_parallel_size not in (None, 1):
+                raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
+            if non_dp_size not in (1, world_size):
+                raise ValueError(
+                    f"HSDP non-DP parallel size must be 1 or WORLD size ({world_size}), but got {non_dp_size}"
+                )
+            data_parallel_size = 1
         if fully_shard_degree <= 0:
             raise ValueError(f"fully_shard_degree must be positive, got {fully_shard_degree}")
         if world_size % fully_shard_degree != 0:
             raise ValueError(
                 f"WORLD size ({world_size}) must be divisible by fully_shard_degree ({fully_shard_degree})"
             )
-        data_parallel_size = 1
     else:
         inferred_data_parallel_size = world_size // non_dp_size
         if data_parallel_size is not None and data_parallel_size != inferred_data_parallel_size:
@@ -930,7 +991,7 @@ def _initialize_model_parallel(
     )
 
     def get_rank_groups(token: str) -> list[list[int]]:
-        if use_hsdp and non_dp_size == 1:
+        if use_hsdp and not hsdp_data_parallel and non_dp_size == 1:
             return [[rank] for rank in range(world_size)]
         return rank_generator.get_ranks(token)
 
@@ -950,7 +1011,23 @@ def _initialize_model_parallel(
         backend=backend,
         parallel_mode="data",
     )
-    vllm_parallel_state._DP = _DP
+    if hsdp_data_parallel:
+        # Omni uses the all-rank DP group above to select a different request
+        # on each HSDP rank. vLLM model layers must see singleton DP groups so
+        # they construct full, unpartitioned parameters for HSDP to shard.
+        vllm_parallel_state._DP = init_model_parallel_group(
+            group_ranks=[[rank] for rank in range(world_size)],
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="data",
+        )
+        if get_world_group().rank_in_group == 0:
+            logger.info(
+                "HSDP rank-local requests: Omni request DP size=%d, vLLM model-layout DP size=1",
+                world_size,
+            )
+    else:
+        vllm_parallel_state._DP = _DP
 
     global _CFG
     assert _CFG is None, "classifier_free_guidance group is already initialized"
@@ -1078,6 +1155,7 @@ def initialize_model_parallel(
     fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
+    hsdp_data_parallel: bool = False,
     backend: str | None = None,
 ) -> None:
     """Atomically initialize diffusion parallel groups.
@@ -1116,6 +1194,7 @@ def initialize_model_parallel(
             fully_shard_degree=fully_shard_degree,
             enable_expert_parallel=enable_expert_parallel,
             use_hsdp=use_hsdp,
+            hsdp_data_parallel=hsdp_data_parallel,
             backend=backend,
         )
     except BaseException:
@@ -1125,7 +1204,7 @@ def initialize_model_parallel(
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
+    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _TEXT_ENCODER_TP, _EXPERT_PARALLEL_GROUP_RANKS
 
     # The optional fused transport owns collective symmetric allocations.
     # Release them while all process groups are still alive, without importing
@@ -1149,6 +1228,10 @@ def destroy_model_parallel():
     if _HSDP_REPLICATE:
         _HSDP_REPLICATE.destroy()
     _HSDP_REPLICATE = None
+
+    if _TEXT_ENCODER_TP:
+        _TEXT_ENCODER_TP.destroy()
+    _TEXT_ENCODER_TP = None
 
     if _CFG:
         _CFG.destroy()

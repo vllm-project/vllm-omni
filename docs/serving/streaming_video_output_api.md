@@ -29,6 +29,71 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
   --output output.mp4
 ```
 
+## Startup Warmup
+
+Use `--video-output-warmup REQUEST_JSON` to complete a short generation and
+fragmented-MP4 encode before the HTTP server starts. This moves first-request
+initialization into startup: `/health` and user routes become available only
+after the warmup succeeds. It increases startup time and does not promise higher
+steady-state generation throughput. The option is disabled when omitted.
+
+The JSON file uses the `session.start` fields below. Supply an explicit
+`num_frames` (preferably one native generation chunk), the deployment's output
+dimensions, and any model-required image or camera inputs. Omit playback pacing:
+the internal consumer drains output immediately and has no player to send
+feedback. Model sampling defaults are inherited unless the request overrides
+them. Use a synthetic image and prompt rather than private user content.
+
+For example, create a one-chunk request for the LingBot-World stepwise deployment:
+
+```python
+import json
+from io import BytesIO
+from pathlib import Path
+
+import pybase64
+from PIL import Image
+
+# Match ar_diffusion_width/height in the deployment configuration.
+width, height = 832, 480
+image = Image.new("RGB", (width, height), (80, 120, 160))
+image.paste((160, 120, 80), (width // 2, 0, width, height))
+buffer = BytesIO()
+image.save(buffer, format="PNG")
+request = {
+    "type": "session.start",
+    "prompt": "A quiet landscape in daylight.",
+    "image_reference": {
+        "image_url": "data:image/png;base64," + pybase64.b64encode(buffer.getvalue()).decode("ascii")
+    },
+    "width": width,
+    "height": height,
+    "num_frames": 9,
+    "fps": 12,
+    "seed": 42,
+    "extra_params": {"camera_action_script": [[["w"], ["w"], ["w"]]]},
+}
+Path("video-warmup.json").write_text(json.dumps(request), encoding="utf-8")
+```
+
+Then add the warmup file to the server command:
+
+```bash
+vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers --omni \
+  --deploy-config vllm_omni/deploy/lingbot_world_v2_stepwise.yaml \
+  --disable-websocket-compression \
+  --video-output-warmup video-warmup.json \
+  --video-output-warmup-timeout 180
+```
+
+The generation/encoding deadline defaults to 180 seconds and must be finite and
+positive. Invalid requests, missing encoded video, generation errors, and
+timeouts fail startup instead of advertising readiness. Failure cleanup also
+uses the normal bounded request-abort timeout. Adjust the deployment's startup
+probe budget to include model loading and warmup. The warmup exercises generation
+and the encoder directly; it does not open a WebSocket or warm network transport.
+One request warms the selected execution path, not every shape, LoRA or replica.
+
 ## Client Frame Diagnostics
 
 The generic streaming client counts decoded frames on a background worker so
@@ -213,10 +278,11 @@ Models that implement interaction updates can change the active prompt:
 }
 ```
 
-Models that register the camera modality (for example LingBot-World) also
-accept structural SE3 payloads on `event.multi_modal_data.camera`. Coordinates
-follow Unity semantics (`+X` right, `+Y` up, `+Z` forward; same as LingBot's
-native camera frame). WASD key tokens are not admitted by the engine:
+Models that register the camera modality also accept camera updates on
+`event.multi_modal_data.camera`; the payload is model-specific. LingBot-World
+takes structural SE3 payloads. Coordinates follow Unity semantics (`+X` right,
+`+Y` up, `+Z` forward; same as LingBot's native camera frame), and WASD key
+tokens are not admitted:
 
 ```json
 {
@@ -242,6 +308,10 @@ native camera frame). WASD key tokens are not admitted by the engine:
 `velocity` (hold a per-frame SE3 delta until replaced). Prompt and camera may
 be combined in one interaction event.
 
+ABot-World instead conditions on W/A/S/D/I/J/K/L key actions, sent in `state`
+or `script` mode, and registers only the camera modality; see the
+[ABot-World recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md#realtime-serving).
+
 The example client's `--prompt-updates` and `--camera-updates` schedules assign
 a distinct `event_id` to each entry within the session, including entries with
 equal timestamps or timestamps less than a millisecond apart. These IDs are
@@ -250,6 +320,12 @@ continues to reject repeated IDs with `event_id_conflict`.
 
 This feature is pipeline-dependent. An enabled endpoint does not imply that
 the loaded model supports midway prompt or camera updates.
+
+`session.interaction.queued` confirms only that the server accepted the
+message. If the model rejects the interaction later, for example because the
+modality is unsupported or the payload is invalid, the server sends an `error`
+with `"code": "interaction_failed"` and the same `event_id`. Generation keeps
+streaming, and the `event_id` may be reused.
 
 The default start timeout is 10 seconds and the server reports a stall after
 about 60 seconds without generation progress or a `session.ping`. See the

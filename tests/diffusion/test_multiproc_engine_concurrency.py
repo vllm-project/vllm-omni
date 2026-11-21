@@ -20,7 +20,7 @@ import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
@@ -91,7 +91,7 @@ def _make_engine(num_gpus: int = 1):
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(streaming_output=False)
     sched = RequestScheduler()
-    sched.initialize(SimpleNamespace())
+    sched.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
     engine.scheduler = sched
     engine.executor = executor
     engine._rpc_lock = threading.RLock()
@@ -320,6 +320,25 @@ class TestRequestModeDispatch:
         result = executor.execute_batch(scheduler_output)
 
         assert result == "dlo-dp"
+        executor.execute_request.assert_called_once_with(scheduler_output)
+        executor.collective_rpc.assert_not_called()
+
+    def test_hsdp_dp_routes_multiple_requests_without_pipeline_batching(self):
+        executor, _, _ = _make_executor(num_gpus=8)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=8,
+                hsdp_data_parallel=True,
+            ),
+        )
+        executor.execute_request = Mock(return_value="hsdp-dp")
+        executor.collective_rpc = Mock()
+        scheduler_output = _make_sched_output("A", "B")
+
+        result = executor.execute_batch(scheduler_output)
+
+        assert result == "hsdp-dp"
         executor.execute_request.assert_called_once_with(scheduler_output)
         executor.collective_rpc.assert_not_called()
 
@@ -968,6 +987,9 @@ class TestSerialEngineOperations:
 class TestWorkerProcRpcRankStatus:
     def _make_worker_proc(self, has_result_mq: bool = True):
         proc = object.__new__(WorkerProc)
+        proc.od_config = SimpleNamespace(step_execution=False)
+        proc._async_output_done = threading.Condition()
+        proc._chunk_output_pending = 0
         proc.gpu_id = 0
         proc.result_mq = object() if has_result_mq else None
         proc.worker = SimpleNamespace(execute_method=Mock(return_value=True))
@@ -1511,6 +1533,88 @@ class TestStageDiffusionClientErrorPropagation:
 
 
 class TestExecutorShutdownCleaner:
+    @pytest.mark.parametrize(
+        ("platform_name", "parent_pid", "current_parent_pid"),
+        [("linux", 321, 321), ("linux", 1, 1), ("linux", 321, 1), ("linux", 321, 123), ("darwin", 321, 1)],
+    )
+    def test_worker_uses_hard_parent_death_signal(self, monkeypatch, platform_name, parent_pid, current_parent_pid):
+        import vllm_omni.plugins as omni_plugins
+
+        events: list[tuple[str, object]] = []
+        worker_main = WorkerProc.worker_main
+
+        class StopWorkerError(Exception):
+            pass
+
+        class FakeWorkerProc:
+            def __init__(self, *args, **kwargs):
+                events.append(("worker", None))
+                raise StopWorkerError
+
+        def self_kill(pid, sig):
+            events.append(("self_kill", (pid, sig)))
+            raise SystemExit
+
+        monkeypatch.setattr(diffusion_worker_module.sys, "platform", platform_name)
+        monkeypatch.setattr(diffusion_worker_module.os, "getppid", lambda: current_parent_pid)
+        monkeypatch.setattr(diffusion_worker_module.os, "getpid", lambda: 654)
+        monkeypatch.setattr(diffusion_worker_module.os, "kill", self_kill)
+        monkeypatch.setattr(diffusion_worker_module, "configure_logging", lambda _: events.append(("logging", None)))
+        monkeypatch.setattr(
+            diffusion_worker_module.signal,
+            "signal",
+            lambda sig, _handler: events.append(("handler", sig)),
+        )
+        monkeypatch.setattr(
+            diffusion_worker_module,
+            "set_death_signal",
+            lambda sig: events.append(("death_signal", sig)),
+        )
+        monkeypatch.setattr(
+            diffusion_worker_module,
+            "destroy_distributed_env",
+            lambda: events.append(("destroy", None)),
+        )
+        monkeypatch.setattr(
+            diffusion_worker_module,
+            "_setup_diffusion_worker_proc_title_and_log_prefix",
+            lambda **_: None,
+        )
+        monkeypatch.setattr(omni_plugins, "load_omni_general_plugins", lambda: events.append(("plugins", None)))
+        monkeypatch.setattr(diffusion_worker_module, "WorkerProc", FakeWorkerProc)
+
+        parent_lost = platform_name == "linux" and parent_pid != current_parent_pid
+        with pytest.raises(SystemExit if parent_lost else StopWorkerError):
+            worker_main(
+                rank=0,
+                od_config=SimpleNamespace(
+                    log_level="INFO",
+                    parallel_config=SimpleNamespace(
+                        enable_expert_parallel=False,
+                        use_hsdp=False,
+                        hsdp_replicate_size=1,
+                    ),
+                ),
+                pipe_writer=Mock(),
+                broadcast_handle=None,
+                wake_event=Mock(),
+                parent_pid=parent_pid,
+            )
+
+        if parent_lost:
+            assert events == [("death_signal", signal.SIGKILL), ("self_kill", (654, signal.SIGKILL))]
+            return
+
+        assert events == [
+            ("death_signal", signal.SIGKILL),
+            ("logging", None),
+            ("handler", signal.SIGTERM),
+            ("handler", signal.SIGINT),
+            ("plugins", None),
+            ("worker", None),
+            ("destroy", None),
+        ]
+
     def test_worker_joins_share_one_global_deadline(self, monkeypatch):
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 
@@ -1520,6 +1624,7 @@ class TestExecutorShutdownCleaner:
                 self.pid = 123
                 self.alive = True
                 self.terminated = False
+                self.exitcode = None
                 self.join_timeouts = []
 
             def is_alive(self):
@@ -1529,6 +1634,7 @@ class TestExecutorShutdownCleaner:
                 self.join_timeouts.append(timeout)
                 if self.terminated:
                     self.alive = False
+                    self.exitcode = -signal.SIGTERM
 
             def terminate(self):
                 self.terminated = True
@@ -1874,6 +1980,7 @@ def test_engine_close_interrupts_only_ray_before_join(backend):
     engine._out_streams = {}
     engine._unclaimed_async_outputs = {}
     engine._shutdown_output_futures = {}
+    engine._request_chunk_states = {}
     interrupted = threading.Event()
     engine.executor = MagicMock()
     engine.executor.shutdown.side_effect = interrupted.set

@@ -4,7 +4,10 @@
 """Omni-DuplexEval: optional session.stats must not fail a finished sample."""
 
 import asyncio
+import json
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -173,3 +176,100 @@ async def test_stalled_stats_send_still_writes_artifacts(monkeypatch, tmp_path) 
     assert all("busy_rtf" not in metric for metric in result.request_metrics)
     assert result.output.exists()
     assert result.output.with_name("s1.meta.json").exists()
+
+
+async def test_curated_stats_survive_result_json_without_changing_metrics(monkeypatch, tmp_path) -> None:
+    from vllm_omni.benchmarks import duplex_session_metrics
+
+    _install_deadlines(monkeypatch)
+    private = "PRIVATE_CONTENT_MUST_NOT_BE_RETAINED"
+    stats = {
+        "stages": [{"stage_id": 2, "name": private}],
+        "dropped_turns": 1,
+        "dropped_spans": 2,
+        "prompt": private,
+        "endpoint": private,
+        "turns": [
+            {
+                "epoch": 3,
+                "turn_id": 4,
+                "response_ids": ["r1"],
+                "status": "done",
+                "final": True,
+                "late_spans": 5,
+                "configuration": private,
+                "chunks": [
+                    {
+                        "seq": 7,
+                        "turn_seq": 0,
+                        "submitted_ns": 10,
+                        "done_ns": 30,
+                        "complete": True,
+                        "truncated": False,
+                        "audio_content": private,
+                        "stage_work": [{"stage_id": 2, "spans": [[10, 20]], "backend": private}],
+                    }
+                ],
+                "audio": [{"response_id": "r1", "emitted_ns": 40, "duration_ms": 100.0, "data": private}],
+            }
+        ],
+    }
+    stats_before = json.dumps(stats, sort_keys=True)
+    get_stats = AsyncMock(return_value=stats)
+    monkeypatch.setattr(_CompletedSessionClient, "get_session_stats", get_stats, raising=False)
+    original_metrics = {"stream_rtf": 1.25, "stream_ttft_ms": 2.0}
+    monkeypatch.setattr(
+        duplex_session_metrics,
+        "collect_duplex_session_metrics",
+        Mock(
+            return_value=SimpleNamespace(
+                request_metrics=[],
+                session_metrics=original_metrics,
+                output_tokens=0,
+            )
+        ),
+    )
+    result, _client, _elapsed = await _generate(monkeypatch, tmp_path, _CompletedSessionClient)
+    assert get_stats.await_count == 1
+    assert result.error == ""
+    assert original_metrics == {"stream_rtf": 1.25, "stream_ttft_ms": 2.0}
+    assert {key: result.session_metrics[key] for key in original_metrics} == original_metrics
+    report = duplex_session_metrics.build_duplex_metrics_report(
+        request_metrics=[], session_metrics=[result.session_metrics]
+    )
+    encoded = json.dumps(report, allow_nan=False)
+    assert private not in encoded
+    retained = json.loads(encoded)["duplex_session_metrics"][0]["server_stats"]
+    assert retained["stages"] == [{"stage_id": 2}]
+    assert retained["dropped_turns"] == 1 and retained["dropped_spans"] == 2
+    turn = retained["turns"][0]
+    assert turn["response_ids"] == ["r1"] and turn["final"] is True and turn["late_spans"] == 5
+    assert turn["chunks"][0]["stage_work"] == [{"stage_id": 2, "spans": [[10, 20]]}]
+    assert turn["audio"] == [{"response_id": "r1", "emitted_ns": 40, "duration_ms": 100.0}]
+    assert json.dumps(stats, sort_keys=True) == stats_before
+
+
+@pytest.mark.parametrize(
+    "stats",
+    [
+        None,
+        [],
+        {"turns": None},
+        {"turns": [None, {"status": {}, "chunks": [0]}]},
+        {
+            "stages": [{"stage_id": True}],
+            "dropped_spans": "private",
+            "turns": [
+                {
+                    "final": "private",
+                    "response_ids": [{}],
+                    "audio": [{"emitted_ns": 1, "duration_ms": float("nan")}],
+                    "chunks": [{"done_ns": {}, "stage_work": [{"stage_id": 1, "spans": [[1, "private"], [2, 3], {}]}]}],
+                }
+            ],
+        },
+    ],
+)
+def test_stats_diagnostics_ignore_optional_or_malformed_values(stats) -> None:
+    encoded = json.dumps(runner._session_stats_diagnostics(stats), allow_nan=False)
+    assert "private" not in encoded

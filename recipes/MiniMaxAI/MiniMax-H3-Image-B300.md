@@ -37,7 +37,7 @@ keeps them in pinned host memory and streams one block at a time.
 Same on every accelerator; see the
 [H200 recipe](./MiniMax-H3-Image-H200.md#supported-model-contract) for the
 parameter table and request examples. In short: `t2i` on
-`/v1/images/generations`, `edit` with 1–9 references on `/v1/images/edits`,
+`/v1/images/generations`, `edit` with 1–16 references on `/v1/images/edits`,
 six CFG-distilled steps, one image per request, no `negative_prompt`.
 
 ## References

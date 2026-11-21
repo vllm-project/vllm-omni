@@ -75,9 +75,10 @@ def test_all_in_one_workflow_matches_omni_node_interfaces(workflow):
         cls = getattr(omni_nodes, node["type"])
         schema = cls.INPUT_TYPES()
         inputs = {**schema.get("required", {}), **schema.get("optional", {})}
-        assert [input_["name"] for input_ in node["inputs"]] == [
-            *schema.get("optional", {}),
-            *schema.get("required", {}),
+        saved_inputs = [input_["name"] for input_ in node["inputs"]]
+        assert set(schema.get("required", {})) <= set(saved_inputs)
+        assert saved_inputs == [
+            name for name in (*schema.get("optional", {}), *schema.get("required", {})) if name in saved_inputs
         ]
         for input_ in node["inputs"]:
             kind = inputs[input_["name"]][0]

@@ -15,6 +15,7 @@ from vllm_omni.platforms.npu.models.minicpmo_fused import (
     _causal_conv,
     blocks_forward_chunk_fused_npu,
     packed_conv_columns,
+    prepare_estimator,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -73,6 +74,8 @@ class _Estimator(nn.Module):
 
 
 def _run(body, estimator: nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if body is blocks_forward_chunk_fused_npu:
+        prepare_estimator(estimator)
     torch.manual_seed(1)
     rows, frames, cached = 4, 6, 5
     attn = estimator.blocks[0].attn
@@ -84,9 +87,10 @@ def _run(body, estimator: nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.
     mask = torch.rand(rows, frames, cached + frames) > 0.3
     mask[..., 0] = True
     cnn = [torch.randn(rows, 2 * channels, width) for _ in range(depth)]
-    att = [torch.randn(rows, attn.num_heads, cached, 2 * attn.head_dim) for _ in range(depth)]
+    # Split K/V rows: K and V on their own axis, matching the fused body's cache contract.
+    att = [torch.randn(2, rows, attn.num_heads, cached, attn.head_dim) for _ in range(depth)]
     cnn_out = torch.zeros(depth, rows, 2 * channels, width)
-    att_out = torch.zeros(depth, rows, attn.num_heads, cached + frames, 2 * attn.head_dim)
+    att_out = torch.zeros(depth, 2, rows, attn.num_heads, cached + frames, attn.head_dim)
     with torch.no_grad():
         out = body(estimator, estimator_input, time_embedding, mask, cnn, att, cnn_out, att_out, [6, 4])
     return out, cnn_out, att_out
