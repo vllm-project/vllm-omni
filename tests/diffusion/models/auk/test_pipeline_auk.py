@@ -850,7 +850,8 @@ class TestRequestParsing:
             assert batch_model_cfg.get(key) == value
         assert "auk_dit_loop_graph" not in base_model_cfg
         assert batch_model_cfg["auk_dit_loop_graph"] is True
-        assert batch_model_cfg["auk_vae_warmup_batches"] == [1, 64, 128]
+        assert batch_model_cfg["auk_vae_max_batch_frames"] == 2560
+        assert batch_model_cfg["auk_vae_warmup_batches"] == [1, 16]
         assert batch_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
 
         merged = merge_pipeline_deploy(AUK_PIPELINE, batch)
@@ -858,7 +859,8 @@ class TestRequestParsing:
         for key, value in base_model_cfg.items():
             assert merged_model_cfg.get(key) == value
         assert merged_model_cfg["auk_dit_loop_graph"] is True
-        assert merged_model_cfg["auk_vae_warmup_batches"] == [1, 64, 128]
+        assert merged_model_cfg["auk_vae_max_batch_frames"] == 2560
+        assert merged_model_cfg["auk_vae_warmup_batches"] == [1, 16]
         assert merged_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
 
     def test_batched_unequal_target_lengths_vae_tail_isolation(self, build_pipeline):

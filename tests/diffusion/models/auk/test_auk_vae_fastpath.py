@@ -521,3 +521,48 @@ def test_vae_capture_oom_releases_allocations_before_retry_and_eager_fallback(mo
     assert (2, 8) in wrapper._uncapturable_compiled_shapes
     assert (2, 8) in wrapper._uncapturable_plain_shapes
     assert not wrapper._plain_pools
+
+
+@pytest.mark.cpu
+def test_vae_decode_micro_batches_large_batches_by_frame_budget() -> None:
+    vae = _small_vae()
+    wrapper = AuKVAEDecodeGraph(vae, enabled=False, max_batch_frames=2560)
+    assert wrapper._max_batch_for_frames(160) == 16
+    assert wrapper._max_batch_for_frames(320) == 8
+    assert wrapper._max_batch_for_frames(640) == 4
+
+    seen_batches: list[int] = []
+    real_decode = vae.decode
+
+    def spy_decode(x: torch.Tensor) -> torch.Tensor:
+        seen_batches.append(int(x.shape[0]))
+        return real_decode(x)
+
+    vae.decode = spy_decode  # type: ignore[method-assign]
+    bounded = AuKVAEDecodeGraph(vae, enabled=False, compile_shapes=(), tile_frames=0, max_batch_frames=16)
+    latents = torch.randn(5, 8, vae.latent_dim)
+    actual = bounded(latents)
+    expected = real_decode(latents)
+    assert seen_batches == [2, 2, 1]
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_compiled_warmup_clamps_batches_and_shares_pool_without_aliasing() -> None:
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(8, 16), max_batch_frames=32)
+    wrapper.warmup(torch.device("cuda"), batch_sizes=(1, 128))
+    # 32 // 8 = 4, 32 // 16 = 2 -> clamped to ladder steps (4, 8) and (2, 16) plus B=1.
+    assert set(wrapper._compiled) == {(1, 8), (4, 8), (1, 16), (2, 16)}
+
+    x5 = torch.randn(5, 8, vae.latent_dim, device="cuda")
+    out5 = wrapper(x5)
+    out5_snap = out5.clone()
+    x3 = torch.randn(3, 16, vae.latent_dim, device="cuda")
+    out3 = wrapper(x3)
+
+    torch.testing.assert_close(out5, out5_snap, atol=0, rtol=0)
+    torch.testing.assert_close(out5, vae.decode(x5), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(out3, vae.decode(x3), atol=1e-3, rtol=1e-3)

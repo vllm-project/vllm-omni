@@ -95,6 +95,12 @@ def _is_oom_capture_error(exc: BaseException) -> bool:
 # largest one. Deployments override them with
 # ``model_config.auk_vae_compile_shapes`` on the diffusion stage.
 DEFAULT_COMPILE_SHAPES: tuple[int, ...] = (128, 256, 512)
+# Cap total latent frames decoded in a single BigVGAN pass (B * frames <= 2560,
+# i.e. B=16/8/4 for 160/320/640-frame buckets). BigVGAN upsamples 480x in fp32,
+# so unchunked B=64/128 x 640 graphs reserve 65-90 GiB in private CUDA pools and
+# OOM 80 GB GPUs alongside stage 0, whereas <=2560 frames saturates decode
+# bandwidth in ~3-4 GiB and keeps compiled shapes below dynamo's recompile_limit.
+DEFAULT_MAX_BATCH_FRAMES: int = 2560
 
 
 def plan_tiles(
@@ -152,6 +158,17 @@ class AuKVAEDecodeGraph:
                 return b
         return batch_size
 
+    def _max_batch_for_frames(self, frames: int) -> int:
+        """Return the largest ladder batch size that fits within ``max_batch_frames``."""
+        if self.max_batch_frames <= 0 or frames <= 0:
+            return 10**9
+        limit = max(1, self.max_batch_frames // frames)
+        best = 1
+        for b in self._BATCH_LADDER:
+            if b <= limit:
+                best = b
+        return best
+
     def __init__(
         self,
         vae: AuKVAE,
@@ -161,12 +178,14 @@ class AuKVAEDecodeGraph:
         max_graphs: int = 32,
         compile_shapes: Sequence[int] = DEFAULT_COMPILE_SHAPES,
         tile_frames: int | None = None,
+        max_batch_frames: int = DEFAULT_MAX_BATCH_FRAMES,
     ) -> None:
         """``tile_frames``: window for clips longer than it; None = the largest bucket, 0 = no tiling."""
         self.vae = vae
         self.enabled = bool(enabled)
         self.frame_alignment = max(1, int(frame_alignment))
         self.max_graphs = max(1, int(max_graphs))
+        self.max_batch_frames = max(0, int(max_batch_frames))
         self.compile_shapes = sorted({int(size) for size in compile_shapes if int(size) > 0})
         self.context_frames = vae.decode_context_frames()
         if tile_frames is None:
@@ -188,7 +207,10 @@ class AuKVAEDecodeGraph:
         # Normalized latent that decodes to raw zero, per device; pads short windows.
         self._pad_latent: torch.Tensor | None = None
         # Startup captures are separate from the bounded runtime graph cache.
+        # Compiled graphs share one private pool; __call__ clones/copies each
+        # replay's static_wav before any subsequent graph in the pool replays.
         self._compiled: dict[tuple[int, int], _GraphEntry] = {}
+        self._compiled_pool: object | None = None
         self._compiled_decode: Callable[[torch.Tensor], torch.Tensor] | None = None
         self._uncapturable_compiled_shapes: set[tuple[int, int]] = set()
         self._uncapturable_plain_shapes: set[tuple[int, int]] = set()
@@ -198,6 +220,20 @@ class AuKVAEDecodeGraph:
     @torch.no_grad()
     def __call__(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode [B, frames, latent_dim] latents into a [B, frames * hop] waveform."""
+
+        if latents.ndim == 3:
+            B, frames, _ = latents.shape
+            window_frames = min(frames, self.tile_frames) if self.tile_frames else frames
+            bucket = self.compiled_bucket(window_frames) or window_frames
+            chunk_b = self._max_batch_for_frames(bucket)
+            if B > chunk_b:
+                first = self(latents[:chunk_b])
+                wav = first.new_empty((B, first.shape[1]))
+                wav[:chunk_b].copy_(first)
+                for start in range(chunk_b, B, chunk_b):
+                    end = min(B, start + chunk_b)
+                    wav[start:end].copy_(self(latents[start:end]))
+                return wav
 
         if not self.enabled or latents.ndim != 3:
             self.last_mode = "eager"
@@ -431,30 +467,44 @@ class AuKVAEDecodeGraph:
                 logger.warning("torch.compile of the AuK codec decode failed; using plain CUDA graphs", exc_info=True)
                 return
 
-        for batch_size in sorted({1, *(int(b) for b in batch_sizes if int(b) > 0)}):
-            pool = torch.cuda.graph_pool_handle()
-            for size in self.compile_shapes:
-                key = (batch_size, size)
-                if key in self._compiled:
-                    continue
-                failed = False
-                try:
-                    self._compiled[key] = self._capture(
-                        size, device, self._compiled_decode, warm_iters=5, pool=pool, batch_size=batch_size
-                    )
-                except RuntimeError as exc:
-                    logger.warning(
-                        "Compiled AuK codec decode failed for batch_size=%d latent_frames=%d; "
-                        "the bucket will be captured on demand",
-                        batch_size,
-                        size,
-                        exc_info=True,
-                    )
-                    _clear_exception_tracebacks(exc)
-                    failed = True
-                if failed:
-                    gc.collect()
-                    torch.accelerator.empty_cache()
+        requested_batches = sorted({1, *(int(b) for b in batch_sizes if int(b) > 0)})
+        # Clamp each (batch_size, frame_bucket) pair to max_batch_frames and
+        # capture them in one shared compiled pool (largest shapes first so
+        # smaller captures reuse blocks from the same pool).
+        targets: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for size in reversed(self.compile_shapes):
+            max_b = self._max_batch_for_frames(size)
+            for req_b in reversed(requested_batches):
+                key = (min(req_b, max_b), size)
+                if key not in seen:
+                    seen.add(key)
+                    targets.append(key)
+
+        if self._compiled_pool is None:
+            self._compiled_pool = torch.cuda.graph_pool_handle()
+        for batch_size, size in targets:
+            key = (batch_size, size)
+            if key in self._compiled:
+                continue
+            failed = False
+            try:
+                self._compiled[key] = self._capture(
+                    size, device, self._compiled_decode, warm_iters=5, pool=self._compiled_pool, batch_size=batch_size
+                )
+            except RuntimeError as exc:
+                logger.warning(
+                    "Compiled AuK codec decode failed for batch_size=%d latent_frames=%d; "
+                    "the bucket will be captured on demand",
+                    batch_size,
+                    size,
+                    exc_info=True,
+                )
+                _clear_exception_tracebacks(exc)
+                failed = True
+            if failed:
+                gc.collect()
+                torch.accelerator.empty_cache()
 
     def _capture(
         self,
@@ -487,4 +537,4 @@ class AuKVAEDecodeGraph:
         return _GraphEntry(graph=graph, static_latents=static_latents, static_wav=static_wav)
 
 
-__all__ = ["DEFAULT_COMPILE_SHAPES", "AuKVAEDecodeGraph", "plan_tiles"]
+__all__ = ["DEFAULT_COMPILE_SHAPES", "DEFAULT_MAX_BATCH_FRAMES", "AuKVAEDecodeGraph", "plan_tiles"]
