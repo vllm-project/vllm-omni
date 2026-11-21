@@ -400,12 +400,30 @@ The gradio script supports the following arguments:
 
 ## DFlash Thinker decoding
 
-The earlier DFlash integration used Model Runner V1. This checkout supports
-only Model Runner V2, so the former `model_runner: v1` deployment is rejected.
-DFlash is not qualified on the current runtime. Use the ordinary V2 deployment
-above; the [historical validation report](../../../design/qwen3_omni_dflash_validation.md)
-records the vLLM 0.33 / MRv1 measurements and unresolved quality limitations.
-Those results do not establish DFlash support on vLLM 0.34.
+DFlash runs on the Thinker. Talker and Code2Wav use their ordinary execution
+paths. Native MRv2 resumable speech uses the standard Qwen3-Omni pipeline
+with `async_chunk: true`, `async_scheduling: false` on AR stages, Thinker
+prefix caching disabled, and `pipeline_parallel_size: 1`. The
+`qwen3_omni_moe_resumable` pipeline provides scheduler-managed chunk transfer
+with MRv2. Model Runner V1 has been removed.
+
+For DFlash speech, set stage 0 `enforce_eager: true` and
+`speculative_config.enforce_eager: true` for eager target and drafter execution.
+CUDA Graph DFlash speech has an unresolved generated-speech ASR regression.
+
+The native resumable implementation was validated with vLLM 0.33.0 using
+Thinker TP1 and TP2. The current main uses vLLM 0.34, so those hardware
+results require revalidation on the updated runtime. See the
+[validation report](../../../design/qwen3_omni_dflash_validation.md)
+for the measured configurations and quality limitations.
+
+For audiovisual speech requests, the Talker context must accommodate the
+user-turn rows transferred from the Thinker. A 60-second Daily-Omni video can
+produce roughly 14,000 prompt tokens. Set stage 1 `max_model_len: 32768`
+when testing the full dataset. The `max_num_batched_tokens` setting controls
+prefill chunk size, while `max_model_len` bounds each request's total context.
+A ready stage input exceeding that stage's context limit ends with a
+request-local error containing the prompt length and configured limit.
 
 ## Example materials
 
