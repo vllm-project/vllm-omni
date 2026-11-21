@@ -68,9 +68,8 @@ class TestParseLoraRequests:
         assert [req.lora_name for req in lora_requests] == ["a", "b"]
         assert scales == [0.7, 1.0]
 
-    def test_rejects_empty_list(self) -> None:
-        with pytest.raises(ValueError, match="non-empty array"):
-            parse_lora_requests([])
+    def test_empty_list_disables_default_adapters(self) -> None:
+        assert parse_lora_requests([]) == ([], [])
 
     def test_rejects_non_dict_non_list(self) -> None:
         with pytest.raises(ValueError, match="expected an object"):

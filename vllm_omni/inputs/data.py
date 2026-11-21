@@ -22,6 +22,7 @@ from vllm_omni.diffusion.attention.schedule import (
     parse_attention_schedule,
     parse_attention_sigma_schedule,
 )
+from vllm_omni.lora.parsing import parse_lora_requests
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -481,6 +482,26 @@ class OmniDiffusionSamplingParams:
         )
 
     @classmethod
+    def from_config(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
+        """Normalize deployment defaults using the public LoRA request format."""
+        params = params.copy()
+        if "lora" in params:
+            if "lora_request" in params or "lora_scale" in params:
+                raise ValueError("Configure lora without lora_request or lora_scale")
+            lora_request, lora_scale = parse_lora_requests(params.pop("lora"))
+            params["lora_request"] = lora_request
+            if lora_scale is not None:
+                params["lora_scale"] = lora_scale
+        configured_lora = params.get("lora_request")
+        if isinstance(configured_lora, dict):
+            params["lora_request"] = LoRARequest(**configured_lora)
+        elif isinstance(configured_lora, list):
+            params["lora_request"] = [
+                LoRARequest(**request) if isinstance(request, dict) else request for request in configured_lora
+            ]
+        return cls(**params)
+
+    @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
         """Reconstruct params from a dict decoded after IPC, handling LoRA."""
         lora_request = params.get("lora_request")
@@ -488,11 +509,12 @@ class OmniDiffusionSamplingParams:
         # A stack serializes as a list of those arrays (or in-process requests).
         if isinstance(lora_request, list) and (not lora_request or not isinstance(lora_request[0], str)):
             params["lora_request"] = [
-                req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest) for req in lora_request
+                req if isinstance(req, (dict, LoRARequest)) else msgspec.convert(req, LoRARequest)
+                for req in lora_request
             ]
-        elif lora_request is not None and not isinstance(lora_request, LoRARequest):
+        elif lora_request is not None and not isinstance(lora_request, (dict, LoRARequest)):
             params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
-        return cls(**params)
+        return cls.from_config(params)
 
 
 # Request schedule fields that extra_args may carry, with the parser for each.
