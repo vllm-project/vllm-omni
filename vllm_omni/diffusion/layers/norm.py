@@ -144,18 +144,35 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
+        enable_fused_add_norm: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Normalize NPU inputs, rounding residual additions before RMSNorm.
+
+        With a residual, return the normalized output and updated residual.
+        ``enable_fused_add_norm`` opts into the fused NPU operator, which can
+        normalize the unrounded sum. Non-NPU tensors use the native path.
+        """
         if not _is_npu_tensor(x):
             return self.forward_native(x, residual)
         import torch_npu
 
         if residual is not None:
-            output, _, updated_residual = torch_npu.npu_add_rms_norm(
-                x,
-                residual,
-                self.weight,
-                self.variance_epsilon,
-            )
+            if enable_fused_add_norm:
+                output, _, updated_residual = torch_npu.npu_add_rms_norm(
+                    x,
+                    residual,
+                    self.weight,
+                    self.variance_epsilon,
+                )
+                return output, updated_residual
+
+            # Preserve the input-dtype rounding boundary before normalization.
+            updated_residual = residual + x
+            output = torch_npu.npu_rms_norm(
+                updated_residual,
+                gamma=self.weight,
+                epsilon=self.variance_epsilon,
+            )[0]
             return output, updated_residual
 
         output = torch_npu.npu_rms_norm(x, gamma=self.weight, epsilon=self.variance_epsilon)[0]
