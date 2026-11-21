@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, TypeVar, cast
 import pybase64 as base64
 from vllm.logger import init_logger
 
+from vllm_omni.engine import CONTEXT_LENGTH_EXCEEDED
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
@@ -788,10 +789,13 @@ class DuplexSessionRunner:
         session = self.session
         if session.state == DuplexSessionState.CLOSED:
             return
-        self._emit_error(
-            "runtime_data_plane_stream_failed",
-            f"Stage-{stage_id} input processor failed: {type(exc).__name__}: {exc}",
-        )
+        reason = str(exc)
+        if reason.partition(":")[0] == CONTEXT_LENGTH_EXCEEDED:
+            code = CONTEXT_LENGTH_EXCEEDED
+            self._emit_error(code, reason)
+        else:
+            code = "runtime_data_plane_stream_failed"
+            self._emit_error(code, f"Stage-{stage_id} input processor failed: {type(exc).__name__}: {exc}")
         draining_response_id = (
             session.response_id_for_request(request_id)
             if isinstance(request_id, str) and session.is_draining_request(request_id)
@@ -820,7 +824,7 @@ class DuplexSessionRunner:
                 "epoch": session.epoch,
                 "committed": False,
                 "status": "failed",
-                "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
+                "status_details": {"type": "failed", "reason": code},
                 "playback": playback,
             }
         )

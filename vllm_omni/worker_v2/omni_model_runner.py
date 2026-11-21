@@ -1307,6 +1307,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        # Scheduler decisions the model follows this step, before it frees finished requests' state.
+        on_scheduled = getattr(self.model, "on_scheduler_output", None)
+        if callable(on_scheduled):
+            on_scheduled(scheduler_output)
         if self._mm_rng_state is not None:
             for req_id in finished:
                 self._mm_rng_state.discard(req_id)

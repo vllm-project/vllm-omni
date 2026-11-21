@@ -16,6 +16,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+from typing import NamedTuple
 
 import regex as re
 
@@ -133,6 +134,9 @@ class DuplexStagePort(ABC):
     def reserve_session(self, session_id: str) -> None:
         """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""
 
+    async def release_session_window(self, session_id: str) -> None:
+        """Release a session's retained model context after its requests have been retired."""
+
     def release_session(self, session_id: str) -> None:
         """Idempotently release a session's replica reservation after cleanup."""
 
@@ -177,10 +181,11 @@ def duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | Non
     return None, None
 
 
+_RESOURCE_ROLE = re.compile(r"[a-zA-Z0-9_-]+")
+
+
 def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
-    if not role or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
-    ):
+    if not role or not _RESOURCE_ROLE.fullmatch(role):
         raise ValueError(f"invalid duplex resource role: {role!r}")
     encoded_session_id = base64.urlsafe_b64encode(fence.session_id.encode("utf-8")).decode("ascii").rstrip("=")
     return f"duplex-s.{encoded_session_id}.e.{fence.epoch}.r.{role}"
@@ -242,6 +247,10 @@ def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
     if fields is None:
         return None
     encoded, _, _ = fields
+    return _decode_session_id(encoded)
+
+
+def _decode_session_id(encoded: str) -> str | None:
     pad = "=" * (-len(encoded) % 4)
     try:
         return base64.urlsafe_b64decode(encoded + pad).decode("utf-8")
@@ -249,22 +258,34 @@ def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
         return None
 
 
-def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
-    """Return whether a current-format resource request belongs to a session."""
+class DuplexResourceRequestFields(NamedTuple):
+    session_id: str
+    epoch: int
+    role: str
+
+
+def parse_duplex_resource_request_id(request_id: str | None) -> DuplexResourceRequestFields | None:
+    """Return the logical session, numeric epoch and role of a duplex resource."""
     fields = _duplex_resource_request_fields(request_id)
     if fields is None:
-        return False
+        return None
     encoded, epoch, role = fields
+    if not role or not _RESOURCE_ROLE.fullmatch(role):
+        return None
     try:
-        int(epoch)
+        number = int(epoch)
     except ValueError:
-        return False
-    if not role or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
-    ):
-        return False
-    encoded_session_id = base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii").rstrip("=")
-    return encoded == encoded_session_id
+        return None
+    session_id = _decode_session_id(encoded)
+    if session_id is None or base64.urlsafe_b64encode(session_id.encode()).decode("ascii").rstrip("=") != encoded:
+        return None
+    return DuplexResourceRequestFields(session_id, number, role)
+
+
+def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
+    """Return whether a current-format resource request belongs to a session."""
+    parsed = parse_duplex_resource_request_id(request_id)
+    return parsed is not None and parsed.session_id == session_id
 
 
 __all__ = [
@@ -283,6 +304,8 @@ __all__ = [
     "duplex_data_plane_request_info",
     "duplex_ephemeral_stage_request_id",
     "duplex_turn_id_from_request_id",
+    "DuplexResourceRequestFields",
+    "parse_duplex_resource_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
     "duplex_same_turn_request_ids",

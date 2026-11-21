@@ -105,6 +105,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_window_suffix_token_ids",
         "duplex_window_previous_marker_token_ids",
         "duplex_window_special_token_ids",
+        "duplex_boundary_token_ids",
     }
 )
 
@@ -541,9 +542,10 @@ def _apply_first_append_context_tokens(
     runtime_config["duplex_window_suffix_token_ids"] = [int(token_id) for token_id in suffix_ids]
     marker_ids = tokenizer.encode("\n\nprevious: ", add_special_tokens=False)
     runtime_config["duplex_window_previous_marker_token_ids"] = [int(token_id) for token_id in marker_ids]
+    runtime_config["duplex_boundary_token_ids"] = MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(tokenizer)
     runtime_config["duplex_window_special_token_ids"] = sorted(
         MiniCPMO45DuplexPolicy.native_special_token_ids(
-            MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(tokenizer),
+            runtime_config["duplex_boundary_token_ids"],
             tokenizer_special_ids=list(getattr(tokenizer, "all_special_ids", ()) or ()),
         )
     )

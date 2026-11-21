@@ -358,6 +358,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_flashinfer_autotune: bool | None = None
     worker_type: str | None = None
     scheduling_metadata_adapter: str | None = None
+    scheduler_window_policy: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
     task_type: str | None = None
@@ -671,6 +672,7 @@ class OmniEngineArgs(EngineArgs):
             model_arch=self.model_arch,
             worker_type=self.worker_type,
             scheduling_metadata_adapter=self.scheduling_metadata_adapter,
+            scheduler_window_policy=self.scheduler_window_policy,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             final_output=self.final_output,

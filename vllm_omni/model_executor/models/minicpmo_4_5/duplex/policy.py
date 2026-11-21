@@ -12,6 +12,48 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
 
+@dataclass(kw_only=True)
+class MiniCPMO45TurnState:
+    """The native turn latches needed both while decoding and when cutting a replay."""
+
+    current_turn_ended: bool = True
+    pending_speech_context: bool = False
+    pending_speech_response_open: bool = False
+    explicit_response_awaiting_content: bool = False
+
+
+def record_turn_sample(
+    state: MiniCPMO45TurnState, sampled: int, token_ids: dict[str, int], payload: dict, *, terminator: bool
+) -> None:
+    if terminator:
+        opening = getattr(state, "explicit_response_awaiting_content", False)
+        if sampled == token_ids.get("listen_token_id") and (payload.get("force_listen") is True or opening):
+            state.current_turn_ended = True
+            state.explicit_response_awaiting_content = False
+            state.pending_speech_response_open = False
+    elif sampled == token_ids.get("turn_eos_token_id"):
+        state.current_turn_ended = True
+        state.explicit_response_awaiting_content = False
+        state.pending_speech_response_open = False
+    else:
+        # A seeded prefix can open a response before tts_bos. Its pending
+        # input stays available until the first content token is accepted.
+        opening = getattr(state, "pending_speech_response_open", False)
+        ended = getattr(state, "current_turn_ended", True)
+        if (
+            sampled == token_ids.get("tts_bos_token_id")
+            and (ended or opening)
+            and getattr(state, "pending_speech_context", False)
+        ):
+            state.pending_speech_response_open = True
+        elif opening or ended:
+            state.pending_speech_response_open = False
+            state.pending_speech_context = False
+        if sampled != token_ids.get("tts_bos_token_id"):
+            state.explicit_response_awaiting_content = False
+        state.current_turn_ended = False
+
+
 @dataclass(frozen=True, slots=True)
 class MiniCPMO45DuplexWindowConfig:
     """Stage-0 window settings.

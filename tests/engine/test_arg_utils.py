@@ -287,6 +287,16 @@ def test_compute_hash_is_stable_across_launches(stage_id):
     assert first_hash == second_hash
 
 
+def test_scheduler_window_policy_preserves_the_model_compile_key():
+    config = OmniEngineArgs(worker_cls=AR_WORKER_CLS).create_engine_config()
+    assert "scheduler_window_policy" not in config.model_config.compile_factors()
+    original = hash_config(config)
+    config.model_config.scheduler_window_policy = (
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv.MiniCPMO45SchedulerWindowPolicy"
+    )
+    assert hash_config(config) == original
+
+
 def test_compute_hash_keeps_stage_connector_settings():
     """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
 
