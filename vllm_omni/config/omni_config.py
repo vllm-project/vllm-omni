@@ -1423,6 +1423,7 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "num_gpus",
         "log_level",
         "profiler_config",
+        "compilation_config",
         "omni_kv_config",
         "cfg_kv_collect_func",
         "max_num_seqs",
