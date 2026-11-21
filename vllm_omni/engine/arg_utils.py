@@ -35,6 +35,7 @@ def is_frontend_only(single_stage_id_filter: int | None) -> bool:
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "FunAudioChatForConditionalGeneration": "funaudiochat",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
@@ -95,6 +96,7 @@ def _register_omni_hf_configs() -> None:
             Qwen3TTSConfig,
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+        from vllm_omni.transformers_utils.configs.funaudiochat import FunAudioChatConfig
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.ming3_audio import (
             BailingMoeV3AudioConfig,
@@ -129,6 +131,7 @@ def _register_omni_hf_configs() -> None:
         ("bailing_moe_v3_audio", BailingMoeV3AudioConfig),
         ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
+        ("funaudiochat", FunAudioChatConfig),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
