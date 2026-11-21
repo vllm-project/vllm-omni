@@ -37,7 +37,10 @@ _TINY_INNER = _TINY_QKV_SLICE
 
 
 @pytest.fixture(autouse=True)
-def _use_tiny_native_dimensions(monkeypatch):
+def _use_tiny_native_dimensions(monkeypatch, request):
+    # Preserve the hardware test while keeping CPU layout tests CUDA-free.
+    if request.node.get_closest_marker("cpu") is not None:
+        monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
     monkeypatch.setattr(lora_module, "_NATIVE_RANK", _TINY_RANK)
     monkeypatch.setattr(lora_module, "_NATIVE_ALPHA", _TINY_RANK)
     monkeypatch.setattr(lora_module, "_NATIVE_HIDDEN_SIZE", _TINY_HIDDEN)
