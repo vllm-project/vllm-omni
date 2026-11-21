@@ -116,10 +116,32 @@ _NPU_ROPE: dict[str, object] = {"freqs": None, "tables": None}
 
 
 def _npu_rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the (cos, sin) tables ``npu_rotary_mul`` expects from a RoPE table.
+
+    ``freqs`` is either the shared ``(S, D // 2)`` table or the per-request
+    ``(B, S, D // 2)`` table produced by ``QwenImage21Rope`` when a batch pads
+    its text to different lengths.
+
+    The interleaved kernel takes a ``(B', S, 1, W)`` table whose leading axis is
+    1 -- it has no interleave-mode variant that carries a per-batch table. The
+    per-request table is therefore kept as a ``(B, S, 1, W)`` stack of
+    single-request tables and applied one request at a time; see
+    ``_apply_qwen_image21_rotary_emb_npu``.
+    """
     if _NPU_ROPE["freqs"] is freqs:
         return _NPU_ROPE["tables"]  # type: ignore[return-value]
-    cos = torch.real(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.imag(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    if freqs.ndim not in (2, 3):
+        raise ValueError(f"Qwen-Image-2.1 RoPE table must be 2-D or 3-D, got {freqs.ndim}-D")
+    cos = torch.real(freqs).float().repeat_interleave(2, dim=-1)
+    sin = torch.imag(freqs).float().repeat_interleave(2, dim=-1)
+    if freqs.ndim == 2:
+        # Shared table: (S, W) -> (1, S, 1, W).
+        cos = cos.unsqueeze(0).unsqueeze(2)
+        sin = sin.unsqueeze(0).unsqueeze(2)
+    else:
+        # Per-request table: (B, S, W) -> (B, S, 1, W).
+        cos = cos.unsqueeze(2)
+        sin = sin.unsqueeze(2)
     tables = (cos, sin)
     _NPU_ROPE["freqs"] = freqs
     _NPU_ROPE["tables"] = tables
@@ -131,12 +153,35 @@ def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> 
 
     Atlas A2 has no interleave mode on ``npu_apply_rotary_pos_emb``. The table
     is reused only while the same freqs object is current.
+
+    A shared ``(S, D // 2)`` table goes through the fused kernel as one call. A
+    per-request ``(B, S, D // 2)`` table gives every request its own angles,
+    which the interleaved kernel cannot take in a single call -- its table's
+    batch axis has to be 1 -- so each request is rotated with its own table.
     """
     import torch_npu
 
     rot_cos, rot_sin = _npu_rope_tables(freqs)
-    rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
-    return rotated.to(dtype=x.dtype)
+    if rot_cos.shape[0] == 1:
+        rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
+        return rotated.to(dtype=x.dtype)
+
+    batch_size = x.shape[0]
+    if rot_cos.shape[0] != batch_size:
+        raise ValueError(
+            f"Qwen-Image-2.1 RoPE table has {rot_cos.shape[0]} request rows but the "
+            f"activation has a batch of {batch_size}."
+        )
+    rows = [
+        torch_npu.npu_rotary_mul(
+            x[index : index + 1].float(),
+            rot_cos[index : index + 1],
+            rot_sin[index : index + 1],
+            rotary_mode="interleave",
+        )
+        for index in range(batch_size)
+    ]
+    return torch.cat(rows, dim=0).to(dtype=x.dtype)
 
 
 def _apply_qwen_image21_rotary_emb_musa(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -984,13 +1029,26 @@ class QwenImage21SequencePrepare(nn.Module):
 def _qwen_image21_rope_text_mask(
     text_mask: torch.Tensor | None, device: torch.device, sp_active: bool
 ) -> torch.Tensor | None:
+    """Return the per-request text-valid mask when the platform can apply it.
+
+    A batch whose prompts have different lengths is padded to the longest one.
+    The shared RoPE table then puts every request's image block at the frame
+    position of the *padded* text length, so a request's output depends on the
+    other requests batched with it. The per-request table shifts each row back
+    by its own pad count, which restores the per-request positions.
+
+    CUDA and NPU can apply that per-request table: the NPU path keeps the batch
+    axis of the ``(B, S, D // 2)`` table, so every row is rotated with its own
+    angles. Other platforms have no per-request RoPE path yet, and sequence
+    parallelism replicates the prefix, so both keep the shared table.
+    """
     if text_mask is None:
         return None
-    if sp_active or device.type != "cuda":
+    if sp_active or device.type not in ("cuda", "npu"):
         if not bool(text_mask.all()):
             raise ValueError(
-                "Qwen-Image-2.1 mixed-length text padding requires CUDA without sequence parallelism "
-                "for per-request image RoPE."
+                "Qwen-Image-2.1 mixed-length text padding requires CUDA or NPU without "
+                "sequence parallelism for per-request image RoPE."
             )
         return None
     return text_mask
