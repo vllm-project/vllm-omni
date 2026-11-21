@@ -25,6 +25,7 @@ primary_code_paths:
   - vllm_omni/entrypoints/cli/**
   - vllm_omni/entrypoints/openai/**
   - vllm_omni/entrypoints/openpi/**
+  - vllm_omni/entrypoints/positronic/**
   - vllm_omni/entrypoints/client_request_state.py
   - vllm_omni/entrypoints/stage_utils.py
   - vllm_omni/entrypoints/utils.py
@@ -65,6 +66,7 @@ validation_paths:
   - tests/entrypoints/test_stream_finish_reason.py
   - tests/entrypoints/openai/**
   - tests/entrypoints/openai_api/**
+  - tests/entrypoints/positronic/**
   - tests/e2e/online_serving/**
 upstream_refs:
   - vllm.engine.protocol.EngineClient

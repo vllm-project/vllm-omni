@@ -33,7 +33,7 @@ frames, settings and the episode lifecycle.
 
 - Reference implementation: [runwayml/praxis-1-oss](https://github.com/runwayml/praxis-1-oss), revision `3219e555fc05b2d5d8e77650f4c266f9e8fd7ebc` (simulation suites and the comparison runs below).
 - Deployments: [praxis1.yaml](../../vllm_omni/deploy/praxis1.yaml), [praxis1_yam.yaml](../../vllm_omni/deploy/praxis1_yam.yaml).
-- Protocol guide: [OpenPI API](../../docs/serving/openpi_api.md). The Positronic session API is documented with its serving PR.
+- Protocol guides: [Positronic API](../../docs/serving/positronic_api.md), [OpenPI API](../../docs/serving/openpi_api.md).
 - No model-specific example: offline requests use the generic `Omni.generate` call shown below.
 
 ## Hardware
@@ -128,7 +128,7 @@ vllm serve "$PRAXIS_CHECKPOINT" --omni --host 127.0.0.1 --port 8123 \
 ```
 
 - Positronic clients connect to `ws://127.0.0.1:8123/api/v1/session` with binary msgpack
-  frames (see the Positronic serving guide once that endpoint is available in your build).
+  frames; see the [wire guide](../../docs/serving/positronic_api.md).
 - OpenPI clients connect to `/v1/realtime/robot/openpi` and send a nonempty
   `session_id` with each observation; see the [wire guide](../../docs/serving/openpi_api.md).
 
@@ -266,7 +266,7 @@ or full-suite qualification.
 | --- | --- |
 | Offline `Omni.generate` with session continuation, reset and video diagnostics | Supported, validated here |
 | OpenPI serving (`/v1/realtime/robot/openpi`) | Supported, validated here; [guide](../../docs/serving/openpi_api.md) |
-| Positronic serving (`/api/v1/session`) | Validated here through the simulation runs below; shipped with the Positronic serving PR |
+| Positronic serving (`/api/v1/session`) | Supported, validated here through the simulation runs; [guide](../../docs/serving/positronic_api.md) |
 | Tensor / sequence / CFG parallelism, HSDP | Unsupported (rejected at startup); [parallelism guides](../../docs/user_guide/diffusion_features.md) |
 | Quantization, CPU offload, sleep mode, LoRA, step execution | Unsupported (rejected at startup); [feature matrix](../../docs/user_guide/diffusion_features.md) |
 | Cache acceleration (Cache-DiT, TeaCache) | Not applied; the pipeline owns its Euler loop |
