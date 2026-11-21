@@ -224,6 +224,9 @@ class VideoTokenLayout:
     latent_grid: tuple[int, int, int] | None = None
     used_len: int | None = None
     video_spans: tuple[VideoTokenSpan, ...] = ()
+    # RF producer relabels rows before SP. Logical video geometry remains in
+    # original coordinates; a distributed consumer must honor the permutation.
+    pre_rearranged: bool = False
 
 
 @dataclass(frozen=True, slots=True)

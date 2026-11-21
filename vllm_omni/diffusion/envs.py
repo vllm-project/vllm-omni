@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     LOCAL_RANK: int = 0
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
     VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS: bool = False
+    VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE: int | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -30,6 +31,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    # Select the HCCL execution engine only for Ulysses process groups.
+    # 2=AICPU, 3=AIV; unset keeps the HCCL runtime default.
+    "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE": lambda: (
+        int(os.environ["VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE"])
+        if "VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE" in os.environ
+        else None
+    ),
     # Minimum rotary-table span (B*S positions) at which consumers of the shared
     # fused_qk_norm_rope op take the fused path instead of their eager chain;
     # "0" = always fuse; unset = each consumer's own measured default. Raw
@@ -38,8 +46,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # On ROCm, run the shared diffusion RMSNorm and SiluAndMul in PyTorch instead
     # of vLLM's precompiled kernels. Opt-in for runtimes whose vLLM build lacks
     # kernels for the GPU arch (hipErrorInvalidImage); off by default.
-    "VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS": lambda: os.environ.get("VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS", "0").lower()
-    in ("1", "true"),
+    "VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS": lambda: (
+        os.environ.get("VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS", "0").lower() in ("1", "true")
+    ),
 }
 
 

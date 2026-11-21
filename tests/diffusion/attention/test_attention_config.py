@@ -239,6 +239,24 @@ class TestAttentionSpec:
             "precision": "fp8",
         }
 
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_block_sparse_parallel_config_forwarded(self, enabled):
+        parallel = {"overlap_comm": enabled, "reorder_hoist": True}
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparse_type": "rf_v3", "parallel": parallel},
+        )
+        assert spec.backend_kwargs()["parallel"] == parallel
+        assert spec.backend_kwargs()["sparse_type"] == "rf_v3"
+
+    @pytest.mark.parametrize("invalid", [0, 1, "true", None])
+    def test_block_sparse_parallel_rejects_ambiguous_booleans(self, invalid):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            AttentionSpec(
+                backend="RAINFUSION_ATTN",
+                block_sparse={"parallel": {"overlap_comm": invalid}},
+            )
+
     def test_block_sparse_precision_enum_input_normalized(self):
         """RainFusionPrecision enum members must normalize to their string value.
 

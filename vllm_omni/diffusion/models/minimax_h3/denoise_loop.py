@@ -173,6 +173,9 @@ class MiniMaxH3DenoiseBranch:
         ``static_kwargs`` makes every model call reuse the exact same BF16
         tensor without extending its lifetime beyond this request branch.
         """
+        from .attention.rf_reorder_hoist import maybe_hoist_branch
+
+        maybe_hoist_branch(self, model)
         prepare = getattr(model, "prepare_rope_table", None)
         if not callable(prepare):
             return
