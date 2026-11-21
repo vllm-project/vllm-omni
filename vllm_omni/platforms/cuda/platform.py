@@ -177,11 +177,13 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "SAGE_ATTN was explicitly selected, but the sageattention package is not available."
                     ) from e
             if backend_upper == "SAGE_ATTN_3":
-                sage_attn3_supported = compute_capability is not None and compute_capability.major >= 10
-                if not sage_attn3_supported:
+                # sageattention3_blackwell's mha_fwd runtime guard (api.cu) only permits
+                # sm_120 and sm_121; sm_100/sm_103 fail inside the kernel.
+                sage3_supported_sms = {(12, 0), (12, 1)}
+                if compute_capability is None or tuple(compute_capability) not in sage3_supported_sms:
                     raise ValueError(
-                        "SAGE_ATTN_3 was explicitly selected but requires a Blackwell-class GPU "
-                        "with compute capability >= 10.0. Select a compatible backend."
+                        "SAGE_ATTN_3 was explicitly selected but does not provide a kernel for "
+                        f"{sm_str or 'this GPU'}. Select a compatible backend."
                     )
                 try:
                     importlib.import_module("sageattn3")

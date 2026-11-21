@@ -2466,6 +2466,23 @@ class BlockSparseSpec:
 
 
 @dataclass
+class SageAttn3Spec:
+    """User-facing controls for SAGE_ATTN_3 (Blackwell FP4 attention)."""
+
+    per_block_mean: bool = True
+    q_chunk_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.per_block_mean, bool):
+            raise TypeError(f"sage3.per_block_mean must be a bool, got {type(self.per_block_mean)!r}")
+        if self.q_chunk_size is not None:
+            if isinstance(self.q_chunk_size, bool) or not isinstance(self.q_chunk_size, int):
+                raise TypeError(f"sage3.q_chunk_size must be an int or None, got {type(self.q_chunk_size)!r}")
+            if self.q_chunk_size <= 0 or self.q_chunk_size % 128 != 0:
+                raise ValueError(f"sage3.q_chunk_size must be a positive multiple of 128, got {self.q_chunk_size}")
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
@@ -2477,6 +2494,7 @@ class AttentionSpec:
     fastvideo_vsa_precision: str = "bf16"
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
+    sage3: SageAttn3Spec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -2486,6 +2504,7 @@ class AttentionSpec:
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.sage3 = self._coerce(self.sage3, SageAttn3Spec, "sage3")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -2524,6 +2543,11 @@ class AttentionSpec:
             raise ValueError(
                 f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
                 f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
+            )
+        if self.sage3 is not None and self.backend.upper() != "SAGE_ATTN_3":
+            raise ValueError(
+                f"sage3 is only supported by the SAGE_ATTN_3 backend, but backend={self.backend!r}. "
+                "Remove sage3 or set backend to SAGE_ATTN_3."
             )
 
     @staticmethod
@@ -2581,6 +2605,10 @@ class AttentionSpec:
             kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
+        if self.sage3 is not None:
+            kw["per_block_mean"] = self.sage3.per_block_mean
+            if self.sage3.q_chunk_size is not None:
+                kw["q_chunk_size"] = self.sage3.q_chunk_size
 
         return kw or None
 
@@ -2660,6 +2688,7 @@ class AttentionConfig:
             "fastvideo_vsa_precision",
             "sparge",
             "block_sparse",
+            "sage3",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)

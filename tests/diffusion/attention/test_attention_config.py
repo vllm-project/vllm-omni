@@ -259,6 +259,38 @@ class TestAttentionSpec:
         assert cfg.precision == "mix"
         assert type(cfg.precision) is str
 
+    def test_sage3_defaults_and_serialization(self):
+        default_spec = AttentionSpec(backend="SAGE_ATTN_3")
+        assert default_spec.sage3 is None
+        assert default_spec.backend_kwargs() is None
+
+        configured = AttentionSpec(
+            backend="sage_attn_3",
+            sage3={"per_block_mean": False, "q_chunk_size": 4096},
+        )
+        assert configured.sage3 is not None
+        assert configured.sage3.per_block_mean is False
+        assert configured.sage3.q_chunk_size == 4096
+        assert configured.backend_kwargs() == {"per_block_mean": False, "q_chunk_size": 4096}
+
+    def test_sage3_rejected_on_non_sage3_backend(self):
+        with pytest.raises(ValueError, match="SAGE_ATTN_3"):
+            AttentionSpec(backend="SAGE_ATTN", sage3={"per_block_mean": False})
+
+    @pytest.mark.parametrize(
+        ("sage3", "exc_type"),
+        [
+            ({"per_block_mean": "no"}, TypeError),
+            ({"q_chunk_size": True}, TypeError),
+            ({"q_chunk_size": 100}, ValueError),
+            ({"q_chunk_size": 0}, ValueError),
+            ({"q_chunk_size": -128}, ValueError),
+        ],
+    )
+    def test_sage3_validation_rejects_invalid_values(self, sage3, exc_type):
+        with pytest.raises(exc_type):
+            AttentionSpec(backend="SAGE_ATTN_3", sage3=sage3)
+
 
 class TestAttentionScheduleConfig:
     @pytest.mark.parametrize(
@@ -404,6 +436,27 @@ class TestAttentionConfig:
         roles: dict[str, Any] = {"wan": {"self": spec}} if nested else {"wan.self": spec}
         config = AttentionConfig(per_role=roles)
         assert config.per_role["wan.self"].backend_kwargs() == {"sparge_topk": 0.25}
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_sage3_config_in_per_role_mapping_and_schedule(self, nested):
+        spec = {"backend": "SAGE_ATTN_3", "sage3": {"per_block_mean": False, "q_chunk_size": 2048}}
+        roles: dict[str, Any] = {"wan": {"self": spec}} if nested else {"wan.self": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["wan.self"].backend_kwargs() == {
+            "per_block_mean": False,
+            "q_chunk_size": 2048,
+        }
+        schedule = parse_attention_schedule_config(
+            {
+                "profiles": {"low_vram": {"per_role": roles}},
+                "default": [{"start": 0, "end": 4, "profile": "low_vram"}],
+            }
+        )
+        assert schedule is not None
+        assert schedule.profiles["low_vram"].per_role["wan.self"].backend_kwargs() == {
+            "per_block_mean": False,
+            "q_chunk_size": 2048,
+        }
 
     def test_constructor_normalizes_auto_to_unset(self):
         config = AttentionConfig(
