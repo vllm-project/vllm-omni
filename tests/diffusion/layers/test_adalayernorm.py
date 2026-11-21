@@ -130,9 +130,13 @@ def test_adalayernorm_zero_accepts_quant_config():
     AdaLayerNormContinuous(64, 64, quant_config=None, prefix="test.norm_out")
 
 
-def test_adalayernorm_uses_replicated_linear():
-    """Verify .linear is a ReplicatedLinear instance (not nn.Linear)."""
-    from vllm.model_executor.layers.linear import ReplicatedLinear
+def test_adalayernorm_modulation_linear_is_column_parallel():
+    """Unquantized modulation projections are column-parallel with a gathered output.
+
+    At TP=1 the layer holds the whole weight and computes what ReplicatedLinear did;
+    under TP each rank keeps its rows (tests/diffusion/layers/test_adalayernorm_tp.py).
+    """
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
 
     from vllm_omni.diffusion.layers.adalayernorm import (
         AdaLayerNormContinuous,
@@ -140,14 +144,9 @@ def test_adalayernorm_uses_replicated_linear():
         AdaLayerNormZeroSingle,
     )
 
-    norm_zero = AdaLayerNormZero(64)
-    assert isinstance(norm_zero.linear, ReplicatedLinear)
-
-    norm_zero_single = AdaLayerNormZeroSingle(64)
-    assert isinstance(norm_zero_single.linear, ReplicatedLinear)
-
-    norm_continuous = AdaLayerNormContinuous(64, 64)
-    assert isinstance(norm_continuous.linear, ReplicatedLinear)
+    for norm in (AdaLayerNormZero(64), AdaLayerNormZeroSingle(64), AdaLayerNormContinuous(64, 64)):
+        assert isinstance(norm.linear, ColumnParallelLinear)
+        assert norm.linear.gather_output
 
 
 # ── Numerical equivalence tests against diffusers originals ──

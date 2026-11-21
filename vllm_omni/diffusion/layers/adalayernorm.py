@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.triton_utils import HAS_TRITON as _HAS_TRITON
 from vllm.triton_utils import tl, triton
 
@@ -379,6 +379,41 @@ class AdaLayerNorm(CustomOp):
         return self.layernorm(x) * (1 + scale) + shift
 
 
+def _modulation_linear(
+    input_size: int,
+    output_size: int,
+    bias: bool,
+    quant_config: "QuantizationConfig | None",
+    prefix: str,
+) -> nn.Module:
+    """An AdaLN modulation projection, sharded over the tensor-parallel group.
+
+    The projection maps the ``[B, dim]`` conditioning embedding to the scale,
+    shift and gate vectors: a large weight applied to a tiny activation. It is
+    built column-parallel with its output gathered, so each TP rank keeps
+    1/tp of the rows and still gets the whole vector in row order; every output
+    element is still one dot product on one rank. Quantized layers stay
+    replicated, as Qwen-Image's modulation projections do.
+    """
+    if quant_config is None:
+        return ColumnParallelLinear(
+            input_size,
+            output_size,
+            bias=bias,
+            gather_output=True,
+            return_bias=False,
+            prefix=prefix,
+        )
+    return ReplicatedLinear(
+        input_size,
+        output_size,
+        bias=bias,
+        return_bias=False,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
+
+
 class AdaLayerNormZero(nn.Module):
     def __init__(
         self,
@@ -390,14 +425,7 @@ class AdaLayerNormZero(nn.Module):
         super().__init__()
         self.emb = None
         self.silu = nn.SiLU()
-        self.linear = ReplicatedLinear(
-            embedding_dim,
-            6 * embedding_dim,
-            bias=bias,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear",
-        )
+        self.linear = _modulation_linear(embedding_dim, 6 * embedding_dim, bias, quant_config, f"{prefix}.linear")
         self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
 
     def forward(
@@ -423,14 +451,7 @@ class AdaLayerNormZeroSingle(nn.Module):
     ):
         super().__init__()
         self.silu = nn.SiLU()
-        self.linear = ReplicatedLinear(
-            embedding_dim,
-            3 * embedding_dim,
-            bias=bias,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear",
-        )
+        self.linear = _modulation_linear(embedding_dim, 3 * embedding_dim, bias, quant_config, f"{prefix}.linear")
         self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
 
     def forward(
@@ -459,13 +480,8 @@ class AdaLayerNormContinuous(nn.Module):
     ):
         super().__init__()
         self.silu = nn.SiLU()
-        self.linear = ReplicatedLinear(
-            conditioning_embedding_dim,
-            embedding_dim * 2,
-            bias=bias,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear",
+        self.linear = _modulation_linear(
+            conditioning_embedding_dim, embedding_dim * 2, bias, quant_config, f"{prefix}.linear"
         )
         self.norm = nn.LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
 
