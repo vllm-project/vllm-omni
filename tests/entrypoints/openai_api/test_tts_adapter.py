@@ -1026,6 +1026,41 @@ def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected
     assert prepared.model_type == "step_audio2"
 
 
+@pytest.mark.parametrize("limit", [None, 7, 8192])
+def test_step_audio2_request_budget_reaches_engine(limit):
+    server = object.__new__(OmniOpenAIServingSpeech)
+    default = SamplingParams(max_tokens=256)
+    decoder_default = SamplingParams(max_tokens=1)
+    seen = []
+
+    def record_generate(**kwargs):
+        seen.append(kwargs)
+        return iter(())
+
+    server._diffusion_mode = False
+    server._tts_model_type = "step_audio2"
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=[default, decoder_default], generate=record_generate
+    )
+    server._adapter = StepAudio2Adapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._refresh_uploaded_speakers = lambda: None
+    server._validate_speech_sample_rate = lambda _request: None
+    server._log_request = lambda *_args: None
+    server._speech_output_policies = {}
+    server.request_logger = None
+    request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=limit)
+
+    asyncio.run(server._prepare_speech_generation(request, request_id="step-budget"))
+
+    assert len(seen) == 1
+    observed = seen[0]["sampling_params_list"]
+    assert observed[0].max_tokens == (limit if limit is not None else 256)
+    assert observed[1].max_tokens == 1
+    assert default.max_tokens == 256
+    assert decoder_default.max_tokens == 1
+
+
 def test_voxtral_prompt_builder_is_sync():
     ctx = SimpleNamespace(
         server=SimpleNamespace(_tts_executor=None),
