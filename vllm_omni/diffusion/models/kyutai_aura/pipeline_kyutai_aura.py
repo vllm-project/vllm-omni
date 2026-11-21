@@ -45,6 +45,7 @@ from vllm_omni.diffusion.models.kyutai_aura.sampling import StudentSigmas, decod
 from vllm_omni.diffusion.models.kyutai_aura.transformer import KyutaiAuraTransformer
 from vllm_omni.diffusion.request_streaming import get_emit_chunk
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
@@ -265,18 +266,29 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput):
 
     # ---------------------------------------------------------------------------------- serving
     def _request_inputs(self, req: DiffusionRequestBatch) -> tuple[str, Any, Any, int, int | None]:
+        """Read and check one request before any chunk is generated; bad inputs are client errors."""
         prompt_entry = req.prompts[0] if req.prompts else {"prompt": ""}
         if isinstance(prompt_entry, str):
-            raise ValueError("Kyutai AURA needs multi_modal_data with an 'image' and an 'audio'")
+            raise OmniClientError("Kyutai AURA needs multi_modal_data with an 'image' and an 'audio'")
         text = prompt_entry.get("prompt") or DEFAULT_PROMPT
         media = prompt_entry.get("multi_modal_data") or {}
         image, audio = media.get("image"), media.get("audio")
         if image is None or audio is None:
-            raise ValueError("Kyutai AURA needs multi_modal_data['image'] (a portrait) and ['audio'] (speech)")
+            raise OmniClientError("Kyutai AURA needs multi_modal_data['image'] (a portrait) and ['audio'] (speech)")
         params = req.sampling_params
-        extra = params.extra_args or {}
+        # The speech is read and returned on the model's own clock, so frames written at another
+        # rate would play faster or slower than the speech track.
+        fps = params.resolved_frame_rate
+        if fps is not None and fps != self.cfg.fps:
+            raise OmniClientError(
+                f"Kyutai AURA generates video at {self.cfg.fps} fps; omit fps or set it to {self.cfg.fps} (got {fps:g})"
+            )
+        num_chunks = (params.extra_args or {}).get("num_chunks")
+        positive_int = isinstance(num_chunks, int) and not isinstance(num_chunks, bool) and num_chunks >= 1
+        if num_chunks is not None and not positive_int:
+            raise OmniClientError(f"extra_params.num_chunks must be a positive integer, got {num_chunks!r}")
         seed = params.seed if params.seed is not None else 42
-        return text, image, audio, int(seed), extra.get("num_chunks")
+        return text, image, audio, int(seed), num_chunks
 
     def _log_speed(self, delivered: list[float], sizes: list[int]) -> None:
         """One line per request: time to the first chunk on the CPU, then the steady frame rate

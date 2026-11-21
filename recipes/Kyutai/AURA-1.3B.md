@@ -51,7 +51,8 @@ curl -s http://localhost:8091/v1/videos/sync \
 ```
 
 - The video API requires a non-empty `prompt`; any short description of the speaker works.
-- The returned MP4 carries the speech track. One request runs at a time.
+- The video plays at the model's 16 fps with the speech track; omit `fps` or pass 16, since any other `fps` returns HTTP 400. `extra_params.num_chunks`, when given, must be a positive integer.
+- One request runs at a time.
 
 ## Validation
 
