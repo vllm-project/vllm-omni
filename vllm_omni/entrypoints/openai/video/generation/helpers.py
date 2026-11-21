@@ -84,6 +84,8 @@ from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads, has_multivie
 logger = init_logger(__name__)
 
 
+# These are model-specific upload limits and intentionally do not follow the
+# process-wide vLLM remote-media configuration.
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 
 MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES = 50 * 1024 * 1024
