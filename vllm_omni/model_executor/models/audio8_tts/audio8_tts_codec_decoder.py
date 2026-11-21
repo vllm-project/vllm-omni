@@ -24,7 +24,12 @@ from vllm_omni.model_executor.models.audio8_tts.configuration_audio8_tts import 
     ARKTTS_CODEC_FRAME_SIZE,
     ARKTTS_CODEC_SAMPLE_RATE,
 )
+from vllm_omni.model_executor.models.audio8_tts.decode_graph import ArkttsDecodeGraphRunner
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.audio8_tts import (
+    DEFAULT_CHUNK_FRAMES,
+    DEFAULT_LEFT_CONTEXT_FRAMES,
+)
 
 logger = init_logger(__name__)
 
@@ -56,6 +61,30 @@ def _resolve_dtype(extra_cfg: dict[str, Any]) -> torch.dtype:
     return _DTYPES[raw]
 
 
+def _resolve_graph_frames(extra_cfg: dict[str, Any]) -> list[int]:
+    """Frame counts to capture for the codec decode graphs.
+
+    Mirrors the connector's chunker: steady windows are
+    ``[left_context | chunk]`` frames, and the first steady window is
+    ``min(initial_coverage + chunk, left_context + chunk)`` where
+    ``initial_coverage`` is the largest multiple of the initial chunk size not
+    above ``chunk``. Window sizes outside this set (the growing initial
+    chunks, the variable final chunk) decode eagerly.
+    """
+    raw = str(extra_cfg.get("audio8_tts_codec_cuda_graph_frames", "")).strip()
+    if raw:
+        sizes = sorted({int(part) for part in raw.replace(";", ",").split(",") if part.strip()})
+        if not sizes or any(size <= 0 for size in sizes):
+            raise ValueError(f"Invalid Audio8 TTS codec cuda graph frames: {raw!r}")
+        return sizes
+    chunk = int(extra_cfg.get("codec_chunk_frames", DEFAULT_CHUNK_FRAMES))
+    left_context = int(extra_cfg.get("codec_left_context_frames", DEFAULT_LEFT_CONTEXT_FRAMES))
+    initial = int(extra_cfg.get("initial_codec_chunk_frames", 0))
+    steady = left_context + chunk
+    coverage = (chunk // initial) * initial if initial > 0 else 0
+    return sorted({min(coverage + chunk, steady), steady})
+
+
 class Audio8TTSCodecDecoder(nn.Module):
     """Stage 1: codec codes -> waveform (runs under the generation runner)."""
 
@@ -85,9 +114,13 @@ class Audio8TTSCodecDecoder(nn.Module):
         }
         # float32 by default: the codec's Snake activations and weight-normed
         # convs lose audible headroom in bf16.
-        self._codec_dtype = _resolve_dtype(_connector_extra_config(vllm_config))
+        extra_cfg = _connector_extra_config(vllm_config)
+        self._codec_dtype = _resolve_dtype(extra_cfg)
+        self._decode_graphs_enabled = bool(extra_cfg.get("audio8_tts_codec_cuda_graph", False))
+        self._graph_frames = _resolve_graph_frames(extra_cfg)
         self._codec: nn.Module | None = None
         self._codec_device: torch.device | None = None
+        self._decode_graph: ArkttsDecodeGraphRunner | None = None
         self._logged_stats = False
 
     # -------------------- codec --------------------
@@ -104,6 +137,28 @@ class Audio8TTSCodecDecoder(nn.Module):
             **self._codec_kwargs,
         )
         self._codec_device = torch.device(device)
+        if self._decode_graphs_enabled and self._codec_device.type == "cuda":
+            try:
+                self._decode_graph = ArkttsDecodeGraphRunner(
+                    self._codec,
+                    num_codebooks=self._num_codebooks,
+                    frames=self._graph_frames,
+                    device=self._codec_device,
+                )
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("Audio8 TTS codec decode graphs unavailable (%s); decoding eagerly", exc)
+                self._decode_graph = None
+
+    def _decode_waveform(self, codes_qf: torch.Tensor) -> torch.Tensor:
+        """Decode one ``[num_codebooks, frames]`` window; graphed when captured."""
+        batch = codes_qf.unsqueeze(0)
+        if self._decode_graph is not None and self._decode_graph.can_decode(batch):
+            return self._decode_graph.decode(batch)
+        codec = self._codec
+        assert codec is not None
+        # Move codes to the codec's device explicitly: a mismatch here
+        # silently falls back to CPU or raises deep inside the decoder.
+        return codec.decode(batch.to(device=self._codec_device))
 
     # -------------------- vLLM hooks --------------------
 
@@ -248,9 +303,7 @@ class Audio8TTSCodecDecoder(nn.Module):
                 )
 
             with torch.amp.autocast("cuda", enabled=False):
-                # Move codes to the codec's device explicitly: a mismatch here
-                # silently falls back to CPU or raises deep inside the decoder.
-                waveform = codec.decode(codes_qf.unsqueeze(0).to(device=self._codec_device))
+                waveform = self._decode_waveform(codes_qf)
             waveform = waveform.reshape(-1).to(dtype=torch.float32)
 
             # Trim the left-context prefix proportionally: the codec's padding /
