@@ -163,6 +163,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         while True:
             async with self._pause_cond:
                 self._check_idle_available()
+                self._check_frontend_admission()
                 if self._idle_timer is not None:
                     self._idle_timer.cancel()
                     self._idle_timer = None
@@ -170,9 +171,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     self._idle_transition = asyncio.create_task(self._idle_switch(wake=True))
                 transition = self._idle_transition
                 if transition is None:
-                    await self._pause_cond.wait_for(
-                        lambda: self._idle_closed or (not self._paused and not getattr(self, "_sleeping_tags", None))
-                    )
+                    await self._pause_cond.wait_for(lambda: self._idle_closed or self._generation_admission_ready())
                     self._check_idle_available()
                     if admit:
                         self._admitting = getattr(self, "_admitting", 0) + 1
@@ -539,8 +538,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
+            self._cancel_input_pump(input_stream_task)
             if admitting:
                 await self._release_generate_admission()
             reservations = getattr(self, "_interaction_reservations", {})
@@ -552,6 +550,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     await self._drain_interaction_error_tasks(finished_state)
             self._log_summary_and_cleanup(request_id)
             self._arm_idle_sleep()
+
+    def _generation_admission_ready(self) -> bool:
+        self._check_frontend_admission()
+        return not self._paused and not getattr(self, "_sleeping_tags", None)
+
+    def _on_frontend_shutdown(self) -> None:
+        loop = self._output_loop
+        if loop is not None and loop.is_running():
+            loop.create_task(self._notify_generation_waiters())
+
+    async def _notify_generation_waiters(self) -> None:
+        async with self._pause_cond:
+            self._pause_cond.notify_all()
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""
@@ -611,9 +622,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 async with self._pause_cond:
                     # Same full-wake condition as generate()'s gate: streaming
                     # ADDs must not race a partially-asleep engine either (#8678).
-                    await self._pause_cond.wait_for(
-                        lambda: not self._paused and not getattr(self, "_sleeping_tags", None)
-                    )
+                    await self._pause_cond.wait_for(self._generation_admission_ready)
                     self._admitting = getattr(self, "_admitting", 0) + 1
             try:
                 await submit_factory()
@@ -835,6 +844,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         input_stream_task = asyncio.create_task(handle_inputs())
         req_state.input_stream_task = input_stream_task
+        req_state.first_chunk_submitted = first_chunk_submitted
         return input_stream_task
 
     @staticmethod
@@ -906,8 +916,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         try:
             if self._idle_timeout_s is not None:
                 await self._wait_for_admission()
-            self.request_states[request_id] = req_state
             self._final_output_handler()
+            self.request_states[request_id] = req_state
             yield req_state
         except asyncio.CancelledError:
             with anyio.CancelScope(shield=True):

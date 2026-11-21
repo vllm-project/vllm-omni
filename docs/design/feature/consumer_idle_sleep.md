@@ -98,8 +98,12 @@ When idle sleep is enabled, `shutdown()` synchronously sets `_idle_closed = True
 before delegating to `super().shutdown(timeout)`, cancels the timer and shared
 transition on the owning event loop (directly when on-loop, or via
 `call_soon_threadsafe` when called from another thread), and immediately tears
-down the engine so any blocked RPC unblocks without waiting for a shutdown
-budget. Late lifecycle/RPC calls check `_idle_closed` before issuing another
+down the engine after the base frontend shutdown has closed admission,
+queued fatal errors and released request waiters on the serving loop. The
+admission gate also binds the serving loop before waiting for sleep or wake,
+so upstream shutdown can find and release those waiters. Engine teardown
+unblocks blocked RPCs without waiting for the idle transition timeout.
+Late lifecycle/RPC calls check `_idle_closed` before issuing another
 operation, transition cancellation during shutdown is nonfatal, and repeated
 `shutdown()` calls are idempotent.
 

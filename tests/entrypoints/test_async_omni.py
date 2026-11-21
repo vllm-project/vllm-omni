@@ -91,6 +91,8 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni.log_stats = False
     omni.request_states = {}
     omni._final_output_handler = lambda: None
+    omni._check_frontend_admission = lambda: None
+    omni._frontend_shutting_down = False
     omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
     omni._compute_final_stage_id = lambda output_modalities: 0
     omni._compute_final_output_stage_ids = lambda output_modalities: [0]
@@ -1009,7 +1011,7 @@ _DIFFUSION_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 _OMNI_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -1037,7 +1039,7 @@ async def test_diffusion_generate_request_id(async_omni_runner_function):
         assert output.request_id != ""
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

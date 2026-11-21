@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import threading
 from argparse import Namespace
 
 import pytest
@@ -16,8 +17,16 @@ from vllm_omni.errors import OmniClientError
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def prepare_frontend_shutdown(omni):
+    omni._output_loop = None
+    omni._output_loop_lock = threading.Lock()
+    omni._frontend_shutting_down = False
+    omni._check_frontend_admission = AsyncOmni._check_frontend_admission.__get__(omni)
+
+
 def make_omni(stage_types=("llm",)):
     omni = _make_omni(stage_types=list(stage_types))
+    prepare_frontend_shutdown(omni)
     omni.request_states = {}
     omni._pending_submits = {}
     omni.final_output_task = None
@@ -283,6 +292,34 @@ async def test_shutdown_before_transition_starts_raises_engine_dead():
         await waiter
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("off_loop", [False, True])
+async def test_shutdown_releases_paused_admission_before_output_pump(enabled, off_loop):
+    omni = make_omni()
+    omni._idle_timeout_s = 300.0 if enabled else None
+    omni._paused = True
+    waiter = asyncio.create_task(omni._wait_for_admission())
+    try:
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert omni.final_output_task is None
+        assert omni._output_loop is asyncio.get_running_loop()
+        if off_loop:
+            await asyncio.to_thread(omni.shutdown)
+        else:
+            omni.shutdown()
+        with pytest.raises(OmniEngineDeadError):
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=1)
+        assert omni._frontend_shutting_down
+        assert not omni.request_states
+        assert omni._idle_timer is None
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+
 async def test_enable_idle_sleep_validates_engine_state(monkeypatch):
     from vllm_omni.config.omni_config import OmniStageModelConfig
 
@@ -333,6 +370,7 @@ async def test_generate_registers_before_submit_and_preserves_arrival(
         return asyncio.create_task(asyncio.sleep(0))
 
     omni = get_async_omni_instance(fake_add_request=add)
+    prepare_frontend_shutdown(omni)
     omni.final_output_task = None
     omni._shutdown_base = lambda: None
     e2e_starts = []
@@ -382,6 +420,7 @@ async def test_generate_registers_before_submit_and_preserves_arrival(
 
 async def test_generate_failure_before_registration_rearms_without_abort(mocker):
     omni = get_async_omni_instance()
+    prepare_frontend_shutdown(omni)
     omni.final_output_task = None
     omni._shutdown_base = lambda: None
     omni.engine.stage_configs = make_omni(("diffusion",)).engine.stage_configs
