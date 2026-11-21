@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm_omni.diffusion.prepared_denoise import PreparedDenoiseInputs
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.schedule import AttentionSchedule, AttentionSigmaSchedule
     from vllm_omni.diffusion.data import DiffusionOutput
@@ -137,6 +139,9 @@ class StepRequestState:
     # become part of the shared step-execution contract.
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # Shared lifecycle owner for optional model-prepared denoise inputs.
+    prepared_denoise: PreparedDenoiseInputs[object] = field(default_factory=PreparedDenoiseInputs)
 
     # ── Runner-owned profiling metadata ──
     stage_durations: dict[str, float] = field(default_factory=dict)

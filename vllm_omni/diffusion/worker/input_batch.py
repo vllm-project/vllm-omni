@@ -19,6 +19,7 @@ import torch
 
 from vllm_omni.diffusion.distributed.member_batch import ExecutionBatch
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import prompt_update_versions
+from vllm_omni.diffusion.prepared_denoise import PreparedDenoiseInputs
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
@@ -633,6 +634,8 @@ class InputBatch:
     negative_txt_seq_lens: list[int] | None = None
     use_mixfusion: bool = False
     states: Sequence[StepRequestState] = field(default_factory=tuple)
+    # Rebound from the current ordered members on every runner execution.
+    prepared_denoise: tuple[PreparedDenoiseInputs[object], ...] = ()
     execution_batch: ExecutionBatch | None = None
 
     # For midway prompt updates (typically for video generation) that changes embeddings without changing ids,
@@ -640,6 +643,7 @@ class InputBatch:
     _prompt_update_versions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        self.prepared_denoise = tuple(state.prepared_denoise for state in self.states)
         if len(self.request_ids) != int(self.idx_mapping.numel()):
             raise ValueError("`request_ids` and `idx_mapping` must have the same length.")
         if self.num_reqs != len(self.request_ids):
@@ -687,6 +691,7 @@ class InputBatch:
         # Same-composition cache hits reuse static prompt fields; request ids
         # must keep the same encoded prompt metadata for the batch lifetime.
         self.states = tuple(selected_states)
+        self.prepared_denoise = tuple(state.prepared_denoise for state in selected_states)
         self._refresh_dynamic_fields(selected_states)
 
     def _rebuild(

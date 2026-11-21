@@ -160,6 +160,35 @@ def _set_step_index(state, step: int) -> None:
     state.extra[mod._STEP_SAMPLING_STATE].step_index = step
 
 
+def test_h3_step_binds_request_owned_rope_from_input_batch(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    branch, video_rows, audio_rows = _make_branch(
+        text_len=1, latent_t=1, latent_h=2, latent_w=2, audio_t=1, seed=5
+    )
+    rope = torch.zeros(branch.seq_len, 6, dtype=torch.bfloat16)
+    model = SimpleNamespace(prepare_rope_table=lambda position_ids, *, seq_len: rope)
+    state = _make_state("a", model, branch, video_rows, audio_rows, [1.0, 0.0], [1.0, 0.0])
+    pipeline = _step_pipeline(model)
+    monkeypatch.setattr(mod.current_omni_platform, "is_npu", lambda: True)
+
+    state.prepared_denoise.prepare(lambda: pipeline.prepare_denoise_inputs(state))
+    batch = InputBatch.make_batch([state])
+    pipeline.bind_prepared_denoise_inputs(batch)
+    kwargs = branch.forward_kwargs(
+        video_rows=video_rows,
+        audio_rows=audio_rows,
+        t_video=1.0,
+        t_audio=1.0,
+        imgvid_cond_timestep=1.0,
+        audio_ref_cond_timestep=1.0,
+    )
+    assert kwargs["rope_table"] is rope
+    state.prepared_denoise.release()
+    with pytest.raises(RuntimeError, match="stale"):
+        branch.prepared_rope.bind()
+
+
 def _step_pipeline(model, *, packed_batch_supported: bool = True):
     """A pipeline instance carrying only what the step methods touch."""
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline

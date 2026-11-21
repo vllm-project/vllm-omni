@@ -4543,6 +4543,19 @@ class MiniMaxH3Pipeline(
         )
         return state
 
+    def prepare_denoise_inputs(self, state: StepRequestState) -> object:
+        """Build the final rank-local RoPE table after step layout is fixed."""
+        if not current_omni_platform.is_npu():
+            return None
+        branch = state.extra[_STEP_BRANCH]
+        transformer = state.extra[_STEP_TRANSFORMER]
+        return branch.build_rope_table(transformer)
+
+    def bind_prepared_denoise_inputs(self, input_batch: InputBatch) -> None:
+        """Attach each request's table in current batch order."""
+        for state, prepared in zip(input_batch.states, input_batch.prepared_denoise, strict=True):
+            state.extra[_STEP_BRANCH].bind_prepared_rope(prepared)
+
     def denoise_step(
         self,
         input_batch: InputBatch,

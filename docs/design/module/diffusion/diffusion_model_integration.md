@@ -59,6 +59,27 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+## Request-scoped prepared denoise inputs
+
+Step-execution pipelines may implement `prepare_denoise_inputs(state)` after
+`prepare_encode` has finalized the model layout. The runner publishes the
+returned model-specific value in `StepRequestState.prepared_denoise` only after
+preparation succeeds. `InputBatch.prepared_denoise` presents references to those
+request-owned stores in the current batch order. A pipeline with special packing
+may implement
+`bind_prepared_denoise_inputs(batch)` to attach them to its model inputs.
+
+The runtime invalidates prepared values at a chunk boundary and releases them
+when a request completes, fails, or is cancelled. A model defines which inputs
+are safe to prepare, invalidates them on any other relevant dependency change,
+and defines how CFG branches and rank-local layouts consume them.
+Request-mode pipelines enter `prepared_denoise_scope(prepare=..., bind=...)`
+after encoding and layout finalization. The scope invokes the model's builder,
+publishes its complete result, and calls the model's binding hook before the
+denoise loop begins. It releases the result after the loop, including on
+preparation failure or cancellation. Unlike step execution, request-mode
+pipelines do not use `StepRequestState` or `InputBatch`.
+
 Qwen-Image-Edit-Plus initializes its Qwen2.5-VL encoder on CPU before sharding
 and moving it to the execution device. Its non-persistent FP32 RoPE frequency
 buffers must match Diffusers' CPU initialization: computing them on the
