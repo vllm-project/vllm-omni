@@ -27,7 +27,10 @@ from vllm_omni.diffusion.data import (
     TransformerConfig,
 )
 
-_FOUR_CARD = hardware_marks(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=4)
+# Selected by the CUDA Ready lane "Diffusion · Distributed & Attention Test · 4-GPU"
+# (`core_model and cuda and L4 and cards_4`). No ROCm or XPU lane runs 4-card
+# diffusion tests at the core_model level, so those platforms are not marked.
+_FOUR_CARD = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 
 # Heads divide by TP x Ulysses; attention_head_dim == sum(axes_dims_rope).
 _CONFIG: dict[str, Any] = dict(
@@ -157,7 +160,7 @@ def _run(world_size: int, tp: int, ulysses: int, checkpoint) -> list[dict]:
         return sorted((queue.get() for _ in range(world_size)), key=lambda report: report["rank"])
 
 
-@pytest.mark.full_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
 @pytest.mark.parametrize("world_size", [pytest.param(4, marks=_FOUR_CARD)])
