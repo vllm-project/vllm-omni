@@ -1873,6 +1873,12 @@ class OmniDiffusionConfig:
                     "that require additional inputs."
                 )
             else:
+                # Ming-Image shares its AR root config with Ming-flash. Preserve
+                # the native pipeline selected by the stage topology and load
+                # its diffusion configuration from the transformer component.
+                if self.model_class_name == "MingImageDiffusionPipeline" and self._load_component_transformer_config():
+                    self.update_multimodal_support()
+                    return
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
                     native_model_class = resolve_native_diffusion_model_class(self.model)
