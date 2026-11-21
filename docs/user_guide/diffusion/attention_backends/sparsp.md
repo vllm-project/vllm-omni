@@ -99,3 +99,15 @@ latency, and bytes sent across all ranks. For four ranks, the report also
 counts bytes crossing the rank-pair boundary. Add `--include-pair-relay`
 on a two-pair topology or `--placement-grid 40 24 48` for the 46,080-token
 periodic refinement capture.
+
+In a 45-call-per-policy LTX-2 replay on four PCIe L40 GPUs with NCCL
+2.32.6 and CDF 0.90, the full Ring and paired manifest paths produced
+bitwise-identical BF16 outputs.
+
+| Capture | Full Ring | Paired manifest |
+| --- | ---: | ---: |
+| Generation, 11,520 tokens | 11.935 ms | 11.961 ms |
+| Refinement, 46,080 tokens | 46.152 ms | 45.349 ms |
+
+The refinement capture sent 3.92% fewer total K/V bytes and 35.13% fewer
+cross-socket K/V bytes. The timings measure attention calls on captured inputs.
