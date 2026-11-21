@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from vllm.multimodal.processing import ProcessorInputs
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.models.ming_image.pipeline import (
     MingImageDiffusionPipeline,
     _validate_variant_config,
@@ -164,6 +167,31 @@ def test_layer_forward_returns_decode_duration_only_when_profiled(monkeypatch, p
         assert result.stage_durations["MingImageDiffusionPipeline.vae.decode"] == 0.5
     else:
         assert result.stage_durations is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "devices", "vae_parallel", "mode"),
+    [
+        ("ming_image_layer_tiled.yaml", "1", 1, "tile"),
+        ("ming_image_layer_tile_parallel.yaml", "1,2", 2, "tile"),
+        ("ming_image_layer_spatial_shard.yaml", "1,2", 2, "spatial_shard_height"),
+        ("ming_image_layer_spatial_shard_width.yaml", "1,2", 2, "spatial_shard_width"),
+    ],
+)
+def test_layer_vae_deploy_topology(filename, devices, vae_parallel, mode):
+    path = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / filename
+    load_deploy_config(path)
+    config = yaml.safe_load(path.read_text())
+    stage = next(stage for stage in config["stages"] if stage["stage_id"] == 1)
+    assert stage["devices"] == devices
+    assert stage["vae_use_tiling"] is True
+    parallel = DiffusionParallelConfig(**stage.get("parallel_config", {}))
+    assert parallel.vae_patch_parallel_size == vae_parallel
+    assert parallel.vae_parallel_mode == mode
+    group_size = (
+        parallel.tensor_parallel_size * parallel.ulysses_degree * parallel.ring_degree * parallel.allgather_degree
+    )
+    assert len(stage["devices"].split(",")) == group_size == parallel.vae_patch_parallel_size
 
 
 def test_layer_pipeline_allows_missing_reference_only_for_dummy_run():
