@@ -1,0 +1,206 @@
+"""Serial same-window current-PR requests with byte-level media/activation gates."""
+import argparse
+import copy
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+import lifecycle as life
+
+
+def verify_sources(config, kind):
+    runtime = config["runtimes"][kind]
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=runtime["path"], text=True).strip() == runtime["revision"]
+    for name, value in runtime["hashes"].items():
+        assert life.sha(Path(runtime["path"]) / name) == value, name
+    for name, value in config["tool_sha256"].items():
+        assert life.sha(ROOT / name) == value, name
+    for name, value in config["input_sha256"].items():
+        assert life.sha(name) == value, name
+    for item in config["model_files"]:
+        current = Path(item["path"]).stat()
+        assert current.st_size == item["bytes"] and current.st_mtime_ns == item["mtime_ns"], item["path"]
+
+
+def setup(config, stage, window, port):
+    verify_sources(config, stage["kind"])
+    window.mkdir(parents=True, exist_ok=False)
+    with socket.socket() as sock:
+        assert sock.connect_ex(("127.0.0.1", port)) != 0, "allocated port is occupied"
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith(("H3_", "VLLM_OMNI_H3_", "VLLM_OMNI_MINIMAX_H3_", "BENCH_")):
+            env.pop(key)
+    env.update(config["environment"])
+    runtime = config["runtimes"][stage["kind"]]
+    env.update(PERF_KIND=stage["kind"], PERF_WINDOW=str(window),
+               PYTHONPATH=runtime["path"] + ":" + str(ROOT) + ":" + env.get("PYTHONPATH", ""))
+    args = [config["python"], str(ROOT / "server.py"), "serve", config["model_root"],
+            "--port", str(port), *config["cli"]]
+    if stage["kind"] == "encoder":
+        args += ["--additional-config", json.dumps({"encoder_weight_transfer": stage["packed"]})]
+    life.write(window / "launch.json", {"argv": args, "source_revision": runtime["revision"],
+        "environment": config["environment"], "cards": os.environ["NPUQ_PHYSICAL_DEVICES"],
+        "master_port": os.environ["MASTER_PORT"], "service_port": port})
+    with (window / "server.log").open("w") as log:
+        proc = subprocess.Popen(args, cwd=runtime["path"], env=env, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+    life.write(window / "owner.json", life.identity(proc.pid))
+    deadline = time.monotonic() + config["startup_timeout"]
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            print((window / "server.log").read_text()[-16000:], file=sys.stderr)
+            raise RuntimeError("owned service exited during startup")
+        life.record_children(window)
+        try:
+            result = life.get_models(port)
+            assert result["data"][0]["id"] == config["model_root"]
+            life.write(window / "models.json", result)
+            print("SERVICE_READY", stage["name"], flush=True)
+            return
+        except (OSError, AssertionError):
+            time.sleep(2)
+    raise TimeoutError("current-PR service startup timed out")
+
+
+def request(config, stage, window, port, phase_dir, phase):
+    assert life.alive(json.loads((window / "owner.json").read_text()))
+    records = json.loads((window / "records.json").read_text()) if (window / "records.json").exists() else []
+    formal = ".formal" in phase
+    if formal:
+        assert sum(x["stage"] == stage["name"] and x["phase"] == "warmup" for x in records) == 2
+    if stage["kind"] == "rgb":
+        subprocess.run([config["python"], str(ROOT / "cpu_prepare.py"),
+                        "true" if stage["reuse"] else "false", str(phase_dir / "cpu-prepare.json")], check=True)
+    context = {"nonce": os.urandom(16).hex(), "stage": stage["name"], "capture": not formal,
+               "stats_dir": str(phase_dir / "stats")}
+    life.write(window / "active-request.json", context)
+    offset = (window / "server.log").stat().st_size
+    helper, request_config, job = life.request_helper(config)
+    params = copy.deepcopy(request_config["request"])
+    if stage["kind"] == "rgb":
+        params.setdefault("extra_params", {})["reference_video_decode_reuse"] = stage["reuse"]
+    multipart_original = helper.benchmark.encode_multipart
+    def feature_multipart(fields, files):
+        extra = json.loads(fields["extra_params"])
+        extra.update(params.get("extra_params", {}))
+        fields["extra_params"] = json.dumps(extra)
+        return multipart_original(fields, files)
+    helper.benchmark.encode_multipart = feature_multipart
+    statuses = []
+    original = helper.urllib.request.urlopen
+    def checked(*args, **kwargs):
+        response = original(*args, **kwargs)
+        statuses.append(response.status)
+        assert response.status == 200
+        return response
+    helper.urllib.request.urlopen = checked
+    try:
+        media, response = helper.send_request(f"http://127.0.0.1:{port}", job["data_dir"], job["case"],
+            12, 480, 864, params, config["request_timeout"])
+    finally:
+        helper.urllib.request.urlopen = original
+        helper.benchmark.encode_multipart = multipart_original
+    assert statuses == [200]
+    path = phase_dir / "case01.mp4"
+    path.write_bytes(media)
+    life.write(phase_dir / "result.json", {"nonce": context["nonce"], "stage": stage["name"],
+        "phase": "formal" if formal else "warmup", "label": phase, "http_status": 200,
+        "bytes": len(media), "video": str(path), "sha256": life.sha(path),
+        "http_e2e_s": response["http_seconds"], "response": response, "log_offset": offset})
+    print("REQUEST_RECEIVED", phase, response["http_seconds"], flush=True)
+
+
+def validate(config, stage, window, phase_dir):
+    record = json.loads((phase_dir / "result.json").read_text())
+    assert record["http_status"] == 200 and record["bytes"] > 100000
+    assert life.sha(record["video"]) == record["sha256"]
+    info = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-count_frames", "-show_streams",
+        "-show_format", "-of", "json", record["video"]]))
+    helper, _, _ = life.request_helper(config)
+    helper.validate_media(info, 480, 864, 12)
+    assert sum(x["codec_type"] == "video" for x in info["streams"]) == 1
+    assert sum(x["codec_type"] == "audio" for x in info["streams"]) == 1
+    subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", record["video"],
+        "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"], check=True, capture_output=True)
+    files = [phase_dir / "stats" / f"rank{x}.json" for x in range(8)]
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        text = (window / "server.log").read_bytes()[record["log_offset"]:].decode(errors="replace")
+        if all(p.exists() for p in files) and 'POST /v1/videos/sync' in text and '200' in text:
+            break
+        assert life.alive(json.loads((window / "owner.json").read_text()))
+        time.sleep(0.5)
+    assert all(p.exists() for p in files), "missing eight-rank completion records"
+    (phase_dir / "request-server.log").write_text(text)
+    assert 'POST /v1/videos/sync' in text and '200' in text
+    rows = [json.loads(p.read_text()) for p in files]
+    for rank, row in enumerate(rows):
+        assert row["nonce"] == record["nonce"] and row["rank"] == rank
+        assert row["world_size"] == 8 and row["encoder_tp"] == 8 and row["deterministic"]
+        assert row["counts"]["dit"] == 8 and row["counts"]["encode"] > 0
+        if stage["kind"] == "encoder":
+            assert row["packed_stager"] == (stage["packed"] == "packed")
+            if stage["packed"] == "packed":
+                assert row["counts"]["prepare_packed"] > 0
+                if record["phase"] == "formal":assert row["counts"]["new_pack"] == 0
+    records = json.loads((window / "records.json").read_text()) if (window / "records.json").exists() else []
+    # Each PR is its own current-source comparison. No historical clip hash is substituted.
+    gate_file = window.parent / ("encoder-byte-gate.json" if stage["kind"] == "encoder" else "rgb-byte-gate.json")
+    if gate_file.exists():
+        gate = json.loads(gate_file.read_text())
+        assert record["sha256"] == gate["media_sha256"], "same/current-config output is not byte-identical"
+    else:
+        gate = {"media_sha256": record["sha256"]}
+    if record["phase"] == "warmup":
+        tensors = {str(x["rank"]): x["tensors"] for x in rows}
+        assert all("encoder_output" in x["tensors"] for x in rows), "missing warmup encoder fingerprints"
+        if "tensors" in gate:assert tensors == gate["tensors"], "warmup activation bytes changed"
+        else:gate["tensors"] = tensors
+    if stage["kind"] == "rgb":
+        cpu = json.loads((phase_dir / "cpu-prepare.json").read_text())
+        signature = {k:cpu[k] for k in ["video_sha256", "qwen_sha256", "timestamps", "audio_sha256", "video_shapes"]}
+        if "cpu_signature" in gate:assert signature == gate["cpu_signature"], "RGB preparation changed pixels/timestamps"
+        else:gate["cpu_signature"] = signature
+        record["cpu_prepare_s"] = cpu["seconds"]
+        events = [json.loads(line) for p in (phase_dir / "stats").glob("events-*.jsonl") for line in p.read_text().splitlines()]
+        transcodes = [x for x in events if x["event"] == "transcode_reference_video"]
+        assert transcodes and all(x["rgb_output"] == stage["reuse"] for x in transcodes), "RGB path not exercised"
+        record["rgb_events"] = events
+    life.write(gate_file, gate)
+    record.update(status="ok", rank_stats=rows,
+        encode_prompt_s=max(x["durations"].get("encode_prompt",0) for x in rows),
+        dit_s=max(x["durations"].get("diffuse",0) for x in rows))
+    assert record["encode_prompt_s"] > 0 and record["dit_s"] > 0
+    records.append(record)
+    life.write(window / "records.json", records)
+    life.write(phase_dir / "result.json", record)
+    life.write(phase_dir / "media-validation.json", info)
+    life.record_children(window)
+    print("VALIDATED", record["label"], record["http_e2e_s"], flush=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["setup", "request", "validate", "teardown"])
+    parser.add_argument("stage")
+    args = parser.parse_args()
+    assert os.environ.get("NPUQ_JOB_ID")
+    assert list(map(int, os.environ["NPUQ_PHYSICAL_DEVICES"].split(","))) == list(range(8))
+    config = json.loads((ROOT / "run-manifest.json").read_text())
+    stage = next(x for x in config["stages"] if x["name"] == args.stage)
+    base = ROOT / "jobs" / os.environ["NPUQ_JOB_ID"]
+    base.mkdir(parents=True, exist_ok=True)
+    window = base / (stage["name"] if stage["kind"] == "encoder" else "rgb")
+    phase = Path(os.environ["NPUQ_PHASE_DIR"])
+    port = int(os.environ["MINDIE_SERVICE_PORT"])
+    if args.action == "setup":setup(config,stage,window,port)
+    elif args.action == "request":request(config,stage,window,port,phase,os.environ["NPUQ_PHASE"])
+    elif args.action == "validate":validate(config,stage,window,phase)
+    else:life.teardown(window,port)

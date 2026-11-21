@@ -1,0 +1,63 @@
+"""CPU-only Ref2VA preparation ABA; no accelerator allocation or service."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import random
+import statistics as st
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parent
+manifest = json.loads((ROOT / "run-manifest.json").read_text())
+assert hashlib.sha256((ROOT / "cpu_prepare.py").read_bytes()).hexdigest() == manifest["tool_sha256"]["cpu_prepare.py"]
+destination = ROOT / "cpu-only"
+destination.mkdir(exist_ok=False)
+env = dict(os.environ)
+env.update(TORCH_DEVICE_BACKEND_AUTOLOAD="0", ASCEND_RT_VISIBLE_DEVICES="", PYTHONDONTWRITEBYTECODE="1")
+rows = []
+signature = None
+for name, enabled in [("off_before", False), ("on", True), ("off_after", False)]:
+    for index in range(5):
+        phase = "warmup" if index < 2 else "formal"
+        label = f"{name}.{phase}{index + 1 if index < 2 else index - 1}"
+        target = destination / (label + ".json")
+        started = time.time()
+        with (destination / (label + ".log")).open("w") as log:
+            subprocess.run([manifest["python"], str(ROOT / "cpu_prepare.py"),
+                            str(enabled).lower(), str(target)], env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        row = json.loads(target.read_text())
+        assert row["source_commit"] == manifest["runtimes"]["rgb"]["revision"]
+        actual = {key: row[key] for key in ["video_sha256", "qwen_sha256", "timestamps", "audio_sha256", "video_shapes"]}
+        if signature is None:
+            signature = actual
+        assert actual == signature, "CPU preparation pixel/timestamp byte gate failed"
+        row.update(stage=name, phase=phase, label=label, started_at_unix=started)
+        rows.append(row)
+        (destination / "records.json").write_text(json.dumps(rows, indent=2) + "\n")
+        print(label, row["seconds"], "exact-input-gate=PASS", flush=True)
+groups = [[r for r in rows if r["stage"] == stage and r["phase"] == "formal"]
+          for stage in ["off_before", "on", "off_after"]]
+values = [[r["seconds"] for r in group] for group in groups]
+means = [st.mean(v) for v in values]
+sd = [st.stdev(v) for v in values]
+times = [st.mean(r["started_at_unix"] for r in group) for group in groups]
+weight = (times[1] - times[0]) / (times[2] - times[0])
+control = (1 - weight) * means[0] + weight * means[2]
+saved = control - means[1]
+rng = random.Random(42)
+bootstrap = []
+for _ in range(10000):
+    a1, b, a2 = [st.mean(rng.choices(v, k=len(v))) for v in values]
+    bootstrap.append((1 - weight) * a1 + weight * a2 - b)
+bootstrap.sort()
+interval = [bootstrap[250], bootstrap[9750]]
+result = {"source_revision": manifest["runtimes"]["rgb"]["revision"],
+          "kind": "independent CPU preparation only", "warmups_per_arm": 2,
+          "formals_per_arm": 3, "requests": rows, "input_signature": signature,
+          "statistics": {"means": means, "sd": sd, "control": control,
+                         "optimized": means[1], "saved": saved, "percent": saved / control * 100,
+                         "control_interpolation_weight": weight, "bootstrap95_saved": interval,
+                         "distinguishable": interval[0] > 0 and saved > max(sd)}}
+(ROOT / "cpu-only-analysis.json").write_text(json.dumps(result, indent=2) + "\n")
+print(json.dumps(result["statistics"], indent=2), flush=True)

@@ -1,0 +1,37 @@
+"""Recompute archived statistics using only public results.json and stdlib."""
+import json
+from pathlib import Path
+import random
+import statistics as st
+import sys
+
+data = json.loads(Path(sys.argv[1]).read_text())
+formal = [r for r in data["requests"] if r["phase"] == "formal"]
+stages = list(dict.fromkeys(r["stage"] for r in formal))
+groups = [[r for r in formal if r["stage"] == stage] for stage in stages]
+assert len(groups) == 3 and all(len(g) == 3 for g in groups)
+times = [st.mean(r["started_at_unix"] for r in group) for group in groups]
+weight = (times[1] - times[0]) / (times[2] - times[0])
+keys = {"http_e2e": "http_e2e_s", "encode_prompt": "encode_prompt_s", "dit": "dit_s"}
+if "cpu_prepare" in data["statistics"]:
+    keys["cpu_prepare"] = "cpu_prepare_s"
+for label, key in keys.items():
+    values = [[r[key] for r in group] for group in groups]
+    means = [st.mean(v) for v in values]
+    sd = [st.stdev(v) for v in values]
+    control = (1 - weight) * means[0] + weight * means[2]
+    saved = control - means[1]
+    rng = random.Random(42)
+    samples = []
+    for _ in range(10000):
+        a1, b, a2 = [st.mean(rng.choices(v, k=len(v))) for v in values]
+        samples.append((1 - weight) * a1 + weight * a2 - b)
+    samples.sort()
+    interval = [samples[250], samples[9750]]
+    actual = {"means": means, "sd": sd, "control": control,
+              "optimized": means[1], "saved": saved,
+              "bootstrap95_saved": interval,
+              "distinguishable": interval[0] > 0 and saved > max(sd)}
+    expected = data["statistics"][label]
+    assert all(v == expected[k] for k, v in actual.items()), label
+    print(label, json.dumps(actual))

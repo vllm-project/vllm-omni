@@ -1,0 +1,565 @@
+{
+  "source_revision": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+  "kind": "independent CPU preparation only",
+  "warmups_per_arm": 2,
+  "formals_per_arm": 3,
+  "requests": [
+    {
+      "seconds": 2.906921025365591,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_before",
+      "phase": "warmup",
+      "label": "off_before.warmup1",
+      "started_at_unix": 1795173257.7864904
+    },
+    {
+      "seconds": 2.9553449787199497,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_before",
+      "phase": "warmup",
+      "label": "off_before.warmup2",
+      "started_at_unix": 1795173295.315568
+    },
+    {
+      "seconds": 3.0241343220695853,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_before",
+      "phase": "formal",
+      "label": "off_before.formal1",
+      "started_at_unix": 1795173332.096795
+    },
+    {
+      "seconds": 2.8477380769327283,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_before",
+      "phase": "formal",
+      "label": "off_before.formal2",
+      "started_at_unix": 1795173370.456428
+    },
+    {
+      "seconds": 3.024515276774764,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_before",
+      "phase": "formal",
+      "label": "off_before.formal3",
+      "started_at_unix": 1795173407.62245
+    },
+    {
+      "seconds": 2.9145293897017837,
+      "reuse": true,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "on",
+      "phase": "warmup",
+      "label": "on.warmup1",
+      "started_at_unix": 1795173445.2008786
+    },
+    {
+      "seconds": 2.8834400698542595,
+      "reuse": true,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "on",
+      "phase": "warmup",
+      "label": "on.warmup2",
+      "started_at_unix": 1795173483.2180552
+    },
+    {
+      "seconds": 2.583985222969204,
+      "reuse": true,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "on",
+      "phase": "formal",
+      "label": "on.formal1",
+      "started_at_unix": 1795173521.12204
+    },
+    {
+      "seconds": 2.509830572642386,
+      "reuse": true,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "on",
+      "phase": "formal",
+      "label": "on.formal2",
+      "started_at_unix": 1795173558.0806901
+    },
+    {
+      "seconds": 2.56851378781721,
+      "reuse": true,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "on",
+      "phase": "formal",
+      "label": "on.formal3",
+      "started_at_unix": 1795173594.205702
+    },
+    {
+      "seconds": 3.145805337931961,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_after",
+      "phase": "warmup",
+      "label": "off_after.warmup1",
+      "started_at_unix": 1795173630.6585932
+    },
+    {
+      "seconds": 3.2508449107408524,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_after",
+      "phase": "warmup",
+      "label": "off_after.warmup2",
+      "started_at_unix": 1795173669.2792194
+    },
+    {
+      "seconds": 3.1245140191167593,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_after",
+      "phase": "formal",
+      "label": "off_after.formal1",
+      "started_at_unix": 1795173707.0029655
+    },
+    {
+      "seconds": 2.9095167913474143,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_after",
+      "phase": "formal",
+      "label": "off_after.formal2",
+      "started_at_unix": 1795173746.281461
+    },
+    {
+      "seconds": 3.4904434350319207,
+      "reuse": false,
+      "video_sha256": [
+        "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+      ],
+      "video_shapes": [
+        [
+          52,
+          1280,
+          704,
+          3
+        ]
+      ],
+      "qwen_sha256": [
+        "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+      ],
+      "timestamps": [
+        [
+          0.25,
+          1.25,
+          2.0
+        ]
+      ],
+      "audio_sha256": [
+        "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+      ],
+      "source_commit": "cef8d680fccbc38ce3901ec051a3f91ea1d2ecfa",
+      "stage": "off_after",
+      "phase": "formal",
+      "label": "off_after.formal3",
+      "started_at_unix": 1795173783.5114357
+    }
+  ],
+  "input_signature": {
+    "video_sha256": [
+      "a4ea8caa4ebd971ae09b1bc0e818f8edaffd57b3b10db8a6fbc611012e165484"
+    ],
+    "qwen_sha256": [
+      "f5bdd305f0a62a59a89aec1d79b40d2d8e828071c604c901d8033e8b5aad3276"
+    ],
+    "timestamps": [
+      [
+        0.25,
+        1.25,
+        2.0
+      ]
+    ],
+    "audio_sha256": [
+      "7edbb4ec58389a9264f511ac258c2941a31f8607d7e48fce113ad272ceb05482"
+    ],
+    "video_shapes": [
+      [
+        52,
+        1280,
+        704,
+        3
+      ]
+    ]
+  },
+  "statistics": {
+    "means": [
+      2.965462558592359,
+      2.5541098611429334,
+      3.1748247484986982
+    ],
+    "sd": [
+      0.10195256969857815,
+      0.039119469180979735,
+      0.2937129865256955
+    ],
+    "control": 3.0701292821096926,
+    "optimized": 2.5541098611429334,
+    "saved": 0.5160194209667592,
+    "percent": 16.807742396182338,
+    "control_interpolation_weight": 0.4999313561066459,
+    "bootstrap95_saved": [
+      0.3786349594057494,
+      0.6686499538872464
+    ],
+    "distinguishable": true
+  },
+  "dependencies": {
+    "torch": "2.10.0+cpu",
+    "torch-npu": "2.10.0.post2",
+    "vllm": "0.33.0+empty",
+    "vllm-ascend": "0.19.1rc2.dev1251",
+    "transformers": "5.19.0",
+    "diffusers": "0.40.0",
+    "numpy": "1.26.4",
+    "Pillow": "12.3.0",
+    "python": "3.12.13",
+    "platform": "Linux-5.15.152.bsk.10-amd64-x86_64-with-glibc2.35",
+    "ffmpeg": "ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers",
+    "recording_scope": "Installed dependency metadata recorded after encoder measurement and before RGB measurement; shared interpreter unchanged by this task."
+  }
+}
