@@ -156,6 +156,10 @@ Content-Type: application/json
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 | `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
 
+For Step-Audio2, `max_new_tokens` overrides the first (Thinker) stage's token
+budget. Omitting it preserves deployment defaults; later stages keep their
+configured budgets. This is a token limit, not an audio-duration limit.
+
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
 #### Voice Clone Parameters (Base task)
