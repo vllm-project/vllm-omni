@@ -1,66 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+"""Local filesystem storage backend."""
+
 import asyncio
 import contextlib
 import os
 import stat
 import time
-from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 from tempfile import NamedTemporaryFile
-from typing import Generic, Literal, TypeVar
 
 from vllm.logger import init_logger
 
-from vllm_omni.config.server_settings import SERVER_SETTINGS_CONFIG, FileBackend
+from vllm_omni.entrypoints.openai.storage.base import (
+    FileStorageHandle,
+    SaveContext,
+    StorageBackend,
+)
 
 logger = init_logger(__name__)
 
 
-@dataclass
-class SaveContext:
-    key: str
-    created_at: int
-    expires_at: int | None = None
-
-
-@dataclass(frozen=True)
-class BaseStorageHandle:
-    kind: str
-
-
-@dataclass(frozen=True)
-class FileStorageHandle(BaseStorageHandle):
-    path: str
-    kind: Literal["path"] = field(default="path", init=False)
-
-
-K = TypeVar("K", bound=BaseStorageHandle, covariant=True)
-
-
-class StorageBaseManager(Generic[K], ABC):
-    @abstractmethod
-    async def save(self, *args, **kwargs) -> SaveContext:
-        pass
-
-    @abstractmethod
-    async def delete(self, *args, **kwargs) -> bool:
-        pass
-
-    async def start(self, *, on_expire: Callable[[list[str]], Awaitable[None]] | None = None) -> None:
-        pass
-
-    async def stop(self, *args, **kwargs) -> None:
-        pass
-
-    @abstractmethod
-    async def open(self, storage_key: str) -> K | None:
-        pass
-
-
-class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
+class LocalStorageManager(StorageBackend):
     def __init__(self, storage_path: str, max_concurrency: int = 4):
         self.storage_path = os.path.realpath(storage_path)
         os.makedirs(self.storage_path, exist_ok=True)
@@ -196,26 +158,3 @@ class LocalStorageTTLManager(LocalStorageManager):
         with contextlib.suppress(asyncio.CancelledError):
             await self._sweeper_task
         self._sweeper_task = None
-
-
-def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
-    manager: LocalStorageManager
-    if isinstance(storage_config, FileBackend):
-        if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
-            manager = LocalStorageTTLManager(
-                storage_path=storage_config.path,
-                max_concurrency=storage_config.file_concurrency,
-                ttl_seconds=storage_config.file_ttl,
-                sweep_interval_seconds=storage_config.ttl_sweep_interval,
-            )
-        else:
-            manager = LocalStorageManager(
-                storage_path=storage_config.path, max_concurrency=storage_config.file_concurrency
-            )
-    else:
-        raise ValueError("No supported storage managers")
-
-    return manager
-
-
-STORAGE_MANAGER = get_storage_manager(SERVER_SETTINGS_CONFIG.storage)
