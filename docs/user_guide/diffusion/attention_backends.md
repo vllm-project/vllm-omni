@@ -18,6 +18,7 @@ For the internal selector, registry, and platform contract, see
 | Select a conservative or platform-native dense kernel | [Dense Backends](attention_backends/dense_backends.md) |
 | Use FlashInfer trtllm-gen FMHA, Skip-Softmax, or TRTLLM SAGE quantization | [TRTLLM Attention](attention_backends/trtllm.md) |
 | Install and use SageAttention 2.2 or SageAttention3 | [SageAttention](attention_backends/sage.md) |
+| Reduce K/V traffic for LTX-2 Ring with demand routing | [SparSP](attention_backends/sparsp.md) |
 | Use INT8 SPARGE top-k sparse attention on Intel XPU | [SPARGE Attention](attention_backends/sparge.md) |
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
