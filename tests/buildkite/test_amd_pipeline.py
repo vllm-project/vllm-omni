@@ -2076,8 +2076,10 @@ def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
     } <= bagel_deps
     source = Path("tests/e2e/online_serving/test_bagel.py").read_text(encoding="utf-8")
     params_source = source.split("test_params =", maxsplit=1)[1].split("def _build_text2img_messages", maxsplit=1)[0]
-    assert "stage_init_timeout=1800" in params_source
-    assert "init_timeout=2100" in params_source
+    assert "stage_init_timeout=2400" in params_source
+    assert "init_timeout=2700" in params_source
+    assert "stage_init_timeout=1800" not in params_source
+    assert "init_timeout=2100" not in params_source
     img2img_marks = source.split("def test_bagel_img2img_online", maxsplit=1)[0]
     assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in img2img_marks
     text2img_marks = img2img_marks.split("def test_bagel_text2img_online", maxsplit=1)[0]
@@ -2183,8 +2185,11 @@ def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
         source = source_path.read_text(encoding="utf-8")
         marks = source.split(f"def {test_name}", maxsplit=1)[0].rsplit("\n\n", maxsplit=1)[-1]
         assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in marks
-        assert '"stage_init_timeout": 1800' in source
-        assert '"init_timeout": 2100' in source
+        runner_param = source.split("_OMNI_RUNNER_PARAM =", maxsplit=1)[1].split("\n)", maxsplit=1)[0]
+        assert '"stage_init_timeout": 2400' in runner_param
+        assert '"init_timeout": 2700' in runner_param
+        assert '"stage_init_timeout": 1800' not in runner_param
+        assert '"init_timeout": 2100' not in runner_param
 
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         assert "Bagel offline shared · 1-GPU" not in pipeline_path.read_text(encoding="utf-8")
@@ -2750,37 +2755,39 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     assert '--run-level "$run_level"' in runner_text
 
 
-def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
+def test_stable_audio_cpu_offload_has_one_blocking_nightly_owner() -> None:
     label = "Stable Audio CPU Offload"
     step = _find_step(label, AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60
     assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-cpu-offload/**/*"]
     assert "retry" not in step
-    assert "env" not in step
+    assert step["env"] == {"STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK": "1"}
     _assert_build_scoped_aiter_mha_cache(
         step,
         "tests/diffusion/offloader/test_diffusion_cpu_offload.py",
         publishes=False,
     )
 
-    commands = "\n".join(step["commands"])
-    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
-    assert "VLLM_ROCM_USE_AITER" not in commands
-    assert "test_diffusion_layerwise_offload.py" not in commands
-    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
-    assert "full_model and rocm and MI325 and cards_1" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert "pytest.log" in commands
+    assert split(step["commands"][-1]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        "1",
+        "1",
+        "45m",
+        "rocm-stable-audio-cpu-offload",
+        "tests/diffusion/offloader/test_diffusion_cpu_offload.py"
+        "::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]",
+        "-m",
+        "full_model and rocm and MI325 and cards_1",
+    ]
 
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert label not in text
+        assert "STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK" not in text
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
@@ -3320,52 +3327,6 @@ def test_qwen_image_21_accuracy_nightly_splits_the_qualified_case(case: str, gra
         assert f"Qwen-Image 2.1 {case} Accuracy" not in pipeline_path.read_text(encoding="utf-8")
 
 
-def test_minicpmo_4_5_perf_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("MiniCPM-o 4.5 Perf", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "omni_minicpmo_4_5_perf"
-    assert step["artifact_paths"] == ["artifacts/rocm-minicpmo-4-5-perf/**/*"]
-    commands = "\n".join(step["commands"])
-    assert "full_model and omni and rocm and MI325 and cards_1" in commands
-    assert " and cuda" not in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert "--assert-baseline" not in commands
-    assert "test_minicpmo_4_5.json" in commands
-    assert "test_performance_benchmark[test_minicpmo_4_5-seed-tts]" in commands
-    assert "test_minicpmo_4_5_a2" in commands
-    assert "Expected exactly one MiniCPM-o 4.5 perf node" in commands
-    assert commands.count("--shard-id=0 --num-shards=1") == 2
-    assert "Expected exactly one executed MiniCPM-o 4.5 perf test" in commands
-    assert "skipped != 0" in commands
-    assert "Expected exactly 5 MiniCPM-o 4.5 result JSON files" in commands
-    assert "Unreadable MiniCPM-o 4.5 result JSON" in commands
-    assert "A2 MiniCPM-o result must not be produced" in commands
-    assert "result_test_minicpmo_4_5_*.json" in commands
-    assert 'rm -rf "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR"' in commands
-    assert "python3 -c 'import sys, xml.etree.ElementTree as ET" in commands
-    config = json.loads(Path("tests/dfx/perf/tests/test_minicpmo_4_5.json").read_text(encoding="utf-8"))
-    selected = next(case for case in config if case["test_name"] == "test_minicpmo_4_5")
-    selected_res = selected["mark"][0]["hardware_marks"]["res"]
-    assert selected_res["rocm"] == "MI325"
-    assert selected_res["cuda"] == ["H100", "B200"]
-    assert selected_res["npu"] == "A3"
-    assert selected["mark"][0]["hardware_marks"]["num_cards"] == 1
-    assert len(selected["benchmark_params"][0]["max_concurrency"]) == 5
-    assert "MI325" not in selected["benchmark_params"][0]["baseline"]
-    a2 = next(case for case in config if case["test_name"] == "test_minicpmo_4_5_a2")
-    assert "rocm" not in a2["mark"][0]["hardware_marks"]["res"]
-    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
-        text = pipeline_path.read_text(encoding="utf-8")
-        assert "MiniCPM-o 4.5 Perf" not in text
-
-
 def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o Omni-DuplexEval CI Guard", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "NonBlocking"
@@ -3713,70 +3674,6 @@ def test_qwen3_tts_perf_executes_evidence_guards_before_exit(
 
 
 @pytest.mark.parametrize(
-    (
-        "pytest_status",
-        "tests",
-        "skipped",
-        "timeout_status",
-        "result_files",
-        "valid_json",
-        "include_a2",
-        "expected_status",
-    ),
-    [
-        (0, 1, 0, None, 5, True, False, 0),
-        (0, 1, 1, None, 5, True, False, 5),
-        (0, 0, 0, None, 5, True, False, 5),
-        (1, 1, 0, None, 5, True, False, 1),
-        (0, 1, 0, 124, 5, True, False, 124),
-        (0, 1, 0, None, 4, True, False, 5),
-        (0, 1, 0, None, 5, False, False, 5),
-        (0, 1, 0, None, 4, True, True, 5),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout", "missing-result", "invalid-json", "a2-result"),
-)
-def test_minicpmo_4_5_perf_executes_evidence_guards_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    result_files: int,
-    valid_json: bool,
-    include_a2: bool,
-    expected_status: int,
-) -> None:
-    benchmark_dir = tmp_path / "benchmark-results"
-    benchmark_dir.mkdir()
-    result_paths: list[Path] = []
-    for index in range(result_files):
-        result_path = benchmark_dir / f"result_test_minicpmo_4_5_{index}.json"
-        result_path.write_text("{}\n", encoding="utf-8")
-        result_paths.append(result_path)
-    if include_a2:
-        a2_result = benchmark_dir / "result_test_minicpmo_4_5_a2_0.json"
-        a2_result.write_text("{}\n", encoding="utf-8")
-        result_paths.append(a2_result)
-    if not valid_json:
-        result_paths[0].write_text("not-json\n", encoding="utf-8")
-
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label="MiniCPM-o 4.5 Perf",
-        command_fragment='pytest -s -v -ra "$$node"',
-        expected_message="Expected exactly one executed MiniCPM-o 4.5 perf test",
-        artifact_env="ROCM_MINICPMO_PERF_ARTIFACT_DIR",
-        job_id_prefix="minicpmo-4-5-perf-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-        extra_env={"BENCHMARK_DIR": str(benchmark_dir)},
-    )
-
-
-@pytest.mark.parametrize(
     ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
     [
         (0, 1, 0, None, 0),
@@ -3810,9 +3707,9 @@ def test_qwen_image_backend_similarity_executes_junit_guard_before_exit(
     )
 
 
-def test_minicpmo_duplex_function_is_one_nonblocking_nightly_job() -> None:
+def test_minicpmo_duplex_function_is_one_blocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o 4.5 Duplex Function", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
