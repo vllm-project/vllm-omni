@@ -34,7 +34,7 @@ import itertools
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -48,6 +48,11 @@ from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+
+if TYPE_CHECKING:
+    import torch.distributed as dist
+
+    from .vision_parallel import VisionAllToAll
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -540,7 +545,16 @@ class MiniMaxH3Qwen3VLVisionPatchMerger(nn.Module):
         self.act_fn = nn.GELU()
         self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sequence_parallel: VisionAllToAll | None = None) -> torch.Tensor:
+        if sequence_parallel is not None:
+            from .vision_sp import row_aligned_call
+
+            x = x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x
+            x = row_aligned_call(self.norm, x, sequence_parallel, merged=self.use_postshuffle_norm)
+            x = x.view(-1, self.hidden_size)
+            x = row_aligned_call(self.linear_fc1, x, sequence_parallel, merged=True)
+            x = row_aligned_call(self.act_fn, x, sequence_parallel, merged=True)
+            return row_aligned_call(self.linear_fc2, x, sequence_parallel, merged=True)
         x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
@@ -557,7 +571,13 @@ class MiniMaxH3Qwen3VLVisionMLP(nn.Module):
         # (``gelu_pytorch_tanh``), which differs from the exact erf GELU.
         self.act_fn = nn.GELU(approximate="tanh")
 
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_state: torch.Tensor, sequence_parallel: VisionAllToAll | None = None) -> torch.Tensor:
+        if sequence_parallel is not None:
+            from .vision_sp import row_aligned_call
+
+            hidden_state = row_aligned_call(self.linear_fc1, hidden_state, sequence_parallel)
+            hidden_state = row_aligned_call(self.act_fn, hidden_state, sequence_parallel)
+            return row_aligned_call(self.linear_fc2, hidden_state, sequence_parallel)
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
@@ -629,15 +649,26 @@ class MiniMaxH3Qwen3VLVisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        sequence_parallel: VisionAllToAll | None = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        if sequence_parallel is None:
+            normalized = self.norm1(hidden_states)
+            output = self.attn(normalized, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+        else:
+            from .vision_sp import attention_sp8, row_aligned_call
+
+            normalized = row_aligned_call(self.norm1, hidden_states, sequence_parallel)
+            output = attention_sp8(
+                self.attn, normalized, position_embeddings, sequence_parallel, _apply_rotary_pos_emb_vision
+            )
+        hidden_states = hidden_states + output
+        if sequence_parallel is None:
+            hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        else:
+            normalized = row_aligned_call(self.norm2, hidden_states, sequence_parallel)
+            hidden_states = hidden_states + self.mlp(normalized, sequence_parallel=sequence_parallel)
         return hidden_states
 
 
@@ -667,6 +698,9 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
                 for _ in range(len(config.deepstack_visual_indexes))
             ]
         )
+        # Set by MiniMaxH3Qwen3VLEncoder when the SP8 opt-in is enabled; ``None``
+        # keeps the replicated vision path.
+        self.sequence_parallel_group: dist.ProcessGroup | None = None
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size
@@ -697,7 +731,14 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         embeddings = embeddings.flatten(1)
         return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    def fast_pos_embed_interpolate(
+        self, grid_thw: torch.Tensor, *, token_indices: tuple[int, ...] | None = None
+    ) -> torch.Tensor:
+        """Interpolate all positions, or selected rows in final merger order.
+
+        Selection moves only the lookup before interpolation: coordinates, weight
+        conversion and the original four-term addition order remain unchanged.
+        """
         grid_thw_list = grid_thw.tolist()
         grid_ts = [row[0] for row in grid_thw_list]
         grid_hs = [row[1] for row in grid_thw_list]
@@ -731,10 +772,33 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
             for i in range(4):
                 idx_list[i].extend(indices[i].tolist())
                 weight_list[i].extend(weights[i].tolist())
+        if token_indices is not None:
+            # Undo frame repetition and spatial merger ordering using CPU metadata.
+            # Keep the original scalar weights, including their dtype conversion.
+            spatial_rows = []
+            merge = self.spatial_merge_size
+            for token in token_indices:
+                full_start = spatial_start = 0
+                for t, h, w in grid_thw_list:
+                    if full_start <= token < full_start + t * h * w:
+                        row = (token - full_start) % (h * w)
+                        block, inner = divmod(row, merge * merge)
+                        block_y, block_x = divmod(block, w // merge)
+                        inner_y, inner_x = divmod(inner, merge)
+                        spatial_rows.append(spatial_start + (block_y * merge + inner_y) * w + block_x * merge + inner_x)
+                        break
+                    full_start += t * h * w
+                    spatial_start += h * w
+                else:
+                    raise ValueError(f"vision position token index out of range: {token}")
+            idx_list = [[values[row] for row in spatial_rows] for values in idx_list]
+            weight_list = [[values[row] for row in spatial_rows] for values in weight_list]
         idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
         weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+        if token_indices is not None:
+            return patch_pos_embeds
         patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
         patch_pos_embeds_permute = []
         merge_size = self.spatial_merge_size
@@ -753,6 +817,11 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        group = self.sequence_parallel_group
+        if group is not None:
+            from .vision_sp import forward_sp8
+
+            return forward_sp8(self, hidden_states, grid_thw, group=group)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -1136,6 +1205,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         device: torch.device,
         load_model: bool,
         encoder_group: Any | None = None,
+        vision_sp_size: int = 1,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
@@ -1188,6 +1258,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
+        from .vision_parallel import resolve_vision_sp_group
+
+        self.vision.sequence_parallel_group = resolve_vision_sp_group(vision_sp_size, encoder_group)
         self.vision.to(dtype=dtype)
         self.text_model = MiniMaxH3Qwen3VLTextModel(
             encoder_group,
@@ -1199,9 +1272,11 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, "
+            "text_encoder_vision_sp_size=%d",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            vision_sp_size,
         )
 
     @property

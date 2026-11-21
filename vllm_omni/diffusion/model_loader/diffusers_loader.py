@@ -65,7 +65,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, PipelineModules
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
-from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.registry import initialize_model, validate_text_encoder_vision_sp_support
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -1343,6 +1343,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             # + `copy_`, which goes through the caching allocator and is fully
             # tracked by CuMemAllocator.
             model_cls = _resolve_custom_pipeline_cls(custom_pipeline_name)
+            validate_text_encoder_vision_sp_support(self.od_config, model_cls)
             with set_current_diffusion_config(self.od_config):
                 model = model_cls(od_config=self.od_config)
             # HSDP normally defers GPU placement to apply_hsdp_to_model to keep peak
@@ -1361,6 +1362,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model_init_kwargs = {"backbone_meta": True} if backbone_meta else None
                     model = initialize_model(self.od_config, model_init_kwargs=model_init_kwargs)
                 elif load_format == "diffusers":
+                    validate_text_encoder_vision_sp_support(self.od_config, DiffusersAdapterPipeline)
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")

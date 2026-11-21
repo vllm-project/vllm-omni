@@ -349,6 +349,12 @@ class DiffusionParallelConfig:
       (world size / data_parallel_size).
     """
 
+    text_encoder_vision_sp_size: int = 1
+    """MiniMax-H3-only experimental vision SP: 1 (replicated, default) or 8 (requires TP8).
+
+    Reuses the encoder TP group without increasing the DiT world size.
+    """
+
     vae_parallel_mode: str = "tile"
     """VAE parallel decode strategy.
 
@@ -403,6 +409,10 @@ class DiffusionParallelConfig:
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        if self.text_encoder_vision_sp_size not in (1, 8):
+            raise ValueError("text_encoder_vision_sp_size must be 1 (replicated) or 8")
+        if self.text_encoder_vision_sp_size == 8 and self.text_encoder_tp_size != 8:
+            raise ValueError("text_encoder_vision_sp_size=8 requires text_encoder_tp_size=8")
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "

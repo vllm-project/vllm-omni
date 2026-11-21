@@ -321,6 +321,7 @@ class MiniMaxH3ImagePipeline(
     """MiniMax-H3-Image t2i / edit (one image per request)."""
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
+    supports_text_encoder_vision_sp: ClassVar[bool] = True
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
     # Layerwise offload streams the DiT blocks and the Qwen3-VL encoder (the
@@ -429,6 +430,7 @@ class MiniMaxH3ImagePipeline(
             device=self.device,
             load_model=rank < tp_size,
             encoder_group=self.text_encoder_group,
+            vision_sp_size=parallel.text_encoder_vision_sp_size,
         )
         if rank >= tp_size:
             # Ranks outside the text-encoder TP group hold no encoder weights.
