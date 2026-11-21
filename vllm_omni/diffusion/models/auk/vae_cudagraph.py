@@ -223,8 +223,9 @@ class AuKVAEDecodeGraph:
 
         if latents.ndim == 3:
             B, frames, _ = latents.shape
-            window_frames = min(frames, self.tile_frames) if self.tile_frames else frames
-            bucket = self.compiled_bucket(window_frames) or window_frames
+            will_tile = bool(self.enabled and self.tile_frames and frames > self.tile_frames)
+            window_frames = self.tile_frames if will_tile else frames
+            bucket = (self.compiled_bucket(window_frames) or window_frames) if self.enabled else window_frames
             chunk_b = self._max_batch_for_frames(bucket)
             if B > chunk_b:
                 first = self(latents[:chunk_b])

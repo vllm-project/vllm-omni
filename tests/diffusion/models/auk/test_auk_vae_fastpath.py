@@ -546,6 +546,16 @@ def test_vae_decode_micro_batches_large_batches_by_frame_budget() -> None:
     assert seen_batches == [2, 2, 1]
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
+    # With enabled=False (enforce_eager), temporal tiling is bypassed, so micro-batch
+    # sizing must use the full clip length rather than tile_frames.
+    seen_batches.clear()
+    eager_tiled_cfg = AuKVAEDecodeGraph(vae, enabled=False, compile_shapes=(72,), tile_frames=72, max_batch_frames=144)
+    long_latents = torch.randn(3, 144, vae.latent_dim)
+    actual_long = eager_tiled_cfg(long_latents)
+    expected_long = real_decode(long_latents)
+    assert seen_batches == [1, 1, 1]
+    torch.testing.assert_close(actual_long, expected_long, atol=1e-5, rtol=1e-5)
+
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
