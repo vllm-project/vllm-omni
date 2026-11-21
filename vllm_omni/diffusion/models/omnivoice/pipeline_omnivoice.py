@@ -20,7 +20,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -53,6 +53,9 @@ from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
 )
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 from vllm_omni.utils.speaker_cache import get_speaker_cache
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 try:
     from transformers import HiggsAudioV2TokenizerModel
@@ -119,6 +122,35 @@ class _PreparedOmniVoiceRequest:
     seed: int | None
     chunks: _OmniVoiceChunks | None = None
     reference_rms: float | None = None
+
+
+def get_omnivoice_pre_process_func(od_config: OmniDiffusionConfig):
+    """Fill the model's default step count before the request is admitted.
+
+    The step scheduler sizes each request from ``num_inference_steps`` and
+    cannot consult the pipeline, so a caller that leaves it unset (e.g. a bare
+    ``OmniDiffusionSamplingParams()``) would fail admission. The pipeline
+    already falls back to ``config.num_step``; apply the same default here so
+    step and non-step execution behave identically.
+
+    The default is resolved once, when the engine builds its hooks, from the
+    revision-pinned ``config.json`` that ``enrich_config()`` already loaded
+    into ``od_config.tf_model_config``; admission itself does no I/O.
+
+    Like other pre-process hooks, this mutates ``request.sampling_params`` in
+    place, so a caller's params object will carry the filled-in step count.
+    """
+    default_num_step = int(OmniVoiceConfig(**od_config.tf_model_config.to_dict()).num_step)
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        sampling = request.sampling_params
+        # timesteps or sigmas alone are enough: StepScheduler._get_total_steps
+        # sizes the request from them before it asserts num_inference_steps.
+        if sampling.num_inference_steps is None and sampling.timesteps is None and sampling.sigmas is None:
+            sampling.num_inference_steps = default_num_step
+        return request
+
+    return pre_process_func
 
 
 def get_omnivoice_post_process_func(od_config: OmniDiffusionConfig):
