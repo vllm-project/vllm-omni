@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.minimax_h3.vae import (
     MiniMaxH3AudioVAE,
     MiniMaxH3VideoVAE,
 )
+from vllm_omni.diffusion.models.minimax_h3.vae_tile_balance import resolve_video_tile_balance_max_tasks
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_ENCODER_LAYOUT_KEY,
     MINIMAX_H3_ENCODER_REQUEST_KEY,
@@ -113,6 +114,9 @@ class MiniMaxH3Encoder(MiniMaxH3TextEncoderBackbone):
                 device=device,
                 encode_only=True,
                 trust_remote_code=vllm_config.model_config.trust_remote_code,
+                encode_tile_balance_max_tasks=resolve_video_tile_balance_max_tasks(
+                    getattr(vllm_config, "additional_config", None)
+                ),
             )
             if self.component_config.video_parallel_mode == "patch":
                 if tp_group is None:

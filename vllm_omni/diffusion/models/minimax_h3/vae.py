@@ -37,6 +37,7 @@ from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
+from .vae_tile_balance import install_video_tile_balance, video_encode_tile_balance_context
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -366,6 +367,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
+        encode_tile_balance_max_tasks: int | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -489,6 +491,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self._tile_gather_expected_hw: tuple[int, int] | None = None
         if self._tile_gather_reuse_enabled():
             self._install_persistent_tile_gather()
+        install_video_tile_balance(self, encode_tile_balance_max_tasks)
 
     def _build_residency_stagers(self, device: torch.device) -> None:
         """Stage the encode and decode halves of the remote separately.
@@ -1153,10 +1156,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                     # (3, T, H, W) normalized-FP32 contract, so encode_videos
                     # skips its own convert/transform/pad whole-video copies.
                     frames = [prepared]
-                latent = self.model.encode_videos(
-                    frames,
-                    use_fp16_latent=True,
-                )[0]
+                with video_encode_tile_balance_context():
+                    latent = self.model.encode_videos(
+                        frames,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             if previous_dtype != torch.float32:
                 self.to(previous_dtype)
