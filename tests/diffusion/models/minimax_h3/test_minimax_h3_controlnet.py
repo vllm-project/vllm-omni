@@ -50,6 +50,7 @@ class CPUAttention(nn.Module):
 
 @pytest.fixture
 def cpu_layers(monkeypatch):
+    monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(blocks, "Attention", CPUAttention)
     with ExitStack() as stack:
         for module in (

@@ -39,6 +39,8 @@ _V1_2_EIGHT_STEP = "minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors"
 
 @pytest.fixture(autouse=True)
 def _use_tiny_h3_dimensions(monkeypatch):
+    # CPU weight-layout tests do not need CUDA-backed pinned memory.
+    monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
     monkeypatch.setattr(lora_module, "_TURBO_TARGET_DIMS", _TINY_TARGET_DIMS)
     monkeypatch.setattr(lora_module, "_TURBO_ADALN_TARGET_DIMS", _TINY_ADALN_TARGET_DIMS)
 
