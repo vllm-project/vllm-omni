@@ -4218,9 +4218,8 @@ def test_multiview_system_prompt_matches_reference_selection(transfer: bool, joi
 )
 @pytest.mark.parametrize("joint", [False, True])
 def test_multiview_forward_per_view_negative_captions(
-    make_cosmos3_pipeline, monkeypatch, source, explicit, expected, joint: bool
+    make_cosmos3_pipeline, source, explicit, expected, joint: bool
 ) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as pipeline_module
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
     from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
 
@@ -4231,8 +4230,8 @@ def test_multiview_forward_per_view_negative_captions(
     pipeline.multiview_cross_view_past_window_seconds = 0.4
     pipeline.multiview_backend = "triton"
     pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
-    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
-    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
+    lidar_control = torch.zeros(1, 128, 10, 1, 3) if joint else None
+    pipeline._encode_inputs = lambda **kwargs: (None, torch.zeros(1, 2, 150, 1, 1), lidar_control, None)
     pipeline._prepare_multiview_latents = lambda **kwargs: (
         torch.zeros(1, 2, 150, 1, 1),
         torch.ones(1, 1, 150, 1, 1),
@@ -4245,7 +4244,10 @@ def test_multiview_forward_per_view_negative_captions(
         return kwargs["latents"]
 
     pipeline.diffuse_transfer = diffuse
-    pipeline._decode_multiview_latents = lambda *args, **kwargs: torch.zeros(1)
+    pipeline._decode_outputs = lambda final_targets, **kwargs: (
+        torch.zeros(1),
+        torch.zeros(1, 3, final_targets[1].shape[2], 1, 3) if kwargs["return_lidar"] else None,
+    )
     tokenizations = _capture_tokenize_calls(pipeline)
     views = [
         {"camera_key": COSMOS3_MADS_CAMERAS[1], "prompt": "A truck passes.", "control_path": "right.mp4"},
@@ -4254,19 +4256,8 @@ def test_multiview_forward_per_view_negative_captions(
     extra = {"multiview": {"views": views}, "wsm": {}, "aspect_ratio": "16,9"}
     if joint:
         extra["lidar"] = {"control_path": "lidar.safetensors", "return_output": True}
-        monkeypatch.setattr(
-            pipeline_module, "load_lidar_frames", lambda path, num_sweeps: torch.zeros(3, num_sweeps, 1, 3)
-        )
         pipeline.transformer.lidar_patch_hw = (1, 1)
-        pipeline.lidar_encoder = lambda frames: torch.zeros(1, 128, frames.shape[1], 1, 3)
-
-        class Decoder:
-            config = pipeline.multiview_config["lidar"]
-
-            def __call__(self, latents):
-                return torch.zeros(1, 3, latents.shape[2], 1, 3)
-
-        pipeline.lidar_decoder = Decoder()
+        pipeline.lidar_decoder = SimpleNamespace(config=pipeline.multiview_config["lidar"])
     prompt = {"prompt": "Driving."}
     sp = make_sampling_params(
         num_frames=297,
@@ -4339,8 +4330,9 @@ def _t2v_multiview_pipeline(make_cosmos3_pipeline, num_views: int = 2):
         torch.zeros(1, 2, latent_t, 1, 1),
     )
     pipeline.diffuse_transfer = lambda **kwargs: kwargs["latents"]
-    pipeline._decode_multiview_latents = lambda *args, **kwargs: torch.zeros(
-        1, 3, num_views * _T2V_MULTIVIEW_FRAMES, 4, 4
+    pipeline._decode_outputs = lambda *args, **kwargs: (
+        torch.zeros(1, 3, num_views * _T2V_MULTIVIEW_FRAMES, 4, 4),
+        None,
     )
     _capture_tokenize_calls(pipeline)
     return pipeline
@@ -4425,8 +4417,12 @@ def test_multiview_condition_indexes_expand_per_view_local_frames(
         return prepare_latents(**kwargs)
 
     pipeline._prepare_multiview_latents = capture
-    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
-    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 16, 1, 1)
+    pipeline._encode_inputs = lambda *args, **kwargs: (
+        torch.zeros(1, 2, 16, 1, 1),
+        torch.zeros(1, 2, 16, 1, 1),
+        None,
+        None,
+    )
     views = [
         {**view, "control_path": f"control{index}.mp4"}
         | ({"vision_path": f"vision{index}.mp4"} if index in vision_views else {})
@@ -4763,11 +4759,10 @@ def test_multiview_denoising_state_is_float32_with_bf16_model() -> None:
     pipeline.vae_scale_factor_spatial = 8
     # Two cameras with two latent frames each; latent frame 0 of each camera is conditioned.
     encoded = torch.full((1, 2, 4, 2, 2), 0.3, dtype=torch.bfloat16)
-    pipeline._encode_multiview_video = lambda video, **kwargs: encoded
     # 1 + 2**-12 rounds to 1 in BF16; injected reference noise must survive unrounded.
     injected = torch.full((1, 2, 4, 2, 2), 1.0 + 2**-12)
     prepare = dict(
-        target_pixels=torch.zeros(1),
+        vision_latents=encoded,
         condition_indexes=[0, 2],
         num_views=2,
         num_frames=5,
