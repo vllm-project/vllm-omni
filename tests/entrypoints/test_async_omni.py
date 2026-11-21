@@ -91,6 +91,8 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni.log_stats = False
     omni.request_states = {}
     omni._final_output_handler = lambda: None
+    omni._check_frontend_admission = lambda: None
+    omni._frontend_shutting_down = False
     omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
     omni._compute_final_stage_id = lambda output_modalities: 0
     omni._compute_final_output_stage_ids = lambda output_modalities: [0]

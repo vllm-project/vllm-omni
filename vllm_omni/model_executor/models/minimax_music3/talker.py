@@ -656,17 +656,6 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
         # step must stay alive so that the terminal span ``postprocess`` is
         # about to write can ride out on the next step's payload; a pair that
         # already published its tail stops now.
-        #
-        # This covers the two ways a song ends on its own: the audio-end token,
-        # and the request's frame budget, which reaches the model as
-        # ``max_audio_frames``. It does not cover the engine ending a request
-        # underneath the model, because the payload for a step is fixed before
-        # the model is told. Hitting ``max_model_len`` mid-song therefore drops
-        # the final window, or the whole song without async_chunk, which only
-        # publishes the song once it ends. In practice the frame budget is
-        # reached first; a request can only hit the context limit with a prompt
-        # long enough that the two limits collide, which the deploy config
-        # documents.
         for index, (cond_row, uncond_row) in enumerate(pairs):
             state = states[index]
             if state.pending_stop:
@@ -817,10 +806,18 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
         state = self._states.get(pair_id)
         if state is None:
             seed = self._row_seeds[row] if row < len(self._row_seeds) else 0
+            prompt_tokens = self._row_prompt_tokens[row] if row < len(self._row_prompt_tokens) else 0
+            requested_frames = (
+                self._row_max_frames[row] if row < len(self._row_max_frames) else DEFAULT_MAX_AUDIO_FRAMES
+            )
+            # Each frame consumes one output token. Reserve the final token
+            # for the step that publishes the buffered audio and emits STOP.
+            max_frames = min(requested_frames, self.vllm_config.model_config.max_model_len - prompt_tokens - 1)
             state = RequestARState(
                 seed=seed,
-                max_frames=self._row_max_frames[row] if row < len(self._row_max_frames) else DEFAULT_MAX_AUDIO_FRAMES,
-                prompt_tokens=self._row_prompt_tokens[row] if row < len(self._row_prompt_tokens) else 0,
+                max_frames=max_frames,
+                prompt_tokens=prompt_tokens,
+                finished=max_frames <= 0,
             )
             self._states[pair_id] = state
             logger.info(
