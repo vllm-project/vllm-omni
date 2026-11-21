@@ -73,7 +73,10 @@ from vllm.entrypoints.generate.base.protocol import (
     RequestResponseMetadata,
     ToolCall,
 )
-from vllm.entrypoints.generate.base.serving import clamp_prompt_logprobs
+from vllm.entrypoints.generate.base.serving import (
+    build_per_request_timing_metrics,
+    clamp_prompt_logprobs,
+)
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -2536,6 +2539,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     mm_token_counts,
                 )
 
+                # Merge per-request timing metrics when enabled; the parent
+                # vLLM serving does the same for n == 1 only.
+                stream_metrics = self._filter_stage_metrics_detail(last_metrics, request)
+                if (request.n or 1) == 1 and self.enable_per_request_metrics:
+                    stream_metrics = dict(stream_metrics or {})
+                    stats = last_metrics if hasattr(last_metrics, "queued_ts") else None
+                    stream_metrics.update(
+                        build_per_request_timing_metrics(stats, completion_tokens).model_dump(exclude_none=True)
+                    )
+                    if isinstance(last_metrics, Mapping):
+                        stream_metrics.update(last_metrics)
+                    stream_metrics = stream_metrics or None
+
                 final_usage_chunk = OmniChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
@@ -2543,7 +2559,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     choices=[],
                     model=model_name,
                     usage=final_usage,
-                    metrics=self._filter_stage_metrics_detail(last_metrics, request),
+                    metrics=stream_metrics,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -2713,6 +2729,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             choices = self._merge_audio_choices(choices, pending_audio_choices)
 
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
+
+        # Merge per-request timing metrics when enabled; the parent vLLM
+        # serving does the same for n == 1 only.
+        if (request.n or 1) == 1 and self.enable_per_request_metrics:
+            completion_tokens = usage.completion_tokens if usage else 0
+            raw_stats = final_res.metrics if final_res is not None else None
+            stats = raw_stats if hasattr(raw_stats, "queued_ts") else None
+            response_metrics = dict(response_metrics or {})
+            response_metrics.update(
+                build_per_request_timing_metrics(stats, completion_tokens).model_dump(exclude_none=True)
+            )
+            if isinstance(raw_stats, Mapping):
+                response_metrics.update(raw_stats)
+            response_metrics = response_metrics or None
 
         # Compute prompt_text for non-streaming response (upstream #42052)
         prompt_text = (
