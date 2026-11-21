@@ -438,15 +438,27 @@ async def _run_video_generation_job(
                 **result.lidar_metadata,
             )
 
-        save_context = await STORAGE_MANAGER.save(video_id, result.video_bytes)
+        file_name = f"{video_id}.{job.file_extension}"
+        save_context = await STORAGE_MANAGER.save(
+            video_id,
+            result.video_bytes,
+            content_type=job.media_type,
+            content_disposition=f'attachment; filename="{file_name}"',
+        )
         if result.lidar_bytes is not None:
-            await STORAGE_MANAGER.save(_lidar_storage_key(video_id), result.lidar_bytes)
+            lidar_key = _lidar_storage_key(video_id)
+            await STORAGE_MANAGER.save(
+                lidar_key,
+                result.lidar_bytes,
+                content_type=lidar.media_type,
+                content_disposition=f'attachment; filename="{lidar_key}"',
+            )
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
         updated_fields = {
             "status": VideoGenerationStatus.COMPLETED,
             "progress": 100,
-            "file_name": f"{video_id}.{job.file_extension}",
+            "file_name": file_name,
             "completed_at": save_context.created_at,
             "inference_time_s": time.perf_counter() - started_at,
             "stage_durations": result.stage_durations,

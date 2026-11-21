@@ -27,6 +27,8 @@ from vllm_omni.entrypoints.openai.storage.base import (
     FileStorageHandle,
     SaveContext,
     StorageBackend,
+    StreamStorageHandle,
+    UrlStorageHandle,
 )
 from vllm_omni.entrypoints.openai.storage.ttl import TtlSweeper
 
@@ -59,6 +61,9 @@ class OpenDALBackend(StorageBackend):
         local_root: str | None = None,
         default_ttl: int | None = None,
         sweep_interval: int | None = None,
+        presign: bool = False,
+        presign_expires: int = 3600,
+        proxy: bool = False,
     ) -> None:
         if default_ttl is not None and sweep_interval is None:
             raise ValueError("`sweep_interval` is required when `default_ttl` is set.")
@@ -68,6 +73,9 @@ class OpenDALBackend(StorageBackend):
         self._record_prefix = record_prefix.strip("/")
         self._local_root = os.path.realpath(local_root) if local_root is not None else None
         self._default_ttl = default_ttl
+        self._presign = presign
+        self._presign_expires = presign_expires
+        self._proxy = proxy
 
         self._io_semaphore = asyncio.Semaphore(max(1, max_concurrency))
         self._record_lock = asyncio.Lock()
@@ -110,13 +118,26 @@ class OpenDALBackend(StorageBackend):
         return os.path.join(self._local_root, self._artifact_prefix, _validate_key(key))
 
     # ---- artifact -----------------------------------------------------
-    async def save(self, key: str, data: bytes, *, ttl: int | None = None) -> SaveContext:
+    async def save(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        ttl: int | None = None,
+        content_type: str | None = None,
+        content_disposition: str | None = None,
+    ) -> SaveContext:
         created_at = int(time.time())
         effective_ttl = self._default_ttl if ttl is None else ttl
         expires_at = created_at + effective_ttl if effective_ttl else None
 
+        write_kwargs = {}
+        if content_type and self._capability.write_with_content_type:
+            write_kwargs["content_type"] = content_type
+        if content_disposition and self._capability.write_with_content_disposition:
+            write_kwargs["content_disposition"] = content_disposition
         async with self._io_semaphore:
-            await self._op.write(self.artifact_path(key), data)
+            await self._op.write(self.artifact_path(key), data, **write_kwargs)
         if expires_at is not None:
             await self._merge_record_expiry(key, expires_at)
         return SaveContext(key=key, created_at=created_at, expires_at=expires_at)
@@ -136,7 +157,7 @@ class OpenDALBackend(StorageBackend):
             record["expires_at"] = expires_at
             await self._write_record(key, json.dumps(record).encode())
 
-    async def open(self, key: str) -> FileStorageHandle | None:
+    async def open(self, key: str) -> FileStorageHandle | UrlStorageHandle | StreamStorageHandle | None:
         path = self.artifact_path(key)
         try:
             metadata = await self._op.stat(path)
@@ -144,10 +165,22 @@ class OpenDALBackend(StorageBackend):
             return None
         if not metadata.is_file:
             return None
-        if self._local_root is None:
-            # Non-filesystem backends cannot hand out a path; they must stream.
-            return None
-        return FileStorageHandle(path=self.get_full_file_path(key))
+
+        if self._local_root is not None:
+            return FileStorageHandle(path=self.get_full_file_path(key))
+
+        if self._presign and not self._proxy and self._capability.presign:
+            try:
+                presigned = await self._op.presign_read(path, self._presign_expires)
+            except Exception:
+                logger.warning("Failed to presign %s; falling back to streaming", path, exc_info=True)
+            else:
+                # OpenDAL returns a PresignedRequest (url/method/headers); older
+                # bindings returned the URL string directly.
+                url = presigned if isinstance(presigned, str) else presigned.url
+                return UrlStorageHandle(url=url)
+
+        return StreamStorageHandle()
 
     async def iter_chunks(self, key: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> AsyncIterator[bytes]:
         reader = await self._op.open(self.artifact_path(key), "rb")

@@ -31,6 +31,21 @@ class FileStorageHandle(BaseStorageHandle):
     kind: Literal["path"] = field(default="path", init=False)
 
 
+@dataclass(frozen=True)
+class UrlStorageHandle(BaseStorageHandle):
+    """The artifact is readable through a presigned URL (redirect the client)."""
+
+    url: str
+    kind: Literal["url"] = field(default="url", init=False)
+
+
+@dataclass(frozen=True)
+class StreamStorageHandle(BaseStorageHandle):
+    """The artifact must be streamed through the API server (``iter_chunks``)."""
+
+    kind: Literal["stream"] = field(default="stream", init=False)
+
+
 class StorageBackend(ABC):
     """Common contract for storing generated artifacts and their job records.
 
@@ -55,12 +70,23 @@ class StorageBackend(ABC):
 
     # ---- artifact -----------------------------------------------------
     @abstractmethod
-    async def save(self, key: str, data: bytes, *, ttl: int | None = None) -> SaveContext:
+    async def save(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        ttl: int | None = None,
+        content_type: str | None = None,
+        content_disposition: str | None = None,
+    ) -> SaveContext:
         """Persist ``data`` under ``key``.
 
         ``ttl`` overrides the backend's configured lifetime for this object;
         ``None`` falls back to the backend default. Per-object values are only
         observed by the record-based TTL sweep (see ``TtlSweeper``).
+        ``content_type`` and ``content_disposition`` are stored as object
+        metadata when the backend supports it, so presigned URLs serve the
+        artifact with the right MIME type and download name.
         """
 
     @abstractmethod

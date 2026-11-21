@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import time
+from types import SimpleNamespace
 
 import opendal
 import pytest
@@ -18,7 +19,9 @@ from vllm_omni.entrypoints.openai.storage import (
     FileStorageHandle,
     OpenDALBackend,
     SaveContext,
+    StreamStorageHandle,
     SweepStrategy,
+    UrlStorageHandle,
 )
 from vllm_omni.entrypoints.openai.storage import opendal_backend as backend_module
 
@@ -223,6 +226,108 @@ def test_ttl_sweeper_survives_a_failing_on_expire(tmp_path):
         assert asyncio.run(storage.open("video-expired")) is None
     finally:
         asyncio.run(storage.stop())
+
+
+class _StubOperator:
+    """Minimal OpenDAL operator stub for the presigned-download path."""
+
+    def __init__(self, *, presign: bool) -> None:
+        self._presign = presign
+
+    def capability(self):
+        return type("Capability", (), {"list": True, "presign": self._presign})()
+
+    async def stat(self, path):
+        return type("Metadata", (), {"is_file": True})()
+
+    async def presign_read(self, path, expire_second):
+        # OpenDAL hands back a PresignedRequest, not a bare URL string.
+        return SimpleNamespace(url=f"https://objects.example/{path}?expires={expire_second}")
+
+
+def test_open_returns_presigned_url_when_supported():
+    backend = OpenDALBackend(_StubOperator(presign=True), presign=True, presign_expires=120)
+
+    handle = asyncio.run(backend.open("video-id"))
+
+    assert isinstance(handle, UrlStorageHandle)
+    assert handle.url == "https://objects.example/artifacts/video-id?expires=120"
+
+
+def test_open_falls_back_to_streaming_when_proxied():
+    backend = OpenDALBackend(_StubOperator(presign=True), presign=True, proxy=True)
+
+    assert isinstance(asyncio.run(backend.open("video-id")), StreamStorageHandle)
+
+
+def test_open_falls_back_to_streaming_when_presign_is_disabled():
+    backend = OpenDALBackend(_StubOperator(presign=True), presign=False)
+
+    assert isinstance(asyncio.run(backend.open("video-id")), StreamStorageHandle)
+
+
+def test_open_falls_back_to_streaming_when_backend_cannot_presign():
+    backend = OpenDALBackend(_StubOperator(presign=False), presign=True)
+
+    assert isinstance(asyncio.run(backend.open("video-id")), StreamStorageHandle)
+
+
+class _RecordingOperator:
+    """Operator stub that records write keywords."""
+
+    def __init__(self, *, object_metadata: bool) -> None:
+        self._object_metadata = object_metadata
+        self.write_kwargs: list[dict] = []
+
+    def capability(self):
+        return type(
+            "Capability",
+            (),
+            {
+                "list": True,
+                "presign": False,
+                "write_with_content_type": self._object_metadata,
+                "write_with_content_disposition": self._object_metadata,
+            },
+        )()
+
+    async def write(self, path, data, **kwargs):
+        self.write_kwargs.append(kwargs)
+
+
+def test_payload_metadata_is_stored_when_supported():
+    operator = _RecordingOperator(object_metadata=True)
+    backend = OpenDALBackend(operator)
+
+    asyncio.run(
+        backend.save(
+            "video-id",
+            b"video-bytes",
+            content_type="video/mp4",
+            content_disposition='attachment; filename="video-id.mp4"',
+        )
+    )
+
+    assert operator.write_kwargs[0] == {
+        "content_type": "video/mp4",
+        "content_disposition": 'attachment; filename="video-id.mp4"',
+    }
+
+
+def test_payload_metadata_is_dropped_when_unsupported():
+    operator = _RecordingOperator(object_metadata=False)
+    backend = OpenDALBackend(operator)
+
+    asyncio.run(
+        backend.save(
+            "video-id",
+            b"video-bytes",
+            content_type="video/mp4",
+            content_disposition='attachment; filename="video-id.mp4"',
+        )
+    )
+
+    assert operator.write_kwargs[0] == {}
 
 
 def test_storage_path_can_be_repointed(tmp_path):
