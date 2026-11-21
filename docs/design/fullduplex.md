@@ -1601,9 +1601,17 @@ existing recent-history budget and disappears when its history item is deleted.
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting
-recent history. An empty boundary is omitted when its observation has left the
-working window or all of its frames are evicted from the prompt; pending
-consolidation records alone do not keep it alive.
+recent history. An empty boundary is omitted when none of its observation's
+frames survives prompt assembly; pending consolidation records alone do not
+keep it alive. Non-empty committed replies
+still referenced by the observation ledger remain eligible at the recent-history
+boundary even after their frames leave the prompt.
+
+For a speech-only follow-up without a new or working-window frame, the ASR
+handoff includes the latest frame still awaiting visual consolidation. It keeps
+that frame's original timestamp and observation-to-history references, before
+the new transcript's turn. Once the frame has been summarized, the summary
+provides its context instead of restoring the cached raw frame.
 
 While idle, JoyAI retains the latest camera frame and one input chunk of audio
 pre-roll. Once speech starts, it keeps the utterance until commit. An idle

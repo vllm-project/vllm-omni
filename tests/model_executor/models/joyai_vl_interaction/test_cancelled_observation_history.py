@@ -8,10 +8,15 @@ from copy import deepcopy
 import pytest
 
 from tests.engine.duplex.test_session_runner import tts_output
+from tests.model_executor.models.joyai_vl_interaction.test_duplex_memory import summary_output
 from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import Processor, frame, open_joyai
+from tests.model_executor.models.joyai_vl_interaction.test_visual_memory_pipeline import submissions
 from vllm_omni.engine.duplex.commands import AppendAudio, CancelResponse, Commit, CreateItem, DeleteItem
+from vllm_omni.engine.duplex.plugin import duplex_text_history
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import WorkingObservation
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -108,6 +113,125 @@ async def test_cancelled_observation_preserves_empty_assistant_boundary(
         )
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summarized", [False, True], ids=["pending", "summarized"])
+async def test_audio_only_followup_retains_latest_frame_until_summarized(mocker, summarized):
+    h = await open_joyai(asr=True)
+    plugin = h.runner.plugin
+    plugin.max_images = 1
+    template = mocker.spy(plugin.processor, "apply_chat_template")
+    mocker.patch(
+        "vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction.cached_processor_from_config",
+        return_value=plugin.processor,
+    )
+    try:
+        await h.run(AppendAudio(video_frames=(frame("green"),)))
+        await h.run(Commit(final=True, create_response=True))
+        request_id = submissions(h, auxiliary=False)[-1].context.request_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> Green.", finished=True),
+            stage_id=1,
+            segment_finished=True,
+        )
+        await h.run(CancelResponse())
+        state = h.runner.model_state
+        assert state.visual_memory.pending[-1].id <= state.closed_frame_id
+        timestamp = f"<{state.visual_memory.pending[-1].time_s:.1f} seconds>"
+        if summarized:
+            request = await plugin.prepare_auxiliary_request(
+                history=duplex_text_history(h.session.history), runtime_config=h.session.runtime_config, state=state
+            )
+            assert request is not None
+            assert plugin.apply_auxiliary_result(
+                request=request, output=summary_output("summary", "A green image."), state=state
+            )
+            assert not state.visual_memory.pending
+        await h.run(AppendAudio(audio=struct.pack("<h", 1000) * 156800, format="pcm16", sample_rate_hz=16000))
+        await h.run(Commit(final=True, create_response=True))
+        followup = submissions(h, auxiliary=False)[-1]
+        assert followup.context.stage_id == 0
+        query = "What color was the last image?"
+        (prompt,) = asr_to_joyai(
+            [tts_output(followup.context.request_id, text=query, finished=True)], dict(followup.prompt)
+        )
+        messages = template.call_args.args[0]
+        if summarized:
+            assert not prompt.get("multi_modal_data", {}).get("image")
+            assert "A green image." in prompt["prompt"]
+        else:
+            assert [image.getpixel((0, 0)) for image in prompt["multi_modal_data"]["image"]] == [(0, 128, 0)]
+            assert messages[-3:] == [
+                {"role": "user", "content": [{"type": "text", "text": timestamp}, {"type": "image"}]},
+                {"role": "assistant", "content": ""},
+                {"role": "user", "content": [{"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"}]},
+            ]
+        assert "</response> Green." not in prompt["prompt"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("reply", ["The image was green.", ""], ids=["played", "unheard"])
+def test_recent_history_boundary_uses_observation_refs_only_for_committed_replies(reply):
+    conversation = [
+        {"role": "user", "content": "What color is the image?"},
+        {"role": "assistant", "content": reply},
+        *[{"role": role, "content": f"{role} {index}"} for index in range(7) for role in ("user", "assistant")],
+        {"role": "user", "content": "Latest question"},
+    ]
+    item_ids = [f"item-{index}" for index in range(len(conversation))]
+    history, _, _ = JoyAIDuplexPlugin._bounded_text_history(
+        {
+            "conversation": conversation,
+            "conversation_item_ids": item_ids,
+            "joyai_observations": (WorkingObservation("old", (0,), "", response_item_id=item_ids[1]),),
+        },
+        {},
+        response_refs=set(),
+    )
+    if reply:
+        assert history[0] == {"role": "assistant", "content": f"</response> {reply}", "_item_key": item_ids[1]}
+        assert len(history) == 16
+    else:
+        assert all(item["_item_key"] != item_ids[1] for item in history)
+
+
+@pytest.mark.parametrize("image_text", [None, USER_QUERY_HEADER], ids=["null", "query-header"])
+def test_asr_query_filter_preserves_image_parts_with_text_metadata(mocker, image_text):
+    processor = Processor()
+    template = mocker.spy(processor, "apply_chat_template")
+    mocker.patch(
+        "vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction.cached_processor_from_config",
+        return_value=processor,
+    )
+    image_part = {"type": "image", "text": image_text}
+    prompt = {
+        "additional_information": {
+            "joyai_prompt_context": {
+                "system": "policy",
+                "history": [],
+                "working_messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": f"{USER_QUERY_HEADER}\nOld question"}, image_part],
+                        "_query_key": "deleted-question",
+                    },
+                    {"role": "user", "content": [], "_current": True},
+                ],
+            },
+            "joyai_prompt_budget": 16384,
+            "joyai_image_token_counts": [256],
+            "deferred_multi_modal_data": {"image": ["green"]},
+        }
+    }
+    (result,) = asr_to_joyai([tts_output("asr", text="New question", finished=True)], prompt)
+    assert template.call_args.args[0] == [
+        {"role": "system", "content": "policy"},
+        {"role": "user", "content": [image_part]},
+        {"role": "user", "content": [{"type": "text", "text": f"{USER_QUERY_HEADER}\nNew question"}]},
+    ]
+    assert result["multi_modal_data"] == {"image": ["green"]}
 
 
 def test_asr_context_budget_evicts_frames_with_their_turns_without_mutating_handoff(mocker):
