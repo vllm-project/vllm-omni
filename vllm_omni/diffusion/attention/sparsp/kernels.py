@@ -18,6 +18,7 @@ def _pack(
     heads,
     blocks,
     wire,
+    count,
     k_head_stride: tl.constexpr,
     k_token_stride: tl.constexpr,
     k_dim_stride: tl.constexpr,
@@ -25,21 +26,26 @@ def _pack(
     v_token_stride: tl.constexpr,
     v_dim_stride: tl.constexpr,
     dim: tl.constexpr,
+    dynamic: tl.constexpr,
     rows: tl.constexpr = 32,
 ):
     block = tl.program_id(0)
+    if dynamic:
+        valid = block < tl.load(count)
+    else:
+        valid = True
     row = tl.program_id(1) * rows + tl.arange(0, rows)
     channel = tl.arange(0, dim)
-    head = tl.load(heads + block).to(tl.int64)
-    source_block = tl.load(blocks + block).to(tl.int64)
+    head = tl.load(heads + block, mask=valid, other=0).to(tl.int64)
+    source_block = tl.load(blocks + block, mask=valid, other=0).to(tl.int64)
     token = source_block * 64 + row[:, None]
     k_source = head * k_head_stride + token * k_token_stride + channel[None, :] * k_dim_stride
     v_source = head * v_head_stride + token * v_token_stride + channel[None, :] * v_dim_stride
     offset = row[:, None] * dim + channel[None, :]
     base = wire + block.to(tl.int64) * (64 * dim * 4)
     bits = tl.pointer_type(tl.uint16)
-    tl.store(base.to(bits) + offset, tl.load(k.to(bits) + k_source))
-    tl.store((base + 64 * dim * 2).to(bits) + offset, tl.load(v.to(bits) + v_source))
+    tl.store(base.to(bits) + offset, tl.load(k.to(bits) + k_source, mask=valid, other=0), mask=valid)
+    tl.store((base + 64 * dim * 2).to(bits) + offset, tl.load(v.to(bits) + v_source, mask=valid, other=0), mask=valid)
 
 
 def pack_kv(
@@ -48,10 +54,22 @@ def pack_kv(
     heads: torch.Tensor,
     blocks: torch.Tensor,
     wire: torch.Tensor,
+    count: torch.Tensor | None = None,
 ) -> None:
     """Pack selected K/V blocks without converting their 16-bit input bits."""
     if heads.numel():
-        _pack[(heads.numel(), 2)](k, v, heads, blocks, wire, *k.stride()[-3:], *v.stride()[-3:], k.shape[-1])
+        _pack[(heads.numel(), 2)](
+            k,
+            v,
+            heads,
+            blocks,
+            wire,
+            count,
+            *k.stride()[-3:],
+            *v.stride()[-3:],
+            k.shape[-1],
+            count is not None,
+        )
 
 
 @triton.jit
