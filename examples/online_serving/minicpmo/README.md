@@ -104,8 +104,9 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     --stream
 ```
 
-The client prints text deltas as they arrive and saves streamed audio chunks
-to WAV files.
+The client prints text deltas as they arrive and appends streamed audio chunks
+to one WAV file per request and choice. Only the first non-empty audio chunk
+contains a WAV header; subsequent chunks contain PCM for the same file.
 
 Shared helpers also work if you pass MiniCPM defaults yourself:
 
