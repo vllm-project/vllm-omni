@@ -29,6 +29,14 @@ stages:
     max_num_batched_tokens: 2048
     hf_overrides:
       architectures: ["StepAudio2Token2WavForConditionalGeneration"]
+      # Opt-in batched code2wav backend (in-tree MiniCPM-o engine over the
+      # same token2wav assets): measured 2.1x per-chunk at batch 1 and flat
+      # batch scaling to n=4 on H100. Numerics differ from the pip
+      # cosyvoice2 path beyond that path's own run-to-run nondeterminism —
+      # gate on real-checkpoint WER/SIM before flipping this on.
+      # token2wav_batched_backend: true
+      # enable_hift_graph: true
+      # enable_cfm_graph: true
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

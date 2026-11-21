@@ -50,6 +50,10 @@ def test_step_audio2_async_chunk_uses_decode_only_tokens_not_prompt_history():
     assert payload.codes.audio.tolist() == [1, 2]
     assert payload.meta.left_context_size == 1
     assert payload.meta.finished.item() is True
+    # Batched-backend meta (request keying + flat-token splitting).
+    assert payload.meta.last_chunk is True
+    assert payload.meta.request_id == "rid-decode-only"
+    assert payload.meta.code_flat_numel == 2
 
 
 def test_step_audio2_async_chunk_returns_none_when_not_enough_tokens():
@@ -99,6 +103,10 @@ def test_step_audio2_async_chunk_emits_non_last_chunk_and_advances_consumed_by_c
     assert payload.meta.finished.item() is False
     assert payload.codes.audio.tolist() == list(range(required))
     assert transfer_manager.code_prompt_token_ids["rid-ready"] == list(range(chunk_size))
+    # Batched-backend meta: chunk carries chunk_size + lookahead tokens.
+    assert payload.meta.last_chunk is False
+    assert payload.meta.request_id == "rid-ready"
+    assert payload.meta.code_flat_numel == required
 
 
 def test_step_audio2_async_chunk_emits_eof_when_finished_with_no_remaining_audio():
@@ -128,3 +136,7 @@ def test_step_audio2_async_chunk_emits_eof_when_finished_with_no_remaining_audio
     assert payload.codes.audio.numel() == 0
     assert payload.meta.left_context_size == 1
     assert payload.meta.finished.item() is True
+    # EOF marker: empty payload, explicitly last, zero flat tokens.
+    assert payload.meta.last_chunk is True
+    assert payload.meta.request_id == "rid-eof"
+    assert payload.meta.code_flat_numel == 0

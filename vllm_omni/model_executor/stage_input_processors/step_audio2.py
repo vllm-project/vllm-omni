@@ -61,6 +61,11 @@ def thinker2token2wav_async_chunk(
       → ``runtime_additional_information`` (0 = not last, 1 = last chunk)
     - ``finished``            → marks request as finished in adapter
 
+    The meta also carries ``last_chunk`` / ``request_id`` / ``code_flat_numel``
+    for the opt-in BatchedToken2Wav decode path (per-request state keying and
+    flat-token splitting at batch>1); the legacy 0/1 ``left_context_size``
+    marker stays for the default pip cosyvoice2 path.
+
     Args:
         transfer_manager: OmniChunkTransferAdapter instance (has
             ``code_prompt_token_ids`` defaultdict for state tracking).
@@ -105,6 +110,9 @@ def thinker2token2wav_async_chunk(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(
                     left_context_size=1,  # 1 = last chunk
+                    last_chunk=True,
+                    request_id=str(request_id),
+                    code_flat_numel=0,
                     finished=torch.tensor(True, dtype=torch.bool),
                 ),
             )
@@ -114,6 +122,9 @@ def thinker2token2wav_async_chunk(
             codes=CodesStruct(audio=torch.tensor(remaining_tokens, dtype=torch.long)),
             meta=MetaStruct(
                 left_context_size=1,  # 1 = last chunk
+                last_chunk=True,
+                request_id=str(request_id),
+                code_flat_numel=len(remaining_tokens),
                 finished=torch.tensor(True, dtype=torch.bool),
             ),
         )
@@ -129,6 +140,9 @@ def thinker2token2wav_async_chunk(
             codes=CodesStruct(audio=torch.tensor(chunk_tokens, dtype=torch.long)),
             meta=MetaStruct(
                 left_context_size=0,  # 0 = not last chunk
+                last_chunk=False,
+                request_id=str(request_id),
+                code_flat_numel=len(chunk_tokens),
                 finished=torch.tensor(False, dtype=torch.bool),
             ),
         )
