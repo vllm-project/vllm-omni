@@ -1598,6 +1598,12 @@ response when cancellation leaves no committed speech. This preserves the turn
 boundary in both direct and ASR-handoff prompts without restoring unheard text
 or treating cancellation as a model silence decision. The boundary follows the
 existing recent-history budget and disappears when its history item is deleted.
+The ASR handoff retains frame timestamps and observation-to-history references,
+so an old frame precedes its reply boundary and the new transcript accompanies
+only the current observation. Both paths apply the image limit before selecting
+recent history. An empty boundary is omitted when its observation has left the
+working window or all of its frames are evicted from the prompt; pending
+consolidation records alone do not keep it alive.
 
 While idle, JoyAI retains the latest camera frame and one input chunk of audio
 pre-roll. Once speech starts, it keeps the utterance until commit. An idle

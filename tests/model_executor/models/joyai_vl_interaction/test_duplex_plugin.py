@@ -105,7 +105,7 @@ def _partial_orchestrator(talker_processor: object) -> _PartialOrchestrator:
 
 @dataclass
 class _PartialStreaming:
-    bridge_states: dict[str, object] = field(default_factory=dict)
+    bridge_states: dict[str, dict[str, object]] = field(default_factory=dict)
     enabled: bool = False
 
 
@@ -114,7 +114,7 @@ class _PartialReqState:
     session_owned: bool = True
     final_stage_id: int = 2
     request_id: str = "req-1"
-    prompt: dict[str, object] = field(default_factory=lambda: {"additional_information": {}})
+    prompt: dict[str, dict[str, object]] = field(default_factory=lambda: {"additional_information": {}})
     streaming: _PartialStreaming = field(default_factory=_PartialStreaming)
 
 
@@ -1119,8 +1119,8 @@ async def test_batched_commits_keep_separate_audio_and_transcript_owners(cancel,
                 images = info["deferred_multi_modal_data"]["image"]
                 assert [image.getpixel((0, 0)) for image in images] == [(255, 0, 0)] + [(0, 0, 255)] * (count - 1)
                 history = info["joyai_prompt_context"]["history"]
-                for previous in expected_transcripts[:-1]:
-                    assert ({"role": "user", "content": previous} in history) is bool(previous)
+                for item_id, previous in zip(item_ids, expected_transcripts[:-1]):
+                    assert ({"role": "user", "content": previous, "_item_key": item_id} in history) is bool(previous)
             if cancel:
                 await h.run(CancelResponse())
             h.runner.on_stage_output(
@@ -1515,6 +1515,7 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 4
     orchestrator, clients, rpc_q, _ = _build(stages=4, plugin=plugin)
 
     async def process_inputs(stage_id, *, request_id, params, **kwargs):
@@ -2374,6 +2375,7 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
     plugin.processor = Processor()
     plugin.max_model_len = 2600
+    plugin.max_images = 4
     monkeypatch.setattr(bridge, "cached_processor_from_config", lambda config: plugin.processor, raising=False)
     monkeypatch.setattr(
         bridge,
