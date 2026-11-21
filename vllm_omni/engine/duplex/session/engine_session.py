@@ -247,6 +247,7 @@ class DuplexEngineSession:
     #: before the response those tokens end up in exists, so they are held here
     #: and folded into the first response that opens after them.
     _pending_stage_metrics: list[dict[str, dict[str, object]]] = field(default_factory=list, repr=False)
+    _ended_response_stage_metrics: dict[str, dict[str, dict[str, object]]] = field(default_factory=dict, repr=False)
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
@@ -266,6 +267,7 @@ class DuplexEngineSession:
     perf: SessionPerfLedger | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        self.config = self.config.with_output_capabilities(self.capabilities)
         if self.accepted_fence is None:
             self.accepted_fence = self.fence
         else:
@@ -981,12 +983,27 @@ class DuplexEngineSession:
         }
         if transcript:
             input_audio_part["transcript"] = transcript
+        text_slot = (
+            self._conversation.history_item_placeholders.get(f"item_{self.active_response_id}")
+            if not self.capabilities.emits_audio and self._response.active_response_awaits_input_commit
+            else None
+        )
         self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
         message = _object_dict(role="user", content=[input_audio_part])
         if transcript:
             message["transcript"] = transcript
-        self.append_history_message(message)
+        index = (
+            next((i for i, candidate in enumerate(self._conversation.messages) if candidate is text_slot), None)
+            if text_slot is not None
+            else None
+        )
+        if index is None:
+            self.append_history_message(message)
+        else:
+            # This is the input that opened the response, not a later user turn.
+            self._conversation.messages.insert(index, message)
+            self._track_history_message(message)
         self._conversation.user_turn_seq += 1
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
@@ -1055,6 +1072,10 @@ class DuplexEngineSession:
             self._response.active_response_awaits_input_commit = False
 
     def reserve_response_options(self, options: ResponseCreateOptions) -> None:
+        candidate = copy.copy(self.config)
+        candidate.extra_body = dict(self.config.extra_body)
+        options.apply_to(candidate)
+        candidate.with_output_capabilities(self.capabilities)
         if self._response.active_response_id is not None:
             raise RuntimeError("response options cannot be reserved while a response is active")
         if self._response.pending_options is not None:
@@ -1152,7 +1173,16 @@ class DuplexEngineSession:
             self.perf.bind_response(
                 epoch=self.epoch, turn_id=self._response.active_response_turn_id, response_id=response_id
             )
+        if not self.capabilities.emits_audio:
+            # Input may continue while text is emitted. Reserve its position
+            # before a later user commit, without waiting for playback.
+            self.reserve_history_item(f"item_{response_id}")
         return response_id
+
+    def pop_ended_response_stage_metrics(self, response_id: object) -> dict[str, dict[str, object]] | None:
+        if not isinstance(response_id, str):
+            return None
+        return self._ended_response_stage_metrics.pop(response_id, None)
 
     def _clear_response_metrics(self) -> None:
         self._response.stage_metrics.clear()
@@ -1546,6 +1576,15 @@ class DuplexEngineSession:
         ):
             self._conversation.retired_audio_item_ids.add(item_id)
 
+    def release_zero_audio_response(self, response_id: str | None) -> None:
+        """Release a reply that produced no audio; it never receives a playback ACK."""
+        if response_id is None:
+            return
+        playback = self._playback.by_response.get(response_id)
+        if playback is not None and max(playback.sent_ms, playback.generated_ms) == 0:
+            self.release_response_history_snapshot(response_id)
+            self.release_response_playback(response_id)
+
     def history_item_has_audio(self, item_id: str) -> bool:
         """Whether this item's response produced audio, including after cleanup.
 
@@ -1659,21 +1698,31 @@ class DuplexEngineSession:
     ) -> dict[str, object] | None:
         self._log_response_aggregator()
         response_id = self._response.active_response_id
+        if response_id is not None and not self.capabilities.emits_audio:
+            ended_metrics = self.accumulate_response_stage_metrics(None)
+            if ended_metrics:
+                self._ended_response_stage_metrics[response_id] = ended_metrics
         if self.perf is not None and response_id is not None:
             self.perf.end_response(response_id)
         response_input_commit_seq = self._response.active_response_input_commit_seq
         if response_input_commit_seq is None:
             response_input_commit_seq = self.input_commit_seq
         response_history_is_late = self.input_commit_seq > response_input_commit_seq
-        assistant_text = "".join(self._response.assistant_text_buffer).strip()
+        assistant_text = "".join(self._response.assistant_text_buffer)
+        if self.capabilities.emits_audio:
+            assistant_text = assistant_text.strip()
+        has_assistant_text = bool(assistant_text.strip())
         message: dict[str, object] | None = None
-        if assistant_text and response_id is not None:
+        if has_assistant_text and response_id is not None:
             self._conversation.assistant_response_snapshots[response_id] = (
                 _object_dict(role="assistant", content=assistant_text),
                 tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
                 response_input_commit_seq,
             )
-        if commit_text and assistant_text and not response_history_is_late:
+        text_slot = (
+            not self.capabilities.emits_audio and f"item_{response_id}" in self._conversation.history_item_placeholders
+        )
+        if commit_text and has_assistant_text and (not response_history_is_late or text_slot):
             committed_text = self._playback_committed_text(
                 assistant_text,
                 playback_commit_policy=playback_commit_policy,
@@ -1690,12 +1739,12 @@ class DuplexEngineSession:
         effective_playback_policy = playback_commit_policy or self.config.playback_commit_policy
         if (
             response_id is not None
-            and assistant_text
+            and has_assistant_text
             and message is None
             and effective_playback_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
         ):
             self.register_history_item(f"item_{response_id}", None)
-        elif response_id is not None and not assistant_text:
+        elif response_id is not None and not has_assistant_text:
             # Sent audio has no transcript to store, but the client still has
             # to ack it. Dropping the item makes that ack fail and leaves
             # sent_ms ahead of committed_ms, so the next response cannot start.
@@ -2025,6 +2074,10 @@ class DuplexEngineSession:
         *,
         playback_commit_policy: str | None = None,
     ) -> str:
+        if not self.capabilities.emits_audio:
+            # Text was emitted to the response stream. Playback policy and
+            # audio alignment cannot gate a text-only reply, including cancel.
+            return assistant_text
         sent_ms = max(self.playback.sent_ms, self.playback.generated_ms)
         committed_ms = self.playback.committed_ms
         policy = playback_commit_policy or self.config.playback_commit_policy
@@ -2148,6 +2201,7 @@ class DuplexEngineSession:
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
+        self._ended_response_stage_metrics.clear()
         self._restore_response_config()
 
     def signal_turn(self, event_type: str, payload: Mapping[str, object] | None = None) -> TurnEvent:
@@ -2183,7 +2237,7 @@ class DuplexEngineSession:
             "active_response_id": self.active_response_id,
             "active_response_turn_id": self.active_response_turn_id,
             "model": self.config.model,
-            "modalities": list(self.config.modalities),
+            "modalities": list(self.config.modalities or ()),
             "instructions": self.config.instructions,
             "voice": self.config.voice,
             "response_format": self.config.response_format,

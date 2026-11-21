@@ -331,6 +331,7 @@ class OmniEngineArgs(EngineArgs):
     model_arch: str | None = None
     engine_output_type: str | None = None
     final_output: bool = False
+    has_downstream_stages: bool = True
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     requires_full_payload_input: bool = False
@@ -674,6 +675,7 @@ class OmniEngineArgs(EngineArgs):
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             final_output=self.final_output,
+            has_downstream_stages=self.has_downstream_stages,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             requires_full_payload_input=self.requires_full_payload_input,

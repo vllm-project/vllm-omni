@@ -835,7 +835,8 @@ def test_from_realtime_maps_wire_fields_and_stores_realtime_keys_in_extra_body()
     assert config.speed == 1.25
     assert config.max_tokens is None
     assert config.response_format == "pcm"
-    assert config.modalities == ["text", "audio"]
+    assert config.modalities is None
+    assert config.with_output_capabilities(DuplexCapabilities()).modalities == ["text", "audio"]
     assert config.extra_body["custom"] is True
     assert config.extra_body["realtime_tools"] == [{"type": "function", "name": "lookup"}]
     assert config.extra_body["realtime_tool_choice"] == "auto"

@@ -364,13 +364,13 @@ class RealtimeDuplexClient:
         turn_detection: dict[str, object] | None = None,
         idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
+        modalities: Sequence[str] | None = ("audio", "text"),
     ) -> None:
         session_extra_body = dict(extra_body or {})
         session_extra_body.pop("native_duplex", None)
         session_extra_body.update(auto_response=auto_response, force_listen_count=0)
         session: dict[str, object] = {
             "model": model,
-            "modalities": ["audio", "text"],
             "input_audio_format": "pcm16",
             "output_audio_format": output_audio_format,
             "turn_detection": dict(turn_detection) if turn_detection is not None else None,
@@ -382,6 +382,8 @@ class RealtimeDuplexClient:
             "playback_commit_policy": "ack_only",
             "extra_body": session_extra_body,
         }
+        if modalities is not None:
+            session["modalities"] = list(modalities)
         if temperature is not None:
             session["temperature"] = float(temperature)
         if ref_audio is not None:
@@ -544,6 +546,10 @@ class RealtimeDuplexClient:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
 
     async def acknowledge_playback(self) -> None:
+        session = next((e.get("session") for e in self.events.events if e.get("type") == "session.created"), None)
+        capabilities = session.get("capabilities") if isinstance(session, dict) else None
+        if isinstance(capabilities, dict) and capabilities.get("supports_playback_ack") is False:
+            return
         for response_id in self.events.response_ids:
             pcm16 = self.events.audio_bytes(response_id)
             if not pcm16 and self.events.response_is_done(response_id):
