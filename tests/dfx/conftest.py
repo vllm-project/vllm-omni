@@ -7,9 +7,12 @@ import math
 import os
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, TypeGuard
 
 import pytest
@@ -86,9 +89,12 @@ def assert_baseline_within_tolerance(
     unless ``required=True`` requests a failure instead.
     """
     baseline_hardware = hardware
-    # Ascend runtime labels use the A2 resource bucket when no exact bucket exists.
-    if isinstance(baseline, dict) and hardware in ("910B", "910B4") and hardware not in baseline and "A2" in baseline:
-        baseline_hardware = "A2"
+    # Ascend runtime labels use the A2/A3 resource buckets when no exact bucket exists.
+    if isinstance(baseline, dict) and hardware not in baseline:
+        if hardware in ("910B", "910B4") and "A2" in baseline:
+            baseline_hardware = "A2"
+        elif hardware == "910" and "A3" in baseline:
+            baseline_hardware = "A3"
     if (
         not isinstance(baseline, dict)
         or not baseline
@@ -780,6 +786,140 @@ def _write_omniinteract_accuracy_result(
     return accuracy_path
 
 
+def prepare_dataset_benchmark(params: dict[str, object], stack: ExitStack) -> dict[str, object]:
+    """Apply a scenario's environment and materialize its verified dataset subset."""
+    from vllm_omni.benchmarks.data_modules import DatasetSource
+
+    prepared = dict(params)
+    environment = params.get("benchmark_env", {})
+    if not isinstance(environment, dict):
+        raise ValueError("benchmark_env must be an object")
+    if environment:
+        patch = stack.enter_context(pytest.MonkeyPatch.context())
+        for key, value in environment.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("benchmark_env keys and values must be strings")
+            patch.setenv(key, value)
+    raw_source = params.get("dataset_source")
+    if raw_source is None:
+        return prepared
+    if not isinstance(raw_source, dict):
+        raise ValueError("dataset_source must be an object")
+    source = DatasetSource.from_config(raw_source)
+    counts = params.get("num_prompts")
+    if (
+        not isinstance(counts, list)
+        or len(counts) != 1
+        or type(counts[0]) is not int
+        or not 0 < counts[0] <= source.count
+    ):
+        raise ValueError("Each pinned dataset scenario requires one positive request count within the source")
+    count = counts[0]
+    validation = params.get("result_validation")
+    if not isinstance(validation, dict) or not isinstance(validation.get("accuracy"), bool):
+        raise ValueError("Pinned dataset scenarios require an explicit result_validation.accuracy boolean")
+    smoke = validation.get("smoke", False)
+    if not isinstance(smoke, bool):
+        raise ValueError("result_validation.smoke must be a boolean")
+    if validation["accuracy"] and not smoke and count != source.count:
+        raise ValueError("Accuracy qualification requires the complete pinned dataset; mark subsets as smoke")
+    limits = validation.get("accuracy_baseline", {})
+    if not isinstance(limits, dict) or any(not _is_finite_number(value) for value in limits.values()):
+        raise ValueError("accuracy_baseline must contain finite numerical thresholds")
+    metrics = validation.get("metrics", {})
+    if not isinstance(metrics, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str) for key, value in metrics.items()
+    ):
+        raise ValueError("result_validation.metrics must map metric names to sample-count fields")
+    if not isinstance(validation.get("require_audio", False), bool):
+        raise ValueError("result_validation.require_audio must be a boolean")
+    indices = raw_source.get("sample_indices")
+    if indices is not None and (
+        not smoke or params.get("dataset_name") != "daily-omni" or not isinstance(indices, list)
+    ):
+        raise ValueError("Sample indices require a matching Daily-Omni smoke subset")
+    work = Path(stack.enter_context(TemporaryDirectory(prefix="benchmark-dataset-")))
+    if params.get("dataset_name") == "daily-omni":
+        from vllm_omni.benchmarks.data_modules.daily_omni_dataset import prepare_daily_omni_inputs
+
+        prepared.update(prepare_daily_omni_inputs(source, count, work, indices=indices))
+    elif params.get("dataset_name") == "seed-tts":
+        from vllm_omni.benchmarks.data_modules.seed_tts_dataset import prepare_seed_tts_inputs
+
+        prepared.update(prepare_seed_tts_inputs(source, count, work))
+    else:
+        raise ValueError(f"No pinned dataset preparation for {params.get('dataset_name')}")
+    return prepared
+
+
+def annotate_dataset_result(
+    result: dict[str, object],
+    returncode: int,
+    params: Mapping[str, object],
+    *,
+    check_baseline: bool,
+    require_baseline: bool,
+) -> dict[str, object]:
+    """Persist configured dataset coverage and quality diagnostics before asserting."""
+    from tests.e2e.accuracy import helpers
+    from vllm_omni.benchmarks.validation import coverage_errors, metric_coverage_errors
+
+    source = params["dataset_source"]
+    validation = params["result_validation"]
+    counts = params["num_prompts"]
+    metadata = params.get("result_metadata", {})
+    assert isinstance(source, dict) and isinstance(validation, dict) and isinstance(counts, list)
+    assert isinstance(metadata, dict), "result_metadata must be an object"
+    expected = counts[0]
+    accuracy = validation["accuracy"]
+    smoke = validation.get("smoke", False)
+    dataset = str(params["dataset_name"])
+    errors = coverage_errors(result, expected, require_audio=validation.get("require_audio", False))
+    errors += metric_coverage_errors(result, expected, validation.get("metrics", {}))
+    limits = validation.get("accuracy_baseline", {}) if accuracy else {}
+    if accuracy:
+        errors += helpers.dataset_accuracy_errors(result, dataset, expected, limits, enforce_thresholds=not smoke)
+    if returncode != 0:
+        errors.append(f"Benchmark subprocess exited with {returncode}")
+    annotated = dict(result)
+    for key, value in metadata.items():
+        if key in result and result[key] != value:
+            errors.append(f"result_metadata cannot overwrite measured result field {key}")
+        else:
+            annotated[key] = value
+    baseline = result.get("baseline") or {}
+    reference = baseline.get(result.get("Hardware")) if isinstance(baseline, dict) else None
+    versions = {}
+    for package in ("vllm", "vllm-omni", "torch"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = "not-installed"
+    annotated.update(
+        accuracy_evaluated=accuracy,
+        qualification_scope="smoke"
+        if smoke
+        else "full-dataset"
+        if expected == source["count"]
+        else "performance-subset",
+        performance_baseline_status="enforced" if require_baseline or (check_baseline and reference) else "collecting",
+        performance_baseline=reference,
+        dataset=dataset.replace("-", "_"),
+        dataset_revision=source["revision"],
+        dataset_manifest_sha256=source["sha256"],
+        commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        software_versions=versions,
+        quality_thresholds=limits,
+        benchmark_exit_code=returncode,
+        validation_errors=errors,
+    )
+    if annotated.get("num_tpot_samples") == 0:
+        for key in annotated:
+            if key.endswith("_tpot_ms"):
+                annotated[key] = None
+    return helpers._json_safe_metric_value(annotated)
+
+
 def run_benchmark(
     args: list[str],
     test_name: str,
@@ -795,6 +935,8 @@ def run_benchmark(
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
     accuracy_baseline: dict[str, Any] | None = None,
+    check_duplex_eval_exit_code: bool = True,
+    result_transform: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -910,8 +1052,10 @@ def run_benchmark(
     result["test_name"] = test_name
     if benchmark_params_name:
         result["name"] = benchmark_params_name
-    # Accuracy is published only in ``result_acc_*.json`` below; the perf result
-    # must not carry a second copy of it. ``result`` keeps it in memory so the
+    if result_transform is not None:
+        result = result_transform(result, returncode)
+    # OmniInteract accuracy is published only in ``result_acc_*.json`` below;
+    # its perf result must not carry a second copy. ``result`` keeps it in memory so the
     # caller's IA-QTF1 floor assertions still see it.
     persisted = result
     if isinstance(omniinteract_summary := result.get("omniinteract"), dict) and "accuracy" in omniinteract_summary:
@@ -921,7 +1065,8 @@ def run_benchmark(
         }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(persisted, f, ensure_ascii=False, indent=2)
-    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
+    # Evaluated scores must be published even when no quality baseline is configured.
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args:
         from tests.e2e.accuracy.helpers import (
             _DUPLEX_EVAL_DEFAULT_ACC_DIR,
             _acc_result_filename,
@@ -961,12 +1106,13 @@ def run_benchmark(
             accuracy=accuracy,
         )
         print(f"Accuracy result saved to {accuracy_path}")
-        from vllm_omni.platforms import current_omni_platform
+        if check_duplex_eval_exit_code and accuracy_baseline is not None:
+            from vllm_omni.platforms import current_omni_platform
 
-        # Preserve the accuracy job's torch_npu shutdown exception while
-        # requiring complete artifacts and scores in the caller's assertions.
-        allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
-        assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
+            # Keep the accuracy-config CLI policy, including the NPU shutdown
+            # exception, independent of publishing record-only evaluated scores.
+            allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
+            assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
     if dataset_name == "omniinteract" and "--omniinteract-evaluate" in args:
         _write_omniinteract_accuracy_result(
             result,
