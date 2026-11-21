@@ -341,7 +341,6 @@ markers = [
     "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: [hardware-resource] [npu] Tests that require A2 NPU",
     "A3: [hardware-resource] [npu] Tests that require A3 NPU",
-    "910: [hardware-resource] [npu] Ascend910 runtime label reported by A3 CI",
     "A5: [hardware-resource] [npu] Tests that require A5 NPU",
     "310P: [hardware-resource] [npu] Tests that require 310P NPU",
     # Tag with [hardware-cards] for tests.helpers.mark.get_supported_card_counts().

@@ -881,6 +881,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
     resource_label = get_runtime_resource_label()
+    resource_label = params.pop("runtime_resource_aliases", {}).get(resource_label, resource_label)
     check_baseline = pytestconfig.getoption("assert_baseline")
     require_baseline = pytestconfig.getoption("require_baseline")
     result_transform: Callable[[dict[str, object], int], dict[str, object]] | None = None

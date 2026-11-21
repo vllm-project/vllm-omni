@@ -2061,21 +2061,32 @@ def test_qwen3_correction_run_rejects_boolean_coverage_count(field):
 
 
 @pytest.mark.parametrize(("case_index", "hardware"), [(0, "H100"), (1, "910"), (0, "B200")])
-def test_qwen3_correction_score_floor(case_index, hardware):
-    from tests.dfx.perf.scripts.run_benchmark import assert_result
+def test_qwen3_correction_score_floor(case_index, hardware, monkeypatch, pytestconfig):
+    from tests.dfx.perf.scripts import run_benchmark as runner
 
     configs = json.loads(Path(__file__).with_name("test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())
+    config = configs[case_index]
     result, _, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
-    result["Hardware"] = hardware
-    params = configs[case_index]["benchmark_params"][0]
+    expected_label = "A3" if hardware == "910" else hardware
+
+    def benchmark(**kwargs):
+        assert kwargs["resource_label"] == expected_label
+        assert "--runtime-resource-aliases" not in kwargs["args"]
+        result["Hardware"] = kwargs["resource_label"]
+        return result
+
+    monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: hardware)
+    monkeypatch.setattr(runner, "run_benchmark", benchmark)
+    server = ServerEndpoint(judge_base_url="http://localhost:8001")
+    case = {"test_name": config["test_name"], "params": config["benchmark_params"][0]}
     accuracy["pr"]["mean_all_success"] = 84 / count
-    assert_result(result, params, count)
+    runner.test_performance_benchmark(server, case, pytestconfig)
     accuracy["pr"]["mean_all_success"] = 83 / count
     if hardware == "B200":
-        assert_result(result, params, count)
+        runner.test_performance_benchmark(server, case, pytestconfig)
     else:
         with pytest.raises(AssertionError, match="PR correction mean_all_success"):
-            assert_result(result, params, count)
+            runner.test_performance_benchmark(server, case, pytestconfig)
 
 
 @pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, -0.1, 1.1])

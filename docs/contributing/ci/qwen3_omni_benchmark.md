@@ -107,7 +107,8 @@ See [build 20013](https://buildkite.com/vllm/vllm-omni/builds/20013),
 For A3 DuplexEval, the two completed runs in [NPU build 12466](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/12466)
 measured response-level mean busy RTFs of 0.716089 and 0.733625 at merge commit `541da19a71`.
 Both evaluated all 120 `PR_correction` samples at concurrency 8. Their mean, 0.724857,
-is the reference under `910`, the runtime hardware label in both result files.
+is the `A3` reference. This case maps the runtime label `910` reported in both
+calibration files to `A3` for baseline selection and result publication.
 
 The judge scored 89/120 (74.17%) on each run, with zero skipped or failed
 evaluations. The accuracy artifacts report aggregate scores for this split.
