@@ -12,6 +12,7 @@ import torch
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     MINICPMO45_TURN_CHUNK_TOKENS,
+    _update_native_talker_prompt,
     llm2tts,
     llm2tts_chunked,
 )
@@ -349,3 +350,18 @@ def test_blocks_concatenate_only_the_steps_that_forwarded_their_rows(monkeypatch
 def test_only_the_chunked_bridge_takes_partial_outputs() -> None:
     assert llm2tts_chunked.accepts_partial_source_outputs is True
     assert not getattr(llm2tts, "accepts_partial_source_outputs", False)
+
+
+@pytest.mark.parametrize("seq", [0, 1])
+def test_talker_prompt_hook_extends_turn_blocks_and_hands_over_only_confirmed_codes(seq: int) -> None:
+    """Turn blocks keep the plain extension; past the first, the previous block's codes ride along."""
+    session = SimpleNamespace(_all_token_ids=[0, 0, 0, 4, 5, 6, 99], num_prompt_tokens=3, num_computed_tokens=6)
+    payload = {"meta": {"turn_chunk": True, "turn_chunk_close": False, "streaming_condition_seq": seq}}
+
+    # No window config is read for turn blocks, so the model config is not needed.
+    assert _update_native_talker_prompt(None, session, payload) is None
+    if seq == 0:
+        assert "ids" not in payload
+    else:
+        # 99 is the sampled EOS, which was never forwarded.
+        assert payload["ids"]["streaming_prompt_previous_codes"] == [4, 5, 6]

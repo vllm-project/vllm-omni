@@ -1617,6 +1617,17 @@ def _update_native_talker_prompt(model_config: Any, session: Any, payload: dict[
         _resolve_talker_streaming_prompt_config,
     )
 
+    meta = payload.get("meta")
+    if payload.get("native_duplex") is not True and isinstance(meta, Mapping) and meta.get("turn_chunk") is True:
+        if int(meta.get("streaming_condition_seq") or 0) > 0:
+            # A turn-chunked block extends the request (llm2tts_chunked). Hand
+            # the Talker the codes the previous block confirmed, never its
+            # uncomputed EOS: they move into the prompt, out of the 16-code
+            # penalty window, unless the next condition seeds it with them.
+            payload.setdefault("ids", {})["streaming_prompt_previous_codes"] = list(
+                session._all_token_ids[session.num_prompt_tokens : session.num_computed_tokens]
+            )
+        return None
     limit, previous_chunks, on_capacity = _resolve_talker_streaming_prompt_config(model_config)
     if previous_chunks != 1 or payload.get("native_duplex") is not True:
         return None

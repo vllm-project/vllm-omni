@@ -414,8 +414,10 @@ class TestTurnChunkedProfile:
         assert stages[1].custom_process_input_func.endswith(".llm2tts_chunked")
         assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 0
         assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.8
+        assert stages[1].yaml_engine_args["recompute_preemption"] == "fail"
 
         turn = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_turn.yaml")
         turn_stages = merge_pipeline_deploy(OMNI_PIPELINES[turn.pipeline], turn)
         assert turn_stages[1].custom_process_input_func.endswith(".llm2tts")
         assert turn_stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 50
+        assert "recompute_preemption" not in turn_stages[1].yaml_engine_args

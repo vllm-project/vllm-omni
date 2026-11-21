@@ -136,6 +136,10 @@ MINICPMO_4_5_TURN_CHUNKED_PIPELINE = dataclasses.replace(
         dataclasses.replace(
             MINICPMO_4_5_PIPELINE.stages[1],
             custom_process_input_func=f"{_PROC}.llm2tts_chunked",
+            # After a block is appended the request carries only its newest
+            # condition, so a replay from zero would rebuild the earlier
+            # conditions and codes as placeholders.
+            recompute_preemption="fail",
         ),
         *MINICPMO_4_5_PIPELINE.stages[2:],
     ),

@@ -1643,21 +1643,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # the last chunk of TTSStreamingGenerator.generate_with_buffer does.
         return torch.cat([condition, self._boundary_embeddings()], dim=0)
 
-    def _turn_chunk_recent_codes(self, request_id: str) -> list[int]:
+    def _turn_chunk_recent_codes(self, request_id: str, info_dict: Mapping[str, Any]) -> list[int]:
         """The last penalty window of codes the request confirmed before its next turn-chunk condition."""
-        history = getattr(self, "_request_codec_history", {}).get(request_id)
-        if history:
+        if self._k_step_frames > 0:
+            # K-step confirms 0/1 control rows in the token stream; the model
+            # records the codec frames it confirmed.
+            history = getattr(self, "_request_codec_history", {}).get(request_id) or []
             return [int(code_id) for code_id in history[-_CODEC_PENALTY_WINDOW:]]
+        # Single-frame decoding keeps the sampled codes in the runner. The
+        # scheduler hands over the previous block's (_update_native_talker_prompt);
+        # they follow the window that block started from.
+        ids = info_dict.get("ids")
+        confirmed = ids.get("streaming_prompt_previous_codes") if isinstance(ids, Mapping) else None
         previous = getattr(self, "_request_audio_states", {}).get(request_id)
-        if not isinstance(previous, dict):
-            return []
-        for key in ("recent_codes", "codes"):
-            codes = previous.get(key)
-            if isinstance(codes, torch.Tensor) and codes.numel():
-                return [int(code_id) for code_id in codes.reshape(-1)[-_CODEC_PENALTY_WINDOW:].tolist() if code_id >= 0]
-            if isinstance(codes, (list, tuple)) and codes:
-                return [int(code_id) for code_id in codes[-_CODEC_PENALTY_WINDOW:] if int(code_id) >= 0]
-        return []
+        seed = previous.get("recent_codes") if isinstance(previous, dict) else None
+        window = [int(code_id) for code_id in (*(seed or ()), *(confirmed or ()))]
+        return [code_id for code_id in window if 0 <= code_id < self._codec_eos_id][-_CODEC_PENALTY_WINDOW:]
 
     def _build_streaming_recompute_embeddings(
         self,
@@ -1895,7 +1896,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             elif turn_chunk and condition_seq:
                 # generate_with_buffer keeps the repetition-penalty window
                 # across blocks: seed it with the codes confirmed so far.
-                retained_codes = self._turn_chunk_recent_codes(request_id)
+                retained_codes = self._turn_chunk_recent_codes(request_id, info_dict)
             offset = max(0, int(info_dict.get("_omni_num_computed_tokens", 0) or 0))
             # The handoff rebuilds only the tail-aligned Talker condition.
             # Materialize zero-token embeddings for any scheduler prompt
