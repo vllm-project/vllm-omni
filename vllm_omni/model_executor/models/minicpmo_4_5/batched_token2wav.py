@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import math
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
@@ -27,6 +28,7 @@ from .cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
     ResidentAttCache,
+    SharedPromptAttCache,
     WholeEulerCFMGraphWrapper,
     _att_keep_ranges,
     _copy_frame_segments,
@@ -103,13 +105,30 @@ def _timestep_frequencies(dim: int) -> torch.Tensor:
     return torch.exp(-math.log(_TIMESTEP_MAX_PERIOD) * torch.arange(start=0, end=half) / half)
 
 
-def _trim_streaming_cache(cache: torch.Tensor, prompt_len: int) -> torch.Tensor:
+def _trim_streaming_cache(
+    cache: torch.Tensor | ResidentAttCache | SharedPromptAttCache, prompt_len: int
+) -> torch.Tensor | ResidentAttCache | SharedPromptAttCache:
     """The streaming trim of a cache whose frame axis is ``-2``."""
     if isinstance(cache, ResidentAttCache):
         # A mixed-reference solve keeps the largest prompt prefix. Each row
         # then drops excess streaming frames without moving its resident cache.
         cache.layout = cache.layout[:prompt_len]
         return cache
+    if isinstance(cache, SharedPromptAttCache):
+        total = int(cache.shape[5])
+        ranges = _att_keep_ranges(total, (prompt_len, _CACHE_TRIM_SUFFIX))
+        if len(ranges) == 1:
+            return cache
+        prompt_frames = int(cache.prompt.shape[5])
+        if (
+            len(ranges) == 2
+            and ranges[0][0] == 0
+            and ranges[0][1] <= int(cache.prefix.shape[5])
+            and ranges[1] == (total - prompt_frames, prompt_frames)
+        ):
+            return SharedPromptAttCache(cache.prefix[..., : ranges[0][1], :].detach(), cache.prompt)
+        materialized = cache.materialize()
+        return torch.cat([materialized[..., start : start + length, :] for start, length in ranges], dim=-2)
     ranges = _att_keep_ranges(int(cache.shape[-2]), (prompt_len, _CACHE_TRIM_SUFFIX))
     if len(ranges) == 1:
         return cache
@@ -266,7 +285,7 @@ def _token2wav_sdpa_context(device: torch.device):
     return npu_token2wav_sdpa_context()
 
 
-def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
+def tensor_signature(value: torch.Tensor | ResidentAttCache | SharedPromptAttCache) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), value.device.type
 
 
@@ -303,8 +322,9 @@ class PromptFeatures:
 
 @dataclass(frozen=True)
 class BatchedToken2WavState:
-    flow_cache: dict[str, torch.Tensor]
+    flow_cache: dict[str, torch.Tensor | ResidentAttCache | SharedPromptAttCache]
     hift_cache: dict[str, torch.Tensor]
+    prompt_att_generation: int | None = None
 
 
 def _undecorate_dynamo(module: nn.Module, method: str) -> None:
@@ -383,6 +403,12 @@ class BatchedToken2Wav(nn.Module):
         self._solve_stats = Code2WavSolveStats()
         self._cfm_tf32 = bool(cfm_tf32)
         cfm_graph_cfg = dict(cfm_graph_config or {})
+        self._prompt_att_sharing = bool(cfm_graph_cfg.get("prompt_att_sharing", False))
+        self._prompt_att_caches: dict[tuple[str, str], torch.Tensor] = {}
+        self._prompt_att_generations: dict[tuple[str, str], int] = {}
+        self._prompt_att_generation_counter = itertools.count(1)
+        self._prompt_att_verified: dict[tuple[str, str], int] = {}
+        self._prompt_att_rejected: set[tuple[str, str]] = set()
         # Ragged solves of rows whose caches differ in length (a stream's second chunk next to steady
         # ones): each row keeps its own cache offset, in one slot-pool Whole-Euler replay when it can.
         self._row_offset_merge = bool(cfm_graph_cfg.get("row_offset_merge", False))
@@ -545,6 +571,13 @@ class BatchedToken2Wav(nn.Module):
                 # Resident request caches need the fused body and its tiled
                 # attention, which reads keys/values out of the pool in place.
                 slot_pool = bool(cfm_graph_cfg.get("slot_pool", False))
+                if slot_pool and self._prompt_att_sharing:
+                    # Slot rows are mutable full-cache storage. Keep the
+                    # shared-prefix path on the arena, whose input copy can
+                    # address prompt and tail separately, until a slot layout
+                    # with shared immutable rows is available.
+                    logger.info("Disabling CFM slot pool while prompt attention sharing is enabled")
+                    slot_pool = False
                 if slot_pool and not (
                     flow_parameter.device.type == "cuda"
                     and self._ragged_fused_body
@@ -597,17 +630,19 @@ class BatchedToken2Wav(nn.Module):
                         )
                         else None,
                         row_offsets=self._row_offset_merge,
+                        arena_rows_from_graph_grid=bool(cfm_graph_cfg.get("arena_rows_from_graph_grid", False)),
                     )
                     logger.info(
                         "Whole-Euler CFM device graph enabled "
                         "(max_graphs=%d, max_serial_batch=%d, max_graph_batch=%s, "
-                        "micro_batch_size=%d, query_bucket_frames=%s, offset_bucket_frames=%d, "
+                        "micro_batch_size=%d, arena_rows=%d, query_bucket_frames=%s, offset_bucket_frames=%d, "
                         "fused_body=%s, precomputed_modulation=%s)",
                         max_graphs,
                         max_serial_batch,
                         str(max_graph_batch),
                         micro_batch_size,
-                        query_bucket_frames,
+                        self._whole_euler_graph_wrapper._arena_rows,
+                        str(query_bucket_frames),
                         self._whole_euler_graph_wrapper.offset_bucket_frames,
                         self._ragged_fused_body,
                         self._whole_euler_graph_wrapper.modulation_fn is not None,
@@ -789,6 +824,10 @@ class BatchedToken2Wav(nn.Module):
             except Exception:
                 logger.debug("Abandoned reference extraction failed", exc_info=True)
         self._prompt_features.pop(prompt_key, None)
+        getattr(self, "_prompt_att_caches", {}).pop(prompt_key, None)
+        getattr(self, "_prompt_att_generations", {}).pop(prompt_key, None)
+        getattr(self, "_prompt_att_verified", {}).pop(prompt_key, None)
+        getattr(self, "_prompt_att_rejected", set()).discard(prompt_key)
         for setup_key in list(self._setup_cache):
             if setup_key[0] == prompt_key:
                 self._setup_cache.pop(setup_key)
@@ -1500,6 +1539,11 @@ class BatchedToken2Wav(nn.Module):
         valid_lengths: list[int] | None = None,
         att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
+        prompt_att_cache: torch.Tensor | None = None,
+        prompt_cache_key: tuple[str, str] | None = None,
+        prompt_att_segments: list[torch.Tensor | None] | None = None,
+        prompt_att_verified: list[bool] | None = None,
+        prompt_att_row_generations: list[int | None] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1528,6 +1572,7 @@ class BatchedToken2Wav(nn.Module):
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
         att_rows = att_cache if isinstance(att_cache, list) else None
+        input_att_rows = att_rows
         if att_rows is not None:
             offset = int(att_rows[0].shape[5])
         else:
@@ -1617,6 +1662,22 @@ class BatchedToken2Wav(nn.Module):
             valid_lengths is None or self._whole_euler_ragged_active()
         )
         if whole_euler_attempted:
+            if prompt_att_verified is None and prompt_att_segments is not None and prompt_cache_key is not None:
+                if att_rows is not None:
+                    prompt_att_verified = [
+                        self._row_is_prompt_att_verified(
+                            prompt_cache_key,
+                            row_cache=row,
+                            row_generation=(
+                                prompt_att_row_generations[idx]
+                                if prompt_att_row_generations is not None and idx < len(prompt_att_row_generations)
+                                else None
+                            ),
+                        )
+                        for idx, row in enumerate(att_rows)
+                    ]
+                else:
+                    prompt_att_verified = [False] * batch_size
             whole_euler_result = self._whole_euler_graph_wrapper.replay(
                 x=x,
                 mu_cfg=mu_cfg,
@@ -1630,8 +1691,34 @@ class BatchedToken2Wav(nn.Module):
                 valid_lengths=valid_lengths,
                 att_keep=att_keep,
                 prompt_lengths=prompt_lengths,
+                prompt_att_segments=prompt_att_segments,
+                prompt_att_verified=prompt_att_verified,
             )
             if whole_euler_result is not None:
+                if (
+                    prompt_att_cache is not None
+                    and prompt_cache_key is not None
+                    and isinstance(whole_euler_result[2], list)
+                ):
+                    chunk_mel, out_cnn, att_rows = whole_euler_result
+                    del whole_euler_result
+                    share_generations = prompt_att_row_generations
+                    if share_generations is None and input_att_rows is not None:
+                        derived_generations = [
+                            -1
+                            if isinstance(orig, SharedPromptAttCache) and orig.prompt is not prompt_att_cache
+                            else None
+                            for orig in input_att_rows
+                        ]
+                        if any(gen is not None for gen in derived_generations):
+                            share_generations = derived_generations
+                    att_rows = self._share_prompt_att_rows(
+                        prompt_cache_key,
+                        prompt_att_cache,
+                        att_rows,
+                        row_generations=share_generations,
+                    )
+                    whole_euler_result = (chunk_mel, out_cnn, att_rows)
                 if solve_timing:
                     self._sync_solve_timing(mu.device)
                     self._solve_stats.record(
@@ -1795,7 +1882,10 @@ class BatchedToken2Wav(nn.Module):
         batch_size: int,
         *,
         estimator_att_keep: tuple[int, int] | None = None,
-    ) -> list[dict[str, torch.Tensor]]:
+        prompt_att_cache: torch.Tensor | None = None,
+        prompt_cache_key: tuple[str, str] | None = None,
+        prompt_att_row_generations: list[int | None] | None = None,
+    ) -> list[dict[str, torch.Tensor | SharedPromptAttCache]]:
         """Per-request flow caches from a batch's stacked caches.
 
         ``estimator_att_cache`` is stacked ``(n_t, depth, 2B, heads, L, d)``
@@ -1870,7 +1960,331 @@ class BatchedToken2Wav(nn.Module):
                     "estimator_att_cache": request_att,
                 }
             )
+        if stacked_att and prompt_att_cache is not None and prompt_cache_key is not None:
+            shared_rows = self._share_prompt_att_rows(
+                prompt_cache_key,
+                prompt_att_cache,
+                [row.pop("estimator_att_cache") for row in result],
+                row_generations=prompt_att_row_generations,
+            )
+            for row, shared in zip(result, shared_rows, strict=True):
+                row["estimator_att_cache"] = shared
         return result
+
+    def _record_prompt_att_cache(self, cache_key: tuple[str, str], att: Any) -> int | None:
+        if (
+            self._prompt_att_sharing
+            and cache_key != ("", "")
+            and isinstance(att, torch.Tensor)
+            and att.ndim == 7
+            and int(att.shape[5]) > 0
+        ):
+            shared_len = min(_CACHE_TRIM_SUFFIX, int(att.shape[5]))
+            self._prompt_att_caches[cache_key] = att[..., -shared_len:, :].detach().contiguous()
+            generation = next(self._prompt_att_generation_counter)
+            self._prompt_att_generations[cache_key] = generation
+            self._prompt_att_verified.pop(cache_key, None)
+            return generation
+        return None
+
+    def _record_setup_state_prompt_att(
+        self,
+        cache_key: tuple[str, str],
+        state: BatchedToken2WavState,
+    ) -> BatchedToken2WavState:
+        """Record ``cache_key``'s prompt attention suffix without churning unchanged setup hits."""
+        att = state.flow_cache["estimator_att_cache"]
+        if not (
+            self._prompt_att_sharing
+            and cache_key != ("", "")
+            and isinstance(att, torch.Tensor)
+            and att.ndim == 7
+            and int(att.shape[5]) > 0
+        ):
+            return state
+        current_gen = self._prompt_att_generations.get(cache_key)
+        if (
+            cache_key in self._prompt_att_caches
+            and current_gen is not None
+            and state.prompt_att_generation == current_gen
+        ):
+            return state
+        generation = self._record_prompt_att_cache(cache_key, att)
+        return replace(state, prompt_att_generation=generation)
+
+    def _row_is_prompt_att_verified(
+        self,
+        cache_key: tuple[str, str],
+        *,
+        row_state: BatchedToken2WavState | None = None,
+        row_cache: torch.Tensor | ResidentAttCache | SharedPromptAttCache | None = None,
+        row_generation: int | None = None,
+    ) -> bool:
+        """Whether a row belongs to ``cache_key``'s verified active prompt suffix generation."""
+        if cache_key in self._prompt_att_rejected:
+            return False
+        current_prompt = self._prompt_att_caches.get(cache_key)
+        current_gen = self._prompt_att_generations.get(cache_key)
+        if current_prompt is None or current_gen is None:
+            return False
+        if self._prompt_att_verified.get(cache_key) != current_gen:
+            return False
+        if row_state is not None:
+            if row_cache is None:
+                row_cache = row_state.flow_cache.get("estimator_att_cache")
+            if row_generation is None:
+                row_generation = row_state.prompt_att_generation
+        if isinstance(row_cache, SharedPromptAttCache):
+            return row_cache.prompt is current_prompt and (row_generation is None or row_generation == current_gen)
+        return row_generation is not None and row_generation == current_gen
+
+    def _next_prompt_att_generation(
+        self,
+        feature: PromptFeatures,
+        att_cache: Any,
+        prev_generation: int | None,
+    ) -> int | None:
+        if not self._prompt_att_sharing:
+            return prev_generation
+        cache_key = feature.cache_key
+        current_prompt = self._prompt_att_caches.get(cache_key)
+        current_gen = self._prompt_att_generations.get(cache_key)
+        if (
+            current_prompt is not None
+            and current_gen is not None
+            and isinstance(att_cache, SharedPromptAttCache)
+            and att_cache.prompt is current_prompt
+        ):
+            return current_gen
+        return prev_generation
+
+    def _share_prompt_att_rows(
+        self,
+        cache_key: tuple[str, str],
+        prompt: torch.Tensor,
+        rows: list[torch.Tensor | SharedPromptAttCache],
+        *,
+        row_generations: list[int | None] | None = None,
+    ) -> list[torch.Tensor | SharedPromptAttCache]:
+        """Share the immutable prompt suffix across request rows after bit-exact verification."""
+        if not self._prompt_att_sharing or cache_key in self._prompt_att_rejected:
+            return rows
+        if not isinstance(prompt, torch.Tensor) or prompt.ndim != 7:
+            self._prompt_att_rejected.add(cache_key)
+            return rows
+        shared_len = min(_CACHE_TRIM_SUFFIX, int(prompt.shape[5]))
+        if shared_len <= 0:
+            return rows
+        if row_generations is not None and len(row_generations) != len(rows):
+            raise ValueError(f"row generation count {len(row_generations)} != attention row count {len(rows)}")
+
+        active_prompt = self._prompt_att_caches.get(cache_key)
+        active_gen = self._prompt_att_generations.get(cache_key)
+        matches_active = active_prompt is not None and prompt is active_prompt and active_gen is not None
+        verified_gen = self._prompt_att_verified.get(cache_key)
+        active_verified = matches_active and verified_gen is not None and verified_gen == active_gen
+
+        if int(prompt.shape[5]) <= _CACHE_TRIM_SUFFIX and prompt.is_contiguous():
+            prompt_segment = prompt
+        else:
+            prompt_segment = prompt[..., -shared_len:, :].detach()
+            if not prompt_segment.is_contiguous():
+                prompt_segment = prompt_segment.contiguous()
+
+        tensor_indices = [idx for idx, row in enumerate(rows) if isinstance(row, torch.Tensor)]
+        if not tensor_indices:
+            shared_rows = [
+                row for row in rows if isinstance(row, SharedPromptAttCache) and row.prompt is prompt_segment
+            ]
+            if shared_rows and matches_active and active_gen is not None and not active_verified:
+                self._prompt_att_verified[cache_key] = active_gen
+                logger.info(
+                    "CFM prompt attention suffix verified bit-exact (prompt=%s rows=%d frames=%d)",
+                    cache_key[0],
+                    len(shared_rows),
+                    shared_len,
+                )
+            elif shared_rows and not matches_active and cache_key not in self._prompt_att_verified:
+                self._prompt_att_verified[cache_key] = 0
+                logger.info(
+                    "CFM prompt attention suffix verified bit-exact (prompt=%s rows=%d frames=%d)",
+                    cache_key[0],
+                    len(shared_rows),
+                    shared_len,
+                )
+            return rows
+
+        def _is_known_stale(idx: int) -> bool:
+            if not matches_active or row_generations is None:
+                return False
+            row_gen = row_generations[idx]
+            return row_gen is not None and row_gen != active_gen
+
+        def _row_compatible(row: torch.Tensor) -> bool:
+            return (
+                row.ndim == 7
+                and tuple(prompt.shape[:5]) == tuple(row.shape[:5])
+                and prompt.shape[6] == row.shape[6]
+                and prompt.dtype == row.dtype
+                and prompt.device == row.device
+                and int(row.shape[5]) >= shared_len
+            )
+
+        shareable: dict[int, bool] = {}
+        newly_verified_count = 0
+        for idx in tensor_indices:
+            row = cast(torch.Tensor, rows[idx])
+            stale = _is_known_stale(idx)
+            if not _row_compatible(row):
+                if stale:
+                    shareable[idx] = False
+                    continue
+                self._prompt_att_rejected.add(cache_key)
+                if matches_active:
+                    self._prompt_att_verified.pop(cache_key, None)
+                return [
+                    r.materialize() if isinstance(r, SharedPromptAttCache) and r.prompt is prompt_segment else r
+                    for r in rows
+                ]
+            if active_verified and row_generations is not None and row_generations[idx] == active_gen:
+                shareable[idx] = True
+                continue
+            if not torch.equal(row[..., -shared_len:, :], prompt_segment):
+                if stale:
+                    shareable[idx] = False
+                    continue
+                logger.warning("CFM prompt attention suffix differs; disabling sharing for %s", cache_key[0])
+                self._prompt_att_rejected.add(cache_key)
+                if matches_active:
+                    self._prompt_att_verified.pop(cache_key, None)
+                return [
+                    r.materialize() if isinstance(r, SharedPromptAttCache) and r.prompt is prompt_segment else r
+                    for r in rows
+                ]
+            shareable[idx] = True
+            newly_verified_count += 1
+
+        if newly_verified_count > 0:
+            if matches_active and active_gen is not None:
+                if not active_verified:
+                    self._prompt_att_verified[cache_key] = active_gen
+                    matching_shared = sum(
+                        1 for r in rows if isinstance(r, SharedPromptAttCache) and r.prompt is prompt_segment
+                    )
+                    logger.info(
+                        "CFM prompt attention suffix verified bit-exact (prompt=%s rows=%d frames=%d)",
+                        cache_key[0],
+                        newly_verified_count + matching_shared,
+                        shared_len,
+                    )
+            elif cache_key not in self._prompt_att_verified:
+                self._prompt_att_verified[cache_key] = 0
+                logger.info(
+                    "CFM prompt attention suffix verified bit-exact (prompt=%s rows=%d frames=%d)",
+                    cache_key[0],
+                    len(rows),
+                    shared_len,
+                )
+
+        for idx in tensor_indices:
+            if shareable.get(idx, False):
+                row = cast(torch.Tensor, rows[idx])
+                rows[idx] = SharedPromptAttCache(row[..., :-shared_len, :].detach().clone(), prompt_segment)
+                del row
+        return rows
+
+    def _prompt_att_segments_for_batch(
+        self,
+        features: PromptFeatures | list[PromptFeatures],
+        batch_size: int,
+    ) -> list[torch.Tensor | None] | None:
+        """Resolve per-row shared prompt suffix views for in-place Whole-Euler replay."""
+        if not self._prompt_att_sharing:
+            return None
+        if not isinstance(features, list):
+            cache_key = features.cache_key
+            if cache_key in self._prompt_att_rejected:
+                return None
+            prompt = self._prompt_att_caches.get(cache_key)
+            return [prompt] * batch_size if prompt is not None else None
+        segments: list[torch.Tensor | None] = []
+        any_present = False
+        for feature in features:
+            cache_key = feature.cache_key
+            prompt = None if cache_key in self._prompt_att_rejected else self._prompt_att_caches.get(cache_key)
+            if prompt is not None:
+                any_present = True
+            segments.append(prompt)
+        return segments if any_present else None
+
+    def _prompt_att_verified_for_batch(
+        self,
+        features: PromptFeatures | list[PromptFeatures],
+        batch_size: int,
+        *,
+        states: list[BatchedToken2WavState] | None = None,
+    ) -> list[bool] | None:
+        """Resolve per-row verification flags so verified voices skip device syncs in steady state."""
+        if not self._prompt_att_sharing:
+            return None
+        if not isinstance(features, list):
+            cache_key = features.cache_key
+            if cache_key in self._prompt_att_rejected or cache_key not in self._prompt_att_caches:
+                return None
+            if states is None:
+                return [False] * batch_size
+            return [self._row_is_prompt_att_verified(cache_key, row_state=state) for state in states]
+        if states is not None and len(states) != len(features):
+            raise ValueError(f"feature count {len(features)} != state count {len(states)}")
+        return [
+            self._row_is_prompt_att_verified(
+                feature.cache_key,
+                row_state=(states[idx] if states is not None else None),
+            )
+            for idx, feature in enumerate(features)
+        ]
+
+    def _apply_prompt_att_sharing(
+        self,
+        features: PromptFeatures | list[PromptFeatures],
+        rows: list[torch.Tensor | SharedPromptAttCache],
+        *,
+        row_generations: list[int | None] | None = None,
+    ) -> list[torch.Tensor | SharedPromptAttCache]:
+        """Apply per-voice immutable prompt suffix sharing to estimator attention rows."""
+        if not self._prompt_att_sharing or not rows:
+            return rows
+        if row_generations is not None and len(row_generations) != len(rows):
+            raise ValueError(f"row generation count {len(row_generations)} != attention row count {len(rows)}")
+        if not isinstance(features, list):
+            prompt_att = self._prompt_att_caches.get(features.cache_key)
+            if prompt_att is None:
+                return rows
+            return self._share_prompt_att_rows(
+                features.cache_key,
+                prompt_att,
+                rows,
+                row_generations=row_generations,
+            )
+        if len(features) != len(rows):
+            raise ValueError(f"feature count {len(features)} != attention row count {len(rows)}")
+        grouped_indices: dict[tuple[str, str], list[int]] = {}
+        for row_idx, feature in enumerate(features):
+            grouped_indices.setdefault(feature.cache_key, []).append(row_idx)
+        updated = list(rows)
+        for cache_key, indices in grouped_indices.items():
+            prompt_att = self._prompt_att_caches.get(cache_key)
+            if prompt_att is None:
+                continue
+            shared_group = self._share_prompt_att_rows(
+                cache_key,
+                prompt_att,
+                [updated[idx] for idx in indices],
+                row_generations=([row_generations[idx] for idx in indices] if row_generations is not None else None),
+            )
+            for idx, shared_row in zip(indices, shared_group, strict=True):
+                updated[idx] = shared_row
+        return updated
 
     @staticmethod
     def _stack_estimator_att(rows: list[torch.Tensor]) -> torch.Tensor:
@@ -1931,8 +2345,9 @@ class BatchedToken2Wav(nn.Module):
         """Whether mixed onset/continuation rows fit ragged Whole-Euler."""
         caches = [state.flow_cache.get("estimator_att_cache") for state in states]
         return (
-            all(isinstance(cache, torch.Tensor) for cache in caches)
-            and len({(tuple(cache.shape[:4]), cache.dtype, cache.device) for cache in caches}) == 1
+            all(isinstance(cache, (torch.Tensor, SharedPromptAttCache)) for cache in caches)
+            and len({(tuple(cache.shape[:-2]), int(cache.shape[-1]), cache.dtype, cache.device) for cache in caches})
+            == 1
             and self._ragged_merge_fits(states, token_counts)
         )
 
@@ -2076,8 +2491,13 @@ class BatchedToken2Wav(nn.Module):
         state = self._setup_cache.get(cache_key)
         if state is not None:
             self._setup_cache.move_to_end(cache_key)
+            updated_state = self._record_setup_state_prompt_att(features.cache_key, state)
+            if updated_state is not state:
+                state = updated_state
+                self._setup_cache[cache_key] = state
         else:
             (state,) = self._create_initial_states(features, 1)
+            state = self._record_setup_state_prompt_att(features.cache_key, state)
             if self._setup_cache_size > 0:
                 self._setup_cache[cache_key] = state
                 while len(self._setup_cache) > self._setup_cache_size:
@@ -2095,6 +2515,10 @@ class BatchedToken2Wav(nn.Module):
             cached = self._setup_cache.get(key)
             if cached is not None:
                 self._setup_cache.move_to_end(key)
+                updated_state = self._record_setup_state_prompt_att(feature.cache_key, cached)
+                if updated_state is not cached:
+                    cached = updated_state
+                    self._setup_cache[key] = cached
                 states[row] = cached
             else:
                 signature = tuple(
@@ -2120,6 +2544,7 @@ class BatchedToken2Wav(nn.Module):
                     )
                     created = self._create_initial_states(combined, len(group))
                 for row, state, cache_key in zip(selected, created, cache_keys, strict=True):
+                    state = self._record_setup_state_prompt_att(features[row].cache_key, state)
                     states[row] = state
                     if self._setup_cache_size > 0:
                         self._setup_cache[cache_key] = state
@@ -2228,6 +2653,11 @@ class BatchedToken2Wav(nn.Module):
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
         prompt_len = max(prompt_lengths)
         att_keep = (prompt_len, _CACHE_TRIM_SUFFIX)
+        prompt_att_cache = self._prompt_att_caches.get(features.cache_key) if not isinstance(features, list) else None
+        prompt_cache_key = features.cache_key if not isinstance(features, list) else None
+        row_generations = [state.prompt_att_generation for state in states]
+        prompt_att_segments = self._prompt_att_segments_for_batch(features, batch_size)
+        prompt_att_verified = self._prompt_att_verified_for_batch(features, batch_size, states=states)
         with self._autocast(tokens.device):
             self._watchdog.phase(
                 "decode/encoder",
@@ -2266,6 +2696,11 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=[state.flow_cache["estimator_att_cache"] for state in states],
                 att_keep=att_keep,
                 prompt_lengths=prompt_lengths,
+                prompt_att_cache=prompt_att_cache,
+                prompt_cache_key=prompt_cache_key,
+                prompt_att_segments=prompt_att_segments,
+                prompt_att_verified=prompt_att_verified,
+                prompt_att_row_generations=row_generations,
             )
         self._watchdog.phase(
             "decode/cache_materialization",
@@ -2281,10 +2716,22 @@ class BatchedToken2Wav(nn.Module):
             },
             batch_size,
             estimator_att_keep=att_keep,
+            prompt_att_cache=prompt_att_cache,
+            prompt_cache_key=prompt_cache_key,
+            prompt_att_row_generations=row_generations,
         )
+        del estimator_att
         for cache, row_prompt_len in zip(new_flow, prompt_lengths, strict=True):
             for name in ("conformer_att_cache", "estimator_att_cache"):
                 cache[name] = _trim_streaming_cache(cache[name], row_prompt_len)
+        if self._prompt_att_sharing:
+            shared_att = self._apply_prompt_att_sharing(
+                features,
+                [cache.pop("estimator_att_cache") for cache in new_flow],
+                row_generations=row_generations,
+            )
+            for cache, shared in zip(new_flow, shared_att, strict=True):
+                cache["estimator_att_cache"] = shared
         old_mel = self._hift_cache_batch(states, "mel")
         old_source = self._hift_cache_batch(states, "source")
         old_speech = self._hift_cache_batch(states, "speech")
@@ -2310,6 +2757,11 @@ class BatchedToken2Wav(nn.Module):
             BatchedToken2WavState(
                 flow_cache=new_flow[row],
                 hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
+                prompt_att_generation=self._next_prompt_att_generation(
+                    features[row] if isinstance(features, list) else features,
+                    new_flow[row]["estimator_att_cache"],
+                    states[row].prompt_att_generation,
+                ),
             )
             for row in range(batch_size)
         ]
@@ -2447,6 +2899,11 @@ class BatchedToken2Wav(nn.Module):
 
         flow_cache = self._stack_flow_cache(states, include_conformer=False)
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
+        prompt_att_cache = self._prompt_att_caches.get(features.cache_key) if not isinstance(features, list) else None
+        prompt_cache_key = features.cache_key if not isinstance(features, list) else None
+        row_generations = [state.prompt_att_generation for state in states]
+        prompt_att_segments = self._prompt_att_segments_for_batch(features, batch_size)
+        prompt_att_verified = self._prompt_att_verified_for_batch(features, batch_size, states=states)
         with self._autocast(padded_hidden.device):
             cond = torch.zeros_like(padded_hidden).transpose(1, 2).contiguous()
             self._watchdog.phase(
@@ -2466,13 +2923,18 @@ class BatchedToken2Wav(nn.Module):
                 valid_lengths=hidden_lengths,
                 att_keep=(max(prompt_lengths), _CACHE_TRIM_SUFFIX),
                 prompt_lengths=prompt_lengths,
+                prompt_att_cache=prompt_att_cache,
+                prompt_cache_key=prompt_cache_key,
+                prompt_att_segments=prompt_att_segments,
+                prompt_att_verified=prompt_att_verified,
+                prompt_att_row_generations=row_generations,
             )
         self._watchdog.phase(
             "decode/cache_materialization",
             {"batch_size": batch_size, "prompt_frames": prompt_lengths},
         )
         assert isinstance(estimator_att, list)
-        new_flow: list[dict[str, torch.Tensor]] = []
+        new_flow: list[dict[str, torch.Tensor | SharedPromptAttCache]] = []
         for row, row_estimator_att in enumerate(estimator_att):
             conformer_cnn = conformer_cnn_rows[row]
             conformer_att = conformer_att_rows[row]
@@ -2494,6 +2956,15 @@ class BatchedToken2Wav(nn.Module):
                     "estimator_att_cache": row_estimator_att,
                 }
             )
+        del estimator_att
+        if self._prompt_att_sharing:
+            shared_att = self._apply_prompt_att_sharing(
+                features,
+                [cache.pop("estimator_att_cache") for cache in new_flow],
+                row_generations=row_generations,
+            )
+            for cache, shared in zip(new_flow, shared_att, strict=True):
+                cache["estimator_att_cache"] = shared
 
         audios: list[torch.Tensor | None] = [None] * batch_size
         next_states: list[BatchedToken2WavState | None] = [None] * batch_size
@@ -2554,6 +3025,11 @@ class BatchedToken2Wav(nn.Module):
                     hift_cache={
                         name: value[group_row : group_row + 1].detach().clone() for name, value in next_hift.items()
                     },
+                    prompt_att_generation=self._next_prompt_att_generation(
+                        features[row] if isinstance(features, list) else features,
+                        new_flow[row]["estimator_att_cache"],
+                        states[row].prompt_att_generation,
+                    ),
                 )
 
         return self._require_complete_ragged_outputs(audios, next_states)

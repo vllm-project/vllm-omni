@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, load_deploy_config
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_code2wav as code2wav
@@ -282,3 +284,49 @@ def test_final_exact_chunk_append_reserves_one_unit_not_two(seq):
         return len(prompt["prompt_token_ids"])
 
     assert _budget(seq=seq, final=True) == _budget(seq=seq, final=False)
+
+
+@pytest.mark.asyncio
+async def test_prepare_runtime_config_wires_duplex_context_caching(monkeypatch):
+    _stub_tokenizer(monkeypatch)
+    plugin = _plugin()
+    config = DuplexSessionConfig(modalities=("text",))
+
+    # 1. Default before configure_server is disabled
+    rt_default = await plugin.prepare_runtime_config(config, model_config=SimpleNamespace())
+    assert rt_default["duplex_context_caching"] is False
+
+    # 2. Server-side duplex_session.model_custom_options enables/disables caching
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"duplex_context_caching": True}))
+    rt_on = await plugin.prepare_runtime_config(config, model_config=SimpleNamespace())
+    assert rt_on["duplex_context_caching"] is True
+
+    # 3. Deploy YAML default configures false and ignores unvalidated model_config/hf_config fields
+    deploy_cfg = load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml"))
+    plugin.configure_server(deploy_cfg.duplex_session)
+    rt_deploy_default = await plugin.prepare_runtime_config(
+        config,
+        model_config=SimpleNamespace(
+            duplex_context_caching=True,
+            hf_config=SimpleNamespace(duplex_context_caching=True),
+            stage_connector_config={"extra": {"duplex_context_caching": True}},
+        ),
+    )
+    assert rt_deploy_default["duplex_context_caching"] is False
+
+    # 4. Client extra_body cannot override the server-owned flag
+    with pytest.raises(module.MiniCPMO45ClientRuntimeConfigError):
+        plugin.validate_client_extra_body({"duplex_context_caching": True})
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"duplex_context_caching": "true"},
+        {"unknown_option": True},
+    ],
+)
+def test_configure_server_rejects_invalid_model_custom_options(options):
+    with pytest.raises(module.MiniCPMO45ClientRuntimeConfigError) as exc:
+        _plugin().configure_server(DuplexSessionRuntimeConfig(model_custom_options=options))
+    assert exc.value.code == "invalid_model_custom_options"
