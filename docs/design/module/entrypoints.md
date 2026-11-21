@@ -217,7 +217,8 @@ Shutdown closes request registration and sends a fatal error to every live
 request queue before cancelling the output pump, in one callback on the
 serving event loop. It wakes generators parked on paused or sleeping admission
 and releases first-input waiters before cancelling the input pump. Engine
-teardown runs in the shutdown caller.
+teardown runs in the shutdown caller after the live serving loop has queued
+the fatal errors and cancelled the output pump.
 Video output sessions shield final task cleanup and unfinished-request abort
 from ASGI cancellation, including disconnects immediately after `session.done`.
 Video encoding and encoder close run on one worker per stream so encoding does

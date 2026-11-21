@@ -8,6 +8,7 @@ import gc
 import queue
 import threading
 from collections.abc import AsyncGenerator, Callable
+from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -1986,4 +1987,104 @@ async def test_async_omni_shutdown_releases_first_streaming_input(
     finally:
         waiting.cancel()
         await asyncio.gather(waiting, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_omni_executor_shutdown_delivers_terminal_errors_before_engine_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = FakeAsyncOmniEngine(
+        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
+            make_output_msg(msg["request_id"], 0, payload="partial", output_finished=False)
+        )
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    streaming = {request_id: asyncio.Event() for request_id in ("req-1", "req-2")}
+
+    async def drain(request_id: str) -> None:
+        async for _ in app.generate(prompt="hello", request_id=request_id):
+            streaming[request_id].set()
+
+    loop = asyncio.get_running_loop()
+    real_schedule = loop.call_soon_threadsafe
+    frontend_scheduled = asyncio.Event()
+    engine_started = asyncio.Event()
+    release_frontend = asyncio.Event()
+    pending_frontend: list[asyncio.Task] = []
+    fatal_enqueued: set[str] = set()
+    fatal_at_teardown: list[set[str]] = []
+    worker: threading.Thread | None = None
+    frontend_intercepted = False
+
+    async def delay_frontend(callback, args, context) -> None:
+        frontend_scheduled.set()
+        await release_frontend.wait()
+        loop.call_soon(callback, *args, context=context)
+
+    def schedule(callback, *args, context=None):
+        nonlocal frontend_intercepted
+        if threading.current_thread() is worker and not frontend_intercepted:
+            frontend_intercepted = True
+
+            def defer() -> None:
+                pending_frontend.append(loop.create_task(delay_frontend(callback, args, context)))
+
+            return real_schedule(defer)
+        return real_schedule(callback, *args, context=context)
+
+    def observe_queue(queue) -> None:
+        put = queue.put_nowait
+
+        def record(message) -> None:
+            if isinstance(message, ErrorMessage) and message.fatal:
+                assert asyncio.get_running_loop() is loop
+                assert message.request_id is not None
+                fatal_enqueued.add(message.request_id)
+            put(message)
+
+        monkeypatch.setattr(queue, "put_nowait", record)
+
+    engine_shutdown = engine.shutdown
+
+    def teardown() -> None:
+        fatal_at_teardown.append(fatal_enqueued.copy())
+        real_schedule(engine_started.set)
+        engine_shutdown()
+
+    def launcher_shutdown() -> None:
+        nonlocal worker
+        worker = threading.current_thread()
+        app.shutdown()
+
+    streams = [asyncio.create_task(drain(request_id)) for request_id in streaming]
+    shutdown = None
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in streaming.values())), timeout=5)
+        for state in app.request_states.values():
+            observe_queue(state.queue)
+        monkeypatch.setattr(loop, "call_soon_threadsafe", schedule)
+        monkeypatch.setattr(engine, "shutdown", teardown)
+
+        shutdown = loop.run_in_executor(None, launcher_shutdown)
+        await asyncio.wait_for(frontend_scheduled.wait(), timeout=5)
+        # Give the executor time to reach teardown while the frontend callback
+        # is held. An implementation that waits for the callback cannot enter.
+        with suppress(TimeoutError):
+            await asyncio.wait_for(engine_started.wait(), timeout=0.25)
+        release_frontend.set()
+
+        await asyncio.wait_for(shutdown, timeout=5)
+        results = await asyncio.wait_for(asyncio.gather(*streams, return_exceptions=True), timeout=5)
+        assert all(isinstance(result, OmniEngineDeadError) for result in results)
+        assert fatal_at_teardown == [set(streaming)]
+        assert not app.request_states
+    finally:
+        release_frontend.set()
+        if shutdown is not None:
+            await asyncio.wait_for(asyncio.gather(shutdown, return_exceptions=True), timeout=5)
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, *pending_frontend, return_exceptions=True)
         app.shutdown()

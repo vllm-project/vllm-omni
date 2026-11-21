@@ -723,10 +723,32 @@ class AsyncOmniBase(OmniBase):
             except RuntimeError:
                 caller_loop = None
             if loop.is_running() and caller_loop is not loop:
-                loop.call_soon_threadsafe(self._shutdown_frontend)
+                self._shutdown_frontend_from_executor(loop)
             else:
                 self._shutdown_frontend()
         OmniBase.shutdown(self)
+
+    def _shutdown_frontend_from_executor(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Wait for the serving loop callback before engine teardown."""
+        finished = threading.Event()
+
+        def stop_frontend() -> None:
+            try:
+                self._shutdown_frontend()
+            finally:
+                finished.set()
+
+        try:
+            loop.call_soon_threadsafe(stop_frontend)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+            return
+        # The launcher awaits this executor call, leaving the serving loop free
+        # to deliver the errors. If the loop stops concurrently, no callback
+        # can run and the executor must still be able to release the engine.
+        while not finished.wait(timeout=0.1) and loop.is_running():
+            pass
 
     def _shutdown_frontend(self) -> None:
         """Close admission and stop the output pump on its owning loop."""
