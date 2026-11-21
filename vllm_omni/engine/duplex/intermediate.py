@@ -36,6 +36,23 @@ class DuplexIntermediateBuffer(TypedDict, total=False):
     mel_spec: object
 
 
+#: Duplex runtime-config key a plugin sets when its Stage 0 model adds the
+#: position base below to its RoPE positions; ``OmniARScheduler`` then cuts a
+#: long session's placeholder prompt behind its sliding window.
+DUPLEX_POSITION_REBASE_KEY = "duplex_position_rebase"
+#: Key in an append's ``duplex`` section: the prompt positions the scheduler has
+#: cut from that session so far.
+DUPLEX_POSITION_BASE_KEY = "position_base"
+
+
+def duplex_position_base(duplex: Mapping[str, object] | None) -> int:
+    """The RoPE position base an append's ``duplex`` section carries (0 if none)."""
+    if not duplex:
+        return 0
+    value = duplex.get(DUPLEX_POSITION_BASE_KEY)
+    return int(value) if isinstance(value, int) else 0
+
+
 def build_duplex_append_prompt(
     *,
     request_id: str,
