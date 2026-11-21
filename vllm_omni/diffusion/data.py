@@ -328,6 +328,14 @@ class DiffusionParallelConfig:
     allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
+    ulysses_a2a_zero_copy: bool = False
+    """Return the CUDA copy-engine exchange outputs as views of the symmetric-memory workspace.
+
+    Requires ``ulysses_a2a_permute``. Skips copying the exchanged Q/K/V and attention output out of the workspace;
+    a returned view stays valid until the next exchange on the same group, whose first barrier waits for every
+    rank's consumers.
+    """
+
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -404,6 +412,8 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        if self.ulysses_a2a_zero_copy and not self.ulysses_a2a_permute:
+            raise ValueError("ulysses_a2a_zero_copy requires ulysses_a2a_permute")
         assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."

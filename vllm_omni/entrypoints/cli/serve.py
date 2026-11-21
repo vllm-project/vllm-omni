@@ -827,6 +827,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-zero-copy",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "With --ulysses-a2a-permute on CUDA, return the exchanged Q/K/V and attention output as views of the "
+                "symmetric-memory workspace instead of copying them out. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",

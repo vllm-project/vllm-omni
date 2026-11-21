@@ -244,6 +244,7 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
+        ulysses_a2a_zero_copy: bool = False,
     ) -> None:
         self._sp_group = sp_group
         self._ulysses_pg = sp_group.ulysses_group
@@ -251,6 +252,7 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
+        self._ulysses_a2a_zero_copy = ulysses_a2a_zero_copy
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -554,7 +556,9 @@ class UlyssesParallelAttention:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                query, key, value = ulysses_qkv_fwd_group(query, key, value, group_name, ulysses_world_size)
+                query, key, value = ulysses_qkv_fwd_group(
+                    query, key, value, group_name, ulysses_world_size, self._ulysses_a2a_zero_copy
+                )
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
                 if self._use_sync:
@@ -697,6 +701,7 @@ class UlyssesParallelAttention:
                     output_img,
                     ctx.ulysses_pg.group_name,
                     dist.get_world_size(ctx.ulysses_pg),
+                    self._ulysses_a2a_zero_copy,
                 )
                 if ctx.use_sync:
                     current_omni_platform.synchronize()
@@ -744,6 +749,7 @@ class UlyssesParallelAttention:
                 attn_output,
                 ctx.ulysses_pg.group_name,
                 dist.get_world_size(ctx.ulysses_pg),
+                self._ulysses_a2a_zero_copy,
             )
             if ctx.use_sync:
                 current_omni_platform.synchronize()

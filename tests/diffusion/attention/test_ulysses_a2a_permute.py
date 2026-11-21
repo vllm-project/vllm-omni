@@ -17,7 +17,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("npu", [False, True])
 @pytest.mark.parametrize("joint", [None, "front", "rear"])
 @pytest.mark.parametrize("use_sync", [False, True])
-def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_sync):
+@pytest.mark.parametrize("zero_copy", [False, True])
+def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_sync, zero_copy):
     """Both platforms share attention routing, including joint slicing."""
     calls = []
     platform = SimpleNamespace(is_npu=lambda: npu, synchronize=lambda: calls.append("sync"))
@@ -32,15 +33,17 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
         allgather_world_size=1,
     )
     monkeypatch.setattr(ulysses.dist, "get_world_size", lambda pg: 2)
-    strategy = ulysses.UlyssesParallelAttention(group, 2, 1, use_sync, ulysses_a2a_permute=True)
+    strategy = ulysses.UlyssesParallelAttention(
+        group, 2, 1, use_sync, ulysses_a2a_permute=True, ulysses_a2a_zero_copy=zero_copy
+    )
     query = torch.randn(1, 3, 4, 16)
     key = torch.randn(1, 3, 2, 16)
     value = torch.randn_like(key)
     gate = torch.randn_like(query)
 
-    def qkv(q, k, v, group_name, world_size):
+    def qkv(q, k, v, group_name, world_size, zero_copy_arg):
         assert q is query and k is key and v is value
-        assert (group_name, world_size) == ("ulysses", 2)
+        assert (group_name, world_size, zero_copy_arg) == ("ulysses", 2, zero_copy)
         calls.append("qkv")
         return tuple(t[:, :, : t.shape[2] // 2].repeat(1, 2, 1, 1) for t in (q, k, v))
 
@@ -49,7 +52,8 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
         assert tensor is gate
         return tensor[:, :, :2].repeat(1, 2, 1, 1)
 
-    def reverse(tensor, group_name, world_size):
+    def reverse(tensor, group_name, world_size, zero_copy_arg):
+        assert zero_copy_arg is zero_copy
         calls.append("reverse")
         assert tensor.shape == (1, 6, 2, 16)
         return tensor[:, :3].repeat(1, 1, 2, 1)
@@ -178,3 +182,11 @@ def test_disabled_optimization_does_not_load_backend(monkeypatch):
     group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1)
     strategy = ulysses.UlyssesParallelAttention(group, 2, 1, False)
     assert strategy.name == "ulysses"
+
+
+def test_zero_copy_requires_a2a_permute():
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    assert DiffusionParallelConfig(ulysses_a2a_permute=True, ulysses_a2a_zero_copy=True).ulysses_a2a_zero_copy
+    with pytest.raises(ValueError, match="ulysses_a2a_zero_copy requires ulysses_a2a_permute"):
+        DiffusionParallelConfig(ulysses_a2a_zero_copy=True)

@@ -445,6 +445,7 @@ class OmniEngineArgs(EngineArgs):
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ulysses_a2a_permute: bool | None = None
+    ulysses_a2a_zero_copy: bool | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     use_hsdp: bool | None = None
@@ -810,6 +811,7 @@ class OrchestratorArgs:
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ulysses_a2a_permute: bool | None = None
+    ulysses_a2a_zero_copy: bool | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
@@ -950,6 +952,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "ulysses_degree",
         "ulysses_mode",
         "ulysses_a2a_permute",
+        "ulysses_a2a_zero_copy",
         "ring_degree",
         "allgather_degree",
         "use_hsdp",

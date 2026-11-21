@@ -85,11 +85,13 @@ class TestParallelConfigPropagation:
             ulysses_degree=2,
             ring_degree=1,
             ulysses_a2a_permute=True,
+            ulysses_a2a_zero_copy=True,
         )
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_degree == 2
         assert od.parallel_config.ring_degree == 1
         assert od.parallel_config.ulysses_a2a_permute is True
+        assert od.parallel_config.ulysses_a2a_zero_copy is True
 
     def test_mask_sp_padding_roundtrip(self):
         pc = DiffusionParallelConfig(ulysses_degree=2, mask_sp_padding=True)
