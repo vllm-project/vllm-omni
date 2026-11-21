@@ -94,10 +94,15 @@ class MRv2FullAttentionGroupView:
         return list(batch.req_ids[: batch.num_reqs])
 
     def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor:
+        """Runs on the engine thread every step: read only the ledger blocks
+        this step's positions fall in, so the cost does not grow with context."""
         batch = self._batch()
         row_of = {req_id: row for row, req_id in enumerate(batch.req_ids[: batch.num_reqs])}
         bs = self.block_size
-        parts: list[np.ndarray] = []
+        starts: list[int] = []
+        counts: list[int] = []
+        offsets: list[int] = []
+        step_blocks: list[int] = []
         for req_id in req_ids:
             count = int(num_scheduled.get(req_id, 0))
             if count <= 0:
@@ -108,16 +113,23 @@ class MRv2FullAttentionGroupView:
                     f"req {req_id}: scheduled {count} tokens, bound input batch disagrees"
                 )
             blocks = self._adapter.block_ids(req_id)
-            pos = np.arange(count, dtype=np.int64) + int(batch.num_computed_tokens_np[row])
-            idx = pos // bs
-            if int(idx[-1]) >= len(blocks):
+            start = int(batch.num_computed_tokens_np[row])
+            first, last = start // bs, (start + count - 1) // bs
+            if last >= len(blocks):
                 raise OmniPrefixCacheUnmatchError(
-                    f"req {req_id}: position {int(pos[-1])} lies past its {len(blocks)} recorded blocks"
+                    f"req {req_id}: position {start + count - 1} lies past its {len(blocks)} recorded blocks"
                 )
-            parts.append(np.asarray(blocks, dtype=np.int64)[idx] * bs + pos % bs)
-        if not parts:
+            offsets.append(len(step_blocks) - first)
+            step_blocks.extend(blocks[first : last + 1])
+            starts.append(start)
+            counts.append(count)
+        if not counts:
             return torch.empty((0,), dtype=torch.long)
-        return torch.from_numpy(np.concatenate(parts))
+        n = np.asarray(counts, dtype=np.int64)
+        first_row = np.cumsum(n) - n
+        pos = np.arange(int(n.sum()), dtype=np.int64) + np.repeat(np.asarray(starts, dtype=np.int64) - first_row, n)
+        idx = pos // bs + np.repeat(np.asarray(offsets, dtype=np.int64), n)
+        return torch.from_numpy(np.asarray(step_blocks, dtype=np.int64)[idx] * bs + pos % bs)
 
 
 def check_mrv2_prefix_cache_layout(*, block_sizes: list[int], block_size: int, dcp_size: int) -> None:
