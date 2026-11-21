@@ -64,7 +64,6 @@ class AuKCUDAGraphWrapper:
     _REF_ALIGNMENT = 50
     _BATCH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
     _MAX_OOM_LOOP_RETRIES = 1
-    _OOM_COOLDOWN_CALLS = 16
 
     @classmethod
     def _batch_bucket(cls, batch_size: int) -> int:
@@ -88,18 +87,30 @@ class AuKCUDAGraphWrapper:
             cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
         return False
 
-    def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
+    def __init__(
+        self,
+        dit: AuKTransformer,
+        *,
+        enabled: bool = True,
+        max_graphs: int = 32,
+        loop_graph: bool = True,
+    ) -> None:
         self.dit = dit
         self.enabled = bool(enabled)
+        self.loop_graph = bool(loop_graph)
         self.max_graphs = max(1, int(max_graphs))
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
         self._loop_cache: OrderedDict[tuple, _LoopGraphEntry] = OrderedDict()
         # Deterministic capture failures (and OOM-exhausted keys) stay eager for
-        # the process lifetime; transient OOMs cool down and retry once after
-        # generation retirement.
+        # the process lifetime; transient OOMs record the cache generation they
+        # failed in and retry once after a subsequent generation retirement.
         self._uncapturable_loop_keys: set[tuple] = set()
-        self._oom_loop_cooldowns: dict[tuple, int] = {}
+        self._cache_generation: int = 0
+        self._oom_loop_failed_gen: dict[tuple, int] = {}
         self._oom_loop_retry_counts: dict[tuple, int] = {}
+        self.loop_captures: int = 0
+        self.eager_loop_fallbacks: int = 0
+        self.retirements: int = 0
         # Single pool shared by single-step and loop graphs, retired atomically.
         # Safe because both __call__ and sample_loop clone static outputs before return.
         self._pool_handle: int | None = None
@@ -107,7 +118,12 @@ class AuKCUDAGraphWrapper:
         # the eager fallback reuses across the steps of one request.
         self._active_key: tuple | None = None
         self._eager_ctx: AuKStepContext | None = None
-        logger.info("Initialized AuK DiT lazy CUDA graph cache: enabled=%s slots=%d", self.enabled, self.max_graphs)
+        logger.info(
+            "Initialized AuK DiT lazy CUDA graph cache: enabled=%s loop_graph=%s slots=%d",
+            self.enabled,
+            self.loop_graph,
+            self.max_graphs,
+        )
 
     @classmethod
     def _bucket_inputs(
@@ -150,10 +166,15 @@ class AuKCUDAGraphWrapper:
             self._loop_cache.clear()
             self._active_key = None
             self._pool_handle = None
-            # Retirement frees the pool held by the previous graph generation,
-            # so keys that only hit transient CUDA OOM can retry once; deterministic
-            # (or OOM-exhausted) failures remain in _uncapturable_loop_keys.
-            self._oom_loop_cooldowns.clear()
+            self._cache_generation += 1
+            self.retirements += 1
+            logger.info(
+                "Retired AuK DiT CUDA graph generation %d (retirements=%d, loop_captures=%d, eager_loop_fallbacks=%d)",
+                self._cache_generation,
+                self.retirements,
+                self.loop_captures,
+                self.eager_loop_fallbacks,
+            )
 
     def _prepare(
         self,
@@ -245,10 +266,15 @@ class AuKCUDAGraphWrapper:
                 assert ctx is not None
                 entry = self._capture(x, ctx, timestep, cfg_strength=cfg_strength, step_index=step_index)
             except Exception:
+                had_graphs = bool(self._cache or self._loop_cache or self._pool_handle is not None)
                 self._cache.clear()
                 self._loop_cache.clear()
-                self._oom_loop_cooldowns.clear()
+                self._oom_loop_failed_gen.clear()
                 self._active_key = None
+                self._pool_handle = None
+                if had_graphs:
+                    self._cache_generation += 1
+                    self.retirements += 1
                 self.enabled = False
                 logger.exception(
                     "Disabling AuK DiT CUDA graphs after capture failure for key=%s; "
@@ -363,7 +389,13 @@ class AuKCUDAGraphWrapper:
         """Sample latents over the full Euler time grid inside a single CUDA graph."""
         n_steps = int(timesteps.numel()) - 1
         uses_cfg = cfg_strength >= 1e-5
-        if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing() or n_steps <= 0:
+        if (
+            not self.enabled
+            or not self.loop_graph
+            or x.device.type != "cuda"
+            or torch.cuda.is_current_stream_capturing()
+            or n_steps <= 0
+        ):
             return self._run_eager_loop(
                 x=x,
                 x_mask=x_mask,
@@ -384,6 +416,7 @@ class AuKCUDAGraphWrapper:
         batch_bucket = self._batch_bucket(orig_batch)
         key = (batch_bucket, target_bucket, text_bucket, ref_bucket, uses_cfg, n_steps)
         if key in self._uncapturable_loop_keys:
+            self.eager_loop_fallbacks += 1
             return self._run_eager_loop(
                 x=x,
                 x_mask=orig_x_mask,
@@ -394,12 +427,9 @@ class AuKCUDAGraphWrapper:
                 timesteps=timesteps,
                 cfg_strength=cfg_strength,
             )
-        cooldown = self._oom_loop_cooldowns.get(key)
-        if cooldown is not None:
-            if cooldown > 1:
-                self._oom_loop_cooldowns[key] = cooldown - 1
-            else:
-                del self._oom_loop_cooldowns[key]
+        failed_gen = self._oom_loop_failed_gen.get(key)
+        if failed_gen is not None and self._cache_generation <= failed_gen:
+            self.eager_loop_fallbacks += 1
             return self._run_eager_loop(
                 x=x,
                 x_mask=orig_x_mask,
@@ -433,26 +463,31 @@ class AuKCUDAGraphWrapper:
                     cfg_strength=cfg_strength,
                 )
             except Exception as exc:
+                had_graphs = bool(self._cache or self._loop_cache or self._pool_handle is not None)
                 self._cache.clear()
                 self._loop_cache.clear()
                 self._active_key = None
                 self._pool_handle = None
-                self._oom_loop_cooldowns.clear()
+                if had_graphs:
+                    self._cache_generation += 1
+                    self.retirements += 1
                 capture_is_oom = self._is_oom_capture_error(exc)
                 if capture_is_oom:
                     retries = self._oom_loop_retry_counts.get(key, 0) + 1
                     self._oom_loop_retry_counts[key] = retries
                     if retries <= self._MAX_OOM_LOOP_RETRIES:
-                        self._oom_loop_cooldowns[key] = self._OOM_COOLDOWN_CALLS
+                        self._oom_loop_failed_gen[key] = self._cache_generation
                         logger.warning(
                             "AuK DiT multi-step CUDA graph capture hit transient OOM for key=%s "
-                            "(attempt %d/%d); falling back to eager until next cache retirement.",
+                            "(attempt %d/%d, gen=%d); falling back to eager until next cache retirement.",
                             key,
                             retries,
                             self._MAX_OOM_LOOP_RETRIES + 1,
+                            self._cache_generation,
                             exc_info=True,
                         )
                     else:
+                        self._oom_loop_failed_gen.pop(key, None)
                         self._uncapturable_loop_keys.add(key)
                         logger.warning(
                             "AuK DiT multi-step CUDA graph capture failed with repeated OOM for key=%s "
@@ -462,6 +497,7 @@ class AuKCUDAGraphWrapper:
                             exc_info=True,
                         )
                 else:
+                    self._oom_loop_failed_gen.pop(key, None)
                     self._uncapturable_loop_keys.add(key)
                     logger.warning(
                         "AuK DiT multi-step CUDA graph capture failed for key=%s; falling back to eager loop.",
@@ -478,8 +514,9 @@ class AuKCUDAGraphWrapper:
                 capture_failed = True
             else:
                 self._loop_cache[key] = entry
-                self._oom_loop_cooldowns.pop(key, None)
+                self._oom_loop_failed_gen.pop(key, None)
                 self._oom_loop_retry_counts.pop(key, None)
+                self.loop_captures += 1
         else:
             assert hit_key is not None
             self._loop_cache.move_to_end(hit_key)
@@ -496,6 +533,7 @@ class AuKCUDAGraphWrapper:
             entry.static_x_in.copy_(x_buck)
 
         if capture_failed:
+            self.eager_loop_fallbacks += 1
             if capture_is_oom:
                 gc.collect()
                 if torch.cuda.is_available():

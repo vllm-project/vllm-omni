@@ -40,7 +40,7 @@ text, exactly as in the upstream repository's cookbook.
 | Sequence limit | reference plus target latents up to 65536 frames (about 21 minutes) |
 | Sampling knobs | `num_inference_steps` (default 32), `guidance_scale` (default 2.0), `seed`; Flash pins 4 steps, CFG 0 and its own time grid |
 | Request knobs | `gen_seconds`, `sway` (default -1.0), `t_grid`, `vae_sample` via `additional_information["auk"]` |
-| Concurrency | one request per DiT forward; the encoder stage runs with `max_num_seqs: 1`, prefix caching and chunked prefill off |
+| Concurrency | one request per DiT forward by default (batching opt-in via `auk_batch.yaml`); the encoder stage runs with `max_num_seqs: 1`, prefix caching and chunked prefill off |
 | Streaming | none: the ODE runs over the whole target |
 
 ## References
@@ -109,12 +109,18 @@ Editing and enhancement requests pass the source clip and may omit
 
 For concurrent requests on an 80GB GPU, select the optional
 `vllm_omni/deploy/auk_batch.yaml` profile with `deploy_config` when creating
-`Omni`. It raises both stages' capacity to 128 and gives stage 1 a 200ms maximum
-admission window. Requests with the same target length and Euler schedule share
-a DiT/VAE pass; seeds, reference clips and output ordering remain request-local.
-The default Base/Flash sampling recipes and encoder settings are inherited from
-`auk.yaml`. Larger graph buckets cost startup time and GPU memory; uncaptured
-shapes can still pay a capture cost on their first request.
+`Omni`. It raises both stages' capacity to 128, enables whole-loop DiT CUDA
+graphs via `auk_dit_loop_graph: true` (while `auk.yaml` keeps single-step DiT
+graphs by default), and gives stage 1 a 200ms maximum admission window
+(`RequestScheduler` waits up to ~40ms (`min(0.05, max_wait / 5)`) on idle
+queues before starting Stage 1, so lone `c=1` requests pay that settle cost).
+Requests in the same Euler schedule and target bucket share a DiT/VAE pass;
+seeds, reference clips, target lengths, and output ordering remain
+request-local. `AuKPipeline` executes one wave at a time without cooperative
+mid-wave cancellation (`supports_request_cancellation` is False), so client
+aborts take effect at wave boundaries. Larger graph buckets cost startup time
+and GPU memory; uncaptured shapes can still pay a capture cost on their first
+request.
 
 ## Verification
 
@@ -208,5 +214,5 @@ Inductor cache, about 30 s less warm).
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
 | `/v1/audio/speech` | supported (base and Flash, `instructions` or `task_type`) | `docs/user_guide/examples/online_serving/text_to_speech.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
-| Batching across requests | one request per DiT forward | `docs/user_guide/diffusion/` |
+| Batching across requests | one request per DiT forward by default; opt-in via `auk_batch.yaml` | `docs/user_guide/diffusion/` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |

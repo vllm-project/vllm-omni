@@ -586,20 +586,30 @@ class TestRequestParsing:
         # The samplers call step() directly, so that is what gets compiled.
         compile_fn.assert_called_once_with(step, dynamic=False)
 
+    @pytest.mark.parametrize("loop_graph", [False, True])
     @pytest.mark.parametrize("variant, cfg", [("base", 2.0), ("flash", 0.0)])
-    def test_setup_compile_warms_the_dit_graph_buckets(self, build_pipeline, mocker, variant, cfg):
-        pipeline, _ = build_pipeline(variant, model_config={"auk_dit_warmup_nfe": 4})
+    def test_setup_compile_warms_the_dit_graph_buckets(self, build_pipeline, mocker, variant, cfg, loop_graph):
+        pipeline, _ = build_pipeline(
+            variant,
+            model_config={"auk_dit_warmup_nfe": 4, "auk_dit_loop_graph": loop_graph},
+        )
         mocker.patch.object(pipeline.vae_decode, "warmup")
         mocker.patch.object(pipeline_auk, "regionally_compile")
-        wrapper = mocker.Mock(enabled=True)
+        wrapper = mocker.Mock(enabled=True, loop_graph=loop_graph)
         pipeline.cudagraph_wrapper = wrapper
 
         pipeline.setup_compile()
 
-        calls = wrapper.sample_loop.call_args_list
+        calls = wrapper.sample_loop.call_args_list if loop_graph else wrapper.call_args_list
+        if loop_graph:
+            wrapper.assert_not_called()
+        else:
+            wrapper.sample_loop.assert_not_called()
+        default_len = 33 if loop_graph else 32
+        serve_len = 5 if loop_graph else 4
         if variant == "base":
-            default = [call for call in calls if call.kwargs["timesteps"].numel() == 33]
-            serving = [call for call in calls if call.kwargs["timesteps"].numel() == 5]
+            default = [call for call in calls if call.kwargs["timesteps"].numel() == default_len]
+            serving = [call for call in calls if call.kwargs["timesteps"].numel() == serve_len]
             assert [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in default] == [
                 (150, 0),
                 (300, 0),
@@ -623,7 +633,7 @@ class TestRequestParsing:
                 (300, 150),
                 (600, 150),
             ]
-            assert all(call.kwargs["timesteps"].numel() == 5 for call in calls)
+            assert all(call.kwargs["timesteps"].numel() == serve_len for call in calls)
         for call in calls:
             assert call.kwargs["cfg_strength"] == cfg
             assert call.kwargs["text"].shape[-2:] == (96, TEXT_HIDDEN_DIM)
@@ -631,7 +641,7 @@ class TestRequestParsing:
     @pytest.mark.parametrize("model_config, enabled", [({"auk_dit_warmup_frames": []}, True), ({}, False)])
     def test_dit_warmup_can_be_skipped(self, build_pipeline, mocker, model_config, enabled):
         pipeline, _ = build_pipeline(model_config=model_config)
-        wrapper = mocker.Mock(enabled=enabled)
+        wrapper = mocker.Mock(enabled=enabled, loop_graph=True)
         pipeline.cudagraph_wrapper = wrapper
 
         pipeline._warmup_dit()
@@ -640,9 +650,9 @@ class TestRequestParsing:
         wrapper.sample_loop.assert_not_called()
 
     def test_dit_warmup_captures_serving_batch(self, build_pipeline, mocker):
-        pipeline, _ = build_pipeline(model_config={"auk_dit_warmup_nfe": 4})
+        pipeline, _ = build_pipeline(model_config={"auk_dit_warmup_nfe": 4, "auk_dit_loop_graph": True})
         pipeline._vae_warmup_batches = (1, 8)
-        wrapper = mocker.Mock(enabled=True)
+        wrapper = mocker.Mock(enabled=True, loop_graph=True)
         pipeline.cudagraph_wrapper = wrapper
 
         pipeline._warmup_dit()
@@ -653,6 +663,18 @@ class TestRequestParsing:
         assert big[0].kwargs["ref"].shape[1] == 0
         assert big[0].kwargs["timesteps"].numel() == 5
         assert big[0].kwargs["text"].shape == (8, 96, TEXT_HIDDEN_DIM)
+
+    def test_auk_dit_loop_graph_defaults_and_validation(self, build_pipeline):
+        default_pipeline, _ = build_pipeline()
+        assert default_pipeline._dit_loop_graph is False
+        assert default_pipeline.cudagraph_wrapper.loop_graph is False
+
+        enabled_pipeline, _ = build_pipeline(model_config={"auk_dit_loop_graph": True})
+        assert enabled_pipeline._dit_loop_graph is True
+        assert enabled_pipeline.cudagraph_wrapper.loop_graph is True
+
+        with pytest.raises(ValueError, match="auk_dit_loop_graph must be a boolean"):
+            build_pipeline(model_config={"auk_dit_loop_graph": "true"})
 
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()
@@ -825,6 +847,8 @@ class TestRequestParsing:
         batch_model_cfg = dict(batch.stages[1].engine_extras["model_config"])
         for key, value in base_model_cfg.items():
             assert batch_model_cfg.get(key) == value
+        assert "auk_dit_loop_graph" not in base_model_cfg
+        assert batch_model_cfg["auk_dit_loop_graph"] is True
         assert batch_model_cfg["auk_vae_warmup_batches"] == [1, 64, 128]
         assert batch_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
 
@@ -832,6 +856,7 @@ class TestRequestParsing:
         merged_model_cfg = dict(merged[1].yaml_engine_args["model_config"])
         for key, value in base_model_cfg.items():
             assert merged_model_cfg.get(key) == value
+        assert merged_model_cfg["auk_dit_loop_graph"] is True
         assert merged_model_cfg["auk_vae_warmup_batches"] == [1, 64, 128]
         assert merged_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
 

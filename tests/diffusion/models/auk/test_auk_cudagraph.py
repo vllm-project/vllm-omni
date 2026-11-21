@@ -308,19 +308,22 @@ def test_is_oom_capture_error_classifies_oom_and_non_oom() -> None:
 
 
 @pytest.mark.cpu
-def test_retire_graph_generation_preserves_uncapturable_and_resets_oom_cooldowns() -> None:
+def test_retire_graph_generation_preserves_uncapturable_and_advances_generation() -> None:
     wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), enabled=False, max_graphs=1)
     bad_key = (2, 32, 16, 0, False, 4)
     oom_key = (4, 32, 16, 0, False, 4)
     wrapper._uncapturable_loop_keys.add(bad_key)
-    wrapper._oom_loop_cooldowns[oom_key] = 5
+    wrapper._oom_loop_failed_gen[oom_key] = wrapper._cache_generation
     wrapper._loop_cache[(1, 32, 16, 0, False, 4)] = object()  # type: ignore[assignment]
+    prev_gen = wrapper._cache_generation
 
     wrapper._retire_graph_generation_if_full()
 
     assert wrapper._loop_cache == {}
     assert bad_key in wrapper._uncapturable_loop_keys
-    assert wrapper._oom_loop_cooldowns == {}
+    assert wrapper._cache_generation == prev_gen + 1
+    assert wrapper.retirements == 1
+    assert wrapper._oom_loop_failed_gen[oom_key] < wrapper._cache_generation
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
@@ -328,61 +331,87 @@ def test_retire_graph_generation_preserves_uncapturable_and_resets_oom_cooldowns
 @torch.inference_mode()
 def test_oom_loop_capture_retries_after_retirement_then_pins(mocker) -> None:
     dit = _make_dit("cuda")
+    inputs = _sample_inputs("cuda")
+    common = dict(**inputs, gen_frames=9, t_grid=[0.0, 0.4, 1.0], cfg_strength=0.0)
+
+    # 1. Transient OOM waits strictly for cache retirement (does not auto-expire after repeated calls).
     wrapper = AuKCUDAGraphWrapper(dit, max_graphs=1)
     real_capture_loop = wrapper._capture_loop
-    capture_outcomes: list[object] = [
+    outcomes_transient: list[object] = [
         torch.cuda.OutOfMemoryError("CUDA out of memory during capture"),
         "real",
-        torch.cuda.OutOfMemoryError("CUDA out of memory on first attempt"),
-        torch.cuda.OutOfMemoryError("CUDA out of memory on retry"),
     ]
     attempts = 0
 
     def flaky_capture(*args, **kwargs):
         nonlocal attempts
-        outcome = capture_outcomes[attempts]
+        outcome = outcomes_transient[attempts]
         attempts += 1
         if isinstance(outcome, BaseException):
             raise outcome
         return real_capture_loop(*args, **kwargs)
 
     mocker.patch.object(wrapper, "_capture_loop", side_effect=flaky_capture)
-    inputs = _sample_inputs("cuda")
-    common = dict(**inputs, gen_frames=9, t_grid=[0.0, 0.4, 1.0], cfg_strength=0.0)
-
-    # 1. Transient OOM falls back to eager and enters cooldown (not permanent blacklist).
     out1 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
     assert out1 is not None and attempts == 1
-    assert not wrapper._uncapturable_loop_keys and len(wrapper._oom_loop_cooldowns) == 1
+    assert not wrapper._uncapturable_loop_keys
+    assert len(wrapper._oom_loop_failed_gen) == 1
+    assert wrapper.eager_loop_fallbacks == 1
 
-    # While still in cooldown without retirement, capture is not retried immediately.
-    out2 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
-    assert out2 is not None and attempts == 1
+    # Even after >16 calls with no cache retirement, capture is not retried in the same generation.
+    for _ in range(20):
+        out_wait = sample_latents(
+            dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper
+        )
+        assert out_wait is not None
+    assert attempts == 1
+    assert wrapper.eager_loop_fallbacks == 21
 
-    # Filling and retiring the generation clears OOM cooldowns so capture retries and succeeds.
+    # Retiring the generation advances _cache_generation so capture retries and succeeds.
     wrapper._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
     wrapper._retire_graph_generation_if_full()
+    assert wrapper.retirements == 1
     out3 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
     assert out3 is not None and attempts == 2
+    assert wrapper.loop_captures == 1
     assert len(wrapper._loop_cache) == 1
+    assert wrapper._oom_loop_failed_gen == {}
     assert wrapper._oom_loop_retry_counts == {}
 
-    # 2. Simulate repeated OOM on a fresh wrapper: retries once after retirement, then pins permanently.
-    wrapper._loop_cache.clear()
-    wrapper._pool_handle = None
-    sample_a = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
-    assert sample_a is not None and attempts == 3
-    wrapper._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
-    wrapper._retire_graph_generation_if_full()
-    sample_b = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
-    assert sample_b is not None and attempts == 4
-    assert len(wrapper._uncapturable_loop_keys) == 1
+    # 2. Repeated OOM on a fresh wrapper: retries once after retirement, then pins permanently.
+    wrapper2 = AuKCUDAGraphWrapper(dit, max_graphs=1)
+    attempts2 = 0
+
+    def always_oom(*args, **kwargs):
+        nonlocal attempts2
+        attempts2 += 1
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+    mocker.patch.object(wrapper2, "_capture_loop", side_effect=always_oom)
+    sample_a = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper2)
+    assert sample_a is not None and attempts2 == 1
+    wrapper2._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
+    wrapper2._retire_graph_generation_if_full()
+    sample_b = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper2)
+    assert sample_b is not None and attempts2 == 2
+    assert len(wrapper2._uncapturable_loop_keys) == 1
+    assert wrapper2._oom_loop_failed_gen == {}
 
     # Even after another retirement, the OOM-exhausted key stays permanently eager.
-    wrapper._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
-    wrapper._retire_graph_generation_if_full()
-    sample_c = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
-    assert sample_c is not None and attempts == 4
+    wrapper2._loop_cache[("dummy",)] = object()  # type: ignore[assignment]
+    wrapper2._retire_graph_generation_if_full()
+    sample_c = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper2)
+    assert sample_c is not None and attempts2 == 2
+
+    # 3. loop_graph=False skips whole-loop capture cleanly even on CUDA.
+    wrapper_noloop = AuKCUDAGraphWrapper(dit, loop_graph=False)
+    sample_loop_spy = mocker.spy(wrapper_noloop, "sample_loop")
+    out_single_step = sample_latents(
+        dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper_noloop
+    )
+    assert out_single_step is not None
+    sample_loop_spy.assert_not_called()
+    assert not wrapper_noloop._loop_cache and len(wrapper_noloop._cache) == 1
 
 
 @pytest.mark.cpu
@@ -450,13 +479,12 @@ def test_loop_capture_oom_releases_allocations_before_eager_and_recovers_from_pr
     out = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
     assert out is not None
     assert transient_alive_at_eager == [False]
-    assert len(wrapper._oom_loop_cooldowns) == 1
+    assert len(wrapper._oom_loop_failed_gen) == 1
     assert not wrapper._uncapturable_loop_keys
 
-    # Now simulate OOM during _prepare (during bucket/prepare setup) -> recovers into cooldown + eager fallback.
-    wrapper._oom_loop_cooldowns.clear()
-    wrapper._oom_loop_retry_counts.clear()
-    real_prepare = wrapper._prepare
+    # Simulate OOM during _prepare (during bucket/prepare setup) -> recovers into failed_gen tracking + eager fallback.
+    wrapper2 = AuKCUDAGraphWrapper(dit, max_graphs=1)
+    real_prepare = wrapper2._prepare
     prepare_calls = 0
 
     def oom_once_in_prepare(*args, **kwargs):
@@ -466,12 +494,12 @@ def test_loop_capture_oom_releases_allocations_before_eager_and_recovers_from_pr
             raise torch.cuda.OutOfMemoryError("CUDA out of memory inside _prepare")
         return real_prepare(*args, **kwargs)
 
-    mocker.patch.object(wrapper, "_prepare", side_effect=oom_once_in_prepare)
-    out2 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
+    mocker.patch.object(wrapper2, "_prepare", side_effect=oom_once_in_prepare)
+    out2 = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper2)
     assert out2 is not None
     assert prepare_calls == 2
-    assert len(wrapper._oom_loop_cooldowns) == 1
-    assert not wrapper._uncapturable_loop_keys
+    assert len(wrapper2._oom_loop_failed_gen) == 1
+    assert not wrapper2._uncapturable_loop_keys
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -771,3 +799,124 @@ def test_sample_latents_noise_frames_matches_unpadded_serial() -> None:
             noise_frames=[10, 9],
             generator=[gen0_batch, gen1_batch],
         )
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+@torch.inference_mode()
+@pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_loop_graph_replay_matches_eager_loop_on_identical_bucket(cfg_strength: float, dtype: torch.dtype) -> None:
+    """With exact bucketed shapes (no padding), loop graph replay is bit-exact against eager even in BF16."""
+    dit = _make_dit("cuda").to(dtype=dtype)
+    wrapper = AuKCUDAGraphWrapper(dit)
+    in0 = _sample_inputs("cuda", 0.0, ref_frames=4)
+    in1 = _sample_inputs("cuda", 0.25, ref_frames=4)
+    batched = {
+        k: torch.cat(
+            [
+                v.to(dtype) if v.is_floating_point() else v,
+                in1[k].to(dtype) if in1[k].is_floating_point() else in1[k],
+            ]
+        )
+        for k, v in in0.items()
+    }
+    batched["text"] = torch.nn.functional.pad(batched["text"], (0, 0, 0, 32 - batched["text"].shape[1]))
+    batched["c_mask"] = torch.nn.functional.pad(batched["c_mask"], (0, 32 - batched["c_mask"].shape[1]), value=False)
+    batched["ref"] = torch.nn.functional.pad(batched["ref"], (0, 0, 0, 50 - batched["ref"].shape[1]))
+    batched["ref_mask"] = torch.nn.functional.pad(
+        batched["ref_mask"], (0, 50 - batched["ref_mask"].shape[1]), value=False
+    )
+
+    common = dict(
+        **batched,
+        gen_frames=32,
+        t_grid=[0.0, 0.4, 1.0],
+        cfg_strength=cfg_strength,
+        dtype=torch.float32,
+        sampler=wrapper,
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+        # Capture on first call, replay on second, then compare against _run_eager_loop on identical shapes.
+        sample_latents(
+            dit,
+            **common,
+            generator=[torch.Generator(device="cuda").manual_seed(1), torch.Generator(device="cuda").manual_seed(2)],
+        )
+        assert wrapper.loop_captures == 1
+        graph_out = sample_latents(
+            dit,
+            **common,
+            generator=[torch.Generator(device="cuda").manual_seed(7), torch.Generator(device="cuda").manual_seed(11)],
+        )
+        wrapper.enabled = False
+        eager_out = sample_latents(
+            dit,
+            **common,
+            generator=[torch.Generator(device="cuda").manual_seed(7), torch.Generator(device="cuda").manual_seed(11)],
+        )
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
+def test_mixed_empty_and_nonempty_ref_batch_matches_serial_cpu(cfg_strength: float) -> None:
+    """Mixed zero-reference and voice-cloned rows in one batch match their serial runs."""
+    dit = _make_dit("cpu")
+    in_empty = _sample_inputs("cpu", 0.0, ref_frames=0)
+    in_ref = _sample_inputs("cpu", 0.25, ref_frames=4)
+    batched = {
+        "text": torch.cat([in_empty["text"], in_ref["text"]]),
+        "c_mask": torch.cat([in_empty["c_mask"], in_ref["c_mask"]]),
+        "ref": torch.cat([torch.zeros(1, 4, 4), in_ref["ref"]]),
+        "ref_mask": torch.cat([torch.zeros(1, 4, dtype=torch.bool), in_ref["ref_mask"]]),
+    }
+    common = dict(gen_frames=9, t_grid=[0.0, 0.4, 1.0], cfg_strength=cfg_strength, dtype=torch.float32)
+    serial0 = sample_latents(dit, **in_empty, **common, generator=torch.Generator().manual_seed(7))
+    serial1 = sample_latents(dit, **in_ref, **common, generator=torch.Generator().manual_seed(11))
+    batched_out = sample_latents(
+        dit,
+        **batched,
+        **common,
+        generator=[torch.Generator().manual_seed(7), torch.Generator().manual_seed(11)],
+    )
+    torch.testing.assert_close(batched_out[0:1], serial0, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(batched_out[1:2], serial1, atol=1e-5, rtol=1e-5)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+@torch.inference_mode()
+@pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mixed_empty_and_nonempty_ref_loop_graph_matches_serial_cuda(cfg_strength: float, dtype: torch.dtype) -> None:
+    """Whole-loop CUDA graph preserves serial parity when text-only and zero-shot TTS rows share a batch."""
+    dit = _make_dit("cuda").to(dtype=dtype)
+    wrapper = AuKCUDAGraphWrapper(dit)
+    in_empty = _sample_inputs("cuda", 0.0, ref_frames=0)
+    in_ref = _sample_inputs("cuda", 0.25, ref_frames=4)
+    in_empty = {k: v.to(dtype) if v.is_floating_point() else v for k, v in in_empty.items()}
+    in_ref = {k: v.to(dtype) if v.is_floating_point() else v for k, v in in_ref.items()}
+    batched = {
+        "text": torch.cat([in_empty["text"], in_ref["text"]]),
+        "c_mask": torch.cat([in_empty["c_mask"], in_ref["c_mask"]]),
+        "ref": torch.cat([torch.zeros(1, 4, 4, device="cuda", dtype=dtype), in_ref["ref"]]),
+        "ref_mask": torch.cat([torch.zeros(1, 4, dtype=torch.bool, device="cuda"), in_ref["ref_mask"]]),
+    }
+    common = dict(gen_frames=9, t_grid=[0.0, 0.4, 1.0], cfg_strength=cfg_strength, dtype=torch.float32)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+        serial0 = sample_latents(dit, **in_empty, **common, generator=torch.Generator(device="cuda").manual_seed(7))
+        serial1 = sample_latents(dit, **in_ref, **common, generator=torch.Generator(device="cuda").manual_seed(11))
+        batched_out = sample_latents(
+            dit,
+            **batched,
+            **common,
+            sampler=wrapper,
+            generator=[torch.Generator(device="cuda").manual_seed(7), torch.Generator(device="cuda").manual_seed(11)],
+        )
+    atol = 3e-2 if dtype == torch.bfloat16 else 1e-5
+    rtol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(batched_out[0:1], serial0, atol=atol, rtol=rtol)
+    torch.testing.assert_close(batched_out[1:2], serial1, atol=atol, rtol=rtol)
+    assert len(wrapper._loop_cache) == 1

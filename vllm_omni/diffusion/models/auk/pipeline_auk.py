@@ -234,6 +234,10 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         ref_cache_size = od_config.model_config.get("auk_ref_cache_size", _REF_CACHE_SIZE)
         if isinstance(ref_cache_size, bool) or not isinstance(ref_cache_size, int) or ref_cache_size < 0:
             raise ValueError("AuK auk_ref_cache_size must be a non-negative integer (0 disables the cache)")
+        dit_loop_graph = od_config.model_config.get("auk_dit_loop_graph", False)
+        if not isinstance(dit_loop_graph, bool):
+            raise ValueError("AuK auk_dit_loop_graph must be a boolean")
+        self._dit_loop_graph = dit_loop_graph
         self.device = get_local_device()
         self.dtype = getattr(od_config, "dtype", None) or torch.bfloat16
 
@@ -299,7 +303,10 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     self.device,
                 )
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(
-            self.dit, enabled=not od_config.enforce_eager, max_graphs=max_dit_graphs
+            self.dit,
+            enabled=not od_config.enforce_eager,
+            max_graphs=max_dit_graphs,
+            loop_graph=dit_loop_graph,
         )
         # The compiled decode buckets are warmed by setup_compile(), which the
         # model runner calls at startup unless the stage is enforce_eager. The
@@ -457,21 +464,35 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         grid: torch.Tensor,
         cfg: float,
     ) -> None:
-        """Capture one DiT CUDA-graph shape (full Euler loop when the wrapper has one)."""
+        """Capture one DiT CUDA-graph shape (full Euler loop when enabled, else single-step)."""
         text = torch.zeros(batch, text_tokens, self.text_hidden_dim, device=self.device, dtype=self.dtype)
         c_mask = torch.ones(text.shape[:2], dtype=torch.bool, device=self.device)
         ref = torch.zeros(batch, ref_frames, self.latent_dim, device=self.device, dtype=torch.float32)
         ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=self.device)
         x = torch.zeros(batch, target_frames, self.latent_dim, device=self.device, dtype=torch.float32)
-        self.cudagraph_wrapper.sample_loop(
-            x=x,
-            text=text,
-            c_mask=c_mask,
-            ref=ref,
-            ref_mask=ref_mask,
-            timesteps=grid,
-            cfg_strength=cfg,
-        )
+        if getattr(self.cudagraph_wrapper, "loop_graph", True):
+            self.cudagraph_wrapper.sample_loop(
+                x=x,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timesteps=grid,
+                cfg_strength=cfg,
+            )
+        else:
+            self.cudagraph_wrapper(
+                x=x,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timestep=grid[0],
+                cfg_strength=cfg,
+                new_request=True,
+                timesteps=grid[:-1],
+                step_index=0,
+            )
 
     # The assembled checkpoint is not a diffusers layout: __init__ reads
     # auk.safetensors and vae.safetensors directly, so the loader has no
@@ -707,6 +728,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             target_bucket = round_up(gen_frames, AuKCUDAGraphWrapper._TARGET_ALIGNMENT)
             nfe, cfg, sway, t_grid = self._resolve_schedule(sampling_params, knobs)
             key = (nfe, cfg, sway, tuple(t_grid) if t_grid is not None else None, target_bucket)
+            # _resolve_generator creates a fresh torch.Generator instance per
+            # unseeded request (never None unless monkeypatched), so id(generator)
+            # only groups requests that intentionally share one Generator object.
             gen_id = id(generator)
             prev_key = gen_open_key.get(gen_id)
             if prev_key is not None and prev_key != key:

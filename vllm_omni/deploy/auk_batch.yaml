@@ -15,5 +15,6 @@ stages:
       # keep the base decode bucket and DiT graph limits from auk.yaml here.
       auk_vae_compile_shapes: [160, 320, 640]
       max_dit_graphs: 32
+      auk_dit_loop_graph: true
       auk_vae_warmup_batches: [1, 64, 128]
       auk_dit_warmup_batches: [1, 64, 128]

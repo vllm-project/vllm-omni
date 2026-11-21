@@ -1008,7 +1008,7 @@ def sample_latents(
         device=device,
     )
     if sampler is not None:
-        if hasattr(sampler, "sample_loop"):
+        if getattr(sampler, "loop_graph", True) and hasattr(sampler, "sample_loop"):
             try:
                 return sampler.sample_loop(
                     x=x,
