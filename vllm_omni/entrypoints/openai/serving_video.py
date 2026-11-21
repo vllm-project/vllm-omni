@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import copy
+import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -32,21 +32,28 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
 )
-from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniTextPrompt,
+    absorb_attention_schedule_extra_args,
+)
 from vllm_omni.metrics import count_video_frames
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
+from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
     DiffusionPayloadValue,
+    valid_frame_counts,
 )
 
 logger = init_logger(__name__)
@@ -93,7 +100,6 @@ class ReferenceVideo:
     """Reference video frames for video-conditioned generation."""
 
     data: list[Image.Image] | list[str]
-    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -101,7 +107,6 @@ class ReferenceAudio:
     """Reference audio file path for speech-to-video generation."""
 
     path: str | list[str]
-    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -112,7 +117,13 @@ class LatentEditInput:
     source_audio: str | None = None
     video_noise_mask: Any | None = None
     audio_noise_mask: Any | None = None
-    cleanup_paths: tuple[str, ...] = ()
+
+
+@dataclass
+class TimelineGuideInput:
+    """Resolved timeline guides forwarded as ``multi_modal_data["timeline_guides"]``."""
+
+    guides: list[dict[str, Any]]
 
 
 @dataclass
@@ -127,6 +138,26 @@ class VideoGenerationArtifacts:
     stage_durations: dict[str, float]
     peak_memory_mb: float
     metrics: dict[str, object] | None = None
+    video_frame_counts: list[int] | None = None
+    lidar: DiffusionPayloadValue | None = None
+    lidar_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EncodedVideoResult:
+    """Encoded outputs of one video request, kept separate from public JSON job metadata.
+
+    ``video_bytes`` is empty for action-only requests. ``lidar_bytes`` is set
+    only when the request asked for numeric LiDAR output.
+    """
+
+    video_bytes: bytes
+    stage_durations: dict[str, float]
+    peak_memory_mb: float
+    action: VideoAction | None = None
+    video_metadata: dict[str, object] = field(default_factory=dict)
+    lidar_bytes: bytes | None = None
+    lidar_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[str, object]:
@@ -140,7 +171,8 @@ def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[
     video = artifacts.videos[0]
     # Pre-encoded outputs arrive as MP4 bytes, which carry no tensor shape.
     if isinstance(video, (bytes, bytearray, memoryview)):
-        num_frames = count_mp4_frames(bytes(video))
+        counts = artifacts.video_frame_counts
+        num_frames = counts[0] if counts else count_mp4_frames(bytes(video))
     else:
         num_frames = count_video_frames(video)
     if num_frames is not None and num_frames > 0:
@@ -162,10 +194,13 @@ class OmniOpenAIServingVideo:
         engine_client: EngineClient,
         model_name: str | None = None,
         stage_configs: list[Any] | None = None,
+        allowed_local_media_path: str = "",
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        # Contains client-named server files, such as multiview media paths.
+        self.allowed_local_media_path = allowed_local_media_path
         self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
         logger.info(
             "Video response frame conversion pool configured: workers=%d",
@@ -183,8 +218,7 @@ class OmniOpenAIServingVideo:
     ) -> tuple[OmniDiffusionConfig | SimpleNamespace | None, tuple[DiffusionModelMetadata, ...]]:
         """Resolve capability metadata from the runtime and diffusion stages."""
         od_config = self._resolve_diffusion_od_config()
-        model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
-        model_archs.extend(_stage_diffusion_model_class_name(stage) for stage in self.stage_configs or ())
+        model_archs = self._get_model_architectures(od_config)
         return od_config, tuple(get_diffusion_model_metadata(model_arch) for model_arch in model_archs)
 
     def _video_encoding_options(self) -> dict[str, bool]:
@@ -232,6 +266,20 @@ class OmniOpenAIServingVideo:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
 
+    def _get_model_architectures(self, od_config: OmniDiffusionConfig | SimpleNamespace | None) -> list[str | None]:
+        """Read architecture names from the current config and stage projections."""
+        model_archs = [_config_value(od_config, "model_class_name")]
+        for stage_config in self.stage_configs or ():
+            engine_args = _config_value(stage_config, "engine_args", {}) or {}
+            model_archs.extend(
+                (
+                    _stage_diffusion_model_class_name(stage_config),
+                    _config_value(stage_config, "model_arch"),
+                    _config_value(engine_args, "model_class_name"),
+                )
+            )
+        return model_archs
+
     @cached_property
     def preserves_reference_image_size(self) -> bool:
         """Return whether the active pipeline owns reference-image resizing."""
@@ -263,6 +311,53 @@ class OmniOpenAIServingVideo:
         return any(item.supports_latent_mask_editing for item in metadata)
 
     @property
+    def supports_multiview_reference_inputs(self) -> bool:
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_multiview_reference_inputs for item in metadata)
+
+    @property
+    def supports_latent_continuation(self) -> bool:
+        """Return whether the configured diffusion model can continue a cached clip."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_latent_continuation for item in metadata)
+
+    @property
+    def is_minimax_h3(self) -> bool:
+        config = self._resolve_diffusion_od_config()
+        architectures = set(self._get_model_architectures(config))
+        return bool(architectures & {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"})
+
+    @property
+    def controlnet_configured(self) -> bool:
+        """Whether the active model was started with a control checkpoint."""
+        config = self._resolve_diffusion_od_config()
+        if config is not None and hasattr(config, "controlnet_model_path"):
+            return bool(config.controlnet_model_path)
+        # Out-of-process clients expose only an architecture/capability view.
+        # Read the actual stage projection in that case, never request extras.
+        stages = self.stage_configs
+        if stages is None:
+            stages = getattr(self._engine_client, "stage_configs", None)
+        for stage in stages or []:
+            if get_stage_type(stage) != "diffusion":
+                continue
+            projection = _config_value(stage, "diffusion_config")
+            if projection is None:
+                projection = _config_value(stage, "engine_args") or {}
+            architecture = _config_value(projection, "model_class_name") or _config_value(stage, "model_arch")
+            if architecture not in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
+                continue
+            if _config_value(projection, "controlnet_model_path"):
+                return True
+        return False
+
+    @property
+    def supports_timeline_guides(self) -> bool:
+        """Return whether the configured diffusion model accepts timeline guides."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_timeline_guides for item in metadata)
+
+    @property
     def supported_control_upload_types(self) -> frozenset[str]:
         """Return multipart control types accepted by the active pipeline.
 
@@ -277,17 +372,29 @@ class OmniOpenAIServingVideo:
             supported.update(item.supported_control_upload_types)
         return frozenset(supported)
 
+    @staticmethod
+    def reject_async_only_outputs(request: VideoGenerationRequest) -> None:
+        """Reject requests whose outputs only the async job endpoints can deliver.
+
+        ``POST /v1/videos/sync`` and the JSON response carry one MP4. Numeric
+        LiDAR is a separate file served from a completed ``POST /v1/videos`` job.
+        """
+        if lidar_output_requested(request.extra_params):
+            raise HTTPException(status_code=400, detail="LiDAR output requires asynchronous POST /v1/videos.")
+
     @classmethod
     def for_diffusion(
         cls,
         diffusion_engine: EngineClient,
         model_name: str,
         stage_configs: list[Any] | None = None,
+        allowed_local_media_path: str = "",
     ) -> OmniOpenAIServingVideo:
         return cls(
             diffusion_engine,
             model_name=model_name,
             stage_configs=stage_configs,
+            allowed_local_media_path=allowed_local_media_path,
         )
 
     def shutdown(self) -> None:
@@ -308,11 +415,16 @@ class OmniOpenAIServingVideo:
         latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
+        if request.streaming_buffer_seconds is not None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="streaming_buffer_seconds is only supported by /v1/realtime/video; use session.playback.",
+            )
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        gen_params = self._resolve_default_sampling_params()
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self._engine_client))
 
         input_image = None if reference_image is None else reference_image.data
         input_video = None if reference_video is None else reference_video.data
@@ -404,11 +516,24 @@ class OmniOpenAIServingVideo:
                     if value is not None
                 }
             )
+        guide_input = request._timeline_guide_input
+        if guide_input is not None:
+            multi_modal_data["timeline_guides"] = guide_input.guides
+        if request._minimax_h3_control_media:
+            # MINIMAX_H3_CONTROL_MEDIA_KEY: server-persisted control uploads, never request extras.
+            multi_modal_data["minimax_h3_control"] = dict(request._minimax_h3_control_media)
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
             gen_params.height = vp.height
+        elif self.supports_multiview_reference_inputs:
+            # Automatic multiview sizing validates even a single dimension
+            # constraint after inspecting the first camera's WSM input.
+            if vp.width is not None:
+                gen_params.width = vp.width
+            if vp.height is not None:
+                gen_params.height = vp.height
         if vp.num_frames is not None:
             gen_params.num_frames = vp.num_frames
         gen_params.num_outputs_per_prompt = request.num_outputs_per_prompt
@@ -476,6 +601,11 @@ class OmniOpenAIServingVideo:
                     raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
+            try:
+                # The request value replaces a schedule the stage default sampling params carried.
+                absorb_attention_schedule_extra_args(gen_params, override=True)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
 
             # Redact inline arrays when logging so RoboLab policy requests do
             # not flood the server log with image/state payloads.
@@ -493,6 +623,11 @@ class OmniOpenAIServingVideo:
             if redacted:
                 loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
+
+        if self.supports_latent_continuation and (request.extra_params or {}).get("regenerate") is not True:
+            # Server-owned: the job id is the only key a later continue_from can name.
+            # A regenerate job is refined at 2K, off the base canvas, and is never cached.
+            gen_params.extra_args["latent_cache_key"] = reference_id
 
         self._apply_lora(request.lora, gen_params)
 
@@ -523,6 +658,14 @@ class OmniOpenAIServingVideo:
         output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
         raw_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
         metrics = {str(key): value for key, value in raw_metrics.items()} if isinstance(raw_metrics, Mapping) else None
+        lidar = multimodal_output.get("lidar")
+        if lidar_output_requested(request.extra_params) and lidar is None:
+            raise ValueError("The requested LiDAR output was not returned by the model.")
+        lidar_metadata = metadata.get("lidar", {}) if isinstance(metadata, Mapping) else {}
+        video_metadata = metadata.get("video") if isinstance(metadata, Mapping) else None
+        frame_counts = video_metadata.get("frame_counts") if isinstance(video_metadata, Mapping) else None
+        if not valid_frame_counts(frame_counts, len(cast(list[DiffusionPayloadValue], videos))):
+            frame_counts = None
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -532,6 +675,9 @@ class OmniOpenAIServingVideo:
             stage_durations=self._extract_stage_durations(result),
             peak_memory_mb=self._extract_peak_memory_mb(result),
             metrics=metrics,
+            lidar=lidar,
+            lidar_metadata=dict(lidar_metadata),
+            video_frame_counts=list(frame_counts) if frame_counts is not None else None,
         )
 
     async def generate_videos(
@@ -544,6 +690,7 @@ class OmniOpenAIServingVideo:
         reference_audio: ReferenceAudio | None = None,
         latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationResponse:
+        self.reject_async_only_outputs(request)
         artifacts = await self._run_and_extract(
             request,
             reference_id,
@@ -600,7 +747,7 @@ class OmniOpenAIServingVideo:
         reference_audio: ReferenceAudio | None = None,
         on_started: Callable[[], Awaitable[None]] | None = None,
         latent_edit_input: LatentEditInput | None = None,
-    ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
+    ) -> EncodedVideoResult:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
             request,
@@ -624,37 +771,42 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
-        action = artifacts.actions[0]
-        video_metadata = _video_metadata_from_artifacts(artifacts)
-        if action is not None and isinstance(artifacts.videos[0], dict):
+        result = EncodedVideoResult(
+            video_bytes=b"",
+            stage_durations=artifacts.stage_durations,
+            peak_memory_mb=artifacts.peak_memory_mb,
+            action=artifacts.actions[0],
+            video_metadata=_video_metadata_from_artifacts(artifacts),
+        )
+        if result.action is not None and isinstance(artifacts.videos[0], dict):
+            if artifacts.lidar is not None:
+                raise ValueError("LiDAR output requires video; action-only output with LiDAR is unsupported.")
             logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
-            return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
+            return result
 
         encoding_options: dict[str, Any] = self._video_encoding_options()
         if audio is not None:
             encoding_options.update(audio=audio, audio_sample_rate=artifacts.audio_sample_rate)
         _t_encode_start = time.perf_counter()
         if isinstance(artifacts.videos[0], bytes):
-            video_bytes = artifacts.videos[0]
+            result.video_bytes = artifacts.videos[0]
             _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
             logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", _t_encode_ms)
-            return (
-                video_bytes,
-                artifacts.stage_durations,
-                artifacts.peak_memory_mb,
-                artifacts.actions[0],
-                video_metadata,
+        else:
+            result.video_bytes = _encode_video_bytes(
+                artifacts.videos[0],
+                fps=artifacts.output_fps,
+                video_codec_options=video_codec_options,
+                frame_converter=self._video_frame_converter,
+                **encoding_options,
             )
-        video_bytes = _encode_video_bytes(
-            artifacts.videos[0],
-            fps=artifacts.output_fps,
-            video_codec_options=video_codec_options,
-            frame_converter=self._video_frame_converter,
-            **encoding_options,
-        )
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-        logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
-        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0], video_metadata
+            _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+            logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
+        if artifacts.lidar is not None:
+            result.lidar_bytes, result.lidar_metadata = await asyncio.to_thread(
+                serialize_lidar_output, artifacts.lidar, artifacts.lidar_metadata
+            )
+        return result
 
     @staticmethod
     def _resolve_video_fps_multiplier(result: object) -> int:
@@ -685,33 +837,21 @@ class OmniOpenAIServingVideo:
             return False
         return "num_frames" in video_params.model_fields_set and video_params.num_frames is not None
 
-    def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
-        default_sampling_params_list = getattr(self._engine_client, "default_sampling_params_list", None)
-        if default_sampling_params_list:
-            for params in default_sampling_params_list:
-                if isinstance(params, OmniDiffusionSamplingParams):
-                    # Requests mutate sampling params in-place, including
-                    # nested dict fields like extra_args. Deep-copy the stage
-                    # defaults so one request cannot leak state into another.
-                    return copy.deepcopy(params)
-        return OmniDiffusionSamplingParams()
-
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
         try:
-            lora_request, lora_scale = parse_lora_request(lora_body)
+            lora_requests, lora_scales = parse_lora_requests(lora_body)
         except ValueError as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=str(e),
             ) from e
 
-        if lora_request is None:
+        if not lora_requests:
             return
 
-        gen_params.lora_request = lora_request
-        if lora_scale is not None:
-            gen_params.lora_scale = lora_scale
+        gen_params.lora_request = lora_requests
+        gen_params.lora_scale = lora_scales
 
     async def _run_generation(
         self,
@@ -797,9 +937,15 @@ class OmniOpenAIServingVideo:
 
     def _extract_video_outputs(self, result: object) -> list[DiffusionPayloadValue]:
         videos = None
-        if hasattr(result, "images") and result.images:
+        custom_output = getattr(result, "custom_output", None)
+        if isinstance(custom_output, Mapping) and "video_frames" in custom_output:
+            videos = custom_output["video_frames"]
+            has_custom_video = True
+        else:
+            has_custom_video = False
+        if not has_custom_video and hasattr(result, "images") and result.images:
             videos = result.images
-        if videos is None:
+        if videos is None and not has_custom_video:
             multimodal_output = getattr(result, "multimodal_output", None)
             if isinstance(multimodal_output, Mapping):
                 videos = multimodal_output.get("video")

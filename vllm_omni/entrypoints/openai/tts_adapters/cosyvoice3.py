@@ -30,6 +30,10 @@ _PROMPT_PREFIX = f"You are a helpful assistant.{_PROMPT_DELIMITER}"
 class CosyVoice3Adapter(ARTTSAdapter):
     stage_keys = frozenset({"cosyvoice3_talker"})
     name = "cosyvoice3"
+    # The default budget is sized from the text (see apply_sampling_overrides),
+    # so a length finish under it means the model did not end the speech.
+    # Flag it rather than reject it, so the audio is still returned as before.
+    reports_length_truncation = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
@@ -119,13 +123,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
         if not request.ref_text or not request.ref_text.strip():
             return "CosyVoice3 requires 'ref_text' (transcript of the reference audio)"
 
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

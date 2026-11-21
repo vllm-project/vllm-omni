@@ -155,6 +155,7 @@ def test_forward_releases_video_after_quantization_and_before_next_seed(monkeypa
     # tensor-decode branch, which is the one the release hook wraps.
     context = {"num_outputs": 2, "seed": 41, "height": 4, "width": 4, "preencode_mp4": False}
     pipeline = SimpleNamespace(
+        load_vae_decoder=True,
         od_config=SimpleNamespace(),
         _extract_prompt=lambda raw: ("a prompt", {}),
         _extract_text_conditioning=lambda raw: None,
@@ -205,6 +206,7 @@ def test_forward_drops_the_decoded_video_before_the_next_seed_diffuses(monkeypat
     # tensor-decode branch, which is the one the release hook wraps.
     context = {"num_outputs": 2, "seed": 41, "height": 4, "width": 4, "preencode_mp4": False}
     pipeline = SimpleNamespace(
+        load_vae_decoder=True,
         od_config=SimpleNamespace(),
         _extract_prompt=lambda raw: ("a prompt", {}),
         _extract_text_conditioning=lambda raw: None,
@@ -243,6 +245,7 @@ def test_post_decode_releases_video_after_quantization(monkeypatch):
     pipeline = SimpleNamespace(
         od_config=SimpleNamespace(),
         _unpack_denoised_rows=lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)),
+        load_vae_decoder=True,
         decode=decode,
         _offload_model_cpu_stage_output=_recording_release(events, releases),
         _release_stage_cache=lambda: None,
@@ -592,6 +595,7 @@ def test_manual_component_offload_wins_over_requested_model_offload(distributed)
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config=None,
         enable_cpu_offload=True,
         enable_layerwise_offload=not distributed,
         enable_distributed_layerwise_offload=distributed,
@@ -619,6 +623,7 @@ def test_requested_model_offload_without_backend_uses_resident_components():
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config=None,
         enable_cpu_offload=True,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,

@@ -12,12 +12,12 @@ serialised through the queue.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import suppress
 from typing import Any, TypeGuard
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import PIN_MEMORY
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.media import (
@@ -54,8 +54,12 @@ class _SharedMemoryLease:
         self.__array_interface__ = array.__array_interface__
 
     def __del__(self) -> None:
-        with suppress(BufferError):
+        # No contextlib.suppress: module globals may already be gone when a
+        # borrowed tensor is collected during interpreter shutdown.
+        try:
             self.shm.close()
+        except BufferError:
+            pass
 
 
 def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.ndarray, dict[str, Any]]:
@@ -80,9 +84,19 @@ def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
 
     array = np.ascontiguousarray(array)
     shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
-    np.copyto(shm_array, array)
-    del shm_array
-    shm.close()
+    try:
+        try:
+            # Single-threaded on purpose: this runs on the async output thread
+            # while the next forward launches kernels, so it must not wake the
+            # intra-op thread pool.
+            np.copyto(shm_array, array)
+        finally:
+            del shm_array
+            shm.close()
+    except BaseException:
+        # The caller cannot track this segment until we return its handle.
+        shm.unlink()
+        raise
     return handle
 
 
@@ -216,10 +230,10 @@ def _tensor_to_shm(
     The shared memory segment remains alive after this call (the local fd is
     closed, but the segment persists until ``_tensor_from_shm`` unlinks it).
 
-    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` with
-    ``pin_memory=True`` on that stream instead of the synchronous ``.cpu()``
-    path.  The caller must synchronize *d2h_stream* after all tensors are
-    packed.
+    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` into host
+    memory pinned per the platform flag ``PIN_MEMORY`` on that stream instead
+    of the synchronous ``.cpu()`` path.  The caller must synchronize
+    *d2h_stream* after all tensors are packed.
     """
     original_dtype = tensor.dtype
     if (
@@ -233,32 +247,50 @@ def _tensor_to_shm(
         if created is not None:
             created.append(handle)
         return handle
-    if d2h_stream is not None:
-        # Non-blocking D2H: copy on side stream to pinned CPU memory.
+    if d2h_stream is not None and tensor.device.type != "cpu":
+        # Non-blocking D2H: copy on side stream into host memory pinned per
+        # the platform flag (PIN_MEMORY). Host tensors skip this staging
+        # copy; they are copied into SHM directly.
         old_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(d2h_stream)
         try:
             t = tensor.detach()
-            cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            try:
+                cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=PIN_MEMORY)
+            except RuntimeError as exc:
+                # Some Ascend hosts cannot grant pinned host pages when free
+                # (non-reclaimable) memory runs low. The copy is still correct
+                # through pageable memory; only the transfer may be slower.
+                message = str(exc)
+                if "MallocHost" not in message and "out of memory" not in message.lower():
+                    raise
+                logger.warning_once(
+                    "Pinned host buffer unavailable for shape=%s dtype=%s; copying through pageable memory.",
+                    tuple(t.shape),
+                    t.dtype,
+                )
+                cpu = torch.empty(t.shape, dtype=t.dtype)
             cpu.copy_(t, non_blocking=True)
         finally:
             torch.accelerator.set_stream(old_stream)
         d2h_stream.synchronize()
         tensor = cpu
-        # numpy has no bfloat16, so widen on the host after D2H. Never widen on
-        # the accelerator before the copy: a payload that already fell back after
-        # an fp32 OOM would OOM again on a second device-side fp32 allocation.
-        if original_dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float32)
     else:
         tensor = tensor.detach().cpu().contiguous()
-        if original_dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float32)
+    # NumPy has no bfloat16: transfer the original bits as uint16 and view them
+    # back on unpack, instead of widening to (and narrowing from) fp32 on the host.
+    bf16_view = original_dtype == torch.bfloat16
+    if bf16_view:
+        tensor = tensor.view(torch.uint16)
     handle = _array_to_shm(tensor.numpy())
     handle.update(
         {
+            # The plain path is always copied out and unlinked on unpack, even
+            # when enable_registered_shm is set, so /dev/shm holds the payload
+            # only in flight. Only the CUDA-registered path above borrows.
             "__tensor_shm__": True,
             "torch_dtype": str(original_dtype),
+            "torch_dtype_view": bf16_view,
         }
     )
     if created is not None:
@@ -269,13 +301,10 @@ def _tensor_to_shm(
 def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     """Reconstruct a tensor from a shared-memory handle and free the segment."""
     tensor = torch.from_numpy(_array_from_shm(handle))
-    # Restore the original dtype if it differs from the numpy-compatible
-    # dtype used for the SHM transfer (e.g. bfloat16 → float32 → bfloat16).
-    torch_dtype_str = handle.get("torch_dtype", "")
-    if torch_dtype_str:
-        original_dtype = getattr(torch, torch_dtype_str.replace("torch.", ""), None)
-        if original_dtype is not None and tensor.dtype != original_dtype:
-            tensor = tensor.view(original_dtype) if handle.get("torch_dtype_view") else tensor.to(original_dtype)
+    if handle.get("torch_dtype_view"):
+        # NumPy has no bfloat16, so bf16 payloads cross as their raw uint16
+        # bits; view them back. Every other dtype already round-trips as is.
+        tensor = tensor.view(getattr(torch, handle["torch_dtype"].removeprefix("torch.")))
     return tensor
 
 
@@ -382,12 +411,14 @@ def _pack_diffusion_media(
         "__type__": _DIFFUSION_MEDIA_WIRE_TYPE,
         "schema_version": video.schema_version,
         "prepared_for_transport": True,
+        "metadata": media.metadata,
         "video": {
             "tensor": packed_tensor,
             "layout": video.spec.layout.value,
             "encoding": video.spec.encoding.value,
             "value_range": video.spec.value_range.value,
             "color_model": video.spec.color_model.value,
+            "preserve_input_dtype": video.spec.preserve_input_dtype,
             "pending_float_consumers": sorted(consumer.value for consumer in video.constraints.pending_float_consumers),
         },
     }
@@ -415,6 +446,7 @@ def _unpack_diffusion_media(packed: dict[str, Any]) -> DiffusionMediaOutput:
                 encoding=VideoTensorEncoding(video_payload["encoding"]),
                 value_range=VideoValueRange(video_payload["value_range"]),
                 color_model=VideoColorModel(video_payload["color_model"]),
+                preserve_input_dtype=video_payload.get("preserve_input_dtype", False),
             ),
             constraints=VideoTransportConstraints(
                 pending_float_consumers=frozenset(
@@ -424,6 +456,7 @@ def _unpack_diffusion_media(packed: dict[str, Any]) -> DiffusionMediaOutput:
             schema_version=1,
         ),
         prepared_for_transport=True,
+        metadata=packed.get("metadata", {}),
     )
     media.validate()
     return media
@@ -517,8 +550,11 @@ def pack_diffusion_output_shm(
     the default stream).  The caller must synchronize *d2h_stream* afterward.
 
     ``enable_registered_shm`` opts explicitly identified video tensors into
-    direct CUDA-to-SHM transfer and borrowed CPU views. Other payloads keep
-    their existing transport. Registration is per transfer, without pooling.
+    direct CUDA-to-SHM transfer and borrowed CPU views. Other payloads, and
+    opted-in tensors that fall back to the plain path (non-CUDA devices, host
+    tensors, or no *d2h_stream*), keep their existing transport: copied out
+    and unlinked on unpack, so /dev/shm holds them only in flight.
+    Registration is per transfer, without pooling.
 
     Packing is failure-atomic: every SHM segment created during the call is
     tracked and unlinked if any part of the payload fails to pack, and field

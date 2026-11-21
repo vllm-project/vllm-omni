@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass, field, fields
+from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine import AdditionalInformationPayload, PayloadSenderInfo
 
 
 @dataclass
@@ -30,6 +31,7 @@ class OmniNewRequestData(NewRequestData):
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
+    resumable: bool = False
 
     @classmethod
     def from_base(
@@ -44,6 +46,7 @@ class OmniNewRequestData(NewRequestData):
             external_req_id=getattr(request, "external_req_id", None),
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            resumable=bool(getattr(request, "resumable", False)),
         )
 
     @classmethod
@@ -78,6 +81,7 @@ class OmniNewRequestData(NewRequestData):
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            resumable=bool(getattr(request, "resumable", False)),
         )
 
 
@@ -89,8 +93,8 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[str, list[int]]
-    additional_information: dict[str, dict | None]
+    prompt_token_ids: dict[str, list[int]] = field(default_factory=dict)
+    additional_information: dict[str, dict | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -108,7 +112,22 @@ class OmniChunkRecvHandle:
 
     request_id: str
     external_req_id: str | None = None
-    payload_sender_info: dict[str, object] | None = None
+    payload_sender_info: PayloadSenderInfo | None = None
+
+
+@dataclass
+class OmniRequestPrewarm:
+    """Warm-up payload for an async-chunk placeholder, handed to the runner once.
+
+    The orchestrator attaches it to a downstream stage's prewarm placeholder so
+    the model can prepare per-request state before the first chunk arrives.
+    ``payload`` is the ``ASYNC_CHUNK_PREWARM_NS`` namespace of the placeholder's
+    additional_information, deserialized (e.g. ``{"ref_audio": Tensor,
+    "ref_audio_sr": int}``).
+    """
+
+    request_id: str
+    payload: dict[str, Any]
 
 
 @dataclass
@@ -116,6 +135,13 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
+    # Scheduler-confirmed history for terminal speculative full-payload sends.
+    finished_req_output_token_ids: dict[str, list[int]] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
+    pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
+    # Aborted, errored, and ignored requests whose pending full payloads
+    # must be dropped instead of flushed. Empty unless the scheduler recorded
+    # one of those terminal statuses.
+    discarded_req_ids: set[str] = field(default_factory=set)

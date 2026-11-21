@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: Qwen
-- Model: `Qwen/Qwen-Image-2.1`
+- Model: `Qwen/Qwen-Image-2.1`, `Qwen/Qwen-Image-2.1-Turbo` (8-step distilled)
 - Task: Text-to-image generation and image-conditioned generation (editing)
 - Mode: Offline inference and online serving with optional step-wise execution
 - Maintainer: Community
@@ -18,7 +18,7 @@
 
 Use this recipe as a starting point for running `Qwen/Qwen-Image-2.1`. A single
 pipeline class, `QwenImage21Pipeline`, handles both pure text-to-image requests
-(no condition image) and image-conditioned requests with up to 4 condition
+(no condition image) and image-conditioned requests with up to 10 condition
 images: prompt and condition images are encoded together by a Qwen3-VL text
 encoder, so editing-style requests go through the same serving path as
 text-to-image.
@@ -34,6 +34,108 @@ text-to-image.
   [`docs/user_guide/diffusion_features.md`](../../docs/user_guide/diffusion_features.md)
 - Sibling recipes: [`Qwen-Image.md`](./Qwen-Image.md),
   [`Qwen-Image-Edit.md`](./Qwen-Image-Edit.md)
+
+## Qwen-Image-2.1-Turbo (8-step distilled)
+
+`Qwen/Qwen-Image-2.1-Turbo` is the 8-step distilled variant of
+Qwen-Image-2.1 and runs through the same `QwenImage21Pipeline`. Keep these
+differences from the base checkpoint in mind:
+
+- **Do not pass `num_inference_steps`.** The Turbo checkpoint's
+  `model_index.json` ships a fixed `sample_sigmas` grid, which vLLM-Omni
+  loads automatically. An explicit `num_inference_steps` is overridden by
+  `sample_sigmas`, so omit it.
+- **Do not enable CFG.** As a distilled model it runs at CFG=1: leave
+  `true_cfg_scale` at its default (1.0); setting `true_cfg_scale > 1` (and a
+  `negative_prompt`) is not meaningful for the distilled weights.
+- **License:** Qwen Research License (not Apache-2.0) — check the checkpoint
+  card before commercial use.
+
+Offline:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image-2.1-Turbo \
+  --prompt "A ceramic teapot on a wooden table" \
+  --output qwen_image_21_turbo_t2i.png \
+  --cfg-scale 1.0
+```
+
+Online serving works the same as the base model
+(`vllm serve Qwen/Qwen-Image-2.1-Turbo --omni --port 8091`). The sampling
+grid can be overridden per request through the whitelisted `sigmas`
+extra-body parameter (both `/v1/chat/completions` and the multi-stage
+`/v1/images/generations` path). The default 8-step grid is
+`[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]`:
+
+```bash
+curl http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen-Image-2.1-Turbo",
+    "prompt": "A ceramic teapot on a wooden table",
+    "size": "1024x1024",
+    "seed": 42,
+    "sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+  }'
+```
+
+### Four-GPU BF16 eager inference
+
+Start a four-GPU server with the checkpoint's native eight-step schedule:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen-Image-2.1-Turbo \
+  --omni --enforce-eager --dtype bfloat16 --num-gpus 4 \
+  --tensor-parallel-size 1 --usp 4 --ring 1 --cfg-parallel-size 1 \
+  --vae-patch-parallel-size 1 --max-num-seqs 1 \
+  --diffusion-attention-backend FLASH_ATTN --port 8098
+```
+
+The default communication backend remains the reference all-to-all. On a
+qualified CUDA installation, opt into symmetric-memory exchange with
+`--ulysses-a2a-permute`. This requires a working CUDA compiler/toolkit and
+NCCL 2.28 or later with symmetric-memory device support, including the wheel
+library/header layout required by the current extension builder. Missing
+requirements fail explicitly at initialization when opted in. No rank-local
+fallback is attempted after collectives have started.
+
+Eligible equal BF16 Q/K/V tensors then share one exchange; other layouts
+retain the separate exchanges. Backend selection uses the common parallel
+configuration; it does not depend on a model name or a hardware-name heuristic.
+
+Shared kernels live under `vllm_omni/diffusion/layers/`: pointwise fusion
+preserves BF16 intermediate roundings. Both standalone RoPE and full head128
+Q/K norm/RoPE require SM103 with CUDA/PyTorch 2.13, where the reduction and
+complex FMA order were validated. Other architectures, including SM90, retain
+the reference normalization and complex RoPE arithmetic. The channel-first VAE norm
+helper and epilogue are shared with Wan; Wan's channels-last policy stays in
+its own adapter.
+
+Exact pure-T2I text conditioning is bounded by 16 entries and 16 MiB.
+Image conditioning, batched prompts, training/gradients, LoRA and CPU offload
+bypass and invalidate this cache. Geometry follows the request's KV lifetime,
+with weak ownership and denoise-finally cleanup that preserves decode graphs.
+Generated images and sampled latents are never reused by these optimizations.
+
+After the server reports ready, send a full eight-step image request:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8098/health
+curl --fail --silent --show-error \
+  http://127.0.0.1:8098/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  --data-binary @- > qwen-image-response.json <<'JSON'
+{"model":"Qwen/Qwen-Image-2.1-Turbo","prompt":"A ceramic teapot on a wooden table","seed":42,"n":1,"size":"1280x704","response_format":"b64_json","output_format":"png","output_compression":100,"true_cfg_scale":1.0,"sigmas":[1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568]}
+JSON
+```
+
+The response contains a base64-encoded PNG in `data[0].b64_json`. This request
+checks generation; it does not measure latency. For performance comparisons,
+freeze the benchmark and accuracy checks independently of the optimization,
+use identical inputs and declared configurations, and compare native RGB and
+alpha outputs. Report cold/unseen prompts separately from warmed repeated
+prompts, which can reuse exact text conditioning.
 
 ## Offline Inference
 
@@ -68,7 +170,7 @@ or via the bundled launcher:
 bash examples/offline_inference/image_to_image/run_qwen_image_21.sh
 ```
 
-Up to 4 condition images can be passed via `--image`:
+Up to 10 condition images can be passed via `--image`:
 
 ```bash
 python examples/offline_inference/image_to_image/image_edit.py \
@@ -88,6 +190,13 @@ shared example otherwise loads inputs as RGB. Add `--width` and `--height`
 it from the last condition image's aspect ratio at approximately 1024×1024.
 Use `--num-outputs-per-prompt` to generate multiple images and `--vae-use-tiling`
 to reduce VAE memory usage. The launcher accepts these options as well.
+
+Each condition image is resized to approximately 1024×1024 pixels in area
+before encoding. More reference images increase encoding and prefix KV-cache
+memory; account for the reference count when choosing batch size and CFG settings.
+For large reference sets on an 80GB GPU, start with `--max-num-seqs 1`.
+With step execution, use `--enforce-eager` to leave room for the condition prefix
+instead of CUDA-graph pools.
 
 ## Online Serving
 
@@ -159,6 +268,11 @@ has a single live owner at a time, so concurrent same-shape requests never
 overwrite each other's prefix. Those buffers require additional memory; graph
 entries are bounded by the transformer's cache limit.
 
+Each captured graph owns its private memory pool, so dropping idle entries
+cannot leave later captures reusing a pool whose last graph was destroyed.
+Capture failures restore the caller's CUDA stream before falling back to
+eager decode, preserving output ordering across consecutive requests.
+
 ### Verification
 
 For a direct API smoke test:
@@ -189,7 +303,7 @@ OpenAI-compatible multimodal endpoint (`/v1/chat/completions` with
 | `num_inference_steps` | 50 | Number of denoising steps. |
 | `height` / `width` | 1024×1024 | Must be multiples of 32. For image-conditioned requests, leaving them unset derives the output size from the last condition image's aspect ratio at ~1024×1024. |
 | `negative_prompt` | None | Ignored at the default CFG scale of 1.0; used only when `true_cfg_scale > 1`. |
-| condition images | — | Up to 4 input images per request; more than 4 raises an error. |
+| condition images | — | Up to 10 input images per request; more than 10 raises an error. |
 | `seed` | — | Fix for reproducible outputs. |
 
 The default CFG scale of 1.0 runs only the positive-prompt branch at each
@@ -251,6 +365,15 @@ at this shape.
 
 ## Quantization
 
+For attention MXFP8 on Ascend, explicitly retain BF16 structural prefill with
+`diffusion_kv_cache_skip_steps: "0"` alongside
+`diffusion_kv_cache_dtype: mxfp8` in a deploy YAML. Pass the file to the
+offline script with `--deploy-config`. The skip selector applies to zero-based
+denoising steps in both whole-request and step-wise execution. See the
+[attention quantization configuration](../../docs/user_guide/quantization/quantized_kvcache.md#qwen-image-21-on-ascend)
+for a complete command and the mask, runtime and quality limitations. This
+setting is independent of the Linear quantization below.
+
 Online FP8 is supported per component via `quantization_config`:
 
 ```python
@@ -281,7 +404,7 @@ for the scope rules.
 
 The cached prefix K/V can be stored in FP8 E4M3 (with per-token-per-head fp32
 scales), halving the prefix-cache memory — relevant for long prompts (up to
-8192 text tokens) and up to 4 condition images (~4096 latent tokens each).
+8192 text tokens) and up to 10 condition images (~4096 latent tokens each).
 Prefill quantizes once; decode dequantizes per step, so attention compute is
 unchanged. Enable it through the model-specific `extras` config (e.g. in the
 deploy YAML's stage `extras` or as an `Omni(...)` engine kwarg):
@@ -305,8 +428,8 @@ cache, so `"fp8_v"` buys back about 9.8 dB at 75% (instead of 50%) of the origin
 cache size. The residual error is inherent e4m3 precision accumulated
 coherently over the denoising trajectory; finer scale granularity
 (per-tensor/per-head/per-token were compared) or Hadamard-rotated V did not
-improve it. The saving scales with prefix length. These sizes are calculated at the
-limit (8192 text tokens + 4 condition images, ~24.6k prefix tokens), not
+improve it. The saving scales with prefix length. These sizes are calculated for
+a four-image example (8192 text tokens + 4 condition images, ~24.6k prefix tokens), not
 measured on the 1024 T2I run above: ~12.9 GB per CFG branch in bf16, ~6.6 GB
 in `"fp8"` and ~9.7 GB in `"fp8_v"`. That is where this option matters. Treat it as an opt-in for
 memory-bound long-prompt / multi-image workloads, not a free lunch;
@@ -416,3 +539,95 @@ unless noted; 4× NVIDIA H200):
   spatial compression). On CUDA OOM the tile size is automatically halved
   (keeping 25% overlap) and decoding retried, down to 128px tiles. Tile sizes
   are not yet exposed as engine arguments.
+
+## NPU performance defaults
+
+Qwen-Image-2.1 enables the following optimizations automatically on eligible
+NPU paths. The measured workload is Qwen-Image-2.1-Turbo, BF16, TP1, eager
+execution, batch 1, CFG1 and 1280×704 on Ascend 910B1. These defaults do not
+change the sampling schedule or select a different attention backend.
+
+These optimizations are selected automatically, without environment switches:
+
+- Interleaved NPU RoPE.
+- Broadcast modulation during BF16 batch-1 eager decode without SP.
+- Residual buffer reuse during eligible BF16 eager inference.
+- NZ storage for eligible BF16 NPU linear weights.
+- Model-local fusion attention for eligible calls with SDPA selected.
+- Triton Ascend SwiGLU fusion on eligible Ascend910B1 BF16 inputs.
+
+`QWEN21_FUSION_PRECISE` still controls fusion attention precision (default `0`).
+
+The automatic attention path requires TP1, no SP, no CPU offload, no
+quantization, batch 1, equal Q/K/V head counts, no metadata, no gradients and
+no compilation. It executes inside shared Attention dispatch. Other models,
+other selected backends, masked calls and graph execution keep their existing
+paths. Causal attention and unequal Q/K/V head counts also retain ordinary SDPA.
+
+Automatic NZ conversion requires unquantized TP1 execution without CPU offload,
+sequence parallelism, HSDP or a configured `lora_path`, BF16 NPU weights, and
+`allow_internal_format=True`
+already configured in the runtime. Otherwise it is skipped. Eligibility follows
+eager execution, not `enable_cuda_graph_decode`. On NPU this transformer stays
+eager either way: Ascend does not torch.compile it, and CUDA graph capture does
+not run, so the default graph manager falls back to eager and still converts.
+The model never changes the global internal-format setting. Conversion is
+skipped when its prerequisites are absent.
+Conversion runs while the transformer loads its weights. Distilled LoRA fusion
+adds ND deltas into those weights afterwards, and HSDP shards or broadcasts
+them, so both configurations keep ND storage.
+Residual reuse requires the eager prepared-modulation path and does not mutate
+its input or combine multiplication/addition rounding into one fused operation.
+
+VAE spatial-padding folding, prompt caching, request geometry reuse and shared
+modulation preparation apply under their own guards.
+
+VAE normalization also reuses its fresh FP32 conversion buffer on NPU for
+FP16/BF16 inference without autograd or compilation. It preserves the L2 norm,
+epsilon clamp and sequential scaling operations, and never overwrites the
+input. A separate 1024×1024,
+8-step Ascend 910B1 comparison validated pixel-identical outputs; its results
+should not be combined with the 1280×704 measurements above.
+
+Unquantized NPU BF16 MLP inference also reuses fresh gate-projection storage
+for separate SiLU and multiplication operations. Autograd, compilation and
+other dtypes retain the original path. VAE normalization skips its fixed Python
+zero bias, while trainable tensor biases are still applied. These changes need
+no additional environment flags and were validated with the 1024×1024 workload.
+
+### Triton Ascend SwiGLU fusion
+
+This path is enabled automatically when its eligibility checks pass.
+Earlier default-configuration measurements excluded this fusion and must not
+be treated as measurements of the new default. With Triton Ascend
+installed, unquantized eager BF16 inference on Ascend910B1 fuses the
+two-input SiLU/multiply path for batch 1, hidden width
+4096 and sequence length at least 4096. Both projected tensors must have width
+12288 and contiguous ND storage. Other cases use the existing implementation.
+The kernel reuses the fresh gate projection, preserves BF16 rounding after
+SiLU, and does not concatenate gate/up tensors. Sequence lengths share a single
+compiled kernel; initial compilation is excluded from warmed latency results.
+
+Focused validation (requires the project's NPU test environment):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest \
+  tests/diffusion/models/qwen_image_21/test_npu_fused_ops.py \
+  --run-level core_model -q
+```
+
+### Conditioning cache and graph fallback scope
+
+The model-local text-only prompt cache matches upstream main. A single string
+prompt is cached directly and does not consult `enable_prompt_embed_cache`.
+Editing, multi-prompt calls, training, autograd, LoRA, and offload bypass the
+cache and drop stored text entries. The shared runner cache keeps its own
+default and collective-safety checks.
+
+Single-request step decode retains its request KV owner. Geometry is stored
+per CFG branch on that owner; rebuilding an equivalent mask no longer invalidates
+it. Prefix layout must remain fixed for the lifetime of that branch's KV cache.
+
+Shared modulation applies to eager prefill and eager decode fallback even when
+a decode graph manager exists. Captured graph execution is unchanged; no new
+graph-mode performance improvement is claimed.

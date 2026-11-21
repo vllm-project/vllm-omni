@@ -16,9 +16,20 @@ import json
 from pathlib import Path
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, DuplexSample, load_samples
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import (
+    DEFAULT_JUDGE_FRAME_MAX_SIDE,
+    evaluate_sample,
+    summarize_scores,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import GenerateSampleResult, generate_sample
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
+    DEFAULT_INSTRUCTIONS,
+    MIX_MODES,
+    MIX_QUESTION,
+    GenerateSampleResult,
+    generate_sample,
+)
+from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
 from vllm_omni.benchmarks.duplex_session_metrics import (
     DUPLEX_METRICS_FILENAME,
     merge_duplex_metrics_report,
@@ -62,11 +73,39 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     _common(generate)
     generate.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     generate.add_argument("--model", required=True)
-    generate.add_argument("--ref-audio", required=True)
+    generate.add_argument(
+        "--ref-audio",
+        help="Reference voice WAV for models that clone it (MiniCPM-o). Omit for models that refuse one (Qwen3-Omni).",
+    )
+    generate.add_argument(
+        "--instructions",
+        default=DEFAULT_INSTRUCTIONS,
+        help="Session system prompt. The default is MiniCPM-o's duplex prompt; pass '' to send none.",
+    )
+    generate.add_argument(
+        "--turn-detection",
+        choices=TURN_DETECTION_MODES,
+        default=TURN_DETECTION_NONE,
+        help=(
+            "'none' streams each sample and commits once, for model-native duplex models (MiniCPM-o). "
+            "'server_vad' lets the server cut the question audio into turns, for turn-based duplex models "
+            "(Qwen3-Omni); the client then never commits and waits for observed speech/responses to settle."
+        ),
+    )
     generate.add_argument("--response-root", required=True)
     generate.add_argument("--fps", type=float, default=1.0)
-    generate.add_argument("--mix", choices=("question",), default="question")
-    generate.add_argument("--pace", choices=("realtime", "as-fast-as-possible"), default="realtime")
+    generate.add_argument(
+        "--mix",
+        choices=MIX_MODES,
+        default=MIX_QUESTION,
+        help="Session audio: 'question' streams only the instruction; 'soundtrack' overlays it on the clip's audio.",
+    )
+    generate.add_argument(
+        "--pace",
+        choices=("realtime", "as-fast-as-possible"),
+        default="realtime",
+        help="Input pacing; server_vad requires realtime to preserve turn and playback timing.",
+    )
     generate.add_argument("--clock", choices=("media",), default="media")
     generate.add_argument("--concurrency", type=int, default=1)
     generate.add_argument("--overwrite", action="store_true")
@@ -79,6 +118,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     evaluate.add_argument("--judge-api-key", default="EMPTY")
     evaluate.add_argument("--judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
     evaluate.add_argument("--judge-fps", type=int, default=2)
+    evaluate.add_argument(
+        "--judge-frame-max-side",
+        type=int,
+        default=DEFAULT_JUDGE_FRAME_MAX_SIDE,
+        help="Scale judge frames down so the longer side is at most this many pixels (0 keeps source resolution).",
+    )
     evaluate.add_argument("--window-size", type=float, default=10.0)
     evaluate.add_argument("--allow-invalid-clock", action="store_true")
     evaluate.add_argument("--eval-workers", type=int, default=1)
@@ -142,6 +187,8 @@ def run(args: argparse.Namespace) -> int:
                         pace=args.pace,
                         clock=args.clock,
                         overwrite=args.overwrite,
+                        instructions=args.instructions or None,
+                        turn_detection=args.turn_detection,
                     )
 
             return list(await asyncio.gather(*(generate_one(sample) for sample in samples)))
@@ -151,26 +198,54 @@ def run(args: argparse.Namespace) -> int:
 
     if args.eval_workers < 1:
         raise ValueError("--eval-workers must be at least 1")
+    if args.judge_frame_max_side < 0:
+        raise ValueError("--judge-frame-max-side must be 0 or positive")
+    frame_max_side = args.judge_frame_max_side or None
+    response_root = Path(args.response_root)
+    score_root = Path(args.score_root)
+
+    def needs_evaluation(sample: DuplexSample, score_path: Path) -> bool:
+        if args.overwrite or not score_path.exists():
+            return True
+        if sample.family == "rtd":
+            cached_cap = json.loads(score_path.read_text(encoding="utf-8")).get("judge_frame_max_side")
+            if cached_cap != frame_max_side:
+                raise ValueError(
+                    f"Cached RTD score {score_path} has judge_frame_max_side={cached_cap!r}, "
+                    f"but the requested setting is {frame_max_side!r} (None means source resolution). "
+                    "Rerun with --overwrite or use a fresh --score-root."
+                )
+        return False
+
+    # Check all selected cached scores before any worker can write a new one.
+    pending: list[tuple[DuplexSample, Path]] = []
+    for sample in samples:
+        score_path = score_root / sample.split / f"{sample.id}.json"
+        if needs_evaluation(sample, score_path):
+            pending.append((sample, score_path))
+    if not pending:
+        return 0
+
     judge = DuplexJudge(args.judge_base_url, args.judge_model, api_key=args.judge_api_key)
 
-    def evaluate_one(sample: DuplexSample) -> None:
-        response_path = Path(args.response_root) / sample.split / f"{sample.id}.json"
-        score_path = Path(args.score_root) / sample.split / f"{sample.id}.json"
-        if score_path.exists() and not args.overwrite:
+    def evaluate_one(work: tuple[DuplexSample, Path]) -> None:
+        sample, score_path = work
+        if not needs_evaluation(sample, score_path):
             return
         evaluate_sample(
             sample,
-            response_path,
+            response_root / sample.split / f"{sample.id}.json",
             score_path,
             judge,
             judge_fps=args.judge_fps,
             judge_video_mode=args.judge_video_mode,
+            judge_frame_max_side=frame_max_side,
             window_size=args.window_size,
             allow_invalid_clock=args.allow_invalid_clock,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.eval_workers) as executor:
-        list(executor.map(evaluate_one, samples))
+        list(executor.map(evaluate_one, pending))
     return 0
 
 

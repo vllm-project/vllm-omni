@@ -1,4 +1,6 @@
 # VoxCPM2 deploy: single-stage AR pipeline with per-request state batching.
+# CUDA defaults to MRV2 with incremental VAE decoding.
+# Other platforms retain their existing runner and audio settings.
 # Runs on large (H20 141GB) and small (24GB L4) cards alike: the KV cache is
 # pinned to a right-sized budget instead of ballooning to fill the card.
 #
@@ -9,6 +11,8 @@ dtype: bfloat16
 stages:
   - stage_id: 0
     max_num_seqs: 8
+    # Keep the latency-oriented default. For opt-in higher concurrency and its
+    # streaming-latency tradeoff, see recipes/OpenBMB/VoxCPM2.md.
     gpu_memory_utilization: 0.9
     # Right-size the KV cache instead of letting it fill gpu_memory_utilization.
     # max_num_seqs(8) * max_model_len(4096) ~= 32k tokens; 6 GiB leaves headroom
@@ -16,10 +20,11 @@ stages:
     # enough to avoid the high ITL observed with large admission caps.
     # The remaining VRAM stays free for the VoxCPM2 diffusion side-path
     # (LocDiT / AudioVAE / code2wav + batch CUDA-graph pools), which allocates
-    # outside vLLM's KV accounting during inference. Keeps peak ~13 GiB on any
-    # card and avoids per-rebase OOM tuning on small CI GPUs.
-    # Assumes prefix caching off and typical live decode concurrency <= ~8;
-    # raise this cap if either grows or enable_prefix_caching is turned on.
+    # outside vLLM's KV accounting during inference. Peak memory depends on
+    # the workload, runtime settings, and hardware; validate it when tuning.
+    # Assumes prefix caching off and typical live decode concurrency <= ~8.
+    # Re-evaluate kv_cache_memory_bytes if concurrency or context length grows,
+    # or enable_prefix_caching is turned on; KV capacity is not a latency guarantee.
     kv_cache_memory_bytes: 6442450944  # 6 GiB
     enforce_eager: true
     trust_remote_code: true
@@ -39,6 +44,8 @@ stages:
 
           audio_emit_every: 1
           vae_decode_every: 3
+          enable_incremental_vae: false
+          enable_exact_patch_batch: false
           enable_batched_cfm: true
           enable_batched_vae_decode: true
           coalesce_audio_d2h: true
@@ -49,6 +56,8 @@ stages:
           enable_loc_dit_reduce_overhead_no_cg: true
           enable_unified_decode_graph: true
           unified_decode_graph_max_batch_size: 8
+          enable_batched_fsq_fusion: true
+          enable_batched_prefill_tail: true
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -56,3 +65,20 @@ stages:
       max_tokens: 4096
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  cuda:
+    model_runner: v2
+    stages:
+      - stage_id: 0
+        engine_extras:
+          hf_overrides:
+            voxcpm2_runtime_config:
+              vae_decode_every: 1
+              audio_emit_every: 3
+              enable_incremental_vae: true
+              enable_exact_patch_batch: false
+              # Incremental unified graphs batch VAE internally.
+              enable_batched_vae_decode: false
+  npu:
+    model_runner: v2

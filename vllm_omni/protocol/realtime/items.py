@@ -174,7 +174,11 @@ def validate_realtime_item_truncate(item: Mapping[str, object], *, content_index
         return "conversation.item.truncate target content part is invalid"
     if part.get("type") not in {"audio", "output_audio"}:
         return "conversation.item.truncate target content part must be audio"
-    duration_ms = part.get("audio_duration_ms") or part.get("duration_ms") or part.get("audio_ms")
+    duration_ms = part.get("audio_duration_ms")
+    if duration_ms is None:
+        duration_ms = part.get("duration_ms")
+    if duration_ms is None:
+        duration_ms = part.get("audio_ms")
     if isinstance(duration_ms, int | float) and int(duration_ms) >= 0 and audio_end_ms > int(duration_ms):
         return "conversation.item.truncate audio_end_ms exceeds item audio duration"
     return None

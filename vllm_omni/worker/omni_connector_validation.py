@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Validation for Omni connector support on selected LLM workers."""
 
 import importlib
@@ -20,10 +23,11 @@ def validate_worker_omni_connector(
     from vllm_omni.worker.omni_connector_model_runner_mixin import (
         OmniConnectorModelRunnerMixin,
     )
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
     if not isinstance(model_runner_cls, type) or not issubclass(
         model_runner_cls,
-        OmniConnectorModelRunnerMixin,
+        (OmniConnectorModelRunnerMixin, OmniGPUModelRunner),
     ):
         worker_name = getattr(worker_cls, "__name__", str(worker_cls_path))
         raise ValueError(f"Worker {worker_name!r} does not provide an Omni connector model runner.")

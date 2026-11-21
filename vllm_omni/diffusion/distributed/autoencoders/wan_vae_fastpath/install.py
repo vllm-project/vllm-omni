@@ -1,32 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Instance-level installer for the Wan VAE decoder fast path."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Instance-level installers for independent Wan-family VAE encoder/decoder fast paths.
+
+Which modules get which replacement forward is derived from the VAE's :class:`families.WanVaeFamily`, so every
+registered Wan-style implementation (diffusers Wan, Qwen-Image, Qwen-Image-2.1, ...) shares one set of forwards.
+"""
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from types import MethodType
 from typing import Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
-    DupUp3D,
+    AvgDown3D,
     WanCausalConv3d,
-    WanDecoder3d,
+    WanEncoder3d,
     WanResample,
     WanResidualBlock,
-    WanResidualUpBlock,
-    WanUpsample,
+    WanResidualDownBlock,
 )
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+from vllm_omni.diffusion.layers.vae_norm_epilogue import KERNEL_DEVICE_TYPES
+
+from . import families as fam
 from . import forwards
-from . import triton_rms_norm as rn
 
 logger = init_logger(__name__)
 
@@ -34,15 +40,41 @@ VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
 REPORT_ATTR = "_vllm_omni_wan_fastpath_report"
 _UNDO_ATTR = "_vllm_omni_wan_fastpath_undo"
+ENCODER_REPORT_ATTR = "_vllm_omni_wan_encode_fastpath_report"
+_ENCODER_UNDO_ATTR = "_vllm_omni_wan_encode_fastpath_undo"
 
-_REPLACEMENT_FORWARDS = {
-    WanDecoder3d: forwards.decoder_forward,
-    WanCausalConv3d: forwards.causal_conv_forward,
-    WanResidualBlock: forwards.residual_block_forward,
-    WanResidualUpBlock: forwards.residual_up_block_forward,
-    WanResample: forwards.resample_forward,
-    WanUpsample: forwards.upsample_forward,
+_ROLE_FORWARDS: dict[str, Callable[..., torch.Tensor]] = {
+    "decoder": forwards.decoder_forward,
+    "residual_block": forwards.residual_block_forward,
+    "residual_up_block": forwards.residual_up_block_forward,
+    "resample": forwards.resample_forward,
+    "upsample": forwards.upsample_forward,
+    "attention_block": forwards.attention_block_forward,
 }
+_CONV_FORWARDS: dict[str, Callable[..., torch.Tensor]] = {
+    "conv3d": forwards.causal_conv_forward,
+    "conv2d_single_frame": forwards.single_frame_conv_forward,
+}
+
+
+def _unsupported_vae_reason(vae: nn.Module) -> str:
+    supported = ", ".join(cls.__name__ for family in fam.families() for cls in family.vaes)
+    return f"{type(vae).__name__} is not a registered Wan-family VAE ({supported})"
+
+
+def _replacements(family: fam.WanVaeFamily, roles: dict[type[nn.Module], str]) -> dict[type[nn.Module], Callable]:
+    """Replacement forward per module type: the role's forward, the causal conv's per its kind."""
+    table: dict[type[nn.Module], Callable[..., torch.Tensor]] = {}
+    for cls, role in roles.items():
+        table[cls] = _CONV_FORWARDS[family.causal_conv_kind] if role == "causal_conv" else _ROLE_FORWARDS[role]
+    return table
+
+
+def _decoder_replacements(family: fam.WanVaeFamily, level: str) -> dict[type[nn.Module], Callable]:
+    roles = family.decoder_roles()
+    if level != "channels_last" and family.attention_block in roles:
+        del roles[family.attention_block]  # not bit-exact
+    return _replacements(family, roles)
 
 
 @dataclass(frozen=True)
@@ -51,6 +83,7 @@ class WanVaeFastPathReport:
 
     level: str
     installed: bool
+    family: str = ""
     reason: str | None = None
     patched: Mapping[str, int] = field(default_factory=dict)
     fused_silu_dtypes: tuple[str, ...] = ()
@@ -59,6 +92,11 @@ class WanVaeFastPathReport:
 
 def is_installed(vae: nn.Module) -> bool:
     report = getattr(vae, REPORT_ATTR, None)
+    return report is not None and report.installed
+
+
+def is_encoder_installed(vae: nn.Module) -> bool:
+    report = getattr(vae, ENCODER_REPORT_ATTR, None)
     return report is not None and report.installed
 
 
@@ -109,15 +147,15 @@ def _restore_module_layouts(
 
 
 def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanVaeFastPathReport:
-    """Install the Wan decoder fast path on one loaded ``AutoencoderKLWan``. Idempotent.
+    """Install the decoder fast path on one loaded Wan-family VAE (see :mod:`.families`). Idempotent.
 
     ``level``:
       * ``"off"``: do nothing.
       * ``"lossless"``: bind the bit-exact replacement forwards (Tier 1).
       * ``"channels_last"``: Tier 1 plus channels-last conv weights (not bit-exact).
 
-    The installer refuses (and reports why) when the VAE is not a diffusers Wan
-    VAE, or when spatially-sharded decode is configured or already installed:
+    The installer refuses (and reports why) when the VAE is not a registered
+    Wan-family VAE, or when spatially-sharded decode is configured or already installed:
     ``wan_spatial_shard`` rebinds the same forwards and replaces the causal
     convolutions with halo-exchanging variants.
     """
@@ -134,11 +172,12 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
         return existing
     if level == "off":
         return WanVaeFastPathReport(level=level, installed=False, reason="disabled")
-    if not isinstance(vae, AutoencoderKLWan):
-        return _skip(level, f"{type(vae).__name__} is not a diffusers AutoencoderKLWan")
+    family = fam.find_family(vae)
+    if family is None:
+        return _skip(level, _unsupported_vae_reason(vae))
     decoder = getattr(vae, "decoder", None)
-    if type(decoder) is not WanDecoder3d:
-        return _skip(level, f"decoder is {type(decoder).__name__}, not diffusers WanDecoder3d")
+    if type(decoder) is not family.decoder:
+        return _skip(level, f"decoder is {type(decoder).__name__}, not {family.decoder.__name__}")
     if getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False):
         return _skip(level, "spatial-shard decode is already installed on this VAE")
     parallel_mode = getattr(getattr(vae, "distributed_executor", None), "parallel_mode", "tile")
@@ -147,13 +186,14 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
 
     modules = [(f"decoder.{name}" if name else "decoder", module) for name, module in decoder.named_modules()]
     post_quant_conv = getattr(vae, "post_quant_conv", None)
-    if type(post_quant_conv) is WanCausalConv3d:
+    if type(post_quant_conv) is family.causal_conv:
         modules.append(("post_quant_conv", post_quant_conv))
+    replacements = _decoder_replacements(family, level)
     bindings: list[tuple[nn.Module, Callable[..., Any]]] = []
     convs: list[nn.Module] = []
     bypassed: set[nn.Module] = set()
     for _, module in modules:
-        replacement = _REPLACEMENT_FORWARDS.get(type(module))
+        replacement = replacements.get(type(module))
         if forwards.is_diffusers_rms_norm(module):
             replacement = forwards.rms_norm_forward
             bypassed.add(module)
@@ -161,11 +201,11 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
             bindings.append((module, replacement))
         if isinstance(module, (nn.Conv2d, nn.Conv3d)):
             convs.append(module)
-        if type(module) in (WanResample, DupUp3D, nn.SiLU) or (
-            type(module) is WanCausalConv3d and module is not post_quant_conv
+        if type(module) in (family.resample, family.dup_up, nn.SiLU) or (
+            type(module) is family.causal_conv and module is not post_quant_conv
         ):
             bypassed.add(module)
-        if type(module) is WanResample and forwards._is_upsample_conv_pair(module.resample):
+        if type(module) is family.resample and forwards._is_upsample_conv_pair(module.resample):
             bypassed.update((module.resample, module.resample[1]))
 
     replaced = {module for module, _ in bindings}
@@ -181,16 +221,48 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
                 and current_forward.__func__ is type(module).forward
             ):
                 return _skip(level, f"{name} has a custom forward that the fast path would replace or bypass")
-        if module in bypassed and (module._forward_pre_hooks or module._forward_hooks):
-            return _skip(level, f"{name} has forward hooks that the fast path would bypass")
+    # Forward hooks need no check here: every inlined call site checks them at
+    # runtime and then calls the module normally.
 
-    device = next((p.device for p in decoder.parameters()), torch.device("cpu"))
+    return _install_bindings(vae, decoder, bindings, convs, level=level, family=family)
+
+
+def _install_bindings(
+    vae: nn.Module,
+    component: nn.Module,
+    bindings: list[tuple[nn.Module, Callable[..., Any]]],
+    convs: list[nn.Module],
+    *,
+    level: str,
+    family: fam.WanVaeFamily = fam.WAN,
+    encoder: bool = False,
+    clone_encoder_shortcuts: bool = False,
+) -> WanVaeFastPathReport:
+    """Commit one component independently, with allocation-free installation rollback."""
+    report_attr = ENCODER_REPORT_ATTR if encoder else REPORT_ATTR
+    undo_attr = _ENCODER_UNDO_ATTR if encoder else _UNDO_ATTR
+    component_name = "encoder" if encoder else "decoder"
+    device = next((p.device for p in component.parameters()), torch.device("cpu"))
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
-    if device.type == "cuda":
+    if device.type in KERNEL_DEVICE_TYPES:
         fused_silu_dtypes = frozenset(
             dtype for dtype in (torch.bfloat16, torch.float16) if rn.silu_epilogue_is_exact(device, dtype)
         )
-    cfg = forwards.FastPathConfig(fused_silu_dtypes=fused_silu_dtypes, channels_last=level == "channels_last")
+    cfg = forwards.FastPathConfig(
+        fused_silu_dtypes=fused_silu_dtypes,
+        channels_last=level == "channels_last",
+        clone_encoder_shortcuts=clone_encoder_shortcuts,
+        fuse_norm_cache=encoder,
+        exact_bf16_norm=encoder,
+        verify_spatial_padding=encoder or level != "channels_last",
+        up_blocks_take_first_chunk=family.up_blocks_take_first_chunk,
+        probe_norm_reduction=family.rms_norm_upcasts,
+        keep_channels_last=not encoder,
+    )
+    # Preserve the output projection's validated formulation. Internal decoder
+    # convolutions can use implicit padding under the channels-last tolerance
+    # contract without allocating full-size first-use equivalence probes.
+    output_cfg = replace(cfg, verify_spatial_padding=True)
 
     with ExitStack() as rollback:
         undo: list[Callable[[], None]] = []
@@ -209,7 +281,8 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
             rollback.callback(restore)
             undo.append(restore)
             module.forward = MethodType(forward, module)
-            setattr(module, forwards.CFG_ATTR, cfg)
+            module_cfg = output_cfg if module is getattr(component, "conv_out", None) else cfg
+            setattr(module, forwards.CFG_ATTR, module_cfg)
             patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
 
         for module, replacement in bindings:
@@ -244,28 +317,212 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
                         rollback.callback(owner._buffers.__setitem__, name, buffer)
                         rollback.callback(setattr, buffer, "data", buffer.data)
             converted = _convert_conv_memory_format(convs, channels_last=True)
-            logger.info("Wan VAE decoder: %d convolution weights converted to channels-last layout", converted)
+            logger.info(
+                "Wan VAE %s: %d convolution weights converted to channels-last layout", component_name, converted
+            )
 
         report = WanVaeFastPathReport(
             level=level,
             installed=True,
+            family=family.name,
             patched=dict(patched),
             fused_silu_dtypes=tuple(str(dtype).removeprefix("torch.") for dtype in sorted(fused_silu_dtypes, key=str)),
             channels_last=cfg.channels_last,
         )
-        rollback.callback(vae.__dict__.pop, REPORT_ATTR, None)
-        rollback.callback(vae.__dict__.pop, _UNDO_ATTR, None)
-        setattr(vae, _UNDO_ATTR, undo)
-        setattr(vae, REPORT_ATTR, report)
+        rollback.callback(vae.__dict__.pop, report_attr, None)
+        rollback.callback(vae.__dict__.pop, undo_attr, None)
+        setattr(vae, undo_attr, undo)
+        setattr(vae, report_attr, report)
         logger.info(
-            "Wan VAE fast path (%s) installed: patched=%s fused_silu=%s channels_last=%s",
+            "Wan VAE encoder fast path (%s) installed on %s: patched=%s fused_silu=%s channels_last=%s"
+            if encoder
+            else "Wan VAE fast path (%s) installed on %s: patched=%s fused_silu=%s channels_last=%s",
             level,
+            family.name,
             report.patched,
             report.fused_silu_dtypes or "off",
             report.channels_last,
         )
         rollback.pop_all()
         return report
+
+
+def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanVaeFastPathReport:
+    """Install on the residual, patchified Wan encoder used by Cosmos3.
+
+    State and layouts are independent of the decoder installation. Spatial
+    sharding only replaces decoder modules, so it does not exclude this path.
+    """
+    from . import encoder_forwards as ef
+
+    if level not in VAE_FAST_PATH_LEVELS:
+        raise ValueError(f"vae_encode_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {level!r}")
+    existing = getattr(vae, ENCODER_REPORT_ATTR, None)
+    if existing is not None:
+        if existing.level != level:
+            logger.warning("Wan VAE encoder already installed at %r; ignoring level %r", existing.level, level)
+        return existing
+    if level == "off":
+        return WanVaeFastPathReport(level=level, installed=False, reason="disabled")
+
+    def skip(reason: str) -> WanVaeFastPathReport:
+        logger.info("Wan VAE encoder fast path (%s) not installed: %s", level, reason)
+        return WanVaeFastPathReport(level=level, installed=False, reason=reason)
+
+    family = fam.find_family(vae)
+    if family is None:
+        return skip(_unsupported_vae_reason(vae))
+    if family is not fam.WAN:
+        return _install_family_encoder(vae, family, level, skip)
+    config = vae.config
+    if not (
+        config.is_residual
+        and config.patch_size == 2
+        and config.in_channels == 12
+        and config.scale_factor_temporal == 4
+        and config.scale_factor_spatial == 16
+        and list(config.temperal_downsample) == [False, True, True]
+    ):
+        return skip("requires a residual patch_size=2 Wan encoder with temporal/spatial compression 4/16")
+    encoder = vae.encoder
+    if type(encoder) is not WanEncoder3d or type(vae.quant_conv) is not WanCausalConv3d:
+        return skip("encoder or quant_conv has an unsupported type")
+    if len(encoder.down_blocks) != 4 or any(type(block) is not WanResidualDownBlock for block in encoder.down_blocks):
+        return skip("requires four diffusers WanResidualDownBlock stages")
+
+    replacements: dict[type[nn.Module], Callable[..., torch.Tensor]] = {
+        WanEncoder3d: ef.encoder_forward,
+        WanResidualDownBlock: ef.residual_down_block_forward,
+        WanResample: ef.downsample_forward,
+        WanCausalConv3d: forwards.causal_conv_forward,
+        WanResidualBlock: forwards.residual_block_forward,
+    }
+    modules = [(f"encoder.{name}" if name else "encoder", module) for name, module in encoder.named_modules()]
+    modules.append(("quant_conv", vae.quant_conv))
+    bindings: list[tuple[nn.Module, Callable[..., Any]]] = []
+    convs: list[nn.Module] = []
+    bypassed: set[nn.Module] = set()
+    for _, module in modules:
+        replacement = replacements.get(type(module))
+        if module is vae.quant_conv:
+            replacement = ef.quant_conv_forward
+        if forwards.is_diffusers_rms_norm(module):
+            replacement = forwards.rms_norm_forward
+            bypassed.add(module)
+        if replacement is not None:
+            bindings.append((module, replacement))
+        if isinstance(module, (nn.Conv2d, nn.Conv3d)):
+            convs.append(module)
+        if type(module) in (AvgDown3D, nn.SiLU) or (type(module) is WanCausalConv3d and module is not vae.quant_conv):
+            bypassed.add(module)
+        if type(module) is WanResample and ef.is_spatial_downsample(module):
+            bypassed.update((module.resample, module.resample[0]))
+
+    replaced = {module for module, _ in bindings}
+    clone_shortcuts = False
+    pure_types = {
+        nn.ModuleList,
+        nn.Sequential,
+        nn.Identity,
+        nn.Dropout,
+        nn.SiLU,
+        nn.ZeroPad2d,
+        nn.Conv2d,
+        WanResidualDownBlock,
+        WanResidualBlock,
+        WanResample,
+        WanCausalConv3d,
+        AvgDown3D,
+    }
+    for name, module in modules:
+        current = module.forward
+        standard = (
+            isinstance(current, MethodType) and current.__self__ is module and current.__func__ is type(module).forward
+        )
+        if module in replaced or module in bypassed:
+            if not standard:
+                return skip(f"{name} has a custom forward that the fast path would replace or bypass")
+        # Normally-called custom modules may mutate their input. Retain
+        # upstream's shortcut clone in that case rather than assuming purity;
+        # forward hooks are checked for the same reason on every call.
+        if name.startswith("encoder.down_blocks."):
+            if not standard or (type(module) not in pure_types and not forwards.is_diffusers_rms_norm(module)):
+                clone_shortcuts = True
+            if type(module) is WanResidualBlock and not forwards.is_diffusers_rms_norm(module.norm1):
+                clone_shortcuts = True
+
+    return _install_bindings(
+        vae, encoder, bindings, convs, level=level, encoder=True, clone_encoder_shortcuts=clone_shortcuts
+    )
+
+
+def _install_family_encoder(
+    vae: nn.Module, family: fam.WanVaeFamily, level: str, skip: Callable[[str], WanVaeFastPathReport]
+) -> WanVaeFastPathReport:
+    """The encoder fast path for a non-diffusers-Wan family: causal convs, residual blocks and norms.
+
+    The Cosmos3-specific encoder forwards (patchified chunk assembly, residual down blocks) are not used; the encoder
+    and its down blocks keep their reference forwards and call the bound modules.
+    """
+    encoder = getattr(vae, "encoder", None)
+    quant_conv = getattr(vae, "quant_conv", None)
+    if family.encoder is None or type(encoder) is not family.encoder:
+        return skip(f"encoder is {type(encoder).__name__}, not {getattr(family.encoder, '__name__', None)}")
+    roles: dict[type[nn.Module], str] = {family.causal_conv: "causal_conv", family.residual_block: "residual_block"}
+    if level == "channels_last" and family.chunked_attention and family.attention_block is not None:
+        roles[family.attention_block] = "attention_block"
+    replacements = _replacements(family, roles)
+    modules = [(f"encoder.{name}" if name else "encoder", module) for name, module in encoder.named_modules()]
+    if type(quant_conv) is family.causal_conv:
+        modules.append(("quant_conv", quant_conv))
+    bindings: list[tuple[nn.Module, Callable[..., Any]]] = []
+    convs: list[nn.Module] = []
+    bypassed: set[nn.Module] = set()
+    for _, module in modules:
+        replacement = replacements.get(type(module))
+        if forwards.is_diffusers_rms_norm(module):
+            replacement = forwards.rms_norm_forward
+            bypassed.add(module)
+        if replacement is not None:
+            bindings.append((module, replacement))
+        if isinstance(module, (nn.Conv2d, nn.Conv3d)):
+            convs.append(module)
+        if type(module) is nn.SiLU or (type(module) is family.causal_conv and module is not quant_conv):
+            bypassed.add(module)
+    replaced = {module for module, _ in bindings}
+    for name, module in modules:
+        current = module.forward
+        standard = (
+            isinstance(current, MethodType) and current.__self__ is module and current.__func__ is type(module).forward
+        )
+        if (module in replaced or module in bypassed) and not standard:
+            return skip(f"{name} has a custom forward that the fast path would replace or bypass")
+    return _install_bindings(vae, encoder, bindings, convs, level=level, family=family, encoder=True)
+
+
+def reference_forward_copy(component: nn.Module) -> nn.Module:
+    """A copy of component that runs the reference forwards and shares its parameters and buffers.
+
+    The fast-path bindings (instance forward and its config) are dropped from the copy only; component
+    keeps its installation. Weights are shared, layouts included, so after a channels_last install the copy
+    computes on channels-last weights (same values). For callers that rebuild a component around its modules,
+    such as spatially sharded encode: the fast forwards inline the convolutions such a caller replaces.
+    """
+    memo: dict[int, Any] = {id(t): t for t in (*component.parameters(), *component.buffers())}
+    copied = copy.deepcopy(component, memo)
+    for module in copied.modules():
+        if forwards.CFG_ATTR in module.__dict__:
+            module.__dict__.pop("forward", None)
+            del module.__dict__[forwards.CFG_ATTR]
+    return copied
+
+
+def uninstall_wan_vae_encoder_fastpath(vae: nn.Module) -> None:
+    """Restore encoder forwards/layouts without altering the decoder installation."""
+    undo = vae.__dict__.pop(_ENCODER_UNDO_ATTR, None)
+    vae.__dict__.pop(ENCODER_REPORT_ATTR, None)
+    for restore in reversed(undo or []):
+        restore()
 
 
 def uninstall_wan_vae_fastpath(vae: nn.Module) -> None:
@@ -277,10 +534,15 @@ def uninstall_wan_vae_fastpath(vae: nn.Module) -> None:
 
 
 __all__ = [
+    "ENCODER_REPORT_ATTR",
     "REPORT_ATTR",
     "VAE_FAST_PATH_LEVELS",
     "WanVaeFastPathReport",
     "install_wan_vae_fastpath",
+    "install_wan_vae_encoder_fastpath",
+    "is_encoder_installed",
     "is_installed",
+    "reference_forward_copy",
     "uninstall_wan_vae_fastpath",
+    "uninstall_wan_vae_encoder_fastpath",
 ]

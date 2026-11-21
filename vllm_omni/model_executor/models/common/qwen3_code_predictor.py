@@ -28,9 +28,11 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.torch_compile import log_torch_compile_stats
 
 logger = init_logger(__name__)
 
@@ -172,6 +174,7 @@ class CodePredictorAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         assert self.num_heads % self.num_kv_heads == 0
         self.is_gqa = self.num_kv_heads != self.num_heads
+        self.use_npu_native_gqa = False
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_dim = getattr(
             config,
@@ -233,6 +236,20 @@ class CodePredictorAttention(nn.Module):
         bsz: int,
         seq_len: int,
     ) -> torch.Tensor:
+        if self.use_npu_native_gqa and q.dtype in (torch.bfloat16, torch.float16):
+            # The inference operator consumes grouped K/V directly. Keep the
+            # existing expanded-head implementation as the default/reference.
+            return torch_npu.npu_fused_infer_attention_score(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                atten_mask=self._fusion_causal_mask[:seq_len, :seq_len].contiguous(),
+                scale=float(self.scaling),
+                sparse_mode=0,
+            )[0]
         q_f, k_f, v_f = q, k, v
         if self.is_gqa:
             k_f = (
@@ -342,13 +359,48 @@ class CodePredictorAttention(nn.Module):
         v = v_raw.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
-        k_cache.index_copy_(2, write_positions, k.to(k_cache.dtype))
-        v_cache.index_copy_(2, write_positions, v.to(v_cache.dtype))
-        if getattr(self, "use_short_kv_attention", False):
+        if current_omni_platform.is_npu() and HAS_TRITON and q.dtype in (torch.bfloat16, torch.float16):
+            from vllm_omni.platforms.npu.layers.predictor_rope_cache import rope_cache
+
+            q = rope_cache(q, k, v, cos, sin, write_positions, k_cache, v_cache)
+        else:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+            q = (q * cos) + (_rotate_half(q) * sin)
+            k = (k * cos) + (_rotate_half(k) * sin)
+            k_cache.index_copy_(2, write_positions, k.to(k_cache.dtype))
+            v_cache.index_copy_(2, write_positions, v.to(v_cache.dtype))
+        if current_omni_platform.is_npu() and self.use_npu_native_gqa and q.dtype in (torch.bfloat16, torch.float16):
+            # The cache has fixed capacity; masked future slots are never read.
+            attn_out = torch_npu.npu_fused_infer_attention_score(
+                q.contiguous(),
+                k_cache,
+                v_cache,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                atten_mask=~key_mask,
+                scale=float(self.scaling),
+                sparse_mode=0,
+            )[0]
+        elif current_omni_platform.is_npu():
+            k_full, v_full = k_cache, v_cache
+            if self.is_gqa:
+                k_full = k_full.repeat_interleave(self.num_queries_per_kv, dim=1)
+                v_full = v_full.repeat_interleave(self.num_queries_per_kv, dim=1)
+            attn_out = torch_npu.npu_fusion_attention(
+                q.contiguous(),
+                k_full.contiguous(),
+                v_full.contiguous(),
+                self.num_heads,
+                "BNSD",
+                atten_mask=(~key_mask).contiguous(),
+                scale=float(self.scaling),
+                keep_prob=1.0,
+                sparse_mode=0,
+                sync=True,
+            )[0]
+        elif getattr(self, "use_short_kv_attention", False):
             from .short_kv_attention import short_kv_attention
 
             attn_out = short_kv_attention(q, k_cache, v_cache, write_positions, self.scaling)
@@ -380,6 +432,7 @@ class CodePredictorMLP(nn.Module):
         # separate gate/up linears. See the module-level HF-numerics note for
         # the GPU bit-level drift caveat.
         self._intermediate_size = int(config.intermediate_size)
+        self.use_npu_fused_swiglu = False
         self.gate_up_proj = nn.Linear(
             config.hidden_size,
             2 * config.intermediate_size,
@@ -389,6 +442,8 @@ class CodePredictorMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(hidden_states)
+        if self.use_npu_fused_swiglu and gate_up.device.type == "npu" and gate_up.dtype == torch.bfloat16:
+            return self.down_proj(torch_npu.npu_swiglu(gate_up, dim=-1))
         gate, up = gate_up.split([self._intermediate_size, self._intermediate_size], dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
@@ -720,10 +775,17 @@ class CodePredictorWrapper(nn.Module):
 
     ``code_predictor_kv_cache`` (CUDA, opt-in) switches to incremental K/V
     decoding: at large batches the re-prefill FLOPs are not negligible.
+    Eager execution defaults to KV reuse on MPS (except FP16); other
+    eager platforms can opt in. Set false to disable it.
     """
 
     _kv_cache_enabled: bool = False
     _fused_sampling_enabled: bool = False
+    # Plain-branch compile budget: 1 static bsz==1 graph + 1 dynamic graph
+    # reused for every bsz>1 bucket. Shared by _compile_cache_size_limit()
+    # and the mark_dynamic branching in _warmup_buckets() -- keep both in
+    # sync if that loop's compile structure ever changes.
+    _PLAIN_BRANCH_MAX_COMPILES = 2
 
     def __init__(
         self,
@@ -787,6 +849,17 @@ class CodePredictorWrapper(nn.Module):
         self._fused_sampling_enabled = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_fused_sampling"))
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
         is_npu = current_omni_platform.is_npu()
+        native_gqa = prefix_graph_cfg.get("code_predictor_npu_native_gqa", False)
+        if not isinstance(native_gqa, bool):
+            raise ValueError("code_predictor_npu_native_gqa must be a boolean")
+        fused_swiglu = prefix_graph_cfg.get("code_predictor_npu_fused_swiglu", False)
+        if not isinstance(fused_swiglu, bool):
+            raise ValueError("code_predictor_npu_fused_swiglu must be a boolean")
+        for layer in self.model.layers:
+            layer.self_attn.use_npu_native_gqa = is_npu and native_gqa
+            layer.mlp.use_npu_fused_swiglu = is_npu and fused_swiglu
+        if is_npu and (native_gqa or fused_swiglu):
+            logger.info("code_predictor NPU native GQA=%s, fused SwiGLU=%s", native_gqa, fused_swiglu)
         # MRv2 captures the whole Talker MTP call. It can therefore capture
         # shorter compiled re-prefill forwards without nesting predictor-owned
         # CUDA graphs inside the outer graph.
@@ -900,6 +973,17 @@ class CodePredictorWrapper(nn.Module):
                 self._capture_npu_graphs()
                 logger.info("code_predictor: eager mode + NPU graphs")
             else:
+                cache_config = self._stage_connector_extra_config(self._vllm_config)
+                device = next(self.model.parameters()).device
+                self._kv_cache_enabled = (
+                    not current_omni_platform.is_cuda()
+                    and self._model_dtype != torch.float16
+                    and self._parse_bool_config(cache_config.get("code_predictor_kv_cache", device.type == "mps"))
+                )
+                if self._kv_cache_enabled:
+                    self._compiled_kv_fwd = self.model.forward_cached
+                    self._ensure_kv_steps(device)
+                    logger.info("code_predictor: eager mode + incremental K/V decoding")
                 logger.warning_once("code_predictor: torch.compile disabled")
             return
 
@@ -926,8 +1010,9 @@ class CodePredictorWrapper(nn.Module):
                 dynamic=self._short_kv_enabled,
                 options={"epilogue_fusion": False},
             )
-        with torch._dynamo.config.patch(cache_size_limit=self._compile_cache_size_limit()):
-            self._warmup_buckets()
+        with log_torch_compile_stats(logger, "code_predictor"):
+            with torch._dynamo.config.patch(cache_size_limit=self._compile_cache_size_limit()):
+                self._warmup_buckets()
 
         if self._kv_cache_enabled:
             # Fifteen short steps per call: they rely on the runner capturing
@@ -1089,8 +1174,14 @@ class CodePredictorWrapper(nn.Module):
 
     def _compile_cache_size_limit(self) -> int:
         bucket_sizes = self._batch_bucket_sizes()
-        if not self._prefix_reprefill_enabled:
-            required_entries = len(bucket_sizes)
+        if self._kv_cache_enabled:
+            required_entries = 4  # {first step, later steps} x {batch 1, dynamic batch}
+        elif not self._prefix_reprefill_enabled:
+            # Returned directly, not via max() with the global default: this
+            # limit only scopes this warmup. A regression here logs a
+            # recompile-limit warning and falls back to eager for unseen
+            # shapes rather than raising.
+            return min(len(bucket_sizes), self._PLAIN_BRANCH_MAX_COMPILES)
         else:
             prefix_buckets = (
                 self._prefix_graph_buckets.intersection(bucket_sizes)
@@ -1103,8 +1194,6 @@ class CodePredictorWrapper(nn.Module):
             if needs_full_graph:
                 full_graph_entries += len(prefix_buckets)
             required_entries = full_graph_entries + len(prefix_buckets) * len(prefix_seq_lens)
-        if self._kv_cache_enabled:
-            required_entries = 4  # {first step, later steps} x {batch 1, dynamic batch}
         return max(torch._dynamo.config.cache_size_limit, required_entries)
 
     def _warmup_buckets(self) -> None:
@@ -1176,8 +1265,16 @@ class CodePredictorWrapper(nn.Module):
                     torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
                 )
                 self._bucket_pos_ids[bsz] = pos_ids
+                hidden = proj_buf[:bsz, :max_seq, :]
+                # Reuses one compiled graph across all bsz>1 buckets instead
+                # of compiling per bucket (same technique as the K/V-cache
+                # branch above; keep in sync with _PLAIN_BRANCH_MAX_COMPILES).
+                # NPU runs model.forward eager here, so skip.
+                if bsz > 1 and not current_omni_platform.is_npu():
+                    torch._dynamo.mark_dynamic(hidden, 0)
+                    torch._dynamo.mark_dynamic(pos_ids, 0)
                 for _ in range(3):
-                    self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+                    self._compiled_model_fwd(hidden, pos_ids)
             logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
 
         # Compiled attention warmup is asynchronous. Complete it before graph

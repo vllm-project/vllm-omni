@@ -5,6 +5,7 @@
 
 import hashlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -23,6 +24,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.inputs import MultiModalHashes
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -34,7 +36,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    check_interleaved_audio_video,
     create_qwen2_5_omni_thinker_field_factory,
     merge_interleaved_embeddings,
 )
@@ -88,7 +89,9 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.quantization.component_config import (
+    ComponentQuantizationConfig,
     resolve_encoder_quant_config,
 )
 
@@ -1061,13 +1064,26 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 "in the audio tower part."
             )
 
-        self.quant_config = quant_config
+        # Online quantization (e.g. --quantization fp8 on a BF16 checkpoint)
+        # only targets the Thinker LM. Serialized checkpoint configs are kept
+        # as they are: pre-quantized ones (modelopt NVFP4/FP8/MXFP8) leave the
+        # vision encoder in BF16 without scale tensors, so it gets None there.
+        visual_prefix = maybe_prefix(prefix, "visual")
+        language_prefix = maybe_prefix(prefix, "language_model")
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            visual_quant_config = quant_config.resolve(visual_prefix)
+        elif isinstance(quant_config, OnlineQuantizationConfig):
+            quant_config = ComponentQuantizationConfig(
+                component_configs={language_prefix: quant_config},
+                default_config=None,
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+            visual_quant_config = None
+        else:
+            visual_quant_config = resolve_encoder_quant_config(quant_config)
 
-        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
-        # the Thinker LM. Vision encoder weights remain in BF16 with no FP8
-        # scale tensors; passing quant_config causes FP8 kernels to run on
-        # BF16 weights, producing garbage embeddings. Keep None for encoders.
-        visual_quant_config = resolve_encoder_quant_config(quant_config)
+        self.vllm_config = vllm_config
+        self.quant_config = quant_config
 
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
@@ -1081,7 +1097,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                     vision_config=thinker_config.vision_config,
                     norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
                     quant_config=visual_quant_config,
-                    prefix=maybe_prefix(prefix, "visual"),
+                    prefix=visual_prefix,
                 )
             else:
                 self.visual = None
@@ -1089,7 +1105,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "language_model"),
+                prefix=language_prefix,
                 hf_config=thinker_config.text_config,
                 architectures=["Qwen2ForCausalLM"],
             )
@@ -1348,8 +1364,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         video_token_id = self.config.video_token_index
         audio_token_id = self.config.audio_token_index
 
-        # The interleaving check reads scalar positions in a Python loop.
-        # Keep its masks on CPU to avoid repeated CUDA synchronization.
+        # Keep the masks on CPU: the counts below and the per-modality counts
+        # in merge_interleaved_embeddings then read back without CUDA syncs.
         input_ids_cpu = input_ids.cpu()
         is_video = is_multimodal & (input_ids_cpu == video_token_id)
         is_audio = is_multimodal & (input_ids_cpu == audio_token_id)

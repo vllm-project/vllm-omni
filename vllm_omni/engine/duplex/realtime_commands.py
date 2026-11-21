@@ -33,6 +33,7 @@ from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     AppendText,
     BargeIn,
+    CancelFunctionCall,
     CancelInput,
     CancelResponse,
     ClearInput,
@@ -44,6 +45,7 @@ from vllm_omni.engine.duplex.commands import (
     DeleteItem,
     DuplexCommand,
     DuplexCommandError,
+    GetSessionStats,
     Heartbeat,
     SignalTurn,
     TruncateItem,
@@ -266,10 +268,14 @@ def translate_realtime_command(
             committed_ms=int(committed_ms) if isinstance(committed_ms, int | float) else None,
             response_id=response_id if isinstance(response_id, str) and response_id else None,
             item_id=item_id if isinstance(item_id, str) and item_id else None,
+            truncate=payload.get("truncate") is True,
         )
 
     if event_type == "session.heartbeat":
         return Heartbeat(event_id=event_id)
+
+    if event_type == "session.stats.get":
+        return GetSessionStats(event_id=event_id)
 
     if event_type == "conversation.item.retrieve":
         # The projected conversation items live engine-side; the runner answers.
@@ -287,6 +293,21 @@ def translate_realtime_command(
 
     if event_type == "input.cancel":
         return CancelInput(event_id=event_id)
+
+    if event_type == "function_call.cancel":
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise DuplexCommandError(
+                "function_call.cancel requires call_id", code="invalid_function_call_cancel", event_id=event_id
+            )
+        reason = payload.get("reason", "cancelled")
+        if reason not in ("cancelled", "failed"):
+            raise DuplexCommandError(
+                "function_call.cancel reason must be cancelled or failed",
+                code="invalid_function_call_cancel",
+                event_id=event_id,
+            )
+        return CancelFunctionCall(event_id=event_id, call_id=call_id, reason=str(reason))
 
     if event_type == "barge_in":
         return BargeIn(event_id=event_id)

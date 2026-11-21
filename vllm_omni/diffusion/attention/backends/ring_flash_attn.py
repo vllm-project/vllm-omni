@@ -68,6 +68,8 @@ def ring_flash_attn_forward(
     lse = None
 
     next_k, next_v = None, None
+    # The merge helper handles platform, device, autograd and tracing fallbacks.
+    use_fused_merge = attn_type in (AttnType.FA, AttnType.FA3)
 
     # Check and adjust q, k, v to be contiguous
     if not q.is_contiguous():
@@ -79,8 +81,6 @@ def ring_flash_attn_forward(
 
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k: torch.Tensor
-            next_v: torch.Tensor
             next_k = comm.send_recv(k)
             next_v = comm.send_recv(v)
             comm.commit()
@@ -93,8 +93,10 @@ def ring_flash_attn_forward(
                 block_rank,
                 comm.world_size,
             )
-            step_k = k[:, :block_valid_length]
-            step_v = v[:, :block_valid_length]
+            # Avoid alias-only views of inference tensors used by native P2P.
+            # Keep actual padding trims; full blocks need no slice.
+            step_k = k if block_valid_length == k.shape[1] else k[:, :block_valid_length]
+            step_v = v if block_valid_length == v.shape[1] else v[:, :block_valid_length]
             if step == 0 and joint_tensor_key is not None:
                 if joint_strategy == "front":
                     step_k = torch.cat([joint_tensor_key, step_k], dim=1)
@@ -124,15 +126,19 @@ def ring_flash_attn_forward(
                     out, lse = block_out, block_lse
                 else:
                     # Ring kernel wrappers canonicalize LSE to (B, H, S).
-                    out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_layout="bhs")
+                    out, lse = update_out_and_lse(
+                        out, lse, block_out, block_lse, lse_layout="bhs", use_fused_merge=use_fused_merge
+                    )
 
         if step + 1 != comm.world_size:
             comm.wait()
             k = next_k
             v = next_v
 
+    assert out is not None
     out = out.to(q.dtype)
     if attn_type != AttnType.SPARSE_SAGE:
+        assert lse is not None
         lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, cast
@@ -21,6 +22,7 @@ from tests.engine.test_orchestrator import (
     _wait_for,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import (
@@ -28,6 +30,7 @@ from vllm_omni.diffusion.interaction.modality_handlers.prompt import (
     PromptSession,
 )
 from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -42,6 +45,7 @@ from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_client import StagePoolClient
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.entrypoints import async_omni_base
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_base import AsyncEventResolver
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
@@ -96,6 +100,10 @@ def _make_diffusion_model_runner(
         streaming_output=streaming_output,
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        diffusion_attention_schedule=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
     )
     runner.vllm_config = object()
     runner.device = torch.device("cpu")
@@ -497,12 +505,15 @@ class TestPromptUpdateExecution:
             num_outputs_per_prompt=1,
             max_sequence_length=226,
             fps=None,
+            attention_schedule=None,
+            attention_sigma_schedule=None,
         )
         req = SimpleNamespace(
             request_id="req",
             prompt="a prompt",
             sampling_params=sampling,
             kv_sender_info=None,
+            mixfusion_info=None,
         )
 
         @contextmanager
@@ -516,10 +527,13 @@ class TestPromptUpdateExecution:
         monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
         monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
 
-        scheduler_output = SimpleNamespace(
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=0,
             finished_req_ids=set(),
-            scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+            scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Admit request and run first denoise step (no chunk boundary yet).
         DiffusionModelRunner.execute_stepwise(runner, scheduler_output)  # pyright: ignore[reportArgumentType]
@@ -528,10 +542,13 @@ class TestPromptUpdateExecution:
 
         runner.submit_interaction("req", _prompt_interaction("new scene", transition_chunks=2))
 
-        cached = SimpleNamespace(
+        cached = DiffusionSchedulerOutput(
+            step_id=1,
             finished_req_ids=set(),
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+            scheduled_cached_reqs=CachedRequestData(request_ids=["req"]),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Second step completes chunk 0: apply runs (no peek), metadata staged.
         chunk0 = DiffusionModelRunner.execute_stepwise(runner, cached).get_request_output("req")  # pyright: ignore[reportArgumentType]
@@ -668,6 +685,209 @@ class TestPromptUpdateIntegration:
                 await asyncio.gather(generate_task, return_exceptions=True)
             await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_callback", [True, False])
+    async def test_rejected_interaction_keeps_async_omni_stream_running(
+        self, pipeline: HeliosPipeline, monkeypatch: pytest.MonkeyPatch, with_callback: bool
+    ) -> None:
+        """A worker-side rejection after queueing is event-scoped and must not end ``generate()``."""
+        pipeline.encode_prompt = MagicMock(  # pyright: ignore[reportAttributeAccessIssue]
+            side_effect=ValueError("prompt embeds are not ready")
+        )
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        rejections: list[tuple[str, str]] = []
+        dispatched: list[str | None] = []
+
+        async def on_error(event_id: str, reason: str) -> None:
+            rejections.append((event_id, reason))
+
+        # Emit the next chunk only after AsyncOmni has handled the rejection, so
+        # the rejection reaches the request while its stream is still open.
+        prompt_update_engine = self._PromptUpdateEngine(
+            self._IncrementalStreamingPipeline(),
+            runner,
+            ready_for_next_chunk=lambda _state: bool(rejections if with_callback else dispatched),
+        )
+        inline_client = self._make_inline_pipeline_client(prompt_update_engine)
+        fixture = _build_harness([inline_client])
+        omni = self._make_async_omni(self._OrchestratorBridgeEngine(fixture))
+        dispatch = omni._dispatch_interaction_error
+
+        def recording_dispatch(req_state, msg):
+            dispatched.append(msg.event_id)
+            dispatch(req_state, msg)
+
+        monkeypatch.setattr(omni, "_dispatch_interaction_error", recording_dispatch)
+
+        generate_task: asyncio.Task[list[OmniRequestOutput]] | None = None
+        try:
+            generate_task = asyncio.create_task(self._collect_generate_outputs(omni))
+            await _wait_for(
+                lambda: (
+                    len(runner.state_cache) > 0
+                    and any(state.external_request_id == "req-omni" for state in omni.request_states.values())
+                )
+            )
+
+            await omni.submit_interaction_async(
+                "req-omni",
+                interaction=_prompt_interaction("new scene", event_id="ui-update-1"),
+                on_error=on_error if with_callback else None,
+            )
+            outputs = await generate_task
+
+            assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+            assert dispatched == ["ui-update-1"]
+            if with_callback:
+                assert len(rejections) == 1
+                assert rejections[0][0] == "ui-update-1"
+                assert "prompt embeds are not ready" in rejections[0][1]
+        finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
+                await asyncio.gather(generate_task, return_exceptions=True)
+            await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
+
+    @pytest.mark.asyncio
+    async def test_pending_rejection_callback_is_cancelled_when_generation_ends(
+        self, pipeline: HeliosPipeline, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejection callback still running when the stream ends must not hold up ``generate()``."""
+        monkeypatch.setattr(async_omni_base, "INTERACTION_ERROR_DRAIN_TIMEOUT_S", 0.05)
+        pipeline.encode_prompt = MagicMock(  # pyright: ignore[reportAttributeAccessIssue]
+            side_effect=ValueError("prompt embeds are not ready")
+        )
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        started: list[str] = []
+        cancelled: list[str] = []
+
+        async def on_error(event_id: str, reason: str) -> None:
+            del reason
+            started.append(event_id)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(event_id)
+                raise
+
+        prompt_update_engine = self._PromptUpdateEngine(
+            self._IncrementalStreamingPipeline(),
+            runner,
+            ready_for_next_chunk=lambda _state: bool(started),
+        )
+        inline_client = self._make_inline_pipeline_client(prompt_update_engine)
+        fixture = _build_harness([inline_client])
+        omni = self._make_async_omni(self._OrchestratorBridgeEngine(fixture))
+
+        generate_task: asyncio.Task[list[OmniRequestOutput]] | None = None
+        try:
+            generate_task = asyncio.create_task(self._collect_generate_outputs(omni))
+            await _wait_for(
+                lambda: (
+                    len(runner.state_cache) > 0
+                    and any(state.external_request_id == "req-omni" for state in omni.request_states.values())
+                )
+            )
+            await omni.submit_interaction_async(
+                "req-omni",
+                interaction=_prompt_interaction("new scene", event_id="ui-update-1"),
+                on_error=on_error,
+            )
+            outputs = await asyncio.wait_for(generate_task, 5)
+
+            assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+            assert started == ["ui-update-1"]
+            assert cancelled == ["ui-update-1"]
+            assert not omni.request_states
+        finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
+                await asyncio.gather(generate_task, return_exceptions=True)
+            await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
+
+    @pytest.mark.asyncio
+    async def test_rejection_during_cleanup_drain_leaves_no_callback_behind(
+        self, pipeline: HeliosPipeline, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejection routed while ``generate()`` drains its callbacks must not start one that outlives it."""
+        monkeypatch.setattr(async_omni_base, "INTERACTION_ERROR_DRAIN_TIMEOUT_S", 0.2)
+        pipeline.encode_prompt = MagicMock(  # pyright: ignore[reportAttributeAccessIssue]
+            side_effect=ValueError("prompt embeds are not ready")
+        )
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        started: list[str] = []
+        cancelled: list[str] = []
+        dispatched: list[str | None] = []
+
+        async def on_error(event_id: str, reason: str) -> None:
+            del reason
+            started.append(event_id)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(event_id)
+                raise
+
+        prompt_update_engine = self._PromptUpdateEngine(
+            self._IncrementalStreamingPipeline(),
+            runner,
+            ready_for_next_chunk=lambda _state: bool(started),
+        )
+        inline_client = self._make_inline_pipeline_client(prompt_update_engine)
+        fixture = _build_harness([inline_client])
+        omni = self._make_async_omni(self._OrchestratorBridgeEngine(fixture))
+        dispatch = omni._dispatch_interaction_error
+        drain = omni._drain_interaction_error_tasks
+
+        def recording_dispatch(req_state, msg):
+            dispatched.append(msg.event_id)
+            dispatch(req_state, msg)
+
+        async def drain_and_reject_again(req_state):
+            # Scheduled to run once the drain is suspended in its bounded wait,
+            # while the request is still registered with the output loop.
+            asyncio.get_running_loop().call_soon(
+                fixture.output_sync_q.put_nowait,
+                ErrorMessage(
+                    error="Failed interaction: late",
+                    request_id=req_state.request_id,
+                    event_id="ui-update-2",
+                    stage_id=0,
+                ),
+            )
+            await drain(req_state)
+
+        monkeypatch.setattr(omni, "_dispatch_interaction_error", recording_dispatch)
+        monkeypatch.setattr(omni, "_drain_interaction_error_tasks", drain_and_reject_again)
+
+        generate_task: asyncio.Task[list[OmniRequestOutput]] | None = None
+        try:
+            generate_task = asyncio.create_task(self._collect_generate_outputs(omni))
+            await _wait_for(
+                lambda: (
+                    len(runner.state_cache) > 0
+                    and any(state.external_request_id == "req-omni" for state in omni.request_states.values())
+                )
+            )
+            await omni.submit_interaction_async(
+                "req-omni",
+                interaction=_prompt_interaction("new scene", event_id="ui-update-1"),
+                on_error=on_error,
+            )
+            outputs = await asyncio.wait_for(generate_task, 5)
+            await asyncio.sleep(0.01)
+
+            assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+            assert dispatched == ["ui-update-1", "ui-update-2"]
+            assert started == ["ui-update-1"]
+            assert cancelled == ["ui-update-1"]
+            assert not omni.request_states
+        finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
+                await asyncio.gather(generate_task, return_exceptions=True)
+            await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
+
     @staticmethod
     async def _collect_generate_outputs(omni: AsyncOmni) -> list[OmniRequestOutput]:
         outputs: list[OmniRequestOutput] = []
@@ -714,6 +934,7 @@ class TestPromptUpdateIntegration:
         omni = object.__new__(AsyncOmni)
         omni.engine = engine  # pyright: ignore[reportAttributeAccessIssue]
         omni.log_stats = False
+        omni.collect_stage_metrics = True
         omni._pause_cond = asyncio.Condition()
         omni._paused = False
         omni.request_states = {}
@@ -814,11 +1035,16 @@ class TestPromptUpdateIntegration:
                 )
             )
 
-        async def try_get_output_async(self) -> Any | None:
-            try:
-                return self._fixture.output_sync_q.get_nowait()
-            except queue.Empty:
-                return None
+        async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+            msgs: list[Any] = []
+            while len(msgs) < max_messages:
+                try:
+                    msgs.append(self._fixture.output_sync_q.get_nowait())
+                except queue.Empty:
+                    break
+            if not msgs:
+                await asyncio.sleep(0.001)
+            return msgs
 
         def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
             return self.stage_metadata[stage_id]
@@ -836,9 +1062,15 @@ class TestPromptUpdateIntegration:
             self,
             streaming_pipeline: TestPromptUpdateIntegration._IncrementalStreamingPipeline,
             runner: DiffusionModelRunner,
+            ready_for_next_chunk: Callable[[StepRequestState], bool] | None = None,
         ) -> None:
             self.streaming_pipeline = streaming_pipeline
             self._runner = runner
+            # Default: the next chunk waits for a queued prompt update.
+            self._ready_for_next_chunk = ready_for_next_chunk or (
+                lambda state: isinstance(state.interaction_sessions.get("prompt"), PromptSession)
+                and state.interaction_sessions["prompt"].pending_event is not None
+            )
             self.executor = SimpleNamespace(
                 register_failure_callback=MagicMock(),
                 check_health=MagicMock(),
@@ -864,10 +1096,7 @@ class TestPromptUpdateIntegration:
             ]
 
             deadline = time.monotonic() + 5.0
-            while (
-                not isinstance(state.interaction_sessions.get("prompt"), PromptSession)
-                or state.interaction_sessions["prompt"].pending_event is None
-            ):
+            while not self._ready_for_next_chunk(state):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("timed out waiting for prompt update during streaming")
                 await asyncio.sleep(0.01)
@@ -894,3 +1123,17 @@ class TestPromptUpdateIntegration:
 
         def abort(self, request_id: str) -> None:
             del request_id
+
+
+def test_unpaced_prompt_updates_keep_latest_pending_target(pipeline):
+    state = _make_diffusion_request_state()
+    handler = PromptInteractionHandler.from_pipeline(pipeline)
+    for index, prompt in enumerate(("first", "latest")):
+        handler.enqueue(
+            state, event_id=prompt, received_at=float(index), payload={"prompt": prompt}, transition_chunks=1
+        )
+    session = state.interaction_sessions["prompt"]
+    assert isinstance(session, PromptSession)
+    assert session.pending_event is not None
+    assert session.pending_event.event_id == "latest"
+    assert session.pending_event.prompt == "latest"

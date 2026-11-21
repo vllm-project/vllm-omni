@@ -39,6 +39,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or positive, got {value!r}")
+    return parsed
+
+
 def _existing_file(value: str) -> str:
     path = Path(value).expanduser()
     if not path.is_file():
@@ -52,6 +59,7 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         OMNIINTERACT_SCENARIO_TAGS,
         OMNIINTERACT_SUBSETS,
     )
+    from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
     group.add_argument(
@@ -102,7 +110,23 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Reject media longer than this safety limit before decoding.",
     )
     group.add_argument(
-        "--omniinteract-ref-audio", type=_existing_file, help="Reference WAV for native-duplex audio output."
+        "--omniinteract-ref-audio",
+        type=_existing_file,
+        help="Reference voice WAV for models that clone it (MiniCPM-o). Omit for models that refuse one (Qwen3-Omni).",
+    )
+    group.add_argument(
+        "--omniinteract-turn-detection",
+        choices=TURN_DETECTION_MODES,
+        default=TURN_DETECTION_NONE,
+        help=(
+            "'none' streams each clip and commits once, for model-native duplex models (MiniCPM-o). "
+            "'server_vad' lets the server cut the soundtrack into turns, for turn-based duplex models "
+            "(Qwen3-Omni); the client then never commits and waits for observed speech/responses to settle."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-instructions",
+        help="Session system prompt. Omitted by default, which keeps each model's own duplex prompt.",
     )
     group.add_argument(
         "--omniinteract-require-response", action="store_true", help="Fail LISTEN-only functional E2E cases."
@@ -159,6 +183,85 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
+    from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import DEFAULT_JUDGE_FRAME_MAX_SIDE
+    from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_MODES, MIX_QUESTION
+    from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
+
+    group = parser.add_argument_group("Omni-DuplexEval Benchmark Options")
+    group.add_argument("--duplex-eval-split", default="all")
+    group.add_argument("--duplex-eval-family", choices=("all", "rtd", "pr"), default="all")
+    group.add_argument("--duplex-eval-ids", nargs="+")
+    group.add_argument("--duplex-eval-media-root", type=Path)
+    group.add_argument(
+        "--duplex-eval-ref-audio",
+        type=_existing_file,
+        help="Reference WAV for models that clone it (MiniCPM-o). Omit for Qwen3-Omni.",
+    )
+    group.add_argument("--duplex-eval-turn-detection", choices=TURN_DETECTION_MODES, default=TURN_DETECTION_NONE)
+    group.add_argument(
+        "--duplex-eval-instructions",
+        help="Session system prompt. Defaults to the native-duplex prompt; pass '' to use the server default.",
+    )
+    group.add_argument("--duplex-eval-fps", type=_positive_finite_float, default=1.0)
+    group.add_argument(
+        "--duplex-eval-mix",
+        choices=MIX_MODES,
+        default=MIX_QUESTION,
+        help="Session audio: 'question' streams only the instruction; 'soundtrack' overlays it on the clip's audio.",
+    )
+    group.add_argument(
+        "--duplex-eval-response-root",
+        type=Path,
+        default=Path("omni-duplex-eval-output"),
+        help="Parent directory for artifacts; each invocation creates a new run subdirectory.",
+    )
+    group.add_argument(
+        "--duplex-eval-evaluate",
+        action="store_true",
+        help="Run the existing Omni-DuplexEval judge after performance timing and print accuracy scores.",
+    )
+    group.add_argument(
+        "--duplex-eval-judge-base-url",
+        default="http://127.0.0.1:8001/v1",
+        help="Base URL of an already-running OpenAI-compatible judge server.",
+    )
+    group.add_argument("--duplex-eval-judge-model", help="Model name exposed by the judge server.")
+    group.add_argument("--duplex-eval-judge-api-key", default="EMPTY")
+    group.add_argument("--duplex-eval-judge-timeout-s", type=_positive_finite_float, default=600.0)
+    group.add_argument("--duplex-eval-judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
+    group.add_argument("--duplex-eval-judge-fps", type=_positive_int, default=2)
+    group.add_argument(
+        "--duplex-eval-judge-frame-max-side",
+        type=_non_negative_int,
+        default=DEFAULT_JUDGE_FRAME_MAX_SIDE,
+        help="Scale judge frames down so the longer side is at most this many pixels (0 keeps source resolution).",
+    )
+    group.add_argument("--duplex-eval-window-size", type=_positive_finite_float, default=10.0)
+    group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
+
+
+def add_duplex_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared duplex workload and metric options."""
+    group = parser.add_argument_group("Duplex Benchmark Options")
+    group.add_argument(
+        "--duplex-metric-aggregation",
+        choices=("session", "response"),
+        default="session",
+        help="Aggregate duplex TTFT, audio TTFP and RTF over session means (default) or individual responses.",
+    )
+    group.add_argument(
+        "--duplex-sample-pool-size",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Select a fixed pool of OmniInteract or Omni-DuplexEval sessions and cycle it to reach --num-prompts. "
+            "With a pool, --num-prompts 0 selects exactly the pool size instead of the full dataset. "
+            "For performance runs without answer evaluation; repeated sessions use distinct output identities."
+        ),
+    )
+
+
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for vLLM-Omni multi-stage benchmarks."""
     group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
@@ -181,6 +284,16 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
             "Total per-request timeout in seconds for benchmark HTTP requests. Timed-out requests are "
             "recorded as failed instead of stalling the run on a hung server. Defaults to 900 when "
             "omitted; set <= 0 to restore the legacy 6 h cap."
+        ),
+    )
+    group.add_argument(
+        "--omni-fail-fast-on-timeout",
+        action="store_true",
+        default=False,
+        help=(
+            "After the first timed-out benchmark request, cancel all remaining queued or in-flight requests. "
+            "Completed outputs and partial result metrics are retained. Supported only with "
+            "--backend openai-chat-omni, --request-rate inf, and non-self-timed workloads."
         ),
     )
 
@@ -349,6 +462,13 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for Seed-TTS benchmarks."""
     group = parser.add_argument_group("Seed-TTS Dataset Options")
     group.add_argument(
+        "--seed-tts-reference-as-input",
+        action="store_true",
+        help="Send Seed-TTS reference speech as a real user audio turn alongside the target text, rather than as "
+        "ref_audio/ref_text voice-clone fields. Requires --backend openai-realtime-chat. Audio is normalized to "
+        "mono 24 kHz PCM16; a one-second silent tail is appended and streamed only in server-VAD mode.",
+    )
+    group.add_argument(
         "--seed-tts-locale",
         type=str,
         choices=["en", "zh"],
@@ -412,8 +532,10 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 _OMNI_BENCH_DATASET_CHOICES = (
+    "realtime-video",
     "daily-omni",
     "omniinteract",
+    "omni-duplex-eval",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -437,7 +559,11 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
                 if extra:
                     action.choices = list(action.choices) + extra
             if action.dest == "backend" and action.choices is not None:
-                extra = [choice for choice in ("openai-image-edits-omni",) if choice not in action.choices]
+                extra = [
+                    choice
+                    for choice in ("openai-image-edits-omni", "openai-realtime-chat", "realtime-video")
+                    if choice not in action.choices
+                ]
                 if extra:
                     action.choices = list(action.choices) + extra
 
@@ -447,8 +573,8 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
     for action in parser._actions:
         if action.dest == "num_prompts":
             action.help = (
-                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} when this option is omitted; "
-                "0 selects all available cases."
+                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} and Omni-DuplexEval uses 3 "
+                "when this option is omitted; 0 selects all available cases for either dataset."
             )
         if action.dest == "percentile_metrics":
             action.help = (
@@ -456,7 +582,16 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 'For text metrics, "ttft", "tpot", and "itl" affect the global benchmark and text '
                 'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
                 'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
-                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
+                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun". '
+                'Realtime video supports "e2el", "video_ttfc", "video_fps", "video_rtf", and '
+                '"video_steady_interval"; all are selected by default for that backend.'
+            )
+        if action.dest == "goodput":
+            action.help = (
+                'Specify service level objectives for goodput as "KEY:VALUE" pairs, where the key is a '
+                'request-level metric name and the value is in milliseconds. Multiple "KEY:VALUE" pairs '
+                "can be provided, separated by spaces, and a request must satisfy every SLO to count toward "
+                'goodput. Allowed metric names are "ttft", "tpot", "e2el", and "audio_ttfp".'
             )
         if action.dest == "random_mm_limit_mm_per_prompt":
             action.help = (
@@ -483,25 +618,154 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
             )
 
 
+def add_realtime_video_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Protocol options; rollout count and output files use the shared CLI."""
+    from vllm_omni.benchmarks.realtime_video.workload import CAMERA_PATTERNS
+
+    group = parser.add_argument_group("Realtime Video Benchmark Options")
+    group.add_argument("--realtime-video-image", help="First frame: local path, HTTP URL or data URL.")
+    group.add_argument("--realtime-video-prompt")
+    group.add_argument("--realtime-video-negative-prompt")
+    group.add_argument("--realtime-video-num-chunks", type=_positive_int, default=16)
+    group.add_argument("--realtime-video-camera-pattern", choices=CAMERA_PATTERNS, default="forward")
+    for name in ("width", "height", "fps"):
+        group.add_argument(f"--realtime-video-{name}", type=_positive_int)
+    group.add_argument("--realtime-video-seed", type=int)
+    group.add_argument("--realtime-video-flow-shift", type=float)
+    group.add_argument("--realtime-video-warmup-num-chunks", type=_positive_int)
+    group.add_argument("--realtime-video-warmup-chunks", type=int, default=6)
+    group.add_argument("--realtime-video-chunk-slo-ms", type=_positive_finite_float)
+    group.add_argument("--realtime-video-target-fps", type=_positive_finite_float)
+    group.add_argument("--realtime-video-playback-buffer-chunks", type=_positive_int, default=1)
+    group.add_argument("--realtime-video-first-chunk-timeout", type=_positive_finite_float, default=900.0)
+    group.add_argument("--realtime-video-chunk-timeout", type=_positive_finite_float, default=300.0)
+    group.add_argument("--realtime-video-ping-interval", type=float, default=20.0)
+    group.add_argument("--realtime-video-save-video", help="Save the last measured rollout without re-encoding.")
+    group.add_argument("--realtime-video-print-chunks", action="store_true")
+    group.add_argument("--realtime-video-evaluate", choices=("precision", "wbench", "vbench"))
+    group.add_argument(
+        "--realtime-video-candidate", type=Path, help="Recorded candidate generation.json; no server is used."
+    )
+    group.add_argument("--realtime-video-eval-output-dir", type=Path, default=Path("realtime-video-evaluation"))
+    group.add_argument("--realtime-video-evaluator-root", type=Path)
+    group.add_argument("--realtime-video-evaluator-python", type=Path)
+    group.add_argument("--realtime-video-evaluator-requirements", type=Path)
+
+
+def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
+    from vllm_omni.benchmarks.realtime_video.client import realtime_video_base_url
+    from vllm_omni.benchmarks.realtime_video.workload import DEFAULT_MODEL
+    from vllm_omni.metrics import definitions as defs
+
+    explicit = getattr(args, "explicit_keys", ())
+    supported_metrics = {"e2el", *defs.VIDEO_STREAM_METRIC_UNITS}
+    if args.percentile_metrics is None:
+        args.percentile_metrics = ",".join(("e2el", *defs.VIDEO_STREAM_METRIC_UNITS))
+    unsupported = set(args.percentile_metrics.split(",")) - supported_metrics
+    if unsupported:
+        raise ValueError(f"realtime-video does not support percentile metrics: {sorted(unsupported)}")
+    for name, expected in (
+        ("backend", "realtime-video"),
+        ("dataset_name", "realtime-video"),
+        ("endpoint", "/v1/realtime/video"),
+    ):
+        if name in explicit and getattr(args, name) != expected:
+            raise ValueError(f"realtime-video requires --{name.replace('_', '-')} {expected}")
+        setattr(args, name, expected)
+    if "num_prompts" not in explicit:
+        args.num_prompts = 1
+    if args.num_prompts < 1 or args.num_warmups < 0:
+        raise ValueError("realtime-video requires positive --num-prompts and non-negative --num-warmups")
+    if args.max_concurrency is None:
+        args.max_concurrency = 1
+    if args.max_concurrency != 1 or args.request_rate != math.inf or args.burstiness != 1.0:
+        raise ValueError("realtime-video requires --max-concurrency 1 --request-rate inf --burstiness 1")
+    if args.self_timed is not None or args.ramp_up_strategy is not None or args.probe_request_rate != 0:
+        raise ValueError("realtime-video does not support self-timed, ramp-up or probe traffic")
+    for name in (
+        "profile",
+        "plot_timeline",
+        "plot_dataset_stats",
+        "ignore_eos",
+        "lora_modules",
+        "goodput",
+        "logprobs",
+        "tokenizer",
+        "extra_body",
+    ):
+        if getattr(args, name, None):
+            raise ValueError(f"realtime-video does not support --{name.replace('_', '-')}")
+    if "ready_check_timeout_sec" in explicit and args.ready_check_timeout_sec != 0:
+        raise ValueError("realtime-video requires --ready-check-timeout-sec 0; use explicit warmups")
+    if args.realtime_video_warmup_chunks < 0:
+        raise ValueError("--realtime-video-warmup-chunks must be non-negative")
+    if not math.isfinite(args.realtime_video_ping_interval) or args.realtime_video_ping_interval < 0:
+        raise ValueError("--realtime-video-ping-interval must be finite and non-negative")
+    args.skip_tokenizer_init = True
+    args.ready_check_timeout_sec = 0
+    if args.model is None:
+        args.model = DEFAULT_MODEL
+    if args.base_url is not None:
+        args.base_url = realtime_video_base_url(args.base_url)
+    if args.realtime_video_evaluate or args.realtime_video_candidate:
+        if not args.realtime_video_evaluate or not args.realtime_video_candidate:
+            raise ValueError(
+                "Realtime-video accuracy requires both --realtime-video-evaluate SUITE "
+                "and --realtime-video-candidate generation.json"
+            )
+        if args.realtime_video_evaluate != "precision" and not all(
+            (
+                args.realtime_video_evaluator_root,
+                args.realtime_video_evaluator_python,
+                args.realtime_video_evaluator_requirements,
+            )
+        ):
+            raise ValueError("Semantic evaluation requires evaluator root, Python and requirements lock")
+
+
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
     add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
+    add_duplex_eval_cli_args(parser)
+    add_duplex_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
+    add_realtime_video_cli_args(parser)
 
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if (
+        getattr(args, "backend", None) == "realtime-video"
+        or getattr(args, "dataset_name", None) == "realtime-video"
+        or getattr(args, "realtime_video_evaluate", None)
+        or getattr(args, "realtime_video_candidate", None)
+    ):
+        _preprocess_realtime_video_args(args)
+    if getattr(args, "dataset_name", None) == "omni-duplex-eval":
+        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
+            raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if args.duplex_eval_evaluate and not args.duplex_eval_judge_model:
+            raise ValueError("Omni-DuplexEval evaluation requires --duplex-eval-judge-model")
+        for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
+            if getattr(args, name, False):
+                raise ValueError(f"Omni-DuplexEval does not support --{name.replace('_', '-')}")
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = 3
+        if args.num_prompts < 0:
+            raise ValueError("Omni-DuplexEval --num-prompts must be non-negative (0 selects all)")
+        if args.max_concurrency is None:
+            args.max_concurrency = 1
+        elif args.max_concurrency <= 0:
+            raise ValueError("Omni-DuplexEval requires positive --max-concurrency")
     if getattr(args, "dataset_name", None) == "omniinteract":
         if getattr(args, "backend", None) != "openai-realtime-duplex":
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")
         if getattr(args, "endpoint", None) != "/v1/realtime":
             raise ValueError("OmniInteract requires --endpoint /v1/realtime")
-        if not getattr(args, "omniinteract_ref_audio", None):
-            raise ValueError("OmniInteract requires --omniinteract-ref-audio")
         if getattr(args, "omniinteract_evaluate", False) and not getattr(args, "omniinteract_judge_model", None):
             raise ValueError("OmniInteract evaluation requires --omniinteract-judge-model")
         if getattr(args, "omniinteract_video_list", None):

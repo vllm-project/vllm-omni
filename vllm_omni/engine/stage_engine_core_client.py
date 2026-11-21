@@ -10,6 +10,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import os
 import socket
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,15 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _default_process_engine_inputs(
@@ -113,6 +123,22 @@ class StageEngineCoreClientBase(StageClientBase):
 
         return StageEngineCoreClient(**client_args)
 
+    def shutdown(self, timeout: float | None = None) -> None:
+        # The orchestrator calls shutdown() without arguments. Forward an
+        # explicitly configured grace period instead of falling back to the
+        # upstream process manager's five-second best-effort timeout.
+        if timeout is None:
+            configured = getattr(self, "_stage_shutdown_timeout", None)
+            if configured is not None:
+                timeout = configured
+            else:
+                configured = getattr(getattr(self, "vllm_config", None), "shutdown_timeout", None)
+                if configured is not None and configured > 0:
+                    timeout = configured
+        # Both concrete clients place an upstream MPClient after this mixin
+        # in their MRO; StageClientBase itself has no process manager.
+        super().shutdown(timeout=timeout)  # type: ignore[misc]
+
     def __init__(
         self,
         vllm_config: Any,
@@ -139,6 +165,7 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         # -------- Stage metadata (public fields used at runtime) --------
         self.replica_id = 0
+        self._stage_shutdown_timeout = getattr(getattr(metadata, "runtime_cfg", None), "shutdown_timeout", None)
         if metadata is not None:
             self.stage_id = metadata.stage_id
             self.replica_id = getattr(metadata, "replica_id", 0)
@@ -153,6 +180,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.prompt_transform_func = metadata.prompt_transform_func
             self.prompt_expand_func = metadata.prompt_expand_func
             self.custom_process_input_func = metadata.custom_process_input_func
+            self.async_chunk_prewarm_payload_func = getattr(metadata, "async_chunk_prewarm_payload_func", None)
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
@@ -281,7 +309,7 @@ class StageEngineCoreClientBase(StageClientBase):
         the KV connector binds — prefer it when available.
         """
         replica_host = self.client_addresses.get("replica_host")
-        if replica_host:
+        if replica_host and not _is_loopback_host(replica_host):
             return replica_host
         for key in ("input_address", "output_address", "stats_update_address"):
             address = self.client_addresses.get(key)
@@ -290,13 +318,13 @@ class StageEngineCoreClientBase(StageClientBase):
             host = urlparse(address).hostname
             if host in {None, "", "*", "0.0.0.0", "::"}:
                 continue
-            if host in {"localhost", "127.0.0.1"}:
+            if _is_loopback_host(host):
                 detected = self._detect_local_ip()
                 if detected:
                     return detected
                 continue
             return host
-        return self._detect_local_ip()
+        return self._detect_local_ip() or replica_host or None
 
     def _get_kv_connector_config(self) -> dict[str, Any] | None:
         omni_kv_config = getattr(self, "_omni_kv_config", None)

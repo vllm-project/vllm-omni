@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from threading import Lock
+
 from prometheus_client import Counter, Gauge, Histogram
 
 from vllm_omni.metrics import definitions as defs
@@ -43,13 +45,15 @@ _generation_tokens_family = Counter(
 
 _stage_gen_time_family = Histogram(
     defs.STAGE_GEN_TIME_S,
-    "Per-stage generation time in seconds for diffusion / image stages.",
+    "Per-stage time from stage submit to finished output, in seconds. "
+    "Excludes diffusion scheduler admission, which is stage_in_queue_s.",
     labelnames=list(defs.STAGE_GEN_TIME_LABELS),
     buckets=defs.SECONDS_BUCKETS,
 )
 _request_queue_wait_family = Histogram(
     defs.REQUEST_QUEUE_WAIT_S,
-    "Per-request queue wait between submit arrival and stage submit, in seconds.",
+    "Orchestrator admission plus the sum of diffusion stage_in_queue_s, in seconds. "
+    "Do not add this histogram to stage_in_queue_s. A present zero is recorded.",
     labelnames=_labelnames,
     buckets=defs.SECONDS_BUCKETS,
 )
@@ -81,7 +85,8 @@ _peak_memory_family = Gauge(
 )
 _stage_in_queue_family = Histogram(
     defs.STAGE_IN_QUEUE_S,
-    "Time in seconds from diffusion scheduler enqueue to initial execution admission. "
+    "Per-stage diffusion scheduler wait from enqueue to initial execution admission, in seconds. "
+    "The sum across stages is already included in request_queue_wait_s. "
     "Zero is the healthy low-load baseline and is counted.",
     labelnames=list(defs.DIFFUSION_LABELS),
     buckets=defs.SECONDS_FAST_BUCKETS,
@@ -100,6 +105,31 @@ _kv_wait_s_family = Histogram(
     labelnames=list(defs.KV_WAIT_LABELS),
     buckets=defs.SECONDS_BUCKETS,
 )
+
+_duplex_families: tuple[Gauge, Counter] | None = None
+_duplex_families_lock = Lock()
+
+
+def _duplex_metric_families() -> tuple[Gauge, Counter]:
+    """Keep legacy deployments' collector registration unchanged."""
+    global _duplex_families
+    with _duplex_families_lock:
+        if _duplex_families is None:
+            reserved = Gauge(
+                defs.DUPLEX_RESERVED_SESSIONS,
+                "Duplex sessions reserved on each stage replica, including opening and closing sessions.",
+                labelnames=list(defs.STAGE_LABELS),
+                # Only the owning frontend publishes each replica. Use live
+                # process aggregation without adding a pid label.
+                multiprocess_mode="livesum",
+            )
+            rejected = Counter(
+                defs.DUPLEX_ADMISSION_REJECTED,
+                "Duplex session admissions rejected by global or replica capacity.",
+                labelnames=list(defs.FAILED_LABELS),
+            )
+            _duplex_families = reserved, rejected
+        return _duplex_families
 
 
 class OmniPrometheusMetrics:
@@ -190,6 +220,25 @@ class OmniPrometheusMetrics:
             model_name=self._model_name,
             stage=str(stage),
         ).set(max(n_waiting, 0))
+
+    def set_duplex_reserved_sessions(self, stage: int, replica: int, reserved: int) -> None:
+        if not self._log_stats:
+            return
+        family, _ = _duplex_metric_families()
+        family.labels(
+            model_name=self._model_name,
+            stage=str(stage),
+            replica=str(replica),
+        ).set(max(reserved, 0))
+
+    def inc_duplex_admission_rejected(self, reason: str) -> None:
+        if not self._log_stats:
+            return
+        _, family = _duplex_metric_families()
+        family.labels(
+            model_name=self._model_name,
+            reason=reason if reason in defs.DUPLEX_ADMISSION_REJECT_REASONS else "unknown",
+        ).inc()
 
     def observe_num_inference_steps(self, n_steps: int) -> None:
         if not self._log_stats or n_steps <= 0:

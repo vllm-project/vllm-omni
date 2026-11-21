@@ -13,30 +13,88 @@ loaded once by ``DuplexOmniEngine`` and handed to ``DuplexOrchestrator`` /
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
 
 import pybase64 as base64
+from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import (
+    DEFAULT_IMAGE_HISTORY_MAX_BYTES,
+    DEFAULT_IMAGE_HISTORY_MAX_ITEMS,
+    DuplexCapabilities,
+    DuplexContextViewPolicy,
+    DuplexSessionConfig,
+)
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
+    DuplexOutputContext,
     DuplexOutputDecision,
+    ToolCallAbandonReason,
+    abandoned_tool_call_notice,
 )
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
+
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
+    from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment, ToolCallOrigin, ToolCallSettlement
+
+
+logger = init_logger(__name__)
 
 
 class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
 
     def __init__(self, message: str, *, code: str = "invalid_duplex_runtime_config") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def validate_session_tools(capabilities: DuplexCapabilities, extra_body: Mapping[str, object]) -> None:
+    """Refuse tool settings this model would otherwise silently ignore.
+
+    It is not part of ``validate_client_extra_body``, which plugins override
+    and which does not see the top-level ``tools`` of a ``session.update``.
+    """
+    tools = extra_body.get("realtime_tools")
+    if not tools:
+        return
+    if capabilities.tool_mode == "none":
+        raise DuplexRuntimeConfigError("This duplex model does not support tools", code="tools_unsupported")
+    max_tools = capabilities.max_tools
+    if max_tools is not None and isinstance(tools, list | tuple) and len(tools) > max_tools:
+        raise DuplexRuntimeConfigError(
+            f"This duplex model supports at most {max_tools} tools per session",
+            code="too_many_tools",
+        )
+    tool_choice = extra_body.get("realtime_tool_choice")
+    if tool_choice not in (None, "auto"):
+        raise DuplexRuntimeConfigError(
+            "Duplex sessions only support tool_choice auto",
+            code="unsupported_tool_choice",
+        )
+
+
+class DuplexInputCapacityError(ValueError):
+    """Reject an append before submission without ending its Session.
+
+    Plugins raise this only for recoverable admission limits. The append owner
+    compensates reservations and its response; ordinary runtime failures keep
+    their existing fatal behavior.
+    """
+
+    def __init__(self, message: str, *, code: str = "input_capacity_exceeded") -> None:
         super().__init__(message)
         self.code = code
 
@@ -114,6 +172,23 @@ class PcmAppendBuffer(ABC):
         allow_emit: bool,
     ) -> PcmAppendReservation | None: ...
 
+    def prepare_commit_prefix(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
+        """Reserve one non-terminal unit that must precede a turn commit.
+
+        Models with a single terminal payload need no prefix. The runner submits
+        each prefix in wire order before reserving and acknowledging the commit.
+        """
+        return None
+
+    def retains_separate_vision_units(self) -> bool:
+        """Whether an already-committed camera unit must stay ahead of the next commit.
+
+        Streaming models replay each frame group as its own listen-only prefix.
+        A single-terminal model combines its frames with the next terminal:
+        replaying it as a non-final prefix is not a legal append.
+        """
+        return False
+
     @abstractmethod
     def prepare_commit(
         self,
@@ -124,6 +199,18 @@ class PcmAppendBuffer(ABC):
 
     @abstractmethod
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
+
+    def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
+        """Reserve one more whole unit from audio already buffered, if there is one (input-clocked sessions).
+
+        After an append emitted its unit, an input-clocked session calls this
+        until it returns ``None``, so an append longer than one unit submits
+        every whole unit it completed and is acknowledged after all of them.
+        Default: ``None`` (one unit per append; the rest waits for later
+        appends).
+        """
+        del operation_id, chunk_period_ms
+        return None
 
 
 class DuplexModelSessionState(ABC):
@@ -136,8 +223,14 @@ class DuplexModelSessionState(ABC):
     committed_audio_payload: dict[str, object] | None
     committed_audio_operation_id: str | None
     committed_audio_reserved_bytes: int
+    committed_audio_consume_started: bool
     deferred_response_create: bool
     deferred_precreate_response: bool
+    # Response id of a response precreated by an explicit response.create
+    # (vs engine-owned auto responses). The model channel uses it to tag the
+    # response's first silence unit so the model can open the assistant turn
+    # even when the previous turn's turn-ended latch is still set.
+    explicit_response_create_id: str | None
     continuation_owner_id: str | None
     continuation_units: int
     pending_silence_task: asyncio.Task[bool] | None
@@ -156,6 +249,15 @@ class DuplexModelSessionState(ABC):
         operation_id: str | None,
         reserved_bytes: int = 0,
     ) -> None: ...
+
+    def mark_committed_audio_consume_started(self) -> None:
+        if self.committed_audio_payload is not None:
+            self.committed_audio_consume_started = True
+
+    def mergeable_committed_audio(self) -> dict[str, object] | None:
+        if self.committed_audio_payload is None or self.committed_audio_consume_started:
+            return None
+        return self.committed_audio_payload
 
     @abstractmethod
     def clear_committed_audio(self) -> int: ...
@@ -181,8 +283,13 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     committed_audio_payload: dict[str, object] | None = None
     committed_audio_operation_id: str | None = None
     committed_audio_reserved_bytes: int = 0
+    #: True once an append task has begun submitting this retained PCM. Later
+    #: commits must not ``merge_audio_payloads`` with it (weather merge/dup).
+    committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
+    # See the field comment on DuplexModelSessionState above.
+    explicit_response_create_id: str | None = None
     continuation_owner_id: str | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
@@ -192,6 +299,14 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     # continuation deadline. A real (non-silence) input resets the chain.
     last_native_submit_monotonic: float | None = None
     silence_deadline_monotonic: float | None = None
+    # Listen-only units peeled off a commit that had to wait for the active
+    # response. Promotion submits these before the retained terminal payload.
+    # Parallel to the payloads: bytes still charged against the session until
+    # that prefix is submitted or the retained turn is discarded. A moved
+    # retained payload contributes 0 here; its charge stays on
+    # ``committed_audio_reserved_bytes``.
+    commit_prefix_payloads: list[dict[str, object]] = field(default_factory=list)
+    commit_prefix_reserved_bytes: list[int] = field(default_factory=list)
 
     def retain_committed_audio(
         self,
@@ -203,14 +318,33 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
         self.committed_audio_payload = payload
         self.committed_audio_operation_id = operation_id
         self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+        self.committed_audio_consume_started = False
+
+    def mark_committed_audio_consume_started(self) -> None:
+        if self.committed_audio_payload is not None:
+            self.committed_audio_consume_started = True
+
+    def mergeable_committed_audio(self) -> dict[str, object] | None:
+        """Retained PCM safe to concatenate into a newer commit.
+
+        Once an append has started consuming the retain, merging would splice
+        an already-submitted utterance into the next turn (merged ASR +
+        duplicate aura2tts).
+        """
+        if self.committed_audio_payload is None or self.committed_audio_consume_started:
+            return None
+        return self.committed_audio_payload
 
     def clear_committed_audio(self) -> int:
-        reserved_bytes = self.committed_audio_reserved_bytes
+        reserved_bytes = self.committed_audio_reserved_bytes + sum(self.commit_prefix_reserved_bytes)
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         self.deferred_response_create = False
         self.deferred_precreate_response = False
+        self.commit_prefix_payloads.clear()
+        self.commit_prefix_reserved_bytes.clear()
         return reserved_bytes
 
     def clear_continuation(self) -> None:
@@ -234,6 +368,41 @@ class DuplexDataPlaneContext:
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexUnitDecision:
+    """How a plugin decision taken at a stage segment end affects the model unit (input-clocked sessions)."""
+
+    #: Reported in ``input_audio_buffer.processed.units[].decision`` (e.g. ``"listen"``).
+    label: str
+    #: False when the decision is a side channel and the unit still produces
+    #: final-stage output (the unit then completes through ``unit_output_complete``).
+    ends_unit: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexUnitOutputs:
+    """What the engine knows about the oldest model unit still producing final-stage output."""
+
+    #: 0-based index of the unit among all units of the session (the order they were
+    #: created in): a stable key, not a position in the output stream (units that
+    #: never reached Stage 0, or whose epoch was cancelled, have indices too).
+    index: int
+    #: Whether the stage just before the final stage reported its segment end for this unit.
+    upstream_segment_finished: bool
+    #: Whether this unit's final-stage segment end arrived: the final stage's segment ends go,
+    #: in order, to the speaking units that reach the final stage (held until that unit speaks),
+    #: even while an older unit still waits for its upstream segment end. With a stage between
+    #: Stage 0 and the final stage, an end is credited to a unit only once the stage before the
+    #: final stage reported that unit's segment end, since a decision there can still end the unit.
+    final_segment_finished: bool
+    #: Session epoch the unit was submitted in (a cancel starts a new one).
+    epoch: int = 0
+    #: 1-based position of the unit among the Stage-0 submissions its epoch accepted
+    #: (the n-th Stage-0 segment end of the epoch decided it), counting units whose
+    #: decision ended them; units that never reached Stage 0 take none.
+    ordinal: int = 0
 
 
 class DuplexDataPlane(ABC):
@@ -272,12 +441,82 @@ class PartialStageForward:
     finished and an earlier sentence is already in flight. The text must be
     submitted resumable. A non-resumable submit is an end sentinel
     (``StreamingUpdate.from_request`` returns None) and aborts that sentence.
+
+    ``source_stage_id`` is the stage the orchestrator forwards *from*
+    (``_forward_to_next_stage`` always goes to source + 1). ``None`` means
+    the producing stage that just emitted ``output``. A Talker-park follow-up
+    must name the thinker stage; forwarding from Talker would hit Code2Wav.
     """
 
     output: object
     is_final_update: bool
     close_only: bool = False
     queue_close_after: bool = False
+    source_stage_id: int | None = None
+
+
+def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[tuple[str, str], ...]:
+    """Snapshot committed text without retaining images or audio payloads."""
+    entries = []
+    for message in conversation:
+        content = message.get("content")
+        if isinstance(content, list):
+            texts = []
+            has_audio_transcript = False
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    texts.append(str(part.get("text", "")))
+                elif part.get("type") == "audio_url" and isinstance(part.get("transcript"), str):
+                    texts.append(part["transcript"])
+                    has_audio_transcript = True
+            transcript = message.get("transcript")
+            if not has_audio_transcript and isinstance(transcript, str):
+                texts.append(transcript)
+            text = "\n".join(texts)
+        else:
+            text = content if isinstance(content, str) else ""
+        entries.append((str(message.get("role", "")), text))
+    return tuple(entries)
+
+
+def duplex_history_digest(history: tuple[tuple[str, str], ...]) -> str:
+    return hashlib.sha256(repr(history).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class DuplexAuxiliaryPolicy:
+    """Model-owned work identity and eligibility for the single auxiliary slot.
+
+    ``source_key`` must remain unchanged when unrelated input is appended so
+    that observation traffic cannot reset retries for the same failed work.
+    ``allow_during_response`` permits queueing alongside ordinary responses;
+    pending or active user interactions still take priority.
+    """
+
+    source_key: Hashable
+    allow_during_response: bool = False
+
+
+@dataclass(frozen=True)
+class DuplexAuxiliaryRequest:
+    """One private, non-resumable request ending at its selected stage.
+
+    The committed prefix identifies the evidence used by the model policy.
+    Later conversation can append while that prefix remains unchanged.
+    """
+
+    stage_id: int
+    prompt: dict[str, object]
+    sampling_params: object
+    history_length: int
+    history_digest: str
+    timeout_s: float = 30.0
+    model_source: object | None = None
+    retry_delays_s: tuple[float, ...] = ()
+    # Continue at this interval after the short retry budget is exhausted.
+    retry_cooldown_s: float | None = None
 
 
 class DuplexModelPlugin(ABC):
@@ -289,9 +528,42 @@ class DuplexModelPlugin(ABC):
     two halves is impossible by construction.
     """
 
+    def history_calibrator(self, runtime_config: DuplexSessionRuntimeConfig) -> HistoryCalibrationPolicy | None:
+        """Optional original-text offset policy, shared per plugin.
+
+        The framework retains requested audio, enforces deadlines and owns history writes.
+        The default preserves existing playback marks for all other models.
+        """
+        return None
+
     projects_intermediate_outputs: bool = False
+    supports_auxiliary_requests: bool = False
+    #: Whether sessions of this model may set ``extra_body.clock == "input"``;
+    #: otherwise such a session is refused (``input_clock_unsupported``). No
+    #: model opts in yet. A plugin opts in once ``unit_decision`` /
+    #: ``unit_output_complete`` match its real unit boundaries, and only if
+    #: Stage 0 ends every accepted submission with exactly one segment end, in
+    #: submission order, with the unit's decision taken on that segment-ending
+    #: output: the n-th Stage-0 segment end of an epoch decides the n-th
+    #: accepted unit. An extra or missing segment end (e.g. a prefill-only
+    #: append that ends no segment) shifts the epoch's later units onto the
+    #: wrong segment ends: an acknowledgement may then arrive before its unit's
+    #: output, or wait for the timeouts, until the next cancel starts a new
+    #: epoch; the timeouts keep acknowledgements coming but do not resynchronise.
+    #: Paths that submit to Stage 0 for something other than a model unit break
+    #: that count too, so a plugin that routes committed input through an input
+    #: transcription request, or resumes the model on a tool result, does not
+    #: opt in until those submissions are accounted for. Likewise a submission
+    #: no client input makes (the remainder of a split committed input, a held
+    #: listen-only prefix, an item command's internal payload) is created after
+    #: its input's acknowledgement was fixed and is reported with the next
+    #: client input; a plugin that relies on those paths does not opt in yet.
+    supports_input_clock: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
+    #: Reasons this model can show a notice for. The notice goes through the
+    #: model's own ``runtime_config_for_function_output``.
+    abandoned_tool_call_reasons: frozenset[ToolCallAbandonReason] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
     silence_continuation_samples: int = 16000
     #: Sample rate of that unit: the runner submits it through ``plan_append``
@@ -302,6 +574,36 @@ class DuplexModelPlugin(ABC):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         # Constructor-only: concrete plugins hand the encoder to their data plane.
         del encode_audio
+
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        """Bind model policy to the resolved deployment topology before admission."""
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        """Receive the deploy-resolved ``async_chunk`` flag before admission.
+
+        The engine always calls this. Models that do not gate streaming on the
+        flag keep this no-op; JoyAI overrides it to switch sentence TTS, Talker
+        DELTA parks, and draining.
+        """
+        del enabled
+
+    def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Validate server-owned model options before accepting sessions."""
+        if runtime_config.model_custom_options:
+            raise DuplexRuntimeConfigError(f"{self.plugin_id} does not support model_custom_options")
+
+    def input_stage_id(self, payload: object) -> int:
+        """Select the entry stage for one append before reserving its request."""
+        return 0
+
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        """Separate the next ASR-only input from a batched response input.
+
+        The remaining committed payload resumes after this item's transcript
+        has reached conversation history. Models without an ASR entry stage
+        consume their input normally.
+        """
+        return payload, None
 
     def silence_unit_payload(self) -> dict[str, object]:
         """One silence unit as an append payload (``pcm_f32le`` zeros).
@@ -333,9 +635,86 @@ class DuplexModelPlugin(ABC):
         """Add model-owned context before planning an append on the session loop."""
         return config
 
+    async def prepare_auxiliary_request(
+        self,
+        *,
+        history: tuple[tuple[str, str], ...],
+        runtime_config: Mapping[str, object],
+        state: DuplexModelSessionState,
+    ) -> DuplexAuxiliaryRequest | None:
+        """Plan bounded background work from committed text; default opt-out."""
+        return None
+
+    def on_history_item_deleted(self, *, state: DuplexModelSessionState, item_id: str) -> int:
+        """Release idle model input after source deletion; return reserved bytes freed.
+
+        Called synchronously on the Session owner after a user item is removed.
+        In-flight input remains owned by its append until that operation settles.
+        """
+        return 0
+
+    def image_history_limits(self) -> tuple[int, int]:
+        """Maximum stored image count and encoded URL bytes in Session records.
+
+        These admission limits are distinct from per-request media limits and
+        model-owned compression buffers. Summarization does not delete records.
+        """
+        return DEFAULT_IMAGE_HISTORY_MAX_ITEMS, DEFAULT_IMAGE_HISTORY_MAX_BYTES
+
+    def auxiliary_policy(
+        self,
+        *,
+        state: DuplexModelSessionState,
+        history_revision: int,
+        history: tuple[dict[str, object], ...],
+    ) -> DuplexAuxiliaryPolicy | None:
+        """Reconcile model sources and select work without preparing its prompt.
+
+        The runner caches the current conversation view by revision. Plugins
+        can invalidate derived state here even when no append follows an edit.
+        The default preserves idle-only text consolidation.
+        """
+        return DuplexAuxiliaryPolicy(source_key=history_revision)
+
+    def auxiliary_source_matches(
+        self,
+        *,
+        request: DuplexAuxiliaryRequest,
+        state: DuplexModelSessionState,
+        history: tuple[dict[str, object], ...],
+    ) -> bool:
+        """Validate model evidence before submission and result application."""
+        text = duplex_text_history(history)
+        return len(text) >= request.history_length and (
+            duplex_history_digest(text[: request.history_length]) == request.history_digest
+        )
+
+    def auxiliary_preempted_by_input(
+        self,
+        *,
+        payload: Mapping[str, object],
+        state: DuplexModelSessionState,
+        has_new_user_input: bool,
+    ) -> bool:
+        """Classify an input as interactive; models may exempt observations.
+
+        ``has_new_user_input`` carries successfully accepted user-item intent
+        until its next append, independently of the conversation item counter.
+        """
+        return True
+
+    def apply_auxiliary_result(
+        self, *, request: DuplexAuxiliaryRequest, output: object, state: DuplexModelSessionState
+    ) -> bool:
+        """Apply a private result after the runner validates its committed prefix."""
+        return False
+
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
         return self.plan_append(**kwargs)
+
+    def commit_append_plan(self, request_id: str) -> None:
+        """Commit model-owned context after the stage accepts a fenced append."""
 
     @abstractmethod
     def plan_append(
@@ -408,7 +787,8 @@ class DuplexModelPlugin(ABC):
         """Return a Talker update the orchestrator should submit, or None.
 
         Default models do not split Stage1 text. The orchestrator owns the
-        actual ``_forward_to_next_stage`` call.
+        actual ``_forward_to_next_stage`` call, including follow-ups whose
+        ``source_stage_id`` is not the producing stage.
         """
         del orchestrator, stage_id, replica_id, output, req_state
         return None
@@ -447,6 +827,11 @@ class DuplexModelPlugin(ABC):
         del stage_id, segment_finished, output, context
         return False
 
+    def resumable_downstream_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Stages that keep a turn-commit request open across downstream segments."""
+        del stage_count
+        return frozenset()
+
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
         """Output stages that may keep running after the next user turn starts.
 
@@ -456,6 +841,99 @@ class DuplexModelPlugin(ABC):
         del stage_count
         return frozenset()
 
+    # ---- input-clocked sessions (extra_body.clock == "input") ----
+
+    def unit_decision(
+        self,
+        *,
+        stage_id: int,
+        decision: DuplexOutputDecision | None,
+        output: object = None,
+        context: DuplexOutputContext | None = None,
+        runtime_config: Mapping[str, object] | None = None,
+    ) -> DuplexUnitDecision | None:
+        """Classify a stage segment end for the input clock.
+
+        The input clock tracks every model unit (one Stage-0 submission) until
+        all of its output has been emitted, so it can acknowledge the client
+        input that caused it. Called when a stage output arrives (so it reads
+        the live output at that moment): for a Stage-0 segment end (the one
+        output of a submission the clock consults, ``supports_input_clock``),
+        and for every output of a later stage before the final one that
+        carries a decision or ends a segment (``decision is None`` for a
+        segment end without one; ``output`` and ``context`` are that stage
+        output). ``runtime_config`` is the
+        session's runtime configuration (passed by the engine; the default
+        only keeps direct calls short). Decisions taken on the final stage are
+        not consulted. Default: no classification without a decision;
+        otherwise the label is ``"listen"`` when the decision metadata sets
+        ``model_listen`` (the framework key several models' data planes set),
+        else the action, and any decision ends the unit (``ends_unit=True``);
+        a plugin whose decisions do not all end the unit overrides this. A
+        plugin whose stage can end a segment that hands the next stage nothing
+        (so the unit would wait for a segment end that never comes) returns a
+        decision with ``ends_unit=True`` for it.
+        """
+        del stage_id, output, context, runtime_config
+        if decision is None:
+            return None
+        metadata = decision.metadata
+        if metadata.get("model_listen") is True:
+            label = "listen"
+        else:
+            label = str(getattr(decision.action, "value", decision.action))
+        return DuplexUnitDecision(label=label, ends_unit=True)
+
+    def unit_output_complete(
+        self,
+        *,
+        unit: DuplexUnitOutputs,
+        final_stage_id: int,
+        new_output: object | None,
+        new_context: DuplexOutputContext | None,
+        state: dict[str, object],
+        runtime_config: Mapping[str, object],
+    ) -> bool:
+        """Input clock: is the final-stage output of ``unit`` (the oldest speaking unit) complete?
+
+        Called after every final-stage output (``new_output`` / ``new_context``,
+        credited to ``unit``; a final-stage segment end sets
+        ``final_segment_finished`` on the unit it belongs to, which may be a
+        later speaking unit), after the segment end of the stage just before
+        the final stage, and, once a unit completed, again for the next one
+        with no new output (so one output may complete several units). The
+        engine only calls it with a speaking unit.
+
+        The engine keeps no output history: a plugin that needs more than the
+        flags of ``unit`` keeps it in ``state``, a dict it owns for the current
+        epoch: the engine hands it a new, empty one whenever a cancel starts a
+        new epoch, since the cancelled epoch's outputs are dropped and its
+        units settled. For example, ``state["flagged_unit"] = unit.index``
+        when ``new_output`` carries an end-of-unit flag; or, for a final stage
+        that emits one frame per Stage-0 submission, a count of the epoch's
+        frames compared with ``unit.ordinal`` (not ``unit.index``, which also
+        counts units that never reached Stage 0 and those of earlier epochs).
+        Output of a later stage that reaches the session before the Stage-0
+        segment end that makes its unit speaking (the orchestrator may deliver
+        different stages' outputs in either order) is held by the engine and
+        handed to the hook, in arrival order, once that unit is speaking.
+        ``runtime_config`` is the session's runtime configuration.
+
+        A hook that raises is logged (once per session) and its call counts
+        as "not complete": the unit is then settled by the timeouts. The same
+        holds for ``unit_decision`` ("no decision").
+
+        Default: the final stage marks one streaming segment end per unit, and
+        final-stage outputs of different units do not interleave. A model whose
+        final stage streams across unit boundaries must override this. Turns
+        never overlap in an input-clocked session (it does not open the
+        concurrent-turn gate, ``supports_concurrent_turn_requests``), because
+        the clock credits outputs to the speaking units in order; crediting by
+        request instead is future work.
+        """
+        del final_stage_id, new_output, new_context, state, runtime_config
+        return unit.final_segment_finished
+
     # ---- session policy (was ServingRuntimeAdapter) ----
 
     @abstractmethod
@@ -463,6 +941,36 @@ class DuplexModelPlugin(ABC):
 
     @abstractmethod
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities: ...
+
+    @property
+    def uses_history_context(self) -> bool:
+        """Whether this plugin consumes Session snapshots and the context ledger."""
+        return False
+
+    def bind_history_context(
+        self, *, state: DuplexModelSessionState, snapshot: DuplexHistorySnapshot, ledger: DuplexContextLedger
+    ) -> None:
+        """Bind current source authority before prompt/planning/result hooks.
+
+        Opt in with ``uses_history_context``. The Session owner calls this
+        synchronously after refreshing its ledger, including immediately before
+        auxiliary source validation and writeback. Plugins may keep node IDs and
+        planning state; published derived messages belong in this ledger.
+        Snapshot containers and ledger nodes must be treated as read-only.
+        """
+        del state, snapshot, ledger
+
+    def context_view_policy(
+        self, *, stage_id: int, runtime_config: DuplexSessionRuntimeConfig
+    ) -> DuplexContextViewPolicy | None:
+        """Opt a stage in to a candidate context view using deployment config.
+
+        ``None`` keeps the verbatim prompt path. Consumers must bind payloads
+        and preserve current request media against authoritative ``conversation``;
+        a zero-keep policy can drop that media in ``conversation_view`` itself.
+        """
+        del stage_id, runtime_config
+        return None
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         """Refuse client ``extra_body`` keys the server owns (``private_runtime_config_keys``)."""
@@ -510,16 +1018,176 @@ class DuplexModelPlugin(ABC):
             modalities=modalities,
         )
 
-    # Optional hook: build the runtime config patch for a function-call output
-    # item. Plugins without tools keep the default (no change).
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        """Recognize one function call in this model's output, or None.
+
+        The plugin owns recognition. A plugin that does not emit tool calls
+        keeps this default. A recognized call is ``{"call_id", "name",
+        "arguments"}``. Feeding an accepted result back is
+        ``runtime_config_for_function_output``.
+        """
+        del model_result
+        return None
+
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object] | None:
-        del config, current, item
+        """Prepare a result candidate without committing plugin bookkeeping.
+
+        The session revalidates epoch and deadline after conversion. Do not
+        consume a call's cached metadata here: a candidate can still be refused.
+        Terminal bookkeeping belongs in ``on_tool_call_settled``.
+        ``item`` is an isolated preparation copy. Its ``name`` and ``arguments``
+        come only from the session's immutable call origin, when available;
+        client-supplied hints are ignored. Plugins requiring that context must
+        refuse missing metadata instead of guessing an association. The public
+        acknowledgement still carries the original submitted item.
+        Plugins without tools keep the default (no change).
+        """
+        del config, current, item, history_len
         return None
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        """Record where this call sat in session history when it was published.
+
+        The session calls this from ``function_call.done``, before a later user
+        turn can grow the history. A plugin that splices the result back into
+        that history stores the length in its own runtime. The default keeps
+        nothing.
+        """
+        del runtime_config, call_id, history_len
+        return None
+
+    def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
+        """Whether a bare ``response.create`` should answer an accepted tool result.
+
+        The runner still decides that a text-only turn is legal. This only
+        reports that the plugin still has a result it has not yet prompted.
+        """
+        del runtime_config
+        return False
+
+    def extra_prompt_config(self, runtime_config: Mapping[str, object]) -> Mapping[str, object]:
+        """Runtime entries this model's prompt preparation reads. Default: none."""
+        del runtime_config
+        return {}
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        """Pop plugin-private prompt keys and return the runtime patch to store.
+
+        The session applies the patch only after the stage accepts the append.
+        A failed submit leaves the runtime unchanged. The default prompt has
+        no private keys.
+        """
+        del prompt
+        return None
+
+    def bind_inflight_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        response_id: str | None,
+    ) -> dict[str, object] | None:
+        """Remember which response owns a just-submitted tool follow-up.
+
+        The default has no inflight tool state. A plugin that does returns a
+        runtime patch naming ``response_id``; ``None`` leaves the runtime as it
+        is.
+        """
+        del runtime_config, response_id
+        return None
+
+    def runtime_config_after_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        committed: bool,
+        awaiting_playback: bool = False,
+        response_id: str | None = None,
+        release_owner: bool = False,
+    ) -> dict[str, object] | None:
+        """Adjust runtime after a response ends.
+
+        ``committed`` is false when the response was cancelled or failed before
+        its text was stored. ``awaiting_playback`` means audio was produced and
+        a later playback ACK may still store that text. ``release_owner`` means
+        that response failed before any playback ACK can store the answer, so a
+        retry may take the tool pair. The default keeps the runtime unchanged.
+        """
+        del runtime_config, committed, awaiting_playback, response_id, release_owner
+        return None
+
+    def on_tool_call_settled(self, settlement: ToolCallSettlement) -> None:
+        """Finalize only the named call's cached metadata after its decision.
+
+        A terminal notification may outlive its origin epoch. This cleanup must
+        not change model input, runtime config or continuation state. The
+        separate recovery hook is fenced against superseded epochs.
+        """
+        del settlement
+
+    def on_tool_calls_closed(self, origins: tuple[ToolCallOrigin, ...]) -> None:
+        """Dispose cached metadata for this session's calls, including pending.
+
+        Close can overtake queued terminal notifications. Cleanup must be
+        idempotent because some calls have already been finalized individually.
+        This does not perform model recovery or change another session's state.
+        """
+        del origins
+
+    def runtime_config_for_abandoned_tool_call(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        abandonment: ToolCallAbandonment,
+        *,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        """Tell the model one call is over, in this model's own format.
+
+        Called for a timed-out or cancelled call still in the current epoch,
+        and for a repeat the session refused to expose (``suppressed``, which
+        has no ledger record). For a reason in ``abandoned_tool_call_reasons``,
+        the fixed ``abandoned_tool_call_notice`` goes through the model's own
+        result path, as if the client had returned it; it never carries client
+        text. A refusal on that path skips the notice, because the session
+        already refuses a repeat of the call. So a suppressed repeat can be the
+        first notice the model gets for an epoch-cancelled call.
+
+        Cached metadata cleanup belongs in ``on_tool_call_settled`` and runs
+        even if an epoch changed. Returning ``None`` requests no change; it is
+        not an acknowledgement that the worker consumed anything. Any other
+        exception closes the session: the owner cannot safely retry partial
+        model/bookkeeping effects. Accepted calls never enter this hook.
+        """
+        if abandonment.reason not in self.abandoned_tool_call_reasons:
+            return None
+        origin = abandonment.origin
+        item: dict[str, object] = {
+            "type": "function_call_output",
+            "call_id": origin.call_id,
+            "output": abandoned_tool_call_notice(abandonment.reason),
+        }
+        if origin.name is not None:
+            item["name"] = origin.name
+        if origin.arguments is not None:
+            item["arguments"] = origin.arguments
+        try:
+            return self.runtime_config_for_function_output(config, current, item, history_len=history_len)
+        except DuplexRuntimeConfigError as exc:
+            logger.warning("Skipping the notice for abandoned function call %s: %s", origin.call_id, exc)
+            return None
 
     def runtime_config_after_model_output(
         self,
@@ -534,6 +1202,68 @@ class DuplexModelPlugin(ABC):
         """
         del current, output_metadata
         return None
+
+    def retire_pending_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Answer what a cancelled epoch does to an accepted-but-unconsumed result.
+
+        A ``function_call_output`` is accepted into the runtime config, and a
+        frame-locked model may only pick it up on a later frame. When the epoch
+        advances (a cancel or barge-in), that queued frame belongs to the
+        generation that was just cancelled and must not be spoken in the next
+        one. Plugins with a queued function channel override this; the default
+        keeps nothing queued and returns ``None`` (no change).
+
+        A history-spliced pair is a different owner. Qwen puts that pair back
+        through ``runtime_config_after_response`` when the response is cancelled
+        or cleared before its text is stored, and a later ``response.create``
+        may answer it in the new epoch. This hook does not drop that pair.
+        The epoch bump still cancels pending ledger calls.
+
+        Returning a config must not reset a monotonic cursor the worker keys
+        its "already consumed" watermark on -- only the queue itself is retired.
+
+        Raising is a fail-closed answer, not a soft error: the framework cannot
+        verify a runtime is clean on its own, so a plugin that cannot retire its
+        queue ends the session rather than let the cancelled generation's result
+        be spoken in the new epoch.
+        """
+        del config, current
+        return None
+
+
+def settle_response_runtime(
+    plugin: object,
+    session: object,
+    *,
+    committed: bool,
+    awaiting_playback: bool = False,
+    response_id: str | None = None,
+    release_owner: bool = False,
+) -> None:
+    """Let the plugin keep or drop response-scoped runtime after ``end_response``.
+
+    ``runtime_config_after_response`` is optional. A plugin object that does
+    not implement it, or implements something that is not callable, is left
+    unchanged.
+    """
+    runtime = getattr(session, "runtime_config", None)
+    replace = getattr(session, "replace_runtime_config", None)
+    hook = getattr(plugin, "runtime_config_after_response", None)
+    if not isinstance(runtime, Mapping) or not callable(replace) or not callable(hook):
+        return
+    updated = hook(
+        runtime,
+        committed=committed,
+        awaiting_playback=awaiting_playback,
+        response_id=response_id,
+        release_owner=release_owner,
+    )
+    if updated is not None:
+        replace(updated)
 
 
 def load_duplex_plugin(path: str, encode_audio: EncodeAudio) -> DuplexModelPlugin:
@@ -566,6 +1296,24 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
             )
 
 
+def validate_duplex_replica_policy(
+    plugin: DuplexModelPlugin,
+    runtime_config: DuplexSessionRuntimeConfig,
+) -> None:
+    """Validate plugin sharing capability before workers start.
+
+    DuplexReplicaPlacement validates group topology against the actual pools.
+    """
+    if runtime_config.replica_policy == "legacy":
+        return
+    cap = runtime_config.max_sessions_per_replica
+    assert cap is not None
+    # This capability depends on the requested capacity for some plugins; the
+    # global admission limit does not describe sharing within a single replica.
+    if cap > 1 and not plugin.capabilities(max_sessions=cap).supports_multi_session_same_replica:
+        raise ValueError("This duplex plugin does not support sharing a replica; set max_sessions_per_replica to 1")
+
+
 @lru_cache(maxsize=8)
 def _silence_pcm_f32le_base64(samples: int) -> str:
     return base64.b64encode(bytes(max(0, samples) * 4)).decode("ascii")
@@ -594,6 +1342,8 @@ __all__ = [
     "DefaultDuplexModelSessionState",
     "DuplexDataPlane",
     "DuplexDataPlaneContext",
+    "DuplexUnitDecision",
+    "DuplexUnitOutputs",
     "DuplexModelPlugin",
     "DuplexModelSessionState",
     "DuplexRuntimeConfigError",
@@ -604,5 +1354,7 @@ __all__ = [
     "load_duplex_plugin",
     "payload_turn_id",
     "reject_changed_runtime_value",
+    "settle_response_runtime",
     "validate_duplex_plugin_sampling",
+    "validate_duplex_replica_policy",
 ]

@@ -50,6 +50,23 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
 
+### Thinking checkpoint chat template
+
+Serving `Qwen/Qwen3-Omni-30B-A3B-Thinking` with function tools through
+`/v1/chat/completions` or the turn-based `/v1/realtime` endpoint requires the
+compatibility chat template bundled with vLLM-Omni. From a source checkout:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Thinking --omni --port 8091 \
+    --chat-template vllm_omni/transformers_utils/chat_templates/qwen3_omni_thinking.jinja \
+    --reasoning-parser qwen3 \
+    --tool-call-parser hermes \
+    --enable-auto-tool-choice
+```
+
+For an installed package, substitute the path to `qwen3_omni_thinking.jinja`
+inside its `vllm_omni/transformers_utils/chat_templates` directory.
+
 For a 3x-GPU multi-replica layout (talker/code2wav scale-out on cuda:1,2),
 use `--stage-overrides` on top of the default config:
 
@@ -127,21 +144,9 @@ Most engine knobs (`max_num_batched_tokens`, `max_model_len`, `enforce_eager`,
 `gpu_memory_utilization`, `tensor_parallel_size`, …) can be tuned without
 editing the YAML. There are three layers, in increasing specificity:
 
-#### 1. Global CLI flags (apply to every stage)
+#### 1. Pipeline-wide CLI flags
 
 ```bash
-# Tighter memory budget on a smaller GPU
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --gpu-memory-utilization 0.85
-
-# Disable cudagraphs (e.g. for debugging)
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --enforce-eager
-
-# Reduce context length
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --max-model-len 32768
-
 # Toggle prefix caching on every stage (yaml default: off)
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --enable-prefix-caching
@@ -168,13 +173,10 @@ parser defaults). If you don't pass a flag, the YAML value wins.
 > automatically based on that bool — no extra flag or variant yaml is
 > needed.
 >
-> ⚠️ **For multi-stage models that share GPUs (qwen3_omni_moe by default
-> shares cuda:1 between stages 1 and 2), avoid using global memory flags.**
-> A global `--gpu-memory-utilization 0.85` would apply to every stage and
-> oversubscribe the shared device. Use per-stage overrides instead — see
-> below.
+> Stage 1 and stage 2 share cuda:1 by default. Assign a memory budget to
+> each stage so the combined allocation fits the shared device.
 
-#### 2. Per-stage overrides via `--stage-overrides` (recommended for memory)
+#### 2. Per-stage overrides via `--stage-overrides`
 
 ```bash
 # Lower stage 1's memory budget; leave others at the YAML default
@@ -183,6 +185,10 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
         "1": {"gpu_memory_utilization": 0.5},
         "2": {"max_num_batched_tokens": 65536}
     }'
+
+# Reduce the thinker context length and disable its CUDA graphs for debugging
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{"0":{"max_model_len":32768,"enforce_eager":true}}'
 ```
 
 Per-stage values are always treated as explicit and beat YAML defaults for
@@ -351,7 +357,7 @@ response=$(curl -s http://localhost:8091/v1/chat/completions \
   }')
 
 echo "$response" | jq -r '.choices[0].message.content'
-echo "$response" | jq -r '.choices[1].message.audio.data' | base64 -d > output.wav
+echo "$response" | jq -r '.choices[0].message.audio.data' | base64 -d > output.wav
 ```
 
 ### Using Python client
@@ -393,11 +399,11 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
     modalities=["text", "audio"]
 )
-# Response contains two choices: one with text, one with audio
+# Text and audio are merged into a single choice
 print(response.choices[0].message.content)  # Text response
 
 # Save audio to file
-audio_data = base64.b64decode(response.choices[1].message.audio.data)
+audio_data = base64.b64decode(response.choices[0].message.audio.data)
 with open("output.wav", "wb") as f:
     f.write(audio_data)
 ```
@@ -557,3 +563,34 @@ In VAD mode, click **Camera** to upload sampled frames with your spoken question
 see [camera setup and limits](../realtime_web/README.md#qwen-vad-camera-input).
 For explicit turns, use `--manual` with the shared UI as described in the
 [shared UI guide](../realtime_web/README.md#qwen3-explicit-turn-realtime).
+
+### Duplex benchmarks: OmniInteract and Omni-DuplexEval
+
+Both benchmarks replay recorded clips into one duplex session. Qwen answers
+committed turns, so run them with server VAD turn detection: the client never
+commits, and frames reach Qwen as `input_image` items (it refuses
+`video_frames` on audio appends). Qwen refuses a reference voice, so omit it.
+Serve `vllm_omni/deploy/qwen3_omni_duplex.yaml` (one session at a time) and
+keep client concurrency at 1.
+
+```bash
+vllm bench serve --omni \
+    --backend openai-realtime-duplex --endpoint /v1/realtime \
+    --base-url http://127.0.0.1:8091 \
+    --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --duplex-eval-turn-detection server_vad \
+    --duplex-eval-instructions "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences." \
+    --dataset-name omni-duplex-eval --dataset-path Hothan/Omni-DuplexEval \
+    --duplex-eval-split PR_correction \
+    --duplex-eval-response-root ./duplex-eval-qwen3 \
+    --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+    --ready-check-timeout-sec 0 --save-result
+```
+
+For metrics, post-run judging and the nightly performance configuration, see
+[Omni-DuplexEval serving benchmarks](../../../docs/cli/bench/serve.md#omni-duplexeval-realtime-benchmark).
+For OmniInteract, see
+[turn-based duplex models](../../../docs/cli/bench/serve.md#turn-based-duplex-models-qwen3-omni).
+A turn-based model acknowledges proactive requests ("remind me when ...")
+immediately but does not speak again when the event happens, so proactive
+splits score low by construction.

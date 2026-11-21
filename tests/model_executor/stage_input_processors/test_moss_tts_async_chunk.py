@@ -112,11 +112,10 @@ def test_requests_progress_independently_and_empty_finish() -> None:
         ([1, 0, 15], 1, [1, 15], 15, 1),
     ],
 )
-def test_graph_shapes_and_fast_path_follow_sender(
+def test_graph_shapes_follow_sender(
     ramp: object, first: int, expected: list[int], max_step: int, effective_first: int
 ) -> None:
     connector = _manager(ramp, first=first).connector.config
-    connector["extra"]["codec_first_chunk_fast_path"] = 1
     config = Mock(
         spec=VllmConfig,
         model_config=Mock(
@@ -133,5 +132,4 @@ def test_graph_shapes_and_fast_path_follow_sender(
     codec = MossTTSCodecDecoder(vllm_config=config)
     assert codec._streaming_graph_frame_sizes == expected
     assert codec._stream_max_step_frames == max_step
-    assert codec._first_chunk_fast
     assert codec._initial_stream_chunk_frames == effective_first

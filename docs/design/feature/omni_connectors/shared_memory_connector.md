@@ -7,8 +7,8 @@ auto-configured when no explicit connector is specified for an edge.
 
 ## How It Works
 
-All payloads are serialized and stored in shared memory (`/dev/shm`); the SHM
-segment name is returned in metadata.
+All payloads are serialized and stored in shared memory; the SHM segment name
+is returned in metadata. The default Linux implementation uses `/dev/shm`.
 
 ## Configuration
 
@@ -28,7 +28,7 @@ connectors:
 
 ### 1. Overview
 
-`SharedMemoryConnector` is the default same-node connector in `vllm_omni/distributed/omni_connectors`. It is designed for stage-to-stage transfer when producer and consumer processes run on the same host and can share `/dev/shm`.
+`SharedMemoryConnector` is the default same-node connector in `vllm_omni/distributed/omni_connectors`. It is designed for stage-to-stage transfer when producer and consumer processes run on the same host and can access the same shared-memory segments.
 
 The connector provides a unified `put()` / `get()` API for arbitrary Python objects while keeping the control plane lightweight:
 
@@ -102,7 +102,7 @@ This metadata is passed over the control plane and allows the downstream stage t
 
 #### 4.3 Locking Model
 
-To avoid races between the producer and consumer, the connector uses a lock file per request:
+To avoid races between the producer and consumer, the connector uses a lock file per request. The default Linux path is:
 
 ```text
 /dev/shm/shm_{put_key}_lockfile.lock
@@ -147,17 +147,16 @@ The primary consumer path is metadata-driven:
 
 This is the path used by the current stage-to-stage connector flow.
 
-#### 5.3 Compatibility Flow: `get(metadata=None)`
+#### 5.3 Key-Based Reads: `get(metadata=None)`
 
-The connector also keeps a compatibility path for callers that only know the key:
+Streaming receivers can address a chunk by key without its storage metadata:
 
-1. Attempt to open the shared-memory segment by name via `SharedMemory(name=get_key)`.
-2. If the segment exists and has non-zero size, acquire the exclusive lock and read the bytes.
+1. Acquire the segment's nonblocking exclusive lock.
+2. Open and read the segment after the writer has sized and populated it.
 3. Deserialize the bytes and return the object.
 
-If the segment does not exist or any exception occurs, the call returns `None` immediately. There is no retry loop in this path -- it is a single-attempt open.
-
-This path is mainly for older code paths and is not the preferred mode for the current connector pipeline.
+If the writer holds the lock or the segment is absent, the call returns `None`
+so the receiver can retry later.
 
 ### 6. Key Implementation Characteristics
 
@@ -192,12 +191,12 @@ sequenceDiagram
 
     SenderStage->>SharedMemoryConnector: put(from_stage, to_stage, put_key, data)
     SharedMemoryConnector->>SharedMemoryConnector: serialize object
-    SharedMemoryConnector->>SharedMemoryConnector: write bytes to /dev/shm
+    SharedMemoryConnector->>SharedMemoryConnector: write bytes to shared memory
     SharedMemoryConnector-->>SenderStage: metadata {shm, size}
     SenderStage->>QueueOrControlPlane: forward connector metadata
     QueueOrControlPlane->>ReceiverStage: task + connector metadata
     ReceiverStage->>SharedMemoryConnector: get(from_stage, to_stage, get_key, metadata)
-    SharedMemoryConnector->>SharedMemoryConnector: read bytes from /dev/shm
+    SharedMemoryConnector->>SharedMemoryConnector: read bytes from shared memory
     SharedMemoryConnector->>SharedMemoryConnector: deserialize object
     SharedMemoryConnector-->>ReceiverStage: (data, size)
 ```

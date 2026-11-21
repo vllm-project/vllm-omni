@@ -43,7 +43,7 @@ class Gr00tPolicy:
         embodiment_tag: EmbodimentTag | str,
         model_path: str,
         *,
-        device: int | str,
+        device: int | str | torch.device,
         strict: bool = True,
     ):
         """Initialize the Gr00t Policy.

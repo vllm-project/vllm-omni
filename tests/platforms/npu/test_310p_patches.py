@@ -256,6 +256,22 @@ def _load_qwen3_tts_patch(monkeypatch: pytest.MonkeyPatch):
     return module, fakes
 
 
+@pytest.mark.parametrize("device_is_310p", [True, False])
+def test_is_310p_uses_vllm_ascend_device_config(monkeypatch: pytest.MonkeyPatch, device_is_310p: bool) -> None:
+    # vllm-ascend no longer re-exports is_310p from vllm_ascend.utils.
+    _install_fake_module(monkeypatch, "vllm_ascend")
+    _install_fake_module(monkeypatch, "vllm_ascend.device")
+    _install_fake_module(monkeypatch, "vllm_ascend.device.device_config", is_310p=lambda: device_is_310p)
+    _install_fake_module(monkeypatch, "vllm_ascend.utils")
+
+    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "__init__.py"
+    module = _load_source_module("vllm_omni_test_310p_detection", path)
+
+    assert module.is_310p() is device_is_310p
+    assert module.is_310p(SimpleNamespace(type="npu")) is device_is_310p
+    assert module.is_310p(torch.device("cpu")) is False
+
+
 def test_registry_applies_worker_once_and_model_patch_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
     registry_path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "__init__.py"
     registry = _load_source_module("vllm_omni_test_310p_patch_registry", registry_path)
@@ -668,6 +684,7 @@ def _load_qwen3_tts_code2wav_npu_patch(
             self.deconv = torch.nn.ConvTranspose1d(4, 4, 4)
             self.grouped_conv = torch.nn.Conv1d(4, 4, 3, groups=2)
             self.cache_precompute_calls = 0
+            self._npu_incremental = None
 
         def precompute_snake_caches(self):
             self.cache_precompute_calls += 1
@@ -721,6 +738,7 @@ def _make_patched_code2wav(target, *, dtype=torch.bfloat16):
         vllm_config=SimpleNamespace(
             device_config=SimpleNamespace(device=torch.device("cpu")),
             model_config=SimpleNamespace(dtype=dtype),
+            additional_config={"npu_incremental_codec": False},
         ),
         prefix="stage1",
     )

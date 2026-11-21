@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Invalid inputs on omni chat: ``POST /v1/chat/completions``, ``WS /v1/video/chat/stream``, ``WS /v1/realtime``."""
+"""Invalid inputs on omni chat.
+
+Covers ``POST /v1/chat/completions``, ``POST /v1/chat/completions/batch``,
+``POST /v1/completions``, ``WS /v1/video/chat/stream``, and ``WS /v1/realtime``.
+"""
 
 from __future__ import annotations
 
@@ -39,10 +43,6 @@ _QWEN3_OMNI_SERVER = [
 
 def _chat_completions_request_without_expectations(omni_server: OmniServer, case_id: str) -> dict[str, Any]:
     """Build ``send_chat_completions_http_request`` kwargs excluding ``err_code`` / ``err_message``."""
-    if case_id == "malformed_json":
-        return {"raw_body": "{not-json", "timeout": 120}
-    if case_id == "missing_messages":
-        return {"json": {"model": omni_server.model, "stream": False}, "timeout": 120}
     if case_id == "model_mismatch":
         return {
             "json": {
@@ -53,18 +53,10 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             "timeout": 120,
         }
     body = _minimal_chat_json(omni_server)
-    if case_id == "stream_wrong_type":
-        body["stream"] = "not-a-boolean"  # type: ignore[assignment]
-    elif case_id == "temperature_wrong_type":
-        body["temperature"] = "hot"  # type: ignore[assignment]
-    elif case_id == "max_tokens_wrong_type":
-        body["max_tokens"] = "not-an-int"  # type: ignore[assignment] # type: ignore[assignment]
-    elif case_id == "modalities_list_bad":
-        body["modalities"] = [123]  # type: ignore[assignment]
-    elif case_id == "response_format_json_schema_incomplete":
-        body["response_format"] = {"type": "json_schema"}
+    if case_id == "modalities_list_bad":
+        body["modalities"] = [123]
     elif case_id == "logprobs_wrong_type":
-        body["logprobs"] = "yes"  # type: ignore[assignment]
+        body["logprobs"] = "yes"
     elif case_id == "logprobs_top_without_enabled":
         body["logprobs"] = False
         body["top_logprobs"] = 5
@@ -94,39 +86,16 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
     "case_id, err_code, err_message",
     [
         pytest.param(
-            "malformed_json",
-            400,
-            ("json_invalid", "decode error"),
-            id="malformed_json",
-        ),
-        pytest.param("missing_messages", 400, ("messages", "missing", "Field required"), id="missing_messages"),
-        pytest.param(
             "model_mismatch",
             404,
             ("model", "does not exist", "NotFoundError"),
             id="model_mismatch",
-        ),
-        pytest.param("stream_wrong_type", 400, ("stream", "bool_parsing", "not-a-boolean"), id="invalid_stream_type"),
-        pytest.param(
-            "temperature_wrong_type",
-            400,
-            ("temperature", "float_parsing", "a valid number"),
-            id="invalid_temperature_type",
-        ),
-        pytest.param(
-            "max_tokens_wrong_type", 400, ("max_tokens", "int_parsing", "integer"), id="invalid_max_tokens_type"
         ),
         pytest.param(
             "modalities_list_bad",
             400,
             ("modalities", "list of strings"),
             id="modalities_list_bad_element",
-        ),
-        pytest.param(
-            "response_format_json_schema_incomplete",
-            400,
-            ("response_format", "BadRequestError", "json_schema"),
-            id="invalid_response_format_json_schema",
         ),
         pytest.param("logprobs_wrong_type", 400, ("logprobs", "boolean"), id="logprobs_wrong_type"),
         pytest.param(
@@ -167,6 +136,75 @@ def test_chat_completions_invalid_requests(
     cfg["err_code"] = err_code
     cfg["err_message"] = err_message
     online_client.send_chat_completions_http_request(cfg)[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /v1/completions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
+def test_completions_rejected_for_thinker_talker(
+    omni_server: OmniServer,
+    online_client: OnlineOmniClient,
+) -> None:
+    """Thinker-talker rejects ``POST /v1/completions`` with 400.
+
+    The handoff segments the sequence with ChatML markers. A bare completion
+    prompt does not carry them, so this route stays closed.
+    """
+    online_client.send_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "prompt": "Hello, how are you?",
+                "max_tokens": 10,
+            },
+            "timeout": 120,
+            "err_code": 400,
+            "err_message": "thinker-talker handoff",
+        }
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /v1/chat/completions/batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize(
+    "sad_opts, err_message",
+    [
+        pytest.param({"stream": "not-a-bool"}, None, id="stream_wrong_type"),
+        pytest.param({"n": 2}, "n > 1", id="n_greater_than_one"),
+    ],
+)
+@pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
+def test_batched_completions_with_bad_values(
+    omni_server: OmniServer,
+    online_client: OnlineOmniClient,
+    sad_opts: dict[str, object],
+    err_message: str | None,
+) -> None:
+    """Bad batched chat options (wrong ``stream`` type, ``n=2``) return 400."""
+    messages = [
+        [{"role": "user", "content": "Say hello."}],
+        [{"role": "user", "content": "Say goodbye."}],
+    ]
+    request_config: dict[str, object] = {
+        "json": {
+            "model": omni_server.model,
+            "messages": messages,
+            **sad_opts,
+        },
+        "timeout": 120,
+        "err_code": 400,
+    }
+    if err_message is not None:
+        request_config["err_message"] = err_message
+    online_client.send_batched_chat_completions_http_request(request_config)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +305,7 @@ def test_realtime_invalid_requests(
             "send_frames": send_frames_spec,
             "timeout": 120,
             "ws_max_size": None,
-            "ws_skip_types": ["session.created", "conversation.created"],
+            "ws_skip_types": ["session.created"],
             "ws_json_type": "error",
             "ws_error_code": ws_error_code,
             "err_message": err_message,

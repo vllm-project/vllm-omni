@@ -26,6 +26,8 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 # unchanged at every step.
 register_key_accumulation_strategy("codes.audio", TensorAccumulationStrategy.CONCAT_DIM0)
 register_key_accumulation_strategy("codes.ref", TensorAccumulationStrategy.REPLACE)
+# code2wav's client key for the frames it decoded: [frames, codebooks] per step.
+register_key_accumulation_strategy("codec_frames", TensorAccumulationStrategy.CONCAT_DIM0)
 
 QWEN3_TTS_PIPELINE = PipelineConfig(
     model_type="qwen3_tts",
@@ -40,6 +42,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
+            prompt_transform_func="vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder.check_text_prompt",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             supports_native_mrv2_data_plane=True,
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
@@ -47,6 +50,9 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            # talker_mtp sums the residual codebook embeddings and adds
+            # text_step; neither is in the token stream (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -89,6 +95,7 @@ QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
+            prompt_transform_func="vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder.check_text_prompt",
             final_output=True,
             final_output_type="audio",
             # The API output processor tags ``model_outputs`` by this modality.
@@ -99,6 +106,9 @@ QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            # talker_mtp sums the residual codebook embeddings and adds
+            # text_step; neither is in the token stream (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
     ),
 )
