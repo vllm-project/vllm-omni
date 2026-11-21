@@ -1,15 +1,23 @@
 # Omni-DuplexEval CI Guard
 
-The nightly runs **66 samples at concurrency 8**, generates responses once,
-then evaluates those same responses. Performance timing ends before judging.
-The DFX runner writes both performance and accuracy artifacts.
+The MiniCPM-o nightly runs **120 `PR_correction` samples at concurrency 8**,
+generates responses once, then evaluates those same responses. Performance
+timing ends before judging. MiniCPM requires complete generation and judging
+and a finite correction success rate. MiniCPM-o skips the per-session
+`client_ttft_ms` / `client_ttfp_ms` gates (native duplex may finish audio
+without a non-empty transcript); run-level `required_duplex_metrics` still
+require some samples for the batch.
+
+The shared `omni_duplex_eval_ci_config.json` still describes the earlier **66
+soundtrack IDs** (30 RTD + 36 PR) and their calibrated floors. Callers that set
+`duplex_eval_accuracy_config` keep that contract.
 
 ## Configuration and execution
 
 | File | Responsibility |
 | --- | --- |
 | `tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json` | Model, judge, benchmark parameters and hardware marks |
-| `omni_duplex_eval_ci_config.json` | Expected dataset, protocol pin, sample IDs and quality thresholds |
+| `omni_duplex_eval_ci_config.json` | Optional 66-ID soundtrack dataset, protocol pin, sample IDs and quality thresholds |
 | `validation.py` | Coverage, protocol, score-file and RTD/PR quality checks |
 | `test_omni_duplex_eval_ci.py` | CPU regressions for the accuracy contract |
 | `tests/dfx/conftest.py` | Common result metadata and artifact publication |
@@ -27,20 +35,18 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 
 For A3, use `-m "full_model and npu and A3 and cards_2"`.
 The existing CUDA and NPU nightly jobs use this same JSON configuration.
-Setting `duplex_eval_evaluate: true` writes an independent `result_acc_*.json`
-from the same measured responses and judge scores, including record-only cases
-without a numerical baseline. `duplex_eval_accuracy_config` additionally enables
-the accuracy contract and CLI-exit guard. Qwen3-Omni's `PR_correction` retains
-its generation settings, embedded performance-JSON scores and exit-code policy.
+Setting `duplex_eval_evaluate: true` writes a separate accuracy artifact from
+the same responses and judge scores. The MiniCPM nightly records its
+120 correction scores on CUDA, NPU and AMD. The Qwen3-Omni nightly also
+checks a 70% correction success floor on H100 and A3.
 
-The AMD MiniCPM CI job passes `--require-duplex-eval-score-floors`.
-Missing or empty floors for the runtime hardware fail this case. Local DFX
-configurations can also set `duplex_eval_require_score_floors: true`.
-Other callers retain record-only behavior for hardware without a score floor.
-The AMD queue currently reports MI300X, normalized to `MI300`; the `MI325`
-pytest marker is a selection label, not evidence for an MI325 baseline.
+Local DFX configurations can set `duplex_eval_accuracy_config` to select the
+66-ID soundtrack contract and its CLI exit-code checks. Setting
+`duplex_eval_require_score_floors: true` requires a floor for the runtime
+hardware. The AMD queue reports MI300X (`MI300` in results) and uses the
+`MI325` pytest marker for scheduling.
 See [AMD qualification](../../../../.buildkite/amd/nightly-qualification.md)
-for the provisional MI300 floors and required native validation.
+for the provisional MI300 floors used by the optional accuracy-config path.
 
 The model uses the first allocated device and the judge uses the second.
 DFX maps the judge's `device_index` through the platform's visible-device
@@ -53,20 +59,20 @@ memory wait after both servers have exited.
 
 Input replay uses the real-time clock and 1 FPS. Warmups and request-based
 readiness probes are disabled; the server fixture waits for startup.
-MiniCPM uses its bundled `assets/HT_ref_audio.wav`. The benchmark parameters
-and accuracy reference must select the same 66 IDs: 30 RTD and 36 PR samples.
-Sessions use the `soundtrack` mix (`duplex_eval_mix`): the instruction audio is
-overlaid on the clip's own audio track. The accuracy config records the mix its
-thresholds were measured with. The guard rejects a benchmark with another mix,
+MiniCPM uses its bundled `assets/HT_ref_audio.wav`. The MiniCPM nightly
+selects the same 120 `PR_correction` IDs as Qwen3-Omni and uses
+`duplex_eval_mix=question`. The optional accuracy-config guard still requires
+its 66 soundtrack IDs (30 RTD and 36 PR) when a caller sets
+`duplex_eval_accuracy_config`. That guard rejects a benchmark with another mix,
 and any score file whose response metadata records a different mix. Metadata
 without a mix counts as `question`.
 
 ## Results
 
-Performance and accuracy reports use their respective result directories.
-`BENCHMARK_DIR` selects the performance directory; `ACC_BENCH_RESULT_DIR`
-selects the accuracy directory, following the existing MiniCPM accuracy tests.
-The defaults are:
+The MiniCPM-o `PR_correction` nightly writes the performance JSON under
+`BENCHMARK_DIR` with embedded judge scores and publishes a separate accuracy JSON
+under `ACC_BENCH_RESULT_DIR`. The optional 66-ID soundtrack path uses the
+same artifact directories. The defaults are:
 
 ```text
 tests/dfx/perf/results/
@@ -124,16 +130,18 @@ The accuracy artifact uses this envelope:
 The `generation` object preserves publication coverage and artifact errors.
 The full `accuracy` object also contains RTD/PR scores, per-task results,
 coverage counts, errors and the score directory. `status` describes judge
-completion; the subsequent assertions enforce the recorded quality thresholds.
-Both result artifacts are saved before the assertions, preserving partial
-results when judging fails or a score falls below its threshold. Buildkite
-uploads JSON files from both directories even on test failure. The AMD job also
+completion. The MiniCPM-o nightly asserts complete judging and a finite
+correction score; the optional accuracy-config path still enforces the
+soundtrack floors below. When `duplex_eval_accuracy_config` is set, both result
+artifacts are saved before the assertions, preserving partial results when
+judging fails or a score falls below its threshold. Buildkite uploads JSON
+files from the configured directories even on test failure. The AMD job also
 retains pytest logs, JUnit results and runtime/process diagnostics. Intermediate
 judge inputs remain temporary and are removed when the test fixture exits.
 The CLI must exit successfully; the existing NPU SIGABRT-on-shutdown exception
 (`-6`) remains accepted when all artifact and score checks pass.
 
-## Accuracy metrics and fixed thresholds
+## Optional soundtrack accuracy-config thresholds
 
 RTD means **Real-Time Description**: content and temporal scores each use
 a 0–3 scale. PR means **Proactive Reminder**: `mean_all_success` is the

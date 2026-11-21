@@ -246,14 +246,18 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": SENSENOVA_U1_EXTRA_BODY_PARAMS,
         "extra_output_params": SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
     },
+    # Cosmos3 scales and center crops the conditioning image to the requested
+    # size itself.
     "Cosmos3OmniDiffusersPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
         # The shared T2I example already supplies modalities=["image"].
     },
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
     },
     "Cosmos3MultiviewPipeline": {
         "extra_body_params": COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS,
