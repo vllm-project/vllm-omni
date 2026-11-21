@@ -752,7 +752,7 @@ def test_single_gpu_spatial_fallback_preserves_fastpath(mocker, level, parallel_
     mocker.patch("torch.distributed.get_world_size", return_value=1)
     mocker.patch.object(registry_module, "current_omni_platform").is_cuda.return_value = True
     config = SimpleNamespace() if level is None else SimpleNamespace(vae_fast_path=level)
-    registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), config)
+    registry_module._apply_vae_fast_paths_if_enabled(_StubPipeline(vae), config)
     selected = "lossless" if level is None else level
     assert not vae.is_distributed_enabled()
     assert not hasattr(vae, "_vllm_omni_wan_spatial_fastpath_level")

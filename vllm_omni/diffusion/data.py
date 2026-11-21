@@ -1091,7 +1091,7 @@ class OmniDiffusionConfig:
     # by Cosmos3. Levels have the same numerical contract as the decoder.
     vae_encode_fast_path: str = "lossless"
     # Latent frames per spatial-shard decode chunk after the first; None selects
-    # min(8, spatial group size) for installed channels_last, otherwise 1.
+    # min(4, spatial group size) for installed channels_last, otherwise 1.
     vae_spatial_temporal_chunk_size: int | None = None
 
     # STA (Sliding Tile Attention) parameters

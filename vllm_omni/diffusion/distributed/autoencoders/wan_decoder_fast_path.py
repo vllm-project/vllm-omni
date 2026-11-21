@@ -183,6 +183,7 @@ def install_wan_decoder_fast_path(vae: Any, *, conv_dtype: torch.dtype | None, l
                 module._vllm_omni_fast_path_upsample = True
                 counts["upsamples"] += 1
             if isinstance(module, WanDistConv2d):
+                module.reuse_input_buffer = True
                 counts["persistent_input_buffers"] += 1
     if level == "fused":
         _install_fused(decoder, post_quant_conv if isinstance(post_quant_conv, nn.Module) else None, counts)

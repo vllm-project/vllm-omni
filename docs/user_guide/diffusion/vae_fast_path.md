@@ -393,9 +393,7 @@ existing path.
 Configure temporal batching with `--vae-spatial-temporal-chunk-size` (engine
 argument and per-stage deploy key `vae_spatial_temporal_chunk_size`). When omitted,
 `off` and `lossless` use **1 latent frame per chunk**. An installed `channels_last`
-path uses **min(8, SP GPU count)**: 2 for two GPUs, 4 for four, and 8 for eight
-or more. Eight-rank chunk-8 memory was simulated; its distributed latency and
-correctness have not been measured.
+path uses **min(4, SP GPU count)**: 2 for two GPUs and 4 for four or more.
 An explicit positive value overrides this policy for every level. The first frame is decoded separately to
 initialize causal upsampling; later chunks retain temporal cache history.
 All ranks must use the same value. This setting only affects spatial-shard

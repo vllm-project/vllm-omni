@@ -1074,7 +1074,7 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help="Latent frames per Wan spatial-shard VAE decode chunk after the first frame. "
-            "Default: min(8, SP GPU count) for channels_last; 1 for off or lossless. "
+            "Default: min(4, SP GPU count) for channels_last; 1 for off or lossless. "
             "Larger chunks use more memory and may change rounding; use 1 for the original chunking. "
             "Does not affect single-GPU or tile decode.",
         )

@@ -81,7 +81,17 @@ if HAS_TRITON:
             tl.store(out_ptr + out_offsets, doubled, mask=out_mask)
             tl.store(out_ptr + (out_offsets + out_width), doubled, mask=out_mask)
 
-    @triton.jit
+    @triton.jit(
+        do_not_specialize=[
+            "channels",
+            "height",
+            "width",
+            "width_blocks",
+            "stride_x_batch",
+            "stride_x_height",
+            "stride_x_width",
+        ]
+    )
     def _upsample2x_pixels_kernel(
         x_ptr,
         out_ptr,
@@ -92,6 +102,7 @@ if HAS_TRITON:
         stride_x_batch,
         stride_x_height,
         stride_x_width,
+        PADDED: tl.constexpr,
         BLOCK_W: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -103,39 +114,61 @@ if HAS_TRITON:
         pid = tl.program_id(0).to(tl.int64)
         width_block = pid % width_blocks
         rest = pid // width_blocks
-        in_height = rest % height
-        batch = rest // height
+        rows = height + PADDED
+        in_height = rest % rows
+        batch = rest // rows
         cols = width_block * BLOCK_W + tl.arange(0, BLOCK_W)
-        col_mask = cols < width
         x_row = batch * stride_x_batch + in_height * stride_x_height
-        out_row_stride = (2 * width) * channels
-        out_row = (batch * (2 * height) + 2 * in_height) * out_row_stride
-        out_pixels = out_row + (2 * cols) * channels
+        out_row_stride = (2 * (width + PADDED)).to(tl.int64) * channels
+        top = 2 * in_height + PADDED
+        left = 2 * cols + PADDED
+        bottom = top + 1
+        right = left + 1
+        if PADDED:
+            # The extra tile coordinates cover both edges, including the corners.
+            top = tl.where(in_height == height, 0, top)
+            bottom = tl.where(in_height == height, 2 * height + 1, bottom)
+            left = tl.where(cols == width, 0, left)
+            right = tl.where(cols == width, 2 * width + 1, right)
+        batch_offset = batch * 2 * rows * out_row_stride
         for c0 in range(0, channels, BLOCK_C):
             chans = c0 + tl.arange(0, BLOCK_C)
-            mask = col_mask[:, None] & (chans < channels)[None, :]
-            values = tl.load(x_ptr + (x_row + cols[:, None] * stride_x_width + chans[None, :]), mask=mask, other=0)
-            first = out_pixels[:, None] + chans[None, :]
+            mask = (cols < width + PADDED)[:, None] & (chans < channels)[None, :]
+            load_mask = mask
+            if PADDED:
+                load_mask = (in_height < height) & (cols < width)[:, None] & (chans < channels)[None, :]
+            values = tl.load(x_ptr + (x_row + cols[:, None] * stride_x_width + chans[None, :]), mask=load_mask, other=0)
+            first = batch_offset + top * out_row_stride + left[:, None] * channels + chans[None, :]
+            dx = (right - left)[:, None] * channels
+            dy = (bottom - top) * out_row_stride
             tl.store(out_ptr + first, values, mask=mask)
-            tl.store(out_ptr + (first + channels), values, mask=mask)
-            tl.store(out_ptr + (first + out_row_stride), values, mask=mask)
-            tl.store(out_ptr + (first + out_row_stride + channels), values, mask=mask)
+            tl.store(out_ptr + first + dx, values, mask=mask)
+            tl.store(out_ptr + first + dy, values, mask=mask)
+            tl.store(out_ptr + first + dy + dx, values, mask=mask)
 
-    @triton.jit
-    def _upsample2x_padded_kernel(
-        X, Y, N: tl.constexpr, C: tl.constexpr, H: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr
-    ):
-        # Flat NHWC indexing uses int64 for large video batches.
-        i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-        c = i % C
-        row = i // C
-        w = row % (2 * W + 2)
-        h = row // (2 * W + 2) % (2 * H + 2)
-        n = row // ((2 * W + 2) * (2 * H + 2))
-        valid = (n < N) & (h > 0) & (h <= 2 * H) & (w > 0) & (w <= 2 * W)
-        source = ((n * H + (h - 1) // 2) * W + (w - 1) // 2) * C + c
-        value = tl.load(X + source, valid, 0)
-        tl.store(Y + i, value, i < N * C * (2 * H + 2) * (2 * W + 2))
+
+def _launch_pixel_upsample(x: torch.Tensor, out: torch.Tensor, *, padded: bool) -> None:
+    batch, channels, height, width = x.shape
+    block_c = min(triton.next_power_of_2(channels), _MAX_BLOCK_C)
+    block_w = max(1, _TILE_ELEMENTS // block_c)
+    width_blocks = triton.cdiv(width + padded, block_w)
+    grid = (batch * (height + padded) * width_blocks,)
+    with torch.get_device_module().device(x.device):
+        _upsample2x_pixels_kernel[grid](
+            x,
+            out,
+            channels,
+            height,
+            width,
+            width_blocks,
+            x.stride(0),
+            x.stride(2),
+            x.stride(3),
+            PADDED=padded,
+            BLOCK_W=block_w,
+            BLOCK_C=block_c,
+            num_warps=_NUM_WARPS,
+        )
 
 
 def upsample_nearest_2x_padded(x: torch.Tensor, out: torch.Tensor) -> bool:
@@ -159,11 +192,7 @@ def upsample_nearest_2x_padded(x: torch.Tensor, out: torch.Tensor) -> bool:
         or torch.compiler.is_compiling()
     ):
         return False
-    n, c, h, w = x.shape
-    with torch.get_device_module().device(x.device):
-        _upsample2x_padded_kernel[(triton.cdiv(out.numel(), 4096),)](
-            x, out, N=n, C=c, H=h, W=w, BLOCK=4096, num_warps=4
-        )
+    _launch_pixel_upsample(x, out, padded=True)
     return True
 
 
@@ -212,25 +241,7 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
 
     if channels_last and channels > 1 and x.is_contiguous(memory_format=torch.channels_last):
         out = torch.empty(out_shape, device=x.device, dtype=x.dtype, memory_format=torch.channels_last)
-        block_c = min(triton.next_power_of_2(channels), _MAX_BLOCK_C)
-        block_w = max(1, _TILE_ELEMENTS // block_c)
-        width_blocks = triton.cdiv(width, block_w)
-        grid = (batch * height * width_blocks,)
-        with torch.get_device_module().device(x.device):
-            _upsample2x_pixels_kernel[grid](
-                x,
-                out,
-                channels,
-                height,
-                width,
-                width_blocks,
-                x.stride(0),
-                x.stride(2),
-                x.stride(3),
-                BLOCK_W=block_w,
-                BLOCK_C=block_c,
-                num_warps=_NUM_WARPS,
-            )
+        _launch_pixel_upsample(x, out, padded=False)
         return out
 
     return None
