@@ -28,7 +28,7 @@ Deliberate differences from the reference, all inference-only:
 """
 
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -621,12 +621,13 @@ class AuKTransformer(nn.Module):
                 c = torch.zeros_like(c)
             prompt = None if ref is None else self._embed_prompt(ref, ref_mask, drop_audio_cond)
 
+        device = c.device if ref is None else ref.device
+        if mask is None:
+            mask = torch.ones((batch, target_len), dtype=torch.bool, device=device)
         audio_mask = mask
-        if ref is not None and (mask is not None or ref_mask is not None):
-            if mask is None:
-                mask = torch.ones((batch, target_len), dtype=torch.bool, device=ref.device)
+        if ref is not None:
             if ref_mask is None:
-                ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=ref.device)
+                ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=device)
             audio_mask = torch.cat([ref_mask, mask], dim=1)
 
         branches = 2 if cfg_infer else 1
@@ -899,12 +900,14 @@ def sample_latents(
     ref: torch.Tensor,
     ref_mask: torch.Tensor | None,
     gen_frames: int,
+    x_mask: torch.Tensor | None = None,
+    noise_frames: Sequence[int] | None = None,
     nfe: int = 32,
     cfg_strength: float = 1.0,
     sway_sampling_coef: float | None = None,
     t_grid: list[float] | None = None,
     seed: int | None = None,
-    generator: torch.Generator | None = None,
+    generator: torch.Generator | list[torch.Generator | None] | None = None,
     latent_dim: int | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
@@ -912,16 +915,20 @@ def sample_latents(
 ) -> torch.Tensor:
     """Integrate the flow from noise to audio latents with explicit Euler steps.
 
-    Single-request only: the batch dimension carries the CFG branches, not
-    separate prompts, so no target padding mask is needed.
+    Supports single-request and multi-request batches (B >= 1).
 
     Args:
         dit: The velocity model.
-        text: Pre-encoded text hidden states ``[1, nt, text_hidden_dim]``.
-        c_mask: Text padding mask ``[1, nt]``.
-        ref: Reference prompt latents ``[1, np, latent_dim]``.
-        ref_mask: Reference padding mask ``[1, np]``.
+        text: Pre-encoded text hidden states ``[B, nt, text_hidden_dim]``.
+        c_mask: Text padding mask ``[B, nt]``.
+        ref: Reference prompt latents ``[B, np, latent_dim]``.
+        ref_mask: Reference padding mask ``[B, np]``.
         gen_frames: Target latent frames to generate.
+        x_mask: Target padding mask ``[B, gen_frames]``, ``True`` where valid.
+        noise_frames: Per-request valid target frames to sample before
+            zero-padding to ``gen_frames``. Preserves exact per-request RNG
+            consumption when requests of different unaligned lengths are
+            batched to a shared bucket.
         nfe: Euler steps, ignored when ``t_grid`` is given.
         cfg_strength: Classifier-free guidance weight. Below ``1e-5`` the
             uncond branch is skipped entirely.
@@ -930,7 +937,7 @@ def sample_latents(
         seed: Seeds the global RNG before drawing the noise. Ignored when
             ``generator`` is given.
         generator: Draws the initial noise from its own RNG, leaving the global
-            one untouched.
+            one untouched. Can be a list of generators for a batched draw.
         latent_dim: Latent channels; defaults to the model's.
         device: Device for the noise; defaults to the reference's.
         dtype: Dtype for the noise and the Euler accumulator; defaults to the
@@ -941,24 +948,58 @@ def sample_latents(
             weights themselves cost, because the draw consumes the generator
             differently and starts the ODE somewhere else. Keeping it fp32
             costs a few tens of KB and no measurable time.
+        sampler: Single-step velocity sampler (e.g. AuKCUDAGraphWrapper).
 
     Returns:
-        The target latents at ``t=1``, ``[1, gen_frames, latent_dim]``.
+        The target latents at ``t=1``, ``[B, gen_frames, latent_dim]``.
     """
     device = torch.device(device) if device is not None else ref.device
     dtype = dtype if dtype is not None else ref.dtype
     latent_dim = latent_dim if latent_dim is not None else dit.latent_dim
+    batch_size = text.shape[0]
+    frame_counts: list[int] | None = None
+    if noise_frames is not None:
+        frame_counts = [int(frames) for frames in noise_frames]
+        if len(frame_counts) != batch_size:
+            raise ValueError("AuK needs one noise frame count per request.")
+        if any(frames < 0 or frames > gen_frames for frames in frame_counts):
+            raise ValueError(f"AuK noise_frames must lie in [0, {gen_frames}]; got {frame_counts}.")
 
-    if generator is None:
+    def _draw_row(row_frames: int, row_generator: torch.Generator | None) -> torch.Tensor:
+        if row_generator is not None:
+            row_noise = torch.randn(
+                row_frames, latent_dim, generator=row_generator, device=row_generator.device, dtype=dtype
+            ).to(device)
+        else:
+            row_noise = torch.randn(row_frames, latent_dim, device=device, dtype=dtype)
+        if row_frames < gen_frames:
+            row_noise = F.pad(row_noise, (0, 0, 0, gen_frames - row_frames))
+        return row_noise
+
+    if isinstance(generator, list):
+        if len(generator) != batch_size:
+            raise ValueError("AuK needs one noise generator per request.")
+        latents_list = []
+        for idx, g in enumerate(generator):
+            row_frames = gen_frames if frame_counts is None else frame_counts[idx]
+            if g is None and seed is not None:
+                torch.manual_seed(seed)
+            latents_list.append(_draw_row(row_frames, g))
+        x = torch.stack(latents_list, dim=0)
+    elif generator is None:
         if seed is not None:
             torch.manual_seed(seed)
-        x = torch.randn(gen_frames, latent_dim, device=device, dtype=dtype).unsqueeze(0)
+        if frame_counts is not None and any(frames != gen_frames for frames in frame_counts):
+            x = torch.stack([_draw_row(frames, None) for frames in frame_counts], dim=0)
+        else:
+            x = torch.randn(batch_size, gen_frames, latent_dim, device=device, dtype=dtype)
     else:
-        x = (
-            torch.randn(gen_frames, latent_dim, generator=generator, device=generator.device, dtype=dtype)
-            .to(device)
-            .unsqueeze(0)
-        )
+        if batch_size > 1:
+            raise ValueError(
+                "AuK needs one noise generator per request when batch_size > 1, or pass a list of generators."
+            )
+        row_frames = gen_frames if frame_counts is None else frame_counts[0]
+        x = _draw_row(row_frames, generator).unsqueeze(0)
 
     t = build_time_grid(
         nfe=nfe,
@@ -967,10 +1008,25 @@ def sample_latents(
         device=device,
     )
     if sampler is not None:
+        if getattr(sampler, "loop_graph", True) and hasattr(sampler, "sample_loop"):
+            try:
+                return sampler.sample_loop(
+                    x=x,
+                    x_mask=x_mask,
+                    text=text,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
+                    timesteps=t,
+                    cfg_strength=cfg_strength,
+                )
+            finally:
+                dit.clear_cache()
         try:
             for i in range(t.shape[0] - 1):
                 velocity = sampler(
                     x=x,
+                    x_mask=x_mask,
                     text=text,
                     c_mask=c_mask,
                     ref=ref,
@@ -988,6 +1044,7 @@ def sample_latents(
     return _sample_latents(
         dit,
         initial_latents=x,
+        x_mask=x_mask,
         text=text,
         c_mask=c_mask,
         ref=ref,
@@ -1001,6 +1058,7 @@ def _sample_latents(
     dit: AuKTransformer,
     *,
     initial_latents: torch.Tensor,
+    x_mask: torch.Tensor | None = None,
     text: torch.Tensor,
     c_mask: torch.Tensor | None,
     ref: torch.Tensor,
@@ -1016,6 +1074,7 @@ def _sample_latents(
         ctx = dit.prepare(
             text,
             target_len=x.shape[1],
+            mask=x_mask,
             c_mask=c_mask,
             ref=ref,
             ref_mask=ref_mask,
@@ -1023,8 +1082,14 @@ def _sample_latents(
             cache=guided,
             timesteps=timesteps[:-1],
         )
+        step_indices = (
+            torch.arange(timesteps.shape[0] - 1, device=x.device, dtype=torch.long)
+            if ctx.modulation is not None
+            else None
+        )
         for i in range(timesteps.shape[0] - 1):
-            v = dit.step(x, timesteps[i], ctx, step_index=i)
+            step_idx = None if step_indices is None else step_indices[i]
+            v = dit.step(x, timesteps[i], ctx, step_index=step_idx)
             if guided:
                 v_cond, v_uncond = v.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength

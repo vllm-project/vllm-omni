@@ -71,7 +71,7 @@ FLASH_T_GRID = [0.0, 0.07612049579620361, 0.2928932309150696, 0.6173166036605835
 CKPT_DIR = os.environ.get("AUK_OMNI_CKPT_DIR") or os.environ.get("AUK_CKPT_DIR")
 PARITY_REF = os.environ.get("AUK_PARITY_REF")
 # An assembled directory is the only thing this pipeline can load.
-IS_ASSEMBLED = bool(CKPT_DIR) and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
+IS_ASSEMBLED = CKPT_DIR is not None and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
 
 # Measured on the released base checkpoint: mean frame cosine 0.961 to 0.968,
 # relative latent MSE 0.051 to 0.063, log-mel distance 0.34. That spread is
@@ -112,6 +112,7 @@ class _StubTransformer(nn.Module):
             "num_single_layers": num_single_layers,
             "attn_mask_enabled": attn_mask_enabled,
         }
+        self.attn_mask_enabled = attn_mask_enabled
         self.latent_dim = latent_dim
         self.proj = nn.Linear(latent_dim, latent_dim, bias=False)
 
@@ -125,6 +126,8 @@ class _StubVAE(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.register_buffer("global_mean", torch.full((LATENT_DIM,), 0.25))
+        self.register_buffer("global_log_std", torch.full((LATENT_DIM,), 4.0))
         self.encode_calls: list[dict[str, Any]] = []
         self.decode_calls = 0
         self.weights_path: str | None = None
@@ -155,7 +158,7 @@ class _StubVAE(nn.Module):
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         self.decode_calls += 1
-        return torch.zeros(1, latents.shape[1] * HOP, device=latents.device)
+        return torch.zeros(latents.shape[0], latents.shape[1] * HOP, device=latents.device)
 
     def decode_context_frames(self) -> tuple[int, int]:
         # A stateless stub: no context, so any tile size is valid.
@@ -167,11 +170,37 @@ def _stub_sampler(calls: list[dict[str, Any]]):
 
     def sample_latents(dit: nn.Module, **kwargs: Any) -> torch.Tensor:
         calls.append(kwargs)
-        shape = (1, kwargs["gen_frames"], kwargs["latent_dim"])
+        shape = (kwargs["text"].shape[0], kwargs["gen_frames"], kwargs["latent_dim"])
         generator = kwargs.get("generator")
+        noise_frames = kwargs.get("noise_frames")
+        if isinstance(generator, list):
+            rows = []
+            for idx, g in enumerate(generator):
+                row_frames = kwargs["gen_frames"] if noise_frames is None else int(noise_frames[idx])
+                if g is not None:
+                    row = torch.randn(
+                        row_frames, kwargs["latent_dim"], generator=g, device=kwargs["device"], dtype=kwargs["dtype"]
+                    )
+                else:
+                    row = torch.zeros(row_frames, kwargs["latent_dim"], device=kwargs["device"], dtype=kwargs["dtype"])
+                if row_frames < kwargs["gen_frames"]:
+                    row = F.pad(row, (0, 0, 0, kwargs["gen_frames"] - row_frames))
+                rows.append(row)
+            return torch.stack(rows)
+        row_frames = kwargs["gen_frames"] if noise_frames is None else int(noise_frames[0])
         if generator is None:
             return torch.zeros(*shape, device=kwargs["device"], dtype=kwargs["dtype"])
-        return torch.randn(*shape, generator=generator, device=kwargs["device"], dtype=kwargs["dtype"])
+        row = torch.randn(
+            shape[0],
+            row_frames,
+            kwargs["latent_dim"],
+            generator=generator,
+            device=kwargs["device"],
+            dtype=kwargs["dtype"],
+        )
+        if row_frames < kwargs["gen_frames"]:
+            row = F.pad(row, (0, 0, 0, kwargs["gen_frames"] - row_frames))
+        return row
 
     return sample_latents
 
@@ -344,8 +373,13 @@ class TestRequestParsing:
     )
     def test_per_component_config_resolves_the_dit_entry(self, build_pipeline, monkeypatch, quantization, expected):
         swapped = []
+
+        def record_quantize(dit, **_):
+            swapped.append(dit)
+            return 160
+
         monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
-        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **_: swapped.append(dit) or 160)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", record_quantize)
         pipeline, _ = build_pipeline(quantization=quantization)
         assert pipeline.dit_fp8 is expected
         assert swapped == ([pipeline.dit] if expected else [])
@@ -374,8 +408,13 @@ class TestRequestParsing:
 
     def test_ignored_layers_reach_the_fp8_swap(self, build_pipeline, monkeypatch):
         calls = []
+
+        def record_ignored(dit, **kwargs):
+            calls.append(kwargs)
+            return 159
+
         monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
-        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **kwargs: calls.append(kwargs) or 159)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", record_ignored)
         layer = "dit.transformer_blocks.0.attn.to_qkv"
         build_pipeline(quantization={"dit": {"method": "fp8", "ignored_layers": [layer]}, "vae": None})
         assert calls == [{"ignored_layers": [layer], "match_mode": "exact"}]
@@ -396,7 +435,7 @@ class TestRequestParsing:
 
         assert pipeline.support_audio_output is True
         assert pipeline.audio_sample_rate == SAMPLE_RATE
-        assert pipeline.supports_request_batch is False
+        assert pipeline.supports_request_batch is True
         # The warmup request cannot carry an encoder-stage text condition.
         assert pipeline.dummy_run_num_frames == 0
 
@@ -451,7 +490,7 @@ class TestRequestParsing:
 
     def test_stereo_source_is_mixed_to_mono(self, build_pipeline):
         pipeline, _ = build_pipeline()
-        stereo = np.zeros((2, SAMPLE_RATE), dtype=np.float32)
+        stereo: Any = np.zeros((2, SAMPLE_RATE), dtype=np.float32)
 
         pipeline.forward(_batch(_prompt(audio=(stereo, SAMPLE_RATE), knobs={"gen_seconds": 1.0}), seed=1))
 
@@ -529,7 +568,7 @@ class TestRequestParsing:
 
         pipeline.setup_compile()
 
-        warmup.assert_called_once_with(pipeline.device)
+        warmup.assert_called_once_with(pipeline.device, batch_sizes=pipeline._vae_warmup_batches)
         # Regional is the default: the DiT's repeated blocks are compiled.
         regional.assert_called_once_with(pipeline.dit, dynamic=pipeline.od_config.diffusion_compile_dynamic)
 
@@ -548,32 +587,95 @@ class TestRequestParsing:
         # The samplers call step() directly, so that is what gets compiled.
         compile_fn.assert_called_once_with(step, dynamic=False)
 
+    @pytest.mark.parametrize("loop_graph", [False, True])
     @pytest.mark.parametrize("variant, cfg", [("base", 2.0), ("flash", 0.0)])
-    def test_setup_compile_warms_the_dit_graph_buckets(self, build_pipeline, mocker, variant, cfg):
-        pipeline, _ = build_pipeline(variant)
+    def test_setup_compile_warms_the_dit_graph_buckets(self, build_pipeline, mocker, variant, cfg, loop_graph):
+        pipeline, _ = build_pipeline(
+            variant,
+            model_config={"auk_dit_warmup_nfe": 4, "auk_dit_loop_graph": loop_graph},
+        )
         mocker.patch.object(pipeline.vae_decode, "warmup")
         mocker.patch.object(pipeline_auk, "regionally_compile")
-        wrapper = mocker.Mock(enabled=True)
+        wrapper = mocker.Mock(enabled=True, loop_graph=loop_graph)
         pipeline.cudagraph_wrapper = wrapper
 
         pipeline.setup_compile()
 
-        shapes = [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in wrapper.call_args_list]
-        assert shapes == [(150, 0), (300, 0), (600, 0), (150, 150), (300, 150), (600, 150)]
-        for call in wrapper.call_args_list:
+        calls = wrapper.sample_loop.call_args_list if loop_graph else wrapper.call_args_list
+        if loop_graph:
+            wrapper.assert_not_called()
+        else:
+            wrapper.sample_loop.assert_not_called()
+        default_len = 33 if loop_graph else 32
+        serve_len = 5 if loop_graph else 4
+        if variant == "base":
+            default = [call for call in calls if call.kwargs["timesteps"].numel() == default_len]
+            serving = [call for call in calls if call.kwargs["timesteps"].numel() == serve_len]
+            assert [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in default] == [
+                (150, 0),
+                (300, 0),
+                (600, 0),
+                (150, 150),
+                (300, 150),
+                (600, 150),
+            ]
+            assert [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in serving] == [
+                (150, 0),
+                (300, 0),
+                (600, 0),
+            ]
+            assert all(call.kwargs["x"].shape[0] == 1 for call in calls)
+        else:
+            assert [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in calls] == [
+                (150, 0),
+                (300, 0),
+                (600, 0),
+                (150, 150),
+                (300, 150),
+                (600, 150),
+            ]
+            assert all(call.kwargs["timesteps"].numel() == serve_len for call in calls)
+        for call in calls:
             assert call.kwargs["cfg_strength"] == cfg
-            assert call.kwargs["new_request"] is True
-            assert call.kwargs["text"].shape == (1, 96, TEXT_HIDDEN_DIM)
+            assert call.kwargs["text"].shape[-2:] == (96, TEXT_HIDDEN_DIM)
 
     @pytest.mark.parametrize("model_config, enabled", [({"auk_dit_warmup_frames": []}, True), ({}, False)])
     def test_dit_warmup_can_be_skipped(self, build_pipeline, mocker, model_config, enabled):
         pipeline, _ = build_pipeline(model_config=model_config)
-        wrapper = mocker.Mock(enabled=enabled)
+        wrapper = mocker.Mock(enabled=enabled, loop_graph=True)
         pipeline.cudagraph_wrapper = wrapper
 
         pipeline._warmup_dit()
 
         wrapper.assert_not_called()
+        wrapper.sample_loop.assert_not_called()
+
+    def test_dit_warmup_captures_serving_batch(self, build_pipeline, mocker):
+        pipeline, _ = build_pipeline(model_config={"auk_dit_warmup_nfe": 4, "auk_dit_loop_graph": True})
+        pipeline._vae_warmup_batches = (1, 8)
+        wrapper = mocker.Mock(enabled=True, loop_graph=True)
+        pipeline.cudagraph_wrapper = wrapper
+
+        pipeline._warmup_dit()
+
+        big = [call for call in wrapper.sample_loop.call_args_list if call.kwargs["x"].shape[0] == 8]
+        assert len(big) == 1
+        assert big[0].kwargs["x"].shape[1] == 150
+        assert big[0].kwargs["ref"].shape[1] == 0
+        assert big[0].kwargs["timesteps"].numel() == 5
+        assert big[0].kwargs["text"].shape == (8, 96, TEXT_HIDDEN_DIM)
+
+    def test_auk_dit_loop_graph_defaults_and_validation(self, build_pipeline):
+        default_pipeline, _ = build_pipeline()
+        assert default_pipeline._dit_loop_graph is False
+        assert default_pipeline.cudagraph_wrapper.loop_graph is False
+
+        enabled_pipeline, _ = build_pipeline(model_config={"auk_dit_loop_graph": True})
+        assert enabled_pipeline._dit_loop_graph is True
+        assert enabled_pipeline.cudagraph_wrapper.loop_graph is True
+
+        with pytest.raises(ValueError, match="auk_dit_loop_graph must be a boolean"):
+            build_pipeline(model_config={"auk_dit_loop_graph": "true"})
 
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()
@@ -622,17 +724,438 @@ class TestRequestParsing:
     def test_reference_cache_is_bounded(self, build_pipeline):
         pipeline, _ = build_pipeline(model_config={"auk_ref_cache_size": 2})
         for level in (0.1, 0.2, 0.3):
-            clip = (np.full(SAMPLE_RATE, level, dtype=np.float32), SAMPLE_RATE)
+            clip: Any = (np.full(SAMPLE_RATE, level, dtype=np.float32), SAMPLE_RATE)
             pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
         assert len(pipeline._ref_cache) == 2
 
-    def test_one_request_per_forward(self, build_pipeline):
+    def test_multiple_requests_per_forward(self, build_pipeline):
         pipeline, _ = build_pipeline()
         batch = _batch(_prompt(knobs={"gen_seconds": 1.0}), seed=1)
-        batch.requests.append(batch.requests[0])
+        req2 = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=2),
+            request_id="auk-test-1",
+        )
+        batch.requests.append(req2)
 
-        with pytest.raises(AssertionError, match="one request per forward"):
-            pipeline.forward(batch)
+        outputs = pipeline.forward(batch)
+        assert len(outputs) == 2
+
+    def test_batch_groups_schedules_and_preserves_output_order(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        requests = [
+            _batch(
+                _prompt(audio=_silence(ref_seconds) if ref_seconds else None, knobs={"gen_seconds": seconds}),
+                seed=seed,
+                output_type="latent",
+            ).requests[0]
+            for seconds, ref_seconds, seed in [(1.0, 0.0, 7), (2.0, 0.5, 11), (1.0, 1.0, 17)]
+        ]
+        requests[2].prompt["prompt_embeds"] = torch.ones(5, TEXT_HIDDEN_DIM)
+        outputs = pipeline.forward(DiffusionRequestBatch(requests))
+        assert len(calls) == 2
+        assert [call["text"].shape[0] for call in calls] == [2, 1]
+        assert calls[0]["c_mask"].sum(dim=1).tolist() == [8, 5]
+        assert calls[0]["ref_mask"].sum(dim=1).tolist() == [0, 50]
+        for output, (seconds, seed) in zip(outputs, [(1.0, 7), (2.0, 11), (1.0, 17)]):
+            expected = torch.randn(
+                1, int(seconds * SAMPLE_RATE / HOP), LATENT_DIM, generator=torch.Generator().manual_seed(seed)
+            )
+            torch.testing.assert_close(output.output, expected, atol=0, rtol=0)
+        assert pipeline.vae.decode_calls == 0
+
+    def test_reference_encoding_runs_under_inference_mode(self, build_pipeline, mocker):
+        pipeline, _ = build_pipeline()
+        encode = pipeline.vae.encode
+        states = []
+
+        def record_mode(*args, **kwargs):
+            states.append(torch.is_inference_mode_enabled())
+            return encode(*args, **kwargs)
+
+        mocker.patch.object(pipeline.vae, "encode", side_effect=record_mode)
+        pipeline.forward(_batch(_prompt(audio=_silence(1.0), knobs={"gen_seconds": 1.0}), seed=1))
+        assert states == [True]
+
+    def test_mixed_target_lengths_batch_together_and_slice_correctly(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        # 2.9s -> round(2.9*50) = 145 frames; 3.1s -> round(3.1*50) = 155 frames
+        # Both round up to target_bucket = round_up(..., 32) = 160 frames!
+        req1 = _batch(
+            _prompt(audio=_silence(0.5), knobs={"gen_seconds": 2.9}),
+            seed=7,
+            output_type="latent",
+        ).requests[0]
+        req2 = _batch(
+            _prompt(audio=_silence(0.5), knobs={"gen_seconds": 3.1}),
+            seed=11,
+            output_type="latent",
+        ).requests[0]
+
+        outputs = pipeline.forward(DiffusionRequestBatch([req1, req2]))
+
+        # Both should be batched together in a SINGLE sampler call
+        assert len(calls) == 1
+        assert calls[0]["text"].shape[0] == 2
+        assert calls[0]["gen_frames"] == 160  # target_bucket
+        assert calls[0]["x_mask"].shape == (2, 160)
+        assert calls[0]["x_mask"][0].sum().item() == 145
+        assert calls[0]["x_mask"][1].sum().item() == 155
+
+        # Each request must get sliced to its own exact requested frame count
+        expected_f1 = int(round(2.9 * SAMPLE_RATE / HOP))  # 145
+        expected_f2 = int(round(3.1 * SAMPLE_RATE / HOP))  # 155
+        assert outputs[0].output.shape == (1, expected_f1, LATENT_DIM)
+        assert outputs[1].output.shape == (1, expected_f2, LATENT_DIM)
+
+        expected_latents1 = torch.randn(1, expected_f1, LATENT_DIM, generator=torch.Generator().manual_seed(7))
+        expected_latents2 = torch.randn(1, expected_f2, LATENT_DIM, generator=torch.Generator().manual_seed(11))
+        torch.testing.assert_close(outputs[0].output, expected_latents1, atol=0, rtol=0)
+        torch.testing.assert_close(outputs[1].output, expected_latents2, atol=0, rtol=0)
+        assert calls[0]["noise_frames"] == [expected_f1, expected_f2]
+
+    def test_mixed_target_lengths_preserve_reusable_generator_state(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+
+        def make_requests(gen: torch.Generator):
+            return [
+                OmniDiffusionRequest(
+                    prompt=_prompt(audio=_silence(0.5), knobs={"gen_seconds": sec}),
+                    sampling_params=OmniDiffusionSamplingParams(generator=gen, output_type="latent"),
+                    request_id=f"auk-rng-{idx}",
+                )
+                for idx, sec in enumerate((2.9, 3.1))
+            ]
+
+        serial_gen = torch.Generator().manual_seed(123)
+        serial_outputs = [pipeline.forward(DiffusionRequestBatch([r]))[0].output for r in make_requests(serial_gen)]
+
+        batched_gen = torch.Generator().manual_seed(123)
+        batched_outputs = [out.output for out in pipeline.forward(DiffusionRequestBatch(make_requests(batched_gen)))]
+
+        for batched, serial in zip(batched_outputs, serial_outputs, strict=True):
+            torch.testing.assert_close(batched, serial, atol=0, rtol=0)
+        assert torch.equal(batched_gen.get_state(), serial_gen.get_state())
+
+    def test_auk_batch_profile_preserves_base_model_config(self):
+        from tests.helpers.stage_config import get_deploy_config_path
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+        from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
+
+        base = load_deploy_config(get_deploy_config_path("auk.yaml"))
+        batch = load_deploy_config(get_deploy_config_path("auk_batch.yaml"))
+        base_model_cfg = dict(base.stages[1].engine_extras["model_config"])
+        batch_model_cfg = dict(batch.stages[1].engine_extras["model_config"])
+        for key, value in base_model_cfg.items():
+            assert batch_model_cfg.get(key) == value
+        assert "auk_dit_loop_graph" not in base_model_cfg
+        assert batch_model_cfg["auk_dit_loop_graph"] is True
+        assert batch_model_cfg["auk_vae_max_batch_frames"] == 2560
+        assert batch_model_cfg["auk_vae_warmup_batches"] == [1, 16]
+        assert batch_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
+
+        merged = merge_pipeline_deploy(AUK_PIPELINE, batch)
+        merged_model_cfg = dict(merged[1].yaml_engine_args["model_config"])
+        for key, value in base_model_cfg.items():
+            assert merged_model_cfg.get(key) == value
+        assert merged_model_cfg["auk_dit_loop_graph"] is True
+        assert merged_model_cfg["auk_vae_max_batch_frames"] == 2560
+        assert merged_model_cfg["auk_vae_warmup_batches"] == [1, 16]
+        assert merged_model_cfg["auk_dit_warmup_batches"] == [1, 64, 128]
+
+    def test_batched_unequal_target_lengths_vae_tail_isolation(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        # Record the decoded latents passed into vae_decode
+        decode_calls = []
+        original_decode = pipeline.vae_decode
+
+        class _RecordDecode:
+            pad_for = staticmethod(original_decode.pad_for)
+
+            def __call__(self, latents: torch.Tensor) -> torch.Tensor:
+                decode_calls.append(latents.clone())
+                return original_decode(latents)
+
+        pipeline.vae_decode = _RecordDecode()
+        req1 = _batch(
+            _prompt(audio=_silence(0.5), knobs={"gen_seconds": 2.9}),
+            seed=7,
+            output_type="pt",
+        ).requests[0]
+        req2 = _batch(
+            _prompt(audio=_silence(0.5), knobs={"gen_seconds": 3.1}),
+            seed=11,
+            output_type="pt",
+        ).requests[0]
+
+        outputs = pipeline.forward(DiffusionRequestBatch([req1, req2]))
+        assert len(decode_calls) == 1
+        decoded_latents = decode_calls[0]
+        expected_pad = original_decode.pad_for(decoded_latents.device)
+        # target_bucket is 160. Row 0 has 145 valid frames, row 1 has 155 valid frames.
+        # Padded frames [145:] in row 0 and [155:] in row 1 must be filled with normalized silence pad_for.
+        torch.testing.assert_close(decoded_latents[0, 145:], expected_pad.expand(15, -1))
+        torch.testing.assert_close(decoded_latents[1, 155:], expected_pad.expand(5, -1))
+        assert len(outputs) == 2
+        assert outputs[0].output.shape == (145 * HOP,)
+        assert outputs[1].output.shape == (155 * HOP,)
+
+    def test_unseeded_multi_schedule_preserves_request_order_rng(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+
+        def make_requests():
+            reqs = [
+                _batch(
+                    _prompt(audio=_silence(0.5), knobs={"gen_seconds": seconds, "vae_sample": vae_sample}),
+                    seed=None,
+                    output_type="latent",
+                ).requests[0]
+                for seconds, vae_sample in [(1.0, True), (2.0, False), (1.0, True)]
+            ]
+            # Clear the random seed auto-assigned by OmniDiffusionRequest so
+            # pipeline._resolve_generator exercises the unseeded fallback.
+            for req in reqs:
+                req.sampling_params.seed = None
+            return reqs
+
+        torch.manual_seed(1234)
+        serial_outputs = [pipeline.forward(DiffusionRequestBatch([req]))[0].output for req in make_requests()]
+
+        torch.manual_seed(1234)
+        batched_outputs = [out.output for out in pipeline.forward(DiffusionRequestBatch(make_requests()))]
+
+        for batched, serial in zip(batched_outputs, serial_outputs, strict=True):
+            torch.testing.assert_close(batched, serial, atol=0, rtol=0)
+
+    def test_interleaved_shared_generator_preserves_request_order(self, build_pipeline):
+        # Verify interleaved requests sharing one Generator flush to keep exact
+        # RNG draw order, whereas distinct per-request generators still batch
+        # across interleaved schedule keys.
+        pipeline, calls = build_pipeline()
+
+        def make_shared_requests(seed: int):
+            shared_gen = torch.Generator(device="cpu").manual_seed(seed)
+            reqs = [
+                _batch(
+                    _prompt(audio=_silence(0.5), knobs={"gen_seconds": seconds}),
+                    seed=None,
+                    output_type="latent",
+                ).requests[0]
+                for seconds in (2.9, 3.5, 3.1)
+            ]
+            for req in reqs:
+                req.sampling_params.generator = shared_gen
+            return reqs, shared_gen
+
+        serial_reqs, serial_gen = make_shared_requests(42)
+        serial_outputs = [pipeline.forward(DiffusionRequestBatch([req]))[0].output for req in serial_reqs]
+
+        calls.clear()
+        batched_reqs, batched_gen = make_shared_requests(42)
+        batched_outputs = [out.output for out in pipeline.forward(DiffusionRequestBatch(batched_reqs))]
+
+        assert len(calls) == 3
+        for batched, serial in zip(batched_outputs, serial_outputs, strict=True):
+            torch.testing.assert_close(batched, serial, atol=0, rtol=0)
+        assert torch.equal(batched_gen.get_state(), serial_gen.get_state())
+
+        calls.clear()
+        distinct_reqs = [
+            _batch(
+                _prompt(audio=_silence(0.5), knobs={"gen_seconds": seconds}),
+                seed=seed,
+                output_type="latent",
+            ).requests[0]
+            for seconds, seed in zip((2.9, 3.5, 3.1), (7, 11, 13), strict=True)
+        ]
+        pipeline.forward(DiffusionRequestBatch(distinct_reqs))
+        assert len(calls) == 2
+        assert [call["text"].shape[0] for call in calls] == [2, 1]
+
+    @pytest.mark.asyncio
+    async def test_mid_forward_abort_completes_survivor_and_skips_preaborted_capture(
+        self, build_pipeline, monkeypatch, mocker
+    ):
+        import asyncio
+        import queue
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+        from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
+        from vllm_omni.diffusion.sched import RequestScheduler
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+        pipeline, _calls = build_pipeline(model_config={"auk_dit_loop_graph": True})
+        loop = asyncio.get_running_loop()
+        od_config = OmniDiffusionConfig(
+            model=pipeline.od_config.model,
+            model_class_name="AuKPipeline",
+            max_num_seqs=4,
+            request_batch_max_wait_ms=0.0,
+            diffusion_attention_schedule=None,
+        )
+        scheduler = RequestScheduler()
+        scheduler.initialize(od_config)
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = od_config
+        engine.scheduler = scheduler
+        engine.step_execution = False
+        engine.supports_request_batch = True
+        engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
+        engine._request_cancellations = None
+        engine._supports_pre_tokenized_prompt_ids = False
+        engine._diffusion_kv_profile_limits = None
+        engine.pre_process_func = None
+        engine.post_process_func = None
+        engine._post_process_accepts_sampling_params = False
+        engine.prefix_cache_func = None
+        engine._request_chunk_states = {}
+        engine._streaming_playback = {}
+        engine.executor = SimpleNamespace(drop_output=Mock(), shutdown=Mock())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._out_streams = {}
+        engine._unclaimed_async_outputs = {}
+        engine._shutdown_output_futures = {}
+        engine._closed = False
+        engine._shutting_down = False
+        engine._shutdown_complete = False
+        engine.abort_queue = queue.Queue()
+        engine._rpc_queue = queue.Queue()
+        engine._scheduling_paused = True
+        engine.main_loop = loop
+        engine.stop_event = threading.Event()
+
+        in_forward = threading.Event()
+        release_forward = threading.Event()
+        original_sample = pipeline_auk.sample_latents
+
+        def blocking_sample(*args, **kwargs):
+            in_forward.set()
+            assert release_forward.wait(timeout=5.0)
+            return original_sample(*args, **kwargs)
+
+        monkeypatch.setattr(pipeline_auk, "sample_latents", blocking_sample)
+
+        forward_waves: list[list[str]] = []
+
+        def execute_batch(sched_output):
+            reqs = [nr.req for nr in sched_output.scheduled_new_reqs]
+            forward_waves.append([r.request_id for r in reqs])
+            outs = pipeline.forward(DiffusionRequestBatch(reqs))
+            return BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(request_id=req.request_id, step_index=None, finished=True, result=out)
+                    for req, out in zip(reqs, outs, strict=True)
+                ]
+            )
+
+        engine.execute_fn = execute_batch
+        engine._loop_started = True
+        engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
+        engine.worker_thread.start()
+        try:
+            req_keep = OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0}),
+                sampling_params=OmniDiffusionSamplingParams(seed=7, output_type="latent"),
+                request_id="req-keep",
+            )
+            req_abort = OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0}),
+                sampling_params=OmniDiffusionSamplingParams(seed=11, output_type="latent"),
+                request_id="req-abort",
+            )
+            stream_keep = engine.async_add_req_and_stream_response(req_keep)
+            stream_abort = engine.async_add_req_and_stream_response(req_abort)
+
+            with engine._cv:
+                engine._scheduling_paused = False
+                engine._cv.notify_all()
+
+            assert await asyncio.to_thread(in_forward.wait, 5.0)
+            engine.abort("req-abort")
+            release_forward.set()
+
+            out_keep = await anext(stream_keep)
+            out_abort = await anext(stream_abort)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream_keep)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream_abort)
+
+            assert forward_waves == [["req-keep", "req-abort"]]
+            assert not out_keep.aborted
+            expected_keep = torch.randn(1, 50, LATENT_DIM, generator=torch.Generator().manual_seed(7))
+            torch.testing.assert_close(out_keep.output, expected_keep, atol=0, rtol=0)
+
+            assert out_abort.aborted is True
+            assert out_abort.output is None
+            with pytest.raises(DiffusionRequestAbortedError):
+                engine.postprocess_output(req_abort, out_abort)
+
+            pipeline.cudagraph_wrapper.enabled = True
+            capture_spy = mocker.patch.object(pipeline.cudagraph_wrapper, "_capture_loop")
+            sample_spy = mocker.spy(pipeline.cudagraph_wrapper, "sample_loop")
+
+            with engine._cv:
+                engine._scheduling_paused = True
+
+            req_preaborted = OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0}),
+                sampling_params=OmniDiffusionSamplingParams(seed=13, output_type="latent"),
+                request_id="req-preaborted",
+            )
+            stream_preaborted = engine.async_add_req_and_stream_response(req_preaborted)
+            engine.abort("req-preaborted")
+
+            with engine._cv:
+                engine._scheduling_paused = False
+                engine._cv.notify_all()
+
+            out_pre = await anext(stream_preaborted)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream_preaborted)
+
+            assert out_pre.aborted is True
+            assert out_pre.output is None
+            with pytest.raises(DiffusionRequestAbortedError):
+                engine.postprocess_output(req_preaborted, out_pre)
+            assert len(forward_waves) == 1
+            sample_spy.assert_not_called()
+            capture_spy.assert_not_called()
+        finally:
+            release_forward.set()
+            engine.close()
+
+    def test_unmasked_checkpoint_runs_exact_shape_serial_waves(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        pipeline.dit.attn_mask_enabled = False
+        req1 = OmniDiffusionRequest(
+            prompt=_prompt(tokens=4, knobs={"gen_seconds": 3.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=7, output_type="latent"),
+            request_id="unmasked-0",
+        )
+        req2 = OmniDiffusionRequest(
+            prompt=_prompt(tokens=7, knobs={"gen_seconds": 3.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=11, output_type="latent"),
+            request_id="unmasked-1",
+        )
+
+        outputs = pipeline.forward(DiffusionRequestBatch([req1, req2]))
+
+        assert len(outputs) == 2
+        assert len(calls) == 2
+        assert calls[0]["gen_frames"] == 150
+        assert calls[1]["gen_frames"] == 150
+        assert calls[0]["text"].shape == (1, 4, TEXT_HIDDEN_DIM)
+        assert calls[1]["text"].shape == (1, 7, TEXT_HIDDEN_DIM)
+        assert calls[0]["x_mask"] is None
+        assert calls[1]["x_mask"] is None
+        assert calls[0]["noise_frames"] is None
+        assert calls[1]["noise_frames"] is None
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
@@ -663,6 +1186,7 @@ def _log_mel_distance(left: torch.Tensor, right: torch.Tensor, sample_rate: int)
 def test_zero_shot_tts_tracks_the_upstream_reference():
     """Replay the saved zero-shot TTS case and report the distances."""
 
+    assert PARITY_REF is not None
     parity_dir = Path(PARITY_REF)
     fusion_dir = Path(os.environ.get("AUK_FUSION_REF") or parity_dir.parent.parent / "fusion_ref")
     reference = torch.load(parity_dir / "zs_tts_en.pt", map_location="cpu", weights_only=False)

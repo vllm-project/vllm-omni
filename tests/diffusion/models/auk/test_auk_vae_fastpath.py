@@ -165,11 +165,29 @@ def test_compiled_bucket_is_the_smallest_captured_one_that_fits() -> None:
     assert wrapper.compile_shapes == [8, 16]
     # Nothing captured yet: every length goes to the per-length graph tier.
     assert wrapper.compiled_bucket(6) is None
-    wrapper._compiled = {8: object(), 16: object()}  # type: ignore[dict-item]
+    wrapper._compiled = {(1, 8): object(), (1, 16): object()}  # type: ignore[dict-item]
     assert [wrapper.compiled_bucket(frames) for frames in (6, 8, 9, 16, 17)] == [8, 8, 16, 16, None]
     # A bucket whose capture failed is skipped, not padded to.
-    wrapper._compiled = {16: object()}  # type: ignore[dict-item]
+    wrapper._compiled = {(1, 16): object()}  # type: ignore[dict-item]
     assert wrapper.compiled_bucket(6) == 16
+    # Extra-batch compiled graphs also count as captured buckets.
+    wrapper._compiled = {}
+    wrapper._compiled[(8, 8)] = object()  # type: ignore[assignment]
+    assert wrapper.compiled_bucket(6) == 8
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_larger_vae_batch_entry_reuses_near_compiled_batch() -> None:
+    wrapper = AuKVAEDecodeGraph(_small_vae(), compile_shapes=(8,))
+    fake = object()
+    wrapper._compiled[(8, 8)] = fake  # type: ignore[assignment]
+    entry, mode = wrapper._larger_batch_entry(7, 8)
+    assert entry is fake and mode == "compiled"
+    entry, mode = wrapper._larger_batch_entry(1, 8)
+    assert entry is None
+    lookup, lookup_mode = wrapper._lookup_graph(7, 8)
+    assert lookup is fake and lookup_mode == "compiled"
 
 
 @pytest.mark.cpu
@@ -331,11 +349,11 @@ def test_graph_replay_matches_eager_per_length() -> None:
         for previous, snapshot in saved_outputs:
             assert torch.equal(previous, snapshot)
         saved_outputs.append((replay, replay.clone()))
-        pools.append(wrapper._plain_pool)
+        pools.append(wrapper._plain_pools[1])
     # The third distinct length found the cache full, so the whole generation
     # (6 and 9) was retired together with its pool rather than one graph at a
     # time; 12 and the re-captured 6 share the new pool.
-    assert list(wrapper._cache) == [12, 6]
+    assert list(wrapper._cache) == [(1, 12), (1, 6)]
     assert pools[0] is pools[2] and pools[3] is pools[4] and pools[2] is not pools[3]
 
 
@@ -348,7 +366,7 @@ def test_bucketed_graph_only_disturbs_the_tail() -> None:
     latents = torch.randn(1, 6, vae.latent_dim, device="cuda")
     eager = vae.decode(latents)
     replay = wrapper(latents)
-    assert replay.shape == eager.shape and list(wrapper._cache) == [8]
+    assert replay.shape == eager.shape and list(wrapper._cache) == [(1, 8)]
     # The padding decodes to raw zero, which is what the eager conv_pre pads
     # with, but it still leaks in through the alias-free upsamplers, whose
     # lookahead accumulates through the stack, so a bucketed replay is close
@@ -366,7 +384,7 @@ def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_
     vae = _small_vae().to("cuda")
     wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(8,))
     wrapper.warmup(torch.device("cuda"))
-    assert list(wrapper._compiled) == [8]
+    assert list(wrapper._compiled) == [(1, 8)]
 
     exact = torch.randn(1, 8, vae.latent_dim, device="cuda")
     eager = vae.decode(exact)
@@ -387,7 +405,7 @@ def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_
     long = torch.randn(1, 12, vae.latent_dim, device="cuda")
     replay, eager = wrapper(long), vae.decode(long)
     _assert_plain_graph_matches_eager(replay, eager)
-    assert wrapper.last_mode == "graph" and list(wrapper._cache) == [12]
+    assert wrapper.last_mode == "graph" and list(wrapper._cache) == [(1, 12)]
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
@@ -397,10 +415,164 @@ def test_tiles_replay_the_compiled_bucket_for_long_clips() -> None:
     vae = _small_vae().to("cuda")
     wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(72,))
     wrapper.warmup(torch.device("cuda"))
-    assert wrapper.tile_frames == 72 and list(wrapper._compiled) == [72]
+    assert wrapper.tile_frames == 72 and list(wrapper._compiled) == [(1, 72)]
 
     latents = torch.randn(1, 150, vae.latent_dim, device="cuda")
     tiled = wrapper(latents)
     assert wrapper.last_mode == "tiled" and not wrapper._cache
     assert tiled.shape == (1, 150 * vae.hop_size)
     torch.testing.assert_close(tiled, vae.decode(latents), atol=1e-4, rtol=0.0)
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+@torch.inference_mode()
+def test_batched_graph_reuses_a_larger_batch_without_mixing_outputs() -> None:
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(), tile_frames=0)
+    wrapper(torch.randn(4, 8, vae.latent_dim, device="cuda"))
+    snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for batch in (3, 2, 3):
+        latents = torch.randn(batch, 8, vae.latent_dim, device="cuda")
+        actual = wrapper(latents)
+        expected = vae.decode(latents)
+        pad = wrapper.pad_for(latents.device).expand(4 - batch, 8, -1)
+        expected_padded = vae.decode(torch.cat([latents, pad], dim=0))[:batch]
+        torch.testing.assert_close(actual, expected_padded, atol=1e-5, rtol=1e-5)
+        # cuDNN allow_tf32=True (default on Ampere/Ada GPUs such as L4) can pick
+        # different Conv1d algorithms across batch=4 vs batch=2 (~3e-4 delta).
+        torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+        for previous, snapshot in snapshots:
+            torch.testing.assert_close(previous, snapshot, atol=0, rtol=0)
+        snapshots.append((actual, actual.clone()))
+    assert list(wrapper._cache) == [(4, 8)]
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_compiled_decode_failure_falls_back_to_vae_decode(mocker) -> None:
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(), tile_frames=0)
+
+    # Set a dummy _compiled_decode that raises RuntimeError during capture
+    def failing_decode(x: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("compiled decode simulated failure")
+
+    wrapper._compiled_decode = failing_decode
+    latents = torch.randn(2, 8, vae.latent_dim, device="cuda")
+
+    # Decoding should catch the compiled capture error, fall back to vae.decode,
+    # and mark (2, 8) as uncapturable under compile.
+    actual = wrapper(latents)
+    expected = vae.decode(latents)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    assert (2, 8) in wrapper._uncapturable_compiled_shapes
+    assert (2, 8) in wrapper._cache
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_vae_capture_oom_releases_allocations_before_retry_and_eager_fallback(mocker) -> None:
+    import weakref
+
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(), tile_frames=0)
+    wrapper._compiled_decode = lambda x: x
+
+    class _Sentinel:
+        pass
+
+    refs: list[weakref.ref] = []
+    alive_at_retry: list[bool] = []
+    alive_at_eager: list[bool] = []
+    real_capture = wrapper._capture
+    real_vae_decode = vae.decode
+    capture_calls = 0
+
+    def oom_capture(*args, **kwargs):
+        nonlocal capture_calls
+        capture_calls += 1
+        sentinel = _Sentinel()
+        refs.append(weakref.ref(sentinel))
+        if capture_calls == 2:
+            # Failed compiled-capture frame must be cleared before plain retry runs.
+            alive_at_retry.append(refs[0]() is not None)
+        if capture_calls <= 2:
+            raise torch.cuda.OutOfMemoryError(f"CUDA out of memory in capture #{capture_calls}")
+        return real_capture(*args, **kwargs)
+
+    def spy_vae_decode(*args, **kwargs):
+        # Failed plain-capture frame must also be cleared before eager fallback runs.
+        alive_at_eager.append(all(ref() is None for ref in refs))
+        return real_vae_decode(*args, **kwargs)
+
+    mocker.patch.object(wrapper, "_capture", side_effect=oom_capture)
+    mocker.patch.object(vae, "decode", side_effect=spy_vae_decode)
+
+    latents = torch.randn(2, 8, vae.latent_dim, device="cuda")
+    out = wrapper(latents)
+    assert out.shape == (2, 8 * vae.hop_size)
+    assert capture_calls == 2
+    assert alive_at_retry == [False]
+    assert alive_at_eager == [True]
+    assert wrapper.last_mode == "eager"
+    assert (2, 8) in wrapper._uncapturable_compiled_shapes
+    assert (2, 8) in wrapper._uncapturable_plain_shapes
+    assert not wrapper._plain_pools
+
+
+@pytest.mark.cpu
+def test_vae_decode_micro_batches_large_batches_by_frame_budget() -> None:
+    vae = _small_vae()
+    wrapper = AuKVAEDecodeGraph(vae, enabled=False, max_batch_frames=2560)
+    assert wrapper._max_batch_for_frames(160) == 16
+    assert wrapper._max_batch_for_frames(320) == 8
+    assert wrapper._max_batch_for_frames(640) == 4
+
+    seen_batches: list[int] = []
+    real_decode = vae.decode
+
+    def spy_decode(x: torch.Tensor) -> torch.Tensor:
+        seen_batches.append(int(x.shape[0]))
+        return real_decode(x)
+
+    vae.decode = spy_decode  # type: ignore[method-assign]
+    bounded = AuKVAEDecodeGraph(vae, enabled=False, compile_shapes=(), tile_frames=0, max_batch_frames=16)
+    latents = torch.randn(5, 8, vae.latent_dim)
+    actual = bounded(latents)
+    expected = real_decode(latents)
+    assert seen_batches == [2, 2, 1]
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    # With enabled=False (enforce_eager), temporal tiling is bypassed, so micro-batch
+    # sizing must use the full clip length rather than tile_frames.
+    seen_batches.clear()
+    eager_tiled_cfg = AuKVAEDecodeGraph(vae, enabled=False, compile_shapes=(72,), tile_frames=72, max_batch_frames=144)
+    long_latents = torch.randn(3, 144, vae.latent_dim)
+    actual_long = eager_tiled_cfg(long_latents)
+    expected_long = real_decode(long_latents)
+    assert seen_batches == [1, 1, 1]
+    torch.testing.assert_close(actual_long, expected_long, atol=1e-5, rtol=1e-5)
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_compiled_warmup_clamps_batches_and_shares_pool_without_aliasing() -> None:
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(8, 16), max_batch_frames=32)
+    wrapper.warmup(torch.device("cuda"), batch_sizes=(1, 128))
+    # 32 // 8 = 4, 32 // 16 = 2 -> clamped to ladder steps (4, 8) and (2, 16) plus B=1.
+    assert set(wrapper._compiled) == {(1, 8), (4, 8), (1, 16), (2, 16)}
+
+    x5 = torch.randn(5, 8, vae.latent_dim, device="cuda")
+    out5 = wrapper(x5)
+    out5_snap = out5.clone()
+    x3 = torch.randn(3, 16, vae.latent_dim, device="cuda")
+    out3 = wrapper(x3)
+
+    torch.testing.assert_close(out5, out5_snap, atol=0, rtol=0)
+    torch.testing.assert_close(out5, vae.decode(x5), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(out3, vae.decode(x3), atol=1e-3, rtol=1e-3)
