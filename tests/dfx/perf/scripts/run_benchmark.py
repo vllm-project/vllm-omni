@@ -982,6 +982,9 @@ def _assert_sweep_result(
     baseline_regressions: list[str],
     baseline_tolerance: float = BASELINE_REGRESSION_TOLERANCE,
 ) -> PerformanceBaselineRegressionError | None:
+    baseline_kwargs: dict[str, float] = {}
+    if baseline_tolerance != BASELINE_REGRESSION_TOLERANCE:
+        baseline_kwargs["baseline_tolerance"] = baseline_tolerance
     try:
         assert_result(
             result,
@@ -989,7 +992,7 @@ def _assert_sweep_result(
             num_prompt,
             check_baseline=pytestconfig.getoption("assert_baseline"),
             require_baseline=pytestconfig.getoption("require_baseline"),
-            baseline_tolerance=baseline_tolerance,
+            **baseline_kwargs,
         )
     except PerformanceBaselineRegressionError as exc:
         baseline_regressions.append(f"{context}\n{exc}")
