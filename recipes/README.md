@@ -78,6 +78,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
+| [`Gradium/Phonon-31M-EN-RTX3090.md`](./Gradium/Phonon-31M-EN-RTX3090.md) | English default-voice streaming TTS, B=1, TP=1 | 1x RTX 3090 24GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
 | [`higurashi-ai/Haru-4B-H200.md`](./higurashi-ai/Haru-4B-H200.md) | Live full-duplex spoken dialogue over `/v1/realtime?duplex=1` (character card + voice reference) | 1x NVIDIA H200 141GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
@@ -142,6 +143,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat; offline end-to-end text-to-speech on XPU | 1x A100 80GB / 5x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen3-TTS.md`](./Qwen/Qwen3-TTS.md) | Text-to-speech serving (CustomVoice / VoiceDesign / Base) | 1x H100/A100 80GB / 1x AMD MI300X |
 | [`Qwen/Qwen3-TTS-RTX4070TiSUPER.md`](./Qwen/Qwen3-TTS-RTX4070TiSUPER.md) | Text-to-speech serving on a 16 GB consumer card (0.6B CustomVoice) | 1x RTX 4070 Ti SUPER 16GB |
+| [`Qwen/Qwen3-TTS-Ascend910B3.md`](./Qwen/Qwen3-TTS-Ascend910B3.md) | Text-to-speech serving (1.7B CustomVoice / VoiceDesign / Base), qualified on v0.28.0 | 1x Ascend 910B3 64GB |
 | [`SenseNova/SenseNova-U1.md`](./SenseNova/SenseNova-U1.md) | Unified image generation and understanding | 1x or 2x H200 / 1x AMD MI300X |
 | [`SenseNova/SenseNova-U1.5.md`](./SenseNova/SenseNova-U1.5.md) | Unified image generation and understanding, with an 8-step distilled LoRA | 1x A800 80GB |
 | [`StabilityAI/Stable-Audio-3-Medium.md`](./StabilityAI/Stable-Audio-3-Medium.md) | Offline + online text-to-audio diffusion (1.4B DiT, up to 380 s) | 1x RTX 4090 24GB |

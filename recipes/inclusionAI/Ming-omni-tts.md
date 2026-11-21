@@ -149,7 +149,7 @@ docker run --rm \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
     --omni \
     --port 8091 \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 #### Verification

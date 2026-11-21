@@ -289,6 +289,93 @@ async def test_generate_rejects_unreadable_cached_mix(tmp_path, monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ([], cli.DEFAULT_JUDGE_FRAME_MAX_SIDE),
+        (["--judge-frame-max-side", "768"], 768),
+        (["--judge-frame-max-side", "0"], None),
+    ],
+)
+def test_cli_evaluate_forwards_judge_frame_max_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: list[str], expected: int | None
+):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(cli, "DuplexJudge", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "evaluate_sample", lambda *args, **kwargs: seen.append(kwargs["judge_frame_max_side"]))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", *flag]
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+    assert seen == [expected]
+
+
+def test_cli_evaluate_rejects_negative_judge_frame_max_side(tmp_path: Path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", "--judge-frame-max-side", "-1"]
+    with pytest.raises(ValueError, match="--judge-frame-max-side"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+
+@pytest.mark.parametrize(
+    ("sample_ids", "cached_score"),
+    [(["cached"], {}), (["new", "cached"], {"judge_frame_max_side": 1920})],
+    ids=["fully-cached-legacy", "partial-resume"],
+)
+def test_cli_evaluate_rejects_mismatched_cached_rtd_cap(tmp_path, monkeypatch, sample_ids, cached_score):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": sample_id, "split": "RTD_OCR"} for sample_id in sample_ids]))
+    score_root = tmp_path / "scores"
+    cached_path = score_root / "RTD_OCR" / "cached.json"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_text(json.dumps(cached_score))
+    seen = []
+    monkeypatch.setattr(cli, "evaluate_sample", lambda sample, *args, **kwargs: seen.append(sample.id))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    with pytest.raises(ValueError, match=r"cached\.json.*judge_frame_max_side.*--overwrite.*--score-root"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+    assert seen == []
+    assert list(cached_path.parent.iterdir()) == [cached_path]
+    assert json.loads(cached_path.read_text()) == cached_score
+
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args([*args, "--overwrite"]))
+    assert seen == sample_ids
+
+
+def test_cli_evaluate_reuses_matching_rtd_and_legacy_pr_scores(tmp_path, monkeypatch):
+    samples = [{"id": "rtd", "split": "RTD_OCR"}, {"id": "pr", "split": "PR_correction"}]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(samples))
+    score_root = tmp_path / "scores"
+    for sample, score in zip(samples, ({"judge_frame_max_side": 768}, {})):
+        path = score_root / sample["split"] / f"{sample['id']}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(score))
+
+    def unexpected_evaluation(*args, **kwargs):
+        pytest.fail("compatible cached scores should be reused")
+
+    monkeypatch.setattr(cli, "evaluate_sample", unexpected_evaluation)
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    assert cli.run(parser.parse_args(args)) == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True])
 async def test_generate_rejects_unpaced_server_vad_before_preparation_or_cache(tmp_path, monkeypatch, cached):
@@ -427,14 +514,19 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
 async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detection, duration, audio_duration, fps):
     import websockets
 
+    from tests.benchmarks.duplex.test_omni_duplex_eval_media import _make_synthetic_mp4
     from vllm_omni.protocol.realtime.items import validate_realtime_video_frames
 
     pcm = b"\x01\x00" * round(audio_duration * 16000)
-    # Keep the real frame-time generator; only JPEG decoding is replaced here.
-    monkeypatch.setattr(
-        media, "extract_jpeg", lambda path, *, timestamp, quality: b"\xff\xd8" + str(timestamp).encode()
+    # Keep the real timestamp grid. iter_jpegs opens the container (it no longer
+    # calls extract_jpeg), so the clip must exist. JPEG bytes stay timestamp-tagged
+    # so each sample remains unique on the wire.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(_make_synthetic_mp4(duration=duration + 1.0))
+    frames = tuple(
+        (timestamp, b"\xff\xd8" + str(timestamp).encode())
+        for timestamp, _ in media.iter_jpegs(clip, fps=fps, duration=duration)
     )
-    frames = tuple(media.iter_jpegs("unused.mp4", fps=fps, duration=duration))
     prepared = runner.PreparedSample(pcm, frames, duration, None, None)
     received = []
     server_turns = turn_detection == "server_vad"
