@@ -17,6 +17,7 @@ from typing import Any, NamedTuple, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    BENCHMARK_RESULT_PATH_KEY,
     PerformanceBaselineRegressionError,
     assert_baseline_within_tolerance,
     create_paired_omni_benchmark_pytest_params,
@@ -959,6 +960,59 @@ def _median_confirmation_result(results: Sequence[Mapping[str, Any]], metrics: f
     return confirmed
 
 
+def _confirmation_result_path(result: Mapping[str, object]) -> Path | None:
+    value = result.get(BENCHMARK_RESULT_PATH_KEY)
+    return Path(value) if isinstance(value, str) else None
+
+
+def _persist_confirmation_result(
+    results: Sequence[Mapping[str, object]],
+    selected_result: Mapping[str, object],
+    metrics: frozenset[str],
+    *,
+    configured_attempts: int,
+    status: str,
+) -> None:
+    """Replace repeated confirmation artifacts with one canonical result JSON."""
+    paths = [_confirmation_result_path(result) for result in results]
+    if not any(paths):
+        # Unit-level runner fakes do not need to materialize benchmark JSON.
+        return
+    assert all(path is not None for path in paths), "every confirmation attempt must expose its result path"
+    concrete_paths = [path for path in paths if path is not None]
+    canonical_path = concrete_paths[0]
+    persisted = {key: value for key, value in selected_result.items() if key != BENCHMARK_RESULT_PATH_KEY}
+    metric_evidence = {}
+    for metric in sorted(metrics):
+        values = [result.get(metric) for result in results]
+        numeric_values = [
+            float(value)
+            for value in values
+            if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+        ]
+        metric_evidence[metric] = {
+            "values": values,
+            "median": statistics.median(numeric_values) if len(numeric_values) == len(values) else None,
+        }
+    persisted["baseline_confirmation_result"] = {
+        "status": status,
+        "attempts_completed": len(results),
+        "attempts_configured": configured_attempts,
+        "metrics": metric_evidence,
+    }
+    temporary_path = canonical_path.with_name(f".{canonical_path.name}.confirmation.tmp")
+    with temporary_path.open("w", encoding="utf-8") as stream:
+        json.dump(persisted, stream, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, canonical_path)
+    for path in concrete_paths[1:]:
+        path.unlink(missing_ok=True)
+    print(
+        f"[baseline-check] persisted {status} confirmation result to {canonical_path} "
+        f"and removed {len(concrete_paths) - 1} retry artifact(s)",
+        flush=True,
+    )
+
+
 @pytest.mark.benchmark
 @pytest.mark.parametrize(
     "omni_server,benchmark_params",
@@ -1169,6 +1223,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 confirmation_metrics, attempts = policy
                 confirmation_results = [result]
                 hard_regression = False
+                last_result = result
                 for attempt in range(2, attempts + 1):
                     print(
                         f"[baseline-check] RETRY confirmation attempt {attempt}/{attempts} "
@@ -1193,9 +1248,11 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                             sweep_size=len(max_concurrency_list),
                         ),
                         benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                        result_filename_suffix=f"confirmation-{attempt}",
                         accuracy_baseline=accuracy_baseline,
                     )
                     confirmation_results.append(retry_result)
+                    last_result = retry_result
                     retry_regressions: list[str] = []
                     retry_regression = _assert_sweep_result(
                         _without_confirmed_baseline_metrics(retry_result, confirmation_metrics),
@@ -1212,10 +1269,18 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                         hard_regression = True
                         break
                 if hard_regression:
+                    _persist_confirmation_result(
+                        confirmation_results,
+                        last_result,
+                        confirmation_metrics,
+                        configured_attempts=attempts,
+                        status="aborted_hard_regression",
+                    )
                     continue
                 confirmed_regressions: list[str] = []
+                confirmed_result = _median_confirmation_result(confirmation_results, confirmation_metrics)
                 confirmed_regression = _assert_sweep_result(
-                    _median_confirmation_result(confirmation_results, confirmation_metrics),
+                    confirmed_result,
                     assert_params,
                     num_prompt,
                     pytestconfig,
@@ -1226,12 +1291,21 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 )
                 if confirmed_regression is not None:
                     baseline_regressions.extend(confirmed_regressions)
+                    confirmation_status = "failed"
                 else:
+                    confirmation_status = "passed"
                     print(
                         f"[baseline-check] PASS confirmed median across {attempts} runs "
                         f"for max_concurrency={concurrency!r}",
                         flush=True,
                     )
+                _persist_confirmation_result(
+                    confirmation_results,
+                    confirmed_result,
+                    confirmation_metrics,
+                    configured_attempts=attempts,
+                    status=confirmation_status,
+                )
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
         if baseline_regressions:

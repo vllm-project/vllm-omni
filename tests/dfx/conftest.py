@@ -21,6 +21,7 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
 
 BASELINE_REGRESSION_TOLERANCE = 0.10
+BENCHMARK_RESULT_PATH_KEY = "_vllm_omni_benchmark_result_path"
 
 # Substrings, not a closed metric list. ``throughput_qps`` matches the higher
 # group only; ``mean_audio_rtf`` and ``peak_memory_mb_mean`` match the lower group.
@@ -823,6 +824,7 @@ def run_benchmark(
     resource_label: str | None = None,
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
+    result_filename_suffix: str | None = None,
     accuracy_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
@@ -836,7 +838,8 @@ def run_benchmark(
     ``benchmark_params_name`` (the ``name`` field from ``benchmark_params``) is
     persisted in the result JSON and filename so multiple generation configs
     under one ``test_name`` stay distinguishable (e.g. Wan USP2 832x480 vs
-    1280x720).
+    1280x720). ``result_filename_suffix`` distinguishes internal repeated runs,
+    such as baseline-confirmation attempts, until the caller consolidates them.
     """
     started_at = datetime.now()
     current_dt = started_at.strftime("%Y%m%d-%H%M%S")
@@ -846,11 +849,16 @@ def run_benchmark(
     name_token = _safe_filename_token(benchmark_params_name) if benchmark_params_name else ""
     if name_token == "na":
         name_token = ""
+    suffix_token = _safe_filename_token(result_filename_suffix) if result_filename_suffix else ""
+    if suffix_token == "na":
+        suffix_token = ""
     name_parts = [f"result_{test_name}"]
     if hw:
         name_parts.append(hw)
     if name_token:
         name_parts.append(name_token)
+    if suffix_token:
+        name_parts.append(suffix_token)
     name_parts.extend(
         [
             str(dataset_name),
@@ -1009,6 +1017,7 @@ def run_benchmark(
             benchmark_params_name=benchmark_params_name,
             accuracy_baseline=accuracy_baseline,
         )
+    result[BENCHMARK_RESULT_PATH_KEY] = str(Path(result_path).resolve())
     return result
 
 

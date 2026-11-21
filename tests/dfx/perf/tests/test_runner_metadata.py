@@ -955,8 +955,8 @@ def test_perf_sweep_collects_all_baseline_regressions(monkeypatch, pytestconfig)
         ([120.0, 125.0, 105.0], False),
     ],
 )
-def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, ttfp_values, passes):
-    from tests.dfx.conftest import PerformanceBaselineRegressionError
+def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_values, passes):
+    from tests.dfx.conftest import BENCHMARK_RESULT_PATH_KEY, PerformanceBaselineRegressionError
     from tests.dfx.perf.scripts import run_benchmark
 
     config = {
@@ -985,7 +985,11 @@ def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, ttfp_values, pas
 
     def benchmark(**kwargs):
         calls.append(kwargs)
-        return results[len(calls) - 1]
+        result = dict(results[len(calls) - 1])
+        result_path = tmp_path / f"attempt-{len(calls)}.json"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        result[BENCHMARK_RESULT_PATH_KEY] = str(result_path)
+        return result
 
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
@@ -1021,6 +1025,22 @@ def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, ttfp_values, pas
 
     assert len(calls) == 3
     assert all("--baseline-confirmation" not in call["args"] for call in calls)
+    assert [call.get("result_filename_suffix") for call in calls] == [None, "confirmation-2", "confirmation-3"]
+    result_paths = list(tmp_path.glob("attempt-*.json"))
+    assert result_paths == [tmp_path / "attempt-1.json"]
+    persisted = json.loads(result_paths[0].read_text(encoding="utf-8"))
+    assert BENCHMARK_RESULT_PATH_KEY not in persisted
+    assert persisted["median_audio_ttfp_ms"] == sorted(ttfp_values)[1]
+    assert persisted["mean_audio_ttfp_ms"] == sorted(ttfp_values)[1]
+    assert persisted["baseline_confirmation_result"] == {
+        "status": "passed" if passes else "failed",
+        "attempts_completed": 3,
+        "attempts_configured": 3,
+        "metrics": {
+            "mean_audio_ttfp_ms": {"values": ttfp_values, "median": sorted(ttfp_values)[1]},
+            "median_audio_ttfp_ms": {"values": ttfp_values, "median": sorted(ttfp_values)[1]},
+        },
+    }
 
 
 def test_perf_sweep_does_not_retry_a_hard_throughput_regression(monkeypatch):
@@ -1079,6 +1099,98 @@ def test_perf_sweep_does_not_retry_a_hard_throughput_regression(monkeypatch):
         run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
 
     assert len(calls) == 1
+
+
+def test_perf_sweep_consolidates_confirmation_aborted_by_hard_retry(monkeypatch, tmp_path):
+    from tests.dfx.conftest import BENCHMARK_RESULT_PATH_KEY, PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_confirmation_hard_retry_regression",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+    results = [
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 120.0,
+            "mean_audio_ttfp_ms": 120.0,
+            "request_throughput": 1.0,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        },
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 105.0,
+            "mean_audio_ttfp_ms": 105.0,
+            "request_throughput": 0.8,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        },
+    ]
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        result = dict(results[len(calls) - 1])
+        result_path = tmp_path / f"attempt-{len(calls)}.json"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        result[BENCHMARK_RESULT_PATH_KEY] = str(result_path)
+        return result
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [100.0],
+                    "mean_audio_ttfp_ms": [100.0],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = SimpleNamespace(getoption=lambda name: name == "assert_baseline")
+
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+
+    assert [call.get("result_filename_suffix") for call in calls] == [None, "confirmation-2"]
+    result_paths = list(tmp_path.glob("attempt-*.json"))
+    assert result_paths == [tmp_path / "attempt-1.json"]
+    persisted = json.loads(result_paths[0].read_text(encoding="utf-8"))
+    assert persisted["request_throughput"] == 0.8
+    assert persisted["baseline_confirmation_result"] == {
+        "status": "aborted_hard_regression",
+        "attempts_completed": 2,
+        "attempts_configured": 3,
+        "metrics": {
+            "mean_audio_ttfp_ms": {"values": [120.0, 105.0], "median": 112.5},
+            "median_audio_ttfp_ms": {"values": [120.0, 105.0], "median": 112.5},
+        },
+    }
 
 
 @pytest.mark.parametrize(

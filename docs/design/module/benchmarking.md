@@ -69,6 +69,15 @@ matching baseline. Existing `--assert-baseline` callers retain their warning and
 skip behavior for missing calibration. Baselines are selected by runtime device
 labels; a pytest selection marker does not establish physical hardware identity.
 
+An opt-in baseline confirmation repeats only the configured sweep point and
+metrics. Repeated attempts are internal evidence, not independent report rows:
+the runner replaces the first attempt's JSON with one canonical result whose
+configured metrics contain the confirmed median and whose
+`baseline_confirmation_result` records every attempt value and verdict. Retry
+JSON files are removed after consolidation, so nightly collection observes one
+result for one sweep point. Non-confirmed baseline metrics remain hard failures
+on every attempt.
+
 ## LingBot performance and accuracy
 
 The packaged `realtime-video` backend uses the existing `vllm bench serve
