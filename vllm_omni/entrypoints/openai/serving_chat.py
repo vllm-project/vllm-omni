@@ -1512,22 +1512,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
         return idx
 
-    # OpenAI API standard sampling parameters that can be safely overridden.
-    # These are the most commonly used parameters with compatible types
-    # between ChatCompletionRequest and SamplingParams.
-    # Users who need more control can use sampling_params_list in extra_body.
-    _OPENAI_SAMPLING_FIELDS: set[str] = {
-        "temperature",
-        "top_p",
-        "top_k",
+    # Fields passed separately from vLLM's defaulted parameters in to_sampling_params().
+    _EXTRA_SAMPLING_FIELDS: set[str] = {
         "max_tokens",
         "min_tokens",
         "seed",
         "ignore_eos",
         "stop",
         "stop_token_ids",
-        "frequency_penalty",
-        "presence_penalty",
         "n",
     }
 
@@ -1538,8 +1530,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Only apply fields explicitly provided by user, not protocol defaults.
         explicit_fields = request.model_fields_set
 
-        for field_name in self._OPENAI_SAMPLING_FIELDS:
-            if field_name not in explicit_fields:
+        for field_name in explicit_fields:
+            if field_name not in request._DEFAULT_SAMPLING_PARAMS and field_name not in self._EXTRA_SAMPLING_FIELDS:
                 continue
 
             value = getattr(request, field_name, None)
