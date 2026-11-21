@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 
+from pathlib import Path
+
 import torch
 from vllm.config import VllmConfig
 from vllm.config.kernel import IrOpPriorityConfig
@@ -115,7 +117,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/deploy"
+        return str(Path(__file__).resolve().parents[2] / "deploy")
 
     @classmethod
     def supports_talker_mtp_graph_capture(cls) -> bool:
