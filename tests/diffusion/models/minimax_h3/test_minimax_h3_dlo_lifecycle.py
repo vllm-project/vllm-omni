@@ -13,6 +13,41 @@ class _OffloadAbort(BaseException):
     pass
 
 
+@pytest.mark.parametrize("whole", [False, True])
+@pytest.mark.parametrize("part", ["encoder", "decoder", "all"])
+def test_image_weight_cache_is_released_before_residency_offload(whole, part, mocker):
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae.npu_image_conv import _weight
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(vae)
+    vae.model = torch.nn.Module()
+    conv = torch.nn.Conv3d(2, 3, 3)
+    vae.model.encoder = conv
+    conv._omni_image_conv_cache_enabled = True
+    conv._omni_image_conv_weight = None
+    _weight(conv)
+    assert conv._omni_image_conv_weight is not None
+
+    should_release = whole or part != "decoder"
+
+    def check_then_abort():
+        assert (conv._omni_image_conv_weight is None) == should_release
+        raise _OffloadAbort("verify release even when offload fails")
+
+    stager = mocker.Mock()
+    stager.offload.side_effect = check_then_abort
+    vae._stager = stager if whole else None
+    vae._encoder_stager = None if whole else stager
+    vae._decoder_stager = None if whole else stager
+    with pytest.raises(_OffloadAbort):
+        if part == "all":
+            vae.offload_to_cpu()
+        else:
+            vae._offload_part_to_cpu(part)
+    stager.offload.assert_called_once_with()
+
+
 def _legacy_distributed_offload_config() -> SimpleNamespace:
     return SimpleNamespace(
         diffusion_offload_config=None,
