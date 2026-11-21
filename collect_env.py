@@ -14,6 +14,7 @@ import sys
 # This script outputs relevant system environment info
 # Run it with `python collect_env.py` or `python -m torch.utils.collect_env`
 from collections import namedtuple
+from importlib import metadata as importlib_metadata
 
 import regex as re
 
@@ -61,7 +62,16 @@ SystemEnv = namedtuple(
         "vllm_build_flags",  # vllm specific field
         "gpu_topo",  # vllm specific field
         "env_vars",
+        "musa_available",
+        "musa_runtime_version",
+        "musa_package_version",
+        "musa_driver_version",
+        "musa_gpu_models",
+        "musa_visible_devices",
+        "torchada_package_version",
+        "mthreads_ml_py_package_version",
     ],
+    defaults=("N/A", None, None, None, None, None, None, None),
 )
 
 DEFAULT_CONDA_PATTERNS = {
@@ -96,6 +106,16 @@ DEFAULT_PIP_PATTERNS = {
     "pynvml",
     "flashinfer-python",
 }
+
+MUSA_PACKAGE_PATTERNS = {"torchada", "mthreads-ml-py"}
+
+
+def _matches_package_pattern(line, patterns):
+    normalized_line = line.lower()
+    for package in MUSA_PACKAGE_PATTERNS:
+        if package in normalized_line and package not in patterns:
+            return False
+    return any(name in normalized_line for name in patterns)
 
 
 def run(command):
@@ -160,7 +180,7 @@ def get_conda_packages(run_lambda, patterns=None):
         return out
 
     return "\n".join(
-        line for line in out.splitlines() if not line.startswith("#") and any(name in line for name in patterns)
+        line for line in out.splitlines() if not line.startswith("#") and _matches_package_pattern(line, patterns)
     )
 
 
@@ -268,6 +288,94 @@ def get_nvidia_smi():
 def get_rocm_version(run_lambda):
     """Returns the ROCm version if available, otherwise 'N/A'."""
     return run_and_parse_first_match(run_lambda, "hipcc --version", r"HIP version: (\S+)")
+
+
+def _get_musa_module():
+    if not TORCH_AVAILABLE:
+        return None
+    musa = getattr(torch, "musa", None)
+    if musa is not None:
+        return musa
+    try:
+        import torch_musa  # noqa: F401
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return None
+    return getattr(torch, "musa", None)
+
+
+def get_musa_visible_devices():
+    for name in ("MUSA_VISIBLE_DEVICES", "MTHREADS_VISIBLE_DEVICES"):
+        if name in os.environ:
+            return "{}={}".format(name, os.environ[name])
+    return None
+
+
+def get_musa_available():
+    musa = _get_musa_module()
+    if musa is None:
+        return "N/A"
+    try:
+        return str(musa.is_available())
+    except (RuntimeError, OSError, AttributeError):
+        return "N/A"
+
+
+def get_musa_gpu_info():
+    musa = _get_musa_module()
+    if musa is None:
+        return None
+    try:
+        device_count = musa.device_count()
+        if device_count == 0:
+            return None
+        return "\n".join(musa.get_device_name(index) for index in range(device_count))
+    except Exception:  # noqa: BLE001
+        # Device-name lookup may trigger Torch-MUSA lazy initialization,
+        # which raises version-specific exceptions such as AssertionError or
+        # DeferredMusaCallError. This is an optional diagnostic probe and must
+        # not prevent the rest of the environment report from being collected.
+        return None
+
+
+def get_musa_package_version():
+    for distribution in ("torch-musa", "torch_musa"):
+        try:
+            return importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+        except (ImportError, OSError, RuntimeError, AttributeError):
+            return None
+
+    try:
+        import torch_musa
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return None
+    return getattr(torch_musa, "__version__", None)
+
+
+def get_musa_driver_version(run_lambda):
+    return run_and_parse_first_match(
+        run_lambda,
+        "cat /proc/driver/musa/version",
+        r"(?:package|driver) version:\s*(\S+)",
+    )
+
+
+def get_musa_additional_package_versions(musa_detected):
+    if not musa_detected:
+        return None, None
+
+    def get_version(package):
+        try:
+            return importlib_metadata.version(package)
+        except (importlib_metadata.PackageNotFoundError, ImportError, OSError, RuntimeError, AttributeError):
+            return None
+
+    return get_version("torchada"), get_version("mthreads-ml-py")
+
+
+def _has_musa_info(musa_available, *musa_values):
+    return musa_available not in (None, "N/A") or any(value is not None for value in musa_values)
 
 
 def get_vllm_version():
@@ -463,7 +571,7 @@ def get_pip_packages(run_lambda, patterns=None):
             raise RuntimeError("Could not collect pip list output (pip or uv module not available)")
 
         out = run_and_read_all(run_lambda, cmd)
-        return "\n".join(line for line in out.splitlines() if any(name in line for name in patterns))
+        return "\n".join(line for line in out.splitlines() if _matches_package_pattern(line, patterns))
 
     pip_version = "pip3" if sys.version[0] == "3" else "pip"
     out = run_with_pip()
@@ -516,6 +624,9 @@ def get_env_vars():
         "OMP_",
         "MKL_",
         "NVIDIA",
+        "MUSA",
+        "MTHREADS",
+        "TORCHADA",
     )
     for k, v in sorted(os.environ.items()):
         omni_classification = ENVIRONMENT_VARIABLE_INVENTORY.get(k)
@@ -535,7 +646,6 @@ def get_env_vars():
 
 def get_env_info():
     run_lambda = run
-    pip_version, pip_list_output = get_pip_packages(run_lambda)
 
     if TORCH_AVAILABLE:
         version_str = torch.__version__
@@ -559,16 +669,32 @@ def get_env_info():
         version_str = debug_mode_str = cuda_available_str = cuda_version_str = "N/A"
         hip_compiled_version = hip_runtime_version = miopen_runtime_version = "N/A"
 
+    musa_available = get_musa_available()
+    musa_runtime_version = getattr(torch.version, "musa", None) if TORCH_AVAILABLE else None
+    musa_package_version = get_musa_package_version()
+    musa_driver_version = get_musa_driver_version(run_lambda)
+    musa_gpu_models = get_musa_gpu_info()
+    musa_visible_devices = get_musa_visible_devices()
+    musa_detected = _has_musa_info(
+        musa_available,
+        musa_runtime_version,
+        musa_package_version,
+        musa_driver_version,
+        musa_gpu_models,
+        musa_visible_devices,
+    )
+    torchada_package_version, mthreads_ml_py_package_version = get_musa_additional_package_versions(musa_detected)
+    pip_version, pip_list_output = get_pip_packages(run_lambda, DEFAULT_PIP_PATTERNS)
+
     sys_version = sys.version.replace("\n", " ")
 
-    conda_packages = get_conda_packages(run_lambda)
+    conda_packages = get_conda_packages(run_lambda, DEFAULT_CONDA_PATTERNS)
 
     rocm_version = get_rocm_version(run_lambda)
     vllm_version = get_vllm_version()
     vllm_omni_version = get_vllm_omni_version(run_lambda)
     vllm_build_flags = summarize_vllm_build_flags()
     gpu_topo = get_gpu_topo(run_lambda)
-
     return SystemEnv(
         torch_version=version_str,
         is_debug_build=debug_mode_str,
@@ -601,7 +727,30 @@ def get_env_info():
         vllm_build_flags=vllm_build_flags,
         gpu_topo=gpu_topo,
         env_vars=get_env_vars(),
+        musa_available=musa_available,
+        musa_runtime_version=musa_runtime_version,
+        musa_package_version=musa_package_version,
+        musa_driver_version=musa_driver_version,
+        musa_gpu_models=musa_gpu_models,
+        musa_visible_devices=musa_visible_devices,
+        torchada_package_version=torchada_package_version,
+        mthreads_ml_py_package_version=mthreads_ml_py_package_version,
     )
+
+
+musa_info_fmt = """
+==============================
+         MUSA Info
+==============================
+MUSA available               : {musa_available}
+MUSA runtime version         : {musa_runtime_version}
+torch-musa package version   : {musa_package_version}
+torchada package version     : {torchada_package_version}
+mthreads-ml-py package version: {mthreads_ml_py_package_version}
+MUSA driver version          : {musa_driver_version}
+MUSA GPU models              : {musa_gpu_models}
+MUSA visible devices         : {musa_visible_devices}
+""".strip()
 
 
 env_info_fmt = """
@@ -640,8 +789,7 @@ cuDNN version                : {cudnn_version}
 HIP runtime version          : {hip_runtime_version}
 MIOpen runtime version       : {miopen_runtime_version}
 Is XNNPACK available         : {is_xnnpack_available}
-
-==============================
+{musa_info}==============================
           CPU Info
 ==============================
 {cpu_info}
@@ -713,6 +861,31 @@ def pretty_str(envinfo):
 
     # If nvidia_gpu_models is multiline, start on the next line
     mutable_dict["nvidia_gpu_models"] = maybe_start_on_next_line(envinfo.nvidia_gpu_models)
+    mutable_dict["musa_gpu_models"] = maybe_start_on_next_line(envinfo.musa_gpu_models)
+
+    musa_optional_fields = (
+        "musa_runtime_version",
+        "musa_package_version",
+        "musa_driver_version",
+        "musa_gpu_models",
+        "musa_visible_devices",
+        "torchada_package_version",
+        "mthreads_ml_py_package_version",
+    )
+    has_musa_info = _has_musa_info(
+        mutable_dict["musa_available"],
+        *(mutable_dict[field] for field in musa_optional_fields),
+    )
+
+    # MUSA probes are optional. Preserve their explicit None contract in the
+    # report instead of applying the legacy generic collection-failure text.
+    for field in musa_optional_fields:
+        if mutable_dict[field] is None:
+            mutable_dict[field] = "None"
+    if has_musa_info:
+        mutable_dict["musa_info"] = "\n{}\n\n".format(musa_info_fmt.format(**mutable_dict))
+    else:
+        mutable_dict["musa_info"] = "\n"
 
     # If the machine doesn't have CUDA, report some fields as 'No CUDA'
     dynamic_cuda_fields = [
