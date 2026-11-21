@@ -82,6 +82,12 @@ last_verified_commit: 3d7fc3b9ba3cac88d579d4dc35b78b0b641675fc
 Entrypoints translate offline, CLI, and serving requests into stable engine
 operations and translate engine outputs into public responses.
 
+`AsyncOmni` explicitly rejects the process checkpoint methods exposed by newer
+vLLM `EngineClient` versions (`checkpoint_prepare`, `checkpoint_restore`, and
+`checkpoint_state`). This keeps ordinary serving instantiable without claiming
+checkpoint support. All three raise `NotImplementedError` before accessing or
+changing stage state; sleep and weight-transfer APIs retain their own contracts.
+
 ## Contract status
 
 This document describes current entrypoint responsibilities plus the boundary
@@ -101,12 +107,35 @@ optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
 from OpenAPI in that mode; configured handlers retain upstream vLLM routing.
 
+The server uses the deployed model's generation tasks to initialize its speech,
+audio generation, and video handlers. Unsupported speech and audio generation
+requests return HTTP 404, and unsupported image and video generation requests
+return HTTP 503 before reaching the engine. Diffusion image models also support
+image generation through Chat Completions. Segmentation and depth routes check
+their own model capabilities.
+
+Diffusion pipelines can declare additional output modalities alongside their
+default output. LingBot Video serves both images and videos; its image requests
+must set `num_frames=1` to override shared video defaults. LingBot World retains
+video-only serving capabilities because it requires causal multi-frame blocks.
+
+An optional `--video-output-warmup` request runs through the streaming video
+handler before HTTP serving starts. The frontend owns request validation,
+draining generation and encoding, and the startup deadline. It does not expose
+`/health` or admit traffic until that request completes successfully. Failure
+aborts the internal request and unwinds engine startup. The request explicitly
+supplies model-specific inputs and a finite frame count; playback pacing is
+rejected because there is no player. Omitting the option skips this warmup.
+
 When `--api-server-count` is greater than one, the serve composition root
 starts the frontend process manager while a parent-owned `StageRuntime`
 launches the shared local stage engines. Each frontend receives only its own
 stage-client channel configuration and does not launch or retire backend
 processes. CLI validation rejects unsupported distributed, diffusion,
 fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
+
+`DuplexOmni` supports an optional session-only process runtime. See
+[process runtime usage, ownership, and limits](../../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
 
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.
@@ -198,6 +227,9 @@ ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
 Video output sessions shield final task cleanup and unfinished-request abort
 from ASGI cancellation, including disconnects immediately after `session.done`.
+Video encoding and encoder close run on one worker per stream so encoding does
+not block control handling. Cancellation queues close after any running encode;
+the event loop does not join that worker while it drains cleanup.
 Abort cleanup bounds both its coroutine and the engine acknowledgement wait
 with `ABORT_TIMEOUT_S`; an unresponsive orchestrator must not hold the shield
 indefinitely.

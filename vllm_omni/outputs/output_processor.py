@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingOutput, PoolingRequestOutput, RequestError, RequestOutput
@@ -20,7 +21,7 @@ from vllm.v1.engine.output_processor import (
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
-from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.data_entry_keys import flatten_payload, unflatten_payload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
@@ -114,6 +115,26 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
     return metrics
 
 
+def _warn_on_dropped_pooling_keys(pooling_output: Any, mm_output: Any) -> None:
+    """Flag pooling-only keys, which the authoritative multimodal field drops.
+
+    Every in-tree producer mirrors one payload on both channels or sets only
+    one, so a difference means a producer broke that contract and the next
+    stage loses data. Only missing keys are flagged: a key on both channels
+    with different values still resolves to ``multimodal_output`` silently,
+    so this is not a full mirror-consistency check. The warning repeats once
+    per distinct set of dropped keys.
+    """
+    if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
+        return
+    dropped = flatten_payload(pooling_output).keys() - flatten_payload(mm_output).keys()
+    if dropped:
+        logger.warning_once(
+            "Dropping pooling_output keys not carried by multimodal_output: %s",
+            ", ".join(sorted(dropped)),
+        )
+
+
 class OmniRequestState(RequestState):
     """Request state for omni models, tracking multimodal outputs.
 
@@ -134,6 +155,15 @@ class OmniRequestState(RequestState):
         # because upstream RequestState.__init__ reorders parameters between
         # releases, making args[12] fragile.
         arrival_time = kwargs.get("arrival_time")
+        # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+        # ndarray at runtime (msgspec array_like), and the in-process
+        # orchestrator forwards that array here, but the client-side
+        # RequestState contract is a plain list (truthiness checks and
+        # list.extend in the base apply_streaming_update).  Normalize once so
+        # every consumer of this state sees list[int].
+        prompt_token_ids = kwargs.get("prompt_token_ids")
+        if isinstance(prompt_token_ids, np.ndarray):
+            kwargs["prompt_token_ids"] = prompt_token_ids.tolist()
         super().__init__(*args, **kwargs)
         self.is_pooling_request = False
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
@@ -146,6 +176,12 @@ class OmniRequestState(RequestState):
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
 
     def apply_streaming_update(self, update) -> None:
+        # Streaming updates are built from EngineCoreRequest.prompt_token_ids
+        # (a 32-bit ndarray on this side, see __init__); the base
+        # implementation evaluates ``update.prompt_token_ids or ()`` and
+        # extends self.prompt_token_ids with it, so hand it a plain list.
+        if isinstance(update.prompt_token_ids, np.ndarray):
+            update.prompt_token_ids = update.prompt_token_ids.tolist()
         super().apply_streaming_update(update)
         self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
 
@@ -670,6 +706,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self._update_streaming_request_state(req_state, request, prompt)
             return
 
+        # vLLM 0.34 transports EngineCoreRequest.prompt_token_ids as an int32
+        # ndarray. Its detokenizer evaluates this field with ``or`` before the
+        # OmniRequestState constructor can normalize it, which is ambiguous for
+        # multi-token NumPy arrays. Convert at the output-processor boundary.
+        if isinstance(request.prompt_token_ids, np.ndarray):
+            request.prompt_token_ids = request.prompt_token_ids.tolist()
+
         req_state = OmniRequestState.from_new_request(
             tokenizer=self.tokenizer,
             request=request,
@@ -710,6 +753,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        weight_version: str | None = None,
     ) -> OutputProcessorOutput:
         default_mm_type = _modality_to_type_string(self.output_modality)
 
@@ -718,10 +762,38 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         # that would trigger upstream's `assert detokenizer is not None`.
         upstream_outputs: list[EngineCoreOutput] = []
         mm_only_outputs: list[EngineCoreOutput] = []
+        admission_outputs: list[OmniRequestOutput] = []
+        admission_aborts: list[str] = []
 
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None:
+                continue
+
+            # Paused-engine and other pre-execution failures ship RequestError
+            # and nothing was run. StagePool registers queue=None, so upstream's
+            # queue.put short-circuit does not run here or in super(). Key on
+            # error, not finish_reason: pooling cache misses use ERROR with
+            # error is None and must stay on the normal path. weight_version is
+            # forwarded only into super(), which is the detokenizer path.
+            error = getattr(eco, "error", None)
+            if error is not None:
+                if req_state.queue is not None:
+                    req_state.queue.put(error.to_exception())
+                else:
+                    message = getattr(error, "message", None)
+                    code = getattr(error, "code", None)
+                    external_id = getattr(req_state, "external_req_id", None) or eco.request_id
+                    admission_outputs.append(
+                        OmniRequestOutput.from_error(
+                            external_id,
+                            message if isinstance(message, str) and message else str(error),
+                            error_type=code if isinstance(code, str) else None,
+                        )
+                    )
+                if req_state.streaming_input:
+                    admission_aborts.append(eco.request_id)
+                self._finish_request(req_state)
                 continue
 
             # Accumulate multimodal tensors regardless of path.
@@ -741,6 +813,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     # is only its compatibility carrier, not a second chunk.
                     if mm_output is None:
                         req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    else:
+                        _warn_on_dropped_pooling_keys(eco.pooling_output, mm_output)
                     eco.pooling_output = None
 
             # Native pooling cache-miss errors carry no tensor. Upstream
@@ -770,10 +844,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
+            weight_version=weight_version,
         )
         return OutputProcessorOutput(
-            request_outputs=mm_request_outputs + upstream_processed.request_outputs,
-            reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,
+            request_outputs=admission_outputs + mm_request_outputs + upstream_processed.request_outputs,
+            reqs_to_abort=admission_aborts + mm_reqs_to_abort + upstream_processed.reqs_to_abort,
         )
 
     def _process_mm_only_outputs(

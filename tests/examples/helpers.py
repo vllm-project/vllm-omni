@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shared fixtures, helpers, and path constants for tests/examples/.
 """
 
+import ast
 import json
 import os
 import re
@@ -11,12 +14,122 @@ import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import pytest
 import torch
 from safetensors.torch import save_file
+
+DOC_TEST_MODELS = (
+    "openbmb/MiniCPM-o-4_5",
+    "Qwen/Qwen3-Omni-*",
+    "Qwen/Qwen3-TTS-*",
+    "Qwen/Qwen-Image-2.1",
+    "Qwen/Qwen-Image-2.1-Turbo",
+    "tencent/HunyuanImage-3.0",
+    "tencent/HunyuanImage-3.0-*",
+    "hunyuanvideo-community/HunyuanVideo-1.5-*",
+    "tencent/HunyuanVideo-1.5",
+    "tencent/HunyuanVideo-1.5-*",
+    "Wan-AI/Wan2.2-*",
+    "MiniMaxAI/MiniMax-H3",
+)
+
+
+def models_in_snippet(language: str, code: str) -> tuple[str, ...]:
+    """Read explicit model arguments, never execute code or infer script defaults.
+
+    Unknown/dynamic model arguments fail closed. All model arguments in a block
+    must be supported, so a supported model cannot hide a second unsupported one.
+    """
+    models: list[str] = []
+    if language == "bash":
+        try:
+            argv = shlex.split(code.replace("\\\n", " "), comments=True)
+        except ValueError:
+            return ()
+        for index, arg in enumerate(argv):
+            if arg == "--model":
+                if index + 1 == len(argv):
+                    return ()
+                models.append(argv[index + 1])
+            elif arg.startswith("--model="):
+                models.append(arg.partition("=")[2])
+            elif arg.startswith("MODEL="):
+                models.append(arg.partition("=")[2])
+            elif arg == "serve" and index > 0 and argv[index - 1] == "vllm":
+                if index + 1 == len(argv):
+                    return ()
+                models.append(argv[index + 1])
+        if any(re.fullmatch(r"[A-Za-z0-9_./-]+", model) is None for model in models):
+            return ()
+    elif language == "python":
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return ()
+        # Resolve only a single module-level literal assignment. Count all
+        # writes, including annotated/augmented assignments, tuple unpacking,
+        # loop targets, named expressions and pattern captures.
+        writes: defaultdict[str, int] = defaultdict(int)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                writes[node.id] += 1
+            elif isinstance(node, ast.arg):
+                writes[node.arg] += 1
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                writes[node.name] += 1
+            elif isinstance(node, ast.alias):
+                writes[node.asname or node.name.split(".")[0]] += 1
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+                writes[node.name] += 1
+            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                writes[node.rest] += 1
+        bindings: dict[str, str] = {}
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and writes[target.id] == 1:
+                        bindings[target.id] = node.value.value
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            values = [kw.value for kw in node.keywords if kw.arg in {"model", "model_name", "model_id"}]
+            if isinstance(node.func, ast.Name) and node.func.id in {"Omni", "AsyncOmni"} and node.args:
+                values.append(node.args[0])
+            for value in values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    models.append(value.value)
+                elif isinstance(value, ast.Name) and isinstance(resolved := bindings.get(value.id), str):
+                    models.append(resolved)
+                else:
+                    return ()
+    return tuple(dict.fromkeys(models))
+
+
+def doc_models_allowed(models: tuple[str, ...]) -> bool:
+    return bool(models) and all(any(fnmatchcase(model, pattern) for pattern in DOC_TEST_MODELS) for model in models)
+
+
+def doc_item_models(params: dict) -> tuple[str, ...]:
+    """Use actual snippet/server parameters rather than module names or headings."""
+    models: list[str] = []
+    for value in params.values():
+        if hasattr(value, "language") and hasattr(value, "code"):
+            snippet_models = models_in_snippet(value.language, value.code)
+            if not snippet_models:
+                return ()
+            models.extend(snippet_models)
+        elif isinstance(getattr(value, "model", None), str):
+            models.append(value.model)
+    return tuple(dict.fromkeys(models))
+
 
 # ---------------------------------------------------------------------------
 # Path constants and fixtures
@@ -101,6 +214,10 @@ class ReadmeSnippet(NamedTuple):
             key = h2_title
             section_counts[key] += 1
             code = token.get("raw", "")
+            # Filter before normalization can create LoRA assets or prepare
+            # model-specific commands. Headings are not a model identity.
+            if not doc_models_allowed(models_in_snippet(language, code)):
+                continue
             output_file_path = None
             if language == "bash":
                 argv = ReadmeSnippet._normalize_bash_command(code, Path(readme_path.parent))

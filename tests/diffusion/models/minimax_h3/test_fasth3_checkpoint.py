@@ -10,7 +10,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.models.minimax_h3 import fasth3_checkpoint
 from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
     FASTH3_BASE_MODEL,
     FASTH3_V2_BASE_SCHEDULE,
@@ -34,6 +41,13 @@ from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _cpu_worker_with_fastvideo_kernel(monkeypatch):
+    """Resolve VSA providers as a CPU worker with fastvideo-kernel would, whatever machine runs the tests."""
+    monkeypatch.setattr(fasth3_checkpoint, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(fasth3_checkpoint, "require_fastvideo_sparse", lambda: None)
 
 
 def _fastvideo_metadata() -> dict[str, object]:
@@ -220,6 +234,36 @@ def test_v2_serving_contract_rejects_incompatible_runtime(kwargs, partition, mat
         spec.check_serving_contract(partition=partition, od_config=_od_config(**kwargs))
 
 
+def test_v2_serving_contract_rejects_a_base_precision_the_device_cannot_run():
+    # H3 skips warm-up, so the base provider has to resolve at startup rather than on the first request.
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    config = _od_config(per_role={"self": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="sage")})
+    with pytest.raises(ValueError, match="FastH3 V2 cannot run its base attention: FlashInfer tile64 requires CUDA"):
+        spec.check_serving_contract(partition="fl2va", od_config=config)
+
+
+def test_v2_serving_contract_rejects_a_base_fastvideo_provider_without_its_kernel(monkeypatch):
+    def missing_kernel():
+        raise ImportError("FastVideo tile64 requires fastvideo-kernel; install vllm-omni[vsa]")
+
+    monkeypatch.setattr(fasth3_checkpoint, "require_fastvideo_sparse", missing_kernel)
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    with pytest.raises(ValueError, match="FastH3 V2 cannot run its base attention: .*fastvideo-kernel"):
+        spec.check_serving_contract(partition="fl2va", od_config=_od_config())
+
+
+def test_v2_serving_contract_resolves_providers_with_bf16_whatever_the_dtype(mocker):
+    resolve = mocker.patch.object(fasth3_checkpoint, "resolve_block_sparse_provider", return_value="flashinfer")
+    config = _scheduled(AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")))
+    config.dtype = torch.float16
+    FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).check_serving_contract(
+        partition="fl2va", od_config=config
+    )
+    # The base, then the profile; H3's attention operands are BF16 whatever --dtype is.
+    assert [call.args[3] for call in resolve.call_args_list] == [torch.bfloat16, torch.bfloat16]
+    assert {call.kwargs["block_size"] for call in resolve.call_args_list} == {64}
+
+
 def test_v2_serving_contract_reads_a_per_role_fixed_topk_override():
     spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
     config = _od_config(
@@ -227,6 +271,39 @@ def test_v2_serving_contract_reads_a_per_role_fixed_topk_override():
     )
     with pytest.raises(ValueError, match="fixed fastvideo_vsa_topk"):
         spec.check_serving_contract(partition="fl2va", od_config=config)
+
+
+def _scheduled(profile: AttentionConfig) -> OmniDiffusionConfig:
+    """A valid V2 baseline with one schedule profile, ``sparse``."""
+    return OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
+        diffusion_attention_schedule=AttentionScheduleConfig(profiles={"sparse": profile}, default=[]),
+    )
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)),
+        AttentionConfig(per_role={"self": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)}),
+    ],
+    ids=["default", "per_role_self"],
+)
+def test_v2_serving_contract_rejects_a_scheduled_fixed_topk_on_the_dit_role(profile):
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    with pytest.raises(ValueError, match="fixed fastvideo_vsa_topk override from attention schedule profile 'sparse'"):
+        spec.check_serving_contract(partition="fl2va", od_config=_scheduled(profile))
+
+
+def test_v2_serving_contract_ignores_a_scheduled_topk_on_the_token_refiner():
+    """The pin is on the gated DiT layers (role "self"). The token refiner has no VSA gate, so FASTVIDEO_VSA
+    runs its dense fallback there and a fixed top-k on that role selects nothing."""
+    profile = AttentionConfig(
+        per_role={"minimax_h3.token_refiner": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)}
+    )
+    FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).check_serving_contract(
+        partition="fl2va", od_config=_scheduled(profile)
+    )
 
 
 def test_v2_request_contract_accepts_omitted_steps_and_default_shifts():
@@ -559,6 +636,56 @@ def test_pipeline_load_weights_rejects_missing_fast_h3_compression_gate():
 
     with pytest.raises(ValueError, match="missing compression gates"):
         pipeline.load_weights([("transformer.blocks.0.attn.qkv_proj.weight", torch.zeros(1))])
+
+
+class _GatedPipelineLoadTransformer(_PipelineLoadTransformer):
+    def __init__(self) -> None:
+        super().__init__(set())
+        self.blocks = nn.ModuleList([nn.Module()])
+        self.blocks[0].attn = nn.Module()
+        self.blocks[0].attn.to_gate_compress = nn.Linear(3, 1, bias=False)
+
+
+class _TextEncoderLoad(nn.Module):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return {name for name, _ in weights}
+
+
+def _fast_h3_checkpoint_pipeline():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.transformer = _GatedPipelineLoadTransformer()
+    pipeline.text_encoder = _TextEncoderLoad()
+    pipeline.video_vae = None
+    pipeline.audio_vae = None
+    pipeline._fasth3 = None
+    pipeline._fasth3_checkpoint = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    return pipeline
+
+
+def test_pipeline_load_weights_skips_gate_check_when_host_weight_plan_owns_transformer():
+    # #10441: with a DLO host-weight plan (e.g. a warm Host Weight Runtime
+    # restore) the loader drops the ``transformer.`` source before calling
+    # load_weights, so only the remaining components stream through here.
+    pipeline = _fast_h3_checkpoint_pipeline()
+
+    loaded = pipeline.load_weights([("text_encoder.layers.0.weight", torch.zeros(1))])
+
+    assert loaded == {"text_encoder.layers.0.weight"}
+
+
+def test_pipeline_load_weights_still_rejects_streamed_checkpoint_without_gates():
+    pipeline = _fast_h3_checkpoint_pipeline()
+
+    with pytest.raises(ValueError, match=r"missing compression gates: \['blocks.0.attn.to_gate_compress.weight'\]"):
+        pipeline.load_weights(
+            [
+                ("transformer.blocks.0.attn.qkv_proj.weight", torch.zeros(1)),
+                ("text_encoder.layers.0.weight", torch.zeros(1)),
+            ]
+        )
 
 
 def _load_fixture(

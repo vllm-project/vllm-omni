@@ -37,16 +37,17 @@ def write_deploy(directory, name="test.yaml", devices="0"):
     return path
 
 
+@pytest.mark.parametrize("name", ["test", "test.yaml"])
 @pytest.mark.parametrize("source", ["plugin", "bundled", "cwd"])
-def test_explicit_bare_name_precedence(deploy_dirs, source):
+def test_explicit_bare_name_precedence(deploy_dirs, source, name):
     platform_dir, bundled_dir, cwd = deploy_dirs
     write_deploy(bundled_dir)
     if source in ("plugin", "cwd"):
         write_deploy(platform_dir)
     if source == "cwd":
-        write_deploy(cwd)
-    expected = {"plugin": platform_dir / "test.yaml", "bundled": bundled_dir / "test.yaml", "cwd": Path("test.yaml")}
-    assert stage_config.resolve_deploy_config_path("test.yaml") == expected[source]
+        write_deploy(cwd, name=name)
+    expected = {"plugin": platform_dir / "test.yaml", "bundled": bundled_dir / "test.yaml", "cwd": Path(name)}
+    assert stage_config.resolve_deploy_config_path(name) == expected[source]
 
 
 @pytest.mark.parametrize("platform_has_config", [True, False])
@@ -90,17 +91,19 @@ def test_missing_bare_name_is_preserved(deploy_dirs):
     assert stage_config.resolve_deploy_config_path("missing.yaml") == Path("missing.yaml")
 
 
-def test_factory_loads_platform_bare_name(deploy_dirs):
+@pytest.mark.parametrize("name", ["test", "test.yaml"])
+def test_factory_loads_platform_bare_name(deploy_dirs, name):
     platform_dir, bundled_dir, _ = deploy_dirs
     write_deploy(bundled_dir, devices="0")
     write_deploy(platform_dir, devices="7")
-    deploy = StageConfigFactory._load_user_deploy_config("test.yaml")
+    deploy = StageConfigFactory._load_user_deploy_config(name)
     assert deploy is not None
     assert deploy.stages[0].devices == "7"
 
 
+@pytest.mark.parametrize("name", ["test", "test.yaml"])
 @pytest.mark.parametrize("explicit", [True, False])
-def test_structured_config_retains_platform_source(deploy_dirs, explicit):
+def test_structured_config_retains_platform_source(deploy_dirs, explicit, name):
     platform_dir, bundled_dir, _ = deploy_dirs
     write_deploy(bundled_dir, devices="0")
     expected = write_deploy(platform_dir, devices="7")
@@ -109,7 +112,7 @@ def test_structured_config_retains_platform_source(deploy_dirs, explicit):
         default_deploy_config_name="test.yaml",
         stages=(stage_config.StagePipelineConfig(stage_id=0, model_stage="test", final_output=True),),
     )
-    deploy, source = _get_deploy_config(pipeline, None, "test.yaml" if explicit else None)
+    deploy, source = _get_deploy_config(pipeline, None, name if explicit else None)
     assert deploy.stages[0].devices == "7"
     assert source == str(expected)
 

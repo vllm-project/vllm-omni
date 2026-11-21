@@ -13,8 +13,24 @@ from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
 )
+from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_model_custom_options_round_trip_through_deploy_yaml(tmp_path):
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  model_custom_options:\n    history_policy: incremental\nstages: []\n",
+        encoding="utf-8",
+    )
+    config = load_deploy_config(deploy_path).duplex_session
+    assert config.model_custom_options == {"history_policy": "incremental"}
+
+
+def test_model_custom_options_requires_mapping():
+    with pytest.raises(ValueError, match="model_custom_options"):
+        DuplexSessionRuntimeConfig(model_custom_options=[])
 
 
 def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> None:
@@ -73,6 +89,39 @@ def test_duplex_session_runtime_loads_replica_placement_fields(tmp_path) -> None
     assert config.max_sessions_per_replica == 3
     assert config.worker_max_sessions == 3
     assert config.replica_groups == [{0: 0, 1: 0}, {0: 1, 1: 0}]
+
+
+@pytest.mark.parametrize("groups_yaml", ["", "  replica_groups: null\n"])
+def test_deploy_yaml_joins_unequal_replica_counts_without_explicit_groups(tmp_path, groups_yaml) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "session_mode: duplex\n"
+        "duplex_session:\n"
+        "  replica_policy: least_sessions\n"
+        "  max_sessions_per_replica: 3\n"
+        f"{groups_yaml}"
+        "stages:\n"
+        "  - {stage_id: 0, num_replicas: 1}\n"
+        "  - {stage_id: 1, num_replicas: 3}\n"
+        "  - {stage_id: 2, num_replicas: 1}\n",
+        encoding="utf-8",
+    )
+    deploy = load_deploy_config(deploy_path)
+    config = deploy.duplex_session
+    assert config.replica_groups is None
+    assert config.max_sessions_per_replica is not None
+    placement = DuplexReplicaPlacement(
+        stage_replica_counts=[stage.num_replicas for stage in deploy.stages],
+        max_sessions_per_replica=config.max_sessions_per_replica,
+        replica_groups=config.replica_groups,
+    )
+    assert placement.snapshot()["groups"] is None
+    assert placement.snapshot()["stage_replica_counts"] == (1, 3, 1)
+    assert [dict(placement.reserve(f"s{index}").replicas) for index in range(3)] == [
+        {0: 0, 1: 0, 2: 0},
+        {0: 0, 1: 1, 2: 0},
+        {0: 0, 1: 2, 2: 0},
+    ]
 
 
 @pytest.mark.parametrize("policy", ["round_robin", "", None, True])
@@ -200,3 +249,18 @@ def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, e
 def test_history_calibration_requires_bounded_server_configuration(patch):
     with pytest.raises(ValueError):
         DuplexSessionRuntimeConfig(**patch)
+
+
+def test_context_keep_media_turns_defaults_to_none_and_loads(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text("duplex_session:\n  context_keep_media_turns: 2\nstages: []\n", encoding="utf-8")
+
+    assert DuplexSessionRuntimeConfig().context_keep_media_turns is None
+    assert DuplexSessionRuntimeConfig(context_keep_media_turns=0).context_keep_media_turns == 0
+    assert load_deploy_config(deploy_path).duplex_session.context_keep_media_turns == 2
+
+
+@pytest.mark.parametrize("value", [-1, True, "2", 1.5])
+def test_context_keep_media_turns_validation(value) -> None:
+    with pytest.raises(ValueError, match="duplex_session.context_keep_media_turns must be an integer >= 0 or null"):
+        DuplexSessionRuntimeConfig(context_keep_media_turns=value)

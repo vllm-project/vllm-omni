@@ -8,6 +8,7 @@ conditioning, not a text-to-speech quality corpus or a model download.
 """
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -65,24 +66,27 @@ def _snapshot(result):
     return mel.clone(), cnn.clone(), att.clone()
 
 
+@pytest.mark.parametrize("native_reference", [False, True], ids=["batching", "fusion-off-on"])
+@pytest.mark.parametrize("mixed_history,variable_queries", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("batch", [1, 2, 3, 4])
 @torch.inference_mode()
-def test_trained_cfm_long_stream_matches_independent_graphs(trained_flow, batch, monkeypatch, record_property):
+def test_trained_cfm_long_stream_matches_independent_graphs(
+    trained_flow, batch, monkeypatch, record_property, mixed_history, variable_queries, native_reference
+):
     token2wav = _Token2Wav(trained_flow.decoder.estimator)
     token2wav.flow = trained_flow
     token2wav.n_timesteps = 10
-    backend = BatchedToken2Wav(
-        token2wav,
-        cfm_graph_config={
-            "enabled": True,
-            "fused_body": True,
-            "capture_frames": 50,
-            "micro_batch_size": 4,
-            "max_graph_batch": 4,
-            "max_graphs": 16,
-            "offset_bucket_frames": 50,
-        },
-    )
+    config = {
+        "enabled": True,
+        "fused_body": True,
+        "capture_frames": 50,
+        "micro_batch_size": 4,
+        "max_graph_batch": 4,
+        # Independent reference rows and merged rows share this graph cache.
+        "max_graphs": 64,
+        "offset_bucket_frames": 50,
+    }
+    backend = BatchedToken2Wav(token2wav, cfm_graph_config=config)
     wrapper = backend._whole_euler_graph_wrapper
     assert backend._whole_euler_ragged_active() and backend._ragged_fused_body
     assert wrapper.device.type == "npu" and wrapper.dtype == torch.float32 and wrapper.att_slots == 0
@@ -90,51 +94,137 @@ def test_trained_cfm_long_stream_matches_independent_graphs(trained_flow, batch,
     channels = int(trained_flow.decoder.rand_noise.shape[1])
     speaker_inputs = torch.randn(batch, trained_flow.spk_embed_affine_layer.in_features, device="npu")
     speakers = torch.cat([backend._project_speakers(value[None]) for value in speaker_inputs])
+    wrapper.npu_mixed_history = mixed_history
+    prompt_lengths = [50 + 10 * row if mixed_history else 50 for row in range(batch)]
     accepted = []
     replay = wrapper.replay
 
     def observe(**kwargs):
         result = replay(**kwargs)
-        assert result is not None, "A real graph is required; eager fallback does not qualify"
+        assert result is not None, (
+            "A real graph is required; eager fallback does not qualify; "
+            f"stats={wrapper.stats_snapshot()}, max_graphs={wrapper.max_graphs}, "
+            f"cached={len(wrapper._cache)}, unsupported={wrapper._unsupported}, "
+            f"batch={kwargs['x'].shape[0]}, query={kwargs['x'].shape[2]}, "
+            f"offsets={[int(row.shape[-2]) for row in kwargs['att_cache']] if isinstance(kwargs['att_cache'], list) else None}"
+        )
         accepted.append(int(kwargs["x"].shape[0]))
         return result
 
     monkeypatch.setattr(wrapper, "replay", observe)
+    from vllm_omni.model_executor.models.minicpmo_4_5.ops import fused_qkv_layer_norm
+
+    reference_backend = BatchedToken2Wav(token2wav, cfm_graph_config=config) if native_reference else backend
+    reference_wrapper = reference_backend._whole_euler_graph_wrapper
+    reference_wrapper.npu_mixed_history = mixed_history
+    native_calls = 0
+    fused_calls = 0
+    eligibility = fused_qkv_layer_norm._use_npu_triton
+
+    def observe_fused(*args, **kwargs):
+        nonlocal fused_calls
+        eligible = eligibility(*args, **kwargs)
+        if eligible:
+            fused_calls += 1
+        return eligible
+
+    monkeypatch.setattr(fused_qkv_layer_norm, "_use_npu_triton", observe_fused)
+
+    def native_eligibility(*args, **kwargs):
+        nonlocal native_calls
+        native_calls += 1
+        return False
+
+    def reference_decode(*args, **kwargs):
+        with monkeypatch.context() if native_reference else nullcontext() as patch:
+            if native_reference:
+                patch.setattr(fused_qkv_layer_norm, "_use_npu_triton", native_eligibility)
+            return reference_backend._decode_cfm(*args, **kwargs)
+
+    # Both paths read the same immutable noise table and fixed codec stream.
+    initial_noise = trained_flow.decoder.rand_noise.clone()
+    generator = torch.Generator().manual_seed(43)
+    tokens = torch.randint(trained_flow.input_embedding.num_embeddings, (batch, 24, 32), generator=generator).to("npu")
+    encoder_states = [(None, None) for _ in range(batch)]
+    chunk_errors = []
+    chunk_relative_errors = []
     max_mel_error = 0.0
     try:
         with npu_token2wav_sdpa_context(require_math=True):
             # Different conditions initialize each row independently, exactly
             # once. Both streams then evolve from these same initial states.
             reference = []
+            prompts = []
             for row in range(batch):
-                prompt_mu = torch.randn(1, channels, 50, device="npu") * 0.1
-                result = backend._decode_cfm(
+                prompt_mu = torch.randn(1, channels, prompt_lengths[row], device="npu") * 0.1
+                prompts.append(prompt_mu.clone())
+                result = reference_decode(
                     prompt_mu,
                     speakers[row : row + 1],
                     torch.zeros_like(prompt_mu),
                     cnn_cache=None,
                     att_cache=None,
-                    att_keep=(50, 100),
+                    att_keep=(max(prompt_lengths), 100),
                 )
                 reference.append(_snapshot(result)[1:])
-            current = [(cnn.clone(), att.clone()) for cnn, att in reference]
+            if native_reference:
+                current = []
+                for row in range(batch):
+                    prompt_mu = prompts[row]
+                    current.append(
+                        _snapshot(
+                            backend._decode_cfm(
+                                prompt_mu,
+                                speakers[row : row + 1],
+                                torch.zeros_like(prompt_mu),
+                                cnn_cache=None,
+                                att_cache=None,
+                                att_keep=(max(prompt_lengths), 100),
+                            )
+                        )[1:]
+                    )
+            else:
+                current = [(cnn.clone(), att.clone()) for cnn, att in reference]
             accepted.clear()
             for chunk in range(24):
                 # A final short query also exercises production query padding.
                 width = 30 if chunk == 23 else 50
-                mu = torch.randn(batch, channels, width, device="npu") * 0.1
+                if native_reference:
+                    hidden_rows = []
+                    for row in range(batch):
+                        cnn, att = encoder_states[row]
+                        hidden, cnn, att = backend._encode_chunk_eager(
+                            tokens[row : row + 1, chunk],
+                            last_chunk=chunk == 23,
+                            cnn_cache=cnn,
+                            att_cache=att,
+                        )
+                        encoder_states[row] = (cnn, att)
+                        assert hidden.shape[1] >= width
+                        hidden_rows.append(hidden[:, :width].transpose(1, 2).contiguous())
+                    mu = torch.cat(hidden_rows)
+                else:
+                    mu = torch.randn(batch, channels, width, device="npu") * 0.1
+                widths = [width - 2 * row if variable_queries else width for row in range(batch)]
                 cond = torch.zeros_like(mu)
+                if variable_queries:
+                    # Poison invalid conditioning frames: a real ragged NPU
+                    # solve must exclude them from valid outputs and caches.
+                    # Independent solves below see only each row's valid slice.
+                    for row, valid_width in enumerate(widths):
+                        mu[row, :, valid_width:] = 7.0
+                        cond[row, :, valid_width:] = -11.0
                 expected = []
                 for row in range(batch):
                     cnn, att = reference[row]
-                    result = backend._decode_cfm(
-                        mu[row : row + 1],
+                    result = reference_decode(
+                        mu[row : row + 1, :, : widths[row]],
                         speakers[row : row + 1],
-                        cond[row : row + 1],
+                        cond[row : row + 1, :, : widths[row]],
                         cnn_cache=cnn,
                         att_cache=[att],
-                        att_keep=(50, 100),
-                        prompt_lengths=[50],
+                        att_keep=(max(prompt_lengths), 100),
+                        prompt_lengths=[prompt_lengths[row]],
                     )
                     expected.append(_snapshot(result))
                 cnn_batch = torch.cat(
@@ -146,18 +236,21 @@ def test_trained_cfm_long_stream_matches_independent_graphs(trained_flow, batch,
                     cond,
                     cnn_cache=cnn_batch,
                     att_cache=[value[1] for value in current],
-                    att_keep=(50, 100),
-                    prompt_lengths=[50] * batch,
+                    att_keep=(max(prompt_lengths), 100),
+                    valid_lengths=widths if mixed_history else None,
+                    prompt_lengths=prompt_lengths,
                 )
                 torch.npu.synchronize()
                 assert isinstance(result[2], list) and len(result[2]) == batch
                 assert len({value.data_ptr() for value in result[2]}) == batch
                 next_states = []
+                chunk_max_error = 0.0
+                chunk_max_relative_error = 0.0
                 for row in range(batch):
                     cnn = torch.cat(
                         (result[1][:, :, row : row + 1], result[1][:, :, batch + row : batch + row + 1]), dim=2
                     )
-                    actual = result[0][row : row + 1], cnn, result[2][row]
+                    actual = result[0][row : row + 1, :, : widths[row]], cnn, result[2][row]
                     for name, value, wanted in zip(("mel", "cnn", "att"), actual, expected[row], strict=True):
                         torch.testing.assert_close(
                             value,
@@ -166,17 +259,34 @@ def test_trained_cfm_long_stream_matches_independent_graphs(trained_flow, batch,
                             atol=1e-4,
                             msg=lambda message: f"batch={batch}, chunk={chunk}, row={row}, {name}: {message}",
                         )
-                    max_mel_error = max(max_mel_error, float((actual[0] - expected[row][0]).abs().max()))
+                    error = float((actual[0] - expected[row][0]).abs().max())
+                    relative = float(
+                        ((actual[0] - expected[row][0]).abs() / expected[row][0].abs().clamp_min(1e-6)).max()
+                    )
+                    chunk_max_relative_error = max(chunk_max_relative_error, relative)
+                    chunk_max_error = max(chunk_max_error, error)
+                    max_mel_error = max(max_mel_error, error)
                     next_states.append((cnn.clone(), result[2][row].clone()))
+                chunk_errors.append(chunk_max_error)
+                chunk_relative_errors.append(chunk_max_relative_error)
                 reference = [(value[1], value[2]) for value in expected]
                 current = next_states
-                if chunk >= 1:
-                    assert all(value[1].shape[4] == 150 for value in current)
+                if chunk >= (3 if variable_queries else 1):
+                    assert all(value[1].shape[-2] == prompt_lengths[row] + 100 for row, value in enumerate(current))
         assert accepted.count(batch) >= 24
         stats = wrapper.stats_snapshot()
         assert stats["hits"] > 0 and stats["flushes"] == 0
+        torch.testing.assert_close(trained_flow.decoder.rand_noise, initial_noise, rtol=0, atol=0)
+        if native_reference:
+            assert native_calls > 0
+            assert reference_wrapper.stats_snapshot()["hits"] > 0
+        assert fused_calls > 0, "The ON path must actually select the NPU Triton kernel"
+        record_property("chunk_mel_max_abs_errors", chunk_errors)
+        record_property("chunk_mel_max_relative_errors_floor_1e_6", chunk_relative_errors)
         record_property("max_mel_abs_error", max_mel_error)
         record_property("cfm_steps", backend.n_timesteps)
         record_property("stream_chunks", 24)
     finally:
         wrapper._flush()
+        if native_reference:
+            reference_wrapper._flush()

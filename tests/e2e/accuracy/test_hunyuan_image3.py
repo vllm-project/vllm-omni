@@ -4,33 +4,35 @@
 from __future__ import annotations
 
 import copy
-import gc
 import importlib.util
 import json
 import os
-import tempfile
-import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
-import requests
 import torch
-import yaml
 from PIL import Image
 
 from tests.e2e.accuracy.helpers import (
     CLIPScorer,
     SemanticSimilarityScorer,
-    assert_similarity,
-    compute_image_ssim_psnr,
+    SimilarityThresholds,
+    assert_similarity_metrics,
+    baseline_from_similarity_thresholds,
     download_images,
+    measure_image_similarity,
     model_output_dir,
+    resolve_device_profile,
+    resolve_device_threshold,
+    resolve_similarity_thresholds,
+    write_accuracy_result,
 )
+from tests.helpers.client import OnlineOmniClient
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
-from tests.helpers.runtime import OmniRunner, OmniServer
+from tests.helpers.runtime import OmniRunner, OmniServer, OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt_tokens,
     resolve_stop_token_ids,
@@ -72,110 +74,56 @@ def _assert_cot_structural_markers(cot_text: str, label: str) -> None:
     )
 
 
-os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+pytestmark = [pytest.mark.diffusion]
 
-pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
+
+@pytest.fixture(autouse=True)
+def _accuracy_env(monkeypatch):
+    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "DEBUG")
+
 
 # ============================================================================
 # Configurable Parameters
 # ============================================================================
-# Comma-separated logical CUDA device ids per stage: split visible GPUs (0..n-1), first half -> AR, second -> DiT.
+# Fixed four-card CI topology: AR TP=2 + DiT TP=2.
+AR_DEVICES, DIT_DEVICES = "0,1", "2,3"
 
-
-def _default_ar_dit_devices() -> tuple[str, str]:
-    """First floor(n/2) logical devices -> AR, rest -> DiT. ``device_count`` respects ``CUDA_VISIBLE_DEVICES``."""
-    n = torch.accelerator.device_count()
-    if n < 2:
-        return "0,1", "2,3"
-    split = n // 2
-    ar = ",".join(str(i) for i in range(split))
-    dit = ",".join(str(i) for i in range(split, n))
-    return ar, dit
-
-
-AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
-
-# Model configuration based on HUNYUAN_MODEL_PATH
-DISTIL_MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct-Distil"
-INSTRUCT_MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
-MODEL_PATH = os.environ.get("HUNYUAN_MODEL_PATH", DISTIL_MODEL_NAME)
-
-# Determine model type and set parameters accordingly
-IS_DISTIL = "distil" in MODEL_PATH.lower()
-MODEL_NAME = DISTIL_MODEL_NAME if IS_DISTIL else INSTRUCT_MODEL_NAME
-NUM_INFERENCE_STEPS = 8 if IS_DISTIL else 50
+# Use the distilled checkpoint without quantization for accuracy comparisons.
+MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct-Distil"
+MODEL_PATH = os.environ.get("HUNYUAN_MODEL_PATH", MODEL_NAME)
+NUM_INFERENCE_STEPS = 8
 GUIDANCE_SCALE = 2.5
 
-# Asset paths based on model type
 ASSET_SUBDIR = "hunyuan_image3"
-REF_IMAGE_NAME = "hunyuan_image_distill_ref.png" if IS_DISTIL else "hunyuan_image_instruct_ref.png"
-COT_REF_NAME = "hunyuan_image_distill_cot_ref.txt" if IS_DISTIL else "hunyuan_image3_instruct_cot_ref.txt"
-HUNYUAN_IMAGE_REF_PATH = get_asset_path(f"{ASSET_SUBDIR}/{REF_IMAGE_NAME}")
-HUNYUAN_COT_REF_PATH = get_asset_path(f"{ASSET_SUBDIR}/{COT_REF_NAME}")
+HUNYUAN_IMAGE_REF_PATH = get_asset_path(f"{ASSET_SUBDIR}/hunyuan_image_distill_ref.png")
+# Official Distil direct-DiT IT2I references (CUDA vs NPU).
+HUNYUAN_DIT_IMAGE_REF_PATH = get_asset_path(f"{ASSET_SUBDIR}/hunyuan_image3_dit_distill_it2i_ref.png")
+HUNYUAN_DIT_IMAGE_REF_PATH_NPU = get_asset_path(f"{ASSET_SUBDIR}/hunyuan_image3_dit_distill_it2i_ref_npu.png")
+HUNYUAN_COT_REF_PATH = get_asset_path(f"{ASSET_SUBDIR}/hunyuan_image_distill_cot_ref.txt")
 
 # ============================================================================
 # Constants
 # ============================================================================
 # Test input
-_IT2I_INPUT = json.loads(get_asset_path("hunyuan_image3/it2i.jsonl").read_text(encoding="utf-8"))
+_IT2I_INPUT = json.loads(get_asset_path(f"{ASSET_SUBDIR}/it2i.jsonl").read_text(encoding="utf-8"))
 PROMPT = _IT2I_INPUT["prompt"]
 TEST_IMAGE_URLS = _IT2I_INPUT["image_files"]
 SEED = 42
+IMAGE_WIDTH, IMAGE_HEIGHT = 1280, 720
+IMAGE_SIZE = f"{IMAGE_WIDTH}x{IMAGE_HEIGHT}"
 AR_TP_SIZE = len(AR_DEVICES.split(","))
 DIT_TP_SIZE = len(DIT_DEVICES.split(","))
 
-# Precision thresholds organized by model variant and test type
-THRESHOLDS = {
-    "instruct": {
-        # AR text comparison
-        "text_prefix_match": 10,  # First 10 characters must match exactly
-        "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
-        # Image comparison
-        "clip_score": 90,  # CLIP image semantic similarity
-        "ssim": 0.26,  # Structural similarity
-        "psnr": 12.5,  # Peak signal-to-noise ratio (dB)
-    },
-    # The 8-step distilled model has more structural variance across GPU
-    # runtimes; CLIP and PSNR retain the same semantic and pixel safeguards.
-    "distil": {
-        "text_prefix_match": 10,
-        "cot_semantic_sim": 0.9,
-        "clip_score": 90,
-        "ssim": 0.23,
-        "psnr": 12.5,
-    },
-    # Thresholds for quantized DiT accuracy tests (bf16 vs quant comparison)
-    "quant": {
-        "psnr": 10.0,
-        "ssim": 0.20,
-        "clip_score": 20.0,  # Minimum CLIP score for quantized output
-        "clip_score_drop": float(
-            os.environ.get("HUNYUAN_IMAGE3_QUANT_CLIP_SCORE_DROP_THRESHOLD", "5.0")
-        ),  # Max allowed drop from bf16
-    },
+# Calibrated device-specific rows can override the existing distilled defaults.
+SIMILARITY_THRESHOLDS_BY_DEVICE: dict[str, SimilarityThresholds] = {
+    "default": SimilarityThresholds(ssim=0.23, psnr=12.5),
 }
+COT_SEMANTIC_THRESHOLDS: dict[str, float] = {"default": 0.9}
+COT_PREFIX_THRESHOLDS: dict[str, float] = {"default": 10}
+IMAGE_SIMILARITY_THRESHOLDS: dict[str, float] = {"default": 90}
 
 
-# Helper to get thresholds for current model variant
-def _get_thresholds() -> dict:
-    """Return appropriate thresholds based on test context."""
-    return THRESHOLDS["distil" if IS_DISTIL else "instruct"]
-
-
-def _get_quant_thresholds() -> dict:
-    """Return thresholds for quantization accuracy tests."""
-    return THRESHOLDS["quant"]
-
-
-# Quant test configuration
-QUANT_PROMPT = "A brown and white dog is running on the grass."
-QUANT_HEIGHT, QUANT_WIDTH = 1024, 1024
-QUANT_RUN_ENV = "HUNYUAN_IMAGE3_RUN_QUANT_ACCURACY"
-QUANT_BF16_ENV = "HUNYUAN_IMAGE3_BF16_MODEL"
-QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
-QUANT_NVFP4_ENV = "HUNYUAN_IMAGE3_NVFP4_MODEL"
-_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
 _DEPLOY_CONFIG = {
     "pipeline": "hunyuan_image_3_moe",
@@ -193,7 +141,8 @@ _DEPLOY_CONFIG = {
             "final_output": True,
             "final_output_type": "text",
             "max_num_seqs": 1,
-            "gpu_memory_utilization": 0.95,
+            # Leave headroom for the input images' VAE encoding.
+            "gpu_memory_utilization": 0.85,
             "enforce_eager": True,
             "trust_remote_code": True,
             "max_num_batched_tokens": 32768,
@@ -232,83 +181,66 @@ _DEPLOY_CONFIG = {
 }
 # fmt: on
 
-_QUANT_DIT_CONFIG = {
-    "pipeline": "hunyuan_image_3_moe",
-    "async_chunk": False,
-    "trust_remote_code": True,
-    "stages": [
-        {
-            "stage_id": 0,
-            "model_stage": "dit",
-            "enforce_eager": True,
-            "trust_remote_code": True,
-            "devices": "0,1",
-            "distributed_executor_backend": "mp",
-            "force_cutlass_fp8": True,
-            "moe_backend": "cutlass",
-            "parallel_config": {
-                "tensor_parallel_size": 2,
-                "enable_expert_parallel": True,
-            },
-            "omni_kv_config": {"need_recv_cache": True},
-            "final_output": True,
-            "final_output_type": "image",
-            "is_comprehension": False,
-            "default_sampling_params": {"seed": SEED},
-        }
-    ],
+
+def _make_ar_dit_config() -> str:
+    config = cast(dict[str, Any], copy.deepcopy(_DEPLOY_CONFIG))
+    config["stages"][0]["omni_kv_config"] = {"need_send_cache": True}
+    config["stages"][1]["omni_kv_config"] = {"need_recv_cache": True}
+    config["stages"] = {stage.pop("stage_id"): stage for stage in config["stages"]}
+    return modify_stage_config(
+        get_deploy_config_path("hunyuan_image_3_moe.yaml"),
+        updates=config,
+        deletes={"platforms": None},
+    )
+
+
+_AR_DIT_DEPLOY = _make_ar_dit_config()
+_AR_DIT_SERVER_PARAMS = OmniServerParams(
+    model=MODEL_PATH,
+    stage_config_path=_AR_DIT_DEPLOY,
+    server_args=["--trust-remote-code", "--dtype", "bfloat16"],
+    env_dict={"DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA"},
+    stage_init_timeout=900,
+    init_timeout=1800,
+)
+_AR_DIT_RUNNER_PARAMS = (
+    MODEL_PATH,
+    _AR_DIT_DEPLOY,
+    {"trust_remote_code": True, "dtype": "bfloat16", "stage_init_timeout": 900, "init_timeout": 1800},
+)
+
+
+# DiT-only: CUDA vs hunyuan_image3_dit_distill_it2i_ref.png;
+# NPU vs hunyuan_image3_dit_distill_it2i_ref_npu.png.
+# Acceptance floors, not calibration means. CUDA five-run BF16 calibration:
+# CUDA/H200: https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-6940430119
+# A3: two BF16 runs on 2026-11-19 (21:24:18 and 21:31:07) both yielded
+# SSIM 0.939406 / PSNR 26.196703 dB; floors allow for run-to-run variation.
+DIT_SIMILARITY_THRESHOLDS_BY_DEVICE: dict[str, SimilarityThresholds] = {
+    "default": SimilarityThresholds(ssim=0.95, psnr=29.0),
+    "A3": SimilarityThresholds(ssim=0.92, psnr=25.0),
 }
 
 
-@dataclass(frozen=True)
-class _QuantAccuracyCase:
-    name: str
-    model_env: str
-    nvfp4_backend: str | None = None
+def _dit_it2i_reference_path() -> Path:
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_npu():
+        return HUNYUAN_DIT_IMAGE_REF_PATH_NPU
+    return HUNYUAN_DIT_IMAGE_REF_PATH
 
 
-def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
-    cases = [
-        _QuantAccuracyCase(name="fp8", model_env=QUANT_FP8_ENV),
-        _QuantAccuracyCase(name="mixed_nvfp4", model_env=QUANT_NVFP4_ENV, nvfp4_backend="cutlass"),
-    ]
-    params: list[pytest.ParameterSet] = []
-    run_quant_accuracy = os.environ.get(QUANT_RUN_ENV, "").lower() in _TRUE_ENV_VALUES
-    for case in cases:
-        marks = []
-        if not run_quant_accuracy:
-            marks.append(pytest.mark.skip(reason=f"Set {QUANT_RUN_ENV}=1 to run HunyuanImage3 quant accuracy."))
-        if not os.environ.get(QUANT_BF16_ENV):
-            marks.append(pytest.mark.skip(reason=f"Set {QUANT_BF16_ENV} to run HunyuanImage3 quant accuracy."))
-        if not os.environ.get(case.model_env):
-            marks.append(pytest.mark.skip(reason=f"Set {case.model_env} to run this quant accuracy case."))
-        params.append(pytest.param(case, id=case.name, marks=marks))
-    return params
+_DIT_SERVER_PARAMS = OmniServerParams(
+    model=os.environ.get("HUNYUAN_IMAGE3_MODEL", MODEL_NAME),
+    stage_config_path=get_deploy_config_path("hunyuan_image3_dit.yaml"),
+    server_args=["--trust-remote-code", "--dtype", "bfloat16"],
+    env_dict={"DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA"},
+    stage_init_timeout=900,
+    init_timeout=1800,
+)
 
 
-def _make_config(enable_kv_reuse: bool, path: Path) -> None:
-    config = cast(dict[str, Any], copy.deepcopy(_DEPLOY_CONFIG))
-    config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
-    config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
-    path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
-
-
-def _quant_devices() -> str:
-    return os.environ.get("HUNYUAN_IMAGE3_QUANT_DEVICES", "0,1")
-
-
-def _quant_tensor_parallel_size() -> int:
-    return int(os.environ.get("HUNYUAN_IMAGE3_QUANT_TP", str(len(_quant_devices().split(",")))))
-
-
-def _make_quant_dit_config(path: Path) -> None:
-    config = cast(dict[str, Any], copy.deepcopy(_QUANT_DIT_CONFIG))
-    config["stages"][0]["devices"] = _quant_devices()
-    config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
-    path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
-
-
-def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_offline(runner: OmniRunner, output_path: Path) -> tuple[Image.Image, str]:
     from transformers import AutoTokenizer
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -325,39 +257,44 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     token_ids = result.token_ids
     system_prompt_type = result.system_prompt_type
 
-    ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path, trust_remote_code=True) as runner:
-        params_list = list(runner.omni.default_sampling_params_list)
-        for sp in params_list:
-            if isinstance(sp, OmniDiffusionSamplingParams):
-                sp.num_inference_steps = NUM_INFERENCE_STEPS
-                sp.guidance_scale = GUIDANCE_SCALE
-                sp.seed = SEED
-                sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
-            elif hasattr(sp, "stop_token_ids"):
-                sp.stop_token_ids = ar_stop_token_ids
+    # Match online fixed-size generation: stop at </recaption> before AR predicts a ratio.
+    ar_stop_token_ids = resolve_stop_token_ids(
+        task="it2i", bot_task="think_recaption", tokenizer=tokenizer, image_size=IMAGE_SIZE
+    )
+    params_list = list(runner.omni.default_sampling_params_list)
+    for sp in params_list:
+        if isinstance(sp, OmniDiffusionSamplingParams):
+            sp.width = IMAGE_WIDTH
+            sp.height = IMAGE_HEIGHT
+            sp.num_inference_steps = NUM_INFERENCE_STEPS
+            sp.guidance_scale = GUIDANCE_SCALE
+            sp.seed = SEED
+            sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
+        elif hasattr(sp, "stop_token_ids"):
+            sp.stop_token_ids = ar_stop_token_ids
+            sp.seed = SEED
+            sp.extra_args = {**(sp.extra_args or {}), "target_h": IMAGE_HEIGHT, "target_w": IMAGE_WIDTH}
 
-        images = download_images(TEST_IMAGE_URLS)
-        prompts: list[OmniPromptType] = [
-            {
-                "prompt_token_ids": token_ids,
-                "prompt": PROMPT,
-                "use_system_prompt": system_prompt_type,
-                "modalities": ["image"],
-                "multi_modal_data": {"image": images},
-            }
-        ]
-        t0 = time.perf_counter()
-        outputs = list(runner.omni.generate(prompts=prompts, sampling_params_list=params_list))
-        elapsed = time.perf_counter() - t0
+    images = download_images(TEST_IMAGE_URLS)
+    prompts: list[OmniPromptType] = [
+        {
+            "prompt_token_ids": token_ids,
+            "prompt": PROMPT,
+            "use_system_prompt": system_prompt_type,
+            "modalities": ["image"],
+            "width": IMAGE_WIDTH,
+            "height": IMAGE_HEIGHT,
+            "multi_modal_data": {"image": images},
+        }
+    ]
+    outputs = list(runner.omni.generate(prompts=prompts, sampling_params_list=params_list))
 
     assert outputs, "Pipeline produced no outputs"
-    images = None
+    output_images = None
     cot_text = ""
     for out in outputs:
-        ro = out
-        if ro and getattr(ro, "outputs", None):
-            cot_text = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
+        if out and getattr(out, "outputs", None):
+            cot_text = "".join(getattr(o, "text", "") or "" for o in out.outputs)
         if not cot_text:
             multimodal_output = getattr(out, "multimodal_output", {}) or {}
             metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
@@ -369,329 +306,176 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
                 cot_text = ar_text or ""
 
         imgs = getattr(out, "images", None)
-        if not imgs and ro and hasattr(ro, "images"):
-            imgs = ro.images
         if imgs:
-            images = imgs
+            output_images = imgs
 
-    assert images, "Pipeline output had no images"
+    assert output_images, "Pipeline output had no images"
     cot_text = cot_text.lstrip("\n")
 
-    image = images[0].convert("RGB")
+    image = output_images[0].convert("RGB")
     image.save(output_path / "image_offline.png")
     (output_path / "cot_offline.txt").write_text(cot_text, encoding="utf-8")
-    gc.collect()
-    if torch.accelerator.is_available():
-        torch.accelerator.empty_cache()
-    return image, cot_text, elapsed
+    return image, cot_text
 
 
-def _run_online(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_online(
+    omni_server: OmniServer, online_client: OnlineOmniClient, output_path: Path, *, bot_task: str
+) -> tuple[Image.Image, str]:
     from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 
-    # After #8606, stage_init_timeout is a hard READY deadline. HunyuanImage-3
-    # AR+DiT MoE load regularly exceeds the 300s CLI default on nightly (issue
-    # #9451). Match the 900s used by the prefix-cache online test, and keep
-    # init_timeout above two sequential stage budgets if the GPUs overlap.
-    server_args = [
-        "--deploy-config",
-        deploy_config_path,
-        "--stage-init-timeout",
-        "900",
-        "--init-timeout",
-        "1800",
-        "--trust-remote-code",
-    ]
-    try:
-        with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:
-            images = download_images(TEST_IMAGE_URLS)
-            t0 = time.perf_counter()
-            response = requests.post(
-                f"http://{omni_server.host}:{omni_server.port}/v1/images/edits",
-                data={
-                    "model": omni_server.model,
-                    "prompt": PROMPT,
-                    "n": 1,
-                    "response_format": "b64_json",
-                    "num_inference_steps": NUM_INFERENCE_STEPS,
-                    "guidance_scale": GUIDANCE_SCALE,
-                    "seed": SEED,
-                    "sys_type": "en_unified",
-                    "bot_task": "think_recaption",
-                    "size": "1280x720",
-                },
-                files=[
-                    ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
-                ],
-                timeout=600,
-            )
-            elapsed = time.perf_counter() - t0
-            if not response.ok:
-                print(f"[ONLINE] HTTP {response.status_code} response body: {response.text}")
-            response.raise_for_status()
-            payload = response.json()
-            assert len(payload["data"]) == 1
-            image = decode_base64_image(payload["data"][0]["b64_json"])
-            image.load()
-            image.save(output_path / "image_online.png")
-            cot_text = payload.get("cot_output") or ""
-            (output_path / "cot_online.txt").write_text(cot_text, encoding="utf-8")
-            return image, cot_text, elapsed
-    finally:
-        gc.collect()
-        if torch.accelerator.is_available():
-            torch.accelerator.empty_cache()
+    images = download_images(TEST_IMAGE_URLS)
+    response = online_client.send_images_edits_http_request(
+        {
+            "data": {
+                "model": omni_server.model,
+                "prompt": PROMPT,
+                "n": 1,
+                "response_format": "b64_json",
+                "num_inference_steps": NUM_INFERENCE_STEPS,
+                "guidance_scale": GUIDANCE_SCALE,
+                "seed": SEED,
+                "sys_type": "en_unified",
+                "bot_task": bot_task,
+                "size": IMAGE_SIZE,
+            },
+            "files": [
+                ("image", (f"image_{i}.png", pil_to_png_bytes(img), "image/png")) for i, img in enumerate(images)
+            ],
+            "timeout": 600,
+        }
+    )[0]
+    assert response.status_code == 200, response.error_message
+    payload = response.json_body
+    assert isinstance(payload, dict)
+    assert len(payload["data"]) == 1
+    image = decode_base64_image(payload["data"][0]["b64_json"])
+    image.load()
+    image.save(output_path / "image_online.png")
+    cot_text = (payload.get("cot_output") or "").lstrip("\n")
+    (output_path / "cot_online.txt").write_text(cot_text, encoding="utf-8")
+    return image, cot_text
 
 
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
-    reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
-)
-def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
-    """Online API test: same pipeline, same seed as offline → PSNR >= 10 dB."""
-    if importlib.util.find_spec("FlagEmbedding") is None:
-        raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
-    from tabulate import tabulate  # type: ignore[import-untyped]
-
-    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-online")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        _make_config(True, tmp / "online.yaml")
-        online_image, online_cot, _ = _run_online(str(tmp / "online.yaml"), output_dir)
-
-    online_cot = online_cot.lstrip("\n")
-    scorer = SemanticSimilarityScorer()
-    clip_scorer = CLIPScorer()
-    cot_ref = HUNYUAN_COT_REF_PATH.read_text(encoding="utf-8")
-    cot_results = scorer.text_similarity(online_cot, cot_ref)
-    image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
-    image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
-    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
-
-    thresholds = _get_thresholds()
-    table = [
-        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", thresholds["cot_semantic_sim"]],
-        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", thresholds["text_prefix_match"]],
-        ["Image-Image similarity", f"{image_clip_score:.4f}", thresholds["clip_score"]],
-        ["SSIM", f"{ssim_value:.4f}", thresholds["ssim"]],
-        ["PSNR (dB)", f"{psnr_value:.2f}", thresholds["psnr"]],
-    ]
-    print("[ONLINE] " + tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
-
-    _assert_cot_structural_markers(online_cot, "ONLINE")
-
-    assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
-        f"[ONLINE] COT semantic similarity {cot_results['cot_semantic_sim']:.4f} below threshold {thresholds['cot_semantic_sim']}"
-    )
-    assert cot_results["text_prefix_match_count"] >= thresholds["text_prefix_match"], (
-        f"[ONLINE] COT prefix match {cot_results['text_prefix_match_count']} below threshold {thresholds['text_prefix_match']}"
-    )
-    assert image_clip_score >= thresholds["clip_score"], (
-        f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {thresholds['clip_score']}"
-    )
-    assert ssim_value >= thresholds["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {thresholds['ssim']}"
-    assert psnr_value >= thresholds["psnr"], (
-        f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {thresholds['psnr']} dB"
-    )
-
-
-def _extract_image(outputs) -> Image.Image:
-    assert outputs, "Pipeline produced no outputs"
-    for output in outputs:
-        images = getattr(output, "images", None)
-        request_output = output
-        if not images and request_output is not None:
-            images = getattr(request_output, "images", None)
-        if images:
-            image = images[0].convert("RGB")
-            image.load()
-            return image
-    raise AssertionError("Pipeline output had no images")
-
-
-def _run_dit_model(
-    model: str,
-    deploy_config_path: str,
-    output_path: Path,
+def _assert_accuracy(
+    image: Image.Image,
+    cot: str | None,
+    label: str,
+    similarity_thresholds: dict[str, SimilarityThresholds],
     *,
-    nvfp4_backend: str | None = None,
-) -> tuple[Image.Image, float]:
-    from tests.helpers.runtime import OmniRunner
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-    from vllm_omni.platforms import current_omni_platform
-
-    old_backend = os.environ.get("VLLM_NVFP4_GEMM_BACKEND")
-    if nvfp4_backend is not None:
-        os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
-
-    try:
-        with OmniRunner(
-            model,
-            deploy_config=deploy_config_path,
-            mode="text-to-image",
-            trust_remote_code=True,
-        ) as runner:
-            generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
-            params = OmniDiffusionSamplingParams(
-                height=QUANT_HEIGHT,
-                width=QUANT_WIDTH,
-                seed=SEED,
-                generator=generator,
-                num_inference_steps=20,
-                guidance_scale=4.0,
-                guidance_scale_provided=True,
-            )
-            t0 = time.perf_counter()
-            outputs = runner.omni.generate({"prompt": QUANT_PROMPT}, params)
-            elapsed = time.perf_counter() - t0
-            image = _extract_image(outputs)
-            image.save(output_path)
-            return image, elapsed
-    finally:
-        if nvfp4_backend is not None:
-            if old_backend is None:
-                os.environ.pop("VLLM_NVFP4_GEMM_BACKEND", None)
-            else:
-                os.environ["VLLM_NVFP4_GEMM_BACKEND"] = old_backend
-        gc.collect()
-        if torch.accelerator.is_available():
-            torch.accelerator.empty_cache()
-
-
-@hardware_test(res={"cuda": "H200"}, num_cards=8)
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
-    reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
-)
-def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
-    if importlib.util.find_spec("FlagEmbedding") is None:
-        raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
-    from tabulate import tabulate  # type: ignore[import-untyped]
-
-    """KV reuse ON vs OFF: same pipeline, same seed → PSNR >= 10 dB."""
-    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-offline-kv-reuse")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        _make_config(True, tmp / "on.yaml")
-        omni_image, omni_cot, time_reuse = _run_offline(str(tmp / "on.yaml"), output_dir)
-
-    scorer = SemanticSimilarityScorer()
-    clip_scorer = CLIPScorer()
-    cot_ref = HUNYUAN_COT_REF_PATH.read_text(encoding="utf-8")
-    cot_results = scorer.text_similarity(omni_cot, cot_ref)
-    image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
-    image_clip_score = clip_scorer.image_image_score(omni_image, image_ref)
-    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=omni_image, reference=image_ref, compare_mode="RGB")
-
-    thresholds = _get_thresholds()
-    table = [
-        ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", thresholds["cot_semantic_sim"]],
-        ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", thresholds["text_prefix_match"]],
-        ["Image-Image similarity", f"{image_clip_score:.4f}", thresholds["clip_score"]],
-        ["SSIM", f"{ssim_value:.4f}", thresholds["ssim"]],
-        ["PSNR (dB)", f"{psnr_value:.2f}", thresholds["psnr"]],
-    ]
-
-    print(tabulate(table, headers=["Metric", "Value", "Threshold"], tablefmt="grid"))
-
-    _assert_cot_structural_markers(omni_cot, "OFFLINE")
-
-    assert cot_results["cot_semantic_sim"] >= thresholds["cot_semantic_sim"], (
-        f"COT semantic similarity {cot_results['cot_semantic_sim']:.4f} is below threshold {thresholds['cot_semantic_sim']}"
-    )
-    assert cot_results["text_prefix_match_count"] >= thresholds["text_prefix_match"], (
-        f"COT prefix match count {cot_results['text_prefix_match_count']} is below threshold {thresholds['text_prefix_match']}"
-    )
-    assert image_clip_score >= thresholds["clip_score"], (
-        f"Image-Image similarity{image_clip_score:.4f} is below threshold {thresholds['clip_score']}"
-    )
-    assert ssim_value >= thresholds["ssim"], f"SSIM {ssim_value:.4f} is below threshold {thresholds['ssim']}"
-    assert psnr_value >= thresholds["psnr"], f"PSNR {psnr_value:.2f} dB is below threshold {thresholds['psnr']} dB"
-
-
-@pytest.mark.parametrize("case", _quant_accuracy_cases())
-@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="Needs 2+ GPUs for HunyuanImage3 DiT")
-def test_quantized_dit_matches_bf16_accuracy(
-    case: _QuantAccuracyCase,
-    accuracy_artifact_root: Path,
+    reference_path: Path | None = None,
 ) -> None:
-    """Quantized DiT checkpoints should preserve prompt-aligned image quality."""
-    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-quant")
-    bf16_model = os.environ[QUANT_BF16_ENV]
-    quant_model = os.environ[case.model_env]
+    ref_path = reference_path or HUNYUAN_IMAGE_REF_PATH
+    device_profile = resolve_device_profile(profiles=similarity_thresholds)
+    thresholds = resolve_similarity_thresholds(similarity_thresholds, device_profile)
+    with Image.open(ref_path) as ref:
+        assert ref.size == (IMAGE_WIDTH, IMAGE_HEIGHT), f"IT2I reference must be {IMAGE_SIZE}"
+        reference_image = ref.convert("RGB")
+    model_label = f"{MODEL_NAME} [{label}] vs reference"
+    ssim, psnr = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=image,
+        diffusers_image=reference_image,
+        compare_mode="RGB",
+    )
+    metrics = {"ssim": ssim, "psnr": psnr}
+    resolved = {"ssim": thresholds.ssim, "psnr": thresholds.psnr}
+    baseline = baseline_from_similarity_thresholds(similarity_thresholds)
+    metric_profiles: dict[str, str] = {}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        deploy_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
-        _make_quant_dit_config(deploy_config_path)
-
-        bf16_image, bf16_time = _run_dit_model(
-            bf16_model,
-            str(deploy_config_path),
-            output_dir / "bf16.png",
+    # Only AR+DiT emits CoT; DiT-only checks the two image quality metrics.
+    if cot is not None:
+        if importlib.util.find_spec("FlagEmbedding") is None:
+            raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
+        cot_ref = HUNYUAN_COT_REF_PATH.read_text(encoding="utf-8")
+        cot_results = SemanticSimilarityScorer().text_similarity(cot, cot_ref)
+        metrics.update(
+            {
+                "clip_score": CLIPScorer().image_image_score(image, reference_image),
+                "cot_semantic_sim": cot_results["cot_semantic_sim"],
+                "text_prefix_match_count": cot_results["text_prefix_match_count"],
+            }
         )
-        quant_image, quant_time = _run_dit_model(
-            quant_model,
-            str(deploy_config_path),
-            output_dir / f"{case.name}.png",
-            nvfp4_backend=case.nvfp4_backend,
-        )
+        for metric, table in (
+            ("cot_semantic_sim", COT_SEMANTIC_THRESHOLDS),
+            ("text_prefix_match_count", COT_PREFIX_THRESHOLDS),
+            ("clip_score", IMAGE_SIMILARITY_THRESHOLDS),
+        ):
+            profile, threshold = resolve_device_threshold(table, label=metric)
+            metric_profiles[metric] = profile
+            resolved[metric] = threshold
+            for profile, value in table.items():
+                baseline.setdefault(profile, {})[metric] = value
 
-    ssim_score, psnr_score = compute_image_ssim_psnr(
-        prediction=quant_image,
-        reference=bf16_image,
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics=metrics,
+        baseline=baseline,
+        extra={
+            "label": label,
+            "reference": str(ref_path),
+            "quantization": "disabled",
+            "device_profile": device_profile,
+            "metric_profiles": metric_profiles,
+        },
     )
-    quant_thresholds = _get_quant_thresholds()
-    assert_similarity(
-        model_name=f"{MODEL_NAME} {case.name} vs bf16",
-        vllm_image=quant_image,
-        diffusers_image=bf16_image,
-        ssim_threshold=quant_thresholds["ssim"],
-        psnr_threshold=quant_thresholds["psnr"],
-        width=QUANT_WIDTH,
-        height=QUANT_HEIGHT,
+    for name, value in metrics.items():
+        print(f"[{label}] {name}: {value:.6f} (threshold >= {resolved[name]})")
+    if cot is not None:
+        _assert_cot_structural_markers(cot, label)
+        for metric in ("clip_score", "cot_semantic_sim", "text_prefix_match_count"):
+            assert metrics[metric] >= resolved[metric], (
+                f"[{label}] {metric} {metrics[metric]:.4f} below threshold {resolved[metric]}"
+            )
+    assert_similarity_metrics(
+        model_name=model_label,
+        ssim_score=ssim,
+        psnr_score=psnr,
+        ssim_threshold=thresholds.ssim,
+        psnr_threshold=thresholds.psnr,
     )
 
-    clip_scorer = CLIPScorer()
-    bf16_clip_score = clip_scorer.score(bf16_image, QUANT_PROMPT)
-    quant_clip_score = clip_scorer.score(quant_image, QUANT_PROMPT)
-    clip_score_drop = bf16_clip_score - quant_clip_score
 
-    metrics = {
-        "case": case.name,
-        "bf16_model": bf16_model,
-        "quant_model": quant_model,
-        "prompt": QUANT_PROMPT,
-        "seed": SEED,
-        "height": QUANT_HEIGHT,
-        "width": QUANT_WIDTH,
-        "num_inference_steps": 20,
-        "guidance_scale": 4.0,
-        "bf16_elapsed_s": bf16_time,
-        "quant_elapsed_s": quant_time,
-        "ssim": ssim_score,
-        "psnr": psnr_score,
-        "bf16_clip_score": bf16_clip_score,
-        "quant_clip_score": quant_clip_score,
-        "clip_score_drop": clip_score_drop,
-    }
-    metrics_path = output_dir / f"{case.name}_metrics.json"
-    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=4)
+@pytest.mark.parametrize("omni_server_function", [_AR_DIT_SERVER_PARAMS], indirect=True)
+@pytest.mark.local_model
+def test_hunyuan_image3_ar_tp2_dit_tp2_it2i_online(
+    accuracy_artifact_root: Path, omni_server_function: OmniServer, online_client_function: OnlineOmniClient
+) -> None:
+    """AR TP=2 + DiT TP=2: online image and CoT quality against the references."""
+    label = f"ar_tp{AR_TP_SIZE}_dit_tp{DIT_TP_SIZE}_it2i_online"
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-" + label)
+    image, cot = _run_online(omni_server_function, online_client_function, output_dir, bot_task="think_recaption")
+    _assert_accuracy(image, cot, label, SIMILARITY_THRESHOLDS_BY_DEVICE)
 
-    print(f"\nHunyuanImage3 quant accuracy ({case.name})")
-    print(f"  bf16 model:       {bf16_model}")
-    print(f"  quant model:      {quant_model}")
-    print(f"  BF16 CLIP score:  {bf16_clip_score:.4f}")
-    print(f"  quant CLIP score: {quant_clip_score:.4f} threshold>={quant_thresholds['clip_score']:.4f}")
-    print(f"  CLIP score drop:  {clip_score_drop:.4f} threshold<={quant_thresholds['clip_score_drop']:.4f}")
-    print(f"  metrics:          {metrics_path}")
 
-    assert quant_clip_score >= quant_thresholds["clip_score"], (
-        f"{case.name} CLIP score below threshold: got {quant_clip_score:.4f}, "
-        f"expected >= {quant_thresholds['clip_score']:.4f}"
-    )
-    assert clip_score_drop <= quant_thresholds["clip_score_drop"], (
-        f"{case.name} CLIP score drop too large: got {clip_score_drop:.4f}, "
-        f"expected <= {quant_thresholds['clip_score_drop']:.4f}"
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=4)
+@pytest.mark.parametrize("omni_runner_function", [_AR_DIT_RUNNER_PARAMS], indirect=True)
+@pytest.mark.local_model
+def test_hunyuan_image3_ar_tp2_dit_tp2_it2i_offline(
+    accuracy_artifact_root: Path, omni_runner_function: OmniRunner
+) -> None:
+    """AR TP=2 + DiT TP=2: offline image and CoT quality against the references."""
+    label = f"ar_tp{AR_TP_SIZE}_dit_tp{DIT_TP_SIZE}_it2i_offline"
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-" + label)
+    image, cot = _run_offline(omni_runner_function, output_dir)
+    _assert_accuracy(image, cot, label, SIMILARITY_THRESHOLDS_BY_DEVICE)
+
+
+@hardware_test(res={"cuda": ["H100", "H200", "B200"], "npu": "A3"}, num_cards=4)
+@pytest.mark.parametrize("omni_server_function", [_DIT_SERVER_PARAMS], indirect=True)
+@pytest.mark.full_model
+def test_hunyuan_image3_dit_tp4_it2i_online(
+    accuracy_artifact_root: Path, omni_server_function: OmniServer, online_client_function: OnlineOmniClient
+) -> None:
+    """DiT TP=4: image quality against the official Distil direct-DiT IT2I reference."""
+    label = "dit_tp4_it2i_online"
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-" + label)
+    image, _ = _run_online(omni_server_function, online_client_function, output_dir, bot_task="none")
+    _assert_accuracy(
+        image,
+        None,
+        label,
+        DIT_SIMILARITY_THRESHOLDS_BY_DEVICE,
+        reference_path=_dit_it2i_reference_path(),
     )

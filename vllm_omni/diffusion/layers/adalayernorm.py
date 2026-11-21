@@ -279,7 +279,12 @@ if _HAS_TRITON:
         if runtime_key in _FAILED_ADALN_KEYS:
             return None
         try:
-            _adaln_scale_shift_layernorm_kernel[(rows,)](*args, num_warps=cfg[1])
+            # Keep the half-precision rounding between modulation multiply
+            # and add; contraction otherwise produces a single BF16/FP16 FMA.
+            if is_half:
+                _adaln_scale_shift_layernorm_kernel[(rows,)](*args, num_warps=cfg[1], enable_fp_fusion=False)
+            else:
+                _adaln_scale_shift_layernorm_kernel[(rows,)](*args, num_warps=cfg[1])
         except Exception as exc:  # noqa: BLE001 - fail closed after optimized-path failure
             _FAILED_ADALN_KEYS.add(runtime_key)
             logger.warning(
