@@ -1259,6 +1259,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         """Select unsummarized recent turns and retain the latest instruction."""
         history = []
         item_ids = session_config.get("conversation_item_ids", ())
+        response_refs = {item.response_item_id for item in session_config.get("joyai_observations", ())}
         query = runtime_config.get("initial_user_text") or ""
         latest_instruction = None
         if query:
@@ -1267,11 +1268,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", []))):
             if role not in {"user", "assistant"}:
                 continue
-            if text:
+            item_key = item_ids[index] if index < len(item_ids) and item_ids[index] else index
+            # An unheard visual reply still separates observations after cancellation.
+            # Retain its empty Session item without inventing speech or restoring a deletion.
+            if text or (role == "assistant" and item_key in response_refs):
                 message = {
                     "role": role,
-                    "content": ("</response> " if role == "assistant" else "") + text,
-                    "_item_key": item_ids[index] if index < len(item_ids) and item_ids[index] else index,
+                    "content": ("</response> " if role == "assistant" and text else "") + text,
+                    "_item_key": item_key,
                 }
                 if role == "user":
                     query = text
@@ -1286,7 +1290,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # current conversation even when summaries or the history bound cover it.
         if latest_instruction is not None and latest_instruction not in history:
             history = [latest_instruction, *history[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES - 1) :]]
-        response_refs = {item.response_item_id for item in session_config.get("joyai_observations", ())}
         while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in response_refs:
             history.pop(0)
         return history, latest_instruction, query

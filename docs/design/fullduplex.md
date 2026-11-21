@@ -1467,6 +1467,12 @@ comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
 
+JoyAI keeps an empty assistant message for a retained visual observation's
+response when cancellation leaves no committed speech. This preserves the turn
+boundary in both direct and ASR-handoff prompts without restoring unheard text
+or treating cancellation as a model silence decision. The boundary follows the
+existing recent-history budget and disappears when its history item is deleted.
+
 While idle, JoyAI retains the latest camera frame and one input chunk of audio
 pre-roll. Once speech starts, it keeps the utterance until commit. An idle
 camera commit enters JoyAI directly; reserved-byte accounting includes the
