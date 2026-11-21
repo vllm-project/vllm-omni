@@ -6,12 +6,14 @@ import asyncio
 import contextlib
 import copy
 import io
+import itertools
 import json
 import mimetypes
 import os
 import random
 import ssl
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -2856,6 +2858,117 @@ async def async_request_openai_image_edits_omni(
     return output
 
 
+_BENCH_AUDIO_SAVE_INDEX = itertools.count(1)
+# One bench run regenerates the whole bench_*.wav set (the per-process index
+# restarts at 0001), so the manifest must describe exactly the current run:
+# the first save of a process truncates it, saves within the run append.
+_BENCH_AUDIO_MANIFEST_OPENED: set[str] = set()
+_BENCH_AUDIO_MANIFEST_LOCK = threading.Lock()
+# Scheduled-but-not-yet-finished WAV dumps. The request function schedules
+# them fire-and-forget so disk I/O never holds a concurrency slot or extends
+# the timed window; the timed run flushes this set right after the gather.
+_BENCH_AUDIO_SAVE_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _save_streamed_pcm_as_wav(
+    save_dir: str,
+    pcm: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+    sample_width: int,
+    request_tag: str | None,
+    prompt: str = "",
+    ttfp_ms: float = 0.0,
+    rtf: float = 0.0,
+) -> str:
+    """Dump one streamed raw-PCM response as a self-describing WAV for QA.
+
+    Called after the request's latency/RTF are already measured, and off the
+    event loop, so saving never perturbs the metrics it documents.
+
+    QA copies are loudness-normalized to a uniform RMS (generated clip loudness
+    varies up to ~17x on VoxCPM2, which reads as "too quiet"/"noisy" when
+    auditioning a mixed set) and gain-clipped at 0.95 peak. Normalization only
+    ever GAINS up quiet clips; loud clips pass through untouched, so this never
+    masks a clipping defect.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    if sample_width == 2 and channels >= 1 and pcm:
+        try:
+            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+            if 0.0 < rms < 0.09:
+                peak = float(np.abs(samples).max()) or 1.0
+                gain = min(0.09 / rms, 0.95 / peak)
+                if gain > 1.01:
+                    gained = np.clip(samples * gain, -0.99, 0.99)
+                    pcm = (gained * 32767.0).astype(np.int16).tobytes()
+        except Exception:
+            pass
+    index = next(_BENCH_AUDIO_SAVE_INDEX)
+    filename = f"bench_{index:04d}.wav"
+    path = os.path.join(save_dir, filename)
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
+    frames = len(pcm) // max(sample_width * channels, 1)
+    duration_s = frames / sample_rate if sample_rate > 0 else 0.0
+    with _BENCH_AUDIO_MANIFEST_LOCK:
+        mode = "a" if save_dir in _BENCH_AUDIO_MANIFEST_OPENED else "w"
+        _BENCH_AUDIO_MANIFEST_OPENED.add(save_dir)
+        with open(os.path.join(save_dir, "manifest.jsonl"), mode, encoding="utf-8") as manifest:
+            # ensure_ascii=False: prompts are typically non-ASCII and the manifest
+            # is read by humans first — keep it greppable, not \u-escaped.
+            manifest.write(
+                json.dumps(
+                    {
+                        "file": filename,
+                        "request_id": request_tag,
+                        "prompt": prompt,
+                        "sample_rate": sample_rate,
+                        "channels": channels,
+                        "frames": frames,
+                        "duration_s": round(duration_s, 4),
+                        "ttfp_ms": round(ttfp_ms, 2),
+                        "rtf": round(rtf, 4),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    return path
+
+
+def _schedule_streamed_pcm_save(save_dir: str, pcm: bytes, **kwargs) -> None:
+    """Queue one WAV dump as a background task instead of awaiting it inline.
+
+    The request's latency/RTF are already recorded when this is called, so
+    saving never perturbs the metrics it documents; scheduling (instead of
+    awaiting) also means disk I/O holds no benchmark concurrency slot and
+    does not extend the timed window. The timed run flushes the queue right
+    after the request gather, so dumps always complete before the run ends.
+    """
+    task = asyncio.get_running_loop().create_task(asyncio.to_thread(_save_streamed_pcm_as_wav, save_dir, pcm, **kwargs))
+    _BENCH_AUDIO_SAVE_TASKS.add(task)
+    task.add_done_callback(_bench_audio_save_done)
+
+
+def _bench_audio_save_done(task: asyncio.Task[None]) -> None:
+    _BENCH_AUDIO_SAVE_TASKS.discard(task)
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Streamed PCM dump failed: %s", exc)
+
+
+async def _await_pending_audio_saves() -> None:
+    """Wait for every scheduled WAV dump to land before the run is reported."""
+    if _BENCH_AUDIO_SAVE_TASKS:
+        await asyncio.gather(*list(_BENCH_AUDIO_SAVE_TASKS), return_exceptions=True)
+
+
 async def async_request_openai_audio_speech(
     request_func_input: RequestFuncInput, session: aiohttp.ClientSession, pbar: tqdm | None = None
 ) -> MixRequestFuncOutput:
@@ -2896,11 +3009,14 @@ async def async_request_openai_audio_speech(
     sample_rate, channels = defs.stream_pcm_format_from_env()
     sample_width = defs.DEFAULT_AUDIO_SAMPLE_WIDTH
 
+    audio_save_dir = os.environ.get("VLLM_OMNI_BENCH_SAVE_AUDIO_DIR", "").strip()
+
     st = time.perf_counter()
     output.start_time = st
     total_pcm_bytes = 0
     capture_wer_pcm = _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False)
     pcm_capture = bytearray() if capture_wer_pcm else None
+    audio_dump = bytearray() if audio_save_dir else None
     chunk_arrival_times_s: list[float] = []
     chunk_sizes: list[int] = []
     response_end_s: float | None = None
@@ -2922,6 +3038,8 @@ async def async_request_openai_audio_speech(
                     chunk_sizes.append(len(chunk))
                     if pcm_capture is not None:
                         pcm_capture.extend(chunk)
+                    if audio_dump is not None:
+                        audio_dump.extend(chunk)
 
                 end_time = time.perf_counter()
                 output.latency = end_time - st
@@ -2971,6 +3089,18 @@ async def async_request_openai_audio_speech(
                     except Exception as ex:
                         logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
                         output.tts_output_pcm_bytes = bytes(pcm_capture)
+                if audio_dump is not None:
+                    _schedule_streamed_pcm_save(
+                        audio_save_dir,
+                        bytes(audio_dump),
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        sample_width=sample_width,
+                        request_tag=getattr(request_func_input, "request_id", None),
+                        prompt=str(getattr(request_func_input, "prompt", "") or ""),
+                        ttfp_ms=output.audio_ttfp * 1000.0,
+                        rtf=output.audio_rtf,
+                    )
                 output.success = True
             else:
                 output.error = response.reason or ""
@@ -4059,6 +4189,8 @@ async def benchmark(
             request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
         warmup_outputs = await asyncio.gather(*warmup_tasks)
+        # Warmup dumps must not bleed into the timed run that follows.
+        await _await_pending_audio_saves()
 
         if warmup_pbar is not None:
             warmup_pbar.close()
@@ -4225,6 +4357,9 @@ async def benchmark(
     else:
         outputs = await asyncio.gather(*tasks)
     fail_fast_triggered = any(getattr(output, "timed_out", False) for output in outputs)
+    # The timed window ends at the gather: flush queued WAV dumps here, after
+    # it, so disk I/O never extends benchmark_duration.
+    await _await_pending_audio_saves()
 
     if probe_task is not None:
         probe_stop.set()
