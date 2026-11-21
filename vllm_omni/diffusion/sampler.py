@@ -15,15 +15,57 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+
+_deferred_conditions: ContextVar[list[tuple[torch.Tensor, str]] | None] = ContextVar(
+    "deferred_conditions", default=None
+)
+
+
+def require_device_condition(condition: torch.Tensor, message: str) -> None:
+    """Raise ValueError(message) unless the 0-d bool tensor ``condition`` holds.
+
+    Inside ``deferred_checks()`` the host readback waits until the block exits, so a
+    sampling loop does not stall the device at every check.
+    """
+    pending = _deferred_conditions.get()
+    if pending is None:
+        if not bool(condition.item()):
+            raise ValueError(message)
+    else:
+        pending.append((condition, message))
+
+
+@contextmanager
+def deferred_checks():
+    """Read ``require_device_condition`` checks back once, when the block exits.
+
+    Unlike a plain ``sample()`` call, a failing check inside the block no longer stops the
+    step before its state is published: use it only where a failure abandons the request.
+    """
+    if _deferred_conditions.get() is not None:
+        yield
+        return
+    pending: list[tuple[torch.Tensor, str]] = []
+    token = _deferred_conditions.set(pending)
+    try:
+        yield
+    finally:
+        _deferred_conditions.reset(token)
+    if pending:
+        flags = torch.stack([condition.reshape(()) for condition, _ in pending]).tolist()
+        for ok, (_, message) in zip(flags, pending, strict=True):
+            if not ok:
+                raise ValueError(message)
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
-    if not bool(torch.isfinite(tensor).all().item()):
-        raise ValueError(f"{name} must be finite")
+    require_device_condition(torch.isfinite(tensor).all(), f"{name} must be finite")
 
 
 def _validate_sigma(value: float, name: str) -> float:
@@ -77,10 +119,14 @@ def euler_eta0_step(
     compute_dtype = torch.float32
     if state.dtype not in (torch.float16, torch.bfloat16):
         compute_dtype = state.dtype
-    sigma_curr_t = state.new_tensor(sigma_curr, dtype=compute_dtype)
-    sigma_next_t = state.new_tensor(sigma_next, dtype=compute_dtype)
-    sigma_ratio = sigma_next_t / sigma_curr_t
-    out = sigma_ratio * state.to(dtype=compute_dtype) + (1.0 - sigma_ratio) * denoised.to(dtype=compute_dtype)
+    if compute_dtype == torch.float32:
+        ratio = np.float32(sigma_next) / np.float32(sigma_curr)
+        sigma_ratio, sigma_rest = float(ratio), float(np.float32(1.0) - ratio)
+    else:
+        sigma_curr_t = state.new_tensor(sigma_curr, dtype=compute_dtype)
+        sigma_ratio = state.new_tensor(sigma_next, dtype=compute_dtype) / sigma_curr_t
+        sigma_rest = 1.0 - sigma_ratio
+    out = sigma_ratio * state.to(dtype=compute_dtype) + sigma_rest * denoised.to(dtype=compute_dtype)
     out = out.to(dtype=state.dtype)
     _require_finite_tensor(out, "euler_eta0_step output")
     return out

@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.sampler import ModelEvaluation, SamplingState
+from vllm_omni.diffusion.sampler import ModelEvaluation, SamplingState, require_device_condition
 
 from .latent_mask import MiniMaxH3LatentEdit
 from .scheduling_minimax_h3_euler_ancestral import minimax_h3_rf_v_to_x0
@@ -124,8 +124,10 @@ class MiniMaxH3Model:
             shape = (index.shape[0], *row.shape[1:])
             if latent.shape != shape or latent.dtype != row.dtype or latent.device != row.device:
                 raise ValueError("Sampled latents must match the target rows' shape, dtype, and device")
-        if not bool(torch.stack([torch.isfinite(latent).all() for latent in state.latents]).all().item()):
-            raise ValueError("Sampled latents must be finite before writing rows")
+        require_device_condition(
+            torch.stack([torch.isfinite(latent).all() for latent in state.latents]).all(),
+            "Sampled latents must be finite before writing rows",
+        )
 
     def write_back(self, state: SamplingState):
         """Write checked latents into the existing full video/audio rows."""

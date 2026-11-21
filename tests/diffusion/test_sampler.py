@@ -15,6 +15,9 @@ from vllm_omni.diffusion.sampler import (
     Sampler,
     SamplingState,
     _commit,
+    deferred_checks,
+    euler_eta0_step,
+    require_device_condition,
     res_multistep_coefficients,
     sample_heun,
     sample_res_multistep,
@@ -353,3 +356,39 @@ def test_heun_correction_evaluates_proposal_at_next_sigma_and_batches_only_non_t
     torch.testing.assert_close(late.latents[0], torch.full((3,), 0.25))
     assert early.step_index == late.step_index == 1
     assert early.history is None and late.history is None
+
+
+def test_deferred_checks_read_back_once_at_exit():
+    with deferred_checks():
+        require_device_condition(torch.tensor(True), "fine")
+    reached = []
+    with pytest.raises(ValueError, match="second"):
+        with deferred_checks():
+            require_device_condition(torch.tensor(True), "first")
+            require_device_condition(torch.tensor(False), "second")
+            reached.append("after failing check")
+    assert reached == ["after failing check"]
+    with pytest.raises(ValueError, match="immediate"):
+        require_device_condition(torch.tensor(False), "immediate")
+
+
+def test_nested_deferred_checks_report_at_the_outermost_exit():
+    reached = []
+    with pytest.raises(ValueError, match="inner"):
+        with deferred_checks():
+            with deferred_checks():
+                require_device_condition(torch.tensor(False), "inner")
+            reached.append("outer tail")
+    assert reached == ["outer tail"]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("sigmas", [(1.0, 0.9), (0.977, 0.12345), (0.31, 0.0), (1e-3, 7e-4)])
+def test_euler_step_matches_device_scalar_formula(dtype, sigmas):
+    torch.manual_seed(0)
+    state, denoised = torch.randn(4096, dtype=dtype), torch.randn(4096, dtype=dtype)
+    curr, nxt = sigmas
+    compute = torch.float32
+    ratio = state.new_tensor(nxt, dtype=compute) / state.new_tensor(curr, dtype=compute)
+    expected = (ratio * state.to(compute) + (1.0 - ratio) * denoised.to(compute)).to(dtype)
+    assert torch.equal(euler_eta0_step(state, denoised, sigma_curr=curr, sigma_next=nxt), expected)
