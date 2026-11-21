@@ -1,6 +1,7 @@
 # Copyright 2022 The OpenAI Authors and The HuggingFace Inc. team. All rights reserved.
 #               2025 Zhipu AI Inc (authors: CogAudio Group Members)
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """WhisperVQEncoder: HF WhisperEncoder + VQ codebook + inter-layer pooling.
 
 Built on standard ``WhisperConfig``.  VQ-specific parameters are patched onto
@@ -248,8 +249,8 @@ class WhisperVQEncoder(WhisperEncoder):
         k = int(self.config.pooling_kernel_size)  # type: ignore[attr-defined]
         pooled_segments: list[Tensor] = []
         pooled_masks: list[Tensor] = []
-        for batch_idx in range(int(hidden_states.shape[0])):
-            length = int(valid_mask[batch_idx].sum().item())
+        valid_lengths = valid_mask.sum(dim=1).tolist()
+        for batch_idx, length in enumerate(valid_lengths):
             segment = hidden_states[batch_idx, :length]
             if segment.numel() == 0:
                 pooled = hidden_states.new_zeros((0, hidden_states.shape[-1]))
@@ -278,8 +279,8 @@ class WhisperVQEncoder(WhisperEncoder):
             dtype=torch.long,
             device=hidden_states.device,
         )
-        for batch_idx in range(int(hidden_states.shape[0])):
-            length = int(valid_mask[batch_idx].sum().item())
+        valid_lengths = valid_mask.sum(dim=1).tolist()
+        for batch_idx, length in enumerate(valid_lengths):
             if length <= 0:
                 continue
             segment = hidden_states[batch_idx : batch_idx + 1, :length]
