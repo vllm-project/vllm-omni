@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
     gather_causal_cache,
     supports_fused_body,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.ops import qkv_head_layer_norm
 
 from .cosyvoice2_dit_attn import _expand_attn_mask_for_npu
 
@@ -275,17 +276,19 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
     if cached and (att_cache[0].data_ptr() != behind_keys.data_ptr() or att_cache[0].stride() != behind_keys.stride()):
         behind_keys[:, :, :cached].copy_(att_cache[0])
         behind_values[:, :, :cached].copy_(att_cache[1])
-    packed = qkv.view(batch, frames, 3, int(attn.num_heads), int(attn.head_dim))
-    query = attn.q_norm(packed[:, :, 0].transpose(1, 2))
-    current_keys = attn.k_norm(packed[:, :, 1].transpose(1, 2))
-    current_values = packed[:, :, 2].transpose(1, 2)
     # A masked gap past the real cache must stay finite: an uninitialized key
     # poisons real rows through ``0 * NaN`` in the attention epilogue.
     if logical_cache > cached:
         behind_keys[:, :, cached:].zero_()
         behind_values[:, :, cached:].zero_()
-    keys[:, :, :frames].copy_(current_keys)
-    values[:, :, :frames].copy_(current_values)
+    query = qkv_head_layer_norm(
+        qkv,
+        kv,
+        num_heads=int(attn.num_heads),
+        head_dim=int(attn.head_dim),
+        q_norm=attn.q_norm,
+        k_norm=attn.k_norm,
+    )
     mask = _expand_attn_mask_for_npu(attn_mask, frames, capacity)
     if mask is not None and int(mask.shape[-1]) != capacity:
         tail = capacity - int(mask.shape[-1])

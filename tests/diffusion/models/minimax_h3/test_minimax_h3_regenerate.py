@@ -255,7 +255,7 @@ def _regenerate_pipeline(adapter):
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.load_vae_encoder = True
-    pipeline.od_config = SimpleNamespace(step_execution=False)
+    pipeline.od_config = SimpleNamespace(cache_backend="none", additional_config={}, step_execution=False)
     pipeline._regenerate = adapter
     pipeline._quality_policy = SimpleNamespace(resolve=lambda **_kwargs: SimpleNamespace(cache_dit=None))
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda _plan: None)

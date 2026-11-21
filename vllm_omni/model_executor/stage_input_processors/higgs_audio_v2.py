@@ -194,7 +194,9 @@ def talker2code2wav_async_chunk(
         )
 
     length = len(transfer_manager.code_prompt_token_ids[request_id])
-    if length <= 0:
+    state = transfer_manager.request_payload.setdefault(request_id, {})
+    pending_frames = length - int(state.get("higgs_frames_sent", 0))
+    if pending_frames <= 0:
         if finished:
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
@@ -207,7 +209,9 @@ def talker2code2wav_async_chunk(
         # Wait until we have a clean chunk boundary.
         return None
 
-    context_length = chunk_remainder if (finished and chunk_remainder > 0) else chunk_size
+    # EOF can arrive without a new frame, including exactly at a boundary.
+    # Only frames beyond the last emission count as new decoder output.
+    context_length = pending_frames
     end_index = min(length, left_context_size_config + context_length)
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
@@ -227,6 +231,7 @@ def talker2code2wav_async_chunk(
         [window_frames[f][q] for q in range(num_codebooks) for f in range(num_frames)],
         dtype=torch.long,
     )
+    state["higgs_frames_sent"] = length
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=flat),

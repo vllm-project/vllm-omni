@@ -272,7 +272,7 @@ A profile identical to the base reuses the base implementation, unless the
 profile carries its own calibration, including one propagated from the
 checkpoint's `sparse_attention_config`. Each distinct FlashInfer implementation
 adds a 128 MiB workspace per layer, unless FlashInfer runs its cute-dsl backend
-(the automatic choice on Blackwell).
+(the automatic choice on SM 10.x/11.x Blackwell).
 
 Startup warm-up does not exercise profiles. Warm up the base and each profile
 before timing. CPU tests use stand-in kernels; they do not establish GPU,

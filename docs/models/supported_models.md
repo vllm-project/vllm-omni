@@ -10,6 +10,12 @@ For deployment recipes (TTS and multimodal), see [recipes.vllm.ai](https://recip
 
 ## List of Supported Models
 
+With vLLM 0.34.0, profiles that require Model Runner V1 are unavailable,
+including Drama 3 / Fish-Omni serving and the LFM3-Omni profiles. Their
+implementation entries below do not imply runnable V2 deployments. See
+[stage-level runner selection](../configuration/stage_configs.md#stage-level-runner-selection)
+for the unavailable workflows and CI coverage limits.
+
 <style>
 th {
   white-space: nowrap;
@@ -37,7 +43,6 @@ th {
 | `MiniMaxH3ImagePipeline` | MiniMax-H3-Image (text-to-image and editing, Atlas 800T A3, Atlas 800I A2 and Atlas 350) | `MiniMaxAI/MiniMax-H3-Image` | | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-NPU.md) |
 | `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2512.md) |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
-| `JoyImageEditPipeline` | JoyAI-Image-Edit | `jdopensource/JoyAI-Image-Edit-Diffusers` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/JD/JoyAI-Image-Edit.md) |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2511 | `Qwen/Qwen-Image-Edit-2511` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
@@ -51,6 +56,7 @@ th {
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Cosmos3MultiviewPipeline` | Cosmos3 multiview T2V, I2V, WSM transfer, view completion, optional joint LiDAR | `Cosmos3-Nano-Transfer-Auto` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md) |
 | `Flux3Pipeline` | Flux3 — T2I, I2I | — | ✅︎ | | | | — |
 | `SanaWmPipeline` | SANA-WM | `BBBBruce/SANA-WM_bidirectional-stage1-diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-WM.md) |
 | `HyNomasModularPipeline` | Hy-Nomas distilled (Diffusers-format weights, reference runtime adapter) | `tencent/Hy-Nomas-Diffusers` | ✅︎ (H200 tested) | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md) |
@@ -145,7 +151,6 @@ th {
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | ✅︎ | — |
 | `HiDreamO1ImagePipeline` | HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | ✅︎ | | | | — |
 | `AnimaPipeline` | Anima | `circlestone-labs/Anima` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/circlestone-labs/Anima.md) |
-| `KokoroForConditionalGeneration` | Kokoro-82M | `hexgrad/Kokoro-82M` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/hexgrad/Kokoro-82M-A6000.md) |
 
 The `Recipe` column links the corresponding deployment recipe. `Published` is
 preferred when a corresponding `recipes.vllm.ai` page exists; otherwise the

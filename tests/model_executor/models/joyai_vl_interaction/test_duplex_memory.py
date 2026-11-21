@@ -3,7 +3,7 @@
 
 import asyncio
 import struct
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -24,9 +24,16 @@ from vllm_omni.engine.duplex.commands import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
-from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
+from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, duplex_history_digest, duplex_text_history
 from vllm_omni.engine.duplex.session import memory_runtime
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import VisualSummary
+from vllm_omni.engine.duplex.visual_memory import (
+    VisualSummary,
+)
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import (
+    JoyAIDataPlane,
+    JoyAISessionState,
+    QueryReference,
+)
 from vllm_omni.model_executor.stage_input_processors import joyai_vl_interaction as joyai_bridge
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -1485,3 +1492,51 @@ async def test_queued_completion_keeps_identity_when_earlier_command_appends_tai
     finally:
         release.set()
         await h.manager.shutdown()
+
+
+@dataclass
+class _MemoryStageCompletion:
+    text: str
+    cumulative_text: str | None = None
+
+
+@dataclass
+class _MemoryStageOutput:
+    request_id: str
+    text: str
+    finished: bool = False
+    stage_id: int = 0
+    multimodal_output: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.outputs = [_MemoryStageCompletion(text=self.text, cumulative_text=self.text if self.finished else None)]
+
+
+def test_query_response_reference_is_recorded_once():
+    """Streaming text deltas must not append the same response 16 times."""
+    plane = JoyAIDataPlane(encode_audio=lambda *_args, **_kwargs: "")
+    plane.begin_request("req")
+    observation = plane.requests["req"]
+    digest = duplex_history_digest((("user", "Is the water boiling?"),))
+    query = QueryReference(item_id="user-1", text_digest=digest, time_s=1.0, first_frame_id=0)
+    observation.state = JoyAISessionState(queries=[query])
+    observation.query_reference = query
+    observation.modalities = ("text",)
+    context = DuplexDataPlaneContext(modalities=("text",), active_response_id="resp-1")
+    spoken = "The water is boiling now."
+    for index in range(1, len(spoken) + 1):
+        list(
+            plane.project(
+                {"data_plane_outputs": [_MemoryStageOutput("req", spoken[:index])]},
+                context=context,
+            )
+        )
+        assert observation.state.queries[0].responses == ()
+    list(
+        plane.project(
+            {"data_plane_outputs": [_MemoryStageOutput("req", spoken, finished=True)]},
+            context=context,
+        )
+    )
+    [response] = observation.state.queries[0].responses
+    assert response.item_id == "item_resp-1"

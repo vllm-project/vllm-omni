@@ -1,6 +1,7 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
-# Keep MRv1 on other platforms; CUDA selects MRv2 below.
+# Keep MRv1 as the global default for deferred platforms; CUDA, ROCm and NPU
+# select MRv2 below.
 model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
@@ -223,6 +224,9 @@ platforms:
       - stage_id: 1
         # K-step advances one codec frame per FlashAttention query.
         attention_backend: FLASH_ATTN
+        # K-step exposes two control logits, not codec prompt logprobs.
+        # Automatic KV sizing must not request generic prompt logprobs.
+        max_logprobs: 0
         # Cover 16 full 4096-token requests while leaving room for Code2Wav.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         # Fifteen continuation drafts reserve sixteen codec positions per step.
@@ -240,6 +244,11 @@ platforms:
         devices: "0,0"
         gpu_memory_utilization: 0.15
         max_num_seqs: 8
+
+  rocm:
+    # vLLM 0.34 removed Model Runner V1; preserve the shared duplex topology
+    # and connector options while selecting the supported runner on ROCm.
+    model_runner: v2
 
   npu:
     # All three stages use MRv2.

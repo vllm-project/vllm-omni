@@ -386,7 +386,13 @@ def _pipeline(*, load_vae_decoder=True):
     pipeline = _bare_pipeline()
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
-    pipeline.od_config = SimpleNamespace(step_execution=False)
+    pipeline.od_config = SimpleNamespace(
+        additional_config={},
+        cache_backend="none",
+        controlnet_model_path=None,
+        step_execution=False,
+        diffusion_attention_schedule=None,
+    )
     pipeline.load_vae_decoder = load_vae_decoder
     pipeline._fasth3 = pipeline._fasth3_checkpoint = pipeline._vdn = None
     pipeline._active_turbo_spec = lambda _sampling: None
@@ -628,7 +634,9 @@ def test_step_post_decode_keeps_the_real_tail_caches_and_trims():
     state = SimpleNamespace(
         extra={"minimax_h3_shape": shape, "minimax_h3_branch": None, "minimax_h3_audio_rows": None}, latents=None
     )
-    pipeline.od_config = SimpleNamespace(step_execution=True)
+    pipeline.od_config = SimpleNamespace(
+        additional_config={}, cache_backend="none", controlnet_model_path=None, step_execution=True
+    )
     video, _ = pipeline.post_decode(state).output
     assert video.shape[1] == 119
     cached = pipeline._latent_clip_cache.get("b")

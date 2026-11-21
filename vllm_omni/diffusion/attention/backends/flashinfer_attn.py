@@ -288,11 +288,14 @@ class FlashInferAttentionImpl(AttentionImpl):
             )
         except Exception:
             return "fa2"
-        if major >= 10:
-            return "cute-dsl"
-        if major >= 9:
-            return "fa3"
-        return "fa2"
+        match major:
+            # cute-dsl uses tcgen05, which SM 12.x (consumer Blackwell) lacks.
+            case 10 | 11:
+                return "cute-dsl"
+            case 9:
+                return "fa3"
+            case _:
+                return "fa2"
 
     @classmethod
     def _check_dtype(

@@ -19,6 +19,7 @@ AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 TINY_DIFFUSION_LABELS = {
     "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
     "ROCm · Tiny Diffusion Multi-GPU · 4-GPU",
+    "ROCm · Tiny Diffusion Multi-GPU · 4-GPU Stable",
 }
 
 
@@ -126,6 +127,26 @@ def test_unrelated_pr_change_omits_all_amd_nightly_jobs() -> None:
         pipeline_path=AMD_NIGHTLY_PIPELINE,
     )
     assert filtered["steps"] == []
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    (
+        "tests/e2e/offline_inference/test_device_postprocess_equivalence.py",
+        "vllm_omni/diffusion/postprocess/device_reduction.py",
+        "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        ".buildkite/amd/scripts/assert-pytest-collection.sh",
+    ),
+)
+def test_wan_device_postprocess_changes_keep_equivalence_nightly(changed_file: str) -> None:
+    filtered = FILTER.filter_amd_nightly_suite(
+        _load_pipeline(AMD_NIGHTLY_PIPELINE),
+        [changed_file],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+    )
+
+    assert "Wan2.2 Device-Postprocess Equivalence" in _labels(filtered)
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ A single pipeline class (`Cosmos3OmniDiffusersPipeline`) serves these modes; the
 mode is selected per request:
 
 - **T2I** — `POST /v1/images/generations` (or a prompt carrying `modalities=["image"]`).
+  T2I does not accept a reference image; send one as an I2V request instead.
 - **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image/video.
 - **I2V** — `POST /v1/videos/sync` with a reference image (`input_reference` file
   upload, or `image_reference` JSON).

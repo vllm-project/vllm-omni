@@ -438,6 +438,35 @@ def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
     assert outputs[0].output.numel() == 0
 
 
+def test_forward_tolerates_none_decode_on_non_decoding_pp_stage() -> None:
+    # Under pipeline parallelism, PipelineParallelMixin wraps vae.decode so that a
+    # stage which does not decode returns (None,) instead of a tensor.
+    pipeline = _make_pipeline()
+    pipeline.vae.decode = lambda latents, return_dict=False: (None,)  # type: ignore[assignment]
+    pipeline.diffuse = lambda **kwargs: torch.zeros_like(kwargs["latents"])  # type: ignore[method-assign]
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type="np",
+                ),
+            )
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 1
+    assert outputs[0].media is None
+    assert outputs[0].output is None
+
+
 def test_forward_batches_precomputed_prompt_embeddings() -> None:
     pipeline = _make_pipeline()
     diffuse_call = {}
@@ -1222,8 +1251,13 @@ def _graph_od_config(**overrides) -> SimpleNamespace:
         cache_backend="none",
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
+        diffusion_kv_mode="dense_legacy",
+        diffusion_kv_cache_dtype=None,
         diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_config=AttentionConfig(),
+        diffusion_attention_schedule=None,
+        diffusion_graph_release_after_denoise=False,
     )
     vars(od_config).update(overrides)
     return od_config

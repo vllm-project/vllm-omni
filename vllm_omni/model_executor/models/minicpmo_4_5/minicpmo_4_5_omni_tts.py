@@ -12,12 +12,14 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
+from __future__ import annotations
+
 import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -31,11 +33,11 @@ from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
 from vllm.v1.worker.gpu.sample.output import SamplerOutput as Mrv2SamplerOutput
+from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
@@ -73,6 +75,9 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.utils.seeded_exponential import fill_exponential_rows, fill_exponential_steps
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 from vllm_omni.worker_v2.warmup import is_warmup_request
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.sampler import Sampler
 
 logger = init_logger(__name__)
 
@@ -894,7 +899,7 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
         return self.base.apply(logits, ctx)
 
 
-def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> Any:
+def _install_mrv2_talker_sampler(sampler: Any, talker: MiniCPMO45OmniTTSForConditionalGeneration) -> Any:
     """Wrap the runner's MRv2 sampler with codec penalties and EOS control.
 
     The upstream sampler applies ``min_tokens`` (codec EOS is a stage stop
@@ -1292,7 +1297,7 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
     for a step without drafts.
     """
 
-    def __init__(self, sampler: Any, spec_config: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> None:
+    def __init__(self, sampler: Any, spec_config: Any, talker: MiniCPMO45OmniTTSForConditionalGeneration) -> None:
         req_states = sampler.req_states
         super().__init__(sampler, spec_config, req_states.device)
         self.talker = talker
@@ -1307,8 +1312,7 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
         self,
         logits: torch.Tensor,
         input_batch: Any,
-        draft_logits: torch.Tensor | None = None,
-        invalid_drafts: torch.Tensor | None = None,
+        draft_logits: DraftLogitsCache | None = None,
     ) -> Any:
         # The runner calls this only for steps that carry draft codes. The Talker
         # DSpark e2e asserts on this exact message.
@@ -1322,7 +1326,7 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
                 input_batch.expanded_idx_mapping[:num_logits].long(),
                 input_batch.expanded_local_pos[:num_logits].long(),
             ] = forced
-        return super().__call__(logits, input_batch, draft_logits, invalid_drafts)
+        return super().__call__(logits, input_batch, draft_logits)
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -4619,6 +4623,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     @cached_property
     def _codec_sampler(self) -> Sampler:
         """Reuse the V1 sampler, as Qwen3-Omni does; metadata remains step-owned."""
+        from vllm.v1.sample.sampler import Sampler
+
         return Sampler()
 
     def sample(self, logits, sampling_metadata, *, per_req_sampling_params=None):

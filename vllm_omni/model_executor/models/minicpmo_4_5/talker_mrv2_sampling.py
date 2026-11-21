@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+from vllm_omni.utils.seeded_exponential import categorical_sample as random_sample
 
 # Same cutoff vLLM's V1 sampler uses to treat a row as greedy.
 _SAMPLING_EPS = 1e-5

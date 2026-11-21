@@ -24,8 +24,6 @@ from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
     npu_token2wav_sdpa_context,
 )
-from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [
     pytest.mark.core_model,
@@ -53,25 +51,6 @@ class _Token2Wav:
         self.speech_window = torch.ones(4, device="npu")
 
 
-def test_npu_runner_inherits_runtime_snapshot_replacement():
-    assert issubclass(OmniNPUModelRunner, OmniGPUModelRunner)
-    assert OmniNPUModelRunner._replace_intermediate_buffer is OmniGPUModelRunner._replace_intermediate_buffer
-    runner = object.__new__(OmniNPUModelRunner)
-    request = SimpleNamespace(additional_information_cpu=None)
-    runner.requests = {"req": request}
-    runner.model_intermediate_buffer = {
-        "req": {
-            "codes": {"audio": torch.tensor([1, 2])},
-            "meta": {"last_chunk": True},
-        }
-    }
-
-    runner._replace_intermediate_buffer("req", {"meta": {"is_segment_finished": True}})
-
-    assert runner.model_intermediate_buffer["req"] == {"meta": {"is_segment_finished": True}}
-    assert request.additional_information_cpu == runner.model_intermediate_buffer["req"]
-
-
 @torch.inference_mode()
 def test_npu_whole_euler_precomputes_modulation_without_fused_body():
     decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
@@ -81,7 +60,10 @@ def test_npu_whole_euler_precomputes_modulation_without_fused_body():
         .npu()
         .eval()
     )
-    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={"enabled": True, "fused_body": False})
+    adapter = BatchedToken2Wav(
+        _Token2Wav(estimator),
+        cfm_graph_config={"enabled": True, "fused_body": False},
+    )
     assert not adapter._ragged_fused_body
     assert adapter._whole_euler_graph_wrapper.modulation_fn is not None
 
@@ -104,7 +86,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         .eval()
     )
     graph_runner = NPUExactGraphRunner(max_graphs=4)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator))
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={})
 
     def inputs(seed: int):
         def make(shape: tuple[int, ...], offset: float):
@@ -208,7 +190,7 @@ def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames, prec
     # block and make modulation/output parity meaningful.
     for parameter in estimator.parameters():
         parameter.normal_(0.0, 0.08)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator))
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={})
     adapter.flow.decoder.rand_noise = torch.randn(1, 2, 128, device="npu")
     adapter.flow.decoder.inference_cfg_rate = 0.7
     wrapper = WholeEulerCFMGraphWrapper(

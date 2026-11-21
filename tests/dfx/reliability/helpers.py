@@ -28,6 +28,7 @@ import re
 import select
 import shlex
 import signal
+import stat as stat_module
 import subprocess
 import sys
 import time
@@ -38,6 +39,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import psutil
 import pytest
+from typing_extensions import NotRequired
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import OmniServerParams
@@ -60,6 +62,8 @@ class ServerFaultSnapshot(TypedDict):
     tree_pids: list[int]
     worker_pids: list[int]
     worker_markers: list[str]
+    shm_objects: NotRequired[list[tuple[str, int, int]]]
+    killed_root_fifo_objects: NotRequired[list[tuple[str, int, int]]]
 
 
 # Substrings matched against ``psutil.Process.name`` + argv text for classifying GPU
@@ -255,6 +259,7 @@ def _build_sidecar_cmd(
         + r"""
 import sys
 import time
+print("STARTING:import_torch", flush=True)
 import torch
 
 device = int(sys.argv[1])
@@ -264,10 +269,12 @@ strict = sys.argv[4] == "1"
 max_free_bytes_arg = int(sys.argv[5])
 max_free_bytes = None if max_free_bytes_arg < 0 else max_free_bytes_arg
 
+print("STARTING:initialize_device", flush=True)
 torch.cuda.init()
 torch.cuda.set_device(device)
 props = torch.cuda.get_device_properties(device)
 free_before, total_bytes = torch.cuda.mem_get_info(device)
+print(f"STARTING:allocate_memory;device={device};free_before={int(free_before)}", flush=True)
 ratio_target_bytes = int(free_before * target_ratio)
 ceiling_target_bytes = 0 if max_free_bytes is None else max(0, int(free_before) - max_free_bytes)
 target_bytes = max(ratio_target_bytes, ceiling_target_bytes)
@@ -418,37 +425,51 @@ def start_gpu_oom_hog(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        bufsize=0,
     )
     assert proc.stdout is not None
 
-    deadline = time.time() + startup_timeout_sec
+    handle = OomHandle(proc=proc, device=device, target_mem_ratio=target_mem_ratio, start_ts=time.time())
+    deadline = time.monotonic() + startup_timeout_sec
     logs: list[str] = []
-    while time.time() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], poll_interval_sec)
-        if ready:
-            line = proc.stdout.readline().strip()
-            if line:
+    pending = b""
+    handed_off = False
+    try:
+        while time.monotonic() < deadline:
+            wait = min(poll_interval_sec, max(0.0, deadline - time.monotonic()))
+            ready, _, _ = select.select([proc.stdout], [], [], wait)
+            if not ready:
+                continue
+            # Read raw bytes: TextIOWrapper can buffer READY behind progress
+            # lines even when select reports no more bytes on the OS pipe.
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                if pending:
+                    logs.append(pending.decode("utf-8", errors="replace"))
+                raise RuntimeError(f"OOM sidecar closed stdout before READY; returncode={proc.poll()}; logs={logs}")
+            pending += chunk
+            lines = pending.split(b"\n")
+            pending = lines.pop()
+            for raw_line in lines:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
                 logs.append(line)
                 print(f"[oom-sidecar][gpu={device}] {line}", flush=True)
                 if line.startswith("READY:"):
-                    return OomHandle(
-                        proc=proc,
-                        device=device,
-                        target_mem_ratio=target_mem_ratio,
-                        start_ts=time.time(),
-                    )
+                    handed_off = True
+                    return handle
                 if line.startswith("ERROR:"):
-                    proc.terminate()
-                    raise RuntimeError(f"OOM sidecar failed to reach target: {line}")
-        if proc.poll() is not None:
-            break
-
-    proc.terminate()
-    if logs:
-        print(f"[oom-sidecar][gpu={device}] startup logs: {' | '.join(logs)}", flush=True)
-    raise TimeoutError(f"OOM sidecar startup timeout. logs={logs}")
+                    raise RuntimeError(f"OOM sidecar failed to reach target: {line}; logs={logs}")
+        if pending:
+            logs.append(pending.decode("utf-8", errors="replace"))
+        raise TimeoutError(f"OOM sidecar startup timeout after {startup_timeout_sec}s; logs={logs}")
+    finally:
+        if not handed_off:
+            # Reap before the next injection: terminate alone leaves cleanup
+            # asynchronous and can overlap the next CUDA context/allocations.
+            stop_gpu_oom_hog(handle)
+            proc.stdout.close()
 
 
 def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
@@ -456,14 +477,15 @@ def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
     proc = handle.proc
     if proc is None:
         return
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=timeout_sec)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=timeout_sec)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout_sec)
+    if proc.stdout is not None:
+        proc.stdout.close()
 
 
 def _device_spec_from_deploy(deploy: Any, stage_config_path: str | Path) -> str:
@@ -857,11 +879,12 @@ def run_fault_injection_with_rate_load(
 
 
 def list_alive_pids(pids: Sequence[int]) -> list[int]:
-    """Return PIDs from ``pids`` that still exist in the kernel and are **not** zombies.
+    """Return PIDs from ``pids`` that still have a live process or thread.
 
     After SIGTERM/SIGKILL the serve child may exit before the test harness calls
     ``Popen.wait()``; until reaped, ``psutil.pid_exists`` stays true for the defunct
     slot. Those PIDs must not count as "residual server processes" for leak checks.
+    A zombie thread-group leader with surviving threads still counts as alive.
     """
     out: list[int] = []
     for pid in pids:
@@ -869,7 +892,8 @@ def list_alive_pids(pids: Sequence[int]) -> list[int]:
         if not psutil.pid_exists(pid_i):
             continue
         try:
-            if psutil.Process(pid_i).status() == psutil.STATUS_ZOMBIE:
+            process = psutil.Process(pid_i)
+            if process.status() == psutil.STATUS_ZOMBIE and process.num_threads() == 1:
                 continue
         except psutil.Error:
             continue
@@ -1064,7 +1088,18 @@ def assert_post_fault_api_unreachable(online_client: Any, *, scenario: str) -> N
 
 
 SIGTERM_CLEANUP_GRACE_SEC = 60.0
+ESCALATION_GRACE_SEC = 90.0
+LAUNCH_FAILURE_TIMEOUT_SEC = 180
 PARTIAL_ISOLATION_HTTP_TIMEOUT_SEC = 30.0
+_LAUNCH_FAILURE_HINTS = (
+    "oom",
+    "out of memory",
+    "cuda",
+    "memory",
+    "exited",
+    "failed to start",
+    "accelerator",
+)
 
 
 def assert_api_still_listening(online_client: Any, *, scenario: str) -> None:
@@ -1084,15 +1119,268 @@ def sigterm_serve_root_and_assert_cleanup(
     assert_no_server_tree_process_residual_and_gpu_release(server, scenario=scenario, timeout_sec=grace_sec)
 
 
+def escalate_live_pids(pids: Sequence[int], *, grace_sec: float) -> bool:
+    """Return True when ``pids`` are still alive after ``grace_sec`` and were sent SIGKILL.
+
+    SIGTERM is the caller's job. This is the shutdown-escalation checkpoint: a
+    stuck exit must not wait forever.
+    """
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline:
+        if not list_alive_pids(pids):
+            return False
+        time.sleep(0.05)
+    sigkill = getattr(signal, "SIGKILL", None)
+    if sigkill is None:
+        raise RuntimeError("SIGKILL is not available; cannot escalate a stuck shutdown")
+    for pid in list_alive_pids(pids):
+        try:
+            os.kill(pid, sigkill)
+        except ProcessLookupError:
+            continue
+        print(f"[reliability][escalation] pid={pid} still alive after {grace_sec:.0f}s; sent SIGKILL", flush=True)
+    return True
+
+
+def assert_launch_failure_observable(exc: BaseException) -> None:
+    """A failed launch must surface as an error, an exit, or a bounded timeout."""
+    text = str(exc).lower()
+    assert any(hint in text for hint in _LAUNCH_FAILURE_HINTS), f"startup failure was not observable: {exc!r}"
+
+
+def start_server_from_params(
+    params: Any, *, startup_timeout: int | None = None, wait_for_device_memory: bool = True
+) -> Any:
+    """Build an ``OmniServer`` the same way the reliability fixture does, without entering it."""
+    from tests.helpers.runtime import OmniServer, _resolve_server_deploy_args, get_model_prefix
+
+    original_model = get_model_prefix() + params.model
+    server_args, stage_config_path, replaced = _resolve_server_deploy_args(
+        list(params.server_args or []),
+        params.stage_config_path,
+        "advanced_model",
+    )
+    if params.use_omni:
+        if "--stage-init-timeout" not in server_args:
+            server_args += ["--stage-init-timeout", "600"]
+        if "--init-timeout" not in server_args:
+            server_args += ["--init-timeout", "900"]
+        if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
+            server_args += ["--log-stats"]
+    if stage_config_path is not None and not replaced:
+        server_args += ["--deploy-config", stage_config_path]
+    if original_model != params.model and "--served-model-name" not in server_args:
+        server_args += ["--served-model-name", params.model]
+    server = OmniServer(
+        original_model,
+        server_args,
+        env_dict=params.env_dict,
+        use_omni=params.use_omni,
+        startup_timeout=params.startup_timeout if startup_timeout is None else startup_timeout,
+        wait_for_device_memory=wait_for_device_memory,
+    )
+    server.model = params.model
+    return server
+
+
+def _deploy_config_path(server: Any) -> str | None:
+    stage_config_path = getattr(server, "stage_config_path", None)
+    if stage_config_path:
+        return str(stage_config_path)
+    args: list[str] = getattr(server, "serve_args", [])
+    for index, arg in enumerate(args):
+        if arg == "--deploy-config" and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--deploy-config="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def client_for_server(server: Any) -> Any:
+    from tests.helpers.client import OnlineOmniClient
+
+    return OnlineOmniClient(
+        host=server.host,
+        port=server.port,
+        api_key="EMPTY",
+        log_stats=getattr(server, "log_stats", False),
+    )
+
+
+def _process_visible_devices(pid: int) -> set[str]:
+    try:
+        env = psutil.Process(pid).environ()
+    except psutil.Error:
+        return set()
+    for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"):
+        raw = env.get(key)
+        if raw:
+            return {token.strip() for token in raw.split(",") if token.strip()}
+    return set()
+
+
+def kill_bad_replica(
+    server: Any,
+    *,
+    pattern: str,
+    devices: str,
+    signal_name: str = "SIGKILL",
+) -> None:
+    """Kill one replica, leaving the other replica's processes alone.
+
+    AR workers are matched by process title (``_replica1``). Diffusion workers
+    that do not carry a replica id are matched by the device set they were given.
+    """
+    _log_server_process_tree(server)
+    root_pids = set(_list_server_process_tree(server)[:1])
+    hits: list[int] = []
+    if pattern:
+        hits = [pid for pid in _pids_in_server_tree_substring_match(server, pattern, limit=16) if pid not in root_pids]
+    if not hits and devices:
+        wanted = {token.strip() for token in devices.split(",") if token.strip()}
+        for pid in _list_server_process_tree(server):
+            if pid in root_pids:
+                continue
+            visible = _process_visible_devices(pid)
+            if visible and visible <= wanted:
+                hits.append(pid)
+    if not hits:
+        pytest.fail(f"no bad-replica process matched pattern={pattern!r} devices={devices!r}")
+    sig = getattr(signal, signal_name, None)
+    if sig is None:
+        raise ValueError(f"Unsupported signal_name: {signal_name}")
+    for pid in hits:
+        name, cmdline = _safe_proc_info(pid)
+        print(
+            f"[reliability][replica] killing pid={pid} name={name} signal={signal_name} cmdline={cmdline}",
+            flush=True,
+        )
+        os.kill(pid, sig)
+
+
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
     """Wall-clock budget for fault-snapshot PIDs / GPU to clear after ``signal_name``."""
     if signal_name == "SIGKILL":
         return 30.0
-    if signal_name == "SIGINT":
-        return 120.0
     if signal_name == "SIGTERM":
         return 90.0
     return 30.0
+
+
+_LINUX_PROC_ROOT = Path("/proc")
+_LINUX_SHM_ROOT = Path("/dev/shm")
+
+
+def _linux_fd_counts(pids: Sequence[int]) -> dict[int, int]:
+    """Inspect FD tables; accept unreadable tables only after confirmed exit."""
+    if sys.platform != "linux":
+        return {}
+    counts: dict[int, int] = {}
+    for pid in pids:
+        try:
+            count = sum(1 for _ in (_LINUX_PROC_ROOT / str(pid) / "fd").iterdir())
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            # A non-root reader can lose /proc/<pid>/fd access until the
+            # parent reaps its zombie. Require no surviving peer threads:
+            # a dead group leader alone does not prove their FDs are closed.
+            # Named SHM/FIFO cleanup is checked separately below.
+            try:
+                process = psutil.Process(pid)
+                exited = process.status() == psutil.STATUS_ZOMBIE and process.num_threads() == 1
+            except psutil.NoSuchProcess:
+                continue
+            if not exited:
+                raise
+            continue
+        if count:
+            counts[pid] = count
+    return counts
+
+
+def _capture_linux_shm_objects(pids: Sequence[int]) -> list[tuple[str, int, int]]:
+    """Track named POSIX SHM/semaphores referenced by this tree, not global growth.
+
+    Closed descriptors can leave live mappings, so inspect both fd and maps.
+    Already-unlinked objects have no name to leak; the process/FD checks cover
+    their holders. Permission errors propagate rather than claiming coverage.
+    """
+    if sys.platform != "linux":
+        return []
+    objects: set[tuple[str, int, int]] = set()
+    for pid in pids:
+        proc = _LINUX_PROC_ROOT / str(pid)
+        try:
+            descriptors = list((proc / "fd").iterdir())
+        except FileNotFoundError:
+            descriptors = []
+        for descriptor in descriptors:
+            try:
+                target = descriptor.readlink()
+                if target.is_relative_to(_LINUX_SHM_ROOT):
+                    stat = target.stat()
+                    fd_stat = descriptor.stat()
+                    if (stat.st_dev, stat.st_ino) == (fd_stat.st_dev, fd_stat.st_ino):
+                        objects.add((str(target), stat.st_dev, stat.st_ino))
+            except FileNotFoundError:
+                continue
+        try:
+            mappings = (proc / "maps").read_text().splitlines()
+        except FileNotFoundError:
+            continue
+        for line in mappings:
+            fields = line.split(maxsplit=5)
+            if len(fields) != 6:
+                continue
+            target = Path(fields[5])
+            if not target.is_relative_to(_LINUX_SHM_ROOT):
+                continue
+            try:
+                stat = target.stat()
+            except FileNotFoundError:
+                continue
+            major, minor = fields[3].split(":")
+            if stat.st_ino == int(fields[4]) and stat.st_dev == os.makedev(int(major, 16), int(minor, 16)):
+                objects.add((str(target), stat.st_dev, stat.st_ino))
+    return sorted(objects)
+
+
+def _remaining_linux_shm_objects(
+    objects: Sequence[tuple[str, int, int]],
+    *,
+    ignore_named_fifos: bool = False,
+    allowed_fifo_objects: Sequence[tuple[str, int, int]] = (),
+) -> list[str]:
+    remaining: list[str] = []
+    for name, device, inode in objects:
+        try:
+            stat = Path(name).stat()
+        except FileNotFoundError:
+            continue
+        # A reused name with a different inode belongs to a different object.
+        if (stat.st_dev, stat.st_ino) == (device, inode):
+            if stat_module.S_ISFIFO(stat.st_mode) and (
+                ignore_named_fifos or (name, device, inode) in allowed_fifo_objects
+            ):
+                continue
+            remaining.append(name)
+    return remaining
+
+
+def capture_exclusive_fifo_objects(target_pids: Sequence[int], tree_pids: Sequence[int]) -> list[tuple[str, int, int]]:
+    """Snapshot FIFOs held by killed targets, excluding references from survivors."""
+    target_objects = set(_capture_linux_shm_objects(target_pids))
+    other_objects = set(_capture_linux_shm_objects(sorted(set(tree_pids) - set(target_pids))))
+    exclusive = []
+    for name, device, inode in sorted(target_objects - other_objects):
+        try:
+            current = Path(name).stat()
+        except FileNotFoundError:
+            continue
+        if (current.st_dev, current.st_ino) == (device, inode) and stat_module.S_ISFIFO(current.st_mode):
+            exclusive.append((name, device, inode))
+    return exclusive
 
 
 def assert_no_server_tree_process_residual_and_gpu_release(
@@ -1101,6 +1389,8 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     scenario: str,
     timeout_sec: float = 30.0,
     poll_interval_sec: float = 0.5,
+    allow_fifo_residual: bool = False,
+    allowed_fifo_objects: Sequence[tuple[str, int, int]] = (),
 ) -> None:
     """Assert no live PIDs remain from the fault-time server tree and no GPU use by those PIDs.
 
@@ -1108,8 +1398,22 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     injection time), not the marker-filtered ``worker_pids`` subset — so helpers like
     ``multiprocessing.resource_tracker`` are included in the residual check.
 
-    **Zombie** PIDs (exited children not yet reaped by the test ``Popen``) are excluded
-    from the "alive" list; ``psutil.pid_exists`` alone would false-positive on them.
+    **Zombie** PIDs with no surviving threads (exited children not yet reaped by
+    the test ``Popen``) are excluded from the "alive" list; ``psutil.pid_exists``
+    alone would false-positive on them.
+
+    On Linux, also require captured PIDs' FD tables to empty and the named
+    /dev/shm objects referenced at injection time to disappear. Identity uses
+    device/inode pairs, so unrelated objects reusing a name do not fail cleanup.
+    A transient /proc permission error during process exit is retried within
+    the same deadline; a still-unreadable FD table fails the check.
+    Objects created after the snapshot and references retained by processes
+    outside the captured tree are not independently inventoried here.
+
+    Whole-tree SIGKILL may allow named FIFO paths to remain: no owner survives
+    to unlink them. Other SHM objects, process/FD and GPU checks stay mandatory.
+    For shutdown-time partial crashes, allowed_fifo_objects may exempt only
+    pre-injection target-exclusive FIFO identities. All other FIFOs stay strict.
 
     Note: if a child is reparented to PID 1 while staying alive, its PID is unchanged
     and remains detected; if it **exits and a new unrelated process reuses the same
@@ -1127,6 +1431,9 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     deadline = time.monotonic() + timeout_sec
     last_alive: list[int] = []
     last_gpu_leaks: dict[int, int] = {}
+    last_fds: dict[int, int] = {}
+    fd_error: PermissionError | None = None
+    last_shm: list[str] = []
     gpu_telemetry_available: bool | None = None
     while time.monotonic() < deadline:
         last_alive = list_alive_pids(tree_pids)
@@ -1142,28 +1449,33 @@ def assert_no_server_tree_process_residual_and_gpu_release(
         else:
             gpu_telemetry_available = True
             last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
-        if not last_alive and not last_gpu_leaks:
+        try:
+            last_fds = _linux_fd_counts(tree_pids)
+        except PermissionError as error:
+            fd_error = error
+        else:
+            fd_error = None
+        shm_objects = snapshot.get("shm_objects", [])
+        last_shm = _remaining_linux_shm_objects(shm_objects)
+        fifo_residual: list[str] = []
+        if allow_fifo_residual or allowed_fifo_objects:
+            required_shm = _remaining_linux_shm_objects(
+                shm_objects, ignore_named_fifos=allow_fifo_residual, allowed_fifo_objects=allowed_fifo_objects
+            )
+            fifo_residual = sorted(set(last_shm) - set(required_shm))
+            last_shm = required_shm
+        if fd_error is None and not last_alive and not last_gpu_leaks and not last_fds and not last_shm:
+            if fifo_residual:
+                logger.warning("[%s] exempt named FIFO paths remain after SIGKILL: %s", scenario, fifo_residual)
             return
         time.sleep(poll_interval_sec)
 
+    if fd_error is not None:
+        raise fd_error
     assert not last_alive, f"[{scenario}] residual server-tree processes remain alive: {last_alive}"
     assert not last_gpu_leaks, f"[{scenario}] server-tree PID GPU memory not released: {last_gpu_leaks}"
-
-
-def assert_no_worker_residual_and_gpu_release(
-    server: Any,
-    *,
-    scenario: str,
-    timeout_sec: float = 30.0,
-    poll_interval_sec: float = 0.5,
-) -> None:
-    """Deprecated: use :func:`assert_no_server_tree_process_residual_and_gpu_release`."""
-    assert_no_server_tree_process_residual_and_gpu_release(
-        server,
-        scenario=scenario,
-        timeout_sec=timeout_sec,
-        poll_interval_sec=poll_interval_sec,
-    )
+    assert not last_fds, f"[{scenario}] server-tree file descriptors remain open: {last_fds}"
+    assert not last_shm, f"[{scenario}] named shared memory/semaphores remain: {last_shm}"
 
 
 def _capture_server_fault_snapshot(
@@ -1191,7 +1503,13 @@ def _capture_server_fault_snapshot(
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,
         "worker_markers": list(markers),
+        "shm_objects": _capture_linux_shm_objects(tree_pids),
     }
+    # Later shutdown injection must retain objects captured before a stage died.
+    previous = getattr(server, "reliability_fault_snapshot", None)
+    if isinstance(previous, dict):
+        snapshot["tree_pids"] = sorted(set(tree_pids) | set(previous.get("tree_pids", [])))
+        snapshot["shm_objects"] = sorted(set(snapshot["shm_objects"]) | set(previous.get("shm_objects", [])))
     setattr(server, "reliability_fault_snapshot", snapshot)
     return snapshot
 
@@ -1216,6 +1534,9 @@ def make_server_root_kill_fault_injector(
         if not root_pids:
             pytest.skip("no server root process found for root-kill injection")
         root_pid = int(root_pids[0])
+        if signal_name == "SIGKILL":
+            # Capture before killing: child-owned/shared FIFOs remain mandatory.
+            snapshot["killed_root_fifo_objects"] = capture_exclusive_fifo_objects([root_pid], snapshot["tree_pids"])
         sig = getattr(signal, signal_name, None)
         if sig is None:
             raise ValueError(f"Unsupported signal_name: {signal_name}")
@@ -1238,7 +1559,11 @@ def make_server_tree_kill_fault_injector(
     inter_kill_wait_seconds: float = 0.2,
     worker_markers_extra: Sequence[str] | None = None,
 ) -> FaultInjector:
-    """Kill current server root first, then kill all remaining descendants.
+    """Kill the root and business descendants, leaving resource trackers to reap.
+
+    Trackers remain in the fault snapshot: cleanup still requires their exit
+    and removal of tracked shared memory/semaphores. Identify them before root
+    death, while their command lines are still available.
 
     See :func:`make_server_root_kill_fault_injector` for ``worker_markers_extra``.
     """
@@ -1255,8 +1580,21 @@ def make_server_tree_kill_fault_injector(
             raise ValueError(f"Unsupported signal_name: {signal_name}")
 
         root_pid = tree_pids[0]
+        tracker_modules = (
+            "multiprocessing.resource_tracker",
+            "multiprocessing.semaphore_tracker",
+            "loky.backend.resource_tracker",
+        )
+        tracker_pids = {
+            pid
+            for pid in tree_pids
+            if pid != root_pid and any(module in _safe_proc_info(pid)[1] for module in tracker_modules)
+        }
         kill_order = [root_pid, *[pid for pid in tree_pids if pid != root_pid]]
         for pid in kill_order:
+            if pid in tracker_pids:
+                print(f"[reliability][process-kill] preserve resource tracker pid={pid} for cleanup", flush=True)
+                continue
             if not psutil.pid_exists(pid):
                 continue
             name, cmdline = _safe_proc_info(pid)
@@ -1408,13 +1746,8 @@ def make_process_kill_fault_injector(
 # (signal name, skip reason). ``None`` means the signal runs.
 SignalSpec = tuple[str, str | None]
 
-# SIGTERM and SIGKILL, both executed. Serve-root adds SIGINT on top of this pair.
-TERM_KILL_SIGNALS: tuple[SignalSpec, ...] = (("SIGTERM", None), ("SIGKILL", None))
-SERVE_ROOT_SIGNALS: tuple[SignalSpec, ...] = (
-    ("SIGTERM", None),
-    ("SIGINT", None),
-    ("SIGKILL", None),
-)
+# Crash injection is abrupt; graceful shutdown has its own scenario.
+CRASH_SIGNALS: tuple[SignalSpec, ...] = (("SIGKILL", None),)
 
 INFLIGHT_INJECTION_REQUEST_RATE = 0.3
 INFLIGHT_INJECTION_REQUEST_COUNT = 10
@@ -1428,37 +1761,42 @@ class FaultModel:
     num_cards: int
     extra_marks: tuple[Any, ...] = ()
     scenarios: list[dict[str, Any]]
-    deploy_dir: Any
+    deploy_dir: Any = None
     lifecycle_scenario: str | None = None
     eager_oom_stage_ids: tuple[int, ...] | None = None
     worker_pattern: str
     isolation_pattern: str
     hard_oom_config: dict[str, Any]
-    recover_oom_config: dict[str, Any] | None = None
-    fault_error_keywords: tuple[str, ...]
     process_kill_error_keywords: tuple[str, ...]
     with_load_timeout_sec: float = 120.0
     concurrent_workers: int = 3
     concurrent_timeout_sec: float = 40.0
     health_miss_skip: str | None = None
-    worker_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
-    serve_root_signals: tuple[SignalSpec, ...] = SERVE_ROOT_SIGNALS
-    serve_root_with_load_signals: tuple[SignalSpec, ...] = SERVE_ROOT_SIGNALS
-    tree_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
-    tree_with_load_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
-    oom_large_fail_message: str = "expected request failure during GPU OOM injection"
-    oom_concurrent_fail_message: str = "expected concurrent request failure under OOM injection"
+    worker_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    serve_root_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    serve_root_with_load_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    tree_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    tree_with_load_signals: tuple[SignalSpec, ...] = CRASH_SIGNALS
+    replica_scenarios: list[dict[str, Any]] | None = None
+    bad_replica_pattern: str = ""
+    bad_replica_devices: str = ""
 
     def scenarios_for_server_set(self, server_set: str) -> list[dict[str, Any]]:
         """Return deploy scenarios for one fault server set.
 
         The ``oom`` set forces ``enforce_eager`` on ``eager_oom_stage_ids``
         under HIP. Models that do not declare those stages keep their deploy.
+        ``launch`` uses the lifecycle scenario when one is set, so startup
+        faults do not repeat every server mode.
         """
         scenarios = list(self.scenarios)
-        if server_set == "lifecycle":
+        if server_set in ("lifecycle", "launch"):
             if self.lifecycle_scenario is not None:
                 scenarios = [item for item in scenarios if item["test_name"] == self.lifecycle_scenario]
+        elif server_set == "replica":
+            if not self.replica_scenarios:
+                raise ValueError(f"{self.model_id} has no replica deploy")
+            scenarios = list(self.replica_scenarios)
         elif server_set == "oom" and self.eager_oom_stage_ids:
             import torch
 
@@ -1500,17 +1838,11 @@ class FaultModel:
     def isolation_after(self, client: Any, server: Any) -> None:
         self.assert_fast_fail(client, server)
 
-    def oom_large_probe(self, client: Any, server: Any) -> None:
+    def oom_under_load_request(self, server: Any) -> dict[str, Any]:
         raise NotImplementedError(self.model_id)
 
-    def oom_concurrent_probe(self, client: Any, server: Any) -> None:
-        raise NotImplementedError(self.model_id)
-
-    def run_error_contract(self, server: Any, client: Any) -> None:
-        raise NotImplementedError(self.model_id)
-
-    def run_oom_recovery(self, server: Any, client: Any) -> None:
-        raise NotImplementedError(self.model_id)
+    def oom_preflight_request(self, server: Any) -> dict[str, Any]:
+        return self.oom_under_load_request(server)
 
 
 def _skip_marks(reason: str | None) -> list[Any]:
@@ -1562,6 +1894,19 @@ def server_and_signal_params(
                 )
             )
     return items
+
+
+def launch_scenario_params(
+    model: FaultModel,
+    scenario: type[FaultScenario],
+    *,
+    skip_reason: str | None = None,
+) -> Any:
+    """Parametrize a server spec the test starts itself. The fixture must not start it first."""
+    return pytest.mark.parametrize(
+        "launch_params",
+        server_params(model, server_set=scenario.server_set, skip_reason=skip_reason),
+    )
 
 
 def scenario_params(

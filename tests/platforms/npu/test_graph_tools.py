@@ -167,6 +167,40 @@ def test_code2wav_runtime_disables_internal_format_and_jit(monkeypatch):
     assert compile_modes == [{"jit_compile": False}]
 
 
+@pytest.mark.parametrize(
+    "additional_config",
+    [
+        {},
+        {"code2wav_fused_qkv_norm": False},
+        {"code2wav_fused_qkv_norm": True},
+        {"code2wav_fused_qkv_norm": None},
+    ],
+)
+def test_code2wav_removed_qkv_switch_warns_without_changing_dispatch(monkeypatch, additional_config):
+    from unittest.mock import Mock
+
+    warning = Mock()
+    monkeypatch.setattr(code2wav_patch.logger, "warning_once", warning)
+    monkeypatch.setattr(code2wav_patch, "_original_build_backend", lambda model: setattr(model, "backend", object()))
+    model = SimpleNamespace(
+        backend=None,
+        _extra_config=lambda: {},
+        _cfm_graph_config={"enabled": False},
+        vllm_config=SimpleNamespace(additional_config=additional_config),
+    )
+    code2wav_patch._patched_build_backend(model)
+    code2wav_patch._patched_build_backend(model)
+    assert model.backend is not None
+    assert model._cfm_graph_config == {"enabled": False, "max_graphs": 32}
+    if "code2wav_fused_qkv_norm" in additional_config:
+        warning.assert_called_once()
+        message = warning.call_args.args[0]
+        assert "including false" in message
+        assert "automatically" in message and "native fallback" in message
+    else:
+        warning.assert_not_called()
+
+
 def test_code2wav_runtime_rejects_launch_blocking(monkeypatch):
     monkeypatch.setenv("ASCEND_LAUNCH_BLOCKING", "1")
 

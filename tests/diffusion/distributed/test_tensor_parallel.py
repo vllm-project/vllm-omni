@@ -131,7 +131,7 @@ def _run_generate(
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 2})
 def test_tensor_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu():
         pytest.skip("Tensor parallel parity test is only supported on CUDA and ROCm for now.")

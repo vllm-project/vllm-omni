@@ -633,6 +633,7 @@ async def _enqueue_add_request(
     yield_stage_id: int | None = None,
     entry_stage_id: int = 0,
     lora_request: LoRARequest | None = None,
+    request_artifact_dirs: list[str] | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -650,6 +651,7 @@ async def _enqueue_add_request(
             enqueue_ts=time.perf_counter(),
             entry_stage_id=entry_stage_id,
             lora_request=lora_request,
+            request_artifact_dirs=request_artifact_dirs,
         )
     )
 
@@ -716,7 +718,9 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         stage1_request = stage1.add_request_calls[0][0]
         assert stage1_request.request_id == "req-llm"
-        assert stage1_request.prompt_token_ids == [7, 8, 9]
+        # v0.34 packs prompt token ids as an int32 ndarray (see
+        # build_engine_core_request_from_tokens); compare in list space.
+        assert stage1_request.prompt_token_ids.tolist() == [7, 8, 9]
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 2.0))
 
@@ -833,7 +837,7 @@ async def test_run_chain_yields_at_each_stage_until_final_output(orchestrator_fa
             await _wait_for(lambda: len(stage.add_request_calls) == 1)
             submitted = stage.add_request_calls[0][0]
             assert submitted.request_id == request_id
-            assert submitted.prompt_token_ids == list(input_token_ids)
+            assert submitted.prompt_token_ids.tolist() == list(input_token_ids)
             assert submitted.sampling_params.max_tokens == sampling_params_list[stage_id].max_tokens
             assert returns_stage_payload(submitted.additional_information) is returns_payload
 
@@ -1548,7 +1552,8 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         prewarmed_request = stage1.add_request_calls[0][0]
         assert prewarmed_request.request_id == "req-async"
-        assert prewarmed_request.prompt_token_ids
+        # ndarray prompt token ids are falsy when the single placeholder is 0.
+        assert len(prewarmed_request.prompt_token_ids) > 0
         assert all(token_id == 0 for token_id in prewarmed_request.prompt_token_ids)
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-final", 3.0))
@@ -2459,10 +2464,70 @@ async def test_stage_pool_requested_replica_down_race_does_not_fallback() -> Non
     assert all(not client.add_request_calls for client in clients)
 
 
+def test_stage_pool_pinned_binding_accepts_a_replica_the_hub_reports_up() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    assert pool.get_bound_replica_id("pinned") == 1
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_stage_pool_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
+    pool, _, _ = _distributed_routing_pool((ReplicaStatus.UP, ReplicaStatus.DOWN))
+
+    with pytest.raises(StageUnavailableError, match="pinned replica 1 is unavailable"):
+        pool.bind_request_to_replica("pinned", 1)
+
+    assert pool.get_bound_replica_id("pinned") is None
+
+
 @pytest.mark.asyncio
-async def test_explicit_run_request_detached_before_admission_returns_client_error() -> None:
+async def test_distributed_pin_down_after_binding_does_not_fallback() -> None:
+    pool, clients, hub = _distributed_routing_pool()
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    hub.replicas[1].status = ReplicaStatus.DOWN
+    pool.invalidate_addr("tcp://replica-1")
+
+    with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
+        pool.preselect_replica_id("pinned")
+
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = FakePromptRequest(request_id="pinned", prompt_token_ids=[1])
+    with pytest.raises(StageUnavailableError, match="pinned replica 1 is unavailable"):
+        await pool.submit_initial("pinned", state, request, pinned_replica_id=1)
+
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_invalidate_addr_returns_pinned_requests_too() -> None:
+    pool, _, _ = _distributed_routing_pool()
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+
+    # Pins share the distributed affinity ledger with explicit routes.
+    assert pool.invalidate_addr("tcp://replica-1") == ["pinned"]
+
+    assert pool.get_bound_replica_id("pinned") is None
+    pool.release_binding("pinned")
+    assert pool.get_bound_replica_id("pinned") is None
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_pinned_submit_in_distributed_mode_uses_that_replica() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = FakePromptRequest(request_id="pinned", prompt_token_ids=[1])
+
+    assert await pool.submit_initial("pinned", state, request, pinned_replica_id=1) == 1
+    assert len(clients[1].add_request_calls) == 1
+    assert not clients[0].add_request_calls
+
+
+@pytest.mark.asyncio
+async def test_explicit_run_request_detached_before_admission_returns_client_error(tmp_path) -> None:
     pool, clients, hub = _distributed_routing_pool()
     request_id = "requested"
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
 
     hub.replicas[1].status = ReplicaStatus.DOWN
     pool.remove_client("tcp://replica-1")
@@ -2486,6 +2551,7 @@ async def test_explicit_run_request_detached_before_admission_returns_client_err
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
             requested_replica_id=1,
         )
     )
@@ -2497,12 +2563,15 @@ async def test_explicit_run_request_detached_before_admission_returns_client_err
     assert error.error == "stage 0 replica_id 1 does not exist or is not available"
     assert pool._requested_replica_ids == {}
     assert all(not client.add_request_calls for client in clients)
+    assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
-async def test_explicit_run_rejected_before_admission_releases_reservation() -> None:
+async def test_explicit_run_rejected_before_admission_releases_reservation(tmp_path) -> None:
     pool, clients, _ = _distributed_routing_pool()
     request_id = "requested"
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     output_queue: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -2525,6 +2594,7 @@ async def test_explicit_run_rejected_before_admission_releases_reservation() -> 
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
             requested_replica_id=1,
         )
     )
@@ -2537,6 +2607,7 @@ async def test_explicit_run_rejected_before_admission_releases_reservation() -> 
     assert pool._requested_replica_ids == {}
     assert pool.get_bound_replica_id(request_id) is None
     assert all(not client.add_request_calls for client in clients)
+    assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -2795,17 +2866,6 @@ async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeyp
     assert pool.get_bound_replica_id("pinned") is None
     assert not processor.add_request_calls
     assert all(not client.add_request_calls for client in clients)
-
-
-@pytest.mark.parametrize("distributed_hook", ["_hub", "_lb"])
-def test_stage_pool_pinned_binding_rejects_distributed_mode(distributed_hook: str) -> None:
-    pool = StagePool(0, [FakeStageClient(), FakeStageClient()])
-    setattr(pool, distributed_hook, object())
-
-    with pytest.raises(StageUnavailableError, match="only supported for local stage pools"):
-        pool.bind_request_to_replica("pinned", 1)
-
-    assert pool.get_bound_replica_id("pinned") is None
 
 
 @pytest.mark.asyncio
@@ -3087,7 +3147,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
 @pytest.mark.asyncio
 async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
-    built_metrics = SimpleNamespace(pipeline_timings={})
+    built_metrics = SimpleNamespace(pipeline_timings={}, scheduler_queue_wait_ms=None)
 
     class RecordingPool:
         def __init__(self) -> None:
@@ -3121,6 +3181,142 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
 
     assert pool.calls == [[output]]
     assert routed == [built_metrics]
+
+
+@pytest.mark.asyncio
+async def test_submit_to_stage_stamps_before_submit_initial() -> None:
+    """Scheduler wait starts at enqueue; stage_submit_ts must precede submit_initial."""
+    seen_at_submit: list[float] = []
+
+    class RecordingPool:
+        stage_type = "diffusion"
+
+        async def submit_initial(self, request_id, req_state, request, **_kwargs):
+            seen_at_submit.append(req_state.stage_submit_ts.get(1, -1.0))
+            return 0
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [None, RecordingPool()]
+    orchestrator._transfer_emitter = None
+    req_state = OrchestratorRequestState(
+        request_id="req-clock",
+        sampling_params_list=[None, None],
+        final_stage_id=1,
+    )
+    req_state.yield_stage_id = None
+
+    await orchestrator._submit_to_stage(
+        "req-clock",
+        req_state,
+        [SimpleNamespace()],
+        source_stage_id=0,
+        source_replica_id=0,
+        receiver_stage_id=1,
+        already_submitted=False,
+        t_submit_start=time.perf_counter(),
+    )
+
+    assert seen_at_submit, "submit_initial was not called"
+    assert seen_at_submit[0] > 0
+    assert req_state.stage_submit_ts[1] == pytest.approx(seen_at_submit[0])
+
+
+@pytest.mark.asyncio
+async def test_submit_to_stage_refreshes_clocks_for_the_next_segment(monkeypatch) -> None:
+    """A later segment on the same request id starts its own wall and monotonic clocks."""
+    clock = {"wall": 1_000.0, "perf": 10.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["wall"])
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.perf_counter", lambda: clock["perf"])
+
+    class RecordingPool:
+        stage_type = "llm"
+
+        async def submit_initial(self, request_id, req_state, request, **_kwargs):
+            return 0
+
+        async def submit_update(self, request_id, req_state, request, **_kwargs):
+            return 0
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [None, RecordingPool()]
+    orchestrator._transfer_emitter = None
+    req_state = OrchestratorRequestState(
+        request_id="req-clock",
+        sampling_params_list=[None, None],
+        final_stage_id=1,
+    )
+    req_state.yield_stage_id = None
+
+    await orchestrator._submit_to_stage(
+        "req-clock",
+        req_state,
+        [SimpleNamespace()],
+        source_stage_id=0,
+        source_replica_id=0,
+        receiver_stage_id=1,
+        already_submitted=False,
+        t_submit_start=time.perf_counter(),
+    )
+    assert req_state.stage_submit_ts[1] == pytest.approx(1_000.0)
+    assert req_state.stage_submit_perf[1] == pytest.approx(10.0)
+
+    clock["wall"] = 6_000.0
+    clock["perf"] = 20.0
+    await orchestrator._submit_to_stage(
+        "req-clock",
+        req_state,
+        [SimpleNamespace()],
+        source_stage_id=0,
+        source_replica_id=0,
+        receiver_stage_id=1,
+        already_submitted=True,
+        t_submit_start=time.perf_counter(),
+    )
+    assert req_state.stage_submit_ts[1] == pytest.approx(6_000.0)
+    assert req_state.stage_submit_perf[1] == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_submit_to_stage_excludes_llm_replica_wait(monkeypatch) -> None:
+    """Unpinned LLM submit_initial can wait for a replica; that wait is not generation."""
+    clock = {"wall": 1_000.0, "perf": 10.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["wall"])
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.perf_counter", lambda: clock["perf"])
+    seen_at_submit: list[float] = []
+
+    class DelayedLLMPool:
+        stage_type = "llm"
+
+        async def submit_initial(self, request_id, req_state, request, **_kwargs):
+            seen_at_submit.append(req_state.stage_submit_ts.get(1, -1.0))
+            clock["wall"] = 2_000.0
+            clock["perf"] = 11.0
+            return 0
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [None, DelayedLLMPool()]
+    orchestrator._transfer_emitter = None
+    req_state = OrchestratorRequestState(
+        request_id="req-clock",
+        sampling_params_list=[None, None],
+        final_stage_id=1,
+    )
+    req_state.yield_stage_id = None
+
+    await orchestrator._submit_to_stage(
+        "req-clock",
+        req_state,
+        [object()],
+        source_stage_id=0,
+        source_replica_id=0,
+        receiver_stage_id=1,
+        already_submitted=False,
+        t_submit_start=time.perf_counter(),
+    )
+
+    assert seen_at_submit == [-1.0]
+    assert req_state.stage_submit_ts[1] == pytest.approx(2_000.0)
+    assert req_state.stage_submit_perf[1] == pytest.approx(11.0)
 
 
 @pytest.mark.asyncio
@@ -3260,6 +3456,7 @@ def test_disabled_stage_metrics_preserve_native_usage_and_finish_reason(mocker) 
     assert metrics.stage_stats.total_token == 191
     assert metrics.stage_stats.total_gen_time_ms == 1000.0
     assert metrics.inter_output_latencies_ms is None
+    assert metrics.scheduler_queue_wait_ms is None
     processor.pop_native_text_metrics.assert_called_once_with("req-no-metrics")
 
     next_metrics = pool.build_stage_metrics([output], submit_ts=1.0, request_timestamp=1.0, replica_id=0)
@@ -3269,6 +3466,57 @@ def test_disabled_stage_metrics_preserve_native_usage_and_finish_reason(mocker) 
     assert next_metrics.stage_stats.total_token == 382
     assert next_metrics.stage_stats.total_gen_time_ms == 3000.0
     assert metrics.stage_stats.total_token == 191
+
+
+def test_build_stage_metrics_subtracts_scheduler_queue_wait(mocker) -> None:
+    processor = mocker.Mock(spec=MultimodalOutputProcessor)
+    processor.pop_native_text_metrics.return_value = {}
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")],
+        output_processor=processor,
+    )
+    pool.collect_stage_metrics = False
+    mocker.patch("vllm_omni.engine.stage_pool._time.time", return_value=2.0)
+    output = SimpleNamespace(
+        request_id="req-wait",
+        metrics={"scheduler_queue_wait_ms": 400.0},
+        outputs=[],
+    )
+
+    metrics = pool.build_stage_metrics([output], submit_ts=1.0, request_timestamp=1.0, replica_id=0)
+
+    assert metrics.stage_gen_time_ms == pytest.approx(600.0)
+    assert metrics.scheduler_queue_wait_ms == pytest.approx(400.0)
+
+
+def test_stage_gen_ignores_backward_wall_clock(mocker) -> None:
+    """Queue wait is a perf_counter duration, so a wall-clock step must not make gen negative."""
+    processor = mocker.Mock(spec=MultimodalOutputProcessor)
+    processor.pop_native_text_metrics.return_value = {}
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")],
+        output_processor=processor,
+    )
+    pool.collect_stage_metrics = False
+    mocker.patch("vllm_omni.engine.stage_pool._time.time", return_value=999.9)
+    mocker.patch("vllm_omni.engine.stage_pool._time.perf_counter", return_value=15.02)
+    output = SimpleNamespace(
+        request_id="req-step",
+        metrics={"scheduler_queue_wait_ms": 5_000.0},
+        outputs=[],
+    )
+
+    metrics = pool.build_stage_metrics(
+        [output],
+        submit_ts=1_000.0,
+        submit_perf=10.0,
+        request_timestamp=1_000.0,
+        replica_id=0,
+    )
+
+    assert metrics.stage_gen_time_ms == pytest.approx(20.0)
 
 
 def test_stage_pool_does_not_track_output_timestamps_when_metrics_disabled() -> None:
@@ -4768,8 +5016,10 @@ def test_diffusion_params_carry_the_sample_count(n: int, per_sample_kv: bool, co
     ],
 )
 async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
-    mocker, resumable: bool, model_type: str, method: str | None, accepted: bool
+    mocker, tmp_path, resumable: bool, model_type: str, method: str | None, accepted: bool
 ) -> None:
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     pool = StagePool(
         0,
         FakeStageClient(),
@@ -4798,11 +5048,14 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
     )
     if accepted:
         dispatch.assert_awaited_once()
         assert output_queue.empty()
+        assert artifact_dir.exists()
+        assert orchestrator.request_states["req"].request_artifact_dirs == {str(artifact_dir)}
     else:
         dispatch.assert_not_awaited()
         error = output_queue.get_nowait()
@@ -4811,13 +5064,16 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
         assert "streaming (resumable) input is not supported with Qwen3-Omni DFlash" in error.error
         assert "req" not in orchestrator.request_states
         assert pool.get_bound_replica_id("req") is None
+        assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("watermarking", "accepted"), [(None, False), (False, True)])
 async def test_add_request_rejects_parallel_samples_on_a_watermarking_stage(
-    mocker, watermarking: bool | None, accepted: bool
+    mocker, tmp_path, watermarking: bool | None, accepted: bool
 ) -> None:
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     pool = _audio_stage_pool(_audio_stage_client("llm"))
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -4841,15 +5097,19 @@ async def test_add_request_rejects_parallel_samples_on_a_watermarking_stage(
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
     )
 
     if accepted:
         fail.assert_not_awaited()
         dispatch.assert_awaited_once()
+        assert artifact_dir.exists()
+        assert orchestrator.request_states["req"].request_artifact_dirs == {str(artifact_dir)}
     else:
         dispatch.assert_not_awaited()
         fail.assert_awaited_once_with("req", 0, "n > 1 is not supported with output watermarking on stage 0")
+        assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -4863,8 +5123,10 @@ async def test_add_request_rejects_parallel_samples_on_a_watermarking_stage(
     ids=["middle-stage-n2", "watermarked-final-stage-n2", "n1-everywhere"],
 )
 async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_submission(
-    mocker, stage_n: list[int], watermark_final: bool, rejected_stage: int | None
+    mocker, tmp_path, stage_n: list[int], watermark_final: bool, rejected_stage: int | None
 ) -> None:
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
     pools = [StagePool(0, FakeStageClient()), StagePool(1, FakeStageClient())]
     pools.append(_audio_stage_pool(_audio_stage_client("llm")) if watermark_final else StagePool(2, FakeStageClient()))
     assert pools[2].will_watermark(SamplingParams(n=2)) is watermark_final
@@ -4891,12 +5153,15 @@ async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_subm
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
     )
 
     if rejected_stage is None:
         fail.assert_not_awaited()
         submits[0].assert_awaited_once()
+        assert artifact_dir.exists()
+        assert orchestrator.request_states["req"].request_artifact_dirs == {str(artifact_dir)}
     else:
         fail.assert_awaited_once_with(
             "req", 0, f"n > 1 is supported only on the entry stage 0; stage {rejected_stage} has n=2"
@@ -4904,6 +5169,7 @@ async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_subm
         for submit in submits:
             submit.assert_not_awaited()
         assert "req" not in orchestrator.request_states
+        assert not artifact_dir.exists()
 
 
 @pytest.mark.asyncio

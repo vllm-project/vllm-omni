@@ -1,5 +1,9 @@
-# Opt-in single-Hopper full-response throughput profile (not streaming TTFP).
-# Stage 1 selects the packed backend through its environment below.
+# Opt-in single-GPU full-response throughput profile (not streaming TTFP).
+# Stage 1 selects the packed backend through its environment below:
+# FlashAttention 3 on Hopper, FlashAttention 2 on other CUDA GPUs.
+# On non-Hopper FA2 GPUs this now enables packed Flow and batched HiFT
+# instead of falling back to stock Flow. Memory use and numerics can change;
+# use cosyvoice3.yaml if the profile causes memory pressure on smaller GPUs.
 # The 4096-frame internal boundary exceeds this profile's 2048-token output cap.
 async_chunk: true
 connectors:
@@ -32,8 +36,8 @@ stages:
   max_num_batched_tokens: 32768
   max_num_seqs: 64
   mm_processor_cache_gb: 0
-  # The talker runs on Model Runner V2 (both RAS and standard sampling);
-  # set model_runner: v1 to fall back. The codec stage stays on V1.
+  # The talker runs on Model Runner V2 (both RAS and standard sampling).
+  # The codec inherits the V2 default; V1 fallback is unavailable.
   model_runner: v2
   output_connectors:
     to_stage_1: connector_of_shared_memory

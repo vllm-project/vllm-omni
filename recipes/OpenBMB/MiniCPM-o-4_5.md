@@ -98,8 +98,8 @@ Talker uses FlashAttention and decodes up to sixteen codec frames per K-step.
 
 CUDA turn serving inherits Thinker ngram speculation and disabled prefix
 caching, and passes the completed Thinker payload to the Talker. The Talker
-streams codec chunks to Code2Wav. To select V1 on CUDA, set
-`platforms.cuda.model_runner: v1` in a custom deployment overlay.
+streams codec chunks to Code2Wav. Model Runner V2 is the only supported runner
+with vLLM 0.34; a custom overlay that selects V1 is rejected.
 
 Stage-0 speculative decoding (including n-gram) cannot be combined with the
 stage-output prefix cache. Existing CUDA turn overlays that enable speculation
@@ -150,8 +150,8 @@ the service after a capture failure. To run without capture, set
 limit there with `code2wav_max_npu_graphs`. Graph mode also requires
 `ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
 
-The inner NPUGraph is independent of the outer runner setting, so do not use a
-global `--enforce-eager` override when Stage 0/1 `PIECEWISE` replay is desired.
+The inner NPUGraph is independent of the outer runner setting. Leave
+`enforce_eager` disabled on stages 0 and 1 to use `PIECEWISE` replay there.
 
 ## GPU
 

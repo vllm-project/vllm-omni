@@ -46,6 +46,26 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
+          "MI300": {
+            "mean_audio_rtf": [
+              0.17206051893271568
+            ],
+            "request_throughput": [
+              0.09495439677312192
+            ],
+            "mean_ttft_ms": [
+              477.99807315332146
+            ],
+            "mean_tpot_ms": [
+              4.642169403002363
+            ],
+            "mean_e2el_ms": [
+              5009.269228748599
+            ],
+            "mean_audio_ttfp_ms": [
+              613.0700132547645
+            ]
+          },
           "H100": {
             "mean_audio_rtf": [
               0.1063
@@ -114,6 +134,26 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
+          "MI300": {
+            "mean_audio_rtf": [
+              0.21692139290737722
+            ],
+            "request_throughput": [
+              0.47853915971821315
+            ],
+            "mean_ttft_ms": [
+              321.35434102237923
+            ],
+            "mean_tpot_ms": [
+              5.11727178018788
+            ],
+            "mean_e2el_ms": [
+              5591.195166952093
+            ],
+            "mean_audio_ttfp_ms": [
+              1313.3037257002798
+            ]
+          },
           "H100": {
             "mean_audio_rtf": [
               0.1296
@@ -184,6 +224,26 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
+          "MI300": {
+            "mean_audio_rtf": [
+              0.4057888853742787
+            ],
+            "request_throughput": [
+              0.9457588752981771
+            ],
+            "mean_ttft_ms": [
+              541.4254003600217
+            ],
+            "mean_tpot_ms": [
+              7.624797112787039
+            ],
+            "mean_e2el_ms": [
+              11128.196099488705
+            ],
+            "mean_audio_ttfp_ms": [
+              2060.99440202408
+            ]
+          },
           "H100": {
             "mean_audio_rtf": [
               0.1798
@@ -255,6 +315,20 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
+          "MI300": {
+            "mean_e2el_ms": [
+              735.6390352986637
+            ],
+            "request_throughput": [
+              0.09925524788997073
+            ],
+            "mean_ttft_ms": [
+              268.9336315175751
+            ],
+            "mean_tpot_ms": [
+              4.6241417757402
+            ]
+          },
           "H100": {
             "mean_e2el_ms": [
               733.5836
@@ -316,6 +390,20 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
+          "MI300": {
+            "mean_e2el_ms": [
+              725.619000075676
+            ],
+            "request_throughput": [
+              0.4965968068643686
+            ],
+            "mean_ttft_ms": [
+              223.58727990213083
+            ],
+            "mean_tpot_ms": [
+              5.11000755366906
+            ]
+          },
           "H100": {
             "mean_e2el_ms": [
               694.9777
@@ -379,6 +467,20 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
+          "MI300": {
+            "mean_e2el_ms": [
+              975.7155577820959
+            ],
+            "request_throughput": [
+              0.9902421804497239
+            ],
+            "mean_ttft_ms": [
+              359.2466840389534
+            ],
+            "mean_tpot_ms": [
+              6.240374665878445
+            ]
+          },
           "H100": {
             "mean_e2el_ms": [
               992.3741

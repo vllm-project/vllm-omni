@@ -367,6 +367,12 @@ def _patched_build_backend(self) -> None:
         )
 
     config = _graph_config(self)
+    if "code2wav_fused_qkv_norm" in config:
+        logger.warning_once(
+            "MiniCPM-o NPU additional_config.code2wav_fused_qkv_norm has been removed and is ignored, "
+            "including false. Eligible FP32 inputs automatically use fused QKV normalization; "
+            "unsupported inputs use the native fallback. Remove the stale key from your deployment or overlay YAML."
+        )
     cfm_config = getattr(self, "_cfm_graph_config", {})
     max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, cfm_config.get("max_graphs", 32)))))
     graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), bool(cfm_config.get("enabled", False)))
@@ -376,7 +382,11 @@ def _patched_build_backend(self) -> None:
     # Preserve the NPU stage switches while routing enabled CFM work through
     # the shared Whole-Euler/step wrappers (including masks and shared arenas).
     if hasattr(self, "_cfm_graph_config"):
-        self._cfm_graph_config = {**self._cfm_graph_config, "enabled": graph_enabled, "max_graphs": max_graphs}
+        self._cfm_graph_config = {
+            **self._cfm_graph_config,
+            "enabled": graph_enabled,
+            "max_graphs": max_graphs,
+        }
     needs_runtime = graph_enabled or any(
         getattr(self, name, {}).get("enabled", False)
         for name in ("_hift_graph_config", "_chunk_encoder_graph_config", "_encoder_graph_config")

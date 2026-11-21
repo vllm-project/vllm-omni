@@ -94,11 +94,10 @@ class PrefixCacheSchedulerAdapter:
     the old request before starting the new one. EXTENDED covers ordinary
     decode, chunked prefill and a live ID re-entering scheduled_new_reqs.
 
-    ABORTED requires an explicit optional cancellation field:
-    ``discarded_req_ids`` (the producer proposed in PR #7681) or
-    ``aborted_req_ids``. Neither is produced by the current scheduler
-    contract; until a producer lands, production terminals remain FINISHED.
-    These fields are accepted for forward compatibility, not inferred.
+    ABORTED requires an explicit cancellation field. The scheduler produces
+    ``discarded_req_ids`` for aborted, errored, and ignored requests.
+    ``aborted_req_ids`` remains an accepted alias. A request that merely
+    leaves the batch is FINISHED, not inferred as aborted.
 
     ``track_requests`` additionally keeps, per live request, its group-0
     block ids and the number of leading rows already delivered. A runner

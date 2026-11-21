@@ -504,6 +504,14 @@ requires the judge to support video inputs and access the same local video paths
 Use `--duplex-eval-judge-video-mode frame-sample` for a remote image-capable judge;
 this changes content evaluation to the existing sampled-frame variant, not full-video judging.
 
+`--duplex-eval-judge-frame-max-side` limits the longer side of RTD judge frames
+to 1920 pixels by default. Larger frames are scaled down with their aspect ratio
+preserved to reduce the judge's image token usage. The cap applies to temporal
+frames in both modes and to content frames in `frame-sample` mode or when
+`video_url` content judging falls back to sampled frames after a context limit
+error. The full video passed in `video_url` mode keeps its source resolution.
+Set the flag to `0` to keep extracted frames at source resolution.
+
 Scoring reuses the standalone evaluator and runs **after performance timing**.
 The terminal and saved benchmark result (`omni_duplex_eval.accuracy`) report scores
 and coverage: total measured sessions, evaluated sessions, skipped failed/unpublished
@@ -551,6 +559,12 @@ does not reproduce the shuffle from `bench serve` or filter out failed or
 unpublished sessions. To automatically score the actual successfully published
 samples, including shuffled or partially successful runs, use
 `--duplex-eval-evaluate` during `bench serve`.
+
+The standalone `evaluate` command uses `--judge-frame-max-side` for the same
+setting. `summarize` reports the RTD cap and rejects scores that mix RTD caps.
+An RTD score without a recorded cap counts as source resolution. To change
+the cap, use a fresh `--score-root` or rescore all previously scored RTD samples
+in that root with `--overwrite`.
 
 The standalone `generate` command remains available. It still skips an existing
 sample unless `--overwrite` is set, and it reuses that sample only when the

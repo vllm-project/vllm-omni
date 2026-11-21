@@ -31,11 +31,23 @@ Setting `duplex_eval_accuracy_config` opts a DFX case into the accuracy
 artifact and CLI-exit guard. Existing evaluated cases such as Qwen3-Omni's
 `pr_correction` keep their current result and exit-code behavior.
 
+The AMD MiniCPM CI job passes `--require-duplex-eval-score-floors`.
+Missing or empty floors for the runtime hardware fail this case. Local DFX
+configurations can also set `duplex_eval_require_score_floors: true`.
+Other callers retain record-only behavior for hardware without a score floor.
+The AMD queue currently reports MI300X, normalized to `MI300`; the `MI325`
+pytest marker is a selection label, not evidence for an MI325 baseline.
+See [AMD qualification](../../../../.buildkite/amd/nightly-qualification.md)
+for the provisional MI300 floors and required native validation.
+
 The model uses the first allocated device and the judge uses the second.
 DFX maps the judge's `device_index` through the platform's visible-device
 environment. The judge is `Qwen/Qwen2.5-VL-7B-Instruct`, with a 65,536-token
 context, video input at 2 FPS, and four evaluation workers. Its allowed
 media directory matches the configured response root.
+The judge shuts down without waiting for all visible devices to become empty,
+because the primary model is still running. The primary server performs that
+memory wait after both servers have exited.
 
 Input replay uses the real-time clock and 1 FPS. Warmups and request-based
 readiness probes are disabled; the server fixture waits for startup.
@@ -113,7 +125,9 @@ coverage counts, errors and the score directory. `status` describes judge
 completion; the subsequent assertions enforce the recorded quality thresholds.
 Both result artifacts are saved before the assertions, preserving partial
 results when judging fails or a score falls below its threshold. Buildkite
-uploads JSON files from both directories and detailed artifacts even on test failure.
+uploads JSON files from both directories even on test failure. The AMD job also
+retains pytest logs, JUnit results and runtime/process diagnostics. Intermediate
+judge inputs remain temporary and are removed when the test fixture exits.
 The CLI must exit successfully; the existing NPU SIGABRT-on-shutdown exception
 (`-6`) remains accepted when all artifact and score checks pass.
 

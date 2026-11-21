@@ -622,7 +622,8 @@ def test_codec_penalty_reads_draft_rows_only_when_a_request_has_them(mocker, dra
         assert kwargs["draft_ids"] is None and kwargs["local_pos"] is None
 
 
-def test_draft_verification_forces_codec_eos_after_processing(mocker):
+@pytest.mark.parametrize("with_draft_logits", [False, True])
+def test_draft_verification_forces_codec_eos_after_processing(mocker, with_draft_logits):
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerRejectionSampler
@@ -650,7 +651,8 @@ def test_draft_verification_forces_codec_eos_after_processing(mocker):
     rejection = MiniCPMO45TalkerRejectionSampler(sampler, spec_config, talker)
     seen = {}
 
-    def verify(self, logits, input_batch, draft_logits, invalid_drafts):
+    def verify(self, logits, input_batch, draft_logits):
+        seen["draft_logits"] = draft_logits
         seen["processed"] = self.sampler.apply_sampling_params(
             logits,
             input_batch.expanded_idx_mapping,
@@ -664,7 +666,11 @@ def test_draft_verification_forces_codec_eos_after_processing(mocker):
         return "verified"
 
     mocker.patch.object(RejectionSampler, "__call__", autospec=True, side_effect=verify)
-    assert rejection(torch.zeros(3, 8), batch) == "verified"
+    from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
+
+    draft_logits = DraftLogitsCache(4, 1, 8, dtype=torch.float32, fill=0.0, device="cpu") if with_draft_logits else None
+    assert rejection(torch.zeros(3, 8), batch, draft_logits) == "verified"
+    assert seen["draft_logits"] is draft_logits
     talker.take_mrv2_forced_eos.assert_called_once_with(batch, sampler.req_states, 3)
     processed = seen["processed"]
     # An unforced row keeps the processors' result; a forced row's target is codec EOS alone.
@@ -724,6 +730,9 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
             max_num_logprobs=lambda idx: NO_LOGPROBS,
         ),
         apply_sampling_params=apply_sampling_params,
+        get_logprobs_dims=lambda idx: None,
+        trace_replay_state=None,
+        may_mask_logits=np.ones(8, dtype=bool),
         logprobs_mode="raw_logprobs",
         compute_nans=False,
         use_fp64_gumbel=False,

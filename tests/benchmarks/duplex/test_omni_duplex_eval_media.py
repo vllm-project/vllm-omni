@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -80,7 +81,7 @@ def test_av_units_reject_invalid_pcm_or_unit_size(pcm, unit_ms):
 # ---------------------------------------------------------------------------
 
 
-def _make_synthetic_mp4(duration: float = 1.0, fps: int = 30) -> bytes:
+def _make_synthetic_mp4(duration: float = 1.0, fps: int = 30, width: int = 64, height: int = 64) -> bytes:
     """Return an MP4 byte blob with a solid-color pattern.
 
     Uses the built-in ``mpeg4`` encoder — available everywhere PyAV's bundled
@@ -90,11 +91,13 @@ def _make_synthetic_mp4(duration: float = 1.0, fps: int = 30) -> bytes:
     total_frames = int(duration * fps)
     with av.open(buf, mode="w", format="mp4") as container:
         stream = container.add_stream("mpeg4", rate=fps)
-        stream.width = 64
-        stream.height = 64
+        stream.width = width
+        stream.height = height
         stream.pix_fmt = "yuv420p"
         for i in range(total_frames):
-            frame = av.VideoFrame.from_ndarray(np.full((64, 64, 3), (i * 8) % 256, dtype=np.uint8), format="rgb24")
+            frame = av.VideoFrame.from_ndarray(
+                np.full((height, width, 3), (i * 8) % 256, dtype=np.uint8), format="rgb24"
+            )
             for pkt in stream.encode(frame):
                 container.mux(pkt)
         for pkt in stream.encode():
@@ -131,6 +134,8 @@ def _make_synthetic_ogg(duration: float = 1.0, sample_rate: int = 16000) -> byte
         stream = container.add_stream(codec_name, rate=sample_rate, layout="mono")
         frame = av.AudioFrame.from_ndarray(samples[np.newaxis, :], format="fltp", layout="mono")
         frame.sample_rate = sample_rate
+        frame.pts = 0
+        frame.time_base = Fraction(1, sample_rate)
         for pkt in stream.encode(frame):
             container.mux(pkt)
         for pkt in stream.encode():
@@ -224,6 +229,24 @@ class TestExtractJpeg:
         path.write_bytes(mp4)
         jpeg = extract_jpeg(path, timestamp=-1.0, quality=3)
         assert jpeg.startswith(b"\xff\xd8")
+
+    @staticmethod
+    def test_max_side_scales_down_keeping_aspect_ratio(tmp_path: Path) -> None:
+        from PIL import Image
+
+        path = tmp_path / "wide.mp4"
+        path.write_bytes(_make_synthetic_mp4(duration=0.5, fps=10, width=320, height=180))
+        full = Image.open(io.BytesIO(extract_jpeg(path, timestamp=0.0)))
+        scaled = Image.open(io.BytesIO(extract_jpeg(path, timestamp=0.0, max_side=160)))
+        assert full.size == (320, 180)
+        assert scaled.size == (160, 90)
+
+    @staticmethod
+    @pytest.mark.parametrize("max_side", [320, 640], ids=["equal", "larger"])
+    def test_max_side_leaves_frames_within_limit_unchanged(tmp_path: Path, max_side: int) -> None:
+        path = tmp_path / "small.mp4"
+        path.write_bytes(_make_synthetic_mp4(duration=0.5, fps=10, width=320, height=180))
+        assert extract_jpeg(path, timestamp=0.0, max_side=max_side) == extract_jpeg(path, timestamp=0.0)
 
     @staticmethod
     def test_raises_value_error_for_no_video(tmp_path: Path) -> None:
