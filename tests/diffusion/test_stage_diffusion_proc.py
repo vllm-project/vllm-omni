@@ -484,7 +484,7 @@ async def test_real_executor_rpc_finishes_before_cancellation() -> None:
         assert release.wait(timeout=5)
 
     proc = object.__new__(StageDiffusionProc)
-    proc._engine = SimpleNamespace(profile=blocking_profile)
+    proc._engine = SimpleNamespace(profile=blocking_profile, _check_and_start_background_loop=AsyncMock())
     proc._executor = ThreadPoolExecutor(max_workers=1)
     task = asyncio.create_task(proc._handle_collective_rpc("profile", None, (True, None), {}))
     try:
