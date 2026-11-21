@@ -88,8 +88,9 @@ after unpacking; it saves memory but is not faster than `convrot_int8` there.
 
 ## Limitations
 
-- CUDA only (compute capability 8.0+). Weights are quantized online; ConvRot
-  checkpoints are not serialized.
+- `convrot_int8` runs on CUDA (compute capability 8.0+) and on Ascend NPU, where
+  it reuses the shared INT8 kernels; `convrot_int4` is CUDA only. Weights are
+  quantized online; ConvRot checkpoints are not serialized.
 - Rotation, activation quantization and, for `convrot_int4`, weight unpacking
   run as separate operations around the GEMM; they are not fused.
 - INT4 activations have a coarse per-token resolution. Compare against BF16 on
