@@ -353,6 +353,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    stack_decode_tiles: bool = True
 
     def __init__(
         self,
