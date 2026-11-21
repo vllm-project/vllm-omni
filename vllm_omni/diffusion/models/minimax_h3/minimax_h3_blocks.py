@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -629,7 +630,8 @@ class MiniMaxH3MLP(nn.Module):
     def _fuse_fc1_swiglu(self, x: torch.Tensor) -> bool:
         fc1 = self.fc1
         return (
-            type(fc1.quant_method) is UnquantizedLinearMethod
+            not isinstance(fc1, BaseLayerWithLoRA)
+            and type(fc1.quant_method) is UnquantizedLinearMethod
             and fc1.bias is None
             and fc1_swiglu_supported(x, fc1.weight)
         )
