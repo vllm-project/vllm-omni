@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_omni_duplex_eval",
-    "description": "CUDA/NPU nightly full-duplex C8 replay of the 120 Qwen3-aligned PR_correction IDs with the question mix, then VL judging. NPU MiniCPM-o topology is 1 card · 3-stage · stage2: 2 replicas (model only); pytest cards_2 is the VL-7B judge on the second card. Prefix cache stays off on the duplex deploy. The job records the correction success rate without a numeric floor: completed==120, every session judged, and mean_all_success finite in [0, 1]. Performance baselines start empty until a measured H100/B200/A3 window is collected.",
+    "description": "CUDA/NPU nightly full-duplex C8 replay of the 120 Qwen3-aligned PR_correction IDs with the question mix, then VL judging. NPU MiniCPM-o topology is 1 card · 3-stage · stage2: 2 replicas (model only); pytest cards_2 is the VL-7B judge on the second card. Prefix cache stays off on the duplex deploy. The job records the correction success rate without a numeric floor: completed==120, every session judged, and mean_all_success finite in [0, 1]. H100 and A3 mean_duplex_busy_rtf are two-run arithmetic means; B200 and MI325 have no calibrated reference. Runtime label 910 uses the A3 bucket.",
     "mark": [
       {
         "hardware_marks": {
@@ -189,7 +189,15 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H100": {
+            "mean_duplex_busy_rtf": [1.6439]
+          },
+          "A3": {
+            "mean_duplex_busy_rtf": [2.2420]
+          }
+        }
       }
     ]
   }

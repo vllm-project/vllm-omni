@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_default",
-    "description": "CUDA nightly default serving: --no-async-chunk and prefix cache off on the duplex deploy. One C64 English Seed-TTS pass of all 1088 utterances records ttft/tpot/rtf/ttfp/throughput/e2e and gates WER 0.05 / SIM 0.80. max_num_seqs is 64; drop stages and duplex_session.max_sessions to 32 if this OOMs. Whisper/SIM scoring uses the second GPU. Performance baselines start empty until a measured H100/B200 window is collected.",
+    "description": "CUDA nightly default serving: --no-async-chunk and prefix cache off on the duplex deploy. One C64 English Seed-TTS pass of all 1088 utterances records ttft/tpot/rtf/ttfp/throughput/e2e and gates WER 0.05 / SIM 0.80. max_num_seqs is 64; drop stages and duplex_session.max_sessions to 32 if this OOMs. Whisper/SIM scoring uses the second GPU. H100 mean_audio_rtf / mean_audio_ttfp_ms is the arithmetic mean of two Buildkite runs; B200 has no calibrated reference.",
     "mark": [
       {
         "hardware_marks": {
@@ -64,13 +64,18 @@
           }
         },
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {}
+        "baseline": {
+          "H100": {
+            "mean_audio_rtf": 0.918119,
+            "mean_audio_ttfp_ms": 3977.78068
+          }
+        }
       }
     ]
   },
   {
     "test_name": "test_minicpmo_4_5_async_prefix",
-    "description": "CUDA nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C1/C16/C32 are perf-only prefixes (32/256/512); C64 also gates WER 0.05 / SIM 0.80 on all 1088 English utterances. max_num_seqs is 64; drop to 32 if C64 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Performance baselines start empty until a measured H100/B200 window is collected.",
+    "description": "CUDA nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C1/C16/C32 are perf-only prefixes (32/256/512); C64 also gates WER 0.05 / SIM 0.80 on all 1088 English utterances. max_num_seqs is 64; drop to 32 if C64 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. H100 rtf/ttfp references are two-run arithmetic means; the C1/C16/C32 list is sweep-aligned. B200 has no calibrated reference.",
     "mark": [
       {
         "hardware_marks": {
@@ -136,7 +141,12 @@
           }
         },
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {}
+        "baseline": {
+          "H100": {
+            "mean_audio_rtf": [0.084132, 0.303207, 0.518391],
+            "mean_audio_ttfp_ms": [224.02943, 713.77122, 1049.99754]
+          }
+        }
       },
       {
         "dataset_name": "seed-tts",
@@ -162,13 +172,18 @@
           }
         },
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {}
+        "baseline": {
+          "H100": {
+            "mean_audio_rtf": 0.954979,
+            "mean_audio_ttfp_ms": 1872.73552
+          }
+        }
       }
     ]
   },
   {
     "test_name": "test_minicpmo_4_5_async_prefix_daily_omni",
-    "description": "CUDA nightly async_chunk + Thinker prefix cache, turn serving. One C8 pass of all 1197 Daily-Omni items records ttft/tpot/e2e and gates overall accuracy at 0.77. MiniCPM interleaved recipe: temperature 0, output-len 512, minicpm-interleave, text modalities. Prefix-on baselines start empty until a measured H100/B200 window is collected. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Shares the async-prefix CUDA nightly job with Seed-TTS, so this entry is cards_2.",
+    "description": "CUDA nightly async_chunk + Thinker prefix cache, turn serving. One C8 pass of all 1197 Daily-Omni items records ttft/tpot/e2e and gates overall accuracy at 0.77. MiniCPM interleaved recipe: temperature 0, output-len 512, minicpm-interleave, text modalities. H100 mean_ttft_ms is the arithmetic mean of two Buildkite runs; rtf/ttfp are not calibrated because this recipe is text-only. B200 has no calibrated reference. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Shares the async-prefix CUDA nightly job with Seed-TTS, so this entry is cards_2.",
     "mark": [
       {
         "hardware_marks": {
@@ -230,13 +245,17 @@
           }
         },
         "percentile-metrics": "ttft,tpot,e2el",
-        "baseline": {}
+        "baseline": {
+          "H100": {
+            "mean_ttft_ms": 4216.23682
+          }
+        }
       }
     ]
   },
   {
     "test_name": "test_minicpmo_4_5_npu_default",
-    "description": "1 card · 3-stage · stage2: 2 replicas (MiniCPM-o only; Whisper/SIM uses a second NPU). NPU nightly default serving: --no-async-chunk and prefix cache off on the duplex deploy. One C16 English Seed-TTS pass of all 1088 utterances records ttft/tpot/rtf/ttfp/throughput/e2e and gates WER 0.05 / SIM 0.80. pytest cards_2 is the scorer, not a second model card. max_num_seqs is 16; drop stages and duplex_session.max_sessions to 8 if this OOMs. Performance baselines start empty until a measured A3 window is collected.",
+    "description": "1 card · 3-stage · stage2: 2 replicas (MiniCPM-o only; Whisper/SIM uses a second NPU). NPU nightly default serving: --no-async-chunk and prefix cache off on the duplex deploy. One C16 English Seed-TTS pass of all 1088 utterances records ttft/tpot/rtf/ttfp/throughput/e2e and gates WER 0.05 / SIM 0.80. pytest cards_2 is the scorer, not a second model card. max_num_seqs is 16; drop stages and duplex_session.max_sessions to 8 if this OOMs. A3 mean_audio_rtf / mean_audio_ttfp_ms is the arithmetic mean of two Buildkite runs (runtime label 910 uses this A3 bucket).",
     "mark": [
       {
         "hardware_marks": {
@@ -305,13 +324,18 @@
           }
         },
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {}
+        "baseline": {
+          "A3": {
+            "mean_audio_rtf": 0.923612,
+            "mean_audio_ttfp_ms": 3869.94365
+          }
+        }
       }
     ]
   },
   {
     "test_name": "test_minicpmo_4_5_npu_async_prefix",
-    "description": "1 card · 3-stage · stage2: 2 replicas (MiniCPM-o only; Whisper/SIM uses a second NPU). NPU nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C1 is a perf-only prefix (32); C16 also gates WER 0.05 / SIM 0.80 on all 1088 English utterances. pytest cards_2 is the scorer, not a second model card. max_num_seqs is 16; drop to 8 if C16 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. Performance baselines start empty until a measured A3 window is collected.",
+    "description": "1 card · 3-stage · stage2: 2 replicas (MiniCPM-o only; Whisper/SIM uses a second NPU). NPU nightly async_chunk + Thinker prefix cache on turn serving. Seed-TTS C1 is a perf-only prefix (32); C16 also gates WER 0.05 / SIM 0.80 on all 1088 English utterances. pytest cards_2 is the scorer, not a second model card. max_num_seqs is 16; drop to 8 if C16 OOMs. Stage-0 ngram is removed because omni prefix cache refuses speculative decoding. A3 rtf/ttfp references are two-run arithmetic means (runtime label 910 uses this A3 bucket).",
     "mark": [
       {
         "hardware_marks": {
@@ -384,7 +408,12 @@
           }
         },
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {}
+        "baseline": {
+          "A3": {
+            "mean_audio_rtf": 0.222293,
+            "mean_audio_ttfp_ms": 571.70081
+          }
+        }
       },
       {
         "name": "async-prefix-seed-tts-c16",
@@ -411,7 +440,12 @@
           }
         },
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {}
+        "baseline": {
+          "A3": {
+            "mean_audio_rtf": 0.898745,
+            "mean_audio_ttfp_ms": 2260.61992
+          }
+        }
       }
     ]
   }
