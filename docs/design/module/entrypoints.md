@@ -225,6 +225,16 @@ stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`
 Streaming input pumps take an admission slot immediately before each EngineCore
 ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
+Shutdown closes request registration and sends a fatal error to every live
+request queue before cancelling the output pump, in one callback on the
+serving event loop. It wakes generators parked on paused or sleeping admission
+and releases first-input waiters before cancelling the input pump. Engine
+teardown runs in the shutdown caller after the live serving loop has queued
+the fatal errors and cancelled the output pump. Downstream stage submissions
+await request-queue capacity so this callback can run under backpressure.
+Shutdown, abort, and generator cleanup cancel each input pump only once so
+its iterator can finish asynchronous cleanup. Duplex closes registered session
+handles on the serving loop after closing admission.
 Video output sessions shield final task cleanup and unfinished-request abort
 from ASGI cancellation, including disconnects immediately after `session.done`.
 Video encoding and encoder close run on one worker per stream so encoding does

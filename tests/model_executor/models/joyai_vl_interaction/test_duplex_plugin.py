@@ -105,7 +105,7 @@ def _partial_orchestrator(talker_processor: object) -> _PartialOrchestrator:
 
 @dataclass
 class _PartialStreaming:
-    bridge_states: dict[str, object] = field(default_factory=dict)
+    bridge_states: dict[str, dict[str, object]] = field(default_factory=dict)
     enabled: bool = False
 
 
@@ -114,7 +114,7 @@ class _PartialReqState:
     session_owned: bool = True
     final_stage_id: int = 2
     request_id: str = "req-1"
-    prompt: dict[str, object] = field(default_factory=lambda: {"additional_information": {}})
+    prompt: dict[str, dict[str, object]] = field(default_factory=lambda: {"additional_information": {}})
     streaming: _PartialStreaming = field(default_factory=_PartialStreaming)
 
 
@@ -1119,8 +1119,8 @@ async def test_batched_commits_keep_separate_audio_and_transcript_owners(cancel,
                 images = info["deferred_multi_modal_data"]["image"]
                 assert [image.getpixel((0, 0)) for image in images] == [(255, 0, 0)] + [(0, 0, 255)] * (count - 1)
                 history = info["joyai_prompt_context"]["history"]
-                for previous in expected_transcripts[:-1]:
-                    assert ({"role": "user", "content": previous} in history) is bool(previous)
+                for item_id, previous in zip(item_ids, expected_transcripts[:-1]):
+                    assert ({"role": "user", "content": previous, "_item_key": item_id} in history) is bool(previous)
             if cancel:
                 await h.run(CancelResponse())
             h.runner.on_stage_output(
@@ -1515,6 +1515,7 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 4
     orchestrator, clients, rpc_q, _ = _build(stages=4, plugin=plugin)
 
     async def process_inputs(stage_id, *, request_id, params, **kwargs):
@@ -1567,7 +1568,7 @@ async def test_async_chunk_prewarm_request_crosses_engine_wire(mocker, monkeypat
 
     mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
     try:
-        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False}, modalities=("text", "audio"))).ok
         await _submit(orchestrator, AppendAudio(video_frames=(frame(),)))
         await _submit(orchestrator, Commit(final=True, create_response=True))
         assert not clients[1].add_request_calls
@@ -1579,16 +1580,17 @@ async def test_async_chunk_prewarm_request_crosses_engine_wire(mocker, monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("text", "last_response_text"),
+    ("text", "last_response_text", "modalities"),
     [
-        ("</silence>", ""),
-        ("</response> The pot is smoking.", "The pot is smoking."),  # suppressed repeat
-        ("</response> Let me check.</delegation> What is in the pot?", ""),  # no delegate tool declared
-        ("</response> The pot is boiling.", ""),  # the harness session is text-only
+        ("</silence>", "", ("text", "audio")),
+        ("</response> The pot is smoking.", "The pot is smoking.", ("text", "audio")),  # suppressed repeat
+        # No delegate tool declared.
+        ("</response> Let me check.</delegation> What is in the pot?", "", ("text", "audio")),
+        ("</response> The pot is boiling.", "", ("text",)),  # no audio requested: nothing is prewarmed
     ],
     ids=["silence", "repeat", "undeclared-delegation", "text-only"],
 )
-async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker, text, last_response_text):
+async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker, text, last_response_text, modalities):
     from tests.engine.test_duplex_orchestrator import _settle
 
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
@@ -1604,13 +1606,14 @@ async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker,
 
     mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
     try:
-        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False}, modalities=modalities)).ok
         runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
         runner.model_state.last_response_text = last_response_text
         await _submit(orchestrator, AppendAudio(video_frames=(frame(),)))
         await _submit(orchestrator, Commit(final=True, create_response=True))
         request_id = clients[0].add_request_calls[-1][0].request_id
-        assert [call[0].request_id for call in clients[2].add_request_calls] == [request_id]
+        prewarmed = "audio" in modalities
+        assert [call[0].request_id for call in clients[2].add_request_calls] == ([request_id] if prewarmed else [])
         request = orchestrator.request_states[request_id]
         runner.on_stage_output(
             0,
@@ -1625,9 +1628,11 @@ async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker,
         )
         await _settle(orchestrator)
         assert not clients[1].add_request_calls
-        # Nothing feeds the prewarmed Code2Wav request; abort it rather than let it
-        # wait out VLLM_OMNI_INPUT_WAIT_TIMEOUT_S.
-        assert any(request_id in ids for ids in clients[2].abort_calls)
+        if prewarmed:
+            # Nothing feeds the prewarmed Code2Wav request; abort it rather than let it
+            # wait out VLLM_OMNI_INPUT_WAIT_TIMEOUT_S.
+            assert any(request_id in ids for ids in clients[2].abort_calls)
+        assert not clients[2].add_request_calls[1:]
         assert request_id not in orchestrator.request_states
         assert not runner.session.resource_request_ids()
     finally:
@@ -2374,6 +2379,7 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
     plugin.processor = Processor()
     plugin.max_model_len = 2600
+    plugin.max_images = 4
     monkeypatch.setattr(bridge, "cached_processor_from_config", lambda config: plugin.processor, raising=False)
     monkeypatch.setattr(
         bridge,
@@ -2640,6 +2646,8 @@ async def test_text_only_response_finishes_without_tts(response_override):
         )
         await h.run(CreateResponse(options={"modalities": ["text"]} if response_override else {}))
         request_id = h.port.submissions[-1].context.request_id
+        # The turn never reaches Code2Wav, so no downstream placeholder is prewarmed for it.
+        assert not h.runner.plugin.prewarms_downstream_stages(request_id)
         consumed = h.deliver(
             tts_output(request_id, text="</response> Smoke!", finished=True),
             stage_id=0,
@@ -2655,6 +2663,18 @@ async def test_text_only_response_finishes_without_tts(response_override):
         events = [event.to_realtime() for event in h.events]
         assert sum(event["type"] == "response.done" for event in events) == 1
         assert not any(event["type"] in {"error", "response.output_audio.delta"} for event in events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_spoken_response_keeps_downstream_prewarm():
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        assert h.runner.plugin.prewarms_downstream_stages(request_id)
+        # An id the data plane does not know keeps the default behavior.
+        assert h.runner.plugin.prewarms_downstream_stages("unknown-request")
     finally:
         await h.manager.shutdown()
 
