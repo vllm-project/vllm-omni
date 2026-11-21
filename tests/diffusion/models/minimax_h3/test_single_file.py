@@ -152,6 +152,77 @@ def test_single_file_resolves_serving_stage_without_hub_discovery(tmp_path, chec
     assert len(resolved.stage_configs) == 1
 
 
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+@pytest.mark.parametrize("custom_base", [False, True])
+def test_single_file_disaggregated_uses_file_for_dit_and_base_for_encoder(tmp_path, monkeypatch, task, custom_base):
+    from vllm_omni.config.resolver import resolve_omni_config
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import resolve_minimax_h3_diffusion_model_path
+    from vllm_omni.diffusion.models.minimax_h3.single_file import MINIMAX_H3_BASE_MODEL, MINIMAX_H3_BASE_REVISION
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minimax_h3_encoder_model_root
+
+    path = tmp_path / "hybrid.safetensors"
+    path.touch()
+    base = tmp_path / "base"
+    (base / "FL2VA" / "text_encoder").mkdir(parents=True)
+    args = {"base_model": str(base), "base_revision": "custom-revision"} if custom_base else {}
+    resolved = resolve_omni_config(
+        str(path),
+        trust_remote_code=False,
+        deploy_config_path="vllm_omni/deploy/minimax_h3_disaggregated.yaml",
+        cli_overrides={"model_class_name": "MiniMaxH3Pipeline", "task_type": task, "custom_pipeline_args": args},
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    encoder, dit = resolved.stage_configs
+    assert encoder.model_config.model == (str(base) if custom_base else MINIMAX_H3_BASE_MODEL)
+    assert encoder.model_config.revision == ("custom-revision" if custom_base else MINIMAX_H3_BASE_REVISION)
+    assert encoder.model_config.task_type == "fl2va"
+    assert dit.model_config.model == str(path)
+    assert dit.diffusion_config.custom_pipeline_args == args
+    assert resolve_minimax_h3_diffusion_model_path(str(path), None, task) == str(path)
+    if custom_base:
+        assert resolve_minimax_h3_encoder_model_root(str(base), "custom-revision", "fl2va") == str(
+            base / "FL2VA" / "text_encoder"
+        )
+        monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _args: None)
+        encoder_args = stage_init_utils.build_engine_args_dict_from_omni_stage_config(encoder, model=str(path))
+        dit_args = stage_init_utils.build_engine_args_dict_from_omni_stage_config(dit, model=str(path))
+        assert encoder_args["model"] == str(base / "FL2VA" / "text_encoder")
+        assert dit_args["model"] == str(path)
+
+
+def test_single_file_disaggregated_decoder_uses_base_components(tmp_path, monkeypatch):
+    from vllm_omni.config.resolver import resolve_omni_config
+    from vllm_omni.engine import stage_init_utils
+
+    path = tmp_path / "hybrid.safetensors"
+    path.touch()
+    base = str(tmp_path / "base")
+    (tmp_path / "base" / "FL2VA").mkdir(parents=True)
+    resolved = resolve_omni_config(
+        str(path),
+        trust_remote_code=False,
+        deploy_config_path="vllm_omni/deploy/minimax_h3_disaggregated_decode.yaml",
+        cli_overrides={
+            "model_class_name": "MiniMaxH3Pipeline",
+            "task_type": "ref2va",
+            "custom_pipeline_args": {"base_model": base, "base_revision": "revision"},
+        },
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    encoder, dit, decoder = resolved.stage_configs
+    assert encoder.model_config.model == base
+    assert dit.model_config.model == str(path)
+    assert decoder.model_config.model == decoder.diffusion_config.model == base
+    assert decoder.model_config.revision == decoder.diffusion_config.revision == "revision"
+    assert decoder.model_config.task_type == decoder.diffusion_config.task_type == "fl2va"
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _args: None)
+    decoder_args = stage_init_utils.build_engine_args_dict_from_omni_stage_config(decoder, model=str(path))
+    assert decoder_args["model"] == str(tmp_path / "base" / "FL2VA")
+
+
 @pytest.mark.parametrize(
     ("task", "as_symlink", "base_source", "expected_revision"),
     [
@@ -171,7 +242,10 @@ def test_pipeline_loads_selected_file_for_each_task(
     from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeAttention
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-    from vllm_omni.diffusion.model_loader.host_weight_plan import build_checkpoint_binding_plan
+    from vllm_omni.diffusion.model_loader.host_weight_plan import (
+        build_checkpoint_binding_plan,
+        build_checkpoint_mmap_plan,
+    )
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
@@ -265,6 +339,17 @@ def test_pipeline_loads_selected_file_for_each_task(
         online_quantization=False,
     )
     assert result.plan is not None, result.fallback_reason
+    mmap_result = build_checkpoint_mmap_plan(
+        pipeline,
+        dit_modules=tuple((name, getattr(pipeline, name)) for name in pipeline._dit_modules),
+        sources=sources,
+        model_path=str(path),
+        tensor_parallel_size=1,
+        use_hsdp=False,
+        online_quantization=False,
+    )
+    assert mmap_result.plan is not None, mmap_result.fallback_reason
+    assert mmap_result.plan.bindings["transformer.time_embedder.table"].checkpoint_key == "adaln_t_table"
     targets = dict(pipeline.named_parameters()) | dict(pipeline.named_buffers())
     for name, binding in result.plan.bindings.items():
         assert binding.file_path == str(path)
@@ -272,6 +357,25 @@ def test_pipeline_loads_selected_file_for_each_task(
         restored = stored if binding.transform is None else binding.transform(stored)
         assert restored.dtype == targets[name].dtype
         torch.testing.assert_close(restored, targets[name], rtol=0, atol=0)
+
+    # DLO realizes checkpoint tensors before post-load validation. Mixed BF16
+    # checkpoints must be cast to their FP32 runtime targets at that boundary.
+    from vllm_omni.diffusion.offloader.distributed_layerwise_backend import DistributedLayerwiseOffloadBackend
+    from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent
+
+    backend = object.__new__(DistributedLayerwiseOffloadBackend)
+    backend.device = torch.device("cpu")
+    backend._using_rank_local_mmap = True
+    backend._mmap_transforms_by_tensor_id = {}
+    backend._load_weights_via_mmap(
+        pipeline,
+        (ResolvedComponent(path="transformer", module=transformer, selected=True),),
+        mmap_result.plan,
+    )
+    assert transformer.video_patch_proj.weight.dtype == torch.float32
+    assert transformer.time_embedder.table.dtype == torch.float32
+    torch.testing.assert_close(transformer.time_embedder.table, checkpoint_tensors["adaln_t_table"].float())
+    assert id(transformer.time_embedder.table) not in backend._mmap_transforms_by_tensor_id
 
 
 @pytest.mark.parametrize("partition", ["fl2va", "ref2va"])

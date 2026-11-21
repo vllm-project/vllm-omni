@@ -83,6 +83,23 @@ logger = init_logger(__name__)
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 
+# XCCL and NCCL reject E8M0 scales as a collective element type. E8M0 is one
+# byte wide and bit-preserving under a uint8 reinterpretation, so collect the
+# underlying byte storage and view the output back as E8M0.
+_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu})
+
+
+def _all_gather_shard(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+    group: torch.distributed.ProcessGroup | None,
+) -> None:
+    """All-gather a shard, using byte storage for unsupported dtypes."""
+    if input_tensor.dtype in _BYTE_VIEW_ALLGATHER_DTYPES:
+        output = output.view(torch.uint8)
+        input_tensor = input_tensor.view(torch.uint8)
+    torch.distributed.all_gather_into_tensor(output, input_tensor, group=group)
+
 
 def _retain_active_hwr_registration(
     registration: HostRegistration,
@@ -347,10 +364,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             offset = offsets.get(dtype, 0)
             transform = (tensor_transforms or {}).get(id(target))
             runtime_source = transform(source) if callable(transform) else source
-            if runtime_source.dtype != dtype or runtime_source.shape != source.shape:
+            # Rank-local staging is sized from the recorded ``numel``/``shape``
+            # of the transformed tensor and re-validated at pack time, so a
+            # model-declared runtime layout may legitimately be smaller than the
+            # checkpoint tensor; ``_shard_and_pin`` accepts the same transforms.
+            # Only dtype must hold, because sources are bucketed by dtype.
+            if runtime_source.dtype != dtype:
                 raise ValueError(
-                    "mmap weight transform changed tensor metadata for "
-                    f"{name!r}: expected dtype={dtype}, shape={tuple(source.shape)}, "
+                    "mmap weight transform changed tensor dtype for "
+                    f"{name!r}: expected dtype={dtype}, "
                     f"got dtype={runtime_source.dtype}, shape={tuple(runtime_source.shape)}"
                 )
             stride = runtime_source.stride()
@@ -657,10 +679,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 with current_omni_platform.stream(self.comm_stream):
                     for dtype, local_shard in gpu_shards.items():
                         gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                        torch.distributed.all_gather_into_tensor(
+                        _all_gather_shard(
                             gw,
                             local_shard,
-                            group=self.dp_group,
+                            self.dp_group,
                         )
                     evt.record(self.comm_stream)
             else:
@@ -687,10 +709,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                             full_out = gpu_weights[dtype_manifest.dtype][
                                 chunk.full_offset : chunk.full_offset + chunk.padded_numel
                             ]
-                            torch.distributed.all_gather_into_tensor(
+                            _all_gather_shard(
                                 full_out,
                                 local_input,
-                                group=self.dp_group,
+                                self.dp_group,
                             )
                             self._ag_done_events[input_slot].record(self.comm_stream)
                         self._chunk_reuse_events[input_slot] = self._ag_done_events[input_slot]
@@ -1381,6 +1403,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Cache open file handles
         file_cache: dict[str, Any] = {}
         loaded_names: set[str] = set()
+        realized_transforms: set[str] = set()
 
         # Realize the loader's exact runtime-name bindings.  In particular,
         # do not reconstruct names from DLO block discovery: storage planning
@@ -1406,6 +1429,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     device="cpu",
                 )
             tensor = file_cache[binding.file_path].get_tensor(binding.checkpoint_key)
+            if tensor.dtype != target.dtype and binding.transform is not None:
+                # Post-load hooks and rank-local staging require the runtime
+                # dtype. Materialize dtype-changing conversions here; defer
+                # layout-only transformations to bounded block staging.
+                tensor = binding.transform(tensor)
+                if tensor.dtype != target.dtype:
+                    raise RuntimeError(f"Invalid dtype transform for mmap tensor {runtime_name!r}")
+                realized_transforms.add(runtime_name)
             if is_parameter:
                 replacement = torch.nn.Parameter(tensor, requires_grad=target.requires_grad)
                 parent._parameters[leaf_name] = replacement
@@ -1414,7 +1445,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 parent._buffers[leaf_name] = replacement
             loaded_names.add(runtime_name)
 
-        logger.info("Realized %d loader-planned tensors as mmap views", len(loaded_names))
+        logger.info("Realized %d loader-planned tensors from mmap", len(loaded_names))
 
         # Keep file handles open — _shard_and_pin will read from the mmap views.
         # They will be released after _shard_and_pin completes (when params are
@@ -1455,7 +1486,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # runtime tensor objects rather than the initial mmap replacements.
         self._mmap_transforms_by_tensor_id.clear()
         for runtime_name, binding in plan.bindings.items():
-            if binding.transform is None:
+            if binding.transform is None or runtime_name in realized_transforms:
                 continue
             parent_path, _, leaf_name = runtime_name.rpartition(".")
             parent = pipeline.get_submodule(parent_path)

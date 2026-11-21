@@ -5,22 +5,23 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.distributed import parallel_state
 
+from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeAttention, _small_od_config
+from vllm_omni.diffusion.distributed import hsdp
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+from vllm_omni.diffusion.models.minimax_h3.adaln_curve import MiniMaxH3AdalnCurve
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 @pytest.fixture(autouse=True)
 def tp1(monkeypatch):
-    from vllm.distributed import parallel_state
-
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
 
 
 def test_curve_interpolates_and_clamps_each_stream_timestep():
-    from vllm_omni.diffusion.models.minimax_h3.adaln_curve import MiniMaxH3AdalnCurve
-
     curve = MiniMaxH3AdalnCurve(3, 2)
     curve.table.data.copy_(torch.tensor([[0.0, 4.0], [2.0, 8.0], [10.0, -4.0]]))
     times = torch.tensor([-0.1, 0.0, 0.25, 0.5, 0.75, 1.0, 1.1], dtype=torch.float64)
@@ -30,8 +31,6 @@ def test_curve_interpolates_and_clamps_each_stream_timestep():
 
 @pytest.mark.parametrize("grid, width", [(0, 2), (1, 2), (3, 0), (3, -1)])
 def test_curve_rejects_invalid_table_dimensions(grid, width):
-    from vllm_omni.diffusion.models.minimax_h3.adaln_curve import MiniMaxH3AdalnCurve
-
     with pytest.raises(ValueError, match="curve"):
         MiniMaxH3AdalnCurve(grid, width)
 
@@ -68,9 +67,6 @@ def test_dense_projection_keeps_original_silu_and_bf16():
 
 @pytest.fixture
 def curve_model(monkeypatch):
-    from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeAttention, _small_od_config
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
-
     monkeypatch.setattr(blocks, "Attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
     # Upstream probes the accelerator for the SM120 AdaLN-offload default; keep these CPU-only tests off CUDA.
@@ -114,9 +110,6 @@ def test_curve_model_checks_fp32_after_offload_restore(curve_model, parameter):
 
 @pytest.mark.parametrize("compressed", [True, False])
 def test_hsdp_preserves_compressed_projection_precision(curve_model, monkeypatch, compressed):
-    from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _small_od_config
-    from vllm_omni.diffusion.distributed import hsdp
-
     model = curve_model if compressed else h3.MiniMaxH3DiTModel(_small_od_config(), diffusers_weights=False)
     monkeypatch.setattr(hsdp, "get_world_group", lambda: SimpleNamespace(world_size=2, rank_in_group=0))
     monkeypatch.setattr(hsdp, "_create_hsdp_mesh", lambda **kwargs: object())

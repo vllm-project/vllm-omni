@@ -755,7 +755,10 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         for i, info in enumerate(infos):
             if not isinstance(info, dict):
                 continue
-            request_id = info.get("request_id")
+            meta = info.get("meta")
+            if info.get("request_id") is None and (not isinstance(meta, dict) or meta.get("request_id") is None):
+                continue
+            request_id = require_request_id(info, "talker")
             session = self._sessions.get(str(request_id)) if request_id is not None else None
             if not session or not session.get("use_native"):
                 continue
@@ -1075,6 +1078,13 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             real_missing = [m for m in real_missing if not m.startswith("tts_model.backbone.")]
         if real_missing:
             raise ValueError(f"NemotronVoiceChat talker is missing TTS weights: {sorted(real_missing)[:10]} ...")
+        if tts.tts_model.config.get("use_audio_prompt_frozen_projection", False):
+            projection = getattr(tts.tts_model, "audio_prompt_projection_W", None)
+            if projection is None or not torch.isfinite(projection).all().item():
+                raise ValueError(
+                    "NemotronVoiceChat talker did not load a finite "
+                    "tts_model.audio_prompt_projection_W from the checkpoint; refusing partial initialization."
+                )
         if unexpected:
             logger.warning(
                 "NemotronVoiceChat talker ignoring %d unexpected TTS tensors (e.g. %s)",

@@ -144,6 +144,18 @@ The job is then re-read so a completed save is not orphaned.
 bytes. It is useful for benchmarks and simple scripts that do not need job
 storage or polling.
 
+### Storage Expiration
+
+Set `VLLM_OMNI_SERVER_STORAGE__FILE_TTL` to enable expiration of locally stored
+videos. `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL` controls how often expired
+files are swept (default: 300 seconds).
+
+When a sweep successfully deletes a video file, it also removes the matching
+job record. The job then disappears from `GET /v1/videos`, and both its metadata
+and content endpoints return 404. A record may remain visible between its
+`expires_at` timestamp and the next sweep. If file deletion fails, its metadata
+is retained and deletion is retried on a later sweep.
+
 ## Examples
 
 ### Image-to-Video
@@ -232,6 +244,15 @@ can differ from the original host, and vLLM-Omni does not yet fully implement
 upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
+
+### MiniMax H3 Samplers
+
+Set `"sampler"` in `extra_params` to select the sampler. Supported values are
+`euler` (default), `res_multistep`, and `heun`. Both request and step execution
+support them, and compatible requests share packed model evaluations, including
+Heun's correction stage. An N-step schedule ending at zero uses `2N - 1` model
+evaluations with Heun. Fixed distilled schedules remain Euler-only. Disable cache
+acceleration, including `quality=high`, when using Heun.
 
 ### MiniMax H3 control and inpainting
 
@@ -374,6 +395,28 @@ For example, each mask file in the request above may contain the JSON scalar
 The server streams source files to temporary request-scoped storage and removes
 them after synchronous or asynchronous generation finishes. Models that do not
 declare latent-mask editing support reject these fields.
+
+### MiniMax H3 Regenerate
+
+A server started with the
+[Open-H3-Regenerate-2K](gh-file:recipes/Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md)
+release re-renders a 768P H3 draft at a higher resolution. Send the draft as
+`source_video` with `extra_params` `{"regenerate": true}` and no noise masks;
+`width`, `height` and the frame count describe the draft canvas, and
+`latent_upscale` the output size (2560x1440 by default):
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=The prompt the draft was generated from" \
+  -F "width=1344" -F "height=768" -F "aspect_ratio=16:9" -F "num_frames=124" -F "fps=24" \
+  -F 'extra_params={"task":"t2va","regenerate":true}' \
+  -F "source_video=@draft.mp4;type=video/mp4" \
+  -o regenerated.mp4
+```
+
+The output is refined at the upscaled size, so `latent_upscale` must land on
+the 32-pixel grid (`align` 32, the default). A regenerated video is not cached
+for `continue_from`: continue the draft, then regenerate the result.
 
 ### MiniMax H3 Timeline Guides
 
