@@ -9,7 +9,13 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.media import (
+    convert_audio_bytes_to_text,
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+    get_asset_path,
+)
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
@@ -482,3 +488,39 @@ def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
+
+
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_to_audio(omni_server, online_client, run_level: str) -> None:
+    """
+    Input Modal: audio
+    Output Modal: audio
+    Input Setting: stream=False
+    Datasets: single request
+    """
+
+    # Load `audio-prompt.wav` file rather than synthetically
+    # generating an audio prompt via `generate_synthetic_audio`.
+    # 'audio-prompt.wav' asks the question "What is the capital of China?"
+    # Since the generate function must define the duration as an int
+    # it is impossible to accurately match the duration to the spoken length of the input phrase.
+    # Because of this short prompts can cause looping in the phrase
+    audio_data_url = get_asset_path("qwen3_omni/audio-prompt.wav", as_data_url=True)
+    messages = dummy_messages_from_mix_data(
+        audio_data_url=audio_data_url,
+        system_prompt=get_system_prompt(),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["audio"],
+    }
+
+    response = online_client.send_omni_request(request_config)
+    assert response[0].audio_bytes is not None
+
+    if run_level in {"advanced_model", "full_model"}:
+        transcription = convert_audio_bytes_to_text(response[0].audio_bytes, language="en").lower()
+        assert "beijing" in transcription
