@@ -339,7 +339,7 @@ Recommended viewers:
 
 For upstream background on the underlying vLLM profiling infrastructure, see the [vLLM profiling guide](https://docs.vllm.ai/en/stable/contributing/profiling/).
 
-## 6. Profiling Omni AR/TTS stages
+## 7. Profiling Omni AR/TTS stages
 
 For Omni AR and TTS stages, put `profiler_config` under each stage that should
 be captured. The serving API then controls a narrow window with
@@ -385,7 +385,7 @@ wrapper and uses `cudaProfilerStart/Stop`; the report is only valid if the
 CUDA API, GPU kernel, OS runtime, and NVTX summaries. Treat profiler latency as
 diagnostic only; use a separate no-profiler run for performance numbers.
 
-## 7. Orchestrator Monitor
+## 8. Orchestrator Monitor
 
 > **Warning:** Diagnostic only. Adds lightweight counters on the orchestrator poll loop and per-replica queue depth. Disable in production unless you are actively debugging orchestrator saturation.
 
