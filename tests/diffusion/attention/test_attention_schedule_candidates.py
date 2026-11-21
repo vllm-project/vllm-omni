@@ -112,11 +112,21 @@ def _fake_backend(name: str) -> type:
     return _Backend
 
 
-def _fake_resolve(*, role, head_size, attention_config=None, role_category=None, allow_trtllm_default=True):
+def _fake_resolve(
+    *,
+    role,
+    head_size,
+    attention_config=None,
+    role_category=None,
+    allow_trtllm_default=True,
+    inherited_backend_overrides=None,
+):
     """Resolve a fake backend from the supplied AttentionConfig, like the real selector."""
     spec = None
     if attention_config is not None:
-        spec, _source = attention_config.resolve_with_source(role=role, role_category=role_category)
+        spec, _source = attention_config.resolve_with_source(
+            role=role, role_category=role_category, inherited_backend_overrides=inherited_backend_overrides
+        )
     if spec is None:
         return _fake_backend("PLATFORM_DEFAULT"), None
     return _fake_backend(spec.backend.upper()), spec
@@ -162,7 +172,15 @@ def attention_env(monkeypatch):
 
     calls: list[dict] = []
 
-    def _counting(*, role, head_size, attention_config=None, role_category=None, allow_trtllm_default=True):
+    def _counting(
+        *,
+        role,
+        head_size,
+        attention_config=None,
+        role_category=None,
+        allow_trtllm_default=True,
+        inherited_backend_overrides=None,
+    ):
         calls.append({"role": role, "attention_config": attention_config})
         return _fake_resolve(
             role=role,
@@ -170,6 +188,7 @@ def attention_env(monkeypatch):
             attention_config=attention_config,
             role_category=role_category,
             allow_trtllm_default=allow_trtllm_default,
+            inherited_backend_overrides=inherited_backend_overrides,
         )
 
     monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _counting)
@@ -179,6 +198,20 @@ def attention_env(monkeypatch):
             return Attention(num_heads=4, head_size=64, causal=False, softmax_scale=1.0, **kwargs)
 
     return SimpleNamespace(build=build, calls=calls, monkeypatch=monkeypatch)
+
+
+def test_model_layer_count_reaches_base_and_scheduled_implementations(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="SOL_ATTN"))},
+        default=[{"start": 1, "end": None, "profile": "sparse"}],
+    )
+    attention = attention_env.build(
+        _make_config(schedule=schedule), layer_count=50, requires_conditioning_mask=True, prefix="blocks.49.attention"
+    )
+    for impl in (attention.attention, attention._schedule_candidates["sparse"].impl):
+        assert impl.kwargs["layer_count"] == 50
+        assert impl.kwargs["requires_conditioning_mask"] is True
+        assert impl.kwargs["prefix"] == "blocks.49.attention"
 
 
 def test_identical_effective_profiles_dedup_to_shared_record(attention_env):

@@ -145,6 +145,30 @@ def test_explicit_cudnn_skips_head_size_check_for_capability_probe(monkeypatch: 
     assert path == DiffusionAttentionBackendEnum.CUDNN_ATTN.get_path()
 
 
+@pytest.mark.parametrize(
+    "capability,head_size,error", [(DeviceCapability(7, 5), 128, "SM80"), (DeviceCapability(8, 0), 64, "head_dim")]
+)
+def test_sol_selection_rejects_unsupported_geometry(monkeypatch, capability, head_size, error):
+    monkeypatch.setattr(CudaOmniPlatform, "get_device_capability", lambda: capability)
+    with pytest.raises(ValueError, match=error):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("SOL_ATTN", head_size)
+
+
+@pytest.mark.parametrize("head_size", [-1, 128])
+@pytest.mark.parametrize(
+    "capability", [DeviceCapability(8, 0), DeviceCapability(9, 0), DeviceCapability(10, 0), DeviceCapability(12, 0)]
+)
+def test_sol_selection_accepts_probe_and_real_head_size(monkeypatch, head_size, capability):
+    from vllm_omni.diffusion.attention.backends.sol_attn import SolAttnBackend
+
+    monkeypatch.setattr(SolAttnBackend, "validate_available", lambda: None)
+    monkeypatch.setattr(CudaOmniPlatform, "get_device_capability", lambda: capability)
+    assert (
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("SOL_ATTN", head_size)
+        == DiffusionAttentionBackendEnum.SOL_ATTN.get_path()
+    )
+
+
 @pytest.mark.parametrize("head_size", [32, 320])
 def test_explicit_flashinfer_raises_for_unsupported_head_size(monkeypatch: pytest.MonkeyPatch, head_size: int):
     _blackwell_sm120(monkeypatch)

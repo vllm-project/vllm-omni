@@ -47,7 +47,12 @@ def test_specialization_preserves_selected_backend_and_options(mocker, local_att
     assert attention.attn_spec is spec
     assert isinstance(attention.parallel_strategy, NoParallelAttention)
     select.assert_called_once_with(
-        role="video.self", head_size=8, attention_config=None, role_category="self", allow_trtllm_default=False
+        role="video.self",
+        head_size=8,
+        attention_config=None,
+        role_category="self",
+        allow_trtllm_default=False,
+        inherited_backend_overrides=None,
     )
 
 

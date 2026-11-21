@@ -21,6 +21,7 @@ from vllm.model_executor.layers.linear import (
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionMetadata,
+    ConditioningBlockMask,
     PackedPaddingMetadata,
     VideoTokenLayout,
 )
@@ -44,6 +45,8 @@ from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.data import AttentionSpec
 
     from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
@@ -210,6 +213,8 @@ class MiniMaxH3Attention(nn.Module):
         role: str = "self",
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
+        inherited_backend_overrides: Mapping[str, AttentionSpec] | None = None,
+        layer_count: int | None = None,
     ) -> None:
         super().__init__()
         self.total_num_heads = arch.num_attention_heads
@@ -267,6 +272,9 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
             impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
+            inherited_backend_overrides=inherited_backend_overrides,
+            layer_count=arch.num_layers if layer_count is None else layer_count,
+            requires_conditioning_mask=True,
         )
 
     def enable_vsa_gate(self) -> None:
@@ -349,6 +357,7 @@ class MiniMaxH3Attention(nn.Module):
         packed_total: int,
         num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
+        conditioning_block_mask: ConditioningBlockMask | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
@@ -467,6 +476,7 @@ class MiniMaxH3Attention(nn.Module):
             ),
             extra=extra,
             video_layout=video_layout,
+            conditioning_block_mask=conditioning_block_mask,
         )
         return self.attention(
             q.unsqueeze(0),
@@ -516,6 +526,7 @@ class MiniMaxH3Attention(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        conditioning_block_mask: ConditioningBlockMask | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
@@ -568,6 +579,7 @@ class MiniMaxH3Attention(nn.Module):
             packed_total=packed_total if packed_total is not None else q.shape[0],
             num_requests=num_requests,
             video_layout=video_layout,
+            conditioning_block_mask=conditioning_block_mask,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
             reference_kv_state=reference_kv_state,
@@ -810,6 +822,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        conditioning_block_mask: ConditioningBlockMask | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_compact: bool = False,
@@ -849,6 +862,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             num_requests=num_requests,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
+            conditioning_block_mask=conditioning_block_mask,
             vsa_prefix_segments=vsa_prefix_segments,
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=self.layer_index,

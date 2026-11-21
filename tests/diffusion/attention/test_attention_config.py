@@ -62,6 +62,105 @@ def _clear_inherited_attention_backend(monkeypatch):
     monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
 
+@pytest.mark.parametrize("source", ["default", "category", "exact", "platform"])
+def test_model_policy_only_replaces_inherited_attention_specs(source):
+    requested = AttentionSpec(backend="sol_attn", sol_attn={"tau": 1.5})
+    replacement = AttentionSpec(backend="TORCH_SDPA")
+    config = AttentionConfig(
+        default=requested if source == "default" else None,
+        per_role={
+            **({"self": requested} if source == "category" else {}),
+            **({"test.refiner": requested} if source == "exact" else {}),
+        },
+    )
+    original = asdict(config)
+    spec, origin = config.resolve_with_source(
+        "test.refiner", "self", inherited_backend_overrides={"SOL_ATTN": replacement}
+    )
+    assert asdict(config) == original
+    if source in ("default", "category"):
+        assert spec is replacement
+        assert spec.backend_kwargs() is None
+        assert "model override SOL_ATTN -> TORCH_SDPA" in origin
+    elif source == "exact":
+        assert spec is requested
+        assert origin == "attention_config.per_role['test.refiner']"
+    else:
+        assert spec is None and origin is None
+
+
+def test_model_policy_can_keep_same_backend_with_dense_options():
+    requested = AttentionSpec(backend="TRTLLM_ATTN", skip_softmax={"threshold": 0.05})
+    dense = AttentionSpec(backend="TRTLLM_ATTN")
+    config = AttentionConfig(default=requested)
+    spec, _ = config.resolve_with_source("test.refiner", inherited_backend_overrides={"TRTLLM_ATTN": dense})
+    assert spec is dense and spec.backend_kwargs() is None
+    assert config.default is requested and requested.skip_softmax.threshold == 0.05
+    spec, _ = config.resolve_with_source("test.refiner", inherited_backend_overrides={"SOL_ATTN": dense})
+    assert spec is requested
+
+
+def test_model_policy_applies_to_baseline_and_independent_schedule_profiles(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+    selected = []
+
+    def select_backend(backend_name, head_size, allow_trtllm_default=True):
+        selected.append(backend_name)
+        return SDPABackend
+
+    monkeypatch.setattr(selector_mod, "_cached_get_backend_cls", select_backend)
+    config = OmniDiffusionConfig(
+        diffusion_attention_config=parse_attention_config(None, attention_backend="SOL_ATTN"),
+        diffusion_attention_schedule={
+            "profiles": {
+                "sparse": {"default": {"backend": "SOL_ATTN", "sol_attn": {"tau": 1.5}}},
+                "explicit": {"per_role": {"test.refiner": "TORCH_SDPA"}},
+                "platform": {},
+            },
+        },
+    )
+    original = asdict(config.diffusion_attention_config)
+    with set_current_diffusion_config(config):
+        layer = Attention(
+            2,
+            128,
+            False,
+            128**-0.5,
+            role="test.refiner",
+            role_category="self",
+            inherited_backend_overrides={"SOL_ATTN": AttentionSpec(backend="TORCH_SDPA")},
+        )
+    assert layer.attn_spec.backend == "TORCH_SDPA"
+    assert layer._schedule_candidates["sparse"].impl is layer.attention
+    assert layer._schedule_candidates["explicit"].impl is layer.attention
+    assert layer._schedule_candidates["platform"].spec is None
+    assert "SOL_ATTN" not in selected
+    assert asdict(config.diffusion_attention_config) == original
+    assert config.diffusion_attention_schedule.profiles["sparse"].default.sol_attn.tau == 1.5
+
+
+def test_model_policy_capability_selection_and_validation_agree(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+    config = AttentionConfig(default="SOL_ATTN")
+    policy = {"SOL_ATTN": AttentionSpec(backend="TORCH_SDPA")}
+    assert (
+        selector_mod.get_attn_backend_for_capability("test.refiner", config, "self", inherited_backend_overrides=policy)
+        is SDPABackend
+    )
+
+    def reject_backend(backend_name, head_size, allow_trtllm_default=True):
+        raise ValueError(f"unsupported backend: {backend_name}")
+
+    monkeypatch.setattr(selector_mod, "_cached_get_backend_cls", reject_backend)
+    with pytest.raises(ValueError, match="unsupported backend: TORCH_SDPA"):
+        selector_mod.get_attn_backend_for_role("test.refiner", 128, config, inherited_backend_overrides=policy)
+    explicit = AttentionConfig(default="TORCH_SDPA", per_role={"test.refiner": "SOL_ATTN"})
+    with pytest.raises(ValueError, match="unsupported backend: SOL_ATTN"):
+        selector_mod.get_attn_backend_for_role("test.refiner", 128, explicit, inherited_backend_overrides=policy)
+
+
 class TestAttentionSpec:
     def test_construct_no_skip_softmax(self):
         spec = AttentionSpec(backend="FLASH_ATTN")
@@ -950,6 +1049,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             attention_config=None,
             role_category=None,
             allow_trtllm_default=False,
+            inherited_backend_overrides=None,
         ):
             captured["role"] = role
             captured["head_size"] = head_size
@@ -1336,7 +1436,12 @@ class TestDiffusionKvCacheQuantization:
         monkeypatch.setattr(
             layer_mod,
             "get_attn_backend_for_role",
-            lambda role, head_size, attention_config=None, role_category=None, allow_trtllm_default=False: (
+            lambda role,
+            head_size,
+            attention_config=None,
+            role_category=None,
+            allow_trtllm_default=False,
+            inherited_backend_overrides=None: (
                 _FakeBackend,
                 None,
             ),

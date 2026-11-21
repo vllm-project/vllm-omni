@@ -130,11 +130,21 @@ class _RecordingTrtllmBackend(TrtllmAttentionBackend):
         return _RecordingTrtllmImpl
 
 
-def _resolve(*, role, head_size, attention_config=None, role_category=None, allow_trtllm_default=True):
+def _resolve(
+    *,
+    role,
+    head_size,
+    attention_config=None,
+    role_category=None,
+    allow_trtllm_default=True,
+    inherited_backend_overrides=None,
+):
     """Stand-in for the platform selector; the platform default is _DenseBackend."""
     spec = None
     if attention_config is not None:
-        spec, _source = attention_config.resolve_with_source(role=role, role_category=role_category)
+        spec, _source = attention_config.resolve_with_source(
+            role=role, role_category=role_category, inherited_backend_overrides=inherited_backend_overrides
+        )
     if spec is None:
         return _DenseBackend, None
     assert spec.backend.upper() == "TRTLLM_ATTN", spec.backend

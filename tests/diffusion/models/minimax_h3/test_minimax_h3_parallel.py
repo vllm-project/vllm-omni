@@ -94,6 +94,54 @@ def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
     assert branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] == (2, 3)
 
 
+@pytest.mark.parametrize("text_len", [63, 64, 65])
+def test_denoise_branch_protects_only_text_and_all_audio_blocks(text_len):
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
+
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=text_len,
+        latent_t=4,
+        latent_h=16,
+        latent_w=16,
+        audio_t=32,
+        ref_blocks=[
+            {"kind": "video_audio", "ref_audio_t": 32, "latent_t": 4, "latent_h": 16, "latent_w": 16},
+            {"kind": "audio", "ref_audio_t": 64},
+        ],
+    )
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(text_len, 4),
+        token_tags=packed["token_tags"],
+        device=torch.device("cpu"),
+    )
+    protection = branch.static_kwargs["packed_seq_params"]["conditioning_block_mask"]
+    assert protection.used_len == int(packed["cu_seqlens"][1])
+    assert protection.block_size == 64
+    assert protection.blocks.dtype == torch.bool and protection.blocks.is_contiguous()
+    assert protection.blocks.shape == ((protection.used_len + 63) // 64,)
+    positions = set(packed["text_pos"].flatten().tolist() + packed["audio_pos"].flatten().tolist())
+    expected = [
+        any(position in positions for position in range(start, min(start + 64, protection.used_len)))
+        for start in range(0, protection.used_len, 64)
+    ]
+    assert protection.blocks.tolist() == expected
+    reference = next(span for span in packed["video_spans"] if span["role"] == "reference")
+    interior_block = (reference["start"] + 63) // 64
+    assert not protection.blocks[interior_block]
+    for step in range(2):
+        kwargs = branch.forward_kwargs(
+            video_rows=torch.zeros(branch.img_pos.numel(), 96),
+            audio_rows=torch.zeros(branch.audio_pos.numel(), 32),
+            t_video=1.0 - step * 0.1,
+            t_audio=1.0 - step * 0.1,
+            imgvid_cond_timestep=0.999,
+            audio_ref_cond_timestep=1.0,
+        )
+        assert kwargs["packed_seq_params"]["conditioning_block_mask"] is protection
+
+
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
     from vllm_omni.diffusion.layers.rope import RotaryEmbedding
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
