@@ -7,20 +7,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.voxcpm2.cuda_graph_wrapper import VoxCPM2CudaGraphWrapper, _UnifiedDecodeGraphStats
 from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2RequestState
-from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
-    VoxCPM2TalkerForConditionalGeneration,
-    _UnifiedDecodeGraphStats,
-)
+from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
+from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import VoxCPM2TalkerForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _model():
     model = VoxCPM2TalkerForConditionalGeneration.__new__(VoxCPM2TalkerForConditionalGeneration)
+    model.cuda_graph = VoxCPM2CudaGraphWrapper(model, _VoxCPM2RuntimeConfig(), 4)
     torch.nn.Module.__init__(model)
     model._enable_unified_decode_graph = True
-    model._unified_graph_stats = _UnifiedDecodeGraphStats()
+    model.cuda_graph._unified_graph_stats = _UnifiedDecodeGraphStats()
     model._mrv2_model_state = SimpleNamespace(
         per_patch_audio=False, tensor_for=lambda state, name: getattr(state, name)
     )
@@ -35,13 +35,13 @@ def _ready_metadata_model():
     model = _model()
     model._enable_cuda_graph = True
     model._tts = SimpleNamespace(feat_decoder=SimpleNamespace(estimator=SimpleNamespace(_compiled=True)))
-    model._cuda_graph_warmup_steps = model._cuda_graph_warmup_threshold = 3
-    model._max_cached_graphs = 8
-    model._mixed_graph_cache_limit = 0
-    model._unified_decode_graph_max_batch_size = 4
-    model._mixed_graphs = {}
-    model._unified_graphs = {}
-    model._select_unified_graph_bucket_size = lambda count: 4
+    model.cuda_graph._cuda_graph_warmup_steps = model.cuda_graph._cuda_graph_warmup_threshold = 3
+    model.cuda_graph._max_cached_graphs = 8
+    model.cuda_graph._mixed_graph_cache_limit = 0
+    model.cuda_graph._unified_decode_graph_max_batch_size = 4
+    model.cuda_graph._mixed_graphs = {}
+    model.cuda_graph._unified_graphs = {}
+    model.cuda_graph._select_unified_graph_bucket_size = lambda count: 4
     return model
 
 
@@ -49,15 +49,15 @@ def _ready_metadata_model():
 def test_mixed_graph_supports_both_prefill_modes(chunked):
     model = _model()
     model.vllm_config.scheduler_config.enable_chunked_prefill = chunked
-    assert model._mixed_unified_graph_enabled()
+    assert model.cuda_graph._mixed_unified_graph_enabled()
 
 
 def test_mixed_token_capacity_bounds_and_buckets():
     model = _model()
-    assert model._mixed_token_capacity(5, 4) == 8
-    assert model._mixed_token_capacity(1, 4) == 4
-    assert model._mixed_token_capacity(16, 4) == 16
-    assert model._mixed_token_capacity(17, 4) is None
+    assert model.cuda_graph._mixed_token_capacity(5, 4) == 8
+    assert model.cuda_graph._mixed_token_capacity(1, 4) == 4
+    assert model.cuda_graph._mixed_token_capacity(16, 4) == 16
+    assert model.cuda_graph._mixed_token_capacity(17, 4) is None
 
 
 def test_mixed_graph_packs_prefill_masks_and_decode_conditions(monkeypatch):
@@ -81,7 +81,7 @@ def test_mixed_graph_packs_prefill_masks_and_decode_conditions(monkeypatch):
         prefix_feat_cond=torch.empty(4, 2, 2),
         last_token_indices=torch.empty(4, dtype=torch.long),
     )
-    model._prepare_mixed_graph_inputs(graph, 2)
+    model.cuda_graph._prepare_mixed_graph_inputs(graph, 2)
     assert graph.text_mask[:, 0].tolist() == [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     assert graph.prev_feat_embed[:, 0].tolist() == [0.0, 5.0, 0.0, 7.0, 0.0, 0.0, 0.0, 0.0]
     assert graph.last_token_indices.tolist() == [2, 3, 3, 3]
@@ -133,8 +133,8 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
     model._dit_proj_fn = lambda lm, res: torch.cat([projection(lm), projection(res)], dim=-1)
     monkeypatch.setattr(model, "_setup_cfm_buffers", lambda: None)
     monkeypatch.setattr(model, "_setup_execution_optimizations", lambda: None)
-    monkeypatch.setattr(model, "_voxcpm2_compile_unified_capture_estimator", lambda x: x)
-    monkeypatch.setattr(model, "_voxcpm2_compile_unified_capture_feat_encoder", lambda x: x)
+    monkeypatch.setattr(model.cuda_graph, "_voxcpm2_compile_unified_capture_estimator", lambda x: x)
+    monkeypatch.setattr(model.cuda_graph, "_voxcpm2_compile_unified_capture_feat_encoder", lambda x: x)
     monkeypatch.setattr(module, "_CFMBufferManager", lambda **kwargs: None)
     monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None))
     monkeypatch.setattr(module, "override_forward_context", lambda _: nullcontext())
@@ -144,7 +144,7 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
         cfm_calls.append(mu.shape[0])
         return mu[:, :2, None] + cond
 
-    monkeypatch.setattr(module, "_optimized_solve_euler_with_noise", solve)
+    monkeypatch.setattr(model, "_solve_cfm_with_noise", solve)
     if per_patch_audio:
         from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2ModelState
 
@@ -169,7 +169,7 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
         model._stop_fn = lambda x: x[:, :2]
         monkeypatch.setattr(model, "_get_vae_decode_sr_cond", lambda _: None)
 
-    graph = model._capture_unified_decode_graph(4, 8, patch_count)
+    graph = model.cuda_graph._capture_unified_decode_graph(4, 8, patch_count)
     if patch_count == 0:
         assert not cfm_calls
     else:
@@ -205,7 +205,7 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
         model._mrv2_model_state = SimpleNamespace(tensor_for=lambda state, name: getattr(state, name))
         model._active_states = {s.request_id: s for s, *_ in entries}
         model._pending_requests = [(s.request_id, *entry) for s, *entry in entries]
-        model._prepare_mixed_graph_inputs(graph, 2)
+        model.cuda_graph._prepare_mixed_graph_inputs(graph, 2)
         graph.input_embeds.copy_(torch.arange(32.0, device="cuda").reshape(8, 4))
         graph.graph.replay()
         scaffold_h = graph.input_embeds * 2
@@ -229,7 +229,7 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
 
     if per_patch_audio:
         model._mrv2_model_state = owner
-        decode_graph = model._capture_unified_decode_graph(4, patch_batch_size=patch_count)
+        decode_graph = model.cuda_graph._capture_unified_decode_graph(4, patch_batch_size=patch_count)
         if decode_graph.patch_indices is not None:
             decode_graph.patch_indices.copy_(torch.tensor([1, 0][:patch_count], device="cuda"))
         decode_graph.audio_slots.copy_(torch.tensor([0, 1, 2, 2], device="cuda"))
@@ -261,7 +261,7 @@ def test_mixed_metadata_request_uses_token_and_request_buckets():
     assert request.num_reqs_padded == 4
     assert request.num_tokens_padded == 8
     assert request.for_cudagraph_capture
-    model._mixed_graphs[(4, 8)] = object()
+    model.cuda_graph._mixed_graphs[(4, 8)] = object()
     replay = model.get_runner_assisted_full_attention_metadata_request(
         req_ids=["a", "b"],
         num_reqs=2,
@@ -270,7 +270,7 @@ def test_mixed_metadata_request_uses_token_and_request_buckets():
         max_num_scheduled_tokens=7,
     )
     assert not replay.for_cudagraph_capture
-    model._mixed_graph_cache_limit = 1
+    model.cuda_graph._mixed_graph_cache_limit = 1
     args = dict(
         req_ids=["a", "b"],
         num_reqs=2,
@@ -279,9 +279,9 @@ def test_mixed_metadata_request_uses_token_and_request_buckets():
         max_num_scheduled_tokens=8,
     )
     assert model.get_runner_assisted_full_attention_metadata_request(**args) is None
-    model._mixed_graph_cache_limit = 0
+    model.cuda_graph._mixed_graph_cache_limit = 0
     assert model.get_runner_assisted_full_attention_metadata_request(**args).for_cudagraph_capture
-    model._cuda_graph_warmup_steps = 0
+    model.cuda_graph._cuda_graph_warmup_steps = 0
     assert (
         model.get_runner_assisted_full_attention_metadata_request(
             req_ids=["a", "b"],
@@ -311,7 +311,7 @@ def test_all_decode_keeps_uniform_metadata_when_mixed_graph_enabled():
     assert request.num_reqs_padded == 4
     assert request.num_tokens_padded is None
     assert request.for_cudagraph_capture
-    model._unified_graphs[4] = object()
+    model.cuda_graph._unified_graphs[4] = object()
     replay = model.get_runner_assisted_full_attention_metadata_request(
         req_ids=["a", "b"],
         num_reqs=2,
@@ -325,7 +325,7 @@ def test_all_decode_keeps_uniform_metadata_when_mixed_graph_enabled():
 def test_per_patch_single_decode_requests_runner_metadata():
     model = _ready_metadata_model()
     model._mrv2_model_state = SimpleNamespace(per_patch_audio=True, tensor_for=lambda *_: torch.ones(1))
-    model._select_unified_graph_bucket_size = lambda count: count
+    model.cuda_graph._select_unified_graph_bucket_size = lambda count: count
     model._active_states = {"a": VoxCPM2RequestState(request_id="a", prefill_completed=True)}
     request = model.get_runner_assisted_full_attention_metadata_request(
         req_ids=["a"],
@@ -343,7 +343,7 @@ def test_chunked_prefill_graph_uses_current_chunk_masks_and_conditioning():
     model = _model()
     model.vllm_config.scheduler_config.enable_chunked_prefill = True
     model._mrv2_model_state = SimpleNamespace(per_patch_audio=True)
-    assert model._mixed_unified_graph_enabled()
+    assert model.cuda_graph._mixed_unified_graph_enabled()
     state = VoxCPM2RequestState(request_id="chunk", prefill_chunk_start=2)
     state.prefill_masks = (
         torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.0]]),
@@ -360,7 +360,7 @@ def test_chunked_prefill_graph_uses_current_chunk_masks_and_conditioning():
     )
     model._active_states = {state.request_id: state}
     model._pending_requests = [(state.request_id, True, None, 2)]
-    model._prepare_mixed_graph_inputs(graph, 1)
+    model.cuda_graph._prepare_mixed_graph_inputs(graph, 1)
     assert graph.text_mask[:, 0].tolist() == [0.0, 1.0, 0.0, 0.0]
     torch.testing.assert_close(graph.prev_feat_embed[0], state.prefill_masks[3][0, 2])
     assert not graph.prev_feat_embed[1:].any()
@@ -372,14 +372,14 @@ def test_chunked_prefill_graph_uses_current_chunk_masks_and_conditioning():
 def test_mixed_invalid_capacity_falls_through_without_decode_graph(monkeypatch, missing):
     model = _ready_metadata_model()
     model._mrv2_model_state = SimpleNamespace(per_patch_audio=True)
-    model._runner_assisted_unified_decode_graph_active = True
+    model.cuda_graph._runner_assisted_unified_decode_graph_active = True
     model._active_states = {"p": VoxCPM2RequestState(request_id="p")}
     model._pending_requests = [("p", True, None, 2)]
     if missing == "request_bucket":
-        model._select_unified_graph_bucket_size = lambda _: None
-        model._mixed_token_capacity = lambda *_: pytest.fail("capacity must not receive a missing bucket")
+        model.cuda_graph._select_unified_graph_bucket_size = lambda _: None
+        model.cuda_graph._mixed_token_capacity = lambda *_: pytest.fail("capacity must not receive a missing bucket")
     else:
-        model._mixed_token_capacity = lambda *_: None
+        model.cuda_graph._mixed_token_capacity = lambda *_: None
     model._forward_unified_decode = lambda *_: pytest.fail("invalid mixed capacity selected a decode graph")
 
     class FallbackReachedError(Exception):
@@ -389,7 +389,7 @@ def test_mixed_invalid_capacity_falls_through_without_decode_graph(monkeypatch, 
         assert not kwargs["is_all_decode"]
         raise FallbackReachedError
 
-    monkeypatch.setattr(model, "_unified_decode_graph_skip_reason", normal_dispatch)
+    monkeypatch.setattr(model.cuda_graph, "_unified_decode_graph_skip_reason", normal_dispatch)
     with pytest.raises(FallbackReachedError):
         model.forward(torch.zeros(2, dtype=torch.long), torch.arange(2), inputs_embeds=torch.zeros(2, 4))
 
@@ -418,13 +418,13 @@ def test_exact_metadata_reuses_actual_patch_variant(kind, patch_count):
     request = model.get_runner_assisted_full_attention_metadata_request(**args)
     assert request.for_cudagraph_capture
     if kind == "decode":
-        model._unified_graphs[(4, patch_count)] = object()
+        model.cuda_graph._unified_graphs[(4, patch_count)] = object()
     else:
-        model._mixed_graphs[(4, 4, patch_count)] = object()
-        model._mixed_graph_cache_limit = 1
+        model.cuda_graph._mixed_graphs[(4, 4, patch_count)] = object()
+        model.cuda_graph._mixed_graph_cache_limit = 1
     assert not model.get_runner_assisted_full_attention_metadata_request(**args).for_cudagraph_capture
     if kind == "mid":
         args["num_computed_tokens"] = [4, 20]  # Same request/token bucket, new patch count.
         assert model.get_runner_assisted_full_attention_metadata_request(**args) is None
-        model._mixed_graph_cache_limit = 0
+        model.cuda_graph._mixed_graph_cache_limit = 0
         assert model.get_runner_assisted_full_attention_metadata_request(**args).for_cudagraph_capture

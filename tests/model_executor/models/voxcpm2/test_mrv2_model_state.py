@@ -9,11 +9,13 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.model_executor.models.voxcpm2.cuda_graph_wrapper import VoxCPM2CudaGraphWrapper
 from vllm_omni.model_executor.models.voxcpm2.model_state import (
     VoxCPM2AudioOutput,
     VoxCPM2BatchSlots,
     VoxCPM2ModelState,
 )
+from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
 from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
     VoxCPM2TalkerForConditionalGeneration,
     _encode_raw_audio,
@@ -26,6 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _talker(device: torch.device) -> VoxCPM2TalkerForConditionalGeneration:
     model = VoxCPM2TalkerForConditionalGeneration.__new__(VoxCPM2TalkerForConditionalGeneration)
+    model.cuda_graph = VoxCPM2CudaGraphWrapper(model, _VoxCPM2RuntimeConfig(), 4)
     nn.Module.__init__(model)
     model._tts = SimpleNamespace(audio_vae=SimpleNamespace(decode_chunk_size=8))
     model._device = device
@@ -210,7 +213,7 @@ def test_graph_commit_preserves_slot_ownership_and_pcm_commits(monkeypatch, has_
         cfm_output=torch.arange(16.0).reshape(2, 2, 4),
     )
 
-    model._commit_graph_decode_state(graph, states, commit_mask, torch.tensor([1, 0]), None)
+    owner.commit_graph_decode_state(graph, states, commit_mask, torch.tensor([1, 0]), None)
 
     for row, (state, committed) in enumerate(zip(states, commit_mask, strict=True)):
         slot = state.slot_index

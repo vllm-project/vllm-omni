@@ -163,6 +163,29 @@ class VoxCPM2RequestState:
     stop_logits_ready: bool = False
 
 
+def patch_is_valid(state, is_prefill: bool) -> bool:
+    # Intermediate prefill chunks still write LM KV, but cannot commit a patch.
+    # A newly stopping step remains valid; only previously stopped rows are masked.
+    return not state.is_stopping and (not is_prefill or state.is_last_prefill_chunk)
+
+
+def mixed_request_is_ready(state, is_prefill: bool, per_patch_audio: bool) -> bool:
+    if is_prefill:
+        return per_patch_audio or state.is_last_prefill_chunk
+    return state.decode_state_ready
+
+
+def finish_graph_prefills(pending_requests) -> None:
+    """Release prefill inputs only after the final chunk produced its patch."""
+    for state, is_prefill, _, _ in pending_requests:
+        if is_prefill and state.is_last_prefill_chunk:
+            state.decode_step_count = 0
+            state.prefill_completed = True
+            state.prefill_embeds = None
+            state.prefill_masks = None
+            state.prompt_cache = None
+
+
 class VoxCPM2ModelState(OmniModelState):
     def __init__(self, vllm_config: Any, model: Any, encoder_cache: Any, device: torch.device) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
@@ -896,3 +919,68 @@ class VoxCPM2ModelState(OmniModelState):
                 self.suspended_vae_features.pop(req_id, None)
             self.suspended.pop(req_id, None)
             self.suspended_audio.pop(req_id, None)
+
+    def commit_graph_decode_state(self, g, states, commit_mask, slot_indices, batch_context) -> None:
+        """Commit valid patches while retaining the legacy stop-logit contract."""
+        num_reqs = len(states)
+        with torch.no_grad():
+            all_stop_logits = (
+                g.stop_logits[:num_reqs] if g.stop_logits is not None else self.model._stop_fn(g.lm_hidden[:num_reqs])
+            )
+        if g.pcm is not None:
+            # GPU valid/active masks own tensor commits. Host ready flags describe
+            # initialized slot data, not whether this step committed a new patch.
+            for state, committed in zip(states, commit_mask, strict=True):
+                if not committed:
+                    continue
+                state.decode_state_ready = True
+                state.stop_logits_ready = True
+            return
+        # store_decode_batch writes committed rows. Only stopping rows
+        # need their logits refreshed separately.
+        if not all(commit_mask):
+            self.stop_logits.index_copy_(
+                0,
+                slot_indices,
+                all_stop_logits.reshape(num_reqs, -1)[:, :2].to(dtype=self.stop_logits.dtype),
+            )
+        committed = [i for i, should_commit in enumerate(commit_mask) if should_commit]
+        if committed:
+            if len(committed) == num_reqs:
+                # The usual decode step commits every row in graph order.
+                # Avoid uploading a Python row list to CUDA and waiting
+                # for the preceding graph replay to finish.
+                self.store_decode_batch(
+                    states,
+                    all_stop_logits,
+                    g.next_feat_embed[:num_reqs],
+                    g.cfm_output[:num_reqs].transpose(1, 2),
+                    batch_context,
+                )
+            else:
+                rows = torch.tensor(committed, device=self.model._device, dtype=torch.long)
+                self.store_decode_batch(
+                    [states[i] for i in committed],
+                    all_stop_logits.index_select(0, rows),
+                    g.next_feat_embed.index_select(0, rows),
+                    g.cfm_output.index_select(0, rows).transpose(1, 2),
+                    batch_context,
+                )
+        for state in states:
+            state.stop_logits_ready = True
+
+    def queue_graph_pcm(self, graph, states, commit_mask) -> None:
+        """Keep PCM alive until async copy and preserve original batch rows."""
+        num_reqs = len(states)
+        # The output copy stream records this event before another replay.
+        graph.audio_copy_event = torch.cuda.Event()
+        self._pcm_copy_event = graph.audio_copy_event
+        self._step_pcm = (graph.pcm[:num_reqs], graph.pcm_valid[:num_reqs], graph.audio_copy_event)
+        for state, committed in zip(states, commit_mask, strict=True):
+            state.audio_patch_ready = False
+            logits = self.tensor_for(state, "precomputed_stop_logits") if committed else None
+            # An already-scheduled extra step may enqueue stale stop logits.
+            # GPU active_slots prevents patch commits and valid PCM output;
+            # the scheduler ignores repeated stop results for finished requests.
+            self.model._results_queue.append((state.request_id, logits))
+            self.model._audio_queue.append((state.request_id, None))

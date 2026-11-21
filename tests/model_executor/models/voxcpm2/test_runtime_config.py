@@ -235,10 +235,8 @@ def test_cfg_value_rejects_nonfinite(value: str) -> None:
 @pytest.mark.parametrize("cfg_value", [1.5, 2.0])
 @pytest.mark.parametrize("cutoff", [0.0, 1.0])
 def test_generation_config_runs_estimator(timesteps: int, batch_size: int, cfg_value: float, cutoff: float) -> None:
-    from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
-        _CFMBufferManager,
-        _optimized_solve_euler_with_noise,
-    )
+    from vllm_omni.model_executor.models.voxcpm2.cuda_graph_wrapper import _CFMBufferManager
+    from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _optimized_solve_euler_with_noise
 
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         _VllmConfig(

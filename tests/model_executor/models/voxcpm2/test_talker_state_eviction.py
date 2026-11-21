@@ -11,6 +11,9 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.voxcpm2.cuda_graph_wrapper import VoxCPM2CudaGraphWrapper
+from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 torch = pytest.importorskip("torch")  # noqa: F811 — guard import for optional torch envs
@@ -55,6 +58,7 @@ def _bind_states(talker, states, *, embed_dim):
 def _make_bare_talker():
     VoxCPM2TalkerForConditionalGeneration, _, _ = _voxcpm2_talker_mod()
     talker = VoxCPM2TalkerForConditionalGeneration.__new__(VoxCPM2TalkerForConditionalGeneration)
+    talker.cuda_graph = VoxCPM2CudaGraphWrapper(talker, _VoxCPM2RuntimeConfig(), 4)
     talker._active_states = {}
     talker._pending_requests = []
     talker._results_queue = []
@@ -364,11 +368,11 @@ class TestDecodeBatchContract:
         talker._tts = _FakeTTS()
         talker.model = FakeScaffold()
         talker._enable_cuda_graph = False
-        talker._cuda_graph_warmup_steps = 0
-        talker._cuda_graph_warmup_threshold = 3
-        talker._max_cached_graphs = 4
-        talker._scaffold_graphs = {}
-        talker._residual_graphs = {}
+        talker.cuda_graph._cuda_graph_warmup_steps = 0
+        talker.cuda_graph._cuda_graph_warmup_threshold = 3
+        talker.cuda_graph._max_cached_graphs = 4
+        talker.cuda_graph._scaffold_graphs = {}
+        talker.cuda_graph._residual_graphs = {}
         _, RequestState, _ = _voxcpm2_talker_mod()
         talker._patch_size = 2
         talker._feat_dim = 3
@@ -447,9 +451,7 @@ class TestDecodeBatchContract:
 
     @pytest.mark.cpu
     def test_batch_decode_matches_per_request_state_updates(self) -> None:
-        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
-            _DecodeResidualMeta,
-        )
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _DecodeResidualMeta
 
         seq_talker = self._make_decode_talker()
         batch_talker = self._make_decode_talker()
@@ -486,9 +488,7 @@ class TestDecodeBatchContract:
 
     @pytest.mark.cpu
     def test_batch_decode_preserves_per_request_cfm_rng_order(self) -> None:
-        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
-            _DecodeResidualMeta,
-        )
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _DecodeResidualMeta
 
         talker = self._make_decode_talker()
         talker._enable_batched_cfm = False
