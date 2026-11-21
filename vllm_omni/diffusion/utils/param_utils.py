@@ -1,9 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import logging
+
+import torch
+
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+logger = logging.getLogger(__name__)
+
+
+def unwrap_request_generator(
+    generator: torch.Generator | list[torch.Generator] | None,
+    context: str = "request",
+) -> torch.Generator | None:
+    """Normalize a request-scoped generator slot to a single generator.
+
+    ``OmniDiffusionSamplingParams.generator`` accepts a single generator or a
+    list of them, but a per-request slot must resolve to exactly one
+    generator: passing the raw list through (e.g. into diffusers
+    ``randn_tensor``'s batch path, which reads ``generator[0].device`` and
+    indexes entries per batch row) crashes on the nested list.
+    """
+    if not isinstance(generator, list):
+        return generator
+    if len(generator) > 1:
+        logger.warning("%s carries %d generators; using the first", context, len(generator))
+    return generator[0] if generator else None
 
 
 def apply_declared_extra_args(
