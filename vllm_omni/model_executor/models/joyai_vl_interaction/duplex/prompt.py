@@ -110,7 +110,11 @@ def interleave_history(
                 or (source.get("_current") and query_has_position)
                 or (query_key not in by_key and query_key != current_query_key)
             ):
-                content = [part for part in content if not part.get("text", "").startswith(USER_QUERY_HEADER)]
+                content = [
+                    part
+                    for part in content
+                    if part.get("type") != "text" or not part["text"].startswith(USER_QUERY_HEADER)
+                ]
         messages.append({"role": source["role"], "content": content})
         response = by_key.get(source.get("_response_item_id"))
         if response is not None and response["role"] == "assistant":

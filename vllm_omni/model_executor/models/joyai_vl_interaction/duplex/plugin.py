@@ -511,15 +511,19 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # Append each conversation image once, alongside newly committed camera
         # frames, so retained camera history cannot displace a newer user image.
         frames = [*state.frames, *new_images][-4:]
+        working_frames = tuple(frame for frame in state.visual_memory.pending if frame.id > state.closed_frame_id)
+        if payload.get("audio") and not new_images and not working_frames:
+            # A spoken follow-up still needs the latest scene while its closed
+            # source awaits consolidation. Preserve the original visual turn;
+            # summarized or deleted sources are no longer in pending.
+            working_frames = tuple(state.visual_memory.pending[-1:])
         return {
             **config,
             "joyai_state": state,
             "joyai_frames": frames,
             "joyai_conversation_images": images,
             "joyai_new_frames": new_images,
-            "joyai_pending_frames": tuple(
-                frame for frame in state.visual_memory.pending if frame.id > state.closed_frame_id
-            ),
+            "joyai_pending_frames": working_frames,
             "joyai_observations": tuple(state.observations),
             "joyai_queries": tuple(state.queries),
             "joyai_closed_frame_id": state.closed_frame_id,
@@ -1225,7 +1229,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # current conversation even when summaries or the history bound cover it.
         if latest_instruction is not None and latest_instruction not in history:
             history = [latest_instruction, *history[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES - 1) :]]
-        while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in response_refs:
+        # Empty replies were already filtered against rendered frames. Played
+        # replies keep their ledger association even when those frames close.
+        boundary_refs = response_refs | {item.response_item_id for item in session_config.get("joyai_observations", ())}
+        while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in boundary_refs:
             history.pop(0)
         return history, latest_instruction, query
 
