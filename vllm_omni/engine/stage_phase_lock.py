@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Per-device shared/exclusive init phase locks for parallel stage init.
 
 When ``VllmOmniOrchestratorConfig.parallel_stage_init`` is enabled, several
@@ -12,8 +15,9 @@ time. Correctness then rests on two mechanisms (see
     a per-device shared (``LOCK_SH``) lock; the profiling measurement inside
     ``determine_available_memory`` takes an exclusive (``LOCK_EX``) lock. The
     exclusive holder waits for in-flight mutations to drain and blocks new ones
-    for its (seconds-long) window, so the device-level profiling number each
-    stage computes stays within its admitted budget.
+    for its (seconds-long) window. Its workers measure non-torch memory over that
+    window, not from their init snapshots, so the peers' memory stays out of a
+    stage's KV budget (see ``OmniGPUWorkerBase._profiled_non_torch_increase``).
 
 The lock is held by the engine-core **driver** process (one per stage / per local
 DP rank) and wraps the driver-side collective calls, so a single acquisition
@@ -200,11 +204,26 @@ def _release_fds(fds: list[int]) -> None:
             pass
 
 
+def _profile_in_quiescent_window(worker) -> bool:
+    """Ask a worker to measure its next profiling over the exclusive lock window.
+
+    ``collective_rpc`` calls this with the worker wrapper, which forwards
+    attribute lookups to the worker. Module-level so multiprocess executors
+    pickle it by reference. Returns False for workers without the hook.
+    """
+    hook = getattr(worker, "profile_in_quiescent_window", None)
+    if hook is None:
+        return False
+    hook()
+    return True
+
+
 def wrap_executor_with_phase_locks(executor_class, locker: DevicePhaseLock):
     """Return a subclass of *executor_class* that brackets init phases with locks.
 
     * ``__init__`` (executor construction → weight load) under ``shared()``.
-    * ``determine_available_memory`` (profiling) under ``exclusive()``.
+    * ``determine_available_memory`` (profiling) under ``exclusive()``; the
+      workers measure non-torch memory over that window.
     * ``initialize_from_config`` (KV cache allocation) under ``shared()``.
     * ``compile_or_warm_up_model`` (kernel warmup + CUDA-graph capture) under
       ``shared()``.
@@ -227,6 +246,14 @@ def wrap_executor_with_phase_locks(executor_class, locker: DevicePhaseLock):
 
         def determine_available_memory(self):
             with locker.exclusive():
+                # Measure non-torch memory over this window, not from the init snapshots.
+                if not all(self.collective_rpc(_profile_in_quiescent_window)):
+                    logger.warning(
+                        "parallel_stage_init: this platform's workers cannot measure memory over "
+                        "the locked profiling window, so stages that share a GPU may count each "
+                        "other's memory. Place such stages on separate GPUs or disable "
+                        "parallel_stage_init."
+                    )
                 return super().determine_available_memory()
 
         def initialize_from_config(self, kv_cache_configs):

@@ -175,6 +175,81 @@ def test_determine_available_memory_clamps_to_zero(monkeypatch):
     assert out == 0
 
 
+def _window_profiling(*, from_init: int, before_window: int, after_window: int, torch_peak: int = 0):
+    """``memory_profiling`` stand-in whose device-level non-torch memory moved
+    by ``from_init`` since the init snapshot, ``after_window - before_window``
+    of it inside the profiling window."""
+
+    @contextmanager
+    def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
+        yield SimpleNamespace(
+            before_profile=SimpleNamespace(torch_allocated=weights_memory, non_torch_memory=before_window),
+            after_profile=SimpleNamespace(non_torch_memory=after_window),
+            non_torch_increase=from_init,
+            torch_peak_increase=torch_peak,
+            total_consumed=weights_memory + from_init,
+            transient_peak_headroom=torch_peak,
+            non_kv_cache_memory=weights_memory + from_init + torch_peak,
+        )
+
+    return _mp
+
+
+def test_parallel_init_measures_non_torch_memory_over_the_locked_window(monkeypatch):
+    """Co-located stages loaded 9 GiB of weights after this stage's init snapshot.
+    Under parallel_stage_init only the 1 GiB growth inside the exclusive window is
+    this stage's own, so the peers' memory must not shrink its KV budget."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.profile_in_quiescent_window()
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _window_profiling(from_init=10 * GIB, before_window=12 * GIB, after_window=13 * GIB, torch_peak=2 * GIB),
+    )
+
+    assert worker.determine_available_memory() == 30 * GIB - (10 + 2 + 1) * GIB
+    assert worker.non_torch_memory == 1 * GIB
+    # The --kv-cache-memory suggestion uses the same corrected consumption.
+    assert worker.total_consumed == (10 + 1) * GIB
+    # The window applies to one profiling only.
+    assert worker._quiescent_profiling_window is False
+    assert worker.determine_available_memory() == 30 * GIB - (10 + 2 + 10) * GIB
+
+
+def test_sequential_init_keeps_measuring_non_torch_memory_from_the_init_snapshot(monkeypatch):
+    """Without the locked window, the stage's own non-torch memory allocated while
+    loading (e.g. kernel modules its first launches load) is only visible from the
+    init snapshot."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _window_profiling(from_init=3 * GIB, before_window=2 * GIB, after_window=3 * GIB, torch_peak=2 * GIB),
+    )
+
+    assert worker.determine_available_memory() == 30 * GIB - (10 + 2 + 3) * GIB
+
+
+@pytest.mark.parametrize("window", [False, True])
+def test_memory_released_elsewhere_does_not_raise_the_budget_above_the_request(monkeypatch, caplog, window):
+    """A co-located stage that exits (or any other process freeing memory) makes the
+    device-level non-torch delta negative; the budget must stay within the request."""
+    worker = _make_worker(requested_memory=14 * GIB, model_memory_usage=6 * GIB)
+    if window:
+        worker.profile_in_quiescent_window()
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _window_profiling(from_init=-54 * GIB, before_window=60 * GIB, after_window=6 * GIB),
+    )
+
+    with caplog.at_level("WARNING", logger=base.logger.name):
+        assert worker.determine_available_memory() == 8 * GIB
+    assert worker.non_torch_memory == 0
+    assert worker.total_consumed == 6 * GIB
+    assert "Counting 0 for this stage" in caplog.text
+
+
 @pytest.mark.parametrize("apply_estimate", [True, False])
 def test_determine_available_memory_reserves_cudagraph_memory(monkeypatch, apply_estimate):
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)

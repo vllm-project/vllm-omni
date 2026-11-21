@@ -16,7 +16,7 @@ import torch
 from vllm import envs
 from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.utils.mem_utils import format_gib, memory_profiling
+from vllm.utils.mem_utils import MemoryProfilingResult, format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import CompilationTimes
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
@@ -95,14 +95,26 @@ class OmniGPUWorkerBase(GPUWorker):
     budget from device-level profiling data. Concurrent same-device stage
     initialization is coordinated externally by the parallel-stage-init
     admission control + SH/EX device locks (see
-    ``VllmOmniOrchestratorConfig.parallel_stage_init``), which keep each
-    measurement quiescent instead of relying on per-process NVML accounting.
+    ``VllmOmniOrchestratorConfig.parallel_stage_init``) instead of per-process
+    NVML accounting. Under it, non-torch memory is measured over the locked
+    profiling window (``profile_in_quiescent_window``).
 
     It also replaces vLLM's TorchProfilerWrapper with OmniTorchProfilerWrapper
     for custom trace naming, background gzip, and trace path collection.
     """
 
     use_v2_model_runner = True
+
+    # Set by profile_in_quiescent_window, consumed by the next profiling.
+    _quiescent_profiling_window: bool = False
+
+    def profile_in_quiescent_window(self) -> None:
+        """Measure the next profiling's non-torch memory over its own window.
+
+        Called by the parallel-stage-init executor wrapper while it holds the
+        exclusive device lock (``engine/stage_phase_lock``).
+        """
+        self._quiescent_profiling_window = True
 
     def _capture_auxiliary_graphs(self) -> None:
         """Let opt-in models warm valid inputs before the worker becomes ready."""
@@ -299,10 +311,13 @@ class OmniGPUWorkerBase(GPUWorker):
                profiling starts; they are part of neither the weights nor the
                profiling-window peak increase. ``non_torch_increase`` is
                device-level, so it reflects whatever else is resident on the
-               GPU at profiling time. Upstream's ``non_kv_cache_memory`` is not
-               used: it also counts memory the caching allocator reserves but
-               does not allocate, e.g. graph pools captured at model load,
-               which co-located stage budgets are tuned without.
+               GPU at profiling time; under ``parallel_stage_init`` it is taken
+               over the locked profiling window only, and it is never negative
+               (``_profiled_non_torch_increase``). Upstream's
+               ``non_kv_cache_memory`` is not used: it also counts memory the
+               caching allocator reserves but does not allocate, e.g. graph
+               pools captured at model load, which co-located stage budgets are
+               tuned without.
 
             3. Profile the CUDA graphs the runner captures through
                ``cudagraph_dispatcher``, the encoder graph manager and the
@@ -335,10 +350,12 @@ class OmniGPUWorkerBase(GPUWorker):
             device-level profiling fallback plus the parallel-stage-init
             admission + SH/EX device locks (see
             ``VllmOmniOrchestratorConfig.parallel_stage_init``): the EX lock
-            makes each measurement quiescent, so the device-level number is the
-            correct, conservative budget. The NVML helpers in
+            makes the profiling window quiescent, so the device-level change
+            over that window is this stage's own. The NVML helpers in
             ``gpu_memory_utils`` are retained for diffusion memory reporting.
         """
+        quiescent_window = self._quiescent_profiling_window
+        self._quiescent_profiling_window = False
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             self.model_runner.profile_run()
             if current_omni_platform.is_rocm():
@@ -366,7 +383,8 @@ class OmniGPUWorkerBase(GPUWorker):
         # Compared with what capture_model() reports, so it leaves out the
         # auxiliary graphs, which warmup captures after it.
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
-        self.non_torch_memory = profile_result.non_torch_increase
+        non_torch_increase = self._profiled_non_torch_increase(profile_result, quiescent_window)
+        self.non_torch_memory = non_torch_increase
         # Upstream adds the applied estimate here as well, then adds the actual
         # graph size again when it suggests --kv-cache-memory in
         # compile_or_warm_up_model. Keep the activation peak alone so that
@@ -377,8 +395,14 @@ class OmniGPUWorkerBase(GPUWorker):
         # kv_cache_memory_bytes is None and peak_activation_memory is set, both
         # true here). Mirror upstream so the omni override keeps it populated.
         # The auxiliary pools persist once warmup captures them, so the
-        # --kv-cache-memory suggestion counts them here.
-        self.total_consumed = profile_result.total_consumed + auxiliary_graph_memory
+        # --kv-cache-memory suggestion counts them here. Its device-level
+        # non-torch part gets the same correction as the budget below.
+        self.total_consumed = (
+            profile_result.total_consumed
+            - profile_result.non_torch_increase
+            + non_torch_increase
+            + auxiliary_graph_memory
+        )
 
         weights_memory = int(self.model_runner.model_memory_usage)
         preprofile_buffers = max(0, profile_result.before_profile.torch_allocated - weights_memory)
@@ -386,7 +410,7 @@ class OmniGPUWorkerBase(GPUWorker):
             weights_memory
             + preprofile_buffers
             + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
+            + non_torch_increase
             + cudagraph_memory_estimate
             + auxiliary_graph_memory
         )
@@ -407,6 +431,41 @@ class OmniGPUWorkerBase(GPUWorker):
         self._log_cudagraph_reserve(cudagraph_memory_estimate + auxiliary_graph_memory)
 
         return int(self.available_kv_cache_memory_bytes)
+
+    @staticmethod
+    def _profiled_non_torch_increase(profile_result: MemoryProfilingResult, quiescent_window: bool) -> int:
+        """Non-torch memory this stage added, from device-level free-memory deltas.
+
+        ``memory_profiling`` measures it from ``init_snapshot``, taken before the
+        weights load. Under ``parallel_stage_init`` the co-located stages load
+        weights, allocate KV caches and capture graphs between that snapshot and
+        this stage's profiling, so the device-level difference counts their
+        memory as this stage's. Only the profiling window runs under the
+        exclusive device lock (``engine/stage_phase_lock``), so measure over that
+        window instead.
+
+        The window leaves out non-torch memory the stage itself allocated
+        between ``init_device`` and profiling, such as the kernel modules its
+        first kernel launches load and torch's side-stream pool. Under
+        ``parallel_stage_init`` that memory sits outside the stage's budget, like
+        its CUDA context does in either mode.
+
+        Either way the value is clamped at zero, so memory released elsewhere on
+        the device (e.g. by a co-located stage that exited) cannot raise the
+        budget above the request. A release that overlaps this stage's own
+        growth still hides that much of it.
+        """
+        if quiescent_window:
+            increase = profile_result.after_profile.non_torch_memory - profile_result.before_profile.non_torch_memory
+        else:
+            increase = profile_result.non_torch_increase
+        if increase < 0:
+            logger.warning(
+                "Device-level non-torch memory fell by %s GiB over this stage's measurement; "
+                "memory was released elsewhere on the device. Counting 0 for this stage.",
+                format_gib(-increase),
+            )
+        return max(0, int(increase))
 
     def _log_cudagraph_reserve(self, cudagraph_memory_estimate: int) -> None:
         """Tell the operator how the graph reserve moved their KV budget.
