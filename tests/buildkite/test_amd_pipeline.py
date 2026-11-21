@@ -2060,8 +2060,10 @@ def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
     } <= bagel_deps
     source = Path("tests/e2e/online_serving/test_bagel.py").read_text(encoding="utf-8")
     params_source = source.split("test_params =", maxsplit=1)[1].split("def _build_text2img_messages", maxsplit=1)[0]
-    assert "stage_init_timeout=1800" in params_source
-    assert "init_timeout=2100" in params_source
+    assert "stage_init_timeout=2400" in params_source
+    assert "init_timeout=2700" in params_source
+    assert "stage_init_timeout=1800" not in params_source
+    assert "init_timeout=2100" not in params_source
     img2img_marks = source.split("def test_bagel_img2img_online", maxsplit=1)[0]
     assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in img2img_marks
     text2img_marks = img2img_marks.split("def test_bagel_text2img_online", maxsplit=1)[0]
@@ -2167,8 +2169,11 @@ def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
         source = source_path.read_text(encoding="utf-8")
         marks = source.split(f"def {test_name}", maxsplit=1)[0].rsplit("\n\n", maxsplit=1)[-1]
         assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in marks
-        assert '"stage_init_timeout": 1800' in source
-        assert '"init_timeout": 2100' in source
+        runner_param = source.split("_OMNI_RUNNER_PARAM =", maxsplit=1)[1].split("\n)", maxsplit=1)[0]
+        assert '"stage_init_timeout": 2400' in runner_param
+        assert '"init_timeout": 2700' in runner_param
+        assert '"stage_init_timeout": 1800' not in runner_param
+        assert '"init_timeout": 2100' not in runner_param
 
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         assert "Bagel offline shared · 1-GPU" not in pipeline_path.read_text(encoding="utf-8")
