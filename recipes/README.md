@@ -97,6 +97,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`MiniMaxAI/MiniMax-H3-Image-4090.md`](./MiniMaxAI/MiniMax-H3-Image-4090.md) | MiniMax-H3-Image text-to-image serving with layerwise offload | 1x RTX 4090 24GB (community deployment) |
 | [`MiniMaxAI/MiniMax-H3-Image-H200.md`](./MiniMaxAI/MiniMax-H3-Image-H200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x H200 141GB (measured) |
 | [`MiniMaxAI/MiniMax-H3-Image-H100.md`](./MiniMaxAI/MiniMax-H3-Image-H100.md) | MiniMax-H3-Image text-to-image and reference editing | 1x or 2x with DLO, 4x H100 80GB (configuration-only) |
+| [`MiniMaxAI/MiniMax-H3-Image-RTX3090.md`](./MiniMaxAI/MiniMax-H3-Image-RTX3090.md) | Native 2048x2048 six-step text-to-image with CPU offload | 2x RTX 3090 24 GiB with NVLink (historical measurements; rebased service smoke passed) |
 | [`MiniMaxAI/MiniMax-H3-Image-B200.md`](./MiniMaxAI/MiniMax-H3-Image-B200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B200 180GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-B300.md`](./MiniMaxAI/MiniMax-H3-Image-B300.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B300 288GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md`](./MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x RTX PRO 6000 Blackwell 96GB (measured) |

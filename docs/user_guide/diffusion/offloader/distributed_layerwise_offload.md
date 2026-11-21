@@ -135,6 +135,65 @@ encoder-TP layout.
 `resident_layers` remains a DiT-only setting and currently requires the DiT
 transfer to be `rank-local`.
 
+## MiniMax-H3-Image exact AdaLN staging
+
+Native, unquantized MiniMax-H3-Image can combine its existing exact AdaLN
+projection cache with rank-local DLO on CUDA at TP2, USP1 and DP1. Enable this
+combination explicitly:
+
+```bash
+--cache-config '{"minimax_h3_adaln_cache":true,"minimax_h3_adaln_offload":true}'
+```
+
+Keep the DiT's transfer `rank-local`. A positive `resident_layers` selects DLO
+through the compact configuration; choose its value from measured memory
+headroom. The projection weights remain on CPU under model-owned staging.
+DLO transfers and retains the other block weights. Registered checkpoint
+names and the native BF16 projection on cache misses are preserved.
+
+Exact warm hits avoid projection weight transfers. A first request, changed
+weights or an uncovered timestep embedding can execute additional staging and
+synchronization, so measure both first-request and warmed latency. Host RAM
+must accommodate the pinned projection masters. The ordinary image DiT stays
+eager while its VAE can retain CUDA graphs.
+
+This composition requires the exact cache and HWR disabled. AllGather, HSDP,
+quantization, ordinary layerwise DiT offload, loader-owned mmap plans and
+other model/topology combinations remain unsupported. Standalone AdaLN
+offload and its SM120 automatic default retain their existing policy.
+
+For the qualified CPU-AdaLN image configuration, retaining core device backing
+can also avoid its H2D load on subsequent requests:
+
+```bash
+--additional-config '{"minimax_h3_retain_resident_cores":true}'
+```
+
+This option defaults to false and requires a positive `resident_layers` count.
+It keeps those core allocations live during later text encoding and VAE
+decoding, including graph capture. Validate cold and warmed memory headroom
+before enabling it. The parameter bindings remain placeholders outside the
+denoise scope; disabling offload releases the retained backing. Base weights
+must remain immutable while offload is enabled. Disable, update weights and
+re-enable before changing them.
+
+The native image pipeline also offers exact request-local text refinement reuse:
+
+```bash
+--additional-config '{"minimax_h3_reuse_refined_text":true}'
+```
+
+This option defaults to false. It requires unquantized native CUDA Flash
+Attention, TP2, USP1 and DP1. For text-to-image, one denoise invocation owns
+the full refined text activation. The first step computes it at the original
+point in the forward pass. Later steps reuse those rows before local slicing,
+while latent projections, timestep embeddings and every main DiT block still
+run. The activation is released with that invocation and is never reused for
+another prompt or adapter. Image editing and video keep their existing path.
+Execution must use eval and no-grad mode. This is exact activation reuse,
+not approximate cross-step denoising or a prompt cache across requests.
+When combining additional options, supply them in one JSON object.
+
 ## Host-weight loading
 
 When the distributed backend is selected by AllGather, resident DiT layers, or

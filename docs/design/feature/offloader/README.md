@@ -90,6 +90,21 @@ that owns its residency to its own block container. DiTs absent from the plan
 fall back to `_layerwise_offload_blocks_attrs` (including the deprecated
 singular-name compatibility path).
 
+`independently_managed_submodules` declares CPU module roots whose model-owned
+staging remains outside rank-local DLO. The resolved tensor inventory excludes
+their parameters and buffers from block transport, resident storage, and
+non-block placement. Roots must contain materialized CPU tensors, must not
+overlap, and must not share tensor objects or storage with another owner.
+They require a selected streamable DiT and cannot sit under an opaque
+on-demand component. AllGather, HSDP, and loader-owned host plans cannot own
+the same independent roots.
+
+`retain_resident_storage` lets a qualified pipeline keep resident-core device
+backing after its denoise scope ends. It defaults to false and requires
+independent CPU staging plus positive DiT residency. Parameter bindings still
+become placeholders outside the scope. Disable restores CPU bindings and
+releases the retained backing before weights can change.
+
 An undeclared DiT submodule joins the plan only when it is large enough that
 keeping it resident would defeat streaming; its block container is then found
 by scanning well-known attribute names, which warns once per submodule class.

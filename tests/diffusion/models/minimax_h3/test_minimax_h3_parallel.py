@@ -400,6 +400,69 @@ def test_local_embedding_spans_reassemble_multimodal_rows():
     torch.testing.assert_close(torch.cat(local_spans), full, atol=0, rtol=0)
 
 
+@torch.no_grad()
+def test_refined_text_reuse_preserves_new_latents_spans_and_request_text():
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    class _Projection(nn.Module):
+        def forward(self, x):
+            return x * 2 + 1, None
+
+    class _Refiner(nn.Module):
+        calls = 0
+
+        def forward(self, x, **kwargs):
+            self.calls += 1
+            return x + x.mean(dim=0, keepdim=True) + x.square() / 128
+
+    model = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.hidden_size = 2
+    model.video_patch_proj = _Projection()
+    model.audio_patch_proj = _Projection()
+    model.condition_proj = _Projection()
+    model.token_refiner = _Refiner()
+    model.time_embedder = nn.Identity()
+    text = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    slot = h3.MiniMaxH3RefinedText()
+    saved_rows = None
+    for step, span in enumerate(((0, 8), (8, 8))):
+        x = torch.arange(32, dtype=torch.float32).reshape(1, 16, 2) + step
+        arguments = {
+            "x": x,
+            "audio_x": x + 100,
+            "text_embeddings_selected": text,
+            "unique_timesteps": torch.tensor([0.2 + step, 0.3 + step]),
+            "img_pos": torch.tensor([1, 2, 6, 7, 11, 12]),
+            "audio_pos": torch.tensor([3, 4, 8, 9, 13, 14]),
+            "text_pos": torch.tensor([0, 5, 10, 15]),
+            "refiner_cu_seqlens": torch.tensor([0, 4, 4], dtype=torch.int32),
+            "refiner_max_seqlen": 4,
+            "seq_len": 16,
+            "device": torch.device("cpu"),
+            "local_span": span,
+        }
+        expected = model._embed(**arguments)
+        actual = model._embed(**arguments, refined_text=slot)
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference, atol=0, rtol=0)
+        assert slot.rows.shape == (4, 2)
+        if saved_rows is None:
+            saved_rows = slot.rows.clone()
+        torch.testing.assert_close(slot.rows, saved_rows, atol=0, rtol=0)
+    assert model.token_refiner.calls == 3
+
+    arguments["text_embeddings_selected"] = text + 16
+    fresh = h3.MiniMaxH3RefinedText()
+    expected = model._embed(**arguments)
+    actual = model._embed(**arguments, refined_text=fresh)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, atol=0, rtol=0)
+    assert model.token_refiner.calls == 5
+    assert not torch.equal(fresh.rows, slot.rows)
+    torch.testing.assert_close(slot.rows, saved_rows, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "local_projection",
     [False, True],

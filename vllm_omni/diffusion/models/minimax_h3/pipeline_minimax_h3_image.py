@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 
@@ -70,7 +71,7 @@ from .denoise_loop import (
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .image_resize import resize_lanczos_uint8
 from .image_vae import MiniMaxH3ImageVAE
-from .minimax_h3_transformer import MiniMaxH3DiTModel
+from .minimax_h3_transformer import MiniMaxH3DiTModel, MiniMaxH3RefinedText
 from .packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 from .packed_tokens import minimax_h3_patchify_video_latent, minimax_h3_unpatchify_video_tokens
 from .pipeline_minimax_h3 import MiniMaxH3Pipeline, _broadcast_tensor, _dit_rank_world
@@ -326,7 +327,7 @@ class MiniMaxH3ImagePipeline(
     # Layerwise offload streams the DiT blocks and the Qwen3-VL encoder (the
     # same encoder class as MiniMax-H3). The image VAE stays resident: its
     # decode tiles replay CUDA graphs that capture the weight addresses.
-    _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+    _offload_plan: OffloadPlan = OffloadPlan(
         offload_submodules={"token_refiner": "blocks"},
         resident_dit_paths=frozenset({"transformer"}),
         encoder_component_types={"text_encoder": TEXT_ENCODER_COMPONENT},
@@ -396,6 +397,50 @@ class MiniMaxH3ImagePipeline(
         self.transformer = MiniMaxH3DiTModel(od_config, quant_config=transformer_quant_config)
         if self.transformer.arch.audio_enabled:
             raise ValueError("MiniMax-H3-Image requires an audio-free DiT (audio_enabled: false)")
+        self._reuse_refined_text = additional.get(
+            "minimax_h3_reuse_refined_text",
+            False,
+        )
+        if type(self._reuse_refined_text) is not bool:
+            raise ValueError("minimax_h3_reuse_refined_text must be a bool")
+        if self._reuse_refined_text:
+            from vllm_omni.diffusion.attention.backends.flash_attn import (
+                FlashAttentionBackend,
+            )
+
+            parallel = od_config.parallel_config
+            if (
+                not current_omni_platform.is_cuda()
+                or transformer_quant_config is not None
+                or self.transformer._diffusers_weights
+                or od_config.diffusion_kv_cache_dtype not in (None, "auto", "float")
+                or get_tensor_model_parallel_world_size() != 2
+                or parallel.sequence_parallel_size != 1
+                or parallel.data_parallel_size != 1
+                or any(
+                    block.attn.attention.attn_backend is not FlashAttentionBackend
+                    for block in self.transformer.token_refiner.blocks
+                )
+            ):
+                raise ValueError(
+                    "Text reuse requires native unquantized CUDA Flash TP2/USP1/DP1",
+                )
+        independent = self.transformer.independently_managed_offload_paths()
+        retain = additional.get("minimax_h3_retain_resident_cores", False)
+        if type(retain) is not bool:
+            raise ValueError("minimax_h3_retain_resident_cores must be a bool")
+        if retain:
+            from vllm_omni.diffusion.offloader.config import resolve_offload
+
+            if not independent or resolve_offload(od_config).resident_layers <= 0:
+                raise ValueError("Retained cores need CPU AdaLN and resident DLO")
+        if independent:
+            paths = frozenset(f"transformer.{path}" for path in independent)
+            self._offload_plan = replace(
+                self._offload_plan,
+                independently_managed_submodules=paths,
+                retain_resident_storage=retain,
+            )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(str(root), subfolder="tokenizer", local_files_only=True)
         self.processor = Qwen3VLProcessor.from_pretrained(str(root), subfolder="processor", local_files_only=True)
@@ -702,6 +747,11 @@ class MiniMaxH3ImagePipeline(
         sigmas = minimax_h3_image_run_sigmas(self.pdd_sigmas)
         sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=self.device)
         deltas = sigma_values[:-1] - sigma_values[1:]
+        refined_text = None
+        if self._reuse_refined_text and not grids:
+            if self.training or torch.is_grad_enabled():
+                raise ValueError("Refined text reuse requires eval and no_grad")
+            refined_text = MiniMaxH3RefinedText()
         with self.progress_bar(total=num_steps) as progress_bar:
             for step in range(num_steps):
                 check_request_cancellation()
@@ -718,7 +768,11 @@ class MiniMaxH3ImagePipeline(
                 # writes only them, so the anchor rows need neither re-copying
                 # nor a zeroed velocity.
                 kwargs["skip_mask_out_condition"] = True
-                velocity, _ = self.transformer(pdd_step=step, **kwargs)
+                velocity, _ = self.transformer(
+                    pdd_step=step,
+                    refined_text=refined_text,
+                    **kwargs,
+                )
                 _euler_target_step(video_rows, velocity, n_cond, deltas[step])
                 progress_bar.update()
         return video_rows[n_cond:]
