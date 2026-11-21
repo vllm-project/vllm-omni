@@ -126,9 +126,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 13 or skipped != 1:
+            if tests != 13 or skipped != 0:
                 print(
-                    f"Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip; "
+                    f"Expected exactly 13 executed Wan2.2 reliability tests with no skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -193,9 +193,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 13 or skipped != 1:
+            if tests != 13 or skipped != 0:
                 print(
-                    f"Expected exactly 13 executed HunyuanImage reliability tests with 1 known skip; "
+                    f"Expected exactly 13 executed HunyuanImage reliability tests with no skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -295,8 +295,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 30 ]]; then
-              echo "Expected exactly 30 single-GPU invalid-parameter nodes, found $$count." >&2
+            if [[ "$$count" != 37 ]]; then
+              echo "Expected exactly 37 single-GPU invalid-parameter nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -324,9 +324,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 30 or skipped != 5:
+            if tests != 37 or skipped != 5:
                 print(
-                    f"Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips; "
+                    f"Expected exactly 37 single-GPU invalid-parameter tests with 5 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
