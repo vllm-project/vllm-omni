@@ -19,6 +19,7 @@ from vllm_omni.diffusion.attention.backends.fastvideo_vsa import (
 from vllm_omni.diffusion.attention.backends.registry import (
     DiffusionAttentionBackendEnum,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -256,3 +257,48 @@ def test_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
     assert baseline.shape == query.shape
     torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
     assert torch.count_nonzero(baseline[:, valid:]) == 0
+
+
+@pytest.mark.parametrize(
+    ("cuda", "npu", "expected"),
+    [(True, False, True), (False, True, True), (False, False, False)],
+    ids=["cuda", "npu", "other"],
+)
+def test_packed_mask_free_gate_covers_the_platforms_that_honour_it(monkeypatch, cuda, npu, expected):
+    # MiniMax-H3 builds a key mask unless this gate is on, and this backend
+    # refuses masks. With the gate off on NPU every padded request fails.
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: npu)
+    assert FastVideoVSABackend.supports_packed_mask_free() is expected
+
+
+def test_npu_dense_path_never_attends_the_structural_padding():
+    impl = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"topk": 1, "min_seq_len": 4096},
+    )
+    valid = 40
+    torch.manual_seed(0)
+    query = torch.randn(1, 64, 2, 8)
+    padding = PackedPaddingMetadata(
+        q_length=valid,
+        kv_length=valid,
+        cu_seqlens_q=torch.tensor([0, valid], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, valid], dtype=torch.int32),
+    )
+
+    baseline = impl.forward_npu(query, query, query, AttentionMetadata(packed_padding=padding, extra={}))
+    perturbed_input = query.clone()
+    perturbed_input[:, valid:] += 100.0
+    perturbed = impl.forward_npu(
+        perturbed_input, perturbed_input, perturbed_input, AttentionMetadata(packed_padding=padding, extra={})
+    )
+    reference = impl.sdpa_fallback.forward_npu(query[:, :valid], query[:, :valid], query[:, :valid])
+
+    assert baseline.shape == query.shape
+    torch.testing.assert_close(baseline[:, :valid], reference, rtol=0, atol=0)
+    torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid], rtol=0, atol=0)
+    assert torch.count_nonzero(baseline[:, valid:]) == 0
+    assert torch.count_nonzero(perturbed[:, valid:]) == 0

@@ -182,6 +182,19 @@ def resolve_block_sparse_provider(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
+    if device.type == "npu":
+        # Every named provider is a CUDA kernel. Refuse instead of resolving to
+        # one of them and running the sparse student on dense fallback attention.
+        if provider != "auto":
+            raise ValueError(f"the {provider} VSA provider is CUDA-only; leave fastvideo_vsa_provider=auto on Ascend")
+        if block_size != 64:
+            raise ValueError("NPU VSA runs 64-token tiles only")
+        if precision != "bf16" or dtype != torch.bfloat16 or head_size != 128:
+            raise ValueError("NPU VSA requires BF16 with head dimension 128")
+        from .npu_tile64_block_sparse import require_npu_tile64_sparse
+
+        require_npu_tile64_sparse()
+        return "npu"
     if provider == "triton":
         from .triton_block_sparse import require_triton_sparse
 
@@ -309,6 +322,12 @@ def block_sparse_attn_bshd(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
+    if provider == "npu":
+        from .npu_tile64_block_sparse import npu_tile64_block_sparse_attention
+
+        if precision != "bf16" or block_size != 64:
+            raise ValueError("NPU VSA requires BF16 precision and 64-token tiles")
+        return npu_tile64_block_sparse_attention(query, key, value, block_map, block_sizes, softmax_scale)
     if provider == "triton":
         from .triton_block_sparse import triton_block_sparse_attention
 
