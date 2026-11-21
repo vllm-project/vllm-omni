@@ -82,19 +82,21 @@ def _worker(rank, path, direction):
                 reference.encode(image)
                 vae.encode(image)
                 torch.testing.assert_close(vae.decode(z).sample, expected, rtol=1e-4, atol=1e-5)
-            for bad_mode in ["tile", "spatial_shard_width" if direction == "height" else "spatial_shard_height"]:
-                vae.distributed_executor.parallel_mode = bad_mode
-                for decode in (vae.decode, vae.tiled_decode):
-                    with pytest.raises(ValueError, match="fresh VAE"):
-                        decode(z)
-            vae.distributed_executor.parallel_mode = f"spatial_shard_{direction}"
-            vae.distributed_executor.group = object()
-            with pytest.raises(ValueError, match="fresh VAE"):
-                vae.decode(z)
-            vae.distributed_executor.group = dist.group.WORLD
-            vae.distributed_executor.parallel_size = 1
-            with pytest.raises(ValueError, match="parallel"):
-                vae.decode(z)
+        # Configuration locking is independent of tensor shape; check it once
+        # per direction on the final, already-patched decoder.
+        for bad_mode in ["tile", "spatial_shard_width" if direction == "height" else "spatial_shard_height"]:
+            vae.distributed_executor.parallel_mode = bad_mode
+            for decode in (vae.decode, vae.tiled_decode):
+                with pytest.raises(ValueError, match="fresh VAE"):
+                    decode(z)
+        vae.distributed_executor.parallel_mode = f"spatial_shard_{direction}"
+        vae.distributed_executor.group = object()
+        with pytest.raises(ValueError, match="fresh VAE"):
+            vae.decode(z)
+        vae.distributed_executor.group = dist.group.WORLD
+        vae.distributed_executor.parallel_size = 1
+        with pytest.raises(ValueError, match="parallel"):
+            vae.decode(z)
         vae = _model()
         vae.distributed_executor = _executor(f"spatial_shard_{direction}", size=3, group=dist.group.WORLD)
         with pytest.raises(ValueError, match="parallel"):
