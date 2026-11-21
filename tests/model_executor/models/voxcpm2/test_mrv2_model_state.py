@@ -192,6 +192,44 @@ def test_batched_decode_state_scatter_and_preemption_restore(
     assert state.stop_logits[1].tolist() == [1.0, 0.0]
 
 
+@pytest.mark.parametrize("has_pcm", [False, True])
+@pytest.mark.parametrize("commit_mask", [[True, True], [True, False], [False, False]])
+def test_graph_commit_preserves_slot_ownership_and_pcm_commits(monkeypatch, has_pcm, commit_mask) -> None:
+    model = _talker(torch.device("cpu"))
+    owner = _state(model, 2, torch.device("cpu"), monkeypatch)
+    owner.next_embed.fill_(-1)
+    owner.prefix_feat.fill_(-2)
+    owner.stop_logits.fill_(-3)
+    states = [owner.slots[1], owner.slots[0]]
+    for slot, state in zip((1, 0), states, strict=True):
+        state.slot_index = slot
+    graph = SimpleNamespace(
+        pcm=torch.ones(2, 1) if has_pcm else None,
+        stop_logits=torch.tensor([[0.0, 1.0], [2.0, 3.0]]),
+        next_feat_embed=torch.arange(12.0).reshape(2, 6),
+        cfm_output=torch.arange(16.0).reshape(2, 2, 4),
+    )
+
+    model._commit_graph_decode_state(graph, states, commit_mask, torch.tensor([1, 0]), None)
+
+    for row, (state, committed) in enumerate(zip(states, commit_mask, strict=True)):
+        slot = state.slot_index
+        if committed and not has_pcm:
+            torch.testing.assert_close(owner.next_embed[slot], graph.next_feat_embed[row])
+            torch.testing.assert_close(owner.prefix_feat[slot], graph.cfm_output[row].T)
+        else:
+            # PCM graphs already committed their tensors inside graph replay.
+            # Host bookkeeping must not overwrite them or revive stopped rows.
+            assert torch.all(owner.next_embed[slot] == -1)
+            assert torch.all(owner.prefix_feat[slot] == -2)
+        if not has_pcm:
+            torch.testing.assert_close(owner.stop_logits[slot], graph.stop_logits[row])
+        else:
+            assert torch.all(owner.stop_logits[slot] == -3)
+        assert state.decode_state_ready is committed
+        assert state.stop_logits_ready is (committed or not has_pcm)
+
+
 def test_batch_slot_indices_reuse_runner_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _talker(torch.device("cpu"))
     state = _state(model, 2, torch.device("cpu"), monkeypatch)
@@ -355,6 +393,7 @@ def test_partial_audio_emits_on_sampled_stop(monkeypatch: pytest.MonkeyPatch) ->
     assert _audio_output(state, [1, 0], [0, 0]) == [None, None]
     output = _audio_output(state, [1, 0], [0, 1])
     assert output[0] is None
+    assert output[1] is not None
     assert output[1]["model_outputs"].tolist() == list(range(17))
     assert model._audio_queue == []
 
@@ -374,11 +413,14 @@ def test_full_chunk_emits_and_then_accumulates_next_chunk(monkeypatch: pytest.Mo
     model.make_omni_output(torch.zeros(2, 4))
     output = _audio_output(state, [1, 0], [0, 0])
     assert output[0] is None
+    assert output[1] is not None
     assert output[1]["model_outputs"].tolist() == list(range(64))
     assert state.audio_output_lengths[0] == 0
     model._audio_queue = [("first", torch.tensor([7.0, 8.0]))]
     model.make_omni_output(torch.zeros(2, 4))
-    assert _audio_output(state, [1, 0], [0, 1])[1]["model_outputs"].tolist() == [7.0, 8.0]
+    tail = _audio_output(state, [1, 0], [0, 1])[1]
+    assert tail is not None
+    assert tail["model_outputs"].tolist() == [7.0, 8.0]
 
 
 def test_length_limit_flushes_partial_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -389,7 +431,9 @@ def test_length_limit_flushes_partial_chunk(monkeypatch: pytest.MonkeyPatch) -> 
     model._audio_queue = [("first", torch.tensor([2.0, 3.0]))]
     model._last_audio_output_req_ids = ["first"]
     model.make_omni_output(torch.zeros(1, 4))
-    assert _audio_output(state, [0], [0], max_seq_len=2)[0]["model_outputs"].tolist() == [2.0, 3.0]
+    tail = _audio_output(state, [0], [0], max_seq_len=2)[0]
+    assert tail is not None
+    assert tail["model_outputs"].tolist() == [2.0, 3.0]
 
 
 @pytest.mark.parametrize(
@@ -410,10 +454,8 @@ def test_length_limit_decodes_pending_latent_tail(
     model._vae_decode_every = 3
     model._audio_emit_every = audio_emit_every
     model._enable_batched_vae_decode = batched
-    model._enable_delayed_audio_copy = False
     model._enable_vae_cuda_graph = False
     model._coalesce_audio_d2h = True
-    model._perf = SimpleNamespace(start=lambda *_: None, stop=lambda *_: None)
     state = _state(model, 2, torch.device("cpu"), monkeypatch)
     for slot, req_id in enumerate(("running", "ending")):
         state.add_request(slot, SimpleNamespace(req_id=req_id))
@@ -534,7 +576,9 @@ def test_partial_chunk_follows_request_to_new_slot_after_preemption(monkeypatch:
     state.add_request(1, SimpleNamespace(req_id="first"))
     model._audio_queue = [("first", torch.arange(32, 64, dtype=torch.float32))]
     model.make_omni_output(torch.zeros(1, 4))
-    assert _audio_output(state, [1], [0])[0]["model_outputs"].tolist() == list(range(64))
+    output = _audio_output(state, [1], [0])[0]
+    assert output is not None
+    assert output["model_outputs"].tolist() == list(range(64))
 
 
 @pytest.mark.parametrize(
@@ -608,7 +652,6 @@ def test_ready_slot_tail_appends_pcm_and_updates_context(monkeypatch: pytest.Mon
 def test_per_patch_decode_does_not_require_stop_check(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _talker(torch.device("cpu"))
     model._enable_batched_vae_decode = True
-    model._enable_delayed_audio_copy = False
     model._enable_vae_cuda_graph = False
     model._coalesce_audio_d2h = True
     state = _state(model, 3, torch.device("cpu"), monkeypatch)
@@ -638,7 +681,6 @@ def test_per_patch_decode_does_not_require_stop_check(monkeypatch: pytest.Monkey
 def test_batched_audio_uses_slots_for_reordered_cohort(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _talker(torch.device("cpu"))
     model._enable_batched_vae_decode = True
-    model._enable_delayed_audio_copy = False
     model._enable_vae_cuda_graph = False
     model._coalesce_audio_d2h = True
     state = _state(model, 3, torch.device("cpu"), monkeypatch)
@@ -783,7 +825,7 @@ def test_voice_clone_individual_encode_and_batched_embeddings_match_individual(m
     model._pending_requests = []
     model._tts = tts
     model.config.bos_token_id = 1
-    speaker_cache = {}
+    speaker_cache: dict[tuple[str, str, int], dict[str, torch.Tensor]] = {}
     model._speaker_cache = SimpleNamespace(
         make_cache_key=lambda name, *, model_type, created_at: (name, model_type, created_at),
         get=speaker_cache.get,
@@ -875,7 +917,7 @@ def test_raw_audio_encode_can_keep_features_on_model_device(monkeypatch: pytest.
 
     tts = SimpleNamespace(audio_vae=FakeVAE(), _encode_sample_rate=16000, patch_size=2, chunk_size=2)
     monkeypatch.setattr(torch.Tensor, "cpu", lambda *_args, **_kwargs: pytest.fail("unexpected feature D2H"))
-    feat = _encode_raw_audio(tts, [0.0] * 4, 16000, keep_on_device=True)
+    feat = _encode_raw_audio(tts, [0.0] * 4, 16000)
     assert feat.shape == (2, 2, 2)
 
 
@@ -896,12 +938,14 @@ def test_raw_audio_resampling_avoids_numpy_round_trip(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         torch.Tensor, "numpy", lambda *_args, **_kwargs: pytest.fail("unexpected audio NumPy round trip")
     )
-    actual = _encode_raw_audio(tts, samples, 8000, keep_on_device=True)
+    actual = _encode_raw_audio(tts, samples, 8000)
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gpu_reference_resampling_matches_legacy_cpu_path() -> None:
+    from vllm.multimodal.audio import AudioResampler
+
     class EchoVAE(nn.Module):
         latent_dim = 1
 
@@ -919,8 +963,9 @@ def test_gpu_reference_resampling_matches_legacy_cpu_path() -> None:
     gpu_tts = SimpleNamespace(
         audio_vae=EchoVAE(torch.device("cuda")), _encode_sample_rate=16000, patch_size=2, chunk_size=2
     )
-    expected = _encode_raw_audio(cpu_tts, samples.tolist(), 8000)
-    actual = _encode_raw_audio(gpu_tts, samples.tobytes(), 8000, keep_on_device=True)
+    resampled = AudioResampler(target_sr=16000).resample(samples, orig_sr=8000)
+    expected = _encode_raw_audio(cpu_tts, resampled.tolist(), 16000)
+    actual = _encode_raw_audio(gpu_tts, samples.tobytes(), 8000)
     torch.testing.assert_close(actual.cpu(), expected, atol=1e-4, rtol=1e-4)
 
 

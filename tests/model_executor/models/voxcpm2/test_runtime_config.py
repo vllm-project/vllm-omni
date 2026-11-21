@@ -8,13 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config.compilation import CUDAGraphMode
 
 import vllm_omni
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.model_executor.models.voxcpm2.runtime_config import (
     _VoxCPM2RuntimeConfig,
-    reject_outer_full_cudagraph,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -39,20 +37,14 @@ class _FakeOmniPlatform:
 
 
 @pytest.mark.parametrize(
-    ("uses_v2", "is_cuda", "expected"),
+    ("is_cuda", "expected"),
     [
-        (False, False, (2, 1)),
-        (False, True, (2, 1)),
-        (True, False, (2, 1)),
-        (True, True, (1, 3)),
+        (False, (2, 1)),
+        (True, (1, 3)),
     ],
 )
-def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected):
-    # Incremental VAE is a CUDA-only per-patch feature: CUDA v2 gets the MRV2
-    # audio profile (1/3); every other combination keeps the v1 cadence (2/1).
-    # These are runtime defaults when no deploy YAML supplies cadence keys.
-    # The shipped base YAML explicitly pins its v1 cadence to (3, 1), so
-    # changing these defaults only affects configurations that leave them unset.
+def test_platform_specific_audio_defaults(monkeypatch, is_cuda, expected):
+    # Incremental VAE is CUDA-only. Explicit deploy settings override these defaults.
     import vllm_omni.platforms as platforms_mod
 
     # Patch the backing global, not the lazy attribute: assigning
@@ -66,26 +58,16 @@ def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected)
     monkeypatch.delitem(vars(platforms_mod), "current_omni_platform", raising=False)
     fake_platform = _FakeOmniPlatform(is_cuda)
     monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
-    config = _VoxCPM2RuntimeConfig.from_vllm_config(
-        SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
-    )
-    assert config.enable_incremental_vae is (uses_v2 and is_cuda)
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(SimpleNamespace(model_config=SimpleNamespace()))
+    assert config.enable_incremental_vae is is_cuda
     assert (config.vae_decode_every, config.audio_emit_every) == expected
-    if uses_v2:
-        # The v2 cadence depends on the platform read at call time; assert the
-        # fake was consulted so a module-level import can't silently bypass it.
-        assert fake_platform.is_cuda_calls >= 1
-    else:
-        # The v1 cadence must stay platform-independent: from_vllm_config
-        # should not consult the platform on the legacy path at all.
-        assert fake_platform.is_cuda_calls == 0
+    assert fake_platform.is_cuda_calls >= 1
 
 
 def test_mrv2_explicit_legacy_audio_override():
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(
             model_config=SimpleNamespace(
-                use_v2_model_runner=True,
                 voxcpm2_runtime_config={"enable_incremental_vae": False, "vae_decode_every": 3, "audio_emit_every": 1},
             )
         )
@@ -95,7 +77,7 @@ def test_mrv2_explicit_legacy_audio_override():
     assert config.audio_emit_every == 1
 
 
-def _runtime_config_from_deploy_yaml(yaml_path: Path, use_v2_model_runner: bool) -> _VoxCPM2RuntimeConfig:
+def _runtime_config_from_deploy_yaml(yaml_path: Path) -> _VoxCPM2RuntimeConfig:
     merged = resolve_deploy_yaml(yaml_path)
     runtime_dict = next(
         stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
@@ -103,29 +85,24 @@ def _runtime_config_from_deploy_yaml(yaml_path: Path, use_v2_model_runner: bool)
         if "voxcpm2_runtime_config" in stage.get("engine_extras", {}).get("hf_overrides", {})
     )
     return _VoxCPM2RuntimeConfig.from_vllm_config(
-        SimpleNamespace(
-            model_config=SimpleNamespace(use_v2_model_runner=use_v2_model_runner, voxcpm2_runtime_config=runtime_dict)
-        )
+        SimpleNamespace(model_config=SimpleNamespace(voxcpm2_runtime_config=runtime_dict))
     )
 
 
 def test_deploy_yaml_resolves_effective_audio_defaults():
-    # The base yaml pins the legacy cadence; CUDA's platform overlay selects
-    # the MRV2 cadence.
+    # The base yaml pins non-incremental decoding; CUDA's overlay enables incremental VAE.
     deploy_dir = Path(vllm_omni.__file__).resolve().parent / "deploy"
     deploy_yaml = deploy_dir / "voxcpm2.yaml"
-    v1 = _runtime_config_from_deploy_yaml(deploy_yaml, use_v2_model_runner=False)
-    assert v1.vae_decode_every == 3
-    assert v1.audio_emit_every == 1
+    base = _runtime_config_from_deploy_yaml(deploy_yaml)
+    assert base.vae_decode_every == 3
+    assert base.audio_emit_every == 1
 
     merged = resolve_deploy_yaml(deploy_yaml)
     cuda_runtime_dict = merged["platforms"]["cuda"]["stages"][0]["engine_extras"]["hf_overrides"][
         "voxcpm2_runtime_config"
     ]
     v2 = _VoxCPM2RuntimeConfig.from_vllm_config(
-        SimpleNamespace(
-            model_config=SimpleNamespace(use_v2_model_runner=True, voxcpm2_runtime_config=cuda_runtime_dict)
-        )
+        SimpleNamespace(model_config=SimpleNamespace(voxcpm2_runtime_config=cuda_runtime_dict))
     )
     assert v2.vae_decode_every == 1
     assert v2.audio_emit_every == 3
@@ -155,7 +132,7 @@ def test_v2_overlay_on_base_yaml_preserves_explicit_audio_cadence(monkeypatch, t
     overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
     overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
 
-    config = _runtime_config_from_deploy_yaml(overlay, use_v2_model_runner=True)
+    config = _runtime_config_from_deploy_yaml(overlay)
     assert (config.vae_decode_every, config.audio_emit_every) == expected
     # Same call-time guard as the defaults test: the fake platform must be
     # the one from_vllm_config consults.
@@ -308,27 +285,6 @@ def test_exact_patch_batch_requires_incremental_unified_decode():
         enable_exact_patch_batch=True, enable_incremental_vae=True, vae_decode_every=1
     )._normalized()
     assert config.enable_exact_patch_batch
-
-
-def _graph_config(mode, *, uses_v2=False):
-    return SimpleNamespace(
-        model_config=SimpleNamespace(use_v2_model_runner=uses_v2),
-        compilation_config=SimpleNamespace(cudagraph_mode=mode),
-    )
-
-
-@pytest.mark.parametrize("mode_name", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
-def test_mrv1_rejects_outer_full_cudagraph(mode_name):
-    with pytest.raises(ValueError, match=f"cudagraph_mode={mode_name}.*PIECEWISE"):
-        reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name]))
-
-
-@pytest.mark.parametrize(
-    ("mode_name", "uses_v2"),
-    [("NONE", False), ("PIECEWISE", False), ("FULL_AND_PIECEWISE", True)],
-)
-def test_supported_graph_modes_pass(mode_name, uses_v2):
-    reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name], uses_v2=uses_v2))
 
 
 def test_cfg_value_env_overrides_yaml(monkeypatch):

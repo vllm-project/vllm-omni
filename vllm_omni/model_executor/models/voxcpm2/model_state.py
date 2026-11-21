@@ -15,7 +15,6 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.streaming_audio import AudioRequest, StreamingAudioBuffer
 
 from .incremental_vae import incremental_vae_decode
-from .voxcpm2_talker import _RequestState
 
 
 def pack_patch_context(context: torch.Tensor, lengths: torch.Tensor, patch: torch.Tensor):
@@ -122,8 +121,38 @@ class VoxCPM2BatchSlots:
 
 
 @dataclasses.dataclass
-class VoxCPM2RequestState(_RequestState):
-    """MRV2 slot ownership and validity; live tensors remain in ModelState."""
+class VoxCPM2RequestState:
+    """Request metadata and suspended tensor snapshots; live tensors stay in ModelState."""
+
+    request_id: str
+    # Per-request CFM noise generator, seeded once from the request's seed at
+    # first prefill chunk (runner passes it as ``_omni_seed``). None means the
+    # request carried no seed and draws noise from the global RNG stream.
+    cfm_generator: torch.Generator | None = None
+    curr_embed_for_next: torch.Tensor | None = None
+    prev_feat_embed: torch.Tensor | None = None
+    curr_prefix_feat_cond: torch.Tensor | None = None
+    last_audio_patch_gpu: torch.Tensor | None = None
+    cfm_output_gpu: torch.Tensor | None = None
+    cfm_noise_step: int = 0
+    precomputed_stop_logits: torch.Tensor | None = None
+    pending_audio_chunks_gpu: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    pending_vae_latents_gpu: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    # Rolling tail of previously-decoded latents used as VAE receptive-field context.
+    # Shape (n_pad_frames, feat_dim) on GPU. None before first decode.
+    decode_pad: torch.Tensor | None = None
+    decode_step_count: int = 0
+    prefill_completed: bool = False
+    is_last_prefill_chunk: bool = False
+    prompt_cache: dict | None = None
+    prefill_masks: tuple | None = None
+    is_stopping: bool = False
+    precomputed_is_stopping: bool | None = None
+    pending_stop_mask_cpu: torch.Tensor | None = None
+    pending_stop_mask_event: object | None = None
+    prefill_embeds: torch.Tensor | None = None
+    # Flush tail audio when the scheduler reaches the generation length limit.
+    audio_length_limit_reached: bool = False
 
     slot_index: int | None = None
     prefill_chunk_start: int = 0
@@ -836,7 +865,6 @@ class VoxCPM2ModelState(OmniModelState):
             parked = dataclasses.replace(state)
             parked.slot_index = None
             parked.pending_audio_chunks_gpu = list(state.pending_audio_chunks_gpu)
-            parked.pending_audio_copies = list(state.pending_audio_copies)
             if state.pending_vae_count:
                 parked.pending_vae_latents_gpu = [self.pending_latents[req_index, : state.pending_vae_count].clone()]
             if state.decode_state_ready:

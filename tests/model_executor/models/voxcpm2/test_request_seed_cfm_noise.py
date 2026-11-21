@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request-level seeds must control the VoxCPM2 CFM noise stream (#7658).
 
 ``/v1/audio/speech`` folds ``request.seed`` into ``SamplingParams.seed``, which
 reaches vLLM's sampler but never the CFM (flow-matching) noise draws: every
 noise site used the global RNG, so identical text + seed returned different
 audio. A seeded request now carries a dedicated ``torch.Generator`` in its
-``_RequestState``; these tests pin the noise semantics without instantiating
+``VoxCPM2RequestState``; these tests pin the noise semantics without instantiating
 the full model.
 """
 
@@ -39,9 +39,9 @@ def _make_talker(deterministic_cfm_noise: bool = False):
 
 
 def _make_state(request_id: str = "req-1", seed: int | None = 42):
-    from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _RequestState
+    from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2RequestState
 
-    state = _RequestState(request_id=request_id)
+    state = VoxCPM2RequestState(request_id=request_id)
     if seed is not None:
         state.cfm_generator = torch.Generator(device="cpu")
         state.cfm_generator.manual_seed(seed)

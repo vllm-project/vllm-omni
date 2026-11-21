@@ -8,8 +8,10 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2RequestState
-from vllm_omni.model_executor.models.voxcpm2.scheduler import VoxCPM2OmniARAsyncScheduler
-from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import VoxCPM2TalkerForConditionalGeneration
+from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+    VoxCPM2TalkerForConditionalGeneration,
+    _UnifiedDecodeGraphStats,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -18,7 +20,10 @@ def _model():
     model = VoxCPM2TalkerForConditionalGeneration.__new__(VoxCPM2TalkerForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model._enable_unified_decode_graph = True
-    model._mrv2_model_state = None
+    model._unified_graph_stats = _UnifiedDecodeGraphStats()
+    model._mrv2_model_state = SimpleNamespace(
+        per_patch_audio=False, tensor_for=lambda state, name: getattr(state, name)
+    )
     model._active_states = {}
     model.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(enable_chunked_prefill=False, max_num_batched_tokens=16)
@@ -40,12 +45,11 @@ def _ready_metadata_model():
     return model
 
 
-@pytest.mark.parametrize("chunked,uses_v2,expected", [(False, True, True), (True, True, True), (False, False, False)])
-def test_mixed_graph_requires_v2_for_both_prefill_modes(chunked, uses_v2, expected):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_mixed_graph_supports_both_prefill_modes(chunked):
     model = _model()
-    model._mrv2_model_state = object() if uses_v2 else None
     model.vllm_config.scheduler_config.enable_chunked_prefill = chunked
-    assert model._mixed_unified_graph_enabled() is expected
+    assert model._mixed_unified_graph_enabled()
 
 
 def test_mixed_token_capacity_bounds_and_buckets():
@@ -86,23 +90,6 @@ def test_mixed_graph_packs_prefill_masks_and_decode_conditions(monkeypatch):
     assert not graph.prefix_feat_cond[2:].any()
 
 
-@pytest.mark.parametrize("uses_v2,chunked,defer", [(True, False, False), (True, True, False), (False, False, True)])
-def test_mixed_admission_removes_only_graph_specific_restriction(monkeypatch, uses_v2, chunked, defer):
-    from vllm.v1.request import RequestStatus
-
-    scheduler = object.__new__(VoxCPM2OmniARAsyncScheduler)
-    scheduler.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(use_v2_model_runner=uses_v2),
-        scheduler_config=SimpleNamespace(enable_chunked_prefill=chunked),
-    )
-    scheduler.waiting = [object()]
-    scheduler.kv_holding_waiting = []
-    scheduler.running = [SimpleNamespace(status=RequestStatus.RUNNING, is_finished=lambda: False, num_prompt_tokens=5)]
-    monkeypatch.setattr(scheduler, "_unified_decode_graph_enabled", lambda: True)
-    monkeypatch.setattr(scheduler, "_get_confirmed_num_computed_tokens", lambda _: 5)
-    assert scheduler._should_defer_waiting_admission() is defer
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "per_patch_audio,incremental_vae,patch_count",
@@ -122,7 +109,6 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
     model._feat_dim = model._patch_size = 2
     model._inference_timesteps = 1
     model._cfg_value = model._cfg_cutoff_ratio = 1.0
-    model._unified_graph_stats = SimpleNamespace(captures=0)
 
     class Backbone:
         def precompute_fused_qkv(self):
@@ -216,7 +202,7 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
         entries = [(prefill, True, None, length), (decode, False, None, 1)]
         if order == "decode-first":
             entries.reverse()
-        model._mrv2_model_state = None  # Use request tensors for this layout-only test.
+        model._mrv2_model_state = SimpleNamespace(tensor_for=lambda state, name: getattr(state, name))
         model._active_states = {s.request_id: s for s, *_ in entries}
         model._pending_requests = [(s.request_id, *entry) for s, *entry in entries]
         model._prepare_mixed_graph_inputs(graph, 2)
@@ -385,7 +371,6 @@ def test_chunked_prefill_graph_uses_current_chunk_masks_and_conditioning():
 @pytest.mark.parametrize("missing", ["request_bucket", "token_capacity"])
 def test_mixed_invalid_capacity_falls_through_without_decode_graph(monkeypatch, missing):
     model = _ready_metadata_model()
-    model._perf = SimpleNamespace(start=lambda *_: None)
     model._mrv2_model_state = SimpleNamespace(per_patch_audio=True)
     model._runner_assisted_unified_decode_graph_active = True
     model._active_states = {"p": VoxCPM2RequestState(request_id="p")}

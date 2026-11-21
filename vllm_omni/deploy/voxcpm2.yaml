@@ -1,6 +1,6 @@
-# VoxCPM2 deploy: single-stage AR pipeline with per-request state batching.
+# VoxCPM2 deploy: single-stage MRV2 AR pipeline with per-request state batching.
 # CUDA defaults to MRV2 with incremental VAE decoding.
-# Other platforms retain their existing runner and audio settings.
+# Other platforms retain their existing audio settings.
 # Runs on large (H20 141GB) and small (24GB L4) cards alike: the KV cache is
 # pinned to a right-sized budget instead of ballooning to fill the card.
 #

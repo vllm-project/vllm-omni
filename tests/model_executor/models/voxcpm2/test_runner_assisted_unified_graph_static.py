@@ -18,7 +18,6 @@ RUNNER_ASSISTED_METADATA = REPO_ROOT / "vllm_omni" / "worker" / "runner_assisted
 TALKER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "voxcpm2_talker.py"
 VOXCPM2_RUNTIME_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "runtime_config.py"
 VOXCPM2_PIPELINE = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "pipeline.py"
-VOXCPM2_SCHEDULER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "scheduler.py"
 OMNI_AR_SCHEDULER = REPO_ROOT / "vllm_omni" / "core" / "sched" / "omni_ar_scheduler.py"
 DEPLOY = REPO_ROOT / "vllm_omni" / "deploy" / "voxcpm2.yaml"
 
@@ -52,7 +51,6 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
     assert "record_fallback" not in source
     assert "fallbacks" not in source
     assert "**info_dict: Unpack[VoxCPM2PreprocessInput]" in source
-    assert "**info: Unpack[VoxCPM2PostprocessInput]" in source
     assert "reference_audio: Any" not in source
     assert "prompt_audio: Any" not in source
     assert "def _nullify_volatile_metadata(ctx: _ForwardContextLike) -> _ForwardContextLike" in source
@@ -124,9 +122,8 @@ def test_voxcpm2_unified_skip_preserves_segmented_decode_graphs():
     assert "anduse_segmented_decode_graph" in compact_source
 
 
-def test_voxcpm2_scheduler_policy_stays_model_local():
+def test_voxcpm2_uses_shared_scheduler():
     common_source = OMNI_AR_SCHEDULER.read_text()
-    voxcpm2_scheduler_source = VOXCPM2_SCHEDULER.read_text()
     pipeline_source = VOXCPM2_PIPELINE.read_text()
 
     assert "VoxCPM2TalkerForConditionalGeneration" not in common_source
@@ -135,17 +132,7 @@ def test_voxcpm2_scheduler_policy_stays_model_local():
     assert "_schedule_with_optional_waiting_deferral" not in common_source
     assert "def _should_defer_waiting_admission(self) -> bool:" in common_source
 
-    assert "class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler)" in voxcpm2_scheduler_source
-    assert "import vllm_omni.platforms as omni_platform" in voxcpm2_scheduler_source
-    assert "from .runtime_config import _VoxCPM2RuntimeConfig" in voxcpm2_scheduler_source
-    assert "_VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)" in voxcpm2_scheduler_source
-    assert "use_cuda_graph=omni_platform.current_omni_platform.is_cuda()" in voxcpm2_scheduler_source
-    assert "_should_defer_waiting_for_unified_decode_graph" in voxcpm2_scheduler_source
-    assert "def schedule(" not in voxcpm2_scheduler_source
-    assert "create_request_queue" not in voxcpm2_scheduler_source
-    assert "original_waiting.prepend_requests(deferred_waiting)" not in voxcpm2_scheduler_source
-    assert "return self._should_defer_waiting_for_unified_decode_graph()" in voxcpm2_scheduler_source
-    assert "vllm_omni.model_executor.models.voxcpm2.scheduler.VoxCPM2OmniARAsyncScheduler" in pipeline_source
+    assert "scheduler_cls=" not in pipeline_source
 
 
 def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():

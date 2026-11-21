@@ -12,35 +12,9 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def reject_outer_full_cudagraph(vllm_config: Any) -> None:
-    """Refuse vLLM's outer full CUDA graph capture on the MRV1 runner.
-
-    The talker walks its pending requests and keeps its own CUDA graphs. A full
-    outer graph replays the model over a padded batch, which breaks that
-    per-request bookkeeping, so the engine dies on the first request. The
-    shipped eager default and PIECEWISE are unaffected. The check covers only
-    the default MRV1 runner, where the failure was reported.
-    """
-    if getattr(vllm_config.model_config, "use_v2_model_runner", False):
-        return
-    compilation_config = getattr(vllm_config, "compilation_config", None)
-    mode = getattr(compilation_config, "cudagraph_mode", None)
-    if mode is None or not mode.has_full_cudagraphs():
-        return
-    raise ValueError(
-        f"VoxCPM2 does not support cudagraph_mode={mode.name}. The talker owns its own CUDA graphs "
-        "and cannot also run inside vLLM's outer full-graph capture. Use "
-        '--compilation-config \'{"cudagraph_mode": "PIECEWISE"}\', or drop --no-enforce-eager to use '
-        "the shipped default, which is the fastest configuration for this model."
-    )
-
-
 @dataclasses.dataclass(frozen=True)
 class _VoxCPM2RuntimeConfig:
     startup_lora_path: str | None = None
-    enable_profiling: bool = False
-    enable_nvtx_profile: bool = False
-    enable_loc_dit_layer_nvtx: bool = False
     enable_torch_compile: bool = True
     enable_loc_dit_fused_qkv: bool = True
     enable_loc_dit_fused_mlp: bool = True
@@ -64,8 +38,6 @@ class _VoxCPM2RuntimeConfig:
     deterministic_cfm_seed: int = 20260601
     audio_emit_every: int = 1
     vae_decode_every: int = 2
-    enable_delayed_audio_copy: bool = False
-    delayed_audio_copy_use_events: bool = False
     coalesce_audio_d2h: bool = True
     enable_batched_vae_decode: bool = True
     enable_batched_fsq_fusion: bool = True
@@ -78,13 +50,12 @@ class _VoxCPM2RuntimeConfig:
     def from_vllm_config(cls, vllm_config: Any) -> _VoxCPM2RuntimeConfig:
         model_config = vllm_config.model_config
         values: dict[str, Any] = {}
-        if getattr(model_config, "use_v2_model_runner", False):
-            from vllm_omni.platforms import current_omni_platform
+        from vllm_omni.platforms import current_omni_platform
 
-            # Incremental VAE decoding is a per-patch unified-graph feature and
-            # only exists on CUDA. Other platforms keep the v1 audio profile.
-            if current_omni_platform.is_cuda():
-                values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
+        # Incremental VAE decoding is a per-patch unified-graph feature and
+        # only exists on CUDA. Other platforms keep the non-incremental profile.
+        if current_omni_platform.is_cuda():
+            values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
         raw = getattr(model_config, "voxcpm2_runtime_config", None)
         if raw is None:
             raw = getattr(getattr(model_config, "hf_config", None), "voxcpm2_runtime_config", None)
@@ -122,18 +93,13 @@ class _VoxCPM2RuntimeConfig:
         if cfg.enable_cfm_prealloc_output and not cfg.enable_cfm_cuda_graph:
             logger.warning("VoxCPM2 CFM preallocated output requires CFM CUDA Graph; disabling it.")
             cfg = dataclasses.replace(cfg, enable_cfm_prealloc_output=False)
-        if cfg.delayed_audio_copy_use_events and not cfg.enable_delayed_audio_copy:
-            logger.warning("VoxCPM2 delayed audio copy events require delayed audio copy; disabling event polling.")
-            cfg = dataclasses.replace(cfg, delayed_audio_copy_use_events=False)
         if cfg.enable_incremental_vae and cfg.enable_batched_vae_decode:
             # Incremental unified graphs batch VAE themselves; this flag only
             # controls the legacy latent-cohort collection path.
             cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
-        if cfg.enable_batched_vae_decode and (
-            cfg.enable_delayed_audio_copy or cfg.audio_emit_every > 1 or cfg.enable_vae_cuda_graph
-        ):
+        if cfg.enable_batched_vae_decode and (cfg.audio_emit_every > 1 or cfg.enable_vae_cuda_graph):
             logger.warning(
-                "VoxCPM2 batched VAE decode is incompatible with delayed audio copy, "
+                "VoxCPM2 batched VAE decode is incompatible with "
                 "audio_emit_every > 1, and VAE CUDA Graph; disabling batched VAE decode."
             )
             cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
