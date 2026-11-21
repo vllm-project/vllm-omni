@@ -13,7 +13,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.endpoint_policy import EndpointRestriction
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import VllmOmniConfig, VllmOmniDiffusionStageConfig
 from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS, SERVE_CLI_SCOPE_KEY, PipelineConfig
 from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
@@ -247,6 +247,27 @@ def resolve_omni_config(
             strategy_specs=strategy_specs,
         )
     if structured_config is not None:
+        if is_native_single_file and native_single_file_model == "MiniMaxH3Pipeline":
+            pipeline = structured_config.pipeline_config
+            if pipeline is not None and pipeline.model_type in {
+                "minimax_h3_disaggregated",
+                "minimax_h3_disaggregated_decode",
+            }:
+                from vllm_omni.diffusion.models.minimax_h3.single_file import resolve_minimax_h3_base_source
+
+                base_model, base_revision = resolve_minimax_h3_base_source(
+                    normalized_overrides.get("custom_pipeline_args")
+                )
+                for stage in structured_config.stage_configs:
+                    if stage.model_stage not in {"encoder", "vae_decode"}:
+                        continue
+                    stage.model_config.model = base_model
+                    stage.model_config.revision = base_revision
+                    stage.model_config.task_type = "fl2va"
+                    if stage.model_stage == "vae_decode" and isinstance(stage, VllmOmniDiffusionStageConfig):
+                        stage.diffusion_config.model = base_model
+                        stage.diffusion_config.revision = base_revision
+                        stage.diffusion_config.task_type = "fl2va"
         return _build_registered_resolution(structured_config)
 
     _apply_generic_stage_overrides(normalized_overrides, filtered_stage_overrides)

@@ -608,6 +608,71 @@ them across ranks. DiT `rank-local` instead retains complete loader-produced
 tensors and avoids the synchronized request-wave contract. H3's TP-sharded
 text encoder uses `rank-local`.
 
+## Community single-file checkpoints (ComfyUI layout)
+
+Community H3 derivatives such as [TenStrip/10Eros-Max](https://huggingface.co/TenStrip/10Eros-Max)
+are published as one ComfyUI-layout `.safetensors` file per DiT variant instead
+of the `FL2VA/` and `Ref2VA/` component trees. Point the server at that file;
+the tokenizer, processor, Qwen3-VL text encoder, video/audio VAEs and release
+metadata are taken from the base MiniMax-H3 repository.
+
+Download the Turbo checkpoint from Hugging Face (install `huggingface_hub` with
+its CLI first):
+
+```bash
+hf download TenStrip/10Eros-Max 10Eros_Max_h3_TURBO-hybrid_beta5.safetensors \
+  --local-dir /models/10eros-max
+```
+
+```bash
+vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors \
+  --omni --model-class-name MiniMaxH3Pipeline --trust-remote-code \
+  --task-type fl2va \
+  --custom-pipeline-args '{"base_model": "MiniMaxAI/MiniMax-H3", "base_revision": "42ed227ee7df40d41602854ae760620d6eb651fe"}' \
+  --num-gpus 2 --tensor-parallel-size 2 --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2 --vae-parallel-mode tile \
+  --enable-distributed-layerwise-offload --dlo-no-use-allgather --dlo-resident-layers 20
+```
+
+- `--task-type` is required: `fl2va` serves T2VA and FL2VA from the file,
+  `ref2va` serves Ref2VA from the same or another file. One file holds one
+  DiT, so the default combined partition is rejected at startup.
+- `base_model` / `base_revision` default to the pinned MiniMax-H3 release shown
+  above; `base_model` may also be a local component tree (the directory that
+  contains `FL2VA/`). For these single-file checkpoints, the text encoder and
+  VAEs are loaded from `FL2VA/`, including for Ref2VA. Only shared components
+  are downloaded from the base model.
+- The file is executed as stored. Its QKV rows already use vLLM's packed
+  order, and its **compressed AdaLN** (`adaln_t_table` plus per-block
+  projections) is interpolated and projected in FP32 exactly as ComfyUI does,
+  without reconstructing dense time embeddings. The optional `adaln_basis` /
+  `adaln_mean` adapter tensors are ignored at inference.
+- Turbo files already contain the merged distillation deltas: do not add a
+  LightX2V adapter. Use 8 steps for Turbo files and 50 for the others, with
+  the same video/audio flow shifts as the official release.
+- Supported tensor dtypes are BF16 and FP32. INT8 and W4A8 single files are
+  rejected at load time. The exact AdaLN sidecar cache (below) is disabled for
+  single files; the runtime AdaLN cache still applies.
+- All parallelism and offload profiles of this recipe apply unchanged
+  (validated with 10Eros-Max beta5: TP1 + Ulysses 4 with HSDP, TP2 +
+  distributed layerwise offload, TP4 for Turbo, single-GPU layerwise offload).
+
+The [disaggregated deployments](MiniMax-H3-Disaggregated.md) accept a single
+file the same way. The DiT stage loads the file; the encoder and VAE-decode
+stages load the shared components from `base_model` / `base_revision`:
+
+```bash
+vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors \
+  --omni --model-class-name MiniMaxH3Pipeline --trust-remote-code \
+  --task-type fl2va \
+  --deploy-config vllm_omni/deploy/minimax_h3_disaggregated.yaml
+```
+
+This deployment defaults to 50 steps. For a Turbo file, send
+`num_inference_steps=8` with each request. Do not use the `_turbo`
+deployments: they carry the official LightX2V four-step defaults
+(five sigma points, `flow_shift=6`).
+
 ## AMD ROCm (gfx942 / gfx950)
 
 The sections above describe the NVIDIA CUDA path. This section covers the AMD
