@@ -873,6 +873,7 @@ class QwenImagePipeline(
             device=rows[0].device,
             dtype=rows[0].dtype,
         )
+        model_timestep = t_for_model / 1000
 
         # Concatenate image latents if available (editing pipelines)
         latent_model_input = latents
@@ -881,7 +882,7 @@ class QwenImagePipeline(
 
         positive_kwargs = {
             "hidden_states": latent_model_input,
-            "timestep": t_for_model / 1000,
+            "timestep": model_timestep,
             "guidance": guidance,
             "encoder_hidden_states_mask": prompt_embeds_mask,
             "encoder_hidden_states": prompt_embeds,
@@ -892,7 +893,7 @@ class QwenImagePipeline(
         if do_true_cfg:
             negative_kwargs = {
                 "hidden_states": latent_model_input,
-                "timestep": t_for_model / 1000,
+                "timestep": model_timestep,
                 "guidance": guidance,
                 "encoder_hidden_states_mask": negative_prompt_embeds_mask,
                 "encoder_hidden_states": negative_prompt_embeds,
