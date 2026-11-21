@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +10,7 @@ import torch.multiprocessing as mp
 from diffusers.models.autoencoders import AutoencoderKLQwenImage
 
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeExecutor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -32,7 +32,14 @@ def _executor(mode, size=2, group=None):
     def no_tiles(*args, **kwargs):
         raise AssertionError("spatial decode must not use tile executor")
 
-    return SimpleNamespace(parallel_mode=mode, parallel_size=size, group=group, execute=no_tiles)
+    # Supply Gloo groups directly without initializing the vLLM worker runtime.
+    executor = DistributedVaeExecutor.__new__(DistributedVaeExecutor)
+    executor.group = group
+    executor._error_group = group
+    executor._error_status = torch.zeros((), dtype=torch.int32)
+    executor.set_parallel_size(size, mode)
+    executor.execute = no_tiles
+    return executor
 
 
 @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
@@ -112,6 +119,46 @@ def _worker(rank, path, direction):
 @pytest.mark.parametrize("direction", ["height", "width"])
 def test_real_qwen_distributed_decode(tmp_path, direction):
     mp.start_processes(_worker, args=(str(tmp_path / "gloo"), direction), nprocs=2, join=True, start_method="spawn")
+
+
+def _preparation_failure_worker(rank, path):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{path}", rank=rank, world_size=2, timeout=timedelta(seconds=15)
+    )
+    try:
+        vae = _model()
+        vae.distributed_executor = _executor("spatial_shard_height", group=dist.group.WORLD)
+        vae.distributed_executor._error_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=15))
+
+        def fail_preparation(module, args):
+            if rank == 1:
+                raise torch.OutOfMemoryError("injected preparation OOM")
+
+        def forbid_decoder(module, args):
+            # Fail immediately if a healthy rank advances into decoder communication.
+            raise AssertionError("decoder entered after another rank failed preparation")
+
+        preparation_hook = vae.post_quant_conv.register_forward_pre_hook(fail_preparation)
+        decoder_hook = vae.decoder.register_forward_pre_hook(forbid_decoder)
+        try:
+            with pytest.raises(torch.OutOfMemoryError, match="spatial decode preparation"):
+                vae.decode(torch.randn(2, 2, 1, 3, 3))
+        finally:
+            preparation_hook.remove()
+            decoder_hook.remove()
+        assert all(value is None for value in vae._feat_map)
+        # All ranks have left the failed request together and can decode again.
+        with torch.no_grad():
+            assert vae.decode(torch.randn(2, 2, 1, 3, 3)).sample.shape == (2, 4, 1, 6, 6)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_spatial_preparation_oom_propagates_to_all_ranks(tmp_path):
+    mp.start_processes(
+        _preparation_failure_worker, args=(str(tmp_path / "gloo"),), nprocs=2, join=True, start_method="spawn"
+    )
 
 
 @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])

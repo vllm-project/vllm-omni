@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -62,15 +63,16 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
                 raise ValueError(
                     f"Qwen spatial-shard vae_patch_parallel_size={size} must match executor group size={world_size}."
                 )
-        if size > 1:
-            install_qwen_spatial_shard_decode(
-                self, executor.group, executor.parallel_mode.removeprefix("spatial_shard_")
-            )
-        if z.shape[2] == 0:
-            raise ValueError("Qwen spatial-shard decode requires at least one latent frame.")
-        self.clear_cache()
         try:
-            x = self.post_quant_conv(z)
+            with executor._sync_errors("spatial decode preparation") if size > 1 else nullcontext():
+                if z.shape[2] == 0:
+                    raise ValueError("Qwen spatial-shard decode requires at least one latent frame.")
+                if size > 1:
+                    install_qwen_spatial_shard_decode(
+                        self, executor.group, executor.parallel_mode.removeprefix("spatial_shard_")
+                    )
+                self.clear_cache()
+                x = self.post_quant_conv(z)
             chunks = []
             for i in range(z.shape[2]):
                 self._conv_idx = [0]
