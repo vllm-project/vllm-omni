@@ -362,6 +362,26 @@ while allocated < target_bytes:
     chunks.append(chunk)
     allocated += chunk.numel() * 2
 
+# The initial free-memory snapshot can become stale while a large device is
+# filled chunk by chunk. For example, another CUDA/HIP context may finish and
+# release memory before this sidecar reaches its original byte target. Re-read
+# the live residual and consume any newly freed memory before declaring the
+# explicit ceiling missed. ``_take`` keeps this reconciliation fail-closed when
+# the allocator rejects, stalls, or does not reduce reported free memory.
+if max_free_bytes is not None and not rejected:
+    while True:
+        free_now, _ = torch.cuda.mem_get_info(device)
+        residual_bytes = int(free_now) - max_free_bytes
+        if residual_bytes <= 0:
+            break
+        req_bytes = min(chunk_bytes, residual_bytes)
+        chunk = _take(max(1, req_bytes // 2))
+        if chunk is None:
+            rejected = True
+            break
+        chunks.append(chunk)
+        allocated += chunk.numel() * 2
+
 # Strict mode keeps filling with smaller chunks until the allocator rejects.
 # Rejection is a raised error, a stalled call, or an alloc that does not
 # reduce free memory. HIP can log OOM and retry without raising.

@@ -553,18 +553,10 @@ float16 = object()
     assert completed.stdout.rstrip().endswith("DONE")
 
 
-@pytest.mark.parametrize(
-    ("reporting_reserve_mib", "expected_returncode", "expected_status"),
-    [
-        (6, 0, "READY:"),
-        (9, 2, "ERROR:"),
-    ],
-)
-def test_sidecar_bounds_reported_residual_without_allocator_rejection(
+@pytest.mark.parametrize("late_free_mib", [6, 188])
+def test_sidecar_reconciles_memory_freed_during_allocation(
     tmp_path: Path,
-    reporting_reserve_mib: int,
-    expected_returncode: int,
-    expected_status: str,
+    late_free_mib: int,
 ) -> None:
     (tmp_path / "torch.py").write_text(
         f"""
@@ -601,8 +593,8 @@ class _Cuda:
 
     @staticmethod
     def mem_get_info(device):
-        reporting_reserve = {reporting_reserve_mib} * _MIB if _Cuda.allocated else 0
-        return _Cuda.initial_free - _Cuda.allocated + reporting_reserve, 1024 * _MIB
+        late_free = {late_free_mib} * _MIB if _Cuda.allocated else 0
+        return _Cuda.initial_free - _Cuda.allocated + late_free, 1024 * _MIB
 
 
 def empty(shape, **kwargs):
@@ -629,11 +621,12 @@ float16 = object()
         timeout=5,
     )
 
-    expected_free_after = (32 + reporting_reserve_mib) * 1024 * 1024
-    assert completed.returncode == expected_returncode, completed.stderr
-    assert f"free_after={expected_free_after}" in completed.stdout
-    assert expected_status in completed.stdout
-    assert completed.stdout.rstrip().endswith("DONE") is (expected_returncode == 0)
+    expected_allocated = (768 + late_free_mib) * 1024 * 1024
+    assert completed.returncode == 0, completed.stderr
+    assert "free_after=33554432" in completed.stdout
+    assert f"allocated={expected_allocated}" in completed.stdout
+    assert "READY:" in completed.stdout
+    assert completed.stdout.rstrip().endswith("DONE")
 
 
 @pytest.mark.parametrize(
