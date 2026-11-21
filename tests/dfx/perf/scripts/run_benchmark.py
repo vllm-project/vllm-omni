@@ -961,6 +961,12 @@ def _median_confirmation_result(results: Sequence[Mapping[str, Any]], metrics: f
 
 
 def _confirmation_result_path(result: Mapping[str, object]) -> Path | None:
+    value = getattr(result, "result_path", None)
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, str):
+        return Path(value)
+    # Unit-level test doubles may expose the path as private mapping metadata.
     value = result.get(BENCHMARK_RESULT_PATH_KEY)
     return Path(value) if isinstance(value, str) else None
 

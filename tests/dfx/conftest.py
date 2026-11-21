@@ -44,6 +44,14 @@ class PerformanceBaselineRegressionError(AssertionError):
         self.threshold_metrics = frozenset(threshold_metrics)
 
 
+class BenchmarkResult(dict[str, Any]):
+    """Benchmark metrics with an out-of-band path to their persisted JSON."""
+
+    def __init__(self, metrics: Mapping[str, Any], *, result_path: Path) -> None:
+        super().__init__(metrics)
+        self.result_path = result_path
+
+
 def metric_lower_is_better(name: str) -> bool:
     """Return whether a smaller measured value is the better one."""
     key = name.lower().replace("-", "_")
@@ -1017,8 +1025,7 @@ def run_benchmark(
             benchmark_params_name=benchmark_params_name,
             accuracy_baseline=accuracy_baseline,
         )
-    result[BENCHMARK_RESULT_PATH_KEY] = str(Path(result_path).resolve())
-    return result
+    return BenchmarkResult(result, result_path=Path(result_path).resolve())
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
