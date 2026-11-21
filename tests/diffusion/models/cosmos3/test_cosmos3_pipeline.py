@@ -1778,11 +1778,35 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert cfg.num_video_frames_per_chunk == 93
     assert cfg.share_vision_temporal_positions is True
     assert cfg.emphasize_control_in_prompt is True
+    assert cfg.use_system_prompt is True
+    assert cfg.system_prompt is None
     prompt_ablation_cfg = transfer.resolve_transfer_config(
         make_sampling_params(extra_args={"edge": True, "emphasize_control_in_prompt": False})
     )
     assert prompt_ablation_cfg is not None
     assert prompt_ablation_cfg.emphasize_control_in_prompt is False
+    no_system_prompt_cfg = transfer.resolve_transfer_config(
+        make_sampling_params(extra_args={"edge": True, "use_system_prompt": False})
+    )
+    assert no_system_prompt_cfg is not None
+    assert no_system_prompt_cfg.use_system_prompt is False
+    custom_system_prompt_cfg = transfer.resolve_transfer_config(
+        make_sampling_params(extra_args={"edge": True, "system_prompt": "custom system prompt"})
+    )
+    assert custom_system_prompt_cfg is not None
+    assert custom_system_prompt_cfg.use_system_prompt is True
+    assert custom_system_prompt_cfg.system_prompt == "custom system prompt"
+    with pytest.raises(ValueError, match="must not be empty"):
+        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True, "system_prompt": ""}))
+    # Other models use string-valued use_system_prompt modes; transfer must not read them as False.
+    with pytest.raises(ValueError, match="must be a boolean"):
+        transfer.resolve_transfer_config(
+            make_sampling_params(extra_args={"edge": True, "use_system_prompt": "en_vanilla"})
+        )
+    with pytest.raises(ValueError, match="use_system_prompt is false"):
+        transfer.resolve_transfer_config(
+            make_sampling_params(extra_args={"edge": True, "use_system_prompt": False, "system_prompt": "custom"})
+        )
     # fps omitted (no fps/frame_rate on the sampling params) -> wsm preset default (10) applies.
     defaulted_fps_cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"wsm": True}))
     assert defaulted_fps_cfg is not None
@@ -3224,11 +3248,13 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
 
 
 @pytest.mark.parametrize(
-    ("hint_key", "emphasize_control", "expected_fps", "negative_prompt"),
+    ("hint_key", "emphasize_control", "expected_fps", "negative_prompt", "system_prompt_args"),
     [
-        ("edge", None, 8.0, None),
-        ("wsm", None, 10.0, ""),
-        ("edge", False, 8.0, "custom negative"),
+        ("edge", None, 8.0, None, {}),
+        ("wsm", None, 10.0, "", {}),
+        ("edge", False, 8.0, "custom negative", {}),
+        ("edge", None, 8.0, None, {"use_system_prompt": False}),
+        ("edge", None, 8.0, None, {"system_prompt": "custom system prompt"}),
     ],
 )
 def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_wsm(
@@ -3237,6 +3263,7 @@ def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_ws
     emphasize_control: bool | None,
     expected_fps: float,
     negative_prompt: str | None,
+    system_prompt_args: dict[str, Any],
 ) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
@@ -3297,6 +3324,7 @@ def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_ws
     }
     if emphasize_control is not None:
         extra_args["emphasize_control_in_prompt"] = emphasize_control
+    extra_args.update(system_prompt_args)
     prompt_data = {
         "prompt": "transfer",
         "modalities": ["video"],
@@ -3323,8 +3351,11 @@ def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_ws
     assert captured["format_aspect_ratio"] == "1,1"
     expected_negative_prompt = "" if negative_prompt is None else negative_prompt
     assert captured["negative_prompt"] == expected_negative_prompt
-    assert captured["format_kwargs"]["use_system_prompt"] is True
-    assert captured["format_kwargs"]["system_prompt"] == COSMOS3_TRANSFER_SYSTEM_PROMPT
+    # Transfer defaults to its training system prompt; requests may replace it or opt out.
+    assert captured["format_kwargs"]["use_system_prompt"] is system_prompt_args.get("use_system_prompt", True)
+    assert captured["format_kwargs"]["system_prompt"] == system_prompt_args.get(
+        "system_prompt", COSMOS3_TRANSFER_SYSTEM_PROMPT
+    )
     assert captured["format_kwargs"]["use_duration_template"] is True
     assert captured["format_kwargs"]["use_resolution_template"] is True
     assert captured["format_kwargs"]["negative_metadata_mode"] == "same"
