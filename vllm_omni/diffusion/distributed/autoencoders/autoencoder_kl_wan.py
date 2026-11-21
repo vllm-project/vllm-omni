@@ -63,7 +63,8 @@ def _requires_gfx11_math_sdpa(
         return False
 
     capability = current_omni_platform.get_device_capability(device.index or 0)
-    if capability is None or capability[0] != 11:
+    # gfx11 and gfx1250 AOTriton builds lack head_dim > 256 kernels.
+    if capability is None or (capability[0] != 11 and tuple(capability) != (12, 5)):
         return False
 
     return any(head_dim > _GFX11_AOTRITON_MAX_HEAD_DIM for head_dim in _wan_attention_head_dims(model))
@@ -270,7 +271,7 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
             # Remove this guard only after the supported ROCm image contains
             # pytorch/pytorch#194100 and #194280 and W7900 validates issue #7484.
             logger.warning_once(
-                "Wan VAE is forcing math SDPA because gfx11 AOTriton does not "
+                "Wan VAE is forcing math SDPA because gfx11/gfx1250 AOTriton does not "
                 "support attention head dimensions above %d.",
                 _GFX11_AOTRITON_MAX_HEAD_DIM,
             )

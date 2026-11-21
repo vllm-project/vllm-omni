@@ -103,14 +103,15 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
             Fully qualified class path of the selected backend.
         """
         from vllm._aiter_ops import is_aiter_found_and_supported
+        from vllm.platforms.rocm import on_gfx1250
 
         # Check if aiter is available for Flash Attention support
-        # aiter currently only is supported on gfx942 and gfx950
+        # aiter currently only is supported on gfx942, gfx950 and gfx1250
         # https://github.com/vllm-project/vllm/blob/main/vllm/_aiter_ops.py
         compute_capability = torch.cuda.get_device_capability()
         major, minor = compute_capability
         capability = major * 10 + minor
-        aiter_supported = is_aiter_found_and_supported() and 90 < capability < 100
+        aiter_supported = is_aiter_found_and_supported() and (90 < capability < 100 or on_gfx1250())
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
@@ -126,7 +127,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
             if backend_upper == "FLASH_ATTN" and not aiter_supported:
                 logger.warning(
                     "Flash Attention requires `aiter` library which is only supported "
-                    "on gfx942 and gfx950. Falling back to TORCH_SDPA backend."
+                    "on gfx942, gfx950 and gfx1250. Falling back to TORCH_SDPA backend."
                 )
                 logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
