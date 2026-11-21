@@ -131,32 +131,31 @@ class SparseRingExecutor:
             torch.cuda.current_stream(self.device).wait_event(event)
         return self.send[slot]
 
-    def _exchange_packet(
+    def _packet_ops(
         self,
-        slot: int,
+        outbox: torch.Tensor,
+        inbox: torch.Tensor,
         destination: int,
         source: int,
         send_bytes: int,
         receive_bytes: int,
-        *,
-        receive_into: torch.Tensor | None = None,
-        ready_stream: torch.cuda.Stream | None = None,
-    ) -> torch.cuda.Event:
-        inbox = self.receive[slot] if receive_into is None else receive_into
+    ) -> list[dist.P2POp]:
         ops = []
         if send_bytes:
-            ops.append(dist.P2POp(dist.isend, self.send[slot][:send_bytes], group=self.group, group_peer=destination))
+            ops.append(dist.P2POp(dist.isend, outbox[:send_bytes], group=self.group, group_peer=destination))
         if receive_bytes:
             ops.append(dist.P2POp(dist.irecv, inbox[:receive_bytes], group=self.group, group_peer=source))
-        # Wait for packing and any earlier read of a reused receive slot.
-        self.communication.wait_stream(self.compute if ready_stream is None else ready_stream)
+        return ops
+
+    def _post_packets(self, ops: list[dist.P2POp], ready_stream: torch.cuda.Stream | None) -> torch.cuda.Event:
+        if ready_stream is not None:
+            self.communication.wait_stream(ready_stream)
         with torch.cuda.stream(self.communication):
             if ops:
                 for work in dist.batch_isend_irecv(ops):
                     work.wait()
             done = torch.cuda.Event()
             done.record(self.communication)
-        self._sent[slot] = done
         return done
 
     def _post_direct_packet(self, index, k, v, outgoing, incoming_count, ready_stream=None) -> torch.cuda.Event:
@@ -168,9 +167,13 @@ class SparseRingExecutor:
         self.payload_bytes += send_bytes
         if self.world == 4 and self.rank // 2 != destination // 2:
             self.cross_pair_payload_bytes += send_bytes
-        return self._exchange_packet(
-            slot, destination, source, send_bytes, incoming_count * block_bytes, ready_stream=ready_stream
+        ops = self._packet_ops(
+            self.send[slot], self.receive[slot], destination, source, send_bytes, incoming_count * block_bytes
         )
+        # Wait for packing and any earlier read of a reused receive slot.
+        done = self._post_packets(ops, self.compute if ready_stream is None else ready_stream)
+        self._sent[slot] = done
+        return done
 
     def _direct(self, q, qs, k, v, local_k, selected, scale) -> None:
         send, receive = self._demands(selected)
@@ -200,7 +203,9 @@ class SparseRingExecutor:
                     scale,
                 )
 
-    def _direct_manifest(self, q, qs, k, v, local, selected, scale) -> None:
+    def _direct_manifest(
+        self, q, qs, k, v, local: tuple[torch.Tensor, torch.Tensor, torch.Tensor], selected, scale
+    ) -> None:
         planning, manifest = self.planning, self.manifest
         assert planning is not None and manifest is not None
         send, receive = manifest.plan()
@@ -225,7 +230,7 @@ class SparseRingExecutor:
             if heads.numel():
                 self._attend(index + 1, source, q, qs, self.key, self.key_scale, self.value, selected, scale)
 
-    def _pair_relay(self, q, qs, k, v, local, selected, scale) -> None:
+    def _pair_relay(self, q, qs, k, v, local: tuple[torch.Tensor, torch.Tensor, torch.Tensor], selected, scale) -> None:
         manifest = self.pair_manifest
         planning = self.planning
         assert manifest is not None and planning is not None
@@ -242,42 +247,35 @@ class SparseRingExecutor:
                 self._attend(step, owner, q, qs, self.key, self.key_scale, self.value, selected, scale)
 
         with torch.cuda.stream(planning):
-            pack_kv(k, v, *plan.local_send.unbind(), self._prepare_packet(0))
-            local_bytes = plan.local_send.shape[1] * block_bytes
-            local_event = self._exchange_packet(
-                0, within, within, local_bytes, plan.local_receive.shape[1] * block_bytes, ready_stream=planning
-            )
-            pack_kv(k, v, *plan.cross_send.unbind(), self._prepare_packet(1))
-            cross_bytes = plan.cross_send.shape[1] * block_bytes
-            # The NCCL stream reads send[0] for the local hop before writing
-            # the cross-socket packet into it for forwarding.
-            relay_slot = self.send[0]
-            cross_event = self._exchange_packet(
-                1,
-                across,
-                across,
-                cross_bytes,
-                plan.cross_receive.shape[1] * block_bytes,
-                receive_into=relay_slot,
-                ready_stream=planning,
-            )
-        self._attend(0, self.rank, q, qs, *local, selected, scale)
-        self.compute.wait_event(local_event)
-        attend_packet(within, self.receive[0], plan.local_receive)
-        self.compute.wait_event(cross_event)
-        forward_bytes = plan.forward_count * block_bytes
-        forwarded_event = self._exchange_packet(
-            0,
-            within,
-            within,
-            forward_bytes,
-            plan.forward_receive.shape[1] * block_bytes,
+            heads, blocks = plan.local_send.unbind()
+            pack_kv(k, v, heads, blocks, self._prepare_packet(0))
+            heads, blocks = plan.cross_send.unbind()
+            pack_kv(k, v, heads, blocks, self._prepare_packet(1))
+        local_bytes = plan.local_send.shape[1] * block_bytes
+        cross_bytes = plan.cross_send.shape[1] * block_bytes
+        local_ops = self._packet_ops(
+            self.send[0], self.receive[0], within, within, local_bytes, plan.local_receive.shape[1] * block_bytes
         )
+        cross_ops = self._packet_ops(
+            self.send[1], self.receive[1], across, across, cross_bytes, plan.cross_receive.shape[1] * block_bytes
+        )
+        first_event = self._post_packets(local_ops + cross_ops, planning)
+        forward_bytes = plan.forward_count * block_bytes
+        # The first exchange has finished reading send[0] and writing receive[1]
+        # before the communication stream reuses both for the forwarding hop.
+        forward_ops = self._packet_ops(
+            self.receive[1], self.send[0], within, within, forward_bytes, plan.forward_receive.shape[1] * block_bytes
+        )
+        forward_event = self._post_packets(forward_ops, None)
+        self._sent[0], self._sent[1] = forward_event, first_event
+        self._attend(0, self.rank, q, qs, *local, selected, scale)
+        self.compute.wait_event(first_event)
+        attend_packet(within, self.receive[0], plan.local_receive)
         # A prefix may include blocks wanted only by the next receiver. The
         # local attention mask still selects exactly the original subset.
-        attend_packet(across, relay_slot, plan.cross_receive)
-        self.compute.wait_event(forwarded_event)
-        attend_packet(forwarded, self.receive[0], plan.forward_receive)
+        attend_packet(across, self.receive[1], plan.cross_receive)
+        self.compute.wait_event(forward_event)
+        attend_packet(forwarded, self.send[0], plan.forward_receive)
         self.payload_bytes = local_bytes + cross_bytes + forward_bytes
         self.cross_pair_payload_bytes = cross_bytes
 

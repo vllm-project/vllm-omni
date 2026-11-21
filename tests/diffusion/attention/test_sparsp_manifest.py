@@ -34,12 +34,11 @@ def check_pair_relay_layout(device):
     manifests = [PairRelayManifest(rank, heads, blocks, device) for rank in range(4)]
     indices = torch.arange(16 * heads * blocks, device=device).reshape(4, 4, heads, blocks)
     for demand in (indices % 11 < 7, indices % 11 < 3, indices < 0, indices >= 0):
-        plans = []
         for manifest in manifests:
             manifest.wants.copy_(demand)
             manifest.compact()
         torch.cuda.current_stream(device).synchronize()
-        plans.extend(manifest.plan() for manifest in manifests)
+        plans = [manifest.plan() for manifest in manifests]
         for rank, plan in enumerate(plans):
             within, across, forwarded = rank ^ 1, rank ^ 2, rank ^ 3
             assert torch.equal(plan.local_send, demand[within, rank].nonzero().T)

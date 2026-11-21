@@ -26,7 +26,9 @@ With four Ring ranks, `selective_pair_relay` groups ranks 0–1 and 2–3.
 Place each pair on the same CPU socket and use the manifest planner.
 One packet crosses sockets per producer and includes the union of both
 remote consumers' demands. The ingress rank forwards the second
-consumer's contiguous prefix to its same-socket peer.
+consumer's contiguous prefix to its same-socket peer. The independent
+within-pair and cross-pair exchanges share a single NCCL batch. Forwarding
+can run while attention consumes the first two received packets.
 
 The default `placement: none` leaves video ownership contiguous.
 `placement: auto` uses periodic ownership when each rank can own an
