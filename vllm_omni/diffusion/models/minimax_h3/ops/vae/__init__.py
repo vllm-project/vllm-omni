@@ -1,18 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Install bit-exact eager optimizations for the MiniMax H3 video VAE."""
+"""Install decoder operator optimizations for the MiniMax H3 video VAE."""
 
 from __future__ import annotations
 
-from types import MethodType
+import os
+from collections.abc import Callable
+from functools import partial
+from types import FunctionType, MethodType
 from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.layers.activation import SiluAndMul
+from vllm_omni.platforms.npu import is_a5
 
 from .dispatch import resolve_h3_vae_operators
+from .qk_norm_rope import try_rms_norm_npu, try_rotary_npu
+
+logger = init_logger(__name__)
 
 
 def _is_boolean_flag(value: Any) -> bool:
@@ -185,8 +194,16 @@ def install_h3_vae_optimizations(
     *,
     device: torch.device,
 ) -> bool:
-    """Install the operators selected for ``device`` once."""
-
+    """Install decoder operators for the selected backend once."""
+    if device.type == "npu":
+        if not is_a5(device):
+            return False
+        config = get_current_diffusion_config_or_none()
+        additional_config = config.additional_config if config is not None else None
+        enabled = (additional_config or {}).get("video_vae_fused_ops", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("MiniMax H3 additional_config.video_vae_fused_ops must be a boolean")
+        return _install_npu_operators(decoder) if enabled else False
     if getattr(decoder, "_omni_h3_vae_optimizations_installed", False):
         return True
     operators = resolve_h3_vae_operators(device)
@@ -211,6 +228,103 @@ def install_h3_vae_optimizations(
         block.forward = MethodType(_optimized_transformer_block, block)
 
     decoder._omni_h3_vae_optimizations_installed = True
+    return True
+
+
+def _npu_rms_norm(self: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    gamma = self.weight if self.weight is not None else self._omni_unit_gamma
+    result = try_rms_norm_npu(x, gamma, self.eps, unit_gamma=self.weight is None)
+    return type(self).forward(self, x) if result is None else result
+
+
+def _npu_rotary(
+    native: Callable[[torch.Tensor, tuple[torch.Tensor, torch.Tensor]], torch.Tensor],
+    x: torch.Tensor,
+    rotary: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    result = try_rotary_npu(x, rotary)
+    return native(x, rotary) if result is None else result
+
+
+def _npu_swiglu_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return self.w2(self._omni_silu_and_mul(self.w1(x)))
+
+
+def _install_npu_operators(decoder: nn.Module) -> bool:
+    """Install on the native decoder before quantization and residency snapshots."""
+    blocks = getattr(decoder, "transformer_blocks", None)
+    if not isinstance(blocks, nn.ModuleList) or not blocks:
+        logger.warning(
+            "Skipping MiniMax H3 VAE NPU operators for %s: expected a non-empty transformer_blocks ModuleList",
+            type(decoder).__name__,
+        )
+        return False
+    if getattr(decoder, "_omni_h3_vae_npu_operators_installed", False):
+        return True
+
+    # Honor the checkpoint's RoPE compile flag with its boolean syntax.
+    rope_compile = os.environ.get("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "0").strip().lower()
+    use_fused_rope = rope_compile not in ("1", "true", "yes", "on")
+    rotary_forwards: dict[FunctionType, FunctionType] = {}
+    for block in blocks:
+        attn = getattr(block, "attn", None)
+        for owner, names in ((block, ("norm1", "norm2")), (attn, ("norm_q", "norm_k"))):
+            if not isinstance(owner, nn.Module):
+                continue
+            for name in names:
+                norm = getattr(owner, name, None)
+                if (
+                    type(norm) is not nn.RMSNorm
+                    or len(norm.normalized_shape) != 1
+                    or norm.eps is None
+                    or "forward" in vars(norm)
+                ):
+                    continue
+                if norm.weight is None:
+                    reference = next(owner.parameters(), None)
+                    device = reference.device if reference is not None else torch.device("cpu")
+                    norm.register_buffer(
+                        "_omni_unit_gamma",
+                        torch.ones(norm.normalized_shape, device=device, dtype=torch.float32),
+                        persistent=False,
+                    )
+                norm.forward = MethodType(_npu_rms_norm, norm)
+
+        forward = getattr(getattr(attn, "forward", None), "__func__", None)
+        if (
+            use_fused_rope
+            and isinstance(forward, FunctionType)
+            and forward is type(attn).forward
+            and "apply_rotary_pos_emb" in forward.__code__.co_names
+        ):
+            if forward not in rotary_forwards:
+                native = forward.__globals__.get("apply_rotary_pos_emb")
+                if callable(native):
+                    # Bind the NPU RoPE to these decoder instances. Keep the
+                    # checkpoint's attention, masks, and collectives intact.
+                    namespace = dict(forward.__globals__, apply_rotary_pos_emb=partial(_npu_rotary, native))
+                    patched = FunctionType(
+                        forward.__code__, namespace, forward.__name__, forward.__defaults__, forward.__closure__
+                    )
+                    patched.__kwdefaults__ = forward.__kwdefaults__
+                    rotary_forwards[forward] = patched
+            if forward in rotary_forwards:
+                attn.forward = MethodType(rotary_forwards[forward], attn)
+
+        ff = getattr(block, "ff", None)
+        if (
+            isinstance(ff, nn.Module)
+            and getattr(ff, "use_gated", False)
+            and type(getattr(ff, "act_fn", None)) is nn.SiLU
+            and callable(getattr(ff, "_forward_impl", None))
+            and not getattr(ff, "_compile_forward_enabled", False)
+            and getattr(ff, "_compiled_forward", None) is None
+            and "_forward_impl" not in vars(ff)
+        ):
+            ff._omni_silu_and_mul = SiluAndMul()
+            ff._forward_impl = MethodType(_npu_swiglu_forward, ff)
+
+    decoder._omni_h3_vae_npu_operators_installed = True
     return True
 
 
