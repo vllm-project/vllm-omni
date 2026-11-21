@@ -203,10 +203,11 @@ class PersonaPlexConfig(PretrainedConfig):
         mimi_name (`str`, *optional*):
             Convenience mirror of ``mimi_config.mimi_name``; if set, it
             overrides the value carried inside ``mimi_config``.
-        mimi_cuda_graphs (`bool`, *optional*, defaults to `False`):
+        mimi_cuda_graphs (`bool`, *optional*, defaults to `True`):
             Replay the streaming Mimi codec from model-local CUDA graphs. Set
             per stage through ``hf_overrides``; independent of ``enforce_eager``,
-            which only governs vLLM's own graphs.
+            which only governs vLLM's own graphs. Off CUDA, or if capture
+            fails, the codec falls back to eager execution.
         mimi_decode_tf32 (`bool`, *optional*, defaults to `True`):
             Stage 1 Code2Wav: keep Mimi weights in float32 and run decoder GEMMs
             in TF32. The flags are process-wide CUDA backend switches; this is
@@ -235,7 +236,7 @@ class PersonaPlexConfig(PretrainedConfig):
         audio_vocab_size: int = 2048,
         num_audio_codebooks: int = 16,
         mimi_name: str | None = None,
-        mimi_cuda_graphs: bool = False,
+        mimi_cuda_graphs: bool = True,
         mimi_decode_tf32: bool = True,
         depformer_cuda_graphs: bool = False,
         **kwargs: Any,

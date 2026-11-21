@@ -149,8 +149,8 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
         model_arch = stage.yaml_engine_args["model_arch"]
         assert stage.yaml_engine_args["hf_overrides"]["mimi_cuda_graphs"] is True
         assert resolve(model_arch, dict(stage.yaml_engine_args["hf_overrides"])).mimi_cuda_graphs is True
-        # Without the deploy override the flag keeps its default.
-        assert resolve(model_arch, None).mimi_cuda_graphs is False
+        # Without the deploy override the flag keeps its default (graphed).
+        assert resolve(model_arch, None).mimi_cuda_graphs is True
 
 
 @pytest.mark.parametrize("deploy", ["personaplex.yaml", "personaplex_duplex_mrv2.yaml"])
