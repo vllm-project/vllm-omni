@@ -765,6 +765,7 @@ def prepare_encoder_inputs(
                         target_frame_count=num_frames,
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
+                        decode_frames=True,
                     )
                 audio_pool = ThreadPoolExecutor(max_workers=1)
                 try:
@@ -783,10 +784,12 @@ def prepare_encoder_inputs(
                         for item in prepared_videos
                     ]
                     for item, audio_future in zip(prepared_videos, audio_futures):
-                        full_frames = load_video_frames(item["prepared_path"])
+                        full_frames = item.get("decoded_frames")
+                        if full_frames is None:
+                            full_frames = load_video_frames(item["prepared_path"])
                         encoded_video_inputs.append(_frames_to_tensor(full_frames))
                         sampled = sample_reference_video_frames(
-                            item["prepared_path"],
+                            item.get("prepared_path", item["original_path"]),
                             decoded_frames=full_frames,
                         )
                         video_timestamps.append(sampled["block_timestamps"])
