@@ -706,6 +706,7 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("step_execution", True),
     ("vae_use_slicing", True),
     ("vae_use_tiling", True),
+    ("vae_stack_tiles", False),
     ("vae_fast_path", "channels_last"),
     ("vae_encode_fast_path", "off"),
     ("enable_multithread_weight_load", False),
