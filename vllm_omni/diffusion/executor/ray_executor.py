@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     uses_rank_local_dp_concurrency,
 )
+from vllm_omni.diffusion.distributed.errors import DistributedExecutionError
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.media import DiffusionMediaOutput
@@ -399,6 +400,11 @@ class RayDiffusionWorkerWrapper:
                             result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
                     else:
                         result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
+        except DistributedExecutionError:
+            # Peers may be blocked in device communication. Exit immediately
+            # so the actor monitor can close the whole worker group.
+            logger.exception("Fatal distributed execution failure on Ray worker %s", self.rank)
+            os._exit(1)
         except SystemExit:
             # A fatal Worker cleanup must not become a recoverable Ray task
             # error. Graceful exit_actor can wait forever on wait_for_exit in

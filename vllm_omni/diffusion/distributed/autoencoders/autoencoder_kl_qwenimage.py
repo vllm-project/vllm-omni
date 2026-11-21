@@ -19,6 +19,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 )
 from vllm_omni.diffusion.distributed.autoencoders.qwen_spatial_shard import install_qwen_spatial_shard_decode
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import WanDistCausalConv3d
+from vllm_omni.diffusion.distributed.errors import DistributedExecutionError
 
 logger = init_logger(__name__)
 
@@ -73,11 +74,20 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
                     )
                 self.clear_cache()
                 x = self.post_quant_conv(z)
-            chunks = []
-            for i in range(z.shape[2]):
-                self._conv_idx = [0]
-                chunks.append(self.decoder(x[:, :, i : i + 1], feat_cache=self._feat_map, feat_idx=self._conv_idx))
-            out = torch.cat(chunks, dim=2).clamp(-1, 1)
+            try:
+                chunks = []
+                for i in range(z.shape[2]):
+                    self._conv_idx = [0]
+                    chunks.append(self.decoder(x[:, :, i : i + 1], feat_cache=self._feat_map, feat_idx=self._conv_idx))
+                out = torch.cat(chunks, dim=2).clamp(-1, 1)
+            except Exception as error:
+                if size > 1:
+                    # A peer may already be waiting in halo/attention/gather
+                    # communication. Another collective cannot report this safely.
+                    raise DistributedExecutionError(
+                        "Qwen spatial decode failed during distributed execution; the worker group must be restarted."
+                    ) from error
+                raise
         finally:
             self.clear_cache()
         return DecoderOutput(sample=out) if return_dict else (out,)

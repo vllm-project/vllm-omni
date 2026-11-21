@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
+import weakref
+from concurrent.futures import Future
 from datetime import timedelta
 
 import pytest
@@ -9,8 +12,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers.models.autoencoders import AutoencoderKLQwenImage
 
+from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeExecutor
+from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor, _ExecutorShutdownCleaner
+from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -159,6 +165,110 @@ def test_spatial_preparation_oom_propagates_to_all_ranks(tmp_path):
     mp.start_processes(
         _preparation_failure_worker, args=(str(tmp_path / "gloo"),), nprocs=2, join=True, start_method="spawn"
     )
+
+
+def _halo_failure_worker(rank, path, ready, start):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{path}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    vae = _model()
+    vae.distributed_executor = _executor("spatial_shard_height", group=dist.group.WORLD)
+    with torch.no_grad():
+        vae.decode(torch.randn(1, 2, 1, 3, 3))
+
+    original_ensure_recv_buf = wan_spatial_shard._ensure_recv_buf
+
+    def fail_allocation(buf, reference):
+        if rank == 1 and (buf is None or buf.shape != reference.shape):
+            raise torch.OutOfMemoryError("injected halo allocation OOM")
+        return original_ensure_recv_buf(buf, reference)
+
+    class DecodeWorker:
+        def execute_method(self, method, *args, **kwargs):
+            # A larger request needs new halo buffers after successful warmup.
+            with torch.no_grad():
+                return vae.decode(torch.randn(1, 2, 1, 5, 5))
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(wan_spatial_shard, "_ensure_recv_buf", fail_allocation)
+            ready[rank].set()
+            assert start.wait(60)
+            proc = WorkerProc.__new__(WorkerProc)
+            proc.worker = DecodeWorker()
+            proc.gpu_id = rank
+            proc.od_config = None
+            proc.result_mq = object()
+            proc._running = True
+            proc._return_result = lambda *args, **kwargs: None
+            message = {"type": "rpc", "method": "execute_model", "output_rank": 0, "exec_all_ranks": True}
+
+            def recv_message():
+                nonlocal message
+                if message is not None:
+                    result, message = message, None
+                    return result
+                # A swallowed request error must leave the worker alive long
+                # enough for the parent's failure-notification deadline to expire.
+                threading.Event().wait(60)
+                raise AssertionError("worker continued after spatial decode failure")
+
+            proc.recv_message = recv_message
+            proc._worker_busy_loop()
+    except BaseException as error:
+        # An escaped exception must not look like the worker's fatal exit(1).
+        raise SystemExit(2) from error
+
+
+def test_spatial_halo_oom_closes_worker_group(tmp_path):
+    ctx = mp.get_context("spawn")
+    ready = [ctx.Event(), ctx.Event()]
+    start = ctx.Event()
+    processes = [
+        ctx.Process(target=_halo_failure_worker, args=(rank, str(tmp_path / "gloo"), ready, start)) for rank in range(2)
+    ]
+    executor = MultiprocDiffusionExecutor.__new__(MultiprocDiffusionExecutor)
+    executor._closed = False
+    executor._is_failed = False
+    executor._processes = processes
+    executor._failure_callbacks = []
+    executor._pump_stop = threading.Event()
+    executor._futures_lock = threading.RLock()
+    pending_request = Future()
+    executor._rpc_futures = {0: pending_request}
+    executor._output_futures = {}
+    executor._batch_split_map = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = {}
+    executor._shutdown_cleaner = _ExecutorShutdownCleaner(processes=processes)
+    executor._finalizer = weakref.finalize(executor, executor._shutdown_cleaner)
+    failed = threading.Event()
+    executor.register_failure_callback(failed.set)
+    try:
+        for process in processes:
+            process.start()
+        assert all(event.wait(60) for event in ready), "warmup did not complete"
+        executor._start_worker_monitor()
+        start.set()
+        # Well below the 60s process-group timeout: a rank failure must reach
+        # the executor and close its peers, even when rank 1 is not the output rank.
+        assert failed.wait(10), "worker group survived a spatial decode failure"
+        assert executor.is_dead
+        assert all(not process.is_alive() for process in processes)
+        assert processes[1].exitcode == 1
+        with pytest.raises(RuntimeError, match="shut down"):
+            pending_request.result(timeout=1)
+        with pytest.raises(RuntimeError, match="closed"):
+            executor.collective_rpc("execute_model")
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+        for process in processes:
+            if process.pid is not None:
+                process.join(5)
+        executor.shutdown()
 
 
 @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
