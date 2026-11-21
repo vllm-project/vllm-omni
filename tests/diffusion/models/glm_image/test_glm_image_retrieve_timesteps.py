@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU tests for GLM-Image timestep handoff through retrieve_timesteps.
 
 GLM-Image integrates with resolution-shifted sigmas but conditions the DiT on
-unshifted timesteps. diffusers >= 0.40 FlowMatchEulerDiscreteScheduler.set_timesteps
-overwrites caller-supplied timesteps with `sigmas * num_train_timesteps`;
-retrieve_timesteps must restore the provided schedule.
+unshifted timesteps. Diffusers 0.42.1 preserves caller-supplied timesteps when
+both timesteps and sigmas are passed; retrieve_timesteps must return that
+unshifted schedule.
 """
 
 import numpy as np

@@ -250,7 +250,7 @@ def test_alignment_preserves_spatial_shard_gather(monkeypatch, alignment_first: 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("installed_version", ["0.40.0", "0.41.0", "0.40.0.dev0"])
+@pytest.mark.parametrize("installed_version", ["0.42.1", "0.42.0", "0.42.1.dev0"])
 def test_alignment_warns_on_unverified_diffusers_version(monkeypatch, installed_version: str) -> None:
     """A dependency upgrade must not silently retain the copied forward."""
     from importlib import metadata
@@ -266,11 +266,11 @@ def test_alignment_warns_on_unverified_diffusers_version(monkeypatch, installed_
         forward = root.block.forward
         install_wan_attention_sdpa_alignment(root)
     assert root.block.forward is forward
-    if installed_version == "0.40.0":
+    if installed_version == "0.42.1":
         assert not recorded
     else:
         assert len(recorded) == 1
-        assert "validated against diffusers 0.40.0" in str(recorded[0].message)
+        assert "validated against diffusers 0.42.1" in str(recorded[0].message)
         assert installed_version in str(recorded[0].message)
     hidden = torch.randn(1, 32, 1, 1, 1)
     _assert_matches_unaligned_math(root.block, hidden)
