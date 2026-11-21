@@ -173,6 +173,17 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    ## Confucius4-TTS
+    "Confucius4TTSTalkerForConditionalGeneration": (
+        "confucius4_tts",
+        "confucius4_tts_talker",
+        "Confucius4TTSTalkerForConditionalGeneration",
+    ),
+    "Confucius4TTSS2ADecoder": (
+        "confucius4_tts",
+        "confucius4_tts_decoder",
+        "Confucius4TTSS2ADecoder",
+    ),
     ## personaplex (Moshi finetune, full-duplex S2S; 2-stage audio->audio offline pipeline)
     # built by lead: personaplex_talker module + PersonaPlexTalkerForConditionalGeneration.
     "PersonaPlexTalkerForConditionalGeneration": (

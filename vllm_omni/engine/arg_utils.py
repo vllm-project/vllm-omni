@@ -34,6 +34,8 @@ def is_frontend_only(single_stage_id_filter: int | None) -> bool:
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "Confucius4TTSS2ADecoder": "confucius4_tts",
+    "Confucius4TTSTalkerForConditionalGeneration": "confucius4_tts",
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
@@ -69,6 +71,10 @@ def _register_omni_hf_configs() -> None:
             Alpamayo2SuperConfig,
         )
         from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze import BreezeConfig
+        from vllm_omni.model_executor.models.confucius4_tts.configuration_confucius4_tts import (
+            Confucius4Config,
+            Confucius4TTSConfig,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -116,6 +122,8 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("alpamayo2_super", Alpamayo2SuperConfig),
         ("breeze", BreezeConfig),
+        ("confucius4", Confucius4Config),
+        ("confucius4_tts", Confucius4TTSConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("ming3_tts", Ming3TTSConfig),
@@ -519,13 +527,13 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
-            # Keep this exception model-scoped so other loader failures retain
-            # vLLM's normal error path.
-            if model_type != "indextts2_5" or not os.path.isdir(self.model):
-                return
-            config_path = os.path.join(self.model, "config.json")
-            if os.path.lexists(config_path):
+            # Some local native TTS bundles only contain checkpoint files.
+            # Keep this exception model-scoped so remote resolution and other
+            # loader failures retain vLLM's normal error path.
+            missing_local_config = os.path.isdir(self.model) and not os.path.lexists(
+                os.path.join(self.model, "config.json")
+            )
+            if model_type not in {"indextts2_5", "confucius4_tts"} or not missing_local_config:
                 return
             config_dict = {}
 

@@ -1,0 +1,54 @@
+pipeline: confucius4_tts
+async_chunk: false
+trust_remote_code: false
+
+connectors:
+  confucius4_tts_shm:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: false
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+
+stages:
+  - stage_id: 0
+    model_arch: Confucius4TTSTalkerForConditionalGeneration
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.5
+    enable_chunked_prefill: false
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    max_model_len: 2041
+    max_num_batched_tokens: 2041
+    output_connectors:
+      to_stage_1: confucius4_tts_shm
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.8
+      top_k: 30
+      repetition_penalty: 10.0
+      max_tokens: 1518
+      stop_token_ids: [8193]
+      detokenize: false
+
+  - stage_id: 1
+    model_arch: Confucius4TTSS2ADecoder
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.35
+    dtype: float32
+    enforce_eager: true
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    max_model_len: 2041
+    max_num_batched_tokens: 2041
+    input_connectors:
+      from_stage_0: confucius4_tts_shm
+    hf_overrides:
+      diffusion_steps: 25
+      inference_cfg_rate: 0.7
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1

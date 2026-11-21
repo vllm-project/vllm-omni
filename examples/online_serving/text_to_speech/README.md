@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| Confucius4-TTS | `netease-youdao/Confucius4-TTS` | ✓ (`ref_audio`, required) | — | uploaded audio voice supported; no presets | — |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -101,6 +102,63 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard and IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## Confucius4-TTS
+
+Two-stage multilingual TTS at 22.05 kHz. The native vLLM talker generates
+semantic tokens, Stage 1 recomputes the aligned latents from the finished
+sequence, and the S2A diffusion model and BigVGAN produce the waveform. Every request needs one reference audio clip.
+
+The first connected launch automatically downloads
+`facebook/w2v-bert-2.0`, `funasr/campplus`, and
+`nvidia/bigvgan_v2_22khz_80band_256x` when they are not already cached. For a
+fully offline deployment, use the
+[self-contained download layout](../../offline_inference/text_to_speech/README.md#confucius4-tts)
+and serve that local model directory instead.
+
+### Launch
+
+```bash
+vllm serve netease-youdao/Confucius4-TTS \
+    --omni \
+    --trust-remote-code \
+    --port 8091
+```
+
+The packaged `vllm_omni/deploy/confucius4_tts.yaml` is selected automatically.
+
+### Sending requests
+
+Send a standard OpenAI Speech API request:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "netease-youdao/Confucius4-TTS",
+        "input": "你好，这是一个语音合成测试。",
+        "ref_audio": "file:///path/to/reference.wav",
+        "response_format": "wav",
+        "extra_params": {"lang": "zh"}
+    }' \
+    --output output.wav
+```
+
+`ref_audio` accepts a local `file://` URI, an HTTP URL, or a
+`data:audio/wav;base64,...` URL.
+Supported language codes are `zh`, `en`, `ja`, `ko`, `de`, `fr`, `es`, `id`,
+`it`, `th`, `pt`, `ru`, `ms`, and `vi`; pass one through `language` or
+`extra_params.lang`. Streaming is not supported; omit `stream` or set it to
+`false`.
+
+The formatted prompt, including the language instruction, is limited to 520
+tokens. The adapter does not normalize or segment long text automatically.
+`max_new_tokens` limits the returned semantic sequence to at most 1518 tokens.
+At about 50 semantic tokens per second, one request yields at most about 30
+seconds of audio; longer text is cut off without an error, and the server logs
+a truncation warning. Split long text into shorter requests.
 
 ---
 

@@ -29,6 +29,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
+    "Confucius4Config": "vllm_omni.transformers_utils.configs.confucius4_tts",
+    "Confucius4TTSConfig": "vllm_omni.transformers_utils.configs.confucius4_tts",
     "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
     "Yue2Config": "vllm_omni.transformers_utils.configs.yue2",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
@@ -67,6 +69,8 @@ __all__ = [
     "VoxCPM2Config",
     "VoxtralTTSConfig",
     "CosyVoice3Config",
+    "Confucius4Config",
+    "Confucius4TTSConfig",
     "MiniMaxMusic3Config",
     "Yue2Config",
     "OmniVoiceConfig",
@@ -101,6 +105,7 @@ def __dir__():
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import confucius4_tts as _confucius4_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_omni as _fish_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402

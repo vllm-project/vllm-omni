@@ -18,6 +18,7 @@ list of supported architectures across all modalities, see
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
+| Confucius4-TTS | `netease-youdao/Confucius4-TTS` | 2 (talker + S2A diffusion/BigVGAN) | ✓ (required) | — | 14 languages (`--lang`) | 22.05 kHz |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | 2 (AR + DAC codec) | ✓ | ✓ (online) | speaker and event tags; no example script | 44.1 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning later) | ✓ (online) | zero-shot | 22.05 kHz |
@@ -103,6 +104,77 @@ python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
 `--streaming` on a 58-character English sentence: TTFA ~0.74 s (4-frame first
 chunk), 7 chunks, 1.55 s wall for 3.16 s of audio (RTF ~0.49). Treat these as
 smoke-test magnitudes, not a benchmark.
+
+---
+
+## Confucius4-TTS
+
+Confucius4-TTS uses a native vLLM GPT-2 talker followed by an S2A diffusion
+decoder and BigVGAN. Reference audio is required, and inference is currently
+non-streaming.
+
+On the first connected run, vLLM-Omni downloads the model plus
+`facebook/w2v-bert-2.0`, `funasr/campplus`, and
+`nvidia/bigvgan_v2_22khz_80band_256x` as needed. For a fully offline host,
+prepare one self-contained directory:
+
+```bash
+MODEL_DIR=/models/Confucius4-TTS
+hf download netease-youdao/Confucius4-TTS --local-dir "$MODEL_DIR"
+hf download facebook/w2v-bert-2.0 \
+    --local-dir "$MODEL_DIR/pretrained/w2v-bert-2.0"
+hf download funasr/campplus campplus_cn_common.bin \
+    --local-dir "$MODEL_DIR/pretrained/campplus"
+hf download nvidia/bigvgan_v2_22khz_80band_256x \
+    --local-dir "$MODEL_DIR/bigvgan"
+```
+
+Use the packaged request helpers with either the Hugging Face model ID or
+`MODEL_DIR`. The same self-contained directory works for OpenAI Speech API
+serving.
+
+```python
+import soundfile as sf
+
+from vllm_omni import Omni
+from vllm_omni.model_extras.confucius4_tts import (
+    SAMPLE_RATE,
+    confucius4_tts_audio,
+    confucius4_tts_prompt,
+    confucius4_tts_sampling_params,
+)
+
+model = "netease-youdao/Confucius4-TTS"
+omni = Omni(model=model)
+try:
+    output = omni.generate(
+        confucius4_tts_prompt(
+            model,
+            "你好，这是一个语音合成测试。",
+            "/path/to/reference.wav",
+            lang="zh",
+        ),
+        sampling_params_list=confucius4_tts_sampling_params(),
+        use_tqdm=False,
+    )[0]
+finally:
+    omni.shutdown()
+
+sf.write("output.wav", confucius4_tts_audio(output).numpy(), SAMPLE_RATE)
+```
+
+Supported language codes are `zh`, `en`, `ja`, `ko`, `de`, `fr`, `es`, `id`,
+`it`, `th`, `pt`, `ru`, `ms`, and `vi`. The formatted prompt, including the
+language instruction, is limited to 520 tokens. The integration does not add
+text normalization or automatic long-text segmentation, so callers should
+split longer input into suitable utterances.
+
+Stage 0 generates at most 1518 semantic tokens; Stage 1 recomputes the
+matching latent rows from the finished sequence. At about 50 semantic tokens
+per second, one request yields at most about 30 seconds of audio; longer text
+is cut off without an error, and a truncation warning is logged.
+`confucius4_tts_sampling_params(max_new_tokens=...)` sets that budget and
+configures token 8193 as the stop token. Output is 22.05 kHz mono audio.
 
 ---
 
