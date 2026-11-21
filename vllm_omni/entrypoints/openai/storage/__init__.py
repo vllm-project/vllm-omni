@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Pluggable storage backend for generated artifacts (e.g. video files).
+"""Pluggable storage backend for generated artifacts and job records.
 
-Public surface: the ``StorageBackend`` contract, local filesystem
-implementations, and the shared ``STORAGE_MANAGER`` instance.
+Public surface: the ``StorageBackend`` contract, the OpenDAL-backed
+implementation, the TTL sweeper, and the shared ``STORAGE_MANAGER`` instance.
 """
-
-# Re-exported for ``vllm_omni.entrypoints.openai.storage`` callers that
-# patch ``storage_module.time.time`` in tests.
-import time  # noqa: F401
 
 from vllm_omni.entrypoints.openai.storage.base import (
     BaseStorageHandle,
@@ -18,10 +14,9 @@ from vllm_omni.entrypoints.openai.storage.base import (
     StorageBackend,
 )
 from vllm_omni.entrypoints.openai.storage.factory import STORAGE_MANAGER, get_storage_manager
-from vllm_omni.entrypoints.openai.storage.local import (
-    LocalStorageManager,
-    LocalStorageTTLManager,
-)
+from vllm_omni.entrypoints.openai.storage.lease import BackendLease
+from vllm_omni.entrypoints.openai.storage.opendal_backend import OpenDALBackend
+from vllm_omni.entrypoints.openai.storage.ttl import SweepStrategy, TtlSweeper
 
 __all__ = [
     # base
@@ -29,13 +24,12 @@ __all__ = [
     "FileStorageHandle",
     "SaveContext",
     "StorageBackend",
-    # local implementations
-    "LocalStorageManager",
-    "LocalStorageTTLManager",
+    # implementations
+    "BackendLease",
+    "OpenDALBackend",
+    "SweepStrategy",
+    "TtlSweeper",
     # factory / instance
     "get_storage_manager",
     "STORAGE_MANAGER",
 ]
-
-# ``time`` stays out of ``__all__``: it is exported for the test patch
-# mentioned above, not part of the public API.
