@@ -62,12 +62,14 @@ def get_non_pad_index(variable_block_sizes: torch.Tensor, max_block_size: int) -
 
 
 @torch.compiler.disable
+@functools.lru_cache(maxsize=32)
 def get_tile_metadata(
     dit_seq_shape: tuple[int, int, int],
     tile_size: tuple[int, int, int],
     block_elements: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return shared cached tensors; callers must not modify them in place."""
     tile_partition_indices = get_tile_partition_indices(dit_seq_shape, tile_size, device)
     variable_block_sizes = construct_variable_block_sizes(dit_seq_shape, tile_size, device)
     non_pad_index = get_non_pad_index(variable_block_sizes, block_elements)
