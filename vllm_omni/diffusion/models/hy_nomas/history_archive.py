@@ -110,6 +110,12 @@ class HyNomasHistoryArchive:
         self._pending = (*self.records, record)
         self._pending_bytes = size
 
+    @property
+    def staged_records(self) -> tuple[HyNomasArchivedChunk, ...]:
+        if self._pending is None:
+            raise RuntimeError("Stage archive rows before selecting history.")
+        return self._pending
+
     def publish(self) -> None:
         if self._pending is None:
             raise RuntimeError("Hy-Nomas archive has no pending chunk.")
