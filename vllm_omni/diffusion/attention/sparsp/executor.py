@@ -100,7 +100,7 @@ class SparseRingExecutor:
 
     def _prepare_manifest(
         self, q: torch.Tensor, local_k: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
-    ) -> tuple[torch.Tensor, torch.cuda.Event, torch.cuda.Event]:
+    ) -> tuple[torch.Tensor, torch.cuda.Event | None, torch.cuda.Event]:
         planning = self.planning
         assert planning is not None
         for tensor in (q, local_k, k, v):
@@ -108,9 +108,7 @@ class SparseRingExecutor:
         planning.wait_stream(self.compute)
         with torch.cuda.stream(planning):
             selected = self._select(q, local_k, scale)
-            # Local attention needs the selection, but not the exchanged demand
-            # or the compact packet lengths. Let it run while we build those.
-            selection_ready = planning.record_event()
+            selection_ready = planning.record_event() if self.pair_manifest is None else None
             wants = self._wants(selected)
             pair_manifest = self.pair_manifest
             if pair_manifest is not None:
@@ -244,7 +242,9 @@ class SparseRingExecutor:
             if heads.numel():
                 self._attend(index + 1, source, q, qs, self.key, self.key_scale, self.value, selected, scale)
 
-    def _pair_relay(self, q, qs, wire_dtype, selected, scale) -> None:
+    def _pair_relay(
+        self, q, qs, local: tuple[torch.Tensor, torch.Tensor, torch.Tensor], wire_dtype, selected, scale
+    ) -> None:
         manifest = self.pair_manifest
         planning = self.planning
         assert manifest is not None and planning is not None
@@ -283,6 +283,7 @@ class SparseRingExecutor:
         )
         forward_event = self._post_packets(forward_ops, None)
         self._sent[0], self._sent[1] = forward_event, first_event
+        self._attend(0, self.rank, q, qs, *local, selected, scale)
         self.compute.wait_event(first_event)
         attend_packet(within, self.receive[0], plan.local_receive)
         # A prefix may include blocks wanted only by the next receiver. The
@@ -343,16 +344,17 @@ class SparseRingExecutor:
                 if planning is not None:
                     ki, ks = self.provider.quantize(local_k, 64)
                     local = (ki, ks, self._compute_input(v))
-                    self.compute.wait_event(selection_ready)
                     selected.record_stream(self.compute)
-                    self._attend(0, self.rank, qi, qs, *local, selected, scale)
-                    # Host-count NCCL APIs still need the packet lengths.
-                    # The GPU can prepare and attend to local K/V during this wait.
-                    lengths_ready.synchronize()
                     if self.pair_manifest is None:
+                        assert selection_ready is not None
+                        self.compute.wait_event(selection_ready)
+                        self._attend(0, self.rank, qi, qs, *local, selected, scale)
+                        lengths_ready.synchronize()
                         self._direct_manifest(qi, qs, k, v, selected, scale)
                     else:
-                        self._pair_relay(qi, qs, k.dtype, selected, scale)
+                        # Let the paired payload exchange overlap local attention.
+                        lengths_ready.synchronize()
+                        self._pair_relay(qi, qs, local, k.dtype, selected, scale)
                 elif self.config.routing == "selective_direct":
                     self._direct(qi, qs, k, v, local_k, selected, scale)
                 else:

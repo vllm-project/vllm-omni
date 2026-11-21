@@ -16,8 +16,8 @@ Both endpoints derive the same head/block order and payload length. Each
 sender packs those blocks into contiguous K/V packets and the receiver
 places them in the layout used by sparse attention. The `manifest` planner
 compacts indices in one GPU pass and reads back only the packet lengths.
-After sparse selection is ready, the local attention pass can also run
-while demand exchange and compact layout preparation are in flight.
+With direct routing, the local attention pass can run while demand
+exchange and compact layout preparation are in flight.
 NCCL packet lengths are copied into pinned host memory on the planning
 stream. Initial packets can pack directly from the GPU plan while the host
 reads lengths for NCCL. The first two hops can use separate slots, and a later hop
@@ -31,8 +31,9 @@ remote consumers' demands. Each socket chooses between the two cross-socket
 rank matchings using the manifest to minimize the number of blocks that
 need forwarding. The ingress rank forwards the second consumer's
 contiguous prefix to its same-socket peer. The independent
-within-pair and cross-pair exchanges share a single NCCL batch. Forwarding
-can run while attention consumes the first two received packets.
+within-pair and cross-pair exchanges share a single NCCL batch. The executor
+queues the first exchange and forwarding before launching local attention.
+Forwarding can also run while attention consumes the first two received packets.
 
 The default `placement: none` leaves video ownership contiguous.
 `placement: auto` uses periodic ownership when each rank can own an
