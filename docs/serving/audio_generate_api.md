@@ -75,10 +75,18 @@ Content-Type: application/json
 | ----------- | ------ | --------- | ------------- |
 | `audio_length` | float | null | Audio duration in seconds (default value is the max ~47s for `stable-audio-open-1.0`) |
 | `audio_start` | float | 0.0 | Audio start time in seconds |
+| `num_frames` | int | null | Exact positive frame count for pipelines supporting frame-based duration |
+| `frame_rate` | float | null | Positive frame rate for pipelines supporting frame-based duration |
 | `negative_prompt` | string | null | Text describing what to avoid in generation |
 | `guidance_scale` | float | model default | Classifier-free guidance scale (higher = more adherence to prompt) |
 | `num_inference_steps` | int | model default | Number of denoising steps (higher = better quality, slower) |
 | `seed` | int | null | Random seed for reproducible generation |
+
+When provided, `audio_length`, `audio_start`, and `frame_rate` must be finite
+numbers. `audio_length` and `frame_rate` must also be greater than zero. When
+`audio_length` is provided, the derived end time (`audio_start + audio_length`)
+must remain finite; a null `audio_start` is treated as zero. Model-specific
+duration limits are enforced by the selected pipeline.
 
 ### Response Format
 
@@ -260,6 +268,11 @@ Invalid or missing parameters:
 }
 ```
 
+Request validation failures also return HTTP 400 in the OpenAI-compatible
+`error` envelope. These include invalid `response_format`, out-of-range `speed`,
+non-finite timing parameters, and overflow of the derived audio end time.
+Requests with these timing errors are rejected before engine submission.
+
 ### 404 Not Found
 
 Model mismatch:
@@ -272,22 +285,6 @@ Model mismatch:
         "param": "model",
         "code": 404
     }
-}
-```
-
-### 422 Unprocessable Entity
-
-Pydantic validation failure (e.g. invalid `response_format`, `speed` out of range):
-
-```json
-{
-    "detail": [
-        {
-            "type": "literal_error",
-            "msg": "Input should be 'wav', 'pcm', 'flac', 'mp3' or 'opus'",
-            ...
-        }
-    ]
 }
 ```
 
