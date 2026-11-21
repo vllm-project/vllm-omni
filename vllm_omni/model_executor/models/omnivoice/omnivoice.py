@@ -21,6 +21,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 logger = init_logger(__name__)
 
@@ -245,7 +246,9 @@ class OmniVoiceModel(
             text_hidden_states=None,
             multimodal_outputs={
                 "audio": tts_speech,
-                "sr": self.config.sample_rate,
+                # Per-request 0-d rate tensors (canonical shape); the decoder
+                # waveform covers `audio_tokens.shape[0]` requests.
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(self.config.sample_rate, audio_tokens.shape[0]),
             },
         )
 

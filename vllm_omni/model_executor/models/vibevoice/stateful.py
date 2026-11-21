@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
+
 if TYPE_CHECKING:
     from transformers.models.vibevoice_acoustic_tokenizer.modeling_vibevoice_acoustic_tokenizer import (
         VibeVoiceAcousticTokenizerConv1dPaddingCache as PaddingCache,
@@ -133,7 +135,12 @@ class VibeVoiceStatefulInference:
         chunks = self._run_audio_tokens(audio_ids, negative_inputs, hidden[audio_indices])
         return {
             "model_outputs": chunks,
-            "sr": [torch.tensor(SAMPLE_RATE, dtype=torch.int32) for _ in chunks],
+            # The acoustic tokenizer's waveform rate. No config field exposes
+            # it (the HF tokenizer config has none), so this module constant
+            # is the single source. A step with no audio tokens emits an
+            # empty list, parallel to ``model_outputs`` (the helper rejects a
+            # zero count by design).
+            SAMPLE_RATE_KEY: make_sample_rate_tensors(SAMPLE_RATE, len(chunks)) if chunks else [],
             "meta": {"req_id": audio_ids, "sparse_audio": ["1"]},
         }
 
