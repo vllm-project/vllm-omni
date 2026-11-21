@@ -717,6 +717,27 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     return accuracy_path
 
 
+def _is_minicpmo_duplex_eval(result: dict, params: dict) -> bool:
+    """True for MiniCPM-o Omni-DuplexEval nightly (native duplex).
+
+    That path may finish a session with audio and an empty transcript, or
+    text without PCM. Run-level ``required_duplex_metrics`` still require
+    some client TTFT/TTFP samples for the batch.
+    """
+    blob = " ".join(
+        str(value)
+        for value in (
+            result.get("test_name"),
+            result.get("model_id"),
+            params.get("test_name"),
+            params.get("model"),
+        )
+        if value
+    ).lower()
+    compact = blob.replace("_", "-")
+    return "minicpm-o" in compact or "minicpmo" in compact.replace("-", "")
+
+
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
     summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
@@ -748,12 +769,13 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         )
         return
     assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
-    for session in sessions:
-        for name in ("client_ttft_ms", "client_ttfp_ms"):
-            metric = session.get(name, {})
-            assert metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")), (
-                f"Omni-DuplexEval session has no measured {name}"
-            )
+    if not _is_minicpmo_duplex_eval(result, params):
+        for session in sessions:
+            for name in ("client_ttft_ms", "client_ttfp_ms"):
+                metric = session.get(name, {})
+                assert metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")), (
+                    f"Omni-DuplexEval session has no measured {name}"
+                )
     if params.get("duplex_eval_evaluate"):
         accuracy = summary.get("accuracy")
         assert isinstance(accuracy, dict), "Omni-DuplexEval accuracy is missing"
@@ -1059,7 +1081,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
             )
-            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
                     result,
@@ -1101,7 +1123,7 @@ def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pyte
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
             )
-            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            assert_params = {**params, "test_name": test_name, **_aggregate_accuracy_params_for_test(test_name)}
             try:
                 assert_result(
                     result,
