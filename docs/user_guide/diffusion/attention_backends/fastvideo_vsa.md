@@ -108,6 +108,32 @@ Omni uses logical 128-token blocks, 90% sparsity, and an independent 10%
 budget for each reference-video region. Both full checkpoints reject a fixed
 top-k override.
 
+### Keep a ratio instead of a count on the four-step adapter
+
+A fixed top-k keeps the same number of video blocks whatever the request
+shape, so its effective sparsity moves with clip length and resolution. With
+the four-step adapter's 64-token blocks and `fastvideo_vsa_topk: 64`:
+
+| Request | Video blocks | Kept | Effective sparsity |
+| --- | ---: | ---: | ---: |
+| 1344x768, 4.4 s | 462 | 13.9% | 86.1% |
+| 1344x768, 10 s | 1188 | 5.4% | 94.6% |
+| 1344x768, 15 s | 1782 | 3.6% | 96.4% |
+
+Set `fastvideo_vsa_sparsity` to keep a fraction of the video blocks instead,
+so one deployment behaves the same across request shapes. The kept count is
+`ceil((1 - sparsity) * video_blocks)`; prefix blocks stay dense, as with top-k:
+
+```bash
+--diffusion-attention-config.default.backend FASTVIDEO_VSA \
+--diffusion-attention-config.default.fastvideo_vsa_sparsity 0.9
+```
+
+The option is opt-in and mutually exclusive with `fastvideo_vsa_topk`; without
+it the fixed top-k behavior is unchanged. It applies to the MiniMax-H3 route
+only. V2 and Omni already pin a ratio in the checkpoint and reject this
+override, like a fixed top-k.
+
 ### Wan top-k behavior
 
 At runtime the backend logs the sequence shape and derived block count:
