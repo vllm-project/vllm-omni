@@ -926,6 +926,31 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self._tile_gather_expected_hw = None
 
     @contextmanager
+    def _wrapped_tile_ownership(self, num_tiles: int) -> Iterator[None]:
+        """Give every rank exactly one tile when the grid is shorter than the group.
+
+        The checkpoint hands a rank the tiles ``range(sp_rank, num_tiles, sp_size)``
+        and rebuilds the grid from every gathered share as
+        ``results[k * sp_size + rank]``, skipping indices past ``num_tiles``.
+        With ``sp_size = num_tiles`` and ``sp_rank = rank % num_tiles``, rank
+        ``r`` owns tile ``r`` for the first ``num_tiles`` ranks. The surplus
+        ranks repeat a tile, so they hold a non-empty share for the collective,
+        and the reconstruction drops those repeats by its own bounds check.
+
+        The process group and the collectives stay those of the full group, and
+        the decoded frames are those of the rank-local fallback: the same tiles
+        through the same decoder. Each rank decodes one tile instead of all of
+        them.
+        """
+        state = self._native_parallel_state()
+        saved = {"sp_size": state["sp_size"], "sp_rank": state["sp_rank"]}
+        state.update(sp_size=num_tiles, sp_rank=int(saved["sp_rank"]) % num_tiles)
+        try:
+            yield
+        finally:
+            state.update(saved)
+
+    @contextmanager
     def _rank_local_tiling(self) -> Iterator[None]:
         state = self._native_parallel_state()
         saved_state = dict(state)
@@ -1233,6 +1258,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         """
         num_tiles = self._decoder_tile_count(latent)
         if self.parallel_size > 1 and num_tiles < self.parallel_size:
+            # The equal-shape replacement gather sizes its buffer for one share
+            # per group rank, so it keeps the rank-local fallback.
+            if num_tiles > 1 and getattr(self, "_checkpoint_tile_gather", None) is None:
+                logger.info_once(
+                    "MiniMax-H3 VAE decode splits into %d tiles for a tile group of %d ranks; "
+                    "each rank decodes one tile and the surplus ranks repeat one.",
+                    num_tiles,
+                    self.parallel_size,
+                )
+                return self._wrapped_tile_ownership(num_tiles)
             logger.warning_once(
                 "MiniMax-H3 VAE decode splits into %d tile(s) but the tile group has "
                 "%d ranks; decoding rank-locally for this shape instead, which is "
