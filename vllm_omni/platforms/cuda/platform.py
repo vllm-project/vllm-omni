@@ -17,6 +17,11 @@ from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 logger = init_logger(__name__)
 
 
+def _is_flash_attn_supported_gpu(gpu_name: str) -> bool:
+    # Turing/Tesla/T4 GPUs don't support flash attention well
+    return not ("Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name)
+
+
 class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
     """CUDA/GPU implementation of OmniPlatform (default).
 
@@ -42,15 +47,17 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
     def has_flash_attn_package(cls) -> bool:
         from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_installed
 
-        # Turing/Tesla/T4 GPUs don't support flash attention well
-        gpu_name = cls.get_device_name()
-        if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
+        if not _is_flash_attn_supported_gpu(cls.get_device_name()):
             return False
 
         if not is_flash_attn_installed():
             return False
 
         return True
+
+    @classmethod
+    def supports_standalone_flash_attn(cls) -> bool:
+        return _is_flash_attn_supported_gpu(cls.get_device_name()) and super().supports_standalone_flash_attn()
 
     @classmethod
     def has_flash_attn_4(cls) -> bool:
