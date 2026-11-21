@@ -36,5 +36,4 @@ stages:
       # 40-420 frames -- but a load-bearing one, because this checkpoint's stop
       # head does not fire on every batched trajectory.
       max_tokens: 1000
-      seed: 42
       detokenize: false
