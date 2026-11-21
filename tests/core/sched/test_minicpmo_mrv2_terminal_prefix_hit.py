@@ -48,6 +48,7 @@ _HASHER = get_request_block_hasher(BLOCK, sha256)
 def _speculative_config():
     spec = SimpleNamespace(
         method="dspark",
+        custom_method=None,
         num_speculative_tokens=NUM_SPEC,
         num_speculative_tokens_per_batch_size=None,
         disable_eagle_block_drop=False,
@@ -60,6 +61,8 @@ def _speculative_config():
         "uses_extract_hidden_states", "use_multi_module_mtp",
     ):  # fmt: skip
         setattr(spec, name, types.MethodType(getattr(SpeculativeConfig, name), spec))
+    spec.speculator_config = SpeculativeConfig.speculator_config.fget(spec)
+    spec.uses_target_hidden_states = SpeculativeConfig.uses_target_hidden_states.fget(spec)
     spec.max_num_new_slots_for_drafting = SpeculativeConfig.max_num_new_slots_for_drafting.fget(spec)
     return spec
 
@@ -132,7 +135,6 @@ def _deliver(scheduler, scheduler_output, spans, sampled):
         )
     output = ModelRunnerOutput(
         req_ids=rids,
-        req_id_to_index={rid: i for i, rid in enumerate(rids)},
         sampled_token_ids=[sampled[rid] for rid in rids],
         logprobs=None,
         prompt_logprobs_dict={},
