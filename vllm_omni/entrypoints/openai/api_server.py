@@ -560,6 +560,15 @@ async def omni_run_server_worker(
                 listen_address,
             )
 
+        if (idle_timeout := getattr(args, "idle_sleep_timeout", None)) is not None:
+            if (
+                not isinstance(engine_client, AsyncOmni)
+                or isinstance(engine_client, DuplexOmni)
+                or api_server_count != 1
+            ):
+                raise ValueError("Idle sleep requires AsyncOmni with one frontend; duplex is unsupported")
+            engine_client.enable_idle_sleep(idle_timeout)
+
         class _TimestampMiddleware:
             """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
 
@@ -768,6 +777,7 @@ async def build_async_omni_from_stage_config(
         kwargs = args.get_explicit_kwargs_dict()
         # This controls only the API-process WebSocket and is not an AsyncOmni option.
         kwargs.pop("robot_openpi_idle_timeout", None)
+        kwargs.pop("idle_sleep_timeout", None)
         model = kwargs.pop("model", None) or args.model
         if args.disable_log_stats:
             kwargs["log_stats"] = False
@@ -3646,6 +3656,8 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
     sleeping_set = raw_request.app.state.sleeping_stages
     if not hasattr(engine_client, "sleep"):
         raise HTTPException(status_code=501, detail="Engine does not support sleep")
+    if isinstance(getattr(engine_client, "_idle_timeout_s", None), (int, float)):
+        raise HTTPException(status_code=409, detail="Automatic idle sleep owns the lifecycle")
     try:
         acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
     except ValueError as e:
@@ -3666,6 +3678,8 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     _reject_process_local_state_with_multiple_api_workers(raw_request, "Wakeup")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
+    if isinstance(getattr(engine_client, "_idle_timeout_s", None), (int, float)):
+        raise HTTPException(status_code=409, detail="Automatic idle sleep owns the lifecycle")
     if not any(sid in sleeping_set for sid in request.stage_ids):
         return {"status": "SKIPPED", "reason": "Target stages are not sleeping."}
     if not hasattr(engine_client, "wake_up"):
