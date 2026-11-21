@@ -29,6 +29,9 @@ PHONON_PIPELINE = PipelineConfig(
 def resolve_phonon_pipeline(hf_config=None):
     from vllm_omni.transformers_utils.configs.phonon import PhononConfig
 
+    if hf_config is not None and not isinstance(hf_config, PhononConfig):
+        return None
+
     eos = getattr(hf_config, "eos_token_id", None)
     if eos is None:
         eos = PhononConfig().eos_token_id
