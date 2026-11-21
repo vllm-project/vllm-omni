@@ -13,6 +13,8 @@ from typing import Any
 import PIL.Image
 import torch
 
+from vllm_omni.diffusion.models.utils import normalize_latents
+
 
 def validate_wan_batch_settings(settings: list[dict[str, Any]], *, stage: str) -> None:
     """Compare only effective settings actually shared by this execution path.
@@ -100,9 +102,7 @@ def encode_wan_image_condition(vae: Any, image_tensor: torch.Tensor, device: tor
         latent_condition = encoded.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
-    mean = torch.tensor(vae.config.latents_mean).view(1, vae.config.z_dim, 1, 1, 1).to(latent_condition)
-    inv_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(latent_condition)
-    return ((latent_condition - mean) * inv_std).to(torch.float32)
+    return normalize_latents(latent_condition, vae.config).to(torch.float32)
 
 
 def validate_wan_conditioning(
