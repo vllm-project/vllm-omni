@@ -54,10 +54,38 @@ def test_request_disconnect_preserves_server_stderr(monkeypatch, capfd):
             connection.close()
         assert server.proc is not None
         assert server.proc.wait(timeout=5) == 7
+        assert server._server_log_thread is not None
+        server._server_log_thread.join(timeout=5)
+        assert "injected server failure after readiness" in capfd.readouterr().err
 
-    # The startup-error ring buffer is not surfaced on this failure path.
-    # Pytest must also capture the child's stderr for its request failure report.
-    assert "injected server failure after readiness" in capfd.readouterr().err
+
+def test_performance_server_stderr_is_deferred_until_teardown(monkeypatch, capfd):
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+    server = runtime.OmniServer("fake-model", [], defer_stderr=True)
+    popen = subprocess.Popen
+
+    def launch(*args, **kwargs):
+        code = textwrap.dedent(
+            f"""\
+            import socket
+            import sys
+
+            with socket.socket() as listener:
+                listener.bind(({server.host!r}, {server.port}))
+                listener.listen()
+                print('deferred server diagnostic', file=sys.stderr, flush=True)
+                while True:
+                    connection, _ = listener.accept()
+                    connection.close()
+            """
+        )
+        pipe_kwargs = {key: kwargs[key] for key in ("stderr", "encoding", "errors", "text", "bufsize") if key in kwargs}
+        return popen([sys.executable, "-c", code], **pipe_kwargs)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", launch)
+    with server:
+        assert "deferred server diagnostic" not in capfd.readouterr().err
+    assert "deferred server diagnostic" in capfd.readouterr().err
 
 
 def test_closed_stderr_capture_does_not_block_the_server(monkeypatch):

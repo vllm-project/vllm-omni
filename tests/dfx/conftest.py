@@ -24,11 +24,35 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
 
 BASELINE_REGRESSION_TOLERANCE = 0.10
+BENCHMARK_RESULT_PATH_KEY = "_vllm_omni_benchmark_result_path"
 
 # Substrings, not a closed metric list. ``throughput_qps`` matches the higher
 # group only; ``mean_audio_rtf`` and ``peak_memory_mb_mean`` match the lower group.
 _LOWER_IS_BETTER_TOKENS = ("latency", "ttft", "tpot", "itl", "e2el", "ttfp", "ttfc", "interval", "rtf", "memory")
 _HIGHER_IS_BETTER_TOKENS = ("throughput", "qps", "fps")
+
+
+class PerformanceBaselineRegressionError(AssertionError):
+    """One or more measured metrics exceeded their configured envelope."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_metrics: set[str] | frozenset[str] = frozenset(),
+        threshold_metrics: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
+        super().__init__(message)
+        self.failed_metrics = frozenset(failed_metrics)
+        self.threshold_metrics = frozenset(threshold_metrics)
+
+
+class BenchmarkResult(dict[str, Any]):
+    """Benchmark metrics with an out-of-band path to their persisted JSON."""
+
+    def __init__(self, metrics: Mapping[str, Any], *, result_path: Path) -> None:
+        super().__init__(metrics)
+        self.result_path = result_path
 
 
 def metric_lower_is_better(name: str) -> bool:
@@ -119,27 +143,35 @@ def assert_baseline_within_tolerance(
         flush=True,
     )
     failures: list[str] = []
+    failed_metrics: set[str] = set()
+    threshold_metrics: set[str] = set()
     for name, expected in bucket.items():
         if isinstance(expected, (list, tuple)):
             failures.append(f"{name}: baseline is still a sweep list; resolve the sweep step before comparing")
+            failed_metrics.add(str(name))
             continue
         if not _is_finite_number(expected):
             failures.append(f"{name}: baseline {expected!r} is not a finite number")
+            failed_metrics.add(str(name))
             continue
         if expected < 0:
             failures.append(f"{name}: negative baseline {expected} is not supported")
+            failed_metrics.add(str(name))
             continue
         actual = measured.get(name)
         if not _is_finite_number(actual):
             failures.append(f"{name}: measured value {actual!r} is not a finite number")
+            failed_metrics.add(str(name))
             continue
         if actual < 0:
             failures.append(f"{name}: negative measured value {actual} is not supported")
+            failed_metrics.add(str(name))
             continue
         try:
             lower_is_better = metric_lower_is_better(str(name))
         except ValueError as exc:
             failures.append(str(exc))
+            failed_metrics.add(str(name))
             continue
         ratio = _worse_ratio(float(actual), float(expected), lower_is_better=lower_is_better)
         regressed = _regressed(ratio, tolerance)
@@ -160,9 +192,15 @@ def assert_baseline_within_tolerance(
             f"{name}: measured {actual} is more than {tolerance:.0%} {direction} "
             f"baseline {expected} on {hardware} (limit {limit})"
         )
+        failed_metrics.add(str(name))
+        threshold_metrics.add(str(name))
     if failures:
         logging.getLogger(__name__).error("[baseline-check] FAIL hardware=%s: %s", hardware, "; ".join(failures))
-        raise AssertionError("performance baseline regression:\n" + "\n".join(failures))
+        raise PerformanceBaselineRegressionError(
+            "performance baseline regression:\n" + "\n".join(failures),
+            failed_metrics=failed_metrics,
+            threshold_metrics=threshold_metrics,
+        )
     print(f"[baseline-check] PASS hardware={hardware}: all {len(bucket)} metrics passed", flush=True)
 
 
@@ -934,6 +972,7 @@ def run_benchmark(
     resource_label: str | None = None,
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
+    result_filename_suffix: str | None = None,
     accuracy_baseline: dict[str, Any] | None = None,
     check_duplex_eval_exit_code: bool = True,
     result_transform: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
@@ -949,7 +988,8 @@ def run_benchmark(
     ``benchmark_params_name`` (the ``name`` field from ``benchmark_params``) is
     persisted in the result JSON and filename so multiple generation configs
     under one ``test_name`` stay distinguishable (e.g. Wan USP2 832x480 vs
-    1280x720).
+    1280x720). ``result_filename_suffix`` distinguishes internal repeated runs,
+    such as baseline-confirmation attempts, until the caller consolidates them.
     """
     started_at = datetime.now()
     current_dt = started_at.strftime("%Y%m%d-%H%M%S")
@@ -959,11 +999,16 @@ def run_benchmark(
     name_token = _safe_filename_token(benchmark_params_name) if benchmark_params_name else ""
     if name_token == "na":
         name_token = ""
+    suffix_token = _safe_filename_token(result_filename_suffix) if result_filename_suffix else ""
+    if suffix_token == "na":
+        suffix_token = ""
     name_parts = [f"result_{test_name}"]
     if hw:
         name_parts.append(hw)
     if name_token:
         name_parts.append(name_token)
+    if suffix_token:
+        name_parts.append(suffix_token)
     name_parts.extend(
         [
             str(dataset_name),
@@ -1126,7 +1171,7 @@ def run_benchmark(
             benchmark_params_name=benchmark_params_name,
             accuracy_baseline=accuracy_baseline,
         )
-    return result
+    return BenchmarkResult(result, result_path=Path(result_path).resolve())
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

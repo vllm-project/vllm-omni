@@ -24,6 +24,18 @@ class ServerEndpoint:
     judge_base_url: str | None = None
 
 
+@dataclass(frozen=True)
+class PytestOptions:
+    """Typed option reader for direct benchmark-runner unit tests."""
+
+    assert_baseline: bool = True
+    require_baseline: bool = False
+    require_duplex_eval_score_floors: bool = False
+
+    def getoption(self, name: str) -> bool:
+        return bool(getattr(self, name))
+
+
 def test_request_failure_assertion_shows_the_underlying_error():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -908,6 +920,323 @@ def test_num_warmups_resolves_each_sweep_point():
     ] == [1, 8, 16]
 
 
+def test_perf_sweep_collects_all_baseline_regressions(monkeypatch, pytestconfig):
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_collect_baselines",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs["flow"])
+        return {"completed": kwargs["num_prompt"], "flow": kwargs["flow"]}
+
+    def assert_regression(result, _params, _num_prompt, *, check_baseline=False, require_baseline=False):
+        raise PerformanceBaselineRegressionError(f"performance baseline regression:\nflow={result['flow']}")
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", assert_regression)
+    case = {
+        "test_name": config["test_name"],
+        "params": {"num_prompts": [2, 4], "max_concurrency": [1, 4]},
+    }
+
+    with pytest.raises(PerformanceBaselineRegressionError) as exc_info:
+        run_benchmark.test_performance_benchmark(
+            ServerEndpoint(model="test-model"),
+            case,
+            pytestconfig=pytestconfig,
+        )
+
+    assert calls == [1, 4]
+    message = str(exc_info.value)
+    assert "across 2 sweep(s)" in message
+    assert "max_concurrency=1 num_prompts=2" in message
+    assert "max_concurrency=4 num_prompts=4" in message
+
+
+@pytest.mark.parametrize(
+    "ttfp_values,passes",
+    [
+        ([167.096, 141.569, 151.8997], True),
+        ([167.096, 155.2, 156.0], False),
+    ],
+)
+def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_values, passes):
+    from tests.dfx.conftest import BENCHMARK_RESULT_PATH_KEY, PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_confirm_h100_ttfp",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+    results = [
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": value,
+            "mean_audio_ttfp_ms": value,
+            "request_throughput": 1.0,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 129.2319,
+                    "mean_audio_ttfp_ms": 129.2319,
+                    "request_throughput": 1.0,
+                }
+            },
+        }
+        for value in ttfp_values
+    ]
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        result = dict(results[len(calls) - 1])
+        result_path = tmp_path / f"attempt-{len(calls)}.json"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        result[BENCHMARK_RESULT_PATH_KEY] = str(result_path)
+        return result
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                    "tolerance": 0.20,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [129.2319],
+                    "mean_audio_ttfp_ms": [129.2319],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = PytestOptions()
+
+    if passes:
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+    else:
+        with pytest.raises(PerformanceBaselineRegressionError, match="confirmed_median_of=3"):
+            run_benchmark.test_performance_benchmark(
+                ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig
+            )
+
+    assert len(calls) == 3
+    assert all("--baseline-confirmation" not in call["args"] for call in calls)
+    assert [call.get("result_filename_suffix") for call in calls] == [None, "confirmation-2", "confirmation-3"]
+    result_paths = list(tmp_path.glob("attempt-*.json"))
+    assert result_paths == [tmp_path / "attempt-1.json"]
+    persisted = json.loads(result_paths[0].read_text(encoding="utf-8"))
+    assert BENCHMARK_RESULT_PATH_KEY not in persisted
+    assert persisted["median_audio_ttfp_ms"] == sorted(ttfp_values)[1]
+    assert persisted["mean_audio_ttfp_ms"] == sorted(ttfp_values)[1]
+    assert persisted["baseline_confirmation_result"] == {
+        "status": "passed" if passes else "failed",
+        "attempts_completed": 3,
+        "attempts_configured": 3,
+        "tolerance": 0.20,
+        "metrics": {
+            "mean_audio_ttfp_ms": {"values": ttfp_values, "median": sorted(ttfp_values)[1]},
+            "median_audio_ttfp_ms": {"values": ttfp_values, "median": sorted(ttfp_values)[1]},
+        },
+    }
+
+
+def test_h100_confirmation_tolerance_resolves_per_sweep():
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts.run_benchmark import _baseline_confirmation_policy
+
+    params = {
+        "baseline_confirmation": {
+            "H100": {
+                "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                "attempts": 3,
+                "tolerance": [0.10, 0.10, 0.20],
+            }
+        }
+    }
+    result = {"Hardware": "H100"}
+    regression = PerformanceBaselineRegressionError(
+        "TTFP regression",
+        failed_metrics={"median_audio_ttfp_ms"},
+        threshold_metrics={"median_audio_ttfp_ms"},
+    )
+
+    policies = [
+        _baseline_confirmation_policy(params, result, regression, sweep_index=index, sweep_size=3) for index in range(3)
+    ]
+
+    assert [policy[2] for policy in policies if policy is not None] == [0.10, 0.10, 0.20]
+
+
+def test_perf_sweep_does_not_retry_a_hard_throughput_regression(monkeypatch):
+    from tests.dfx.conftest import PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_hard_h100_regression",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 120.0,
+            "mean_audio_ttfp_ms": 120.0,
+            "request_throughput": 0.8,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        }
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                    "tolerance": 0.20,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [100.0],
+                    "mean_audio_ttfp_ms": [100.0],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = PytestOptions()
+
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+
+    assert len(calls) == 1
+
+
+def test_perf_sweep_consolidates_confirmation_aborted_by_hard_retry(monkeypatch, tmp_path):
+    from tests.dfx.conftest import BENCHMARK_RESULT_PATH_KEY, PerformanceBaselineRegressionError
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config = {
+        "test_name": "test_confirmation_hard_retry_regression",
+        "server_params": {"model": "test-model"},
+        "benchmark_params": [],
+    }
+    calls = []
+    results = [
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 120.0,
+            "mean_audio_ttfp_ms": 120.0,
+            "request_throughput": 1.0,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        },
+        {
+            "completed": 4,
+            "Hardware": "H100",
+            "median_audio_ttfp_ms": 105.0,
+            "mean_audio_ttfp_ms": 105.0,
+            "request_throughput": 0.8,
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": 100.0,
+                    "mean_audio_ttfp_ms": 100.0,
+                    "request_throughput": 1.0,
+                }
+            },
+        },
+    ]
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        result = dict(results[len(calls) - 1])
+        result_path = tmp_path / f"attempt-{len(calls)}.json"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        result[BENCHMARK_RESULT_PATH_KEY] = str(result_path)
+        return result
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    case = {
+        "test_name": config["test_name"],
+        "params": {
+            "num_prompts": [4],
+            "max_concurrency": [64],
+            "baseline_confirmation": {
+                "H100": {
+                    "metrics": ["median_audio_ttfp_ms", "mean_audio_ttfp_ms"],
+                    "attempts": 3,
+                    "tolerance": 0.20,
+                }
+            },
+            "baseline": {
+                "H100": {
+                    "median_audio_ttfp_ms": [100.0],
+                    "mean_audio_ttfp_ms": [100.0],
+                    "request_throughput": [1.0],
+                }
+            },
+        },
+    }
+    pytestconfig = PytestOptions()
+
+    with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
+        run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
+
+    assert [call.get("result_filename_suffix") for call in calls] == [None, "confirmation-2"]
+    result_paths = list(tmp_path.glob("attempt-*.json"))
+    assert result_paths == [tmp_path / "attempt-1.json"]
+    persisted = json.loads(result_paths[0].read_text(encoding="utf-8"))
+    assert persisted["request_throughput"] == 0.8
+    assert persisted["baseline_confirmation_result"] == {
+        "status": "aborted_hard_regression",
+        "attempts_completed": 2,
+        "attempts_configured": 3,
+        "tolerance": 0.20,
+        "metrics": {
+            "mean_audio_ttfp_ms": {"values": [120.0, 105.0], "median": 112.5},
+            "median_audio_ttfp_ms": {"values": [120.0, 105.0], "median": 112.5},
+        },
+    }
+
+
 @pytest.mark.parametrize(
     "warmups,message",
     [
@@ -1211,6 +1540,7 @@ def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_ind
     @contextmanager
     def server(model, args, **kwargs):
         assert kwargs["wait_for_device_memory"] is False
+        assert kwargs["defer_stderr"] is True
         seen.append(kwargs["env_dict"])
 
         class Endpoint:
@@ -1227,6 +1557,26 @@ def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_ind
     assert __import__("os").environ[device_env] == devices
     with pytest.raises(ValueError, match="outside"):
         runner._resolve_judge_visible_devices(str(len(devices.split(","))), device_env)
+
+
+def test_performance_server_defers_stderr_replay(monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    seen = []
+
+    @contextmanager
+    def server(model, args, **kwargs):
+        seen.append(kwargs)
+        yield ServerEndpoint(model=model)
+
+    monkeypatch.setattr(runner, "OmniServer", server)
+    monkeypatch.setattr(runner, "_resolve_offline_model", lambda model, revision=None: model)
+    monkeypatch.setattr(runner, "_judge_server_params_for_test", lambda test_name: None)
+    monkeypatch.setattr(runner, "_omni_server_env", lambda: {})
+    with runner._start_omni_server(("perf-case", "model", None, None, (), False)):
+        pass
+    assert len(seen) == 1
+    assert seen[0]["defer_stderr"] is True
 
 
 def test_omniinteract_result_rejects_incomplete_artifacts():
@@ -2265,6 +2615,32 @@ def test_inline_deploy_modifications_require_a_deploy_path(tmp_path, field):
     config = {"test_name": "missing-deploy", "server_params": {"model": "mock", field: {"async_chunk": True}}}
     with pytest.raises(ValueError, match="requires stage_config_name or --deploy-config"):
         _create_unique_server_params([config], tmp_path)
+
+
+def test_qwen3_omni_async_perf_uses_default_deploy_and_preserves_cold_start_timeout():
+    from tests.dfx.conftest import _create_unique_server_params
+    from tests.dfx.perf.scripts.run_benchmark import (
+        DEPLOY_CONFIGS_DIR,
+        _cli_flag_value,
+        _merge_omni_default_server_args,
+    )
+
+    config_path = Path(__file__).with_name("test_qwen3_omni_async_chunk.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))[0]
+    deploy_dir = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
+    assert DEPLOY_CONFIGS_DIR == deploy_dir
+
+    row = _create_unique_server_params([config], DEPLOY_CONFIGS_DIR)[0]
+    assert row[2] is None
+
+    extra_cli_args = list(row[4])
+    effective_args = extra_cli_args + _merge_omni_default_server_args(
+        extra_cli_args,
+        use_omni=row[5],
+    )
+    assert effective_args.count("--stage-init-timeout") == 1
+    assert _cli_flag_value(effective_args, "--stage-init-timeout") == "900"
+    assert _cli_flag_value(effective_args, "--init-timeout") == "900"
 
 
 @pytest.mark.parametrize("extra", [("--revision", "a" * 40), (f"--revision={'a' * 40}",), ()])
