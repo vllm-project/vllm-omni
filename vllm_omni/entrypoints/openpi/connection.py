@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """WebSocket connection for robot policy inference (OpenPI protocol).
 
@@ -8,32 +8,17 @@ Protocol (compatible with OpenPI policy clients):
     Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
     Reset    -> client sends msgpack({endpoint:reset}), server sends msgpack(status)
 
-NumPy values use msgpack-numpy marker mappings. Outbound payloads follow the
-openpi-client format so official OpenPI clients can decode action responses:
-    ndarray -> {__ndarray__: true, dtype, shape, data}
-    scalar  -> {__npgeneric__: true, dtype, data}
-
-Inbound payloads accept both the openpi-client markers above and the legacy
-vLLM-native markers:
-    ndarray -> {nd: true, type, kind, shape, data}
-    scalar  -> {nd: false, type, kind, data}
-
-`kind` is required on the `nd` markers because it is what separates them from a
-plain user mapping, but its value is dialect-specific: the vLLM-native markers
-carry the dtype kind character while the `msgpack-numpy` package leaves it empty
-for plain dtypes and sets "V" for structured ones. Both spellings are accepted.
-Scalars packed by `msgpack-numpy` omit `kind` entirely and are therefore left as
-mappings.
+NumPy serialization is shared in ``vllm_omni.protocol.numpy_msgpack``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections import OrderedDict
+from collections.abc import Awaitable
 from typing import Any
 
-import msgspec
-import numpy as np
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 from vllm.logger import init_logger
@@ -41,124 +26,29 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openpi.serving import (
     ServingRealtimeRobotOpenPI,
 )
+from vllm_omni.protocol.numpy_msgpack import pack as _pack
+from vllm_omni.protocol.numpy_msgpack import unpack as _unpack
 
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
-MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
-_MISSING = object()
 # Upper bound on the per-connection set of seen session ids.
 MAX_TRACKED_SESSIONS = 1024
 
 
-def _pack_numpy(obj: Any) -> Any:
-    if isinstance(obj, np.ndarray | np.generic) and obj.dtype.kind in ("V", "O", "c"):
-        raise ValueError(f"Unsupported dtype: {obj.dtype}")
-    if isinstance(obj, np.ndarray):
-        if not obj.flags.c_contiguous:
-            obj = np.ascontiguousarray(obj)
-        return {
-            b"__ndarray__": True,
-            b"data": obj.tobytes(),
-            b"dtype": obj.dtype.str,
-            b"shape": obj.shape,
-        }
-    if isinstance(obj, np.generic):
-        return {
-            b"__npgeneric__": True,
-            b"data": obj.item(),
-            b"dtype": obj.dtype.str,
-        }
-    raise TypeError(f"Unsupported type: {type(obj)!r}")
-
-
-def _mapping_get(obj: dict[Any, Any], key: str, default: Any = None) -> Any:
-    return obj.get(key, obj.get(key.encode(), default))
-
-
-def _decode_marker_text(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode()
-    return str(value)
-
-
-def _is_truthy_marker(value: Any) -> bool:
-    return value is True or value == 1
-
-
-def _decode_vllm_numpy_marker(obj: dict[Any, Any]) -> Any:
-    nd = _mapping_get(obj, "nd", _MISSING)
-    dtype = _mapping_get(obj, "type", _MISSING)
-    kind = _mapping_get(obj, "kind", _MISSING)
-    data = _mapping_get(obj, "data", _MISSING)
-    if nd is _MISSING or dtype is _MISSING or kind is _MISSING or data is _MISSING:
-        return _MISSING
-
-    kind_text = _decode_marker_text(kind)
-    # Structured markers carry a dtype descriptor list in `type`, so reject them
-    # before `np.dtype()` sees something it cannot parse.
-    if kind_text == "V":
-        raise ValueError("Unsupported dtype: structured arrays")
-
-    dtype_obj = np.dtype(_decode_marker_text(dtype))
-    if kind_text not in ("", dtype_obj.kind):
-        raise ValueError(f"NumPy dtype marker kind mismatch: {dtype_obj.kind!r} != {kind_text!r}")
-    if dtype_obj.kind in ("V", "O", "c"):
-        raise ValueError(f"Unsupported dtype: {dtype_obj}")
-
-    array = np.frombuffer(data, dtype=dtype_obj).copy()
-    if nd:
-        shape = _mapping_get(obj, "shape", _MISSING)
-        if shape is _MISSING:
-            raise ValueError("NumPy ndarray marker is missing shape")
-        return array.reshape(tuple(shape))
-    return array[0]
-
-
-def _decode_openpi_numpy_marker(obj: dict[Any, Any]) -> Any:
-    if _is_truthy_marker(_mapping_get(obj, "__ndarray__", False)):
-        data = _mapping_get(obj, "data", _MISSING)
-        dtype = _mapping_get(obj, "dtype", _MISSING)
-        shape = _mapping_get(obj, "shape", _MISSING)
-        if data is _MISSING or dtype is _MISSING or shape is _MISSING:
-            raise ValueError("OpenPI ndarray marker is missing required fields")
-
-        dtype_obj = np.dtype(_decode_marker_text(dtype))
-        if dtype_obj.kind in ("V", "O", "c"):
-            raise ValueError(f"Unsupported dtype: {dtype_obj}")
-        array = np.frombuffer(data, dtype=dtype_obj).copy()
-        return array.reshape(tuple(shape))
-
-    if _is_truthy_marker(_mapping_get(obj, "__npgeneric__", False)):
-        data = _mapping_get(obj, "data", _MISSING)
-        dtype = _mapping_get(obj, "dtype", _MISSING)
-        if data is _MISSING or dtype is _MISSING:
-            raise ValueError("OpenPI scalar marker is missing required fields")
-        dtype_obj = np.dtype(_decode_marker_text(dtype))
-        if dtype_obj.kind in ("V", "O", "c"):
-            raise ValueError(f"Unsupported dtype: {dtype_obj}")
-        return dtype_obj.type(data)
-
-    return _MISSING
-
-
-def _unpack_numpy(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        for decoder in (_decode_vllm_numpy_marker, _decode_openpi_numpy_marker):
-            decoded = decoder(obj)
-            if decoded is not _MISSING:
-                return decoded
-        return {key: _unpack_numpy(value) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [_unpack_numpy(value) for value in obj]
-    return obj
-
-
-def _pack(obj: Any) -> bytes:
-    return msgspec.msgpack.encode(obj, enc_hook=_pack_numpy)
-
-
-def _unpack(data: bytes) -> Any:
-    return _unpack_numpy(msgspec.msgpack.decode(data))
+async def await_policy(operation: Awaitable[Any], receive: asyncio.Task, websocket: WebSocket) -> Any:
+    """Cancel in-flight policy work when the peer closes its socket."""
+    work = asyncio.ensure_future(operation)
+    try:
+        done, _ = await asyncio.wait((work, receive), return_when=asyncio.FIRST_COMPLETED)
+        if work not in done:
+            # A failed receive is a transport error: treat it as a disconnect rather than an inference error.
+            if receive.exception() is None and receive.result()["type"] != "websocket.disconnect":
+                await websocket.close(code=1008, reason="Wait for the policy reply before sending another request")
+            raise WebSocketDisconnect()
+        return await work
+    finally:
+        work.cancel()
+        await asyncio.gather(work, return_exceptions=True)
 
 
 class RobotRealtimeConnection:
@@ -173,6 +63,7 @@ class RobotRealtimeConnection:
         self.websocket = websocket
         self.serving = serving
         self._idle_timeout = idle_timeout
+        self._session_prefix = "openpi-" + uuid.uuid4().hex + ":"
         self._current_session_id: str | None = None
         # Session ids seen on this connection, most-recently-used last.
         self._seen_sessions: OrderedDict[str, None] = OrderedDict()
@@ -181,7 +72,7 @@ class RobotRealtimeConnection:
         self._current_session_id = None
         self._seen_sessions.clear()
 
-    def _mark_session_seen(self, session_id: str) -> bool:
+    async def _mark_session_seen(self, session_id: str) -> bool:
         """Record ``session_id``; return True when it is the first sighting.
 
         A session's first observation is the one that carries ``reset`` to the
@@ -194,6 +85,7 @@ class RobotRealtimeConnection:
         self._seen_sessions[session_id] = None
         if len(self._seen_sessions) > MAX_TRACKED_SESSIONS:
             evicted, _ = self._seen_sessions.popitem(last=False)
+            await self.serving.close_sessions([evicted])
             logger.debug(
                 "Robot OpenPI connection is tracking more than %d sessions; dropped least-recently-used %s",
                 MAX_TRACKED_SESSIONS,
@@ -205,8 +97,6 @@ class RobotRealtimeConnection:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
 
     def _unpack_request(self, data: bytes) -> dict[str, Any]:
-        if len(data) > MAX_OPENPI_PAYLOAD_BYTES:
-            raise ValueError("OpenPI request payload too large")
         obs = _unpack(data)
         if not isinstance(obs, dict):
             raise ValueError("Invalid request payload")
@@ -215,21 +105,27 @@ class RobotRealtimeConnection:
     async def handle_connection(self) -> None:
         """Main loop for OpenPI-compatible policy serving."""
         await self.websocket.accept()
+        receive: asyncio.Task | None = None
 
         try:
             # Send model-specific PolicyServerConfig resolved by serving from
             # diffusion od_config.model_config.
             metadata = self.serving.policy_server_config.to_dict()
+            if metadata.get("supports_close_session") and not self.serving.has_single_worker():
+                await self._send_error("Robot sessions require one stage and one worker replica")
+                await self.websocket.close()
+                return
             await self.websocket.send_bytes(_pack(metadata))
 
+            receive = asyncio.create_task(self.websocket.receive())
             while True:
                 idle_timeout = self._idle_timeout
                 if idle_timeout is None:
-                    msg = await self.websocket.receive()
+                    msg = await receive
                 else:
                     try:
                         msg = await asyncio.wait_for(
-                            self.websocket.receive(),
+                            asyncio.shield(receive),
                             timeout=idle_timeout,
                         )
                     except asyncio.TimeoutError:
@@ -243,11 +139,12 @@ class RobotRealtimeConnection:
                 if msg.get("type") == "websocket.disconnect":
                     break
 
+                receive = asyncio.create_task(self.websocket.receive())
                 if "bytes" not in msg or not msg["bytes"]:
                     continue
 
                 try:
-                    obs = self._unpack_request(msg["bytes"])
+                    obs = await asyncio.to_thread(self._unpack_request, msg["bytes"])
                 except Exception:
                     logger.exception("Invalid robot OpenPI request payload")
                     try:
@@ -260,11 +157,19 @@ class RobotRealtimeConnection:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
+                        await self.serving.close_sessions(list(self._seen_sessions))
                         self.reset()
                         self.serving.reset(obs)
                         await self.websocket.send_bytes(_pack({"status": "reset successful"}))
                     else:
-                        session_id = str(obs.get("session_id") or self._current_session_id or "default")
+                        # Client ids are namespaced per connection, so a client that sends none
+                        # still gets a connection-private "default" episode.
+                        raw_id = obs.get("session_id")
+                        session_id = (
+                            (self._session_prefix + str(raw_id))
+                            if raw_id
+                            else (self._current_session_id or self._session_prefix + "default")
+                        )
                         if session_id != self._current_session_id:
                             if self._current_session_id is not None:
                                 logger.info(
@@ -274,13 +179,13 @@ class RobotRealtimeConnection:
                                 )
                             self._current_session_id = session_id
 
-                        reset = self._mark_session_seen(session_id)
-                        actions = await self.serving.infer(
-                            obs,
-                            session_id=session_id,
-                            reset=reset,
+                        reset = await self._mark_session_seen(session_id)
+                        actions = await await_policy(
+                            self.serving.infer(obs, session_id=session_id, reset=reset), receive, self.websocket
                         )
                         await self.websocket.send_bytes(_pack(actions))
+                except WebSocketDisconnect:
+                    break
                 except Exception:
                     logger.exception("Error handling request")
                     try:
@@ -292,3 +197,9 @@ class RobotRealtimeConnection:
             pass
         except Exception:
             logger.exception("Connection error")
+        finally:
+            if receive is not None:
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
+            await self.serving.close_sessions(list(self._seen_sessions))
+            self.reset()

@@ -52,6 +52,8 @@ def _engine_with_policy_config(policy_config=None):
 
 
 class RecordingEngine:
+    stage_configs: list = []
+
     def __init__(self):
         self.od_config = SimpleNamespace(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
         self.generate_calls = []
@@ -416,7 +418,7 @@ def test_infer_yields_event_loop_while_engine_is_running():
     assert asyncio.run(run_test()) >= 2
 
 
-def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
+def test_two_websocket_clients_with_identical_session_ids_are_isolated(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", _json_pack)
     monkeypatch.setattr(openpi_connection, "_unpack", _json_unpack)
 
@@ -435,7 +437,7 @@ def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
                 metadata = _json_unpack(websocket.receive_bytes())
                 assert metadata["needs_session_id"] is True
 
-                websocket.send_bytes(_json_pack({"prompt": prompt}))
+                websocket.send_bytes(_json_pack({"prompt": prompt, "session_id": "shared"}))
                 actions = _json_unpack(websocket.receive_bytes())
                 np.testing.assert_array_equal(
                     np.asarray(actions, dtype=np.float32),
@@ -453,11 +455,12 @@ def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
     request_ids = [call["request_id"] for call in engine.generate_calls]
     assert len(request_ids) == 2
     assert len(set(request_ids)) == 2
-    assert all(request_id.startswith("robot-default-") for request_id in request_ids)
+    assert all(request_id.startswith("robot-openpi-") for request_id in request_ids)
     assert engine.saw_overlap is True
 
     sampling_params = [call["sampling_params_list"][0] for call in engine.generate_calls]
-    assert [params.extra_args["session_id"] for params in sampling_params] == ["default", "default"]
+    ids = [params.extra_args["session_id"] for params in sampling_params]
+    assert len(set(ids)) == 2 and all(s.endswith(":shared") for s in ids)
     assert [params.extra_args["reset"] for params in sampling_params] == [True, True]
 
 
@@ -652,3 +655,63 @@ def test_drop_session_calls_dreamzero_close_hook():
     serving.drop_session("rollout-1")
 
     assert closed == ["rollout-1"]
+
+
+@pytest.mark.parametrize("ending", ["disconnect", "reset", "timeout", "failure"])
+def test_owned_sessions_release_worker_slots_across_reconnections(ending):
+    fail = ending == "failure"
+
+    class StatefulEngine(RecordingEngine):
+        def __init__(self):
+            super().__init__()
+            self.od_config.model_config["policy_server_config"] = {
+                **TEST_POLICY_SERVER_CONFIG,
+                "supports_close_session": True,
+            }
+            self.live = set()
+            self.closed = []
+
+        async def generate(self, *, prompt, request_id, sampling_params_list):
+            extra = sampling_params_list[0].extra_args
+            session_id = extra["session_id"]
+            if extra.get("close_session"):
+                self.live.discard(session_id)
+                self.closed.append(session_id)
+            else:
+                assert not self.live  # Previous socket must have released its worker slot.
+                self.live.add(session_id)
+                if fail:
+                    raise RuntimeError("inference failed after allocating state")
+            yield SimpleNamespace(multimodal_output={"actions": np.zeros((1, 13), np.float32)})
+
+    engine = StatefulEngine()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine)
+    app = FastAPI()
+
+    @app.websocket("/policy")
+    async def policy(websocket: WebSocket):
+        await openpi_connection.RobotRealtimeConnection(
+            websocket, serving, idle_timeout=0.01 if ending == "timeout" else None
+        ).handle_connection()
+
+    with TestClient(app) as client:
+        for _ in range(6):
+            with client.websocket_connect("/policy") as ws:
+                openpi_connection._unpack(ws.receive_bytes())
+                ws.send_bytes(openpi_connection._pack({"session_id": "same-client-id"}))
+                result = openpi_connection._unpack(ws.receive_bytes())
+                assert isinstance(result, dict) if fail else isinstance(result, np.ndarray)
+                if ending == "reset":
+                    ws.send_bytes(openpi_connection._pack({"endpoint": "reset"}))
+                    assert openpi_connection._unpack(ws.receive_bytes())["status"] == "reset successful"
+                elif ending == "timeout":
+                    from starlette.websockets import WebSocketDisconnect
+
+                    with pytest.raises(WebSocketDisconnect):
+                        ws.receive_bytes()
+            assert not engine.live
+    assert len(set(engine.closed)) == 6
+
+
+def test_single_worker_requires_resolved_topology():
+    assert not openpi_serving.ServingRealtimeRobotOpenPI(_engine_with_policy_config()).has_single_worker()
