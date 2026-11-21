@@ -1531,6 +1531,25 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
 
 
+@pytest.mark.parametrize(
+    "path,run_level",
+    [(CUDA_READY_YAML, "core_model"), (Path(".buildkite/cuda/test-merge.yml"), "advanced_model")],
+)
+def test_lingbot_world_replaces_cuda_ready_and_merge_video_gate(monkeypatch, path, run_level):
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), changed_files=None, pipeline_path=path)
+    steps = [step for step in _iter_steps(rendered) if "LingBot" in step.get("label", "")]
+
+    assert [step["label"] for step in steps] == ["Diffusion · LingBot-World Test"]
+    assert steps[0]["agents"]["queue"] == "mithril-h100-pool"
+    assert any(
+        "tests/e2e/offline_inference/test_lingbot_world_v2.py" in command
+        and f"{run_level} and cuda and diffusion" in command
+        and f"--run-level '{run_level}'" in command
+        for command in steps[0]["commands"]
+    )
+
+
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
 @pytest.mark.parametrize(
     "changed_path,roles",
