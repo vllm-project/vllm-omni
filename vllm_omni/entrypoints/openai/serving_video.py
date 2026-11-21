@@ -322,6 +322,12 @@ class OmniOpenAIServingVideo:
         return any(item.supports_latent_continuation for item in metadata)
 
     @property
+    def preencode_mp4_by_default(self) -> bool:
+        """Return whether complete-MP4 requests should encode the MP4 on the worker unless they opt out."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.preencode_mp4_by_default for item in metadata)
+
+    @property
     def is_minimax_h3(self) -> bool:
         config = self._resolve_diffusion_od_config()
         architectures = set(self._get_model_architectures(config))
@@ -628,6 +634,9 @@ class OmniOpenAIServingVideo:
             # Server-owned: the job id is the only key a later continue_from can name.
             # A regenerate job is refined at 2K, off the base canvas, and is never cached.
             gen_params.extra_args["latent_cache_key"] = reference_id
+
+        if self.preencode_mp4_by_default:
+            gen_params.extra_args.setdefault("preencode_mp4", True)
 
         self._apply_lora(request.lora, gen_params)
 

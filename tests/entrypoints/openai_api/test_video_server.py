@@ -1594,6 +1594,34 @@ def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixt
     assert "latent_cache_key" not in engine.captured_sampling_params_list[0].extra_args
 
 
+@pytest.mark.parametrize(
+    ("model_class_name", "extra_params", "expected"),
+    [
+        ("MiniMaxH3Pipeline", None, True),
+        ("MiniMaxH3Pipeline", {"preencode_mp4": False}, False),
+        (None, None, None),
+    ],
+)
+def test_complete_mp4_requests_preencode_by_model_default(
+    test_client, mocker: MockerFixture, model_class_name, extra_params, expected
+):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    if model_class_name is not None:
+        engine.model_class_name = model_class_name
+    data = {"prompt": "A red fox in fresh snow."}
+    if extra_params is not None:
+        data["extra_params"] = json.dumps(extra_params)
+
+    response = test_client.post("/v1/videos/sync", data=data)
+
+    assert response.status_code == 200
+    assert engine.captured_sampling_params_list[0].extra_args.get("preencode_mp4") is expected
+
+
 def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
     response = test_client.post(
         "/v1/videos/sync",
