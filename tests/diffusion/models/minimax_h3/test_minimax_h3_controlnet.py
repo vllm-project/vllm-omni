@@ -604,10 +604,20 @@ def test_control_mask_threshold_resize_threshold_boundary(tmp_path, static):
     assert set(actual.flatten().tolist()) == {0.0, 1.0}
 
 
-@pytest.mark.parametrize("degree", ["ulysses_degree", "ring_degree", "allgather_degree"])
-def test_control_rejects_sequence_parallel_before_weight_loading(control_startup, degree):
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"ulysses_degree": 2},
+        {"ring_degree": 2},
+        {"allgather_degree": 2},
+        {"use_hsdp": True, "hsdp_weight_load_strategy": "pre_sharded"},
+    ],
+    ids=["ulysses", "ring", "allgather", "pre_sharded_hsdp"],
+)
+def test_control_rejects_sequence_parallel_or_hsdp_before_weight_loading(control_startup, overrides):
     pipeline_module, config = control_startup
-    setattr(config.parallel_config, degree, 2)
+    for key, value in overrides.items():
+        setattr(config if key == "hsdp_weight_load_strategy" else config.parallel_config, key, value)
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
         with pytest.raises(ValueError, match="no cache/offload/SP"):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)

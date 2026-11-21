@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -796,6 +796,10 @@ class MiniMaxH3DiTBlock(nn.Module):
             prefix=f"{prefix}.adaln_proj",
             adaln_cache=adaln_cache,
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load this block from block-relative names via the owning ``MiniMaxH3DiTModel``."""
+        return self._h3_dit_owner().load_block_weights(self.layer_index, weights)
 
     def forward(
         self,
