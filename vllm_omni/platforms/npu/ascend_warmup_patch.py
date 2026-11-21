@@ -160,16 +160,46 @@ def _apply_contiguous_kv_patch() -> None:
     intact. Gated on the K-step config so any other worker (stage 0,
     non-speculative deployments) keeps its stock layout choice.
     """
-    try:
-        import importlib
+    import importlib
 
-        runner_module = importlib.import_module("vllm_ascend.worker.v1.model_runner")
-    except Exception as error:  # pragma: no cover - non-ascend builds
-        logger.warning("[npu] contiguous KV patch not applied: %s", error)
+    # vllm-ascend moved this module (``worker.model_runner_v1`` ->
+    # ``worker.v1.model_runner``) in its vLLM 0.33 alignment. Try both so a bump
+    # on either side does not silently disable the patch, and report at error
+    # level when neither binds: the strided layout costs the one-query FIA graph
+    # on every frame, and a warning that scrolls past is easy to miss.
+    import_errors: list[str] = []
+    runner_module = None
+    for candidate in (
+        # The transplant lands on a *consumer module's* from-import binding, so the
+        # target tracks the runner generation: v1's model runner, the pre-0.33
+        # legacy name, and v2's attention utils (verified in the nightly images:
+        # nightly-main ships only the v2 consumer, 0.32.0rc-a3 ships v1 + v2).
+        "vllm_ascend.worker.v1.model_runner",
+        "vllm_ascend.worker.model_runner_v1",
+        "vllm_ascend.worker.v2.attn_utils",
+    ):
+        try:
+            module = importlib.import_module(candidate)
+        except Exception as error:  # pragma: no cover - non-ascend builds
+            import_errors.append(f"{candidate}: {error}")
+            continue
+        if not hasattr(module, "requires_contiguous_pa_kv_cache"):
+            import_errors.append(f"{candidate}: no requires_contiguous_pa_kv_cache")
+            continue
+        runner_module = module
+        break
+
+    if runner_module is None:
+        logger.error(
+            "[npu] contiguous KV patch NOT applied: no vllm-ascend consumer module exposes "
+            "requires_contiguous_pa_kv_cache (%s). The KV cache stays strided, and the one-query "
+            "FIA graph pays for the stride indirection on every frame.",
+            "; ".join(import_errors),
+        )
         return
 
-    original = getattr(runner_module, "requires_contiguous_pa_kv_cache", None)
-    if original is None or getattr(original, "_vllm_omni_contiguous", False):
+    original = runner_module.requires_contiguous_pa_kv_cache
+    if getattr(original, "_vllm_omni_contiguous", False):
         return
 
     def _contiguous_for_kstep(layer, vllm_config, spec, *args, **kwargs):
