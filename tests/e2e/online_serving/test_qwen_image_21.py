@@ -29,13 +29,8 @@ MULTI_IMAGE_SERVER_CASES = [
     for name, extra in [("request", []), ("step-eager", ["--step-execution", "--enforce-eager"])]
 ]
 pytestmark = [
-    pytest.mark.core_model,
     pytest.mark.advanced_model,
     pytest.mark.diffusion,
-    pytest.mark.skipif(
-        not os.environ.get("QWEN_IMAGE_21_TEST_MODEL"),
-        reason="Set QWEN_IMAGE_21_TEST_MODEL to a provisioned checkpoint until public weights are available.",
-    ),
 ]
 
 
