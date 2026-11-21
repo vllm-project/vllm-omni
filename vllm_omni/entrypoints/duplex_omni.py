@@ -711,16 +711,18 @@ class DuplexOmni(AsyncOmni):
             handle._mark_closed(f"engine_dead: {error}")
         self._handles.clear()
 
-    def shutdown(self, timeout: float | None = None) -> None:
+    def _on_frontend_shutdown(self) -> None:
+        if not self.session_only:
+            super()._on_frontend_shutdown()
         for handle in list(self._handles.values()):
             handle._mark_closed("shutdown")
         self._handles.clear()
         for compensation in list(self._resume_compensations):
             compensation.cancel()
+
+    def shutdown(self, timeout: float | None = None) -> None:
         if isinstance(self.engine, ProcessDuplexEngineClient):
-            if self.final_output_task is not None:
-                self.final_output_task.cancel()
-                self.final_output_task = None
+            self._close_async_frontend()
             self.engine.shutdown(timeout)
             self._weak_finalizer.detach()
         else:

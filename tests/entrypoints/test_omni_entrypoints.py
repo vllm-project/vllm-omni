@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import janus
 import pytest
 from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
@@ -23,8 +24,8 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import StageConfig, StageType
-from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
@@ -1944,7 +1945,9 @@ async def test_async_omni_shutdown_releases_first_streaming_input(
     _patch_engine(monkeypatch, engine)
     app = AsyncOmni("dummy-model")
     input_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
     input_closed = asyncio.Event()
+    allow_cleanup = asyncio.Event()
     allow_input = asyncio.Event()
 
     async def inputs() -> AsyncGenerator[StreamingInput, None]:
@@ -1953,7 +1956,19 @@ async def test_async_omni_shutdown_releases_first_streaming_input(
             await allow_input.wait()
             yield StreamingInput(prompt={"prompt_token_ids": [1]})
         finally:
+            cleanup_started.set()
+            await allow_cleanup.wait()
             input_closed.set()
+
+    if start_input_pump:
+        # An abort ACK may arrive while the input iterator is releasing its resources.
+        abort = engine.abort_async
+
+        async def acknowledge_abort(request_ids, timeout=None):
+            await cleanup_started.wait()
+            return await abort(request_ids, timeout)
+
+        monkeypatch.setattr(engine, "abort_async", acknowledge_abort)
 
     original_add_streaming = app._add_streaming_input_request
     pumps: list[asyncio.Task] = []
@@ -1976,6 +1991,7 @@ async def test_async_omni_shutdown_releases_first_streaming_input(
 
         with pytest.raises(OmniEngineDeadError, match="shutting down"):
             await asyncio.wait_for(waiting, timeout=1)
+        allow_cleanup.set()
         assert len(pumps) == 1
         await asyncio.wait_for(asyncio.gather(*pumps, return_exceptions=True), timeout=1)
         assert input_started.is_set() is start_input_pump
@@ -1985,8 +2001,9 @@ async def test_async_omni_shutdown_releases_first_streaming_input(
         assert not app.request_states
         assert app.final_output_task is None
     finally:
+        allow_cleanup.set()
         waiting.cancel()
-        await asyncio.gather(waiting, return_exceptions=True)
+        await asyncio.gather(waiting, *pumps, return_exceptions=True)
         app.shutdown()
 
 
@@ -2087,4 +2104,44 @@ async def test_async_omni_executor_shutdown_delivers_terminal_errors_before_engi
         for stream in streams:
             stream.cancel()
         await asyncio.gather(*streams, *pending_frontend, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_executor_shutdown_with_full_downstream_stage_queue(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine()
+    stage_engine = object.__new__(AsyncOmniEngine)
+    requests = janus.Queue(maxsize=1)
+    stage_engine.request_queue = requests
+    monkeypatch.setattr(engine, "add_next_stage_input_async", stage_engine.add_next_stage_input_async, raising=False)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    stage_input = NextStageInputMessage(
+        request_id="original",
+        source_stage_id=0,
+        receiver_stage_id=1,
+        requests=[],
+        submit_kwargs=None,
+        stage_output=None,
+        prompt="hello",
+        sampling_params_list=[],
+    )
+    requests.sync_q.put_nowait(stage_input)
+    # Bound the test even if a synchronous put blocks the entire serving loop.
+    watchdog = threading.Timer(5, requests.close)
+    watchdog.start()
+    stage = asyncio.create_task(app.run_downstream_stage(stage_input, request_id="downstream"))
+    try:
+        await asyncio.sleep(0)
+        assert app.request_states and not stage.done()
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=2)
+        assert engine.shutdown_called
+        assert requests.sync_q.get_nowait() is stage_input
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(stage, timeout=2)
+        assert not app.request_states
+    finally:
+        watchdog.cancel()
+        await requests.aclose()
+        await asyncio.gather(stage, return_exceptions=True)
         app.shutdown()

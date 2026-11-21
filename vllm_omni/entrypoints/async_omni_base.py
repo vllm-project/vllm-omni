@@ -634,11 +634,15 @@ class AsyncOmniBase(OmniBase):
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.get(rid)
-            input_stream_task = getattr(state, "input_stream_task", None)
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
+            self._cancel_input_pump(getattr(state, "input_stream_task", None))
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
+
+    @staticmethod
+    def _cancel_input_pump(task: asyncio.Task | None) -> None:
+        # A second cancel interrupts async cleanup inside the input iterator.
+        if task is not None and not task.done() and not task.cancelling():  # type: ignore[attr-defined]
+            task.cancel()
 
     @staticmethod
     def _synthetic_abort_output_message(
@@ -711,6 +715,11 @@ class AsyncOmniBase(OmniBase):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine and release the frontend's request waiters."""
+        self._close_async_frontend()
+        OmniBase.shutdown(self, timeout)
+
+    def _close_async_frontend(self) -> None:
+        """Close admission and finish loop-owned cleanup before engine teardown."""
         with self._output_loop_lock:
             loop = self._output_loop
             if loop is None:
@@ -726,7 +735,6 @@ class AsyncOmniBase(OmniBase):
                 self._shutdown_frontend_from_executor(loop)
             else:
                 self._shutdown_frontend()
-        OmniBase.shutdown(self)
 
     def _shutdown_frontend_from_executor(self, loop: asyncio.AbstractEventLoop) -> None:
         """Wait for the serving loop callback before engine teardown."""
@@ -767,8 +775,7 @@ class AsyncOmniBase(OmniBase):
             first_chunk_submitted = req_state.first_chunk_submitted
             if first_chunk_submitted is not None and not first_chunk_submitted.done():
                 first_chunk_submitted.set_result(None)
-            if req_state.input_stream_task is not None:
-                req_state.input_stream_task.cancel()
+            self._cancel_input_pump(req_state.input_stream_task)
             for task in list(req_state.interaction_error_tasks):
                 task.cancel()
         if self.final_output_task is not None:

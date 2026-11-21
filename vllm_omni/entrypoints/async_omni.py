@@ -413,10 +413,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
-            # Shutdown cancels the input pump before the queued error reaches
-            # us. Let that cancellation finish the iterator's cleanup.
-            if not self._frontend_shutting_down and input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
+            self._cancel_input_pump(input_stream_task)
             if admitting:
                 await self._release_generate_admission()
             reservations = getattr(self, "_interaction_reservations", {})
