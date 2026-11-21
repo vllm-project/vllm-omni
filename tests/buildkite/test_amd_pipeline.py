@@ -19,6 +19,7 @@ import yaml
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
@@ -99,7 +100,7 @@ TINY_DIFFUSION_JOBS = (
     (
         "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
         "mi300_2",
-        12,
+        14,
         "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only",
         "artifacts/rocm-tiny-diffusion-2gpu/**/*",
     ),
@@ -702,7 +703,7 @@ _NIGHTLY_UNITS_PROMOTIONS = (
         "UNUSED_ARTIFACT_DIR",
         "bash .buildkite/amd/scripts/run-omni-processor-test.sh",
     ),
-    ("Simple · Pi0.5 CPU Test", 103, "Pi0.5 CPU", "PI05_CPU_ARTIFACT_DIR", "pytest -sv"),
+    ("Simple · Pi0.5 CPU Test", 104, "Pi0.5 CPU", "PI05_CPU_ARTIFACT_DIR", "pytest -sv"),
     (
         "Simple · PersonaPlex Temporal Streaming Test",
         3,
@@ -725,11 +726,16 @@ def test_nightly_units_promotion_execution_guard(
     pytest_status = 1 if scenario == "pytest-failure" else 124 if scenario == "timeout" else 0
     timeout_status = 124 if scenario == "timeout" else None
     tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    expected_message = f"Expected exactly {count} executed {name} tests"
+    extra_env = {"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)}
+    if label == "Simple · Pi0.5 CPU Test":
+        expected_message = "Expected every collected Pi0.5 CPU test to run and pass"
+        extra_env["PI05_CPU_COLLECTED"] = str(count)
     _assert_nightly_junit_guard(
         tmp_path,
         step_label=label,
         command_fragment=command_fragment,
-        expected_message=f"Expected exactly {count} executed {name} tests",
+        expected_message=expected_message,
         artifact_env=artifact_env,
         job_id_prefix="nightly-units-guard",
         pytest_status=pytest_status,
@@ -739,7 +745,38 @@ def test_nightly_units_promotion_execution_guard(
         errors=int(scenario == "error"),
         timeout_status=timeout_status,
         expected_status={"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5),
-        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+        extra_env=extra_env,
+    )
+
+
+def test_pi05_nightly_collection_guard_uses_the_runtime_selector_and_fails_closed(tmp_path: Path) -> None:
+    step = _find_step("Simple · Pi0.5 CPU Test", AMD_NIGHTLY_PIPELINE)
+    collect_command = next(command for command in step["commands"] if "--collect-only" in command)
+    run_command = next(command for command in step["commands"] if "pytest -sv" in command)
+    selector = "tests/diffusion/models/pi05/test_pi05_units.py -m 'core_model and cpu'"
+
+    assert selector in collect_command
+    assert selector in run_command
+    assert "grep -c '::' || true" in collect_command
+
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label="Simple · Pi0.5 CPU Test",
+        command_fragment="pytest -sv",
+        expected_message="Expected every collected Pi0.5 CPU test to run and pass",
+        artifact_env="PI05_CPU_ARTIFACT_DIR",
+        job_id_prefix="nightly-units-zero-collection",
+        pytest_status=0,
+        tests=104,
+        skipped=0,
+        failures=0,
+        errors=0,
+        timeout_status=None,
+        expected_status=5,
+        extra_env={
+            "BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path),
+            "PI05_CPU_COLLECTED": "0",
+        },
     )
 
 
@@ -1456,37 +1493,37 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
             "artifact_env": "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "expected_nodes": 14,
-            "expected_skipped": 3,
+            "expected_skipped": 0,
             "timeout": "220m",
             "collection_message": "Expected exactly 14 MiniCPM-o 4.5 reliability nodes",
-            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+            "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
-            "expected_nodes": 66,
+            "expected_nodes": 30,
             "expected_skipped": 5,
             "timeout": "75m",
-            "collection_message": "Expected exactly 66 single-GPU invalid-parameter nodes",
-            "junit_message": "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
+            "collection_message": "Expected exactly 30 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
         },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
-            "expected_nodes": 24,
+            "expected_nodes": 18,
             "expected_skipped": 0,
             "timeout": "75m",
-            "collection_message": "Expected exactly 24 invalid-parameter reliability nodes",
-            "junit_message": "Expected exactly 24 executed invalid-parameter reliability tests",
+            "collection_message": "Expected exactly 18 invalid-parameter reliability nodes",
+            "junit_message": "Expected exactly 18 executed invalid-parameter reliability tests",
         },
         "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-audio/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
-            "expected_nodes": 127,
+            "expected_nodes": 85,
             "expected_skipped": 26,
             "timeout": "105m",
-            "collection_message": "Expected exactly 127 audio invalid-parameter nodes",
-            "junit_message": "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+            "collection_message": "Expected exactly 85 audio invalid-parameter nodes",
+            "junit_message": "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         },
     }
     for label, expected in guarded_jobs.items():
@@ -1568,32 +1605,32 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
             "minicpmo-reliability-guard",
             14,
-            3,
-            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips",
+            0,
+            "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
             "invalid-parameters-single-reliability-guard",
-            66,
+            30,
             5,
-            "Expected exactly 66 single-GPU invalid-parameter tests with 5 known skips",
+            "Expected exactly 30 single-GPU invalid-parameter tests with 5 known skips",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
             "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
             "invalid-parameters-reliability-guard",
-            24,
+            18,
             0,
-            "Expected exactly 24 executed invalid-parameter reliability tests",
+            "Expected exactly 18 executed invalid-parameter reliability tests",
         ),
         (
             "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
             "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
             "invalid-parameters-audio-reliability-guard",
-            127,
+            85,
             26,
-            "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+            "Expected exactly 85 audio invalid-parameter tests with 26 known skips",
         ),
     ),
     ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
@@ -2697,37 +2734,39 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     assert '--run-level "$run_level"' in runner_text
 
 
-def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
+def test_stable_audio_cpu_offload_has_one_blocking_nightly_owner() -> None:
     label = "Stable Audio CPU Offload"
     step = _find_step(label, AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60
     assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-cpu-offload/**/*"]
     assert "retry" not in step
-    assert "env" not in step
+    assert step["env"] == {"STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK": "1"}
     _assert_build_scoped_aiter_mha_cache(
         step,
         "tests/diffusion/offloader/test_diffusion_cpu_offload.py",
         publishes=False,
     )
 
-    commands = "\n".join(step["commands"])
-    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
-    assert "VLLM_ROCM_USE_AITER" not in commands
-    assert "test_diffusion_layerwise_offload.py" not in commands
-    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
-    assert "full_model and rocm and MI325 and cards_1" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert "pytest.log" in commands
+    assert split(step["commands"][-1]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        "1",
+        "1",
+        "45m",
+        "rocm-stable-audio-cpu-offload",
+        "tests/diffusion/offloader/test_diffusion_cpu_offload.py"
+        "::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]",
+        "-m",
+        "full_model and rocm and MI325 and cards_1",
+    ]
 
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert label not in text
+        assert "STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK" not in text
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
@@ -3757,9 +3796,9 @@ def test_qwen_image_backend_similarity_executes_junit_guard_before_exit(
     )
 
 
-def test_minicpmo_duplex_function_is_one_nonblocking_nightly_job() -> None:
+def test_minicpmo_duplex_function_is_one_blocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o 4.5 Duplex Function", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
