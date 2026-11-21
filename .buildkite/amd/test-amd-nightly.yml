@@ -2348,7 +2348,7 @@ steps:
       - label: "MiniCPM-o 4.5 Duplex Function"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: [omni_minicpmo_4_5_duplex_function, ci_rocm]
         artifact_paths:
