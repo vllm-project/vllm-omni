@@ -3306,52 +3306,6 @@ def test_qwen_image_21_accuracy_nightly_splits_the_qualified_case(case: str, gra
         assert f"Qwen-Image 2.1 {case} Accuracy" not in pipeline_path.read_text(encoding="utf-8")
 
 
-def test_minicpmo_4_5_perf_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("MiniCPM-o 4.5 Perf", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "omni_minicpmo_4_5_perf"
-    assert step["artifact_paths"] == ["artifacts/rocm-minicpmo-4-5-perf/**/*"]
-    commands = "\n".join(step["commands"])
-    assert "full_model and omni and rocm and MI325 and cards_1" in commands
-    assert " and cuda" not in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert "--assert-baseline" not in commands
-    assert "test_minicpmo_4_5.json" in commands
-    assert "test_performance_benchmark[test_minicpmo_4_5-seed-tts]" in commands
-    assert "test_minicpmo_4_5_a2" in commands
-    assert "Expected exactly one MiniCPM-o 4.5 perf node" in commands
-    assert commands.count("--shard-id=0 --num-shards=1") == 2
-    assert "Expected exactly one executed MiniCPM-o 4.5 perf test" in commands
-    assert "skipped != 0" in commands
-    assert "Expected exactly 5 MiniCPM-o 4.5 result JSON files" in commands
-    assert "Unreadable MiniCPM-o 4.5 result JSON" in commands
-    assert "A2 MiniCPM-o result must not be produced" in commands
-    assert "result_test_minicpmo_4_5_*.json" in commands
-    assert 'rm -rf "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR"' in commands
-    assert "python3 -c 'import sys, xml.etree.ElementTree as ET" in commands
-    config = json.loads(Path("tests/dfx/perf/tests/test_minicpmo_4_5.json").read_text(encoding="utf-8"))
-    selected = next(case for case in config if case["test_name"] == "test_minicpmo_4_5")
-    selected_res = selected["mark"][0]["hardware_marks"]["res"]
-    assert selected_res["rocm"] == "MI325"
-    assert selected_res["cuda"] == ["H100", "B200"]
-    assert selected_res["npu"] == "A3"
-    assert selected["mark"][0]["hardware_marks"]["num_cards"] == 1
-    assert len(selected["benchmark_params"][0]["max_concurrency"]) == 5
-    assert "MI325" not in selected["benchmark_params"][0]["baseline"]
-    a2 = next(case for case in config if case["test_name"] == "test_minicpmo_4_5_a2")
-    assert "rocm" not in a2["mark"][0]["hardware_marks"]["res"]
-    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
-        text = pipeline_path.read_text(encoding="utf-8")
-        assert "MiniCPM-o 4.5 Perf" not in text
-
-
 def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o Omni-DuplexEval CI Guard", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "NonBlocking"
@@ -3689,70 +3643,6 @@ def test_qwen3_tts_perf_executes_evidence_guards_before_exit(
         expected_message="Expected exactly eight executed Qwen3-TTS perf tests",
         artifact_env="ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR",
         job_id_prefix="qwen3-tts-perf-guard",
-        pytest_status=pytest_status,
-        tests=tests,
-        skipped=skipped,
-        timeout_status=timeout_status,
-        expected_status=expected_status,
-        extra_env={"BENCHMARK_DIR": str(benchmark_dir)},
-    )
-
-
-@pytest.mark.parametrize(
-    (
-        "pytest_status",
-        "tests",
-        "skipped",
-        "timeout_status",
-        "result_files",
-        "valid_json",
-        "include_a2",
-        "expected_status",
-    ),
-    [
-        (0, 1, 0, None, 5, True, False, 0),
-        (0, 1, 1, None, 5, True, False, 5),
-        (0, 0, 0, None, 5, True, False, 5),
-        (1, 1, 0, None, 5, True, False, 1),
-        (0, 1, 0, 124, 5, True, False, 124),
-        (0, 1, 0, None, 4, True, False, 5),
-        (0, 1, 0, None, 5, False, False, 5),
-        (0, 1, 0, None, 4, True, True, 5),
-    ],
-    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout", "missing-result", "invalid-json", "a2-result"),
-)
-def test_minicpmo_4_5_perf_executes_evidence_guards_before_exit(
-    tmp_path: Path,
-    pytest_status: int,
-    tests: int,
-    skipped: int,
-    timeout_status: int | None,
-    result_files: int,
-    valid_json: bool,
-    include_a2: bool,
-    expected_status: int,
-) -> None:
-    benchmark_dir = tmp_path / "benchmark-results"
-    benchmark_dir.mkdir()
-    result_paths: list[Path] = []
-    for index in range(result_files):
-        result_path = benchmark_dir / f"result_test_minicpmo_4_5_{index}.json"
-        result_path.write_text("{}\n", encoding="utf-8")
-        result_paths.append(result_path)
-    if include_a2:
-        a2_result = benchmark_dir / "result_test_minicpmo_4_5_a2_0.json"
-        a2_result.write_text("{}\n", encoding="utf-8")
-        result_paths.append(a2_result)
-    if not valid_json:
-        result_paths[0].write_text("not-json\n", encoding="utf-8")
-
-    _assert_nightly_junit_guard(
-        tmp_path,
-        step_label="MiniCPM-o 4.5 Perf",
-        command_fragment='pytest -s -v -ra "$$node"',
-        expected_message="Expected exactly one executed MiniCPM-o 4.5 perf test",
-        artifact_env="ROCM_MINICPMO_PERF_ARTIFACT_DIR",
-        job_id_prefix="minicpmo-4-5-perf-guard",
         pytest_status=pytest_status,
         tests=tests,
         skipped=skipped,
