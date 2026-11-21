@@ -112,7 +112,7 @@ def resolve_connector_spec(
         extra.setdefault("sender_zmq_port", resolved_port)
         extra.pop("zmq_port", None)
         outgoing = extra.get("outgoing")
-        if spec.name == "NixlConnector" and isinstance(outgoing, dict):
+        if spec.name in {"NixlConnector", "MooncakeTransferEngineConnector"} and isinstance(outgoing, dict):
             extra["zmq_port"] = compute_connector_zmq_port(
                 expand_env_int(outgoing.get("zmq_port", 50051), "zmq_port"),
                 purpose=purpose,

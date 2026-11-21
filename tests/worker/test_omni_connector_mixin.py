@@ -216,6 +216,35 @@ def test_init_payload_connector_ownership(role, custom_func, expected):
     host.shutdown_omni_connectors()
 
 
+@pytest.mark.parametrize("worker_type", ["ar", "generation"])
+@pytest.mark.parametrize("role", ["sender", "receiver"])
+@pytest.mark.parametrize(
+    "async_chunk,use_v2,native_capability,runner_owns_transport",
+    [(False, False, False, True), (True, False, True, False), (True, True, False, False), (True, True, True, True)],
+)
+def test_chunk_connector_has_one_transport_owner(
+    async_chunk, use_v2, native_capability, runner_owns_transport, worker_type, role
+):
+    model_config = _make_model_config(
+        async_chunk=async_chunk, worker_type=worker_type, custom_func="package.build_payload"
+    )
+    model_config.use_v2_model_runner = use_v2
+    model_config.supports_native_mrv2_data_plane = native_capability
+    model_config.stage_connector_config = {"name": "MooncakeTransferEngineConnector", "extra": {"role": role}}
+    host = MixinHost()
+    with (
+        patch.object(host, "_create_connector", return_value=MockConnector()) as create,
+        patch.object(host, "_load_custom_func", return_value=(None, None)),
+    ):
+        host.init_omni_connectors(model_config)
+    try:
+        assert bool(create.call_count) is runner_owns_transport
+        assert (host._recv_thread is not None) is runner_owns_transport
+        assert (host._save_thread is not None) is runner_owns_transport
+    finally:
+        host.shutdown_omni_connectors()
+
+
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize("rank", [0, 1])
 def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank, mocker):

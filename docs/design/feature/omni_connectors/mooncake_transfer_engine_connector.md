@@ -54,22 +54,23 @@ stages:
 ### Required
 
 | Parameter | Description |
-|---|---|
+| --- | --- |
 | `role` | **Internal, do not set manually.** Auto-injected by the orchestration layer (`"sender"` for `output_connectors`, `"receiver"` for `input_connectors`). Defaults to `"sender"` if omitted. |
+| `outgoing` | **Internal.** For a middle stage, carries its downstream edge so the connector can listen for downstream pulls while receiving from upstream. |
 | `host` | Local IP address for RDMA. `"auto"` detects from network interfaces. |
 | `protocol` | Transport protocol: `"rdma"` (InfiniBand/RoCE) or `"tcp"`. |
 
 ### Memory Pool
 
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `memory_pool_size` | 4 GB (CPU) / 2 GB (GPU) | Total size of the RDMA-registered memory pool in bytes. Recommended 4 GB for CPU pinned memory; 2 GB for GPU VRAM to conserve device memory. |
 | `memory_pool_device` | `"cpu"` | `"cpu"`: pinned host memory (recommended, works on all topologies). `"cuda"`: GPU VRAM for GPUDirect RDMA (requires NIC-GPU direct PCIe connectivity, PIX topology). |
 
 ### Networking
 
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `zmq_port` | 50051 | ZMQ **base** port. The orchestration layer computes the actual port as `base + purpose_offset + stage_offset` (see table below). Users only set this base value. |
 | `sender_host` | `None` | **Internal.** Receiver-side only — dynamically resolved via `update_sender_info()`. Not needed in YAML. |
 | `sender_zmq_port` | `None` | **Internal.** Receiver-side only — defaults to the sender's adjusted port. Not needed in YAML. |
@@ -79,14 +80,14 @@ stages:
 
 To avoid port conflicts when multiple edges, purposes, DP replicas, or TP ranks share the same node, the actual ZMQ port is computed as:
 
-```
+```text
 side_channel_port = zmq_port + purpose_offset + stage_offset + dp_index * tp_size
 sender_listen     = side_channel_port + tp_rank
 receiver_connect  = remote_side_channel_port + tp_rank
 ```
 
 | Component | Value | Description |
-|---|---|---|
+| --- | --- | --- |
 | `zmq_port` | 50051 (default) | Base port from YAML config |
 | `purpose_offset` | `request_forwarding` = 0, `kv_transfer` = 100 | Separates control-plane vs KV-cache connections |
 | `stage_offset` | `int(from_stage)` (0, 1, 2...) | Separates edges from different source stages |
@@ -97,7 +98,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 **Example** (base=50051, stage 0→1, DP=2, TP=2, kv_transfer):
 
 | Caller | DP | TP rank | Port |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Stage worker | DP0 | rank 0 | `50051 + 100 + 0 + 0×2 + 0 = 50151` |
 | Stage worker | DP0 | rank 1 | `50051 + 100 + 0 + 0×2 + 1 = 50152` |
 | Stage worker | DP1 | rank 0 | `50051 + 100 + 0 + 1×2 + 0 = 50153` |
@@ -107,7 +108,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 ## Memory Pool Modes
 
 | Mode | Config | Recommended Pool Size | Data Flow | Best For |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | CPU Pinned | `memory_pool_device: "cpu"` | 4 GB | GPU → CPU pool → RDMA → CPU pool → GPU | Most hardware topologies (recommended) |
 | GPUDirect | `memory_pool_device: "cuda"` | 2 GB | GPU → GPU pool → RDMA (NIC reads GPU BAR1) → GPU pool | NIC-GPU direct PCIe (PIX topology) |
 
@@ -118,7 +119,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 ## Environment Variables
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `RDMA_DEVICE_NAME` | Override RDMA device name (e.g., `mlx5_0`). |
 | `MC_IB_PCI_RELAXED_ORDERING` | Set to `1` to enable PCIe relaxed ordering for GPUDirect. |
 
@@ -142,7 +143,7 @@ docker run -it \
 Benchmark results on H800 GPUs with mlx5_0 RDMA NIC (~186 MB KV cache):
 
 | Metric | MooncakeStoreConnector | MooncakeTransferEngineConnector (CPU) |
-|---|---|---|
+| --- | --- | --- |
 | KV transfer wall time | ~810 ms | **~14 ms** |
 | RDMA throughput | N/A (TCP) | ~22 GB/s |
 | Speedup | 1x | **58x** |
@@ -175,7 +176,7 @@ echo "MC_IB_PCI_RELAXED_ORDERING=${MC_IB_PCI_RELAXED_ORDERING:-<not set>}"
 ### Common Issues
 
 | Symptom | Cause | Fix |
-|---|---|---|
+| --- | --- | --- |
 | `Failed to modify QP to RTR` | Cross-NIC QP handshake failure (multi-NIC DGX) | Set `device_name` to a single RoCE NIC (e.g., `mlx5_2`) or set `RDMA_DEVICE_NAME` env var |
 | `transport retry counter exceeded` | RDMA path between incompatible NICs | Same as above — restrict to one NIC |
 | `zmq.error.Again: Resource temporarily unavailable` | ZMQ recv timeout (transfer took too long) | Check NIC selection; increase data may need longer timeout |
@@ -195,6 +196,7 @@ ibdev2netdev | grep -v "ib[0-9]"
 ```
 
 Then configure the connector:
+
 ```yaml
 device_name: "mlx5_2"  # or set RDMA_DEVICE_NAME=mlx5_2
 ```
@@ -378,10 +380,10 @@ Two helper classes control local memory ownership:
 
 - `ManagedBuffer`
   Represents one live slice of the pool and exposes:
-  - `.tensor`
-  - `.as_tensor(dtype, shape)`
-  - `.to_bytes()`
-  - `.release()`
+    - `.tensor`
+    - `.as_tensor(dtype, shape)`
+    - `.to_bytes()`
+    - `.release()`
 
 #### 4.4 ZMQ Side Channel
 
@@ -407,7 +409,7 @@ A sender connector:
 
 #### 5.2 Receiver Role
 
-A receiver connector:
+A receive-only connector:
 
 - does not bind the sender-side ZMQ listener
 - accepts `get()` calls
@@ -420,6 +422,20 @@ The role is not inferred dynamically. It is injected from the deploy connector w
 - outgoing edge for a stage -> `role="sender"`
 
 This is important because incorrect role assignment would break initialization semantics.
+
+For an async-chunk chain such as Thinker → Talker → Code2Wav, the middle
+stage uses one connector for both directions. Its incoming edge supplies
+`sender_host` and `sender_zmq_port`; its outgoing edge supplies the local
+`host` and `zmq_port`. Stage initialization carries the outgoing edge in an
+internal `outgoing` field, enabling both `get()` and `put()` on that connector.
+The final receive-only stage continues to use `get()` without a listener.
+Both edges of a Mooncake middle stage must use `MooncakeTransferEngineConnector`.
+Each edge's endpoint retains its own stage, TP-rank and replica port offsets.
+
+On the legacy async-chunk path, the scheduler's transfer adapter owns the
+connector and the model runner skips creating a duplicate. Native MRv2 and
+full-payload paths create the connector in the model runner. This keeps one
+owner for each listener endpoint.
 
 #### 5.3 Host Auto-Detection
 
@@ -476,7 +492,7 @@ The connector uses `ManagedBuffer` in two different ways:
 
 #### 7.1 High-Level Behavior
 
-`put()` is only valid in sender mode. Its job is to expose a payload for later remote pull by the receiver.
+`put()` is valid for senders and middle stages with an outgoing edge. Its job is to expose a payload for later remote pull by the receiver.
 
 The high-level flow is:
 
@@ -489,20 +505,20 @@ The high-level flow is:
 
 `put()` supports three payload classes:
 
-**A. `ManagedBuffer`**
+##### A. `ManagedBuffer`
 
 If the buffer belongs to the same pool, the connector can use it directly without copying. This is the most efficient path.
 
 If the buffer comes from a different pool, the connector falls back to a copy path.
 
-**B. `torch.Tensor` or `bytes`**
+##### B. `torch.Tensor` or `bytes`
 
 These payloads are copied into the local pool and marked as fast-path data:
 
 - no Omni object serialization is required
 - receiver can get a `ManagedBuffer` back
 
-**C. Generic Python object**
+##### C. Generic Python object
 
 Any other payload is serialized via `OmniSerializer.serialize(...)` and then copied into the pool.
 
@@ -558,7 +574,7 @@ This table is the sender-side truth source for both metadata queries and pull re
 
 The `metadata` parameter in `get()` is optional. The connector supports two resolution modes depending on whether the caller supplies it.
 
-**With metadata**
+##### With metadata
 
 When the caller passes metadata, the connector uses it directly. The metadata carries:
 
@@ -568,7 +584,7 @@ When the caller passes metadata, the connector uses it directly. The metadata ca
 
 This mode is suitable when the control plane already forwards the sender's `put()` output to the receiver.
 
-**Without metadata**
+##### Without metadata
 
 When `get(metadata=None)` is called, the connector queries the sender over ZMQ to discover the same fields (`data_size`, `is_fast_path`). The caller must first call:
 
