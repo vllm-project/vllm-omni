@@ -86,11 +86,12 @@ possible. Multimodal processor caches retain existing behavior. The benchmark
 measures a warmed service. Use the recorded case order when comparing revisions.
 
 Daily-Omni records TTFT, TPOT, ITL, E2E latency and request throughput.
-The text-only case collects a new TTFT reference. Seed-TTS also records audio
+The text-only case retains the H100 mean TTFT reference of 3647.318585 ms
+from the two earlier runs with text and audio output. Seed-TTS also records audio
 duration and uses audio RTF and TTFP for performance regression checks.
 Throughput is an aggregate metric, not a per-request percentile.
 `result_validation.metrics` checks that each metric has a valid value and
-the expected number of samples. The H100 Seed-TTS references in
+the expected number of samples. The H100 references in
 `benchmark_params[].baseline` use the arithmetic mean for each scenario in
 [build 20463](https://buildkite.com/vllm/vllm-omni/builds/20463), running
 [commit `9d86d17f12`](https://github.com/vllm-project/vllm-omni/commit/9d86d17f1223f77c713b04dd398c24257b6c53e5).

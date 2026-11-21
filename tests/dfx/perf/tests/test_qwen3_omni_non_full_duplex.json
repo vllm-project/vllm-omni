@@ -216,7 +216,12 @@
           "SEED_TTS_SIM_EVAL": "0",
           "SEED_TTS_UTMOS_EVAL": "0"
         },
-        "daily_omni_pack_mode": "qwen"
+        "daily_omni_pack_mode": "qwen",
+        "baseline": {
+          "H100": {
+            "mean_ttft_ms": 3647.318585
+          }
+        }
       }
     ]
   },
