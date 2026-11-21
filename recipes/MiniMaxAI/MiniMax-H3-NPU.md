@@ -184,6 +184,28 @@ Notes:
   service into 64 GB HBM per device (Atlas 800I A3). Host (CPU) memory usage
   is high with this option.
 
+### Opt-in BF16 packed-prefix attention
+
+To select the H3-owned BF16 fused path instead of the Laser selection above,
+set this before starting the server with `--diffusion-attention-backend FLASH_ATTN`:
+
+```bash
+export MINDIE_SD_FA_TYPE="fused_attn_score"
+```
+
+For eligible long BF16 H3 attention calls, this folds independent heads into
+BNSD batches and slices K/V to the real document prefix. Padding query outputs
+are not consumed by H3. Short text refiners, caller masks, piecewise/query-range
+metadata and unsupported packing or head geometry retain the parent path.
+Quantized attention still uses the inherited precision dispatch.
+
+This changes the execution layout, not the model weights or solver step count.
+It does not establish bit-exactness for every workload or a service speedup.
+The four-logical-device 910C qualification and its exact tested revisions are
+tracked in [InferRSI #317](https://github.com/InferMatrixLab/InferRSI/pull/317).
+Qualification on that pinned experimental revision is not a new-base result.
+Leave the variable unset to retain the backend's normal selection.
+
 ### Recommended lossy configuration (Atlas 800I A2 / A3)
 
 Adds RainFusion block-sparse attention and INT8 online quantization on top of
