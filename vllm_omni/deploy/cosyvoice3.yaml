@@ -34,6 +34,9 @@ connectors:
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       codec_chunk_frames: 15
+      # Optional: emit a smaller first chunk so code2wav starts earlier (lower TTFA).
+      # Later chunks follow codec_chunk_frames and codec_stream_scale_factor.
+      initial_codec_chunk_frames: 5
       codec_left_context_frames: 25
       codec_vocab_size: 6561
 
