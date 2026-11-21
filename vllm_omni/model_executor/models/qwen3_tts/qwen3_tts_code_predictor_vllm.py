@@ -87,6 +87,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         self._frame_graph_temperature = float(self._subtalker_temperature(vllm_config))
         self._frame_cache: FrameLocalKVCache | None = None
         self._fused_requested = self._parse_bool_config(extra.get("code_predictor_fused"))
+        self._fp8_requested = self._parse_bool_config(extra.get("code_predictor_fp8"))
         self._fused = None
 
     @staticmethod
@@ -201,7 +202,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         if self._fused_requested:
             from .fused_code_predictor import FusedCodePredictor
 
-            self._fused = FusedCodePredictor(self, max_batch)
+            self._fused = FusedCodePredictor(self, max_batch, fp8_weights=self._fp8_requested)
             # Compile every kernel variant outside any graph capture.
             hidden = int(self.talker_config.hidden_size)
             for batch in self._fused.warmup_batches():
