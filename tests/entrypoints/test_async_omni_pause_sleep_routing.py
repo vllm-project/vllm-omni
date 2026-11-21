@@ -295,9 +295,10 @@ def test_sleep_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
         assert any(ack.metadata.get("path") == "engine_core" for ack in acks if ack.stage_id == 0)
         assert CuMemTag.WEIGHTS.value in omni._sleeping_tags
         assert CuMemTag.KV_CACHE.value in omni._sleeping_tags
-        # Sleep gates frontend admission for the trainer resume contract.
+        # Plain sleep gates frontend admission temporarily without holding it
+        # past a full wake_up (only pause_generation / release_kv_cache_memory hold).
         assert omni._paused is True
-        assert omni._hold_admission_until_resume is True
+        assert omni._hold_admission_until_resume is False
 
     asyncio.run(run())
 
@@ -322,7 +323,7 @@ def test_sleep_blocks_admission_before_engine_core_rpc():
 
         assert paused_at_rpc == [True]
         assert omni._paused is True
-        assert omni._hold_admission_until_resume is True
+        assert omni._hold_admission_until_resume is False
         # Sleep must not also call pause_scheduler (EngineCore.sleep pauses).
         assert all(c.kwargs.get("method") != "pause_scheduler" for c in omni.collective_rpc.await_args_list)
 
@@ -401,7 +402,7 @@ def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
         omni._wake_diffusion.assert_awaited_once()
         assert {ack.stage_id for ack in acks} == {0, 1}
         assert not omni._sleeping_tags
-        # Mixed/AR wake restores memory but does not resume frontend admission.
+        # Explicit pause hold stays closed until resume_generation.
         assert omni._paused is True
         assert omni._hold_admission_until_resume is True
 
@@ -409,22 +410,283 @@ def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
 
 
 @pytest.mark.cpu
-def test_wake_up_does_not_resume_frontend_admission():
+def test_wake_up_resumes_frontend_admission_after_ar_sleep():
+    """Plain AR sleep -> full wake_up restores admission (matching upstream vLLM)."""
+
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
         await omni.sleep(level=1, mode="abort")
         assert omni._paused is True
-        assert omni._hold_admission_until_resume is True
+        assert omni._hold_admission_until_resume is False
 
+        async def wait_for_admission() -> None:
+            async with omni._pause_cond:
+                await omni._pause_cond.wait_for(lambda: not omni._paused and not omni._sleeping_tags)
+
+        waiter = asyncio.create_task(wait_for_admission())
+        await omni.wake_up()
+        await asyncio.wait_for(waiter, timeout=1.0)
+
+        assert omni._paused is False
+        assert omni._hold_admission_until_resume is False
+        assert not omni._sleeping_tags
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_partial_wake_up_keeps_frontend_paused_until_all_tags_warm():
+    """sleep -> wake_up(weights) keeps _paused until wake_up(kv_cache) finishes."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        await omni.sleep(level=1, mode="abort")
+        assert omni._paused is True
+
+        async def wait_for_admission() -> None:
+            async with omni._pause_cond:
+                await omni._pause_cond.wait_for(lambda: not omni._paused and not omni._sleeping_tags)
+
+        waiter = asyncio.create_task(wait_for_admission())
+        await omni.wake_up(tags=[CuMemTag.WEIGHTS.value])
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        assert omni._paused is True
+        assert omni._sleeping_tags == {CuMemTag.KV_CACHE.value}
+
+        await omni.wake_up(tags=[CuMemTag.KV_CACHE.value])
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert omni._paused is False
+        assert not omni._sleeping_tags
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_pause_then_sleep_wake_keeps_admission_paused_for_ar():
+    """Explicit pause_generation still requires resume_generation after AR wake."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        await omni.pause_generation(mode="abort")
+        await omni.sleep(level=1, mode="abort")
         await omni.wake_up()
 
+        assert not omni._sleeping_tags
         assert omni._paused is True
         assert omni._hold_admission_until_resume is True
-        assert not omni._sleeping_tags
-        # Explicit resume is required after AR sleep/wake.
+
         await omni.resume_generation()
         assert omni._paused is False
         assert omni._hold_admission_until_resume is False
+
+    asyncio.run(run())
+
+
+def _wire_generate_stubs(omni: AsyncOmni, *, num_stages: int) -> AsyncMock:
+    """Attach minimal stubs so omni.generate() exercises the real admission gate."""
+    omni._pending_submits = {}
+    omni.request_states = {}
+    omni.engine.num_stages = num_stages
+    omni.log_stats = False
+    omni._maybe_expand_sampling_params = lambda spl: spl
+    omni.resolve_sampling_params_list = lambda spl, **_: spl
+    omni._compute_final_stage_id = lambda output_modalities: num_stages - 1
+    omni._compute_final_output_stage_ids = lambda output_modalities: [num_stages - 1]
+    omni._get_pd_separation_pair = lambda: None
+    omni._publish_request_gauges = lambda total: None
+    omni._log_summary_and_cleanup = lambda request_id, reason="stage_error": None
+    add_request = omni.engine.add_request_async = AsyncMock()
+
+    async def no_outputs(*args, **kwargs):
+        return
+        yield  # pragma: no cover
+
+    omni._process_orchestrator_results = no_outputs
+    return add_request
+
+
+@pytest.mark.cpu
+def test_overlapping_wake_does_not_reopen_admission_during_inflight_sleep():
+    """Waking stage A while stage B's sleep RPC is in flight must keep
+    admission closed until stage B finishes sleeping and is fully woken."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        add_request = _wire_generate_stubs(omni, num_stages=2)
+
+        # Stage 0 (A) is already asleep.
+        await omni.sleep(stage_ids=[0], level=1, mode="abort")
+        assert omni._paused is True
+        assert omni._stage_sleeping_tags == {0: {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}}
+
+        # Park stage 1 (B)'s sleep RPC mid-flight.
+        b_sleep_entered = asyncio.Event()
+        release_b_sleep = asyncio.Event()
+        orig_rpc = omni._engine_core_rpc
+
+        async def gated_rpc(method: str, *, stage_ids=None, args=(), kwargs=None):
+            if method == "sleep" and stage_ids == [1]:
+                b_sleep_entered.set()
+                await release_b_sleep.wait()
+            return await orig_rpc(method, stage_ids=stage_ids, args=args, kwargs=kwargs)
+
+        omni._engine_core_rpc = gated_rpc
+
+        sleep_b = asyncio.create_task(omni.sleep(stage_ids=[1], level=1, mode="abort"))
+        await asyncio.wait_for(b_sleep_entered.wait(), timeout=1.0)
+
+        # Overlapping wake_up(A) clears stage 0's tags while B is still offloading.
+        await omni.wake_up(stage_ids=[0])
+        assert not omni._sleeping_tags
+        assert omni._paused is True
+
+        async def consume() -> None:
+            async for _ in omni.generate("hi", sampling_params_list=[SimpleNamespace(max_tokens=1)] * 2):
+                pass
+
+        req_task = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)
+        assert not req_task.done()
+        assert omni._admitting == 0
+        add_request.assert_not_awaited()
+
+        # Once stage B's sleep completes, B's tags are recorded and the request stays parked.
+        release_b_sleep.set()
+        await asyncio.wait_for(sleep_b, timeout=1.0)
+        assert omni._paused is True
+        assert omni._stage_sleeping_tags == {1: {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}}
+        await asyncio.sleep(0.05)
+        assert not req_task.done()
+        add_request.assert_not_awaited()
+
+        # Partial wake of B keeps the request parked; full wake admits it.
+        await omni.wake_up(stage_ids=[1], tags=[CuMemTag.WEIGHTS.value])
+        await asyncio.sleep(0.05)
+        assert not req_task.done()
+        assert omni._paused is True
+        add_request.assert_not_awaited()
+
+        await omni.wake_up(stage_ids=[1], tags=[CuMemTag.KV_CACHE.value])
+        await asyncio.wait_for(req_task, timeout=2.0)
+        assert omni._paused is False
+        assert not omni._sleeping_tags
+        add_request.assert_awaited_once()
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_cancelled_before_rpc_restores_admission_without_explicit_resume():
+    """Cancelling sleep() during pre-dispatch renderer cache clear must not
+    leave frontend admission wedged when no worker RPC was dispatched."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        add_request = _wire_generate_stubs(omni, num_stages=1)
+
+        clear_entered = asyncio.Event()
+        release_clear = asyncio.Event()
+
+        async def parked_clear() -> None:
+            clear_entered.set()
+            await release_clear.wait()
+
+        omni._clear_frontend_mm_cache = parked_clear
+
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
+        await asyncio.wait_for(clear_entered.wait(), timeout=1.0)
+        assert omni._paused is True
+
+        sleep_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sleep_task
+
+        omni.collective_rpc.assert_not_awaited()
+        assert omni._paused is False
+        assert not omni._sleeping_tags
+
+        async def consume() -> None:
+            async for _ in omni.generate("hi", sampling_params_list=[SimpleNamespace(max_tokens=1)]):
+                pass
+
+        await asyncio.wait_for(consume(), timeout=2.0)
+        add_request.assert_awaited_once()
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_failure_preserves_explicit_pause_and_keeps_post_dispatch_closed():
+    """Pre-dispatch sleep failures must not clear an explicit pause hold, and
+    post-dispatch RPC failures must remain fail-closed."""
+
+    async def run() -> None:
+        # 1. Pre-dispatch failure under explicit pause_generation() keeps gate closed.
+        omni_paused = _make_omni(stage_types=["llm"])
+        await omni_paused.pause_generation(mode="abort")
+        omni_paused._clear_frontend_mm_cache = AsyncMock(side_effect=RuntimeError("cache clear failed"))
+
+        with pytest.raises(RuntimeError, match="cache clear failed"):
+            await omni_paused.sleep(level=1, mode="abort")
+
+        assert omni_paused._paused is True
+        assert omni_paused._hold_admission_until_resume is True
+
+        # 2. Post-dispatch AR sleep RPC failure stays fail-closed (no sleeping tags recorded)
+        # even if a subsequent sleep() fails before dispatch; only resume_generation() reopens it.
+        omni_rpc_fail = _make_omni(stage_types=["llm"])
+        omni_rpc_fail._engine_core_rpc = AsyncMock(side_effect=RuntimeError("engine sleep rpc failed"))
+
+        with pytest.raises(RuntimeError, match="engine sleep rpc failed"):
+            await omni_rpc_fail.sleep(level=1, mode="abort")
+
+        assert omni_rpc_fail._paused is True
+        assert omni_rpc_fail._hold_admission_until_resume is True
+        assert not omni_rpc_fail._sleeping_tags
+
+        omni_rpc_fail._clear_frontend_mm_cache = AsyncMock(side_effect=RuntimeError("pre-dispatch fail"))
+        with pytest.raises(RuntimeError, match="pre-dispatch fail"):
+            await omni_rpc_fail.sleep(level=1, mode="abort")
+
+        assert omni_rpc_fail._paused is True
+        assert omni_rpc_fail._hold_admission_until_resume is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_diffusion_wake_cancelled_during_settle_still_reopens_admission(mocker):
+    """Cancelling wake_up() during the post-wake settle sleep after all tags
+    are already cleared must not leave admission wedged closed."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        await omni.sleep(level=1, mode="abort")
+        assert omni._paused is True
+
+        real_sleep = asyncio.sleep
+        settle_entered = asyncio.Event()
+        release_settle = asyncio.Event()
+
+        async def gated_sleep(delay: float, *args, **kwargs):
+            if delay == 0.1:
+                settle_entered.set()
+                await release_settle.wait()
+            return await real_sleep(delay, *args, **kwargs)
+
+        mocker.patch("vllm_omni.entrypoints.async_omni.asyncio.sleep", side_effect=gated_sleep)
+
+        wake_task = asyncio.create_task(omni.wake_up())
+        await asyncio.wait_for(settle_entered.wait(), timeout=1.0)
+        wake_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wake_task
+
+        assert not omni._sleeping_tags
+        assert omni._paused is False
 
     asyncio.run(run())
 
@@ -442,8 +704,8 @@ def test_sleep_level1_wake_without_tags_clears_all_sleeping_tags():
 
         await omni.wake_up()
         assert not omni._sleeping_tags
-        assert omni._paused is True
-        assert omni._hold_admission_until_resume is True
+        assert omni._paused is False
+        assert omni._hold_admission_until_resume is False
 
     asyncio.run(run())
 
@@ -579,6 +841,7 @@ def test_partial_wake_does_not_skip_remaining_sleeping_stage():
         assert 0 not in omni._stage_sleeping_tags
         assert 1 in omni._stage_sleeping_tags
         assert CuMemTag.WEIGHTS.value in omni._sleeping_tags
+        assert omni._paused is True
 
         omni.collective_rpc.reset_mock()
         acks = await omni.wake_up(stage_ids=[1])
@@ -589,6 +852,7 @@ def test_partial_wake_does_not_skip_remaining_sleeping_stage():
         assert wake_kwargs["stage_ids"] == [1]
         assert not omni._sleeping_tags
         assert not omni._stage_sleeping_tags
+        assert omni._paused is False
 
     asyncio.run(run())
 
