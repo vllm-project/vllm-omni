@@ -3774,6 +3774,74 @@ def test_qwen_image_backend_similarity_executes_junit_guard_before_exit(
     )
 
 
+_LINGBOT_EXPANSION_NIGHTLY_JOBS = (
+    (
+        "LingBot-Video Dense Batch CFG",
+        1,
+        "rocm-lingbot-dense-batch-cfg",
+        ("tests/e2e/online_serving/test_lingbot_video_expansion.py::test_batch_cfg_extra_params",),
+    ),
+    (
+        "LingBot-Video MoE Image and Video Modes",
+        2,
+        "rocm-lingbot-moe-modes",
+        (
+            "tests/e2e/online_serving/test_lingbot_video_moe.py::test_text_to_image_moe",
+            "tests/e2e/online_serving/test_lingbot_video_moe.py::test_video_generation_modes_moe",
+        ),
+    ),
+    (
+        "LingBot-Video MoE Layerwise and CPU Offload",
+        2,
+        "rocm-lingbot-moe-offload",
+        (
+            "tests/e2e/online_serving/test_lingbot_video_offload.py::test_text_to_video_moe_layerwise_offload",
+            "tests/e2e/online_serving/test_lingbot_video_offload.py::test_text_to_video_moe_cpu_offload",
+        ),
+    ),
+)
+
+
+@pytest.mark.parametrize(("label", "expected_count", "artifact_slug", "nodes"), _LINGBOT_EXPANSION_NIGHTLY_JOBS)
+def test_lingbot_expansion_has_separate_blocking_nightly_jobs(
+    label: str,
+    expected_count: int,
+    artifact_slug: str,
+    nodes: tuple[str, ...],
+) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 90
+    assert step["source_file_dependencies"] == "diffusion_lingbot_function"
+    assert step["artifact_paths"] == [f"artifacts/{artifact_slug}/**/*"]
+    assert "retry" not in step
+    assert len(step["commands"]) == 1
+    assert split(step["commands"][0]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        "1",
+        str(expected_count),
+        "75m",
+        artifact_slug,
+        *nodes,
+        "-m",
+        "full_model and diffusion and rocm and MI325 and cards_1",
+    ]
+
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        assert label not in pipeline_path.read_text(encoding="utf-8")
+
+
+def test_lingbot_expansion_source_dependencies_include_runner_guards() -> None:
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    for script in ("run-rocm-diffusion-nightly.sh", "assert-pytest-collection.sh"):
+        assert f".buildkite/amd/scripts/{script}" in dependencies["diffusion_lingbot_function"]
+
+
 def test_minicpmo_duplex_function_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o 4.5 Duplex Function", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "NonBlocking"
