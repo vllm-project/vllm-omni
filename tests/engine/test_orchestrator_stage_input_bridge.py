@@ -426,6 +426,9 @@ def test_partial_handoff_needs_an_opted_in_bridge_and_a_streamed_stage() -> None
     assert not orchestrator._forwards_partial_outputs(0, session)
     # The last stage has no next stage to hand off to.
     assert not orchestrator._forwards_partial_outputs(1, _partial_handoff_request(orchestrator))
+    # A next stage fed by its async-chunk connector takes its inputs there.
+    orchestrator._stage_receives_async_chunks = lambda _stage_id: True
+    assert not orchestrator._forwards_partial_outputs(0, _partial_handoff_request(orchestrator))
 
 
 @pytest.mark.asyncio

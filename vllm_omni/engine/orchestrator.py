@@ -2555,9 +2555,18 @@ class OrchestratorBase:
         Opt-in per processor (``accepts_partial_source_outputs``), for plain
         requests whose stage reports unfinished outputs at all: FINAL_ONLY
         requests take the ordinary whole-output handoff, and streaming-input
-        and session-owned requests keep their own segment forwarding.
+        and session-owned requests keep their own segment forwarding. Only
+        inputs the orchestrator forwards itself qualify; a next stage fed by
+        its async-chunk connector gets them there.
         """
-        if req_state.streaming.enabled or req_state.session_owned or stage_id + 1 >= len(self.stage_pools):
+        if (
+            req_state.streaming.enabled
+            or req_state.session_owned
+            or stage_id >= req_state.final_stage_id
+            or stage_id + 1 >= len(self.stage_pools)
+            or req_state.skip_legacy_stage_forward
+            or (self.async_chunk and self._stage_receives_async_chunks(stage_id + 1))
+        ):
             return False
         params = req_state.sampling_params_list[stage_id] if stage_id < len(req_state.sampling_params_list) else None
         if getattr(params, "output_kind", None) == RequestOutputKind.FINAL_ONLY:
