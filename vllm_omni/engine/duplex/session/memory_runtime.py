@@ -183,13 +183,21 @@ class SessionMemoryRuntime:
         if self._history_revision != self._ctx.session.history_revision:
             self._history = self._ctx.session.history
             self._history_revision = self._ctx.session.history_revision
-            if self._ctx.plugin.uses_history_context:
+            if self._ctx.plugin.uses_history_context or self._ctx.plugin.uses_context_ledger:
                 self._snapshot = self._ctx.session.history_snapshot()
         if self._ctx.plugin.uses_history_context:
             assert self._snapshot is not None
             ledger = self._ctx.session.context_ledger
             ledger.refresh(self._snapshot)
             self._ctx.plugin.bind_history_context(state=self._ctx.model_state, snapshot=self._snapshot, ledger=ledger)
+        if self._ctx.plugin.uses_context_ledger:
+            assert self._snapshot is not None
+            self._ctx.plugin.observe_history_context(
+                snapshot=self._snapshot,
+                ledger=self._ctx.session.context_ledger,
+                state=self._ctx.model_state,
+                runtime_config=self._ctx.session.runtime_config,
+            )
         return self._history
 
     @property
