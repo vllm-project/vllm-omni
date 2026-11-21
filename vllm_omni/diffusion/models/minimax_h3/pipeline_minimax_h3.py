@@ -1218,11 +1218,14 @@ class MiniMaxH3Pipeline(
                 ),
             )
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
+        # Only single files change the QKV layout; subclasses such as
+        # TaoMateH3DiTModel keep the original constructor signature.
+        single_file_kwargs = {"grouped_qkv_weights": False} if single_file else {}
         self.transformer = transformer_cls(
             od_config,
             quant_config=transformer_quant_config,
             diffusers_weights=modular,
-            grouped_qkv_weights=not single_file,
+            **single_file_kwargs,
         )
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint
@@ -1246,7 +1249,7 @@ class MiniMaxH3Pipeline(
                 od_config,
                 quant_config=transformer_quant_config,
                 diffusers_weights=modular,
-                grouped_qkv_weights=not single_file,
+                **single_file_kwargs,
             )
 
         self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)

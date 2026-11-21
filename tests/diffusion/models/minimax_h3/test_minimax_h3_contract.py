@@ -815,7 +815,9 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
             created["dit"].append((args, kwargs))
 
     class CustomDiT(FakeDiT):
-        pass
+        # Mirror TaoMateH3DiTModel: derived DiTs keep the base constructor signature.
+        def __init__(self, od_config, quant_config=None, *, diffusers_weights=None):
+            super().__init__(od_config, quant_config=quant_config, diffusers_weights=diffusers_weights)
 
     class CustomPipeline(pipeline_module.MiniMaxH3Pipeline):
         _transformer_cls = CustomDiT
@@ -891,6 +893,7 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     assert pipeline.supported_tasks == expected_tasks
     assert len(created["dit"]) == expected_dits
     assert all(kwargs["diffusers_weights"] is False for _, kwargs in created["dit"])
+    assert all("grouped_qkv_weights" not in kwargs for _, kwargs in created["dit"])
     component_path = tmp_path / component_partition
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
