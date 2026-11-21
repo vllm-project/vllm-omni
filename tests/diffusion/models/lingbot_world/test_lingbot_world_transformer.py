@@ -1066,8 +1066,8 @@ def test_temporal_rope_matches_absolute_positions_without_growing_cache(start_fr
         phase = positions.flatten()[:, None] * frequencies[None, :]
         reference.append(torch.polar(torch.ones_like(phase), phase))
     expected = torch.cat(reference, dim=-1)
-    torch.testing.assert_close(cosine, expected.real.float().to(dtype), rtol=0, atol=0)
-    torch.testing.assert_close(sine, expected.imag.float().to(dtype), rtol=0, atol=0)
+    torch.testing.assert_close(cosine, expected.real, rtol=0, atol=0)
+    torch.testing.assert_close(sine, expected.imag, rtol=0, atol=0)
     assert {name: (value.data_ptr(), value.shape) for name, value in model.named_buffers()} == buffers
 
 
