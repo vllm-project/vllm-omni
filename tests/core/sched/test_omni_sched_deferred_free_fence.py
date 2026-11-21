@@ -64,6 +64,9 @@ def _empty_frame(*, total_num_scheduled_tokens: int):
     scheduler_output.num_scheduled_tokens = {}
     scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens
     model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    # req_ids is a required field without a class-level default, so a spec'd
+    # mock rejects it; set it explicitly (the pin's scheduler reads it first).
+    model_runner_output.req_ids = []
     model_runner_output.sampled_token_ids = []
     model_runner_output.logprobs = None
     model_runner_output.prompt_logprobs_dict = {}
@@ -172,7 +175,6 @@ def _make_fast_path_sched(*, defer_block_free: bool) -> tuple[MagicMock, Request
     sched.log_stats = False
     sched.kv_cache_config = MagicMock(kv_cache_groups=[])
     sched.use_v2_model_runner = False
-    sched.prev_step_scheduled_req_ids = set()
     sched.needs_kv_cache_zeroing = False
     sched.connector = None
     sched.ec_connector = None

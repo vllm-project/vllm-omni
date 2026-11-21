@@ -25,7 +25,7 @@ published recipe when available and otherwise to the corresponding recipe in
 this directory. The recipe files remain the source of truth for commands and
 validation details.
 
-This source checkout targets final vLLM 0.33.0. Use the matching runtime in
+This source checkout targets final vLLM 0.34.0. Use the matching runtime in
 [the installation guide](../docs/getting_started/installation/README.md).
 Recipes explicitly pinned to an older Omni release, commit, external PR or
 container retain their historical runtime. Their measured hardware and quality
@@ -78,8 +78,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
-| [`hexgrad/Kokoro-82M-A6000.md`](./hexgrad/Kokoro-82M-A6000.md) | Online + offline TTS with 54 built-in voices (streaming PCM/WAV, SSE) | 1x RTX A6000 48GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
+| [`higurashi-ai/Haru-4B-H200.md`](./higurashi-ai/Haru-4B-H200.md) | Live full-duplex spoken dialogue over `/v1/realtime?duplex=1` (character card + voice reference) | 1x NVIDIA H200 141GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
@@ -106,7 +106,6 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Kandinsky/Kandinsky6-TI2VA.md`](./Kandinsky/Kandinsky6-TI2VA.md) | Text/image-to-video-and-audio, offline and `/v1/videos` | 1x H100 80GB with CPU offload; 2x H100 for parallel modes |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
 | [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified / 1x Intel Arc Pro B70 32GB |
-| [`JD/JoyAI-Image-Edit.md`](./JD/JoyAI-Image-Edit.md) | Text-guided single-image editing | 1x H800 PCIe 80GB |
 | [`m-a-p/SheetSage2-H200.md`](./m-a-p/SheetSage2-H200.md) | Official audio-to-score preprocessing and YuE2 request export | 1x H200 141GB |
 | [`m-a-p/YuE2-3B.md`](./m-a-p/YuE2-3B.md) | Offline and online text-to-music with optional ABC score | 1x RTX 4090 24GB |
 | [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
@@ -114,7 +113,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`NVIDIA/SANA-Video-2B.md`](./NVIDIA/SANA-Video-2B.md) | Native and Diffusers-adapter 480p/720p T2V+I2V | 1x RTX 5090 32GB |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
-| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) or 1x RTX 5090 32GB with layerwise offload |
+| [`Runway/Praxis-1.md`](./Runway/Praxis-1.md) | Closed-loop video/action robot policy (DROID single arm, YAM two arms): offline, OpenPI and Positronic serving | 1x NVIDIA H100 80GB |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`SandAI/MAGI-2-preview-NPU.md`](./SandAI/MAGI-2-preview-NPU.md) | Online Preview-stage T2VA at 272p | 4x NPU, 112 GiB each; TP1/SP4 eager |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
@@ -122,14 +122,17 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |
+| [`cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md`](./cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md) | Up-to-11-camera AV video generation (T2V / I2V / WSM transfer / view completion), optional joint numeric LiDAR | 1x / 2x (CFG) GB200 186GB, strict Ulysses CP; TP/HSDP configuration-only |
 | [`OpenBMB/MiniCPM-o-4_5.md`](./OpenBMB/MiniCPM-o-4_5.md) | Online full-duplex serving and offline inference for omni multimodal chat (text / image / audio / video → text + 24 kHz speech) | 2x A100/H100 80GB / 3x mid-tier GPU / 8x RTX 4090 24GB |
 | [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB / 1x Ascend 910B3 64GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
+| [`OpenMOSS/MOSS-TTS-Realtime-RTX5060Ti-16GB.md`](./OpenMOSS/MOSS-TTS-Realtime-RTX5060Ti-16GB.md) | Streaming voice-cloned TTS baseline | 1x RTX 5060 Ti 16GB |
 | [`OpenMOSS/MOSS-TTS-Nano-NPU.md`](./OpenMOSS/MOSS-TTS-Nano-NPU.md) | Online multilingual voice-cloned TTS | 1x Ascend 910B3 64GB |
 | [`Physis-AI/CausVid-Wan.md`](./Physis-AI/CausVid-Wan.md) | Experimental offline Noisy PP / Chunk PP on CausVid Wan 2.1 1.3B | Multi-GPU CUDA (SF: S=1; Latest-KV: S=D+1) |
 | [`Physis-AI/Physis-Same-Step.md`](./Physis-AI/Physis-Same-Step.md) | Experimental Same-Step video on five Physis checkpoints | Multi-GPU CUDA |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
 | [`NVIDIA/NemotronLabs-VoiceChat.md`](./NVIDIA/NemotronLabs-VoiceChat.md) | Offline speech-to-speech voice chat (11B, frame-locked 12.5 Hz, 3-stage thinker/talker/code2wav) | 1x H100 80GB |
+| [`NVIDIA/PersonaPlex-RTX5080-Laptop-16GB.md`](./NVIDIA/PersonaPlex-RTX5080-Laptop-16GB.md) | Live full-duplex speech-to-speech with per-session voice and persona, Stage 0 in FP8 | 1x RTX 5080 Laptop 16GB |
 | [`NVIDIA/SANA-WM.md`](./NVIDIA/SANA-WM.md) | First-frame image-to-video serving with camera control | 1x 24GB+ CUDA GPU; ~40GB disk |
 | [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4; offline text-to-image on XPU | 1x A100 80GB / 2x B200 / 1x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen-Image-2.1.md`](./Qwen/Qwen-Image-2.1.md) | Text-to-image and image-conditioned generation (editing) with prefix KV cache and CUDA graph decode | 1x GPU with CPU offload / 1x H200 |

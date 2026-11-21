@@ -578,6 +578,36 @@ def assert_wav_sample_rate(audio_bytes: bytes | None, sample_rate: int) -> None:
     assert info.samplerate == sample_rate, f"Expected a {sample_rate} Hz WAV, got {info.samplerate} Hz"
 
 
+def assert_wav_pcm_close(
+    first_audio_bytes: bytes | None,
+    second_audio_bytes: bytes | None,
+    *,
+    atol: int = 0,
+) -> None:
+    """Assert two uncompressed 16-bit WAV bodies have sample-close PCM."""
+    assert first_audio_bytes, "Expected first WAV bytes"
+    assert second_audio_bytes, "Expected second WAV bytes"
+    assert atol >= 0, "PCM absolute tolerance must be nonnegative"
+
+    def _decode(audio_bytes: bytes) -> tuple[tuple[int, int, int], np.ndarray]:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            assert wav_file.getsampwidth() == 2, "Expected 16-bit PCM WAV"
+            assert wav_file.getcomptype() == "NONE", "Expected uncompressed PCM WAV"
+            sample_rate = wav_file.getframerate()
+            channels = wav_file.getnchannels()
+            frame_count = wav_file.getnframes()
+            pcm = np.frombuffer(wav_file.readframes(frame_count), dtype="<i2")
+
+        assert pcm.size == frame_count * channels, "WAV frame data is truncated"
+        return (sample_rate, channels, frame_count), pcm.reshape(frame_count, channels)
+
+    first_metadata, first_pcm = _decode(first_audio_bytes)
+    second_metadata, second_pcm = _decode(second_audio_bytes)
+    assert first_metadata == second_metadata
+    assert first_pcm.size > 0, "Expected nonempty WAV samples"
+    np.testing.assert_allclose(second_pcm, first_pcm, rtol=0, atol=atol)
+
+
 def assert_audio_valid(
     audio_or_path: Path | np.ndarray,
     *,
@@ -735,21 +765,24 @@ def _assert_preset_voice_gender_from_audio(
 def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
     frame_len = int(0.03 * sr)
     hop = frame_len // 2
+    lags = np.arange(max(1, int(sr / 400)), min(int(sr / 80), frame_len - 1) + 1)
     hnr_values: list[float] = []
     for start in range(0, len(pcm_samples) - frame_len, hop):
-        frame = pcm_samples[start : start + frame_len].astype(np.float32, copy=False)
+        frame = pcm_samples[start : start + frame_len].astype(np.float64, copy=False)
         frame = frame - np.mean(frame)
-        if np.max(np.abs(frame)) < 0.01:
+        if np.max(np.abs(frame)) < 0.01 or lags.size == 0:
             continue
         ac = np.correlate(frame, frame, mode="full")[len(frame) - 1 :]
-        ac = ac / (ac[0] + 1e-10)
-        min_lag = int(sr / 400)
-        max_lag = min(int(sr / 80), len(ac))
-        if min_lag >= max_lag:
-            continue
-        peak = float(np.max(ac[min_lag:max_lag]))
-        if 0 < peak < 1:
-            hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
+        # At lag k only N-k samples overlap. Dividing by the full frame's
+        # energy attenuates low-pitch peaks even for a noiseless periodic
+        # signal. Normalize each correlation by the two overlapping segments'
+        # energies instead; their geometric mean also bounds it by one.
+        energy = np.concatenate(([0.0], np.cumsum(frame * frame)))
+        denominator = np.sqrt(energy[frame_len - lags] * (energy[-1] - energy[lags]))
+        correlation = np.divide(ac[lags], denominator, out=np.zeros(lags.size), where=denominator > 1e-10)
+        peak = min(float(np.max(correlation)), 1.0 - 1e-7)
+        if peak > 0:
+            hnr_values.append(10 * np.log10(peak / (1 - peak)))
     # Silence and constant signals provide no usable harmonic estimate. They
     # must not pass a model-specific floor of zero or below.
     return float(np.mean(hnr_values)) if hnr_values else float("-inf")
@@ -759,23 +792,26 @@ def _assert_pcm_int16_speech_hnr(
     audio_bytes: bytes,
     min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB,
     sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ,
+    channels: int = 1,
 ) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
-    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
-    which matches the cleaner TTS models the helper was originally calibrated
-    for. Quieter codecs (e.g. MOSS-TTS-Nano, whose voice_clone output is
-    intrinsically around -2 dB) can pass a lower per-test threshold via
-    request_config["min_hnr_db"] to keep the catastrophic-failure check
-    while not gating CI on a model-intrinsic property.
+    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB).
+    Tests can override it via request_config["min_hnr_db"]. The estimate uses
+    overlap-normalized correlation so a lower fundamental frequency does not
+    itself lower the score. Silence, constant signals and noise must fail;
+    HNR alone does not establish transcript correctness or perceptual quality.
 
     ``sr`` must be the stream's real sample rate: the autocorrelation lag window
     is derived from it, so a wrong rate detunes the 80-400 Hz pitch search and
     understates HNR for models that do not decode at 24 kHz.
     """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
-    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    assert len(audio_bytes) % (2 * channels) == 0, "PCM byte length must be aligned to int16 frames"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        # Interleaved multi-channel PCM: downmix so the pitch search sees one waveform.
+        pcm_samples = pcm_samples.reshape(-1, channels).mean(axis=1)
     hnr = _compute_pcm_hnr_db(pcm_samples, sr=sr)
     print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB, sr={sr})")
     assert hnr >= min_hnr_db, f"PCM speech HNR={hnr:.2f} dB is below the configured floor of {min_hnr_db} dB."
@@ -832,15 +868,22 @@ def _speech_pcm_sample_rate(request_config: dict[str, Any]) -> int:
     return int(expected or _PCM_SPEECH_SAMPLE_RATE_HZ)
 
 
+def _speech_pcm_channels(request_config: dict[str, Any]) -> int:
+    channels = request_config.get("transcript_pcm_channels", 1)
+    assert type(channels) is int and channels > 0, "transcript_pcm_channels must be a positive integer"
+    return channels
+
+
 def _speech_audio_for_transcription(audio_bytes: bytes | None, request_config: dict[str, Any]) -> bytes | None:
     """Give ASR a WAV container when a speech test opts into raw PCM transcription."""
     if not audio_bytes or request_config.get("response_format") != "pcm":
         return audio_bytes
     sample_rate = _speech_pcm_sample_rate(request_config)
-    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    channels = _speech_pcm_channels(request_config)
+    assert len(audio_bytes) % (2 * channels) == 0, "PCM byte length must be aligned to int16 frames"
     with io.BytesIO() as buffer:
         with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
+            wav_file.setnchannels(channels)
             wav_file.setsampwidth(2)
             wav_file.setframerate(sample_rate)
             wav_file.writeframes(audio_bytes)
@@ -1132,8 +1175,14 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             # search window to 147-735 Hz and misses the fundamental entirely,
             # scoring clean speech ~1.9 dB lower than it is.
             sample_rate = _speech_pcm_sample_rate(request_config)
+            channels = _speech_pcm_channels(request_config)
             try:
-                _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db, sr=sample_rate)
+                _assert_pcm_int16_speech_hnr(
+                    response.audio_bytes,
+                    min_hnr_db=min_hnr_db,
+                    sr=sample_rate,
+                    channels=channels,
+                )
             except AssertionError as exc:
                 _retain_failed_speech_audio(
                     response.audio_bytes,

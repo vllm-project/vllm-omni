@@ -5,7 +5,10 @@
 #      Start Token2Wav     #
 ############################
 
+from __future__ import annotations
+
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -31,14 +34,15 @@ from vllm.model_executor.models.utils import init_vllm_registered_model as _vllm
 from vllm.model_executor.models.utils import maybe_prefix as _vllm_maybe_prefix
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
@@ -1215,6 +1219,8 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     @property
     def sampler(self):
         # Token2Wav does not use sampler; return vLLM default for API parity
+        from vllm.v1.sample.sampler import Sampler
+
         return Sampler()
 
     def forward(

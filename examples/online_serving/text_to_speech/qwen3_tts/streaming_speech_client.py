@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """WebSocket client for streaming text-input TTS.
 
 Connects to the /v1/audio/speech/stream endpoint, sends text incrementally
@@ -28,6 +31,12 @@ Usage:
     python streaming_speech_client.py \
         --text "नमस्ते। कैसे हो?" \
         --split-granularity sentence
+
+    # Stream WAV output; binary frames form one continuous WAV byte stream
+    python streaming_speech_client.py \
+        --text "Hello world. How are you?" \
+        --stream-audio \
+        --response-format wav
 
     # Receive JSON sidecar chunks with word-level timestamps
     python streaming_speech_client.py \
@@ -64,6 +73,7 @@ Requirements:
 import argparse
 import asyncio
 import base64
+import io
 import json
 import os
 import wave
@@ -96,10 +106,30 @@ def save_audio_file(output_dir: str, basename: str, response_format: str, chunks
         save_pcm_wav(wav_path, audio_bytes)
         return wav_path
 
+    if response_format == "wav":
+        audio_bytes = finalize_streaming_wav(audio_bytes)
+
     filename = os.path.join(output_dir, f"{basename}.{response_format}")
     with open(filename, "wb") as f:
         f.write(audio_bytes)
     return filename
+
+
+def finalize_streaming_wav(audio_bytes: bytes) -> bytes:
+    """Rewrite a streamed WAV header with the final RIFF and data sizes."""
+    try:
+        source = wave.open(io.BytesIO(audio_bytes), "rb")
+    except (wave.Error, EOFError):
+        return audio_bytes
+
+    output = io.BytesIO()
+    with source, wave.open(output, "wb") as target:
+        target.setnchannels(source.getnchannels())
+        target.setsampwidth(source.getsampwidth())
+        target.setframerate(source.getframerate())
+        while frames := source.readframes(4096):
+            target.writeframes(frames)
+    return output.getvalue()
 
 
 def save_pcm_wav(path: str, audio_bytes: bytes, sample_rate: int = 24000) -> None:
@@ -360,7 +390,7 @@ def main():
     parser.add_argument(
         "--stream-audio",
         action="store_true",
-        help="Receive one or more PCM chunks per sentence (requires --response-format pcm)",
+        help="Receive one or more audio chunks per sentence (requires --response-format pcm or wav)",
     )
     parser.add_argument(
         "--word-timestamps",

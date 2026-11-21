@@ -29,9 +29,9 @@ uv pip check
 apt-get install -y espeak-ng jq
 ```
 
-The CUDA CI image verifies the vLLM 0.33 runtime and imports the rebuilt
-`lmcache.cuda_ops` before model tests. See the installation guide for the
-base-image dependency repairs; metadata checks alone do not verify native ABI.
+The CUDA CI image verifies the official vLLM 0.34.0 runtime and imports the
+rebuilt `lmcache.cuda_ops` before model tests. See the installation guide for
+runtime and dependency setup; metadata checks alone do not verify native ABI.
 
 ## Running Tests
 
@@ -148,7 +148,7 @@ Failed jobs: 1/2
     bash tools/nightly/run_nightly_jobs.sh --test-type function --model-type omni
     bash tools/nightly/run_nightly_jobs.sh --test-type perf --model-type diffusion
 
-    # Stability scripts (tests/dfx/stability/scripts/) and local marker tests
+    # Stability scripts (tests/dfx/stability/scripts/run_stability_benchmark.py) and local marker tests
     bash tools/nightly/run_nightly_jobs.sh --test-type stability --model-type omni
     bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
     ```
@@ -184,10 +184,10 @@ Failed jobs: 1/2
     cd tests
 
     # Stability: Qwen3-Omni
-    pytest -s -v dfx/stability/scripts/run_stability_qwen3_omni.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_benchmark.py --test-config-file dfx/stability/tests/test_qwen3_omni.json -m slow
 
     # Stability: Wan2.2 (v1/videos diffusion benchmark loop)
-    pytest -s -v dfx/stability/scripts/run_stability_wan22.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_benchmark.py --test-config-file dfx/stability/tests/test_wan22.json -m slow
 
     # Reliability: Qwen3-Omni (H100 × 2)
     pytest -s -v dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"
