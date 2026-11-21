@@ -2,11 +2,37 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+from fnmatch import fnmatch
 from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import save_file
+from vllm.config.load import LoadConfig
+from vllm.distributed import parallel_state
+
+from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeAttention
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.host_weight_plan import (
+    build_checkpoint_binding_plan,
+    build_checkpoint_mmap_plan,
+)
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import resolve_minimax_h3_diffusion_model_path
+from vllm_omni.diffusion.models.minimax_h3.single_file import (
+    MINIMAX_H3_BASE_MODEL,
+    MINIMAX_H3_BASE_REVISION,
+    MiniMaxH3SingleFileSpec,
+)
+from vllm_omni.diffusion.offloader.distributed_layerwise_backend import DistributedLayerwiseOffloadBackend
+from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent
+from vllm_omni.engine import stage_init_utils
+from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minimax_h3_encoder_model_root
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -52,8 +78,6 @@ def checkpoint_tensors():
 
 
 def test_inspect_compressed_checkpoint_derives_native_architecture(tmp_path, checkpoint_tensors):
-    from vllm_omni.diffusion.models.minimax_h3.single_file import MiniMaxH3SingleFileSpec
-
     path = tmp_path / "hybrid.safetensors"
     save_file(checkpoint_tensors, path)
     spec = MiniMaxH3SingleFileSpec.from_file(path)
@@ -85,8 +109,6 @@ def test_inspect_compressed_checkpoint_derives_native_architecture(tmp_path, che
     ],
 )
 def test_inspect_rejects_incomplete_or_unsupported_files(tmp_path, checkpoint_tensors, change, message):
-    from vllm_omni.diffusion.models.minimax_h3.single_file import MiniMaxH3SingleFileSpec
-
     tensors = checkpoint_tensors
     if change == "missing_projection":
         del tensors["final_layer.audio_out.weight"]
@@ -117,8 +139,6 @@ def test_inspect_rejects_incomplete_or_unsupported_files(tmp_path, checkpoint_te
 
 
 def test_single_file_config_preserves_h3_architecture_and_reference_inputs(tmp_path, checkpoint_tensors):
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
     path = tmp_path / "hybrid.safetensors"
     save_file(checkpoint_tensors, path)
     config = OmniDiffusionConfig(model=str(path), model_class_name="MiniMaxH3ModularPipeline")
@@ -132,9 +152,6 @@ def test_single_file_config_preserves_h3_architecture_and_reference_inputs(tmp_p
 
 
 def test_single_file_resolves_serving_stage_without_hub_discovery(tmp_path, checkpoint_tensors, monkeypatch):
-    from vllm_omni.config.config_factory import StageConfigFactory
-    from vllm_omni.config.resolver import resolve_omni_config
-
     def unexpected_discovery(*args, **kwargs):
         pytest.fail("single-file H3 must not resolve its local filename as a Hub repository")
 
@@ -155,12 +172,6 @@ def test_single_file_resolves_serving_stage_without_hub_discovery(tmp_path, chec
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
 @pytest.mark.parametrize("custom_base", [False, True])
 def test_single_file_disaggregated_uses_file_for_dit_and_base_for_encoder(tmp_path, monkeypatch, task, custom_base):
-    from vllm_omni.config.resolver import resolve_omni_config
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import resolve_minimax_h3_diffusion_model_path
-    from vllm_omni.diffusion.models.minimax_h3.single_file import MINIMAX_H3_BASE_MODEL, MINIMAX_H3_BASE_REVISION
-    from vllm_omni.engine import stage_init_utils
-    from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minimax_h3_encoder_model_root
-
     path = tmp_path / "hybrid.safetensors"
     path.touch()
     base = tmp_path / "base"
@@ -193,9 +204,6 @@ def test_single_file_disaggregated_uses_file_for_dit_and_base_for_encoder(tmp_pa
 
 
 def test_single_file_disaggregated_decoder_uses_base_components(tmp_path, monkeypatch):
-    from vllm_omni.config.resolver import resolve_omni_config
-    from vllm_omni.engine import stage_init_utils
-
     path = tmp_path / "hybrid.safetensors"
     path.touch()
     base = str(tmp_path / "base")
@@ -236,20 +244,6 @@ def test_single_file_disaggregated_decoder_uses_base_components(tmp_path, monkey
 def test_pipeline_loads_selected_file_for_each_task(
     tmp_path, checkpoint_tensors, monkeypatch, task, as_symlink, base_source, expected_revision
 ):
-    from vllm.config.load import LoadConfig
-    from vllm.distributed import parallel_state
-
-    from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeAttention
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-    from vllm_omni.diffusion.model_loader.host_weight_plan import (
-        build_checkpoint_binding_plan,
-        build_checkpoint_mmap_plan,
-    )
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
-
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
     monkeypatch.setattr(blocks, "Attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -360,9 +354,6 @@ def test_pipeline_loads_selected_file_for_each_task(
 
     # DLO realizes checkpoint tensors before post-load validation. Mixed BF16
     # checkpoints must be cast to their FP32 runtime targets at that boundary.
-    from vllm_omni.diffusion.offloader.distributed_layerwise_backend import DistributedLayerwiseOffloadBackend
-    from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent
-
     backend = object.__new__(DistributedLayerwiseOffloadBackend)
     backend.device = torch.device("cpu")
     backend._using_rank_local_mmap = True
@@ -380,10 +371,6 @@ def test_pipeline_loads_selected_file_for_each_task(
 
 @pytest.mark.parametrize("partition", ["fl2va", "ref2va"])
 def test_single_file_base_download_excludes_dense_dits(monkeypatch, tmp_path, partition):
-    from fnmatch import fnmatch
-
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
-
     captured = {}
 
     def download(**kwargs):
