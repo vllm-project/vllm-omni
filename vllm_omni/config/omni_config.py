@@ -303,6 +303,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     allgather_degree: int
     ulysses_mode: str
     ulysses_a2a_permute: bool
+    ulysses_ce_overlap_chunks: int
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     vae_parallel_mode: str
@@ -905,6 +906,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
     ulysses_a2a_permute: bool = False
+    ulysses_ce_overlap_chunks: int = Field(default=0, ge=0)
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)

@@ -767,6 +767,19 @@ def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
     assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
 
 
+def test_serve_parser_accepts_ulysses_ce_overlap_chunks() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--ulysses-a2a-permute", "--ulysses-ce-overlap-chunks", "4"]
+    )
+
+    assert args.ulysses_ce_overlap_chunks == 4
+    assert args.get_explicit_kwargs_dict()["ulysses_ce_overlap_chunks"] == 4
+
+
 def test_serve_parser_accepts_server_level_mixfusion_flags() -> None:
     """The server-level MixFusion knobs are modeled on ``OrchestratorArgs`` and
     ``StageDeployConfig`` but must also be registered in the serve parser, so

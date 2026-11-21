@@ -244,8 +244,10 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
+        ce_overlap_chunks: int = 0,
     ) -> None:
         self._sp_group = sp_group
+        self.ce_overlap_chunks = int(ce_overlap_chunks)
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx

@@ -827,6 +827,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--ulysses-ce-overlap-chunks",
+            type=int,
+            default=None,
+            help=(
+                "With --ulysses-a2a-permute on CUDA, split each rank's attention heads into this many chunks and "
+                "move them on copy engines while earlier chunks compute (must divide num_heads / ulysses_degree; "
+                "0 disables). Requires strict pure Ulysses. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
