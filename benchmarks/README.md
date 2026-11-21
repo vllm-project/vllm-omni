@@ -25,18 +25,10 @@ Online-serving benchmark for diffusion image/video models, sending requests to t
 - **Datasets**: `vbench`, `trace`, `random`
 - **Key metrics**: request throughput, latency percentiles, optional SLO attainment
 
-### [GLM-Image](glm_image/README.md) — Text-to-Image and Image-to-Image
-
-Benchmarks for GLM-Image performance across HuggingFace baseline, vLLM-Omni offline inference, and vLLM-Omni online serving.
-
-- **Layout**: `glm_image/huggingface/` (HF baseline), `glm_image/vllm-omni/` (offline inference), `glm_image/benchmark_glm_image.py` (online serving)
-- **Tasks**: text-to-image and image-to-image
-- **Key metrics**: request/image throughput, latency percentiles, optional per-stage pipeline timings
-
-### [LingBot-Video](lingbot_video/README.md) — Dense and MoE Parity
+### [LingBot-Video](../tests/parity/lingbot_video/README.md) — Dense and MoE Parity
 
 Manual cross-runtime validation for the dense LingBot-Video pipeline and the
-LingBot-Video MoE transformer.
+LingBot-Video MoE transformer, hosted under `tests/parity/lingbot_video/`.
 
 - **Dense pipeline**: decoded-video MAE, MSE, PSNR, latency, and optional steady-state timings
 - **MoE transformer**: bitwise router, sparse-block, shared-expert, and full-transformer parity
