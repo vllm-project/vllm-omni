@@ -17,7 +17,6 @@ import numpy as np
 import pybase64
 from PIL import Image
 from vllm.config import ModelConfig
-from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.stage_config import PipelineConfig
@@ -86,6 +85,11 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     TextSummaryChunk,
     TextSummaryLimit,
     TextSummaryProgress,
+)
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompt import (
+    drop_oldest_visual_frame,
+    interleave_history,
+    visual_response_refs,
 )
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,
@@ -1047,7 +1051,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return query, query_index
 
     def _working_messages(
-        self, session_config: Mapping[str, object], runtime_config: Mapping[str, object]
+        self,
+        session_config: Mapping[str, object],
+        runtime_config: Mapping[str, object],
+        *,
+        awaiting_transcript: bool = False,
     ) -> tuple[list[dict[str, object]], list[Image.Image], list[int]]:
         """Render retained visual observations in order, without owning played Q&A."""
         pending = {frame.id: frame for frame in session_config.get("joyai_pending_frames", ())}
@@ -1075,7 +1083,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", [])))
             if role == "user" and text
         }
-        query, query_index = self._current_query(session_config, runtime_config)
+        query, query_index = ("", -1) if awaiting_transcript else self._current_query(session_config, runtime_config)
         current_query_key = (
             (item_ids[query_index] if 0 <= query_index < len(item_ids) and item_ids[query_index] else query_index)
             if query
@@ -1104,7 +1112,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     "role": "user",
                     "content": content,
                     "_query_key": included_query_key,
-                    "_history_anchors": observation.history_anchor_item_ids,
+                    "_history_anchors": list(observation.history_anchor_item_ids),
                     "_response_item_id": observation.response_item_id,
                 }
             )
@@ -1126,7 +1134,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             content.extend([{"type": "text", "text": f"<{time_s:.1f} seconds>"}, {"type": "image"}])
             images.append(image)
             counts.append(tokens)
-        if not content:
+        if not content and not awaiting_transcript:
             content.append(
                 {"type": "text", "text": "Observe the current scene and choose whether to speak or stay silent."}
             )
@@ -1181,85 +1189,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return "\n".join(lines), active_query, prefix_keys
 
     @staticmethod
-    def _interleave_history(
-        history: list[dict[str, object]], working_messages: list[dict[str, object]], prefix_keys: set
-    ) -> list[dict[str, object]]:
-        """Place committed Q&A at its visual source, resolving item references anew."""
-        by_key = {message["_item_key"]: message for message in history}
-        positions = {message["_item_key"]: index for index, message in enumerate(history)}
-        current_query_key = working_messages[-1].get("_query_key")
-        query_has_position = current_query_key in by_key and any(
-            current_query_key in message.get("_history_anchors", ()) for message in working_messages[:-1]
-        )
-        claimed = {
-            key
-            for message in working_messages
-            for key in (message.get("_query_key"), message.get("_response_item_id"))
-            if key is not None and not (message.get("_current") and query_has_position and key == current_query_key)
-        }
-        messages = []
-        cursor = 0
-
-        def append_history(end: int) -> None:
-            nonlocal cursor
-            while cursor < end:
-                message = history[cursor]
-                if message["_item_key"] not in claimed:
-                    content = message["content"]
-                    if message["role"] == "user":
-                        content = [{"type": "text", "text": f"{USER_QUERY_HEADER}\n{content}"}]
-                    messages.append({"role": message["role"], "content": content})
-                cursor += 1
-
-        for source in working_messages:
-            if source.get("_current"):
-                append_history(len(history))
-            else:
-                anchor = next(
-                    (positions[key] for key in reversed(source.get("_history_anchors", ())) if key in positions), -1
-                )
-                append_history(anchor + 1)
-            content = source["content"]
-            query_key = source.get("_query_key")
-            if isinstance(content, list) and query_key is not None:
-                # Budget-trimmed or deleted historical queries stay removed.
-                # The current instruction remains available with its images.
-                if (
-                    query_key in prefix_keys
-                    or (source.get("_current") and query_has_position)
-                    or (query_key not in by_key and query_key != current_query_key)
-                ):
-                    content = [part for part in content if not part.get("text", "").startswith(USER_QUERY_HEADER)]
-            messages.append({"role": source["role"], "content": content})
-            response = by_key.get(source.get("_response_item_id"))
-            if response is not None and response["role"] == "assistant":
-                messages.append({"role": "assistant", "content": response["content"]})
-        return messages
-
-    @staticmethod
-    def _drop_oldest_visual_frame(messages: list[dict[str, object]]) -> None:
-        """Trim one frame and its timestamp at an explicit model-context boundary."""
-        for index, message in enumerate(messages):
-            content = message["content"]
-            if message["role"] != "user" or not isinstance(content, list):
-                continue
-            for part_index, part in enumerate(content):
-                if part.get("type") == "image":
-                    del content[part_index - 1 : part_index + 1]
-                    if not content:
-                        del messages[index]
-                        if index < len(messages) and messages[index]["role"] == "assistant":
-                            del messages[index]
-                    return
-
-    @staticmethod
     def _bounded_text_history(
-        session_config: dict[str, object], runtime_config: dict[str, object]
+        session_config: dict[str, object], runtime_config: dict[str, object], *, response_refs: set[str]
     ) -> tuple[list[dict[str, object]], dict[str, object] | None, str]:
         """Select unsummarized recent turns and retain the latest instruction."""
         history = []
         item_ids = session_config.get("conversation_item_ids", ())
-        response_refs = {item.response_item_id for item in session_config.get("joyai_observations", ())}
         query = runtime_config.get("initial_user_text") or ""
         latest_instruction = None
         if query:
@@ -1339,15 +1274,15 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         if payload.get("audio"):
             return self._plan_speech_append(session_config, runtime_config, payload, sampling_params)
-        history, latest_instruction, query = self._bounded_text_history(session_config, runtime_config)
-        # Rendering attaches fresh queries to their visual observation and
-        # leaves already-observed items at their committed history position.
-        unsummarized_history = history.copy()
         working_messages, images, image_token_counts = self._working_messages(session_config, runtime_config)
         while len(images) > self.max_images:
-            self._drop_oldest_visual_frame(working_messages)
+            drop_oldest_visual_frame(working_messages)
             images.pop(0)
             image_token_counts.pop(0)
+        history, latest_instruction, query = self._bounded_text_history(
+            session_config, runtime_config, response_refs=visual_response_refs(working_messages)
+        )
+        unsummarized_history = history.copy()
         system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
@@ -1371,7 +1306,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             )
             messages = [
                 {"role": "system", "content": system},
-                *self._interleave_history(
+                *interleave_history(
                     [message for message in history if message["_item_key"] not in prefix_keys],
                     working_messages,
                     prefix_keys,
@@ -1416,7 +1351,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 visual_summaries.pop(0)
                 rebudget_history = True
             elif len(images) > 1:
-                self._drop_oldest_visual_frame(working_messages)
+                drop_oldest_visual_frame(working_messages)
                 images.pop(0)
                 image_token_counts.pop(0)
             else:
@@ -1434,18 +1369,19 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     def _plan_speech_append(self, session_config, runtime_config, payload, sampling_params) -> DuplexAppendPlan:
         """Keep ASR handoff budgeting deferred until the transcript is available."""
-        history, _, _ = self._bounded_text_history(session_config, runtime_config)
-        # The new spoken query is not known yet. Keep the initial standing
-        # instruction separate from evictable history until ASR supplies it.
+        working_messages, images, image_token_counts = self._working_messages(
+            session_config, runtime_config, awaiting_transcript=True
+        )
+        while len(images) > self.max_images:
+            drop_oldest_visual_frame(working_messages)
+            images.pop(0)
+            image_token_counts.pop(0)
+        history, _, _ = self._bounded_text_history(
+            session_config, runtime_config, response_refs=visual_response_refs(working_messages)
+        )
+        # Keep the standing instruction pinned until ASR supplies the new query.
         instruction = runtime_config.get("initial_user_text") or ""
-        history = [{"role": item["role"], "content": item["content"]} for item in history if item["_item_key"] != -1]
-        images = []
-        for encoded in session_config.get("joyai_frames", [])[-4:]:
-            if encoded.startswith("data:"):
-                encoded = encoded.split(",", 1)[1]
-            with open_image(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
-                image.thumbnail((448, 448))
-                images.append(image.convert("RGB").copy())
+        history = [item for item in history if item["_item_key"] != -1]
         system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
@@ -1455,7 +1391,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
-        image_token_counts = self._image_token_counts(images)
         prompt_data = {
             "additional_information": {
                 key: runtime_config[key] for key in ("tts_speaker", "tts_language", "tts_instruct")
@@ -1470,6 +1405,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             joyai_prompt_context={
                 "system": system,
                 "history": history,
+                "working_messages": working_messages,
                 "instruction": instruction,
                 "summary": session_config.get("joyai_summary") or "",
                 "visual_summaries": [
