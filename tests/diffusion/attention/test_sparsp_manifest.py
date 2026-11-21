@@ -21,7 +21,9 @@ def test_manifest_preserves_packed_order_on_reuse(world, blocks):
         manifest = DemandManifest(rank, world, heads, blocks, device)
         empty, full = torch.zeros_like(gives), torch.ones_like(wants)
         for outgoing, incoming in ((gives, wants), (empty, full), (gives, wants)):
-            send, receive = manifest.compact(outgoing, incoming)
+            manifest.compact(outgoing, incoming)
+            torch.cuda.current_stream(device).synchronize()
+            send, receive = manifest.plan()
             for route, sent, received in zip(hops, send, receive, strict=True):
                 assert torch.equal(sent, outgoing[route.destination].nonzero().T)
                 assert torch.equal(received, incoming[route.source].nonzero().T)
@@ -35,7 +37,9 @@ def check_pair_relay_layout(device):
         plans = []
         for manifest in manifests:
             manifest.wants.copy_(demand)
-            plans.append(manifest.compact())
+            manifest.compact()
+        torch.cuda.current_stream(device).synchronize()
+        plans.extend(manifest.plan() for manifest in manifests)
         for rank, plan in enumerate(plans):
             within, across, forwarded = rank ^ 1, rank ^ 2, rank ^ 3
             assert torch.equal(plan.local_send, demand[within, rank].nonzero().T)

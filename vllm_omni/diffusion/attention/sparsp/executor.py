@@ -26,6 +26,7 @@ class SparseRingExecutor:
         self.provider = SpargeProvider(config, heads, device)
         self.compute = torch.cuda.Stream(device=device)
         self.communication = torch.cuda.Stream(device=device)
+        self.planning = torch.cuda.Stream(device=device) if config.demand_planner == "manifest" else None
         self.manifest: DemandManifest | None = None
         self.pair_manifest: PairRelayManifest | None = None
         self.hops = peer_hops(self.rank, self.world, min(2, self.world - 1))
@@ -89,15 +90,31 @@ class SparseRingExecutor:
         wants = self._wants(selected)
         gives = torch.empty_like(wants)
         dist.all_to_all_single(gives, wants, group=self.group)
-        if self.manifest is not None:
-            send, receive = self.manifest.compact(gives, wants)
-            return send, receive
         peer_ranks = [(self.rank + offset) % self.world for offset in range(1, self.world)]
         masks = torch.stack([gives[peer] for peer in peer_ranks] + [wants[peer] for peer in reversed(peer_ranks)])
         indices = masks.nonzero()[:, 1:].T.contiguous()
         counts = masks.sum(dim=(1, 2)).tolist()
         plans = indices.split(counts, dim=1)
         return plans[: self.world - 1], plans[self.world - 1 :]
+
+    def _prepare_manifest(self, q: torch.Tensor, k: torch.Tensor, scale: float) -> torch.Tensor:
+        planning = self.planning
+        assert planning is not None
+        q.record_stream(planning)
+        k.record_stream(planning)
+        planning.wait_stream(self.compute)
+        with torch.cuda.stream(planning):
+            selected = self._select(q, k, scale)
+            wants = self._wants(selected)
+            if self.pair_manifest is not None:
+                dist.all_gather_into_tensor(self.pair_manifest.wants.flatten(), wants.flatten(), group=self.group)
+                self.pair_manifest.compact()
+            else:
+                assert self.manifest is not None
+                gives = torch.empty_like(wants)
+                dist.all_to_all_single(gives, wants, group=self.group)
+                self.manifest.compact(gives, wants)
+        return selected
 
     def _attend(self, step, owner, q, qs, k, ks, v, selected, scale) -> None:
         blocks = self.tokens // 64
@@ -111,7 +128,7 @@ class SparseRingExecutor:
     def _prepare_packet(self, slot: int) -> torch.Tensor:
         event = self._sent[slot]
         if event is not None:
-            self.compute.wait_event(event)
+            torch.cuda.current_stream(self.device).wait_event(event)
         return self.send[slot]
 
     def _exchange_packet(
@@ -123,6 +140,7 @@ class SparseRingExecutor:
         receive_bytes: int,
         *,
         receive_into: torch.Tensor | None = None,
+        ready_stream: torch.cuda.Stream | None = None,
     ) -> torch.cuda.Event:
         inbox = self.receive[slot] if receive_into is None else receive_into
         ops = []
@@ -130,8 +148,8 @@ class SparseRingExecutor:
             ops.append(dist.P2POp(dist.isend, self.send[slot][:send_bytes], group=self.group, group_peer=destination))
         if receive_bytes:
             ops.append(dist.P2POp(dist.irecv, inbox[:receive_bytes], group=self.group, group_peer=source))
-        # Packing and prior consumption of this packet's slots are ordered on compute.
-        self.communication.wait_stream(self.compute)
+        # Wait for packing and any earlier read of a reused receive slot.
+        self.communication.wait_stream(self.compute if ready_stream is None else ready_stream)
         with torch.cuda.stream(self.communication):
             if ops:
                 for work in dist.batch_isend_irecv(ops):
@@ -141,19 +159,24 @@ class SparseRingExecutor:
         self._sent[slot] = done
         return done
 
+    def _post_direct_packet(self, index, k, v, outgoing, incoming_count, ready_stream=None) -> torch.cuda.Event:
+        source, destination, slot = self.hops[index]
+        heads, blocks = outgoing
+        pack_kv(k, v, heads, blocks, self._prepare_packet(slot))
+        block_bytes = kv_block_bytes(self.dim)
+        send_bytes = heads.numel() * block_bytes
+        self.payload_bytes += send_bytes
+        if self.world == 4 and self.rank // 2 != destination // 2:
+            self.cross_pair_payload_bytes += send_bytes
+        return self._exchange_packet(
+            slot, destination, source, send_bytes, incoming_count * block_bytes, ready_stream=ready_stream
+        )
+
     def _direct(self, q, qs, k, v, local_k, selected, scale) -> None:
         send, receive = self._demands(selected)
-        block_bytes = kv_block_bytes(self.dim)
 
         def issue(index: int) -> torch.cuda.Event:
-            source, destination, slot = self.hops[index]
-            heads, blocks = send[index]
-            pack_kv(k, v, heads, blocks, self._prepare_packet(slot))
-            send_bytes, receive_bytes = heads.numel() * block_bytes, receive[index].shape[1] * block_bytes
-            self.payload_bytes += send_bytes
-            if self.world == 4 and self.rank // 2 != destination // 2:
-                self.cross_pair_payload_bytes += send_bytes
-            return self._exchange_packet(slot, destination, source, send_bytes, receive_bytes)
+            return self._post_direct_packet(index, k, v, send[index], receive[index].shape[1])
 
         event = issue(0)
         ki, ks = self.provider.quantize(local_k, 64)
@@ -177,12 +200,36 @@ class SparseRingExecutor:
                     scale,
                 )
 
-    def _pair_relay(self, q, qs, k, v, local_k, selected, scale) -> None:
+    def _direct_manifest(self, q, qs, k, v, local, selected, scale) -> None:
+        planning, manifest = self.planning, self.manifest
+        assert planning is not None and manifest is not None
+        send, receive = manifest.plan()
+
+        def issue(index: int) -> torch.cuda.Event:
+            with torch.cuda.stream(planning):
+                return self._post_direct_packet(index, k, v, send[index], receive[index].shape[1], planning)
+
+        slots = len(self.send)
+        events = [issue(index) for index in range(slots)]
+        self._attend(0, self.rank, q, qs, *local, selected, scale)
+        for index, (heads, blocks) in enumerate(receive):
+            self.compute.wait_event(events[index])
+            source, _, slot = self.hops[index]
+            if heads.numel():
+                place_kv(self.receive[slot], heads, blocks, self.key, self.key_scale, self.value, k.dtype)
+            if index + slots < len(receive):
+                # Placement has consumed the old receive buffer. Its next
+                # transfer can overlap attention on the placed K/V.
+                planning.wait_stream(self.compute)
+                events.append(issue(index + slots))
+            if heads.numel():
+                self._attend(index + 1, source, q, qs, self.key, self.key_scale, self.value, selected, scale)
+
+    def _pair_relay(self, q, qs, k, v, local, selected, scale) -> None:
         manifest = self.pair_manifest
-        assert manifest is not None
-        wants = self._wants(selected)
-        dist.all_gather_into_tensor(manifest.wants.flatten(), wants.flatten(), group=self.group)
-        plan = manifest.compact()
+        planning = self.planning
+        assert manifest is not None and planning is not None
+        plan = manifest.plan()
         within, across, forwarded = self.rank ^ 1, self.rank ^ 2, self.rank ^ 3
         block_bytes = kv_block_bytes(self.dim)
 
@@ -194,26 +241,27 @@ class SparseRingExecutor:
                 step = (self.rank - owner) % self.world
                 self._attend(step, owner, q, qs, self.key, self.key_scale, self.value, selected, scale)
 
-        heads, blocks = plan.local_send.unbind()
-        pack_kv(k, v, heads, blocks, self._prepare_packet(0))
-        local_bytes = plan.local_send.shape[1] * block_bytes
-        local_event = self._exchange_packet(0, within, within, local_bytes, plan.local_receive.shape[1] * block_bytes)
-        ki, ks = self.provider.quantize(local_k, 64)
-        self._attend(0, self.rank, q, qs, ki, ks, self._compute_input(v), selected, scale)
-
-        # Receive into the acquired send slot so its prefix can be forwarded.
-        relay_slot = self._prepare_packet(0)
-        heads, blocks = plan.cross_send.unbind()
-        pack_kv(k, v, heads, blocks, self._prepare_packet(1))
-        cross_bytes = plan.cross_send.shape[1] * block_bytes
-        cross_event = self._exchange_packet(
-            1,
-            across,
-            across,
-            cross_bytes,
-            plan.cross_receive.shape[1] * block_bytes,
-            receive_into=relay_slot,
-        )
+        with torch.cuda.stream(planning):
+            pack_kv(k, v, *plan.local_send.unbind(), self._prepare_packet(0))
+            local_bytes = plan.local_send.shape[1] * block_bytes
+            local_event = self._exchange_packet(
+                0, within, within, local_bytes, plan.local_receive.shape[1] * block_bytes, ready_stream=planning
+            )
+            pack_kv(k, v, *plan.cross_send.unbind(), self._prepare_packet(1))
+            cross_bytes = plan.cross_send.shape[1] * block_bytes
+            # The NCCL stream reads send[0] for the local hop before writing
+            # the cross-socket packet into it for forwarding.
+            relay_slot = self.send[0]
+            cross_event = self._exchange_packet(
+                1,
+                across,
+                across,
+                cross_bytes,
+                plan.cross_receive.shape[1] * block_bytes,
+                receive_into=relay_slot,
+                ready_stream=planning,
+            )
+        self._attend(0, self.rank, q, qs, *local, selected, scale)
         self.compute.wait_event(local_event)
         attend_packet(within, self.receive[0], plan.local_receive)
         self.compute.wait_event(cross_event)
@@ -269,14 +317,28 @@ class SparseRingExecutor:
                 q = self._compute_input(query.transpose(1, 2))
                 k, v = key.transpose(1, 2), value.transpose(1, 2)
                 local_k = self._compute_input(k)
-                selected = self._select(q, local_k, scale)
+                planning = self.planning
+                selected = (
+                    self._select(q, local_k, scale) if planning is None else self._prepare_manifest(q, local_k, scale)
+                )
                 self.payload_bytes = 0
                 self.cross_pair_payload_bytes = 0
                 self.dense_payload_bytes = (self.world - 1) * 2 * k.numel() * k.element_size()
                 self.lses.fill_(-torch.inf)
                 qi, qs = self.provider.quantize(q, 128)
-                if self.config.routing == "selective_pair_relay":
-                    self._pair_relay(qi, qs, k, v, local_k, selected, scale)
+                if planning is not None:
+                    ki, ks = self.provider.quantize(local_k, 64)
+                    local = (ki, ks, self._compute_input(v))
+                    # NCCL needs host-visible lengths. Wait only for the
+                    # planning stream while local preparation is in flight.
+                    planning.synchronize()
+                    selected.record_stream(self.compute)
+                    k.record_stream(planning)
+                    v.record_stream(planning)
+                    if self.pair_manifest is None:
+                        self._direct_manifest(qi, qs, k, v, local, selected, scale)
+                    else:
+                        self._pair_relay(qi, qs, k, v, local, selected, scale)
                 elif self.config.routing == "selective_direct":
                     self._direct(qi, qs, k, v, local_k, selected, scale)
                 else:
@@ -295,4 +357,6 @@ class SparseRingExecutor:
             return
         self.compute.synchronize()
         self.communication.synchronize()
+        if self.planning is not None:
+            self.planning.synchronize()
         self._closed = True

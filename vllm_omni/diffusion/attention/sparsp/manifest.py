@@ -47,8 +47,9 @@ class DemandManifest:
         self.capacity = heads * blocks
         self.indices = torch.empty((2, world - 1, 2, self.capacity), dtype=torch.int32, device=device)
         self.counts = torch.empty((2, world - 1), dtype=torch.int32, device=device)
+        self.host_counts = torch.empty(self.counts.shape, dtype=torch.int32, device="cpu", pin_memory=True)
 
-    def compact(self, gives: torch.Tensor, wants: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], ...]:
+    def compact(self, gives: torch.Tensor, wants: torch.Tensor) -> None:
         _compact[(2, self.world - 1)](
             gives,
             wants,
@@ -60,10 +61,13 @@ class DemandManifest:
             self.capacity,
             triton.next_power_of_2(self.capacity),
         )
-        # Read just the lengths needed to form the NCCL tensor slices.
+        self.host_counts.copy_(self.counts, non_blocking=True)
+
+    def plan(self) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Read packet lengths after the planning stream has completed."""
         return tuple(
             tuple(self.indices[direction, hop, :, :count] for hop, count in enumerate(lengths))
-            for direction, lengths in enumerate(self.counts.tolist())
+            for direction, lengths in enumerate(self.host_counts.tolist())
         )
 
 
@@ -121,8 +125,9 @@ class PairRelayManifest:
         self.wants = torch.empty((4, 4, heads, blocks), dtype=torch.bool, device=device)
         self.indices = torch.empty((5, 2, self.capacity), dtype=torch.int32, device=device)
         self.counts = torch.empty(6, dtype=torch.int32, device=device)
+        self.host_counts = torch.empty(self.counts.shape, dtype=torch.int32, device="cpu", pin_memory=True)
 
-    def compact(self) -> PairRelayPlan:
+    def compact(self) -> None:
         _compact_pairs[(5,)](
             self.wants,
             self.indices,
@@ -132,7 +137,11 @@ class PairRelayManifest:
             self.capacity,
             triton.next_power_of_2(self.capacity),
         )
-        *lengths, forward_count = self.counts.tolist()
+        self.host_counts.copy_(self.counts, non_blocking=True)
+
+    def plan(self) -> PairRelayPlan:
+        """Read packet lengths after the planning stream has completed."""
+        *lengths, forward_count = self.host_counts.tolist()
         local_send, local_receive, cross_send, cross_receive, forward_receive = (
             self.indices[row, :, :count] for row, count in enumerate(lengths)
         )

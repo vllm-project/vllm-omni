@@ -16,6 +16,10 @@ Both endpoints derive the same head/block order and payload length. Each
 sender packs those blocks into contiguous K/V packets and the receiver
 places them in the layout used by sparse attention. The `manifest` planner
 compacts indices in one GPU pass and reads back only the packet lengths.
+Planning overlaps with local Q/K quantization and V layout preparation.
+NCCL packet lengths are copied into pinned host memory on the planning
+stream. The first two hops can use separate slots, and a later hop
+reuses its slot once placement has consumed the previous packet.
 The union over local queries determines traffic savings.
 
 With four Ring ranks, `selective_pair_relay` groups ranks 0–1 and 2–3.
