@@ -423,9 +423,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device=device,
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
-        # The three decoder fast paths below are XPU-only: they were written
-        # against the XPU kernels/compile stack and validated there. CUDA keeps
-        # its own fused-operator path (install_h3_vae_optimizations above); on
+        # The three decoder fast paths below were written against the XPU
+        # kernels/compile stack and validated there; the FP16 weight cast alone
+        # is also available on NPU, as an opt-in. CUDA keeps its own
+        # fused-operator path (install_h3_vae_optimizations above); on
         # every other device the checkpoint's reference decoder runs unchanged
         # and none of the switches prints or installs anything. Like
         # install_h3_vae_optimizations, they target the checkpoint's own
@@ -454,7 +455,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 len(_blocks),
                 device,
             )
-        if _xpu and os.environ.get("H3_VAE_FP16_WEIGHTS", "1") == "1" and decoder is not None:
+        # Ascend decodes under the same FP16 autocast and never installs the CUDA path either, so the same cast
+        # applies there. It is opt-in on NPU (H3_VAE_FP16_WEIGHTS=1); the XPU default stays on.
+        _npu = device.type == "npu" and decoder_path is None
+        _fp16_weights = os.environ.get("H3_VAE_FP16_WEIGHTS", "1" if _xpu else "0") == "1"
+        if (_xpu or _npu) and _fp16_weights and decoder is not None:
             # CUDA path (ops/vae/__init__.py) persists decoder-block Linear weights in fp16 so autocast does not re-cast
             # every weight on every tile; on XPU that path is never installed. Same cast, env-gated.
             from vllm_omni.diffusion.models.minimax_h3.ops.vae import _decoder_block_linears as _h3_dbl

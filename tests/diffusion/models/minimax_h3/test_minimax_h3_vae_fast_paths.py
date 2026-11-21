@@ -149,6 +149,31 @@ def test_non_xpu_is_a_quiet_noop(component_dir, compile_spy, linears, fake_check
     assert getattr(decoder, "_h3_xefmha_stats", None) is None
 
 
+class _NpuDevice:
+    """Stock torch has no "npu" device type; the constructor only reads ``.type``."""
+
+    type = "npu"
+    index = 0
+
+
+@pytest.mark.parametrize(("env", "expected"), [(None, torch.float32), ("0", torch.float32), ("1", torch.float16)])
+def test_npu_fp16_weights_is_opt_in_and_installs_nothing_else(
+    component_dir, compile_spy, linears, fake_checkpoint, monkeypatch, env, expected
+):
+    for var in ("H3_VAE_XEFMHA", "H3_VAE_COMPILE", "H3_VAE_FP16_WEIGHTS"):
+        monkeypatch.delenv(var, raising=False)
+    if env is not None:
+        monkeypatch.setenv("H3_VAE_FP16_WEIGHTS", env)
+    vae = MiniMaxH3VideoVAE(component_dir, device=_NpuDevice(), trust_remote_code=True, allow_decoder_compile=True)
+    decoder = vae.remote.model.decoder
+
+    assert all(lin.weight.dtype == expected for lin in linears)
+    # The attention reroute and the compile stay XPU-only.
+    assert not compile_spy
+    assert all(b.attn.perform_attention is b.attn._original for b in decoder.transformer_blocks)
+    assert getattr(decoder, "_h3_xefmha_stats", None) is None
+
+
 def test_xpu_compile_denied_keeps_other_two(component_dir, compile_spy, linears, fake_checkpoint, monkeypatch):
     for var in ("H3_VAE_XEFMHA", "H3_VAE_COMPILE", "H3_VAE_FP16_WEIGHTS"):
         monkeypatch.delenv(var, raising=False)
