@@ -276,15 +276,18 @@ def test_pipeline_loads_selected_file_for_each_task(
     monkeypatch.setattr(pipeline_module, "download_weights_from_hf_specific", download_base)
     checkpoint_tensors["adaln_t_table"] = torch.tensor([[0, 4], [2, 8], [10, -4]], dtype=torch.bfloat16)
     checkpoint_tensors["blocks.0.attn.qkv_proj.weight"] = torch.arange(192).reshape(24, 8).to(torch.bfloat16)
-    path = tmp_path / "hybrid[beta5].safetensors"
+    # Glob metacharacters in both the directory and the filename must not hide the file.
+    checkpoint_dir = tmp_path / "H3[beta]"
+    checkpoint_dir.mkdir()
+    path = checkpoint_dir / "hybrid[beta5].safetensors"
     save_file(checkpoint_tensors, path)
     if as_symlink:
         blob = tmp_path / "blobs" / "blob_without_extension"
         blob.parent.mkdir()
         path.rename(blob)
         path.symlink_to(blob)
-    save_file(checkpoint_tensors, tmp_path / "unrelated.safetensors")
-    (tmp_path / "model.safetensors.index.json").write_text(
+    save_file(checkpoint_tensors, checkpoint_dir / "unrelated.safetensors")
+    (checkpoint_dir / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {key: "unrelated.safetensors" for key in checkpoint_tensors}})
     )
     config = OmniDiffusionConfig(

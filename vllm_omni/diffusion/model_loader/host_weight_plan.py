@@ -147,10 +147,11 @@ def _add_safetensors_source(
                 indexed_keys += 1
         return indexed_keys
 
+    # Match relative to the directory so its own name is never read as a pattern.
     weight_files = {
-        filename
+        os.path.join(checkpoint_dir, filename)
         for pattern in (["*.safetensors"] if allow_patterns is None else allow_patterns)
-        for filename in glob.glob(os.path.join(checkpoint_dir, pattern))
+        for filename in glob.glob(pattern, root_dir=checkpoint_dir)
         if filename.endswith(".safetensors")
     }
     for filename in sorted(weight_files):

@@ -366,7 +366,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         else:
             hf_weights_files = []
             for pattern in allow_patterns:
-                hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+                # Match relative to the folder so its own name is never read as a pattern.
+                hf_weights_files += [
+                    os.path.join(hf_folder, filename) for filename in glob.glob(pattern, root_dir=hf_folder)
+                ]
                 if hf_weights_files:
                     # Decide by actual files rather than pattern name (patterns may include subfolders).
                     use_safetensors = any(f.endswith(".safetensors") for f in hf_weights_files)
