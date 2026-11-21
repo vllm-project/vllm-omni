@@ -26,6 +26,7 @@ surfaces share the same RVQ + DAC weights.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import torch
@@ -110,6 +111,16 @@ class HiggsAudioV2Code2Wav(nn.Module):
         self.fc2: nn.Linear | None = None
         self.acoustic_decoder: nn.Module | None = None
         self._loaded: bool = False
+
+        # Exact-shape decode CUDA graphs (ported from higgs-audio v3's
+        # ``_capture_decode_graphs``): see :meth:`capture_auxiliary_graphs`.
+        self._codec_graph_enabled = self.config.resolve_graph_defaults(
+            use_v2_model_runner=bool(
+                getattr(getattr(self.vllm_config, "model_config", None), "use_v2_model_runner", False)
+            )
+        )
+        self._decode_graphs: dict[tuple[int, int], tuple[Any, torch.Tensor, torch.Tensor]] = {}
+        self._decode_graphs_initialized = False
 
         # When constructed via the engine path, eagerly load codec weights from
         # the model directory. The engine's subsequent ``load_weights(weights)``
@@ -243,6 +254,20 @@ class HiggsAudioV2Code2Wav(nn.Module):
             raise RuntimeError("HiggsAudioV2Code2Wav not loaded. Call load_weights() first.")
 
         codes = self._validate_codes(audio_codes)
+        if codes.is_cuda and self._codec_graph_enabled:
+            batch, _, frames = codes.shape
+            entry = self._decode_graphs.get((batch, frames))
+            if entry is not None:
+                graph, static_codes, static_audio = entry
+                static_codes[:batch].copy_(codes)
+                graph.replay()
+                # The next call may replay the same graph. Own the output
+                # before reusing its storage or shared graph memory pool.
+                return static_audio[:batch].clone()
+        return self._decode_codes_impl(codes)
+
+    def _decode_codes_impl(self, codes: torch.Tensor) -> torch.Tensor:
+        """Eager decode body shared by the direct path and graph capture."""
         device = codes.device
 
         rvq_codes = codes.transpose(0, 1).long()  # [num_codebooks, B, T]
@@ -287,6 +312,85 @@ class HiggsAudioV2Code2Wav(nn.Module):
         if pcm.shape[-1] <= trim:
             return pcm[..., :0]
         return pcm[..., trim:]
+
+    # ------------------------------------------------------- decode CUDA graphs
+    @torch.inference_mode()
+    def capture_auxiliary_graphs(self) -> None:
+        """Capture exact codec decode shapes before the worker is ready.
+
+        Called by ``OmniGPUWorkerBase.compile_or_warm_up_model`` after the
+        runner's own init work (weights loaded, profiling done, nothing
+        served yet) — the same hook higgs-audio v3 and MiniCPM-o use. A no-op
+        when codec graphs are disabled or already captured; if the codec is
+        not loaded yet, decode simply stays eager.
+        """
+        if not self._codec_graph_enabled or self._decode_graphs_initialized:
+            return
+        if not self._loaded:
+            logger.warning(
+                "HiggsAudioV2Code2Wav: codec not loaded at warmup; skipping decode-graph capture (decode stays eager)"
+            )
+            return
+        device = self.fc2.weight.device
+        if device.type == "cuda":
+            self._capture_decode_graphs(device)
+
+    def _decode_graph_shapes(self) -> list[tuple[int, int]]:
+        """Exact ``(batch, frames)`` decode shapes to capture.
+
+        The v2 runtime decodes each request separately (batch 1), so the
+        default table covers every batch-1 length up to
+        ``codec_graph_single_max_frames``; the optional batch/frame tables
+        add multi-request shapes for callers that decode stacked requests
+        (v3's batched forward does).
+        """
+        single_max = int(getattr(self.config, "codec_graph_single_max_frames", 150))
+        batches = getattr(self.config, "codec_graph_batch_sizes", ())
+        frames = getattr(self.config, "codec_graph_frame_sizes", (5, 29, 54))
+        if single_max < 1 or any(int(n) < 1 for n in (*batches, *frames)):
+            raise ValueError("Higgs codec graph dimensions must be positive")
+        return sorted({(1, n) for n in range(1, single_max + 1)} | {(int(b), int(f)) for b in batches for f in frames})
+
+    @torch.inference_mode()
+    def _capture_decode_graphs(self, device: torch.device) -> None:
+        # Never pad time: convolution boundary conditions must stay exact.
+        # Batch size also stays exact: padding can change convolution
+        # algorithms and rounding. Uncovered shapes retain the eager path.
+        start = time.perf_counter()
+        memory_before = torch.accelerator.memory_allocated(device)
+        reserved_before = torch.accelerator.memory_reserved(device)
+        shapes = self._decode_graph_shapes()
+        previous_device = current_omni_platform.current_device()
+        current_omni_platform.set_device(device)
+        try:
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            pool = torch.cuda.graph_pool_handle()
+            for batch, frames in shapes:
+                codes = torch.zeros((batch, self.num_codebooks, frames), device=device, dtype=torch.long)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        self._decode_codes_impl(codes)
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool, stream=stream):
+                    audio = self._decode_codes_impl(codes)
+                self._decode_graphs[batch, frames] = (graph, codes, audio)
+            torch.cuda.current_stream(device).wait_stream(stream)
+        finally:
+            current_omni_platform.set_device(torch.device(device.type, previous_device))
+        self._decode_graphs_initialized = True
+        torch.accelerator.synchronize()
+        logger.info(
+            "Higgs v2 codec captured %d exact-frame CUDA graphs in %.2f s "
+            "(allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
+            len(self._decode_graphs),
+            time.perf_counter() - start,
+            (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,
+            (torch.accelerator.memory_reserved(device) - reserved_before) / 2**20,
+            torch.accelerator.memory_reserved(device) / 2**20,
+        )
 
     # ---------------------------------------------------- vLLM runtime forward
     @torch.no_grad()
@@ -384,7 +488,11 @@ class HiggsAudioV2Code2Wav(nn.Module):
             raise ValueError(
                 f"audio_codes second dim must equal num_codebooks={self.num_codebooks}; got {int(audio_codes.shape[1])}"
             )
-        if audio_codes.numel() > 0:
+        # ``.item()`` triggers a GPU->CPU sync and is illegal inside CUDA-graph
+        # capture (the warmup run before capture hits this path). Skip the
+        # range check while a graph is being captured; the validator still
+        # fires at real inference time.
+        if audio_codes.numel() > 0 and not torch.cuda.is_current_stream_capturing():
             max_val = int(audio_codes.max().item())
             min_val = int(audio_codes.min().item())
             if max_val >= self.num_real_codes or min_val < 0:
