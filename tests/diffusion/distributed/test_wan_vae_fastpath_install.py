@@ -444,13 +444,15 @@ def test_installer_preserves_wrappers_and_hooks_on_modules_it_still_calls() -> N
         handle.remove()
 
 
-def test_installer_refuses_unsupported_targets() -> None:
+def test_installer_refuses_unsupported_targets(monkeypatch) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
 
     assert install_wan_vae_fastpath(vae, level="off").installed is False
     assert not is_installed(vae)
 
-    vae.distributed_executor = SimpleNamespace(parallel_mode="spatial_shard_height", parallel_size=2)
+    vae.distributed_executor = SimpleNamespace(parallel_mode="spatial_shard_height", parallel_size=2, group=None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
     report = install_wan_vae_fastpath(vae)
     assert not report.installed and "deferred" in report.reason
     assert vae._vllm_omni_wan_spatial_fastpath_level == "lossless"
@@ -763,6 +765,15 @@ def test_single_gpu_spatial_fallback_preserves_fastpath(mocker, level, parallel_
             selected == "channels_last"
         )
     assert torch.isfinite(vae.decode(torch.randn(1, 4, 2, 4, 4)).sample).all()
+
+
+def test_partial_spatial_group_installs_tile_fastpath(monkeypatch):
+    vae = DistributedAutoencoderKLWan(**TINY_RESIDUAL).eval()
+    vae.distributed_executor = SimpleNamespace(parallel_mode="spatial_shard_width", parallel_size=2, group=None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
+    assert not vae._spatial_shard_decode_enabled(torch.empty(1, 4, 1, 4, 4))
+    assert install_wan_vae_fastpath(vae, level="channels_last").installed
 
 
 def test_registry_hook_skips_unsupported_platform_and_non_wan_vaes(mocker) -> None:

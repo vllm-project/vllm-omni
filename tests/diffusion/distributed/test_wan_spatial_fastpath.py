@@ -190,18 +190,20 @@ def test_channels_last_halo_exchange(ndim, axis, dtype):
     fmt = torch.channels_last_3d if ndim == 5 else torch.channels_last
     dim = ndim - (2 if axis == "height" else 1)
     extent = shape[dim]
-    # Each rank has distinct, exactly representable values on both boundaries.
-    coords = torch.arange(extent, device="cuda", dtype=dtype)
-    view = [1] * ndim
-    view[dim] = extent
-    buf = (coords + 16 * rank).view(view).expand(shape).contiguous(memory_format=fmt)
+
+    # Preserve variation across channels, batches, and the unsplit spatial axes.
+    def rank_input(owner):
+        generator = torch.Generator(device="cuda").manual_seed(1337 + owner)
+        return torch.randn(shape, generator=generator, device="cuda", dtype=dtype).contiguous(memory_format=fmt)
+
+    buf = rank_input(rank)
     expected = buf.clone()
     expected.narrow(dim, 0, 2).zero_()
     expected.narrow(dim, extent - 2, 2).zero_()
     if rank > 0:
-        expected.narrow(dim, 0, 2).copy_(buf.narrow(dim, extent - 4, 2) - 16)
+        expected.narrow(dim, 0, 2).copy_(rank_input(rank - 1).narrow(dim, extent - 4, 2))
     if rank + 1 < world:
-        expected.narrow(dim, extent - 2, 2).copy_(buf.narrow(dim, 2, 2) + 16)
+        expected.narrow(dim, extent - 2, 2).copy_(rank_input(rank + 1).narrow(dim, 2, 2))
 
     module = SimpleNamespace(
         split_tensor_dim=dim,
@@ -384,3 +386,52 @@ def test_resample_automatically_fuses_bf16_upsampling_and_preserves_hooks(monkey
             assert len(calls) == 1
         finally:
             hook.remove()
+
+    for target in (resample.resample, resample.resample[0], conv):
+        with monkeypatch.context() as patch:
+            original_forward = target.forward
+            patch.setattr(target, "forward", lambda *args, **kwargs: original_forward(*args, **kwargs))
+            assert torch.equal(fp.resample_forward(resample, x), expected)
+            assert len(calls) == 1
+
+
+@torch.inference_mode()
+def test_cached_spatial_conv_global_hook_sees_tensor():
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import WanDistCausalConv3d
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
+
+    source = torch.nn.Conv3d(2, 2, 1).cuda()
+    conv = WanDistCausalConv3d(source, dist.group.WORLD)
+    conv.input_memory_format = torch.channels_last_3d
+    observed = []
+
+    def record(module, args, output):
+        if module is conv:
+            observed.append(output)
+
+    with torch.nn.modules.module.register_module_forward_hook(record):
+        out, bias = fp._run_cached_causal_conv(
+            conv, torch.ones(1, 2, 1, 4, 4, device="cuda"), [None], 0, return_bias=True
+        )
+    assert len(observed) == 1 and observed[0] is out
+    assert bias is None
+
+
+@torch.inference_mode()
+def test_padded_upsample_reuses_kernel_across_resolutions(monkeypatch):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+
+    kernels = []
+    run = up._upsample2x_pixels_kernel.run
+
+    def capture(*args, **kwargs):
+        kernel = run(*args, **kwargs)
+        kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(up._upsample2x_pixels_kernel, "run", capture)
+    for h, w in ((16, 32), (13, 23), (31, 48)):
+        x = torch.randn(2, 16, h, w, device="cuda", dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)
+        out = x.new_empty((2, 16, 2 * h + 2, 2 * w + 2)).contiguous(memory_format=torch.channels_last)
+        assert up.upsample_nearest_2x_padded(x, out)
+    assert len(kernels) == 3 and kernels[0] is not None and all(k is kernels[0] for k in kernels)
