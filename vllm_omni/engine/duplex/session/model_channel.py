@@ -47,6 +47,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import (
+    DuplexContextChangedError,
     DuplexInputCapacityError,
     DuplexRuntimeConfigError,
     coerce_int,
@@ -289,7 +290,7 @@ class ModelChannel:
                     else None
                 ),
             )
-        except (asyncio.CancelledError, DuplexInputCapacityError):
+        except (asyncio.CancelledError, DuplexInputCapacityError, DuplexContextChangedError):
             raise
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -495,7 +496,7 @@ class ModelChannel:
                 and snapshot is not None
                 and session.history_revision != snapshot.history_revision
             ):
-                raise DuplexRuntimeConfigError(
+                raise DuplexContextChangedError(
                     "Conversation changed during context preparation; retry the response",
                     code="context_changed",
                 )
@@ -596,7 +597,7 @@ class ModelChannel:
                     }
                 ],
             }
-        except DuplexInputCapacityError:
+        except (DuplexInputCapacityError, DuplexContextChangedError):
             resource = session.request_resources.get((stage_id, request_id))
             if resource is not None and not resource.submitted:
                 try:

@@ -4,8 +4,6 @@
 """Budget final prompts with local processor assets; no GPU or model forward."""
 
 import io
-import os
-from pathlib import Path
 
 import numpy as np
 import pybase64 as base64
@@ -24,19 +22,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture(scope="module")
-def processor():
-    from transformers import AutoProcessor
-
-    path = os.environ.get("QWEN3_OMNI_BUDGET_PROCESSOR_PATH")
-    if path is None:
-        pytest.skip("Set QWEN3_OMNI_BUDGET_PROCESSOR_PATH to local Qwen3-Omni processor assets")
-    assert path is not None
-    assert Path(path).is_dir(), "Explicit processor asset path must exist"
-    return AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
+def processor(qwen_processor):
+    return qwen_processor
 
 
 @pytest.fixture(scope="module")
-def engine_processor(processor):
+def engine_processor(processor, qwen_processor_source):
     from vllm.multimodal.processing import InputProcessingContext
 
     from vllm_omni.config.model import OmniModelConfig
@@ -46,10 +37,11 @@ def engine_processor(processor):
         Qwen3OmniMoeThinkerProcessingInfo,
     )
 
-    path = os.environ["QWEN3_OMNI_BUDGET_PROCESSOR_PATH"]
+    path = qwen_processor_source
     config = OmniModelConfig(
         model=path,
         tokenizer=path,
+        revision="26291f793822fb6be9555850f06dfe95f2d7e695",
         trust_remote_code=False,
         max_model_len=32768,
         limit_mm_per_prompt={"audio": 4, "image": 8},
@@ -74,18 +66,24 @@ def _engine_tokens(engine_processor, prompt):
     return len(result["prompt_token_ids"])
 
 
-def _plugin(processor, policy="budget", limit=32768):
+def _plugin(processor, policy="budget", limit=32768, *, history_policy=None):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     plugin.processor = processor
     plugin.max_model_len = 32768
+    config = DuplexSessionRuntimeConfig(
+        qwen_context_policy=policy,
+        qwen_context_max_tokens=limit,
+        model_custom_options={"history_policy": history_policy} if history_policy is not None else {},
+    )
+    plugin.configure_server(config)
     plugin.context_view_policy(
         stage_id=0,
-        runtime_config=DuplexSessionRuntimeConfig(qwen_context_policy=policy, qwen_context_max_tokens=limit),
+        runtime_config=config,
     )
     return plugin
 
 
-def _plan(plugin, messages, *, reserve=64, runtime=None, payload=None):
+def _plan(plugin, messages, *, reserve=64, runtime=None, payload=None, context=None):
     return plugin.plan_append(
         request_id="budget-test",
         fence=None,
@@ -93,6 +91,7 @@ def _plan(plugin, messages, *, reserve=64, runtime=None, payload=None):
             "qwen_messages": messages,
             "conversation": messages,
             CONTEXT_SOURCES: tuple(DuplexSourceRef(i + 100, 1) for i in range(len(messages))),
+            **(context or {}),
         },
         runtime_config={"instructions": "You are a concise assistant.", **(runtime or {})},
         seq=1,
@@ -179,41 +178,52 @@ async def test_summary_preserves_checkpoint_assistant_prefix_and_ends_with_extra
     assert "NO_RELEVANT_MEMORY" in extraction_task
 
 
-def test_actual_template_boundary_and_generation_reserve(processor):
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_actual_template_boundary_and_generation_reserve(processor, engine_processor, offset):
     messages = _history(12)
     reference = _plan(_plugin(processor), messages).prompt
-    count = _expanded(processor, reference)["input_ids"].shape[-1]
-    exact = _plan(_plugin(processor, limit=count + 64), messages).prompt
-    assert exact["prompt"] == reference["prompt"]
+    count = _engine_tokens(engine_processor, reference)
+    limit = count + 64 + offset
+    selected = _plan(_plugin(processor, limit=limit), messages).prompt
+    if offset >= 0:
+        assert selected["prompt"] == reference["prompt"]
+    else:
+        assert "question 0" not in selected["prompt"]
+        assert "answer 0" not in selected["prompt"]
+    assert "question 1" in selected["prompt"] and "answer 1" in selected["prompt"]
+    assert "current question" in selected["prompt"]
+    assert _engine_tokens(engine_processor, selected) + 64 <= limit
     clipped = _plan(_plugin(processor, limit=count + 64), messages, reserve=65).prompt
-    assert "question 0" not in clipped["prompt"]
-    assert "answer 0" not in clipped["prompt"]
-    assert "question 1" in clipped["prompt"] and "answer 1" in clipped["prompt"]
-    assert "current question" in clipped["prompt"]
-    assert _expanded(processor, clipped)["input_ids"].shape[-1] + 65 <= count + 64
+    assert "question 0" not in clipped["prompt"] and "answer 0" not in clipped["prompt"]
+    assert _engine_tokens(engine_processor, clipped) + 65 <= count + 64
 
 
-def test_budget_tool_anchor_outlives_sixteen_message_window(processor):
+@pytest.mark.parametrize(
+    ("policy", "history_policy", "expected_anchors"),
+    [("budget", None, {"old-call": 2}), ("legacy", None, {"old-call": 2}), ("legacy", "recent", {})],
+)
+def test_tool_anchor_retention_follows_history_policy(processor, policy, history_policy, expected_anchors):
     messages = _history(12)
     runtime = {"qwen_call_anchors": {"old-call": 2}}
-    budget = _plan(_plugin(processor), messages, runtime=runtime).prompt
-    legacy = _plan(_plugin(processor, policy="legacy"), messages, runtime=runtime).prompt
-    assert budget["_qwen_call_anchors"] == {"old-call": 2}
-    assert legacy["_qwen_call_anchors"] == {}
+    plugin = _plugin(processor, policy=policy, history_policy=history_policy)
+    prompt = _plan(plugin, messages, runtime=runtime).prompt
+    assert prompt["_qwen_call_anchors"] == expected_anchors
 
 
-def test_prepare_history_preserves_older_turns_only_for_budget_policy(processor):
+@pytest.mark.parametrize(
+    ("policy", "history_policy", "retains_old_turns"),
+    [("budget", None, True), ("legacy", None, True), ("legacy", "recent", False)],
+)
+def test_prepare_history_retention_follows_history_policy(processor, policy, history_policy, retains_old_turns):
     messages = _history(12)
-    prompts = {}
-    for policy in ("legacy", "budget"):
-        plugin = _plugin(processor, policy=policy)
-        config = plugin.prepare_prompt_config(
-            {"conversation": messages}, state=plugin.create_session_state(), payload={"type": "conversation"}
-        )
-        prompts[policy] = _plan(plugin, config["qwen_messages"]).prompt["prompt"]
-    assert "question 0" in prompts["budget"] and "answer 0" in prompts["budget"]
-    assert "question 0" not in prompts["legacy"] and "answer 0" not in prompts["legacy"]
-    assert "current question" in prompts["budget"] and "current question" in prompts["legacy"]
+    plugin = _plugin(processor, policy=policy, history_policy=history_policy)
+    config = plugin.prepare_prompt_config(
+        {"conversation": messages}, state=plugin.create_session_state(), payload={"type": "conversation"}
+    )
+    prompt = _plan(plugin, config["qwen_messages"]).prompt["prompt"]
+    assert ("question 0" in prompt) == retains_old_turns
+    assert ("answer 0" in prompt) == retains_old_turns
+    assert "current question" in prompt
 
 
 def test_unavailable_old_audio_drops_its_answer_without_dropping_current_input(processor):
@@ -232,12 +242,17 @@ def test_unavailable_old_audio_drops_its_answer_without_dropping_current_input(p
     assert prompt["multi_modal_data"] == {}
 
 
-@pytest.mark.parametrize("kind", ["audio", "image", "mixed"])
-def test_mandatory_media_expansion_is_counted_at_exact_final_prompt_boundary(processor, kind):
+@pytest.mark.parametrize(
+    ("kind", "image_size"),
+    [("audio", None), ("image", (56, 56)), ("image", (224, 224)), ("image", (448, 112)), ("mixed", (224, 224))],
+)
+def test_mandatory_media_expansion_is_counted_at_exact_final_prompt_boundary(
+    processor, engine_processor, kind, image_size
+):
     messages = []
     payload = {"type": "conversation"}
     if kind in ("image", "mixed"):
-        image = Image.new("RGB", (224, 224), color="blue")
+        image = Image.new("RGB", image_size, color="blue")
         with io.BytesIO() as stream:
             image.save(stream, format="PNG")
             url = "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
@@ -249,12 +264,16 @@ def test_mandatory_media_expansion_is_counted_at_exact_final_prompt_boundary(pro
     runtime = {"initial_user_text": "Describe what you hear and see."}
     reference = _plan(_plugin(processor), messages, runtime=runtime, payload=payload).prompt
     expanded = _expanded(processor, reference)
-    count = expanded["input_ids"].shape[-1]
+    count = _engine_tokens(engine_processor, reference)
+    assert expanded["input_ids"].shape[-1] == count
     placeholder_count = len(processor.tokenizer(reference["prompt"])["input_ids"])
     assert count > placeholder_count
     exact = _plan(_plugin(processor, limit=count + 64), messages, runtime=runtime, payload=payload).prompt
     assert exact["prompt"] == reference["prompt"]
-    assert _expanded(processor, exact)["input_ids"].shape[-1] == count
+    assert _engine_tokens(engine_processor, exact) + 64 == count + 64
+    above = _plan(_plugin(processor, limit=count + 65), messages, runtime=runtime, payload=payload).prompt
+    assert above["prompt"] == exact["prompt"]
+    assert _engine_tokens(engine_processor, above) + 64 <= count + 65
     if kind in ("audio", "mixed"):
         np.testing.assert_array_equal(exact["multi_modal_data"]["audio"][0][0], audio)
         assert "Describe what you hear and see." in exact["prompt"]
@@ -265,7 +284,7 @@ def test_mandatory_media_expansion_is_counted_at_exact_final_prompt_boundary(pro
     assert error.value.code == "context_budget_exceeded"
 
 
-@pytest.mark.parametrize("audio_samples", [16000, 16001, 16159, 16160, 16641])
+@pytest.mark.parametrize("audio_samples", [8000, 16000, 16001, 16159, 16160, 16641, 48000])
 def test_budget_matches_engine_preprocessing_for_non_hop_aligned_audio(processor, engine_processor, audio_samples):
     audio = np.zeros(audio_samples, dtype="<f4")
     payload = {"audio": base64.b64encode(audio.tobytes()).decode()}
@@ -303,3 +322,60 @@ def test_budget_matches_engine_preprocessing_for_mixed_media_and_tools(processor
     media = {"image": [image], "audio": [(audio, 16000)]}
     prompt = {"prompt": text, "multi_modal_data": media}
     assert plugin._context_token_count(text, media) == _engine_tokens(engine_processor, prompt)
+
+
+@pytest.mark.parametrize("pending_tool", [False, True], ids=["intervening-system", "pending-tool"])
+def test_mandatory_context_and_complete_turns_survive_real_token_boundary(processor, engine_processor, pending_tool):
+    messages = _history(3)
+    messages.insert(1, {"role": "system", "content": "Always keep this instruction."})
+    messages = [dict(message, _src=i) for i, message in enumerate(messages)]
+    context = {}
+    if pending_tool:
+        context["qwen_tool_turns"] = [
+            {
+                "history_len": 1,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": {}}}],
+                    },
+                    {"role": "tool", "content": "Unique pending result"},
+                ],
+            }
+        ]
+    # Keep the system instruction and current input, plus the original complete
+    # exchange when a pending continuation makes that older exchange mandatory.
+    mandatory = [message for i, message in enumerate(messages) if i in ({0, 1, 2, 7} if pending_tool else {1, 7})]
+    reference = _plan(_plugin(processor), mandatory, context=context).prompt
+    count = _engine_tokens(engine_processor, reference)
+    selected = _plan(_plugin(processor, limit=count + 64), messages, context=context).prompt
+    assert selected["prompt"] == reference["prompt"]
+    assert _engine_tokens(engine_processor, selected) + 64 == count + 64
+    assert selected["prompt"].count("Always keep this instruction.") == 1
+    assert "current question" in selected["prompt"]
+    assert "question 1" not in selected["prompt"] and "answer 1" not in selected["prompt"]
+    if pending_tool:
+        assert "question 0" in selected["prompt"] and "answer 0" in selected["prompt"]
+        assert selected["prompt"].count("Unique pending result") == 1
+    with pytest.raises(DuplexRuntimeConfigError) as error:
+        _plan(_plugin(processor, limit=count + 63), messages, context=context)
+    assert error.value.code == "context_budget_exceeded"
+
+
+def test_oversized_summary_keeps_recent_complete_turn_with_real_token_count(processor, engine_processor):
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.context_budget import CONTEXT_SUMMARY, ContextSummary
+
+    messages = _history(4)
+    summary = ContextSummary("Earlier unique memory. " * 200, (DuplexSourceRef(100, 1), DuplexSourceRef(101, 1)), 1)
+    reference = _plan(_plugin(processor), messages[-3:]).prompt
+    count = _engine_tokens(engine_processor, reference)
+    selected = _plan(
+        _plugin(processor, policy="budget_summary", limit=count + 64),
+        messages,
+        context={CONTEXT_SUMMARY: summary},
+    ).prompt
+    assert selected["prompt"] == reference["prompt"]
+    assert "Earlier unique memory" not in selected["prompt"]
+    assert "question 3" in selected["prompt"] and "answer 3" in selected["prompt"]
+    assert "question 2" not in selected["prompt"] and "answer 2" not in selected["prompt"]
+    assert _engine_tokens(engine_processor, selected) + 64 == count + 64

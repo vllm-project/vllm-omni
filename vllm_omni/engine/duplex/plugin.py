@@ -61,6 +61,10 @@ class DuplexRuntimeConfigError(ValueError):
         self.code = code
 
 
+class DuplexContextChangedError(DuplexRuntimeConfigError):
+    """Reject a stale prepared prompt before admission, permitting a client retry."""
+
+
 def validate_session_tools(capabilities: DuplexCapabilities, extra_body: Mapping[str, object]) -> None:
     """Refuse tool settings this model would otherwise silently ignore.
 

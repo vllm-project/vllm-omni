@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from pathlib import Path
+
 import pytest
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, load_deploy_config
@@ -56,3 +58,23 @@ def test_token_limits_require_positive_integers(name, value):
 def test_summary_timeout_requires_finite_positive_number(value):
     with pytest.raises(ValueError, match="qwen_summary_timeout_s"):
         DuplexSessionRuntimeConfig(qwen_summary_timeout_s=value)
+
+
+def test_documented_context_overlay_loads_mrv2_deployment(tmp_path):
+    repo = Path(__file__).resolve().parents[3]
+    guide = (repo / "docs/serving/realtime_duplex_api.md").read_text()
+    section = guide.split("### Qwen long-session context policies (experimental)", 1)[1]
+    example = section.split("```yaml\n", 1)[1].split("```", 1)[0]
+    # Copy the deployment profiles beside the extracted example, matching the
+    # documented relative-base layout without writing into the source tree.
+    for profile in (repo / "vllm_omni/deploy").glob("*.yaml"):
+        (tmp_path / profile.name).write_text(profile.read_text())
+    path = tmp_path / "context-memory.yaml"
+    path.write_text(example)
+    deploy = load_deploy_config(path)
+    assert deploy.session_mode == "duplex"
+    assert deploy.model_runner == "v2"
+    assert deploy.duplex_session.qwen_context_policy == "budget_summary"
+    assert deploy.duplex_session.qwen_context_max_tokens == 4096
+    assert deploy.duplex_session.qwen_summary_max_tokens == 512
+    assert len(deploy.stages) == 3

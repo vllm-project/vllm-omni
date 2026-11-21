@@ -2652,9 +2652,11 @@ them out into typed events before they reach a client.
 Qwen3-Omni deployments can opt into token-budgeted history and background
 summary memory. These policies extend the existing commit-based duplex session;
 they do not increase the checkpoint's native context length.
+Save this overlay alongside `qwen3_omni_duplex_mrv2.yaml` in
+`vllm_omni/deploy/`, since `base_config` resolves relative to the overlay file.
 
 ```yaml
-base_config: qwen3_omni_duplex.yaml
+base_config: qwen3_omni_duplex_mrv2.yaml
 duplex_session:
   qwen_context_policy: budget_summary
   qwen_context_max_tokens: 4096

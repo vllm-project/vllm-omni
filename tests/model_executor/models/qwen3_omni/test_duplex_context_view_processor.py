@@ -4,8 +4,8 @@
 """Exercise final session prompts with the supported, real Qwen processor.
 
 Only processor/tokenizer assets are needed; no model weights or forward pass
-are loaded. The pinned revision is loaded through Hugging Face, which uses
-the local cache when that snapshot is present and downloads it otherwise.
+are loaded. The shared fixture accepts local processor assets or loads the pinned revision
+through Hugging Face. Required mode fails when local assets are not configured.
 """
 
 from __future__ import annotations
@@ -34,31 +34,10 @@ if TYPE_CHECKING:
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.asyncio]
 
 PROCESSOR_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-PROCESSOR_REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"
 _MEDIA_BLOCKS = {
     "audio": "<|audio_start|><|audio_pad|><|audio_end|>",
     "image": "<|vision_start|><|image_pad|><|vision_end|>",
 }
-
-
-@pytest.fixture(scope="module")
-def qwen_processor(record_testsuite_property) -> Qwen3OmniMoeProcessor:
-    import transformers
-    from transformers import AutoProcessor, Qwen3OmniMoeProcessor
-
-    processor = AutoProcessor.from_pretrained(
-        PROCESSOR_MODEL,
-        revision=PROCESSOR_REVISION,
-        trust_remote_code=False,
-    )
-    assert isinstance(processor, Qwen3OmniMoeProcessor)
-    assert processor.audio_token == "<|audio_pad|>"
-    assert processor.image_token == "<|image_pad|>"
-    record_testsuite_property("qwen3_omni_processor_model", PROCESSOR_MODEL)
-    record_testsuite_property("qwen3_omni_processor_revision", PROCESSOR_REVISION)
-    record_testsuite_property("qwen3_omni_processor_source", PROCESSOR_MODEL)
-    record_testsuite_property("qwen3_omni_transformers_version", transformers.__version__)
-    return processor
 
 
 def _image_part(image: Image.Image) -> dict[str, object]:
