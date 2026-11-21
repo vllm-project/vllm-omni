@@ -442,6 +442,12 @@ class MiniMaxH3Attention(nn.Module):
             extra["vdn_window"] = vdn_window
         if reference_kv_compact:
             extra["minimax_h3_compact_reference_rows"] = reference_rows
+            extra["minimax_h3_resident_reference_kv"] = reference_kv_state.is_device_resident
+            layout = reference_kv_state.transport_alignment
+            if layout is not None and layout["transport_padding"]:
+                if packed_total != layout["compact_rows"]:
+                    raise RuntimeError("attention compact logical length mismatch")
+                extra["minimax_h3_transport_alignment"] = layout
         if reference_kv_state is not None:
             extra["minimax_h3_reference_kv_post_parallel"] = (
                 reference_kv_state,

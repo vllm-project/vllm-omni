@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import (
+    ImageTokenSpan,
     VideoTokenLayout,
     VideoTokenSpan,
 )
@@ -134,7 +135,19 @@ def _compact_reference_video_layout(
         targets.append(VideoTokenSpan(start=compact_start, latent_grid=grid, role="target"))
     if len(targets) != 1:
         return None
-    return VideoTokenLayout(used_len=used_length, video_spans=tuple(targets))
+    images = []
+    for span in layout.image_spans:
+        removed = bisect_left(positions, span.start + span.length) - bisect_left(positions, span.start)
+        if removed == 0:
+            images.append(
+                ImageTokenSpan(
+                    start=span.start - bisect_left(positions, span.start),
+                    latent_grid=span.latent_grid,
+                )
+            )
+        elif removed != span.length:
+            return None
+    return VideoTokenLayout(used_len=used_length, video_spans=tuple(targets), image_spans=tuple(images))
 
 
 def _reference_kv_video_layout(
@@ -144,8 +157,8 @@ def _reference_kv_video_layout(
 ) -> VideoTokenLayout | None:
     """Keep complete reference-video spans in the cached K/V prefix.
 
-    Q has only target rows. Images, partial video spans, and other context
-    retain their existing dense protection because they have no K/V video span.
+    Q has only target rows. Complete images retain separate image geometry;
+    partial video spans and other context retain dense protection.
     """
     if compact is None:
         return None
@@ -164,7 +177,19 @@ def _reference_kv_video_layout(
         VideoTokenSpan(start=span.start + reference_rows, latent_grid=span.latent_grid, role=span.role)
         for span in compact.video_spans
     )
+    images = []
+    for span in original.image_spans:
+        first = bisect_left(positions, span.start)
+        last = bisect_left(positions, span.start + span.length)
+        if 0 < last - first < span.length:
+            raise ValueError("reference image not fully represented in cached prefix")
+        if last - first == span.length:
+            images.append(ImageTokenSpan(start=first, latent_grid=span.latent_grid))
+    images.extend(
+        ImageTokenSpan(start=span.start + reference_rows, latent_grid=span.latent_grid) for span in compact.image_spans
+    )
     return VideoTokenLayout(
+        image_spans=tuple(sorted(images, key=lambda span: span.start)),
         used_len=compact.used_len + reference_rows,
         video_spans=tuple(sorted(spans, key=lambda span: span.start)),
     )
@@ -186,11 +211,11 @@ def _local_compact_positions(
     if local_start % local_len or not 0 <= local_start < seq_len:
         raise ValueError(f"invalid original SP span start={local_start}, length={local_len}")
     compact_total = int(active_positions.numel())
-    if compact_total % world_size:
-        return None
-    compact_local_len = compact_total // world_size
+    from vllm_omni.diffusion.attention.ops.reference_kv_alignment import shard_bounds
+
     rank = local_start // local_len
-    return active_positions.narrow(0, rank * compact_local_len, compact_local_len)
+    start, valid, _ = shard_bounds(compact_total, world_size, rank)
+    return active_positions.narrow(0, start, valid)
 
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
@@ -1440,6 +1465,8 @@ class MiniMaxH3DiTModel(nn.Module):
         compact_reference = False
         active_positions: torch.Tensor | None = None
         compact_local_positions: torch.Tensor | None = None
+        compact_local_padding = 0
+        compact_transport_padding = 0
         if reference_kv_state is not None:
             if reference_kv_state.should_skip_reference_projection:
                 if num_requests != 1 or not _supports_reference_kv_compaction(self.blocks):
@@ -1462,8 +1489,14 @@ class MiniMaxH3DiTModel(nn.Module):
                     local_start=local_start,
                     local_len=local_len,
                 )
-                if compact_local_positions is None:
-                    raise ValueError("MiniMax H3 reference-KV target rows cannot form an equal SP shard")
+                from vllm_omni.diffusion.attention.ops.reference_kv_alignment import alignment, shard_bounds
+
+                compact_total = int(active_positions.numel())
+                world = seq_len // local_len
+                _, compact_transport_padding = alignment(compact_total, world)
+                _, valid, width = shard_bounds(compact_total, world, local_start // local_len)
+                compact_local_padding = width - valid
+                reference_kv_state.set_transport_alignment(compact_total, compact_transport_padding)
 
         rope_table = kwargs.get("rope_table")
         if compact_reference and local_len != seq_len:
@@ -1472,10 +1505,14 @@ class MiniMaxH3DiTModel(nn.Module):
             if rope_table is None:
                 compact_rope_ids = img_position_ids.to(device).index_select(1, compact_local_positions)
                 rope_table = _build_rope_table(self.rope(compact_rope_ids).to(device))
+                if compact_local_padding:
+                    from vllm_omni.diffusion.attention.ops.reference_kv_alignment import append_rows
+
+                    rope_table = append_rows(rope_table, compact_local_padding, 0)
                 rope_table = reference_kv_state.cache_compact_rope_table(rope_table)
             self._validate_prepared_rope_table(
                 rope_table,
-                local_len=compact_local_positions.numel(),
+                local_len=compact_local_positions.numel() + compact_local_padding,
                 device=device,
             )
         elif rope_table is None:
@@ -1513,6 +1550,11 @@ class MiniMaxH3DiTModel(nn.Module):
             global_positions=(compact_local_positions if compact_reference and local_len != seq_len else None),
         )
 
+        if compact_local_padding:
+            from vllm_omni.diffusion.attention.ops.reference_kv_alignment import append_rows
+
+            decoder_input = append_rows(decoder_input, compact_local_padding, 0)
+
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
 
@@ -1525,9 +1567,14 @@ class MiniMaxH3DiTModel(nn.Module):
 
         reference_mask: torch.Tensor | None = None
         if reference_kv_state is not None and not compact_reference:
-            reference_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
-            condition_rows = ~update_mask.view(-1).to(device=device, dtype=torch.bool)
-            reference_mask.index_fill_(0, infer_out_pos.to(device)[condition_rows], True)
+            reference_mask = reference_kv_state._reference_mask
+            if reference_mask is None:
+                reference_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+                condition_rows = ~update_mask.view(-1).to(device=device, dtype=torch.bool)
+                reference_mask.index_fill_(0, infer_out_pos.to(device)[condition_rows], True)
+                reference_kv_state._reference_mask = reference_mask
+            elif reference_mask.numel() != seq_len or reference_mask.device != device:
+                raise RuntimeError("request-static reference mask layout changed")
             reference_kv_state.set_global_reference_mask(reference_mask)
 
         if compact_reference:
@@ -1547,6 +1594,10 @@ class MiniMaxH3DiTModel(nn.Module):
                 # compact shard. Metadata starts global so its SP hook selects
                 # exactly the same compact rows.
                 block_combined = block_combined.index_select(0, active_positions)
+                if compact_transport_padding:
+                    from vllm_omni.diffusion.attention.ops.reference_kv_alignment import append_rows
+
+                    block_combined = append_rows(block_combined, compact_transport_padding, 0)
                 hidden, block_rope, block_combined = self.local_sp_prepare(hidden, block_rope, block_combined)
         else:
             if local_len == seq_len:
@@ -1644,6 +1695,10 @@ class MiniMaxH3DiTModel(nn.Module):
             assert active_positions is not None
             assert compact_local_positions is not None
             local_inverse_indices = inverse_indices.index_select(0, compact_local_positions)
+            if compact_local_padding:
+                from vllm_omni.diffusion.attention.ops.reference_kv_alignment import append_rows
+
+                local_inverse_indices = append_rows(local_inverse_indices, compact_local_padding, 0)
             video_logits, audio_logits = self.final_layer(
                 hidden,
                 t_emb=t_emb,
@@ -1652,6 +1707,9 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
             compact_logits = self.sp_gather(compact_logits)
+            if compact_logits.shape[0] != active_positions.numel() + compact_transport_padding:
+                raise RuntimeError("gathered compact logits do not match transport layout")
+            compact_logits = compact_logits[: active_positions.numel()]
             video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
             compact_video = compact_logits[..., :video_width]
             compact_audio = compact_logits[..., video_width:]

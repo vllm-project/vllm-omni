@@ -7,7 +7,7 @@ import functools
 import inspect
 import math
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -106,6 +106,13 @@ class RainFusionConfig:
     end_step: int = 0
     precision: str = "bf16"
     skip_layers: frozenset[int] = frozenset()
+    image_sparsity: float = 0.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.image_sparsity, bool) or not isinstance(self.image_sparsity, (int, float)):
+            raise ValueError("RainFusion image_sparsity must be a number within [0, 1].")
+        if not 0 <= self.image_sparsity <= 1:
+            raise ValueError("RainFusion image_sparsity must be within [0, 1].")
 
     @classmethod
     def from_backend_kwargs(cls, backend_kwargs: dict | None) -> RainFusionConfig:
@@ -116,11 +123,12 @@ class RainFusionConfig:
             end_step=int(bk.get("end_step", 0)),
             precision=str(bk.get("precision", "bf16")),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
+            image_sparsity=bk.get("image_sparsity", 0.0),
         )
 
     @property
     def enabled(self) -> bool:
-        return self.sparsity > 0.0
+        return self.sparsity > 0.0 or self.image_sparsity > 0.0
 
 
 @dataclass(frozen=True)
@@ -131,6 +139,7 @@ class RainFusionPlan:
     prefix_len: int | None = None
     latent_shape: list[int] | None = None
     video_spans: list[dict[str, object]] | None = None
+    image_spans: list[dict[str, object]] | None = None
 
 
 class RainFusionAttentionBackend(AttentionBackend):
@@ -274,6 +283,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             int(attn_metadata.extra.get("minimax_h3_compact_reference_rows", 0)) if attn_metadata is not None else 0
         )
         if reference_rows:
+            assert attn_metadata is not None
             if self.qkv_layout != _INPUT_LAYOUT:
                 raise ValueError("RainFusion reference-KV reuse requires BSND layout")
             if key.shape != value.shape or key.shape[1] != query.shape[1] + reference_rows:
@@ -291,6 +301,9 @@ class RainFusionAttentionImpl(AttentionImpl):
                     kv_layout = replace(
                         layout,
                         used_len=used_kv,
+                        image_spans=tuple(
+                            replace(span, start=span.start + reference_rows) for span in layout.image_spans
+                        ),
                         video_spans=tuple(
                             replace(span, start=span.start + reference_rows) for span in layout.video_spans
                         ),
@@ -305,7 +318,17 @@ class RainFusionAttentionImpl(AttentionImpl):
                 )
                 plan = self._resolve_plan(sparse_metadata)
                 if plan is not None:
-                    if self._can_use_hybrid(query, attn_metadata):
+                    from mindiesd.utils.get_platform import is_a5_device
+
+                    precision = attn_metadata.extra.get("kv_cache_dtype", self.rainfusion.precision)
+                    if (
+                        not plan.image_spans
+                        and is_a5_device()
+                        and precision in ("float", "bf16", "mix")
+                        and attn_metadata.extra.get("minimax_h3_resident_reference_kv", False)
+                    ):
+                        return self._forward_rectangular_npu(query, key, value, attn_metadata, plan, reference_rows)
+                    if not plan.image_spans and self._can_use_hybrid(query, attn_metadata):
                         q_spans = tuple((span.start, tuple(span.latent_grid)) for span in layout.video_spans)
                         return self._forward_hybrid_npu(
                             query, key, value, attn_metadata, plan, reference_rows, q_spans=q_spans
@@ -335,6 +358,43 @@ class RainFusionAttentionImpl(AttentionImpl):
         if query.ndim != 4 or key.shape != query.shape or value.shape != query.shape or plan.used_len > query.shape[1]:
             raise ValueError("RainFusion video geometry must fit identical full-sequence BSND Q/K/V tensors.")
         return self._forward_sparse_npu(query, key, value, plan, attn_metadata)
+
+    def _forward_rectangular_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata: AttentionMetadata,
+        plan: RainFusionPlan,
+        reference_rows: int,
+    ) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.ops.rainfusion_rectangular import get_plan, run
+
+        if metadata.attn_mask is not None:
+            raise ValueError("rectangular RainFusion cannot replace an explicit attention mask")
+        if metadata.extra.get("kv_cache_dtype", "bf16") not in ("float", "bf16"):
+            raise ValueError("rectangular RainFusion requires unquantized cached K/V")
+        precision = metadata.extra.get("kv_cache_dtype", self.rainfusion.precision)
+        if precision == "float":
+            precision = "bf16"
+        used_q = int(metadata.extra["max_seqlen_q"])
+        used_kv = int(metadata.extra["max_seqlen_k"])
+        if plan.video_spans is None:
+            raise ValueError("rectangular RainFusion requires explicit video spans")
+        spans = tuple(
+            (cast(int, span["start"]), tuple(cast(list[int], span["latent_shape"]))) for span in plan.video_spans
+        )
+        rect_plan = get_plan(used_kv, reference_rows, spans, str(query.device))
+        result = run(
+            query[:, :used_q],
+            key[:, :used_kv],
+            value[:, :used_kv],
+            rect_plan,
+            self.rainfusion.sparsity,
+            self.softmax_scale,
+            precision=precision,
+        )
+        return torch.cat((result, query[:, used_q:]), dim=1) if query.shape[1] > used_q else result
 
     def _can_use_hybrid(self, query: torch.Tensor, metadata: AttentionMetadata | None) -> bool:
         if (
@@ -549,8 +609,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         previous_end = 0
         target_count = 0
         video_seqlen = 0
-        boundary_dense_seqlen = 0
-        previous_video_length: int | None = None
         for span in sorted(layout.video_spans, key=lambda item: item.start):
             grid = tuple(int(dim) for dim in span.latent_grid)
             length = math.prod(grid)
@@ -574,17 +632,10 @@ class RainFusionAttentionImpl(AttentionImpl):
                 return None
             if role == "target":
                 target_count += 1
-            if previous_video_length is not None:
-                # rf_v2 works on fixed 128-token blocks. The preceding clip
-                # needs these dense rows to complete its tail block before
-                # this clip begins, otherwise one sparse block would cross a
-                # clip boundary.
-                boundary_dense_seqlen += (-previous_video_length) % _BLOCK_SIZE
             spans.append({"start": start, "latent_shape": list(grid)})
             span_summaries.append(f"role={role}, start={start}, seqlen={length}, latent_shape={grid}")
             previous_end = start + length
             video_seqlen += length
-            previous_video_length = length
 
         if target_count != 1:
             logger.warning_once(
@@ -599,7 +650,26 @@ class RainFusionAttentionImpl(AttentionImpl):
                 _MIN_VIDEO_BLOCKS * _BLOCK_SIZE,
             )
             return None
-        dense_context_seqlen = int(used_len) - video_seqlen
+        images = []
+        if self.rainfusion.image_sparsity > 0:
+            for image in layout.image_spans:
+                grid = tuple(int(dim) for dim in image.latent_grid)
+                if len(grid) != 2 or any(dim <= 0 for dim in grid):
+                    raise ValueError("RainFusion image grids must contain two positive dimensions.")
+                images.append({"start": int(image.start), "latent_shape": list(grid)})
+        combined = sorted([*spans, *images], key=lambda span: cast(int, span["start"]))
+        previous_end = 0
+        for span in combined:
+            end = span["start"] + math.prod(span["latent_shape"])
+            if span["start"] < previous_end or end > int(used_len):
+                raise ValueError("RainFusion image/video spans overlap or exceed the sequence.")
+            previous_end = end
+        boundary_dense_seqlen = sum(
+            (-math.prod(cast(list[int], span["latent_shape"]))) % _BLOCK_SIZE for span in combined[:-1]
+        )
+        dense_context_seqlen = int(used_len) - sum(
+            math.prod(cast(list[int], span["latent_shape"])) for span in combined
+        )
         if boundary_dense_seqlen > dense_context_seqlen:
             logger.warning_once(
                 "RAINFUSION_ATTN staying dense: multi-video spans need dense_context_seqlen=%d "
@@ -617,7 +687,11 @@ class RainFusionAttentionImpl(AttentionImpl):
             dense_context_seqlen,
             int(used_len),
         )
-        return RainFusionPlan(used_len=int(used_len), video_spans=spans)
+        return RainFusionPlan(
+            used_len=int(used_len),
+            video_spans=spans,
+            image_spans=images or None,
+        )
 
     def _forward_sparse_npu(
         self,
@@ -675,6 +749,11 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
+        if plan.image_spans:
+            parameters = inspect.signature(sparse_attention).parameters
+            if not {"image_spans", "image_sparsity"}.issubset(parameters):
+                raise ValueError("Upgrade MindIE-SD: independent image sparsity requires image_spans/image_sparsity.")
+            common_kwargs.update(image_spans=plan.image_spans, image_sparsity=self.rainfusion.image_sparsity)
         if plan.video_spans is not None:
             out = sparse_attention(
                 q,

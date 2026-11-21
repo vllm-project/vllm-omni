@@ -66,6 +66,18 @@ The NPU attention factory rejects Ulysses × AllGather-KV when this option is
 enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
 The same topology remains available through the standard communication path.
 
+### Compact MiniMax-H3 reference KV
+
+Reference-KV reuse removes reference query rows before SP sharding. In strict
+Ulysses mode, MiniMax-H3 rounds this compact sequence up to equal physical shard
+widths. Attention removes the transport padding after the forward exchange and
+before restoring cached reference KV, then restores zero rows before the reverse
+exchange. The model removes the padding after gathering outputs. Padded rows
+never participate in attention scores or reference KV capture.
+
+This path requires pure Ulysses with `ring_degree = 1` and no paged KV. It keeps
+the strict transport shape contract and does not use a padding attention mask.
+
 ---
 
 ## UAA Mode (Experimental)

@@ -743,6 +743,7 @@ class MiniMaxH3Pipeline(
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
+    _ref2va_lora_path: Path | None = None
     # Set from --lora-path when it names a VDN-H3 checkpoint directory.
     _vdn: VDNCheckpoint | None = None
     _fasth3_checkpoint: FastH3CheckpointSpec | None = None
@@ -1220,6 +1221,18 @@ class MiniMaxH3Pipeline(
             if self._vdn is None and self._regenerate is None
             else None
         )
+        from .ref2va_lora import resolve_adapter_path
+
+        self._ref2va_lora_path = resolve_adapter_path(od_config)
+        if self._ref2va_lora_path is not None:
+            if not current_omni_platform.is_npu():
+                raise ValueError("the eight-step Ref2VA startup adapter currently supports Ascend NPU only")
+            if "ref2va" not in self.supported_tasks:
+                raise ValueError("the eight-step Ref2VA adapter requires a Ref2VA model partition")
+            if resolve_offload(od_config).offloads(DIT_COMPONENT):
+                raise ValueError("the eight-step Ref2VA adapter requires resident DiT weights")
+            if self._base_schedule_for_task("ref2va") is not None:
+                raise ValueError("the eight-step Ref2VA adapter cannot override a checkpoint's pinned schedule")
         if self._fasth3 is not None and self._fasth3.requires_vsa:
             # The artifact assigns a compression gate per DiT block, so those
             # modules have to exist before load_weights streams them in. Only
@@ -1463,12 +1476,25 @@ class MiniMaxH3Pipeline(
                 )
             if missing_gates := required_gates - transformer_loaded:
                 raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
+        if self._ref2va_lora_path is not None:
+            from .ref2va_lora import install_adapter
+
+            install_adapter(self._transformer_for_task("ref2va"), self._ref2va_lora_path)
         return loaded_with_prefix
 
     @property
     def lora_is_fused(self) -> bool:
-        """True when --lora-path was consumed as a load-time weight fusion."""
-        return self._fasth3 is not None or self._vdn is not None or self._regenerate is not None
+        """Whether a fixed startup adapter has consumed --lora-path.
+
+        The Ref2VA adapter uses BF16 forward deltas after the base projection;
+        its weights are kept separate from the quantized checkpoint.
+        """
+        return (
+            self._fasth3 is not None
+            or self._vdn is not None
+            or self._regenerate is not None
+            or self._ref2va_lora_path is not None
+        )
 
     def _configure_adaln_sidecar(
         self,
@@ -1561,6 +1587,15 @@ class MiniMaxH3Pipeline(
         derived from the step count, together with the count the rest of the
         request speaks in.
         """
+        if self._ref2va_lora_path is not None:
+            if task != "ref2va" or sampling.num_inference_steps != 8:
+                raise OmniClientError(
+                    "the Ref2VA v4-step600 EMA adapter requires task=ref2va and num_inference_steps=8"
+                )
+            if sampling.lora_request is not None:
+                raise OmniClientError(
+                    "the immutable Ref2VA startup adapter does not support per-request LoRA switching"
+                )
         if self._fasth3 is not None:
             # A fused student carries its own positions; the checkpoint
             # underneath it is the many-step teacher, whose schedule does not

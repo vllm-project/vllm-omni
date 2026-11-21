@@ -6,7 +6,9 @@ block, and attends to the highest-scoring blocks after arranging video tokens
 in `(t, h, w)` order.
 
 Only the video segment is sparse. Prefix rows such as text, visual conditions,
-and audio, plus first-frame blocks, remain dense. Unsupported calls—including
+and audio, plus first-frame blocks, remain dense by default. Reference-image
+selection below is an explicit exception for eligible image key blocks.
+Unsupported calls—including
 warmup steps, skipped layers, missing video geometry, and video segments below
 32 blocks—delegate to `FLASH_ATTN`, so compatible models can select RainFusion
 globally.
@@ -110,3 +112,40 @@ forwards remain floating-point BSA; unsupported BSA precision is an error rather
 than an automatic fallback. See
 [quantized attention](../../quantization/quantized_kvcache.md#wan22-t2v-quantized-attention-on-ascend)
 for the shared configuration structure and index semantics.
+
+## Independent reference-image sparsity
+
+Set `rainfusion.image_sparsity` alongside `block_sparse` in an attention spec:
+
+```json
+{
+  "default": {
+    "backend": "RAINFUSION_ATTN",
+    "block_sparse": {"sparsity": 0.8, "precision": "mix"},
+    "rainfusion": {"image_sparsity": 0.9}
+  }
+}
+```
+
+The deletion ratio is in `[0, 1]`; default 0 preserves the original image mask.
+For each image, head and eligible video query block, selection keeps
+`max(1, ceil(N * (1 - image_sparsity)))` of that image's N candidate key blocks.
+Reference-video and target-video queries both participate. Selection is
+independent of global top-k and can restore connections it removed. Protected
+query rows and image boundary blocks retain their protection.
+
+Models supply independent `ImageTokenSpan(start, latent_grid)` metadata;
+the backend does not infer image geometry from a prefix. MindIE-SD must expose
+`image_spans/image_sparsity` and matching rf_v2/rf_v3 behavior; old RBS helper
+builds are insufficient and missing public parameters cause an explicit error.
+
+With selected images, compact MiniMax-H3 reference reuse pads dummy reference
+queries after Ulysses, executes equal-length Q/K/V attention and discards their
+outputs. Reference projection and KV reuse remain active. Without image
+selection, A5 resident reuse supports rectangular BF16/mix with unquantized KV.
+Image sparsity does not reduce the reference KV allocation; Ring is unsupported.
+
+Use the existing attention schedule to vary video sparsity across steps. Each
+profile must include its own RainFusion options. See the
+[reference optimization recipe](../../../../recipes/h3_ref_optimizations/README.md)
+for dependency revision, configuration and validation limits.

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Post-Ulysses reference-KV cache with layerwise host-to-device prefetch."""
+"""Post-Ulysses reference KV with host prefetch or same-stream device storage."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class MiniMaxH3ReferenceKVStats:
     block_cached_layers: int = 0
     refresh_steps: int = 0
     h2d_steps: int = 0
+    resident_reuse_steps: int = 0
     captured_layers: int = 0
     substituted_layers: int = 0
     h2d_bytes: int = 0
@@ -39,6 +40,7 @@ class _MiniMaxH3ReferenceKVBase:
     """Request-local refresh schedule and reference-row bookkeeping."""
 
     stats: MiniMaxH3ReferenceKVStats
+    is_device_resident = False
 
     def __init__(
         self,
@@ -74,6 +76,8 @@ class _MiniMaxH3ReferenceKVBase:
         self._global_non_reference_positions: torch.Tensor | None = None
         self._global_reference_positions: torch.Tensor | None = None
         self._compact_rope_table: torch.Tensor | None = None
+        self._reference_mask: torch.Tensor | None = None
+        self.transport_alignment: dict[str, int] | None = None
         self._step: int | None = None
         self._refresh = False
         self._global_refresh = False
@@ -166,6 +170,14 @@ class _MiniMaxH3ReferenceKVBase:
             raise RuntimeError("compact reference RoPE layout changed within one run")
         return self._compact_rope_table
 
+    def set_transport_alignment(self, compact_rows: int, padding: int) -> None:
+        layout = {"compact_rows": compact_rows, "transport_padding": padding}
+        if compact_rows <= 0 or padding < 0:
+            raise ValueError("compact transport requires positive logical rows and nonnegative padding")
+        if self.transport_alignment is not None and self.transport_alignment != layout:
+            raise RuntimeError("compact transport layout changed within a request")
+        self.transport_alignment = layout
+
     @property
     def local_sequence_rows(self) -> int:
         if self._local_sequence_rows is None:
@@ -241,7 +253,12 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             return None
         if config.kv_refresh_interval == 0:
             _log.warning("MiniMax-H3 reference-KV populate-once mode is lossy with bidirectional attention")
-        state = cls(
+        state_cls = cls
+        if config.kv_storage == "npu":
+            if torch.device(device).type != "npu":
+                raise ValueError("kv_storage=npu requires an Ascend NPU device")
+            state_cls = MiniMaxH3ReferenceKVResidentState
+        state = state_cls(
             num_layers=num_layers,
             global_reference_rows=global_reference_rows,
             device=device,
@@ -250,13 +267,13 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         )
         _log.info(
             "MiniMax-H3 reference-KV enabled: layers=%d, global_ref_rows=%d, "
-            "refresh_interval=%d, device=%s, ring_size=%d, "
+            "refresh_interval=%d, device=%s, storage=%s, "
             "host_quantization=%s, skip_reference_projection=True, cache_layout=post_ulysses",
             num_layers,
             global_reference_rows,
             config.kv_refresh_interval,
             device,
-            state.ring_size,
+            config.kv_storage,
             state.host_quantization,
         )
         return state
@@ -299,6 +316,10 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         if self._device_scale_ring is not None:
             total += self._device_scale_ring.numel() * self._device_scale_ring.element_size()
         return total
+
+    @property
+    def device_cache_bytes(self) -> int:
+        return 0
 
     def _fall_back_to_int8(self, reason: Exception | str) -> None:
         if self.effective_host_quantization == "int8":
@@ -511,6 +532,11 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             raise ValueError(
                 f"cached post-Ulysses reference head layout mismatch: {cached_k.shape[1:]} != {key.shape[2:]}"
             )
+        return self._combine_cached_reference(cached_k, cached_v, key, value)
+
+    def _combine_cached_reference(
+        self, cached_k: torch.Tensor, cached_v: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return (
             torch.cat((cached_k.unsqueeze(0), key), dim=1),
             torch.cat((cached_v.unsqueeze(0), value), dim=1),
@@ -751,18 +777,21 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             except Exception:
                 _log.debug("Tier2 copy-stream close failed", exc_info=True)
         _log.info(
-            "MiniMax-H3 reference-KV Tier2 summary: host_bytes=%d, "
-            "device_staging_bytes=%d, refresh_steps=%d, h2d_steps=%d, "
+            "MiniMax-H3 reference-KV %s summary: host_bytes=%d, device_cache_bytes=%d, "
+            "device_staging_bytes=%d, refresh_steps=%d, h2d_steps=%d, resident_reuse_steps=%d, "
             "captured_layers=%d, substituted_layers=%d, block_cached_layers=%d, "
             "prefetched_layers=%d, ready_wait_layers=%d, h2d_bytes=%d, "
             "projection_skipped_layers=%d, projection_skipped_rows=%d, "
             "projection_total_rows=%d, cache_layout=post_ulysses, "
             "host_quantization=%s, effective_host_quantization=%s, "
             "dequantized_layers=%d, quantization_fallbacks=%d",
+            self.tier_name,
             self.host_bytes,
+            self.device_cache_bytes,
             self.device_staging_bytes,
             self.stats.refresh_steps,
             self.stats.h2d_steps,
+            self.stats.resident_reuse_steps,
             self.stats.captured_layers,
             self.stats.substituted_layers,
             self.stats.block_cached_layers,
@@ -790,3 +819,100 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         self._global_reference_positions = None
         self._global_sequence_rows = None
         self._compact_rope_table = None
+        self._reference_mask = None
+        self.transport_alignment = None
+
+
+class MiniMaxH3ReferenceKVResidentState(MiniMaxH3ReferenceKVTier2State):
+    """Same-stream device storage without host copies or a staging ring.
+
+    _host_pool is the inherited storage sentinel, but holds device tensors here.
+    No copy stream or staging ring is allocated. Only the compute stream reads
+    and overwrites the request-local pool, in layer/step order.
+    """
+
+    tier_name = "Resident"
+    is_device_resident = True
+
+    @property
+    def host_bytes(self) -> int:
+        return 0
+
+    @property
+    def device_cache_bytes(self) -> int:
+        if self._host_pool is None:
+            return 0
+        return self._host_pool.numel() * self._host_pool.element_size()
+
+    def begin_step(self, step: int, *, sigma: float | None = None) -> None:
+        del sigma
+        if self._step is not None:
+            raise RuntimeError("resident reference-KV step is still active")
+        self._step = int(step)
+        self._layers_seen.clear()
+        self._global_refresh = step == 0 or (self.refresh_interval > 0 and step % self.refresh_interval == 0)
+        self._refresh = self._is_refresh_step(step)
+        if self._refresh:
+            self.stats.refresh_steps += 1
+        else:
+            if self._host_pool is None:
+                raise RuntimeError("resident reuse before populate")
+            self.stats.resident_reuse_steps += 1
+
+    def _capture_post_ulysses_layer(self, layer_index: int, key: torch.Tensor, value: torch.Tensor) -> None:
+        if key.shape != value.shape or key.ndim != 4 or key.shape[0] != 1:
+            raise ValueError("resident cache requires matching [1,S,H,D] K/V")
+        if self._global_sequence_rows != int(key.shape[1]):
+            raise ValueError("resident sequence layout changed")
+        if self.host_quantization != "none":
+            raise ValueError("resident cache requires unquantized storage")
+        shape = (self.num_layers, 2, self.global_reference_rows, *key.shape[2:])
+        if self._host_pool is None:
+            self._host_pool = torch.empty(shape, device=key.device, dtype=key.dtype)
+        if tuple(self._host_pool.shape) != shape or self._host_pool.dtype != key.dtype:
+            raise ValueError("resident cache layout changed")
+        positions = self.global_reference_positions
+        with record_function("minimax_h3.ref_kv_resident.capture_direct"):
+            torch.index_select(key[0], 0, positions, out=self._host_pool[layer_index, 0])
+            torch.index_select(value[0], 0, positions, out=self._host_pool[layer_index, 1])
+        self.stats.captured_layers += 1
+        self._layers_seen.add(layer_index)
+
+    def take_cached_reference_layer(self, layer_index: int, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._step is None or self._global_refresh:
+            raise RuntimeError("resident cache requested outside reuse step")
+        if not 0 <= layer_index < self.num_layers or layer_index != len(self._layers_seen):
+            raise RuntimeError("resident layers must execute exactly once in order")
+        if self._host_pool is None:
+            raise RuntimeError("resident pool is missing")
+        # Request-local NPU pool is read on the compute stream. The caller's
+        # torch.cat copies these views into request-local scratch before attention;
+        # refresh writes occur later on the same stream. Host ring is unchanged.
+        with record_function("minimax_h3.ref_kv_resident.take_cached"):
+            cached = self._host_pool[layer_index]
+        if cached.dtype != like.dtype or cached.device != like.device:
+            raise RuntimeError("resident cache dtype/device changed")
+        self.stats.substituted_layers += 1
+        self._layers_seen.add(layer_index)
+        return cached[0], cached[1]
+
+    def _combine_cached_reference(
+        self, cached_k: torch.Tensor, cached_v: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (2, 1, cached_k.shape[0] + key.shape[1], *key.shape[2:])
+        scratch = getattr(self, "_concat_scratch", None)
+        if scratch is None:
+            scratch = torch.empty(shape, device=key.device, dtype=key.dtype)
+            self._concat_scratch = scratch
+        elif tuple(scratch.shape) != shape or scratch.dtype != key.dtype or scratch.device != key.device:
+            raise RuntimeError("resident concatenation layout changed")
+        torch.cat((cached_k.unsqueeze(0), key), dim=1, out=scratch[0])
+        torch.cat((cached_v.unsqueeze(0), value), dim=1, out=scratch[1])
+        return scratch[0], scratch[1]
+
+    def close(self) -> None:
+        super().close()
+        self._concat_scratch = None
+
+    def mark_block_cache_skipped(self, layer_indices: list[int]) -> None:
+        _MiniMaxH3ReferenceKVBase.mark_block_cache_skipped(self, layer_indices)

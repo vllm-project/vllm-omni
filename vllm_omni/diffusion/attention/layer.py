@@ -1263,6 +1263,19 @@ class Attention(nn.Module):
         post_parallel_ref = (
             attn_metadata.extra.get("minimax_h3_reference_kv_post_parallel") if attn_metadata is not None else None
         )
+        transport_padding = 0
+        alignment_layout = (
+            attn_metadata.extra.get("minimax_h3_transport_alignment") if attn_metadata is not None else None
+        )
+        if alignment_layout is not None:
+            if use_paged_attention or self.use_ring or strategy.name != "ulysses":
+                raise ValueError("compact transport alignment requires pure Ulysses reference KV")
+            if not isinstance(post_parallel_ref, tuple) or len(post_parallel_ref) != 3 or not post_parallel_ref[2]:
+                raise ValueError("transport alignment requires a compact reference-KV state")
+            from vllm_omni.diffusion.attention.ops.reference_kv_alignment import strip_qkv
+
+            transport_padding = alignment_layout["transport_padding"]
+            query, key, value = strip_qkv(query, key, value, alignment_layout["compact_rows"], transport_padding)
         if post_parallel_ref is not None:
             if not isinstance(post_parallel_ref, tuple) or len(post_parallel_ref) != 3:
                 raise TypeError("minimax_h3_reference_kv_post_parallel must be a (state, layer_index, compact) tuple")
@@ -1334,6 +1347,11 @@ class Attention(nn.Module):
             padding_start = paged_sp_padding_offset - paged_sp_padding
             output_padding = out.new_zeros((out.shape[0], paged_sp_padding, *out.shape[2:]))
             out = torch.cat((out[:, :padding_start], output_padding, out[:, padding_start:]), dim=1)
+
+        if transport_padding:
+            from vllm_omni.diffusion.attention.ops.reference_kv_alignment import append_rows
+
+            out = append_rows(out, transport_padding, 1)
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output

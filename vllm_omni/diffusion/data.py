@@ -2466,6 +2466,19 @@ class BlockSparseSpec:
 
 
 @dataclass
+class RainFusionSpec:
+    """RainFusion-only controls; shared sparsity options stay in BlockSparseSpec."""
+
+    image_sparsity: float = 0.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.image_sparsity, bool) or not isinstance(self.image_sparsity, (int, float)):
+            raise ValueError("rainfusion.image_sparsity must be a number within [0, 1].")
+        if not 0 <= self.image_sparsity <= 1:
+            raise ValueError("rainfusion.image_sparsity must be within [0, 1].")
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
@@ -2478,6 +2491,7 @@ class AttentionSpec:
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
+    rainfusion: RainFusionSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
@@ -2486,6 +2500,9 @@ class AttentionSpec:
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.rainfusion = self._coerce(self.rainfusion, RainFusionSpec, "rainfusion")
+        if self.rainfusion is not None and self.backend.upper() != "RAINFUSION_ATTN":
+            raise ValueError("rainfusion is only supported by the RAINFUSION_ATTN backend")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -2582,6 +2599,9 @@ class AttentionSpec:
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 
+        if self.rainfusion is not None and self.rainfusion.image_sparsity > 0.0:
+            kw["image_sparsity"] = self.rainfusion.image_sparsity
+
         return kw or None
 
 
@@ -2660,6 +2680,7 @@ class AttentionConfig:
             "fastvideo_vsa_precision",
             "sparge",
             "block_sparse",
+            "rainfusion",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)

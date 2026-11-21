@@ -150,3 +150,34 @@ It does not reduce weight residency or cancel layerwise prefetch. A future
 integration that skips weight transfers must coordinate with `OffloadPlan`
 before prefetch and provide a safe miss path; moving weight storage currently
 causes conservative cache invalidation.
+
+## MiniMax-H3 approximate reference reuse
+
+The request-local reference-KV cache is distinct from exact conditioning
+projection reuse. `kv_storage=host` retains the existing layerwise prefetch;
+`kv_storage=npu` keeps unquantized reference KV on the device. Both refresh on
+the configured interval and compact reference query rows on reuse steps. The
+device pool and concatenation scratch are read and overwritten on the compute
+stream in layer order and released when the request closes.
+
+Reference reuse does not install an adapter or change weight loading. A request
+keeps its model and adapter fixed for the denoise run; its cache closes before
+another request can reuse storage. Refresh intervals are independent of the
+step count. Independent image sparsity is a separate RainFusion option and
+requires `ImageTokenSpan` geometry preserved through packing and compaction.
+Its public MindIE-SD ABI requires equal-length Q/K/V: selected-image reuse adds
+dummy reference queries after Ulysses and discards their outputs. With image
+selection off, resident A5 reuse retains rectangular attention. See the
+[reference optimization recipe](../../../../recipes/h3_ref_optimizations/README.md)
+for configuration, its independent MindIE-SD dependency and validation limits.
+
+### Fixed eight-step Ref2VA adapter
+
+The separate LQ-Slim preset accepts the immutable v4-step600 EMA artifact through
+the normal startup LoRA flags. It adds BF16 deltas after base projections,
+including quantized projections. Its hash and 259-target layout are validated
+before binding. Installation clears the AdaLN projection cache; forward hooks
+retain that cache's normal conservative fallback. The adapter requires resident
+DiT weights, scale 1, eight steps and DiT TP=1; it disables per-request adapter
+switching. These restrictions do not apply to the independent Ref extensions.
+See the [LQ-Slim recipe](../../../../recipes/lq_slim/README.md).

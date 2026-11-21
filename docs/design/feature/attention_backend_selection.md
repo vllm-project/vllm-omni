@@ -73,6 +73,7 @@ unstructured keyword dictionaries:
   validation;
 - `skip_softmax` is consumed by TRTLLM; and
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
+- `rainfusion` owns RainFusion-only reference-image selection; and
 - `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
 - `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend.
 
