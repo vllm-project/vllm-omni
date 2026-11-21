@@ -19,10 +19,21 @@ class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
     """
 
     def _unified_decode_graph_enabled(self) -> bool:
-        runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)
-        return runtime_config.unified_decode_graph_available(
-            use_cuda_graph=omni_platform.current_omni_platform.is_cuda()
-        )
+        """Whether the unified decode graph can run, resolved once per scheduler.
+
+        ``from_vllm_config`` rebuilds the runtime config and re-runs
+        ``_normalized()`` on every call, and this predicate is queried on every
+        scheduling step; the answer only depends on the engine config and the
+        platform, both of which are fixed for the life of the scheduler.
+        """
+        cached = self.__dict__.get("_unified_decode_graph_cache")
+        if cached is None:
+            runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)
+            cached = runtime_config.unified_decode_graph_available(
+                use_cuda_graph=omni_platform.current_omni_platform.is_cuda()
+            )
+            self._unified_decode_graph_cache = cached
+        return cached
 
     def _should_defer_waiting_for_unified_decode_graph(self) -> bool:
         if not self._unified_decode_graph_enabled():

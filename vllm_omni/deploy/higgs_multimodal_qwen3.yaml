@@ -11,6 +11,7 @@
 # worth of work). Stage 1 honors meta.left_context_size + meta.right_holdback_size
 # so the per-chunk codec windows stitch into a coherent PCM stream.
 async_chunk: true
+model_runner: v2
 
 connectors:
   connector_of_shared_memory:

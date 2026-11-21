@@ -64,6 +64,9 @@ async def test_public_handles_and_session_only_guard(process_omni):
     assert not omni.sessions
     await omni.aclose()
     assert not omni.engine.is_alive()
+    with pytest.raises(EngineDeadError, match="shutting down"):
+        await omni.open_session()
+    assert omni.final_output_task is None
 
 
 @pytest.mark.asyncio
