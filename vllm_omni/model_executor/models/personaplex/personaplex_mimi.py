@@ -125,6 +125,19 @@ def _map_moshi_codec_weights(
     return mapped
 
 
+def _nest_codec_weights(codec_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    prefixes = {
+        "encoder.layers.": "encoder.encoder_seanet.layers.",
+        "decoder.layers.": "decoder.decoder_seanet.layers.",
+        "downsample.": "encoder.downsample.",
+        "upsample.": "decoder.upsample.",
+    }
+    return {
+        next((new + name[len(old) :] for old, new in prefixes.items() if name.startswith(old)), name): tensor
+        for name, tensor in codec_state.items()
+    }
+
+
 class _StreamConv1d:
     """Moshi ``RawStreamingConv1d``: causal left-context carry per call.
 
@@ -436,16 +449,7 @@ class PersonaPlexMimiCodec(nn.Module):
         # Newer Transformers packages the SEANet and resamplers in separate
         # encoder/decoder models. The bundled checkpoint layout stays the same.
         if encoder_owner is not self.model:
-            prefixes = {
-                "encoder.layers.": "encoder.encoder_seanet.layers.",
-                "decoder.layers.": "decoder.decoder_seanet.layers.",
-                "downsample.": "encoder.downsample.",
-                "upsample.": "decoder.upsample.",
-            }
-            codec_state = {
-                next((new + name[len(old) :] for old, new in prefixes.items() if name.startswith(old)), name): tensor
-                for name, tensor in codec_state.items()
-            }
+            codec_state = _nest_codec_weights(codec_state)
             transformer_prefixes = ("encoder.encoder_transformer.", "decoder.decoder_transformer.")
         incompatible = self.model.load_state_dict(codec_state, strict=False)
         expected_missing = {name for name in self.model.state_dict() if name.startswith(transformer_prefixes)}
