@@ -324,16 +324,22 @@ model or deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
 include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
-PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni profiles. Selecting
+PersonaPlex's Talker, VibeVoice, and the LFM3-Omni profiles. Selecting
 `v2` manually does not establish support for those paths.
-YuE2's audio synthesis still depends on V1 model sampling hooks; its two
-offline audio export tests are not applicable to the V2 runtime.
 The complete PersonaPlex workflow is also unavailable: its Talker still
 requires V1, although its Code2Wav stage has V2 components.
 The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
 hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
 fallback.
+
+YuE2's `yue2.yaml` uses the shared V2 AR runner with a model-owned sampler and
+model-state lifecycle hooks. The sampler preserves phase-specific sampling and
+paired CFG; the hooks release AR slots while NAR/VAE jobs complete and deliver audio by
+request ID. Automatic ABC transitions reset the same request's phase state.
+The profile requires one GPU, synchronous scheduling, and disabled prefix
+caching and external KV transfer. See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md).
+
 Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
 are unavailable. Their retired serving E2E tests covered speech generation,
 voice cloning, streaming, concurrency and request validation across those
@@ -444,7 +450,7 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Merged with pipeline `sampling_constraints`; scalar constraints win, while required `stop_token_ids` are appended and deduplicated. |
 | `engine_extras` | dict | optional | `{}` | Catch-all for engine fields not listed above; deep-merged across overlays and forwarded to the stage engine. |
 
-**Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. A top-level `--tensor-parallel-size` is broadcast to every stage, so it can make a single-GPU stage violate this contract ([issue #5003](gh-issue:5003)); fix that case with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set TP only on the multi-GPU stage.
+**Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. Use `--stage-overrides` or the stage's deploy entry to set `tensor_parallel_size` and `devices` together per stage.
 
 ### Connector schema
 
@@ -496,6 +502,19 @@ platform-specific value in a user overlay, use the same platform block.
 
 `--stage-overrides` logs a warning and ignores deploy-only fields such
 as `session_mode` and `connectors`. Set those fields in the deploy YAML.
+
+Stage-owned flags such as `--gpu-memory-utilization`, `--kv-cache-memory-bytes`,
+`--max-model-len`, and `--tensor-parallel-size` reject a flat value that would override
+multiple stages in `vllm serve --omni`. Use `--stage-overrides` or a
+deploy YAML to specify the value for each intended stage. A numeric
+`--stage-id` scopes these flags to the selected stage. Flat flags with a
+single eligible recipient and pipeline-wide flags such as `--dtype`
+continue to work.
+
+A nested `parallel_config` in `--stage-overrides` takes precedence for that
+stage. For example, `'{"1":{"parallel_config":{"tensor_parallel_size":1}}}'`
+sets stage 1's tensor parallel size and lets a flat `--tensor-parallel-size`
+apply to stage 0 in a two-stage pipeline.
 
 ### Stage-Based CLI Paradigm
 
@@ -554,7 +573,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 From highest to lowest:
 
 1. Per-stage overrides (`--stage-overrides` JSON)
-2. Explicit global CLI flags (`--gpu-memory-utilization 0.85`, etc.)
+2. Explicit CLI flags for the pipeline or a single eligible stage
 3. Platform section (`platforms.npu.stages`, etc.) on top of the base `stages:`
 4. Overlay YAML (via `base_config:`) on top of the base YAML
 5. Parser defaults
@@ -616,13 +635,12 @@ stages:
     gpu_memory_utilization: 0.5     # smaller GPU
 ```
 
-Launched with both an explicit global flag and a per-stage override:
+Launch with stage-specific overrides:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config my_overrides.yaml \
-    --max-model-len 16384 \
-    --stage-overrides '{"0": {"max_num_seqs": 8}}'
+    --stage-overrides '{"0": {"max_num_seqs": 8, "max_model_len": 16384}, "1": {"max_model_len": 16384}}'
 ```
 
 Within the stage-based CLI paradigm, equivalent configuration parameters can inherently be passed directly
@@ -642,10 +660,10 @@ Effective config per stage after the merge:
 | ------- | ------- | ------------- | -------- |
 | 0 | `gpu_memory_utilization` | `0.9` | base YAML (overlay didn't touch stage 0) |
 | 0 | `max_num_seqs` | `8` | per-stage CLI (`--stage-overrides`) — wins over base `32` |
-| 0 | `max_model_len` | `16384` | global CLI |
+| 0 | `max_model_len` | `16384` | per-stage CLI |
 | 1 | `gpu_memory_utilization` | `0.5` | overlay YAML — wins over base `0.7` |
 | 1 | `max_num_seqs` | `16` | base YAML (overlay didn't touch this field) |
-| 1 | `max_model_len` | `16384` | global CLI |
+| 1 | `max_model_len` | `16384` | per-stage CLI |
 | 2 | (all defaults) | — | base YAML (no overrides apply) |
 
 Therefore, as a core part of vLLM-Omni, a model's pipeline and deployment configurations have several main functions:
@@ -940,3 +958,18 @@ stereo; benchmark raw PCM with `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 `VLLM_OMNI_BENCH_AUDIO_CHANNELS=2`. See the
 [MOSS recipe](gh-file:recipes/OpenMOSS/MOSS-TTS.md#local-15-unified-deployment-and-slot-attention)
 for the execution path and configuration overrides.
+
+## MiniMax-Music3 with Model Runner V2
+
+`minimax_music3.yaml` and `minimax_music3_2gpu.yaml` inherit the vLLM 0.34 MRV2
+default for both stages. The serving validation for these profiles used CUDA. The MRV2 model state passes the batch rows, counts and per-request
+arguments to the talker for CFG pairing, frame feedback and seeded sampling.
+Stage 0 uses `async_scheduling: false` so the two members of a CFG pair
+are sampled in the same engine step.
+
+Each window reaches stage 1 as its codes, 200 frames x 8 codebooks =
+1600 prompt tokens. A song's last window
+can be one frame longer: 201 frames, 1608 tokens. A window is never split, so
+in your own config keep stage 1's `max_num_batched_tokens` at least
+`max_num_seqs` x 1608 on MRV2. With less, a few requests take every step and
+the other streams wait.

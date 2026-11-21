@@ -11,7 +11,8 @@ Usage examples:
   # Start server first:
   vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
       --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
-      --trust-remote-code --enforce-eager
+      --trust-remote-code \
+      --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 
   # Audio to text (ASR)
   python openai_chat_completion_client.py --query-type audio_to_text

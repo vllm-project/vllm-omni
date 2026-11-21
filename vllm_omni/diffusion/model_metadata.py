@@ -17,6 +17,11 @@ class DiffusionModelMetadata:
     supported_control_upload_types: tuple[str, ...] = ()
     attention_mask_free: bool = False
     final_output_type: str | None = None
+    # Additional generation outputs for the default topology (e.g. Cosmos3
+    # can return images even though its default output is video).
+    additional_output_types: tuple[str, ...] = ()
+    # Whether a standalone audio output is served through /v1/audio/generate.
+    supports_audio_generation: bool = False
     # Whether ``/v1/videos`` accepts source media plus per-token video/audio
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
@@ -58,6 +63,9 @@ FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "StableAudioPipeline": DiffusionModelMetadata(final_output_type="audio", supports_audio_generation=True),
+    "StableAudio3Pipeline": DiffusionModelMetadata(final_output_type="audio", supports_audio_generation=True),
+    "LTX2TextToAudioPipeline": DiffusionModelMetadata(final_output_type="audio", supports_audio_generation=True),
     "Praxis1Pipeline": DiffusionModelMetadata(final_output_type="actions"),
     "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -197,10 +205,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+        additional_output_types=("image",),
     ),
     "Cosmos3OmniPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+        additional_output_types=("image",),
     ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
