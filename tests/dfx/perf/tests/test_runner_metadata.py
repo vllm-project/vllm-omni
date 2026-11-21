@@ -24,6 +24,18 @@ class ServerEndpoint:
     judge_base_url: str | None = None
 
 
+@dataclass(frozen=True)
+class PytestOptions:
+    """Typed option reader for direct benchmark-runner unit tests."""
+
+    assert_baseline: bool = True
+    require_baseline: bool = False
+    require_duplex_eval_score_floors: bool = False
+
+    def getoption(self, name: str) -> bool:
+        return bool(getattr(self, name))
+
+
 def test_request_failure_assertion_shows_the_underlying_error():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -936,7 +948,7 @@ def test_perf_sweep_collects_all_baseline_regressions(monkeypatch, pytestconfig)
 
     with pytest.raises(PerformanceBaselineRegressionError) as exc_info:
         run_benchmark.test_performance_benchmark(
-            SimpleNamespace(host="localhost", port=8000, model="test-model"),
+            ServerEndpoint(model="test-model"),
             case,
             pytestconfig=pytestconfig,
         )
@@ -1014,7 +1026,7 @@ def test_perf_sweep_confirms_h100_ttfp_with_median(monkeypatch, tmp_path, ttfp_v
             },
         },
     }
-    pytestconfig = SimpleNamespace(getoption=lambda name: name == "assert_baseline")
+    pytestconfig = PytestOptions()
 
     if passes:
         run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
@@ -1123,7 +1135,7 @@ def test_perf_sweep_does_not_retry_a_hard_throughput_regression(monkeypatch):
             },
         },
     }
-    pytestconfig = SimpleNamespace(getoption=lambda name: name == "assert_baseline")
+    pytestconfig = PytestOptions()
 
     with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
         run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
@@ -1203,7 +1215,7 @@ def test_perf_sweep_consolidates_confirmation_aborted_by_hard_retry(monkeypatch,
             },
         },
     }
-    pytestconfig = SimpleNamespace(getoption=lambda name: name == "assert_baseline")
+    pytestconfig = PytestOptions()
 
     with pytest.raises(PerformanceBaselineRegressionError, match="request_throughput"):
         run_benchmark.test_performance_benchmark(ServerEndpoint(model="test-model"), case, pytestconfig=pytestconfig)
