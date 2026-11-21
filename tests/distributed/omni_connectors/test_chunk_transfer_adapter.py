@@ -38,11 +38,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def shm_sender(build_adapter):
     adapter, _ = build_adapter(stage_id=0)
     connector = SharedMemoryConnector({"stage_id": 0})
+    # put() refuses a stage whose marker is not in this IPC namespace.
+    receiver = SharedMemoryConnector({"stage_id": 1})
     adapter.connector = connector
     adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
         codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long))
     )
     yield adapter, connector
+    receiver.close()
     connector.close()
 
 
@@ -1199,6 +1202,7 @@ def test_generation_window_ending_the_audio_is_not_decoded_again(build_adapter, 
     windows = [window for window in windows if window is not None]
 
     shm = SharedMemoryConnector({"stage_id": 0})
+    downstream = SharedMemoryConnector({"stage_id": 1})
     received = []
     try:
         for index, window in enumerate(windows):
@@ -1207,6 +1211,7 @@ def test_generation_window_ending_the_audio_is_not_decoded_again(build_adapter, 
             received.append(shm.get("0", "1", key))
             shm.cleanup(key)
     finally:
+        downstream.close()
         shm.close()
 
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")

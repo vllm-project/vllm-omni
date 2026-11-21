@@ -108,7 +108,7 @@ def _release_runner_shm_resources(worker: Any, request_ids: list[str]) -> int:
     return 0 if release is None else release(request_ids)
 
 
-def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
+def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any, input_queue: Any = None) -> bool:
     """Bind the TP1 in-process runner control plane directly to its scheduler."""
     if not isinstance(model_executor, UniProcExecutor):
         return False
@@ -122,7 +122,18 @@ def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> b
     sink = getattr(scheduler, "enqueue_omni_connector_output", None)
     if data_plane is None or not callable(sink):
         return False
-    data_plane.set_omni_connector_output_sink(sink)
+
+    def sink_and_wake(output: Any) -> None:
+        sink(output)
+        # WAKEUP only unblocks the idle wait. has_requests() stays true while
+        # the inbox holds this failure, so the next step emits it.
+        if input_queue is not None:
+            try:
+                input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+            except Exception:
+                logger.debug("Failed to wake engine core for connector output", exc_info=True)
+
+    data_plane.set_omni_connector_output_sink(sink_and_wake)
     return True
 
 
@@ -149,7 +160,7 @@ class StageEngineCoreProc(EngineCoreProc):
         current_omni_platform.prepare_stage_engine()
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
-        if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
+        if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler, self.input_queue):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
 
     def _handle_client_request(self, request_type: EngineCoreRequestType, request: Any) -> None:

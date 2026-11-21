@@ -1328,6 +1328,8 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
     """A text-only request never runs the Talker, so the producer must unlink."""
     ext_id = f"release_{uuid.uuid4().hex}"
     connector = SharedMemoryConnector({"stage_id": 0})
+    # The sender refuses a put to a stage with no visible peer, so keep a stage-1 receiver alive.
+    downstream = SharedMemoryConnector({"stage_id": 1})
     plane.__dict__.update(_omni_connector=connector, _stage_id=0, _request_ids_mapping={})
     plane.register_request(_new_request(external_req_id=ext_id))
     sibling_key = f"{ext_id}_1_0_0"
@@ -1349,6 +1351,7 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
         assert connector.put("0", "1", f"{ext_id}_0_2", "late")[0]
         assert plane.release_shm_resources([ext_id, "unknown"]) == 1
     finally:
+        downstream.close()
         connector.close()
 
 

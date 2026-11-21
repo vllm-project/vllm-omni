@@ -19,6 +19,7 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
+from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase, PermanentTransferError
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -53,13 +54,11 @@ def _recv_poll_seconds() -> float:
 
 
 _RECV_POLL_S = _recv_poll_seconds()
+_INPUT_WAIT_TIMEOUT_MODULE: Any = None
 # Upper bound, in drain passes, on how long a missed request waits behind a burst.
 _RECV_DRAIN_REPOLL_PASSES = 8
 
 if TYPE_CHECKING:
-    from vllm_omni.distributed.omni_connectors.connectors.base import (
-        OmniConnectorBase,
-    )
     from vllm_omni.engine import AdditionalInformationPayload
 
 
@@ -67,6 +66,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     """Own payload caching, full/chunk transport, and connector I/O."""
 
     _full_payload_replace_keys_cached: frozenset[str]
+    # request_id -> (client_index, reason), drained into OmniConnectorOutput.
+    _permanent_send_failures: dict[str, tuple[int, str]]
+    _permanent_recv_failures: dict[str, tuple[int, str]]
+    _recv_waiting_since: dict[str, float]
 
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
@@ -218,16 +221,40 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_stage: str,
         connector_get_key: str | None,
         metadata: dict[str, Any] | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         if connector_get_key is None:
             return None
-        if not self._stage_payload_broadcast_groups():
-            if metadata is None:
-                return connector.get(from_stage, to_stage, connector_get_key)
-            return connector.get(from_stage, to_stage, connector_get_key, metadata)
-        if not self.is_data_transfer_rank():
+        if self._stage_payload_broadcast_groups() and not self.is_data_transfer_rank():
             return None
+        return self._get_stage_payload(connector, from_stage, to_stage, connector_get_key, metadata, deadline)
+
+    def _get_stage_payload(
+        self,
+        connector: OmniConnectorBase,
+        from_stage: str,
+        to_stage: str,
+        connector_get_key: str,
+        metadata: dict[str, Any] | None,
+        deadline: float | None,
+    ) -> Any:
+        """Use a deadline-aware get when this connector implements one.
+
+        A mock connector grows ``get_with_deadline`` automatically. Only a
+        method defined on the connector class counts, so tests that stub
+        ``get`` keep that stub.
+        """
+        deadline_get = getattr(type(connector), "get_with_deadline", None)
+        if (
+            deadline is not None
+            and deadline_get is not None
+            and deadline_get is not OmniConnectorBase.get_with_deadline
+        ):
+            try:
+                return connector.get_with_deadline(from_stage, to_stage, connector_get_key, metadata, deadline=deadline)
+            except NotImplementedError:
+                pass
         if metadata is None:
             return connector.get(from_stage, to_stage, connector_get_key)
         return connector.get(from_stage, to_stage, connector_get_key, metadata)
@@ -239,6 +266,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_stage: str,
         connector_get_key: str | None,
         metadata: dict[str, Any] | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -247,6 +275,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             to_stage,
             connector_get_key,
             metadata,
+            deadline,
         )
 
     def _recv_async_chunk_result(
@@ -472,6 +501,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             or output.stage_recv_req_ids
             or output.has_pending_kv_work
             or output.stage_payloads
+            or output.permanent_send_failures
+            or output.permanent_recv_failures
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:
@@ -946,6 +977,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 "put_key": connector_put_key,
                 "data": payload,
                 "request_id": req_id,
+                "client_index": self._task_client_index(request),
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(req_id, deque()).append(task)
@@ -986,6 +1018,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     self._stage_full_payload_locked(request_id, OmniSerializer.deserialize(request.payload_sender_info))
                 return
             self._pending_load_reqs[request_id] = request
+            # Chunk streams reset their wait in the scheduler adapter when a
+            # chunk arrives. Starting one clock here fails a healthy stream
+            # that simply runs longer than the timeout. Full payload has no
+            # such reset: the clock covers the one get.
+            if not self._async_chunk:
+                self._recv_wait_since().setdefault(request_id, time.monotonic())
         self._work_available.set()
 
     def recv_chunk(self) -> dict[str, Any]:
@@ -1099,6 +1137,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         while not self._stop_event.is_set():
             snapshot = getattr(self._omni_connector, "get_wakeup_generation", None)
             generation = snapshot() if callable(snapshot) else None
+            self._drain_recv_claim_abandons()
             with self._lock:
                 pending_ids = list(self._pending_load_reqs.keys())
 
@@ -1182,6 +1221,135 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             self._save_work_available.wait(timeout=0.01)
             self._save_work_available.clear()
 
+    def _permanent_send_failure_map(self) -> dict[str, tuple[int, str]]:
+        failures = getattr(self, "_permanent_send_failures", None)
+        if failures is None:
+            failures = {}
+            self._permanent_send_failures = failures
+        return failures
+
+    def _permanent_recv_failure_map(self) -> dict[str, tuple[int, str]]:
+        failures = getattr(self, "_permanent_recv_failures", None)
+        if failures is None:
+            failures = {}
+            self._permanent_recv_failures = failures
+        return failures
+
+    def _recv_wait_since(self) -> dict[str, float]:
+        waits = getattr(self, "_recv_waiting_since", None)
+        if waits is None:
+            waits = {}
+            self._recv_waiting_since = waits
+        return waits
+
+    def _clear_recv_delivery_state(self, req_id: str) -> None:
+        self._recv_wait_since().pop(req_id, None)
+        super()._clear_recv_delivery_state(req_id)
+
+    def _full_payload_recv_deadline(self, req_id: str) -> float | None:
+        timeout_s = self._input_wait_timeout_s()
+        if timeout_s <= 0:
+            return None
+        with self._lock:
+            started = self._recv_wait_since().get(req_id)
+        if started is None:
+            return None
+        return started + timeout_s
+
+    def _input_wait_timeout_s(self) -> float:
+        global _INPUT_WAIT_TIMEOUT_MODULE
+        if _INPUT_WAIT_TIMEOUT_MODULE is None:
+            from vllm_omni.core.sched import omni_scheduler_mixin as module
+
+            _INPUT_WAIT_TIMEOUT_MODULE = module
+        return float(_INPUT_WAIT_TIMEOUT_MODULE.DEFAULT_INPUT_WAIT_TIMEOUT_S)
+
+    def _expire_recv_if_needed(self, req_id: str) -> bool:
+        """Stop polling a receive that has waited past the stage-input deadline."""
+        timeout_s = self._input_wait_timeout_s()
+        if timeout_s <= 0:
+            return False
+        with self._lock:
+            started = self._recv_wait_since().get(req_id)
+        if started is None or time.monotonic() - started < timeout_s:
+            return False
+        # The previous poll may have returned before this deadline and left a
+        # read claim on this thread. Drop it here; the post-get path only
+        # abandons when the get itself observes the deadline.
+        self._abandon_recv_claim(req_id)
+        self._record_permanent_recv_failure(
+            req_id,
+            f"timed out waiting for connector input after {timeout_s:g}s",
+        )
+        return True
+
+    def _remember_recv_claim_key(self, req_id: str, connector_get_key: str | None) -> None:
+        if not connector_get_key:
+            return
+        with self._lock:
+            self._active_recv_claim_keys[req_id] = connector_get_key
+
+    def _drain_recv_claim_abandons(self) -> None:
+        """Drop queued read claims on the receive thread."""
+        connector = getattr(self, "_omni_connector", None)
+        abandon = getattr(connector, "abandon_get", None)
+        if not callable(abandon):
+            with self._lock:
+                self._recv_claim_abandons.clear()
+            return
+        while True:
+            with self._lock:
+                if not self._recv_claim_abandons:
+                    return
+                connector_get_key = self._recv_claim_abandons.popleft()
+            try:
+                abandon(connector_get_key)
+            except Exception:
+                logger.debug("abandon_get failed for %s", connector_get_key, exc_info=True)
+
+    def _abandon_recv_claim(self, req_id: str) -> None:
+        """Drop this thread's unresolved read claim for one request."""
+        connector = getattr(self, "_omni_connector", None)
+        abandon = getattr(connector, "abandon_get", None)
+        if not callable(abandon):
+            return
+        with self._lock:
+            connector_get_key = self._active_recv_claim_keys.pop(req_id, None)
+        if not connector_get_key:
+            request = self._pending_load_reqs.get(req_id)
+            external_req_id = self._request_ids_mapping.get(req_id, req_id)
+            chunk_id = self._get_req_chunk[req_id]
+            _from_stage, _to_stage, connector_get_key, _metadata = self._stage_payload_recv_spec(
+                external_req_id,
+                str(self._stage_id - 1),
+                str(self._stage_id),
+                chunk_id,
+                getattr(request, "payload_sender_info", None),
+            )
+        if not connector_get_key:
+            return
+        try:
+            abandon(connector_get_key)
+        except Exception:
+            logger.debug("abandon_get failed for %s", connector_get_key, exc_info=True)
+
+    def _record_permanent_recv_failure(self, req_id: str, reason: str) -> None:
+        with self._lock:
+            request = self._pending_load_reqs.pop(req_id, None)
+            self._recv_wait_since().pop(req_id, None)
+            stage_id = getattr(self, "_stage_id", "?")
+            message = f"Stage-{stage_id} connector receive failed for request {req_id!r}: {reason}"
+            self._permanent_recv_failure_map().setdefault(req_id, (self._task_client_index(request), message))
+        logger.error("%s", message)
+
+    @staticmethod
+    def _task_client_index(request: Any | None) -> int:
+        raw = getattr(request, "client_index", 0) if request is not None else 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
     def _requeue_or_drop_failed_send(
         self,
         task: dict,
@@ -1213,16 +1381,33 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 dq.appendleft(task)
         else:
             cause = error or task.get("_last_send_error")
-            failure = RuntimeError(
-                "connector send failed permanently for "
+            stage_id = getattr(self, "_stage_id", "?")
+            reason = (
+                f"Stage-{stage_id} connector send failed permanently for "
                 f"request {req_id!r}, key {task.get('put_key')!r} "
                 f"after {self._MAX_SEND_RETRIES + 1} attempts"
             )
             if cause is not None:
+                reason = f"{reason}: {type(cause).__name__}: {cause}"
+            failure = RuntimeError(reason)
+            if cause is not None:
                 failure.__cause__ = cause
+            client_index = task.get("client_index", 0)
+            try:
+                client_index = int(client_index)
+            except (TypeError, ValueError):
+                client_index = 0
+            with self._lock:
+                self._permanent_send_failure_map().setdefault(req_id, (client_index, reason))
+            sink = getattr(self, "_omni_connector_output_sink", None)
+            if sink is not None:
+                try:
+                    sink(OmniConnectorOutput(permanent_send_failures={req_id: (client_index, reason)}))
+                except Exception:
+                    logger.exception("Connector output sink failed for send give-up %s", req_id)
             logger.error(
                 "[Stage-%s] Giving up on send for %s after %d retries",
-                getattr(self, "_stage_id", "?"),
+                stage_id,
                 req_id,
                 self._MAX_SEND_RETRIES,
             )
@@ -1296,6 +1481,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             chunk_id,
             getattr(request, "payload_sender_info", None),
         )
+        # Retain the key before get: a lost handshake reply leaves a claim on
+        # this thread, and runner cleanup may remove the pending receive before
+        # the next poll can recompute the key.
+        self._remember_recv_claim_key(req_id, connector_get_key)
 
         if self._async_chunk:
             result = self._recv_async_chunk_result(
@@ -1306,16 +1495,25 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 metadata,
             )
         else:
+            deadline = self._full_payload_recv_deadline(req_id)
             result = self._recv_full_payload_result(
                 connector,
                 from_stage,
                 to_stage,
                 connector_get_key,
                 metadata,
+                deadline,
             )
+            if result is None and deadline is not None and time.monotonic() >= deadline and connector_get_key:
+                # The read stopped at the request deadline. Drop its claim so a
+                # later poll cannot publish the buffer after the request fails.
+                self._abandon_recv_claim(req_id)
 
         if result is None:
             return False
+
+        with self._lock:
+            self._active_recv_claim_keys.pop(req_id, None)
 
         payload_data, _size = result
         if not payload_data:
@@ -1683,6 +1881,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._chunk_ready_req_ids.update(newly_finished)
         with self._lock:
             stage_payloads, self._run_stage_payloads = self._run_stage_payloads, {}
+            permanent_send_failures = dict(self._permanent_send_failure_map())
+            self._permanent_send_failures.clear()
+            permanent_recv_failures = dict(self._permanent_recv_failure_map())
+            self._permanent_recv_failures.clear()
 
         output = OmniConnectorOutput(
             chunk_ready_req_ids=set(self._chunk_ready_req_ids),
@@ -1692,6 +1894,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
             stage_payloads=stage_payloads,
+            permanent_send_failures=permanent_send_failures,
+            permanent_recv_failures=permanent_recv_failures,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1746,6 +1950,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             "put_key": connector_put_key,
             "data": payload_data,
             "request_id": request_id,
+            "client_index": self._task_client_index(request),
             "completion": completion,
         }
         with self._lock:
@@ -1761,13 +1966,18 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         so the drain does not poll it again. Ready requests are published as
         one cohort.
         """
+        self._drain_recv_claim_abandons()
         ready: list[str] = []
         for req_id in pending_ids:
             if self._stop_event.is_set():
                 break
             try:
+                if self._expire_recv_if_needed(req_id):
+                    continue
                 if self._poll_single_request(req_id, publish_ready=False):
                     ready.append(req_id)
+            except PermanentTransferError as exc:
+                self._record_permanent_recv_failure(req_id, str(exc))
             except Exception:
                 logger.warning("Error receiving data for %s", req_id, exc_info=True)
         if ready and self._async_chunk:
