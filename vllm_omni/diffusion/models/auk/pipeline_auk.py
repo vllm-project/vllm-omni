@@ -693,6 +693,10 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         waves: list[tuple[_ScheduleKey, list[_RequestCondition]]] = []
         open_groups: dict[_ScheduleKey, list[_RequestCondition]] = {}
         gen_open_key: dict[int, _ScheduleKey] = {}
+        # Checkpoints with attn_mask_enabled=False omit key-padding biases in
+        # attention, so padded batching would leak padded target/text/ref tokens
+        # into valid outputs; keep each request on its exact-shape serial path.
+        allow_batching = bool(getattr(self.dit, "attn_mask_enabled", True))
 
         def _flush_group(group_key: _ScheduleKey) -> None:
             flushed = open_groups.pop(group_key)
@@ -728,6 +732,10 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             target_bucket = round_up(gen_frames, AuKCUDAGraphWrapper._TARGET_ALIGNMENT)
             nfe, cfg, sway, t_grid = self._resolve_schedule(sampling_params, knobs)
             key = (nfe, cfg, sway, tuple(t_grid) if t_grid is not None else None, target_bucket)
+            item = _RequestCondition(index, text, ref, generator, sampling_params.output_type or "np", gen_frames)
+            if not allow_batching:
+                waves.append((key, [item]))
+                continue
             # _resolve_generator creates a fresh torch.Generator instance per
             # unseeded request (never None unless monkeypatched), so id(generator)
             # only groups requests that intentionally share one Generator object.
@@ -737,9 +745,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                 # Flush the earlier open wave when a shared generator transitions
                 # to a different schedule key so RNG consumption stays serial.
                 _flush_group(prev_key)
-            open_groups.setdefault(key, []).append(
-                _RequestCondition(index, text, ref, generator, sampling_params.output_type or "np", gen_frames)
-            )
+            open_groups.setdefault(key, []).append(item)
             gen_open_key[gen_id] = key
 
         for group_key in list(open_groups):

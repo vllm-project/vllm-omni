@@ -112,6 +112,7 @@ class _StubTransformer(nn.Module):
             "num_single_layers": num_single_layers,
             "attn_mask_enabled": attn_mask_enabled,
         }
+        self.attn_mask_enabled = attn_mask_enabled
         self.latent_dim = latent_dim
         self.proj = nn.Linear(latent_dim, latent_dim, bias=False)
 
@@ -1126,6 +1127,33 @@ class TestRequestParsing:
         finally:
             release_forward.set()
             engine.close()
+
+    def test_unmasked_checkpoint_runs_exact_shape_serial_waves(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        pipeline.dit.attn_mask_enabled = False
+        req1 = OmniDiffusionRequest(
+            prompt=_prompt(tokens=4, knobs={"gen_seconds": 3.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=7, output_type="latent"),
+            request_id="unmasked-0",
+        )
+        req2 = OmniDiffusionRequest(
+            prompt=_prompt(tokens=7, knobs={"gen_seconds": 3.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=11, output_type="latent"),
+            request_id="unmasked-1",
+        )
+
+        outputs = pipeline.forward(DiffusionRequestBatch([req1, req2]))
+
+        assert len(outputs) == 2
+        assert len(calls) == 2
+        assert calls[0]["gen_frames"] == 150
+        assert calls[1]["gen_frames"] == 150
+        assert calls[0]["text"].shape == (1, 4, TEXT_HIDDEN_DIM)
+        assert calls[1]["text"].shape == (1, 7, TEXT_HIDDEN_DIM)
+        assert calls[0]["x_mask"] is None
+        assert calls[1]["x_mask"] is None
+        assert calls[0]["noise_frames"] is None
+        assert calls[1]["noise_frames"] is None
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
