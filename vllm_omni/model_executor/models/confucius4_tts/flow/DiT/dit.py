@@ -85,7 +85,11 @@ class DiT(nn.Module):
         max_seq_len: Maximum sequence length for rotary embeddings
         ff_intermediate_size: Feedforward intermediate size (default: hidden_dim * 4)
         final_layer: "wavenet" or "mlp"
-        wavenet_*: WaveNet final layer parameters
+        wavenet_hidden_dim: WaveNet final layer hidden width
+        wavenet_kernel_size: WaveNet final layer convolution kernel size
+        wavenet_dilation_rate: WaveNet final layer dilation base
+        wavenet_num_layers: Number of WaveNet final layer blocks
+        wavenet_dropout: WaveNet final layer dropout
     """
 
     def __init__(

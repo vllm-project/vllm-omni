@@ -271,11 +271,11 @@ class SinusPositionEmbedding(nn.Module):
         dim: Embedding dimension
     """
 
-    def __init__(self, dim):
+    def __init__(self, dim: int) -> None:
         super().__init__()
         self.dim = dim
 
-    def forward(self, x, scale=1000):
+    def forward(self, x: torch.Tensor, scale: float = 1000) -> torch.Tensor:
         """Generate sinusoidal embeddings.
 
         Args:
@@ -302,12 +302,12 @@ class TimestepEmbedding(nn.Module):
         freq_embed_dim: Frequency embedding dimension
     """
 
-    def __init__(self, dim, freq_embed_dim=256):
+    def __init__(self, dim: int, freq_embed_dim: int = 256) -> None:
         super().__init__()
         self.time_embed = SinusPositionEmbedding(freq_embed_dim)
         self.time_mlp = nn.Sequential(nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
 
-    def forward(self, timestep: float[b]):  # noqa: F821
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
         """Embed diffusion timestep.
 
         Args:

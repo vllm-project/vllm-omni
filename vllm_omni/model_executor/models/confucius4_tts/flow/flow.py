@@ -37,9 +37,28 @@ class MaskedDiffWithXvecConfig:
         semantic_codebook_size: Number of semantic tokens
         semantic_codebook_dim: Codebook dimension for token embedding
         semantic_output_dim: Output dimension after token embedding
-        lr_*: Length regulator parameters for upsampling
-        cfm_*: Conditional flow matching parameters
-        estimator_*: DiT/WaveNet estimator architecture parameters
+        lr_channels: Length regulator hidden channels
+        lr_sampling_ratios: Length regulator per-stage sampling ratios
+        lr_out_channels: Length regulator output channels
+        lr_groups: Length regulator convolution groups
+        lr_in_channels: Length regulator input channels
+        cfm_inference_cfg_rate: Default classifier-free guidance scale
+        cfm_t_scheduler: Flow-matching time scheduler ("linear" or "cosine")
+        estimator_hidden_dim: DiT hidden width
+        estimator_num_heads: DiT attention heads
+        estimator_depth: Number of DiT blocks
+        estimator_mel_dim: Mel-spectrogram dimension seen by the estimator
+        estimator_cond_dim: Conditioning vector width
+        estimator_style_dim: Speaker style embedding width
+        estimator_mlp_ratio: DiT feed-forward expansion ratio
+        estimator_dropout: DiT dropout
+        estimator_long_skip_connection: Enable U-Net-style skip connections
+        estimator_final_layer: Final layer type ("wavenet" or "mlp")
+        estimator_wavenet_hidden_dim: WaveNet final layer hidden width
+        estimator_wavenet_kernel_size: WaveNet final layer kernel size
+        estimator_wavenet_dilation_rate: WaveNet final layer dilation base
+        estimator_wavenet_num_layers: Number of WaveNet final layer blocks
+        estimator_wavenet_dropout: WaveNet final layer dropout
     """
 
     input_size: int = 512

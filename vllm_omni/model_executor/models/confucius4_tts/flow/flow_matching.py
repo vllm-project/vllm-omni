@@ -39,7 +39,11 @@ class ConditionalCFM(nn.Module):
         style_dim: Speaker style embedding dimension
         long_skip_connection: Enable U-Net-style skip connections
         final_layer: Final layer type ("wavenet" or other)
-        wavenet_*: WaveNet final layer parameters
+        wavenet_hidden_dim: WaveNet final layer hidden width
+        wavenet_kernel_size: WaveNet final layer convolution kernel size
+        wavenet_dilation_rate: WaveNet final layer dilation base
+        wavenet_num_layers: Number of WaveNet final layer blocks
+        wavenet_dropout: WaveNet final layer dropout
     """
 
     def __init__(
