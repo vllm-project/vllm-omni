@@ -66,8 +66,8 @@ stages:
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `diffusion_kv_mode` | Yes | `paged_scheduler` enables Scheduler-managed pages; `dense_legacy` is the default |
-| `diffusion_kv_max_rows_per_request` | Yes for paged | Positive Worker row limit, including all internal CFG branches; use `1` without CFG and `2` for standard CFG |
+| `diffusion_kv_mode` | Optional | `paged_scheduler` enables Scheduler-managed pages; `dense_legacy` stays the default while paged execution is validated, and an explicit `paged_scheduler` that cannot run fails at config time instead of falling back to dense |
+| `diffusion_kv_max_rows_per_request` | Optional for paged | Positive Worker row limit, including all internal CFG branches; use `1` without CFG and `2` for standard CFG. When omitted, a paged-capable model integration supplies its own capacity (2 for HunyuanImage-3.0 CFG); set it explicitly to override that value |
 | `kv_cache_memory_bytes` | Optional | Explicit physical KV-pool budget per Worker/rank; omit it to use automatic sizing |
 | `gpu_memory_utilization` | Optional | Automatic pool-sizing fraction when no explicit byte budget is set |
 | `max_num_seqs` | Recommended `1` | Public request capacity; it is separate from the internal CFG row limit |
@@ -151,6 +151,11 @@ validated. Configure the topology in the stage's existing `parallel_config`:
 | `sequence_parallel_size` + strict Ulysses | Shards the sequence across ranks | Ring and AllGather-KV modes are not supported |
 | `cfg_parallel_size: 2` | Places the positive and negative branches on separate ranks | Set `diffusion_kv_max_rows_per_request` to at least `2` |
 
+The layout is checked when the config is built, not when the model is loaded: an
+explicit `diffusion_kv_mode: paged_scheduler` with Ring, AllGather-KV, or a
+non-strict Ulysses mode fails there, and an omitted `diffusion_kv_mode` stays on
+the dense path for that topology instead of failing during model build.
+
 `max_num_seqs` controls public request concurrency and is independent of the
 internal CFG row limit. Keep `max_num_seqs: 1` for the current Hunyuan paged
 path; increasing it does not enable independent request batching.
@@ -160,7 +165,11 @@ path; increasing it does not enable independent request batching.
 - `paged_scheduler requires diffusion_kv_max_rows_per_request`: add a positive
   stage value and include all CFG rows.
 - Unsupported backend error: select `FLASH_ATTN`; the other attention backends
-  currently do not implement the paged-KV capability.
+  currently do not implement the paged-KV capability. The check reads the
+  backend the paged self-attention layer resolves to, so a `per_role` override
+  for `self` counts as much as `default`.
+- Ring / AllGather-KV / non-strict Ulysses rejection: use strict Ulysses, or a
+  topology without sequence parallelism.
 - Step-mode rejection: remove `step_execution: true` and use request-level
   execution, or select `dense_legacy` for step execution.
 - Imported AR-KV rejection: `paged_scheduler` does not consume the
