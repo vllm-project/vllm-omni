@@ -99,6 +99,9 @@ Local file storage behavior can be controlled via the following environment vari
   seconds
 - `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL`: optional sweep interval in
   seconds for enforcing file TTL; defaults to `300` when TTL is set
+- `VLLM_OMNI_SERVER_STORAGE__TYPE`: `file` (default) or `s3`; the S3 backend is
+  configured with `BUCKET`, `REGION`, `ENDPOINT_URL`, `PREFIX`, `PRESIGN`,
+  `PRESIGN_EXPIRES`, and `PROXY`
 
 Example:
 

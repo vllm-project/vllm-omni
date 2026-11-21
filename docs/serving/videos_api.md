@@ -716,6 +716,28 @@ root.
 > `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
 > use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.
 
+### S3-compatible object storage
+
+```bash
+export VLLM_OMNI_SERVER_STORAGE__TYPE=s3
+export VLLM_OMNI_SERVER_STORAGE__BUCKET=vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__REGION=us-east-1
+# MinIO / self-hosted S3-compatible endpoint; omit for AWS S3.
+export VLLM_OMNI_SERVER_STORAGE__ENDPOINT_URL=http://minio:9000
+export VLLM_OMNI_SERVER_STORAGE__PREFIX=omni
+# Redirect /v1/videos/{id}/content to a presigned URL (default), or stream the
+# artifact through the API server instead.
+export VLLM_OMNI_SERVER_STORAGE__PRESIGN=true
+export VLLM_OMNI_SERVER_STORAGE__PRESIGN_EXPIRES=3600
+export VLLM_OMNI_SERVER_STORAGE__PROXY=false
+```
+
+Credentials are never part of the server configuration: the standard provider
+chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, IAM
+roles) is used. With presigning enabled, `/v1/videos/{id}/content` answers with a
+302 redirect to the object store; `VLLM_OMNI_SERVER_STORAGE__PROXY=true` keeps the
+bytes flowing through the API server instead.
+
 ## Model-Specific Examples
 
 For complete text-to-video, image-to-video, and model-specific video-to-video

@@ -29,7 +29,7 @@ import torch
 import uvloop
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -209,6 +209,8 @@ from vllm_omni.entrypoints.openai.storage import (
     STORAGE_MANAGER,
     BackendLease,
     FileStorageHandle,
+    StreamStorageHandle,
+    UrlStorageHandle,
 )
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
@@ -3579,11 +3581,13 @@ async def download_video(video_id: str, variant: Literal["video", "lidar"] = "vi
             MP4; ``lidar`` is the numeric LiDAR file of a joint generation job.
 
     Returns:
-        A ``FileResponse`` streaming the requested file from local storage.
+        A ``FileResponse`` for local storage, a ``RedirectResponse`` to a
+        presigned object-store URL, or a ``StreamingResponse`` that proxies the
+        artifact from the storage backend.
 
     Raises:
         HTTPException: If the job does not exist, failed, is still in progress,
-        has no asset of that variant, or the file is missing from disk.
+        has no asset of that variant, or the file is missing from storage.
     """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
@@ -3605,12 +3609,22 @@ async def download_video(video_id: str, variant: Literal["video", "lidar"] = "vi
 
     file_handle = await STORAGE_MANAGER.open(storage_key)
     if file_handle is None:
-        raise HTTPException(status_code=404, detail=f"Generated {variant} file not found on disk")
-    if not isinstance(file_handle, FileStorageHandle):
-        raise HTTPException(
-            status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
+        raise HTTPException(status_code=404, detail=f"Generated {variant} file not found in storage")
+    if isinstance(file_handle, FileStorageHandle):
+        return FileResponse(path=file_handle.path, media_type=media_type, filename=file_name)
+    if isinstance(file_handle, UrlStorageHandle):
+        # Presigned URL: let the client fetch the object from the object store.
+        return RedirectResponse(url=file_handle.url, status_code=HTTPStatus.FOUND.value)
+    if isinstance(file_handle, StreamStorageHandle):
+        return StreamingResponse(
+            STORAGE_MANAGER.iter_chunks(storage_key),
+            media_type=media_type,
+            headers={"content-disposition": f'attachment; filename="{file_name}"'},
         )
-    return FileResponse(path=file_handle.path, media_type=media_type, filename=file_name)
+
+    raise HTTPException(
+        status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
+    )
 
 
 @profiler_router.post("/start_profile")
