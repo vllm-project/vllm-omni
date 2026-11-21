@@ -122,6 +122,7 @@ from vllm.tokenizers.mistral import (
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
@@ -280,6 +281,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             model_stage = cls._stage_get(engine_args, "model_stage")
         return model_arch, model_stage
 
+    @classmethod
+    def _stage_takes_partial_source_outputs(cls, stage: Any) -> bool:
+        """Whether a stage's input processor consumes unfinished upstream outputs."""
+        qualname = cls._stage_get(stage, "custom_process_input_func")
+        if qualname is None:
+            qualname = cls._stage_get(cls._stage_get(stage, "stage_pipeline_config"), "custom_process_input_func")
+        if not isinstance(qualname, str) or not qualname:
+            return bool(getattr(qualname, "accepts_partial_source_outputs", False))
+        try:
+            processor = resolve_obj_by_qualname(qualname)
+        except (ImportError, AttributeError, ValueError):
+            return False
+        return bool(getattr(processor, "accepts_partial_source_outputs", False))
+
     def _has_minicpmo45_stage(self) -> bool:
         for stage in getattr(self.engine_client, "stage_configs", []) or []:
             model_arch, _ = self._stage_model_metadata(stage)
@@ -409,7 +424,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             model_arch, model_stage = self._stage_model_metadata(stage)
             if model_arch == "MiniCPMO45OmniForConditionalGeneration":
                 if model_stage == "llm":
-                    sp.output_kind = RequestOutputKind.FINAL_ONLY
+                    # The Talker takes the running token stream only when its
+                    # bridge opts into partial outputs (turn-chunked profile).
+                    next_stage = stage_configs[idx + 1] if idx + 1 < len(stage_configs) else None
+                    sp.output_kind = (
+                        RequestOutputKind.DELTA
+                        if self._stage_takes_partial_source_outputs(next_stage)
+                        else RequestOutputKind.FINAL_ONLY
+                    )
                 elif model_stage == "tts":
                     sp.output_kind = RequestOutputKind.DELTA
             elif model_arch == "BailingMoeV3AudioForConditionalGeneration" and model_stage == "thinker":

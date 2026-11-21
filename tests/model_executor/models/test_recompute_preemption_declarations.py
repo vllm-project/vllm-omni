@@ -12,6 +12,10 @@ different KV than the one that produced the audio already delivered
 - a per-frame temporal hidden plus codebook (personaplex),
 - 31 side-channel FSQ codes per frame (Gepard).
 
+MiniCPM-o 4.5's turn-chunked Talker qualifies for a different reason: once a
+block is appended its buffer holds only the newest condition, so the replay
+rebuilds the earlier conditions and codes as placeholders.
+
 Stages that embed the sampled token alone -- every thinker, Qwen2.5-Omni's
 talker, which keeps all codebook layers in the token stream -- keep upstream's
 recompute mode. Fish Omni also keeps recompute: its MRv2 model state saves and
@@ -33,6 +37,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_TURN_CHUNKED_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
@@ -64,6 +69,7 @@ _FAIL = [
     (MOSS_TTS_PIPELINE, "moss_tts"),
     (MOSS_TTS_REALTIME_PIPELINE, "moss_tts"),
     (MOSS_TTS_LOCAL_PIPELINE, "moss_tts_local"),
+    (MINICPMO_4_5_TURN_CHUNKED_PIPELINE, "tts"),
 ]
 
 _ALLOW = [

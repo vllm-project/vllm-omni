@@ -131,6 +131,8 @@ _CODEC_PENALTY_WINDOW = 16
 # without it a request that never samples codec EOS keeps emitting frames for
 # twice as long as upstream would, which is audible as a long silent tail.
 _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
+# TTSStreamingGenerator.generate_with_buffer's per-block max_new_token.
+_TURN_CHUNK_CODEC_MAX_NEW_TOKENS = 500
 # Native duplex Talker must finish after one MiniCPMTTS.generate_chunk:
 # 25 codec frames (``codec_chunk_frames``) plus the terminating sample.
 # Without this, the single-vocab Sampler keeps the stage-1 request alive
@@ -143,6 +145,23 @@ _DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
 #: the Talker's EOS is masked for this many steps after each 25-frame boundary:
 #: the model emits a cadence EOS there whether or not its text is spoken.
 _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
+
+
+def _turn_chunk_open_block_cap(info: Mapping[str, Any] | None) -> int | None:
+    """Codes an open turn-chunked block may take, or None for any other condition.
+
+    generate_with_buffer's per-block ceiling, lowered to the cap the bridge
+    (``llm2tts_chunked``) counted against the Talker context for this block.
+    """
+    if not isinstance(info, Mapping) or info.get("native_duplex") is True:
+        return None
+    meta = info.get("meta")
+    if not isinstance(meta, Mapping) or meta.get("turn_chunk") is not True or meta.get("turn_chunk_close") is True:
+        return None
+    block_cap = meta.get("turn_chunk_max_codes")
+    if not isinstance(block_cap, int) or isinstance(block_cap, bool) or block_cap <= 0:
+        return _TURN_CHUNK_CODEC_MAX_NEW_TOKENS
+    return min(block_cap, _TURN_CHUNK_CODEC_MAX_NEW_TOKENS)
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
@@ -1590,6 +1609,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         *,
         native_duplex: bool = False,
         close_text: bool = False,
+        open_condition: bool = False,
     ) -> torch.Tensor:
         if tts_token_ids.numel() == 0 or tts_hidden_states.numel() == 0:
             # The thinker can legally emit an empty speech segment (<|tts_bos|>
@@ -1614,13 +1634,31 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
         audio_bos = self.emb_text(index_to_device([self._tts_bos_id], device))
         condition = text_embeds + hidden_embeds
-        if native_duplex and not close_text:
-            # Match MiniCPMTTS.generate_chunk's streaming condition.
+        if (native_duplex and not close_text) or open_condition:
+            # Match MiniCPMTTS.generate_chunk's streaming condition, also the
+            # blocks before the last one in TTSStreamingGenerator.generate_with_buffer.
             return torch.cat([condition, audio_bos], dim=0)
         # Offline, and the turn-end condition of a native-duplex turn whose text
         # ends a sentence: <text_eos> tells the Talker no more text follows, as
         # the last chunk of TTSStreamingGenerator.generate_with_buffer does.
         return torch.cat([condition, self._boundary_embeddings()], dim=0)
+
+    def _turn_chunk_recent_codes(self, request_id: str, info_dict: Mapping[str, Any]) -> list[int]:
+        """The last penalty window of codes the request confirmed before its next turn-chunk condition."""
+        if self._k_step_frames > 0:
+            # K-step confirms 0/1 control rows in the token stream; the model
+            # records the codec frames it confirmed.
+            history = getattr(self, "_request_codec_history", {}).get(request_id) or []
+            return [int(code_id) for code_id in history[-_CODEC_PENALTY_WINDOW:]]
+        # Single-frame decoding keeps the sampled codes in the runner. The
+        # scheduler hands over the previous block's (_update_native_talker_prompt);
+        # they follow the window that block started from.
+        ids = info_dict.get("ids")
+        confirmed = ids.get("streaming_prompt_previous_codes") if isinstance(ids, Mapping) else None
+        previous = getattr(self, "_request_audio_states", {}).get(request_id)
+        seed = previous.get("recent_codes") if isinstance(previous, dict) else None
+        window = [int(code_id) for code_id in (*(seed or ()), *(confirmed or ()))]
+        return [code_id for code_id in window if 0 <= code_id < self._codec_eos_id][-_CODEC_PENALTY_WINDOW:]
 
     def _build_streaming_recompute_embeddings(
         self,
@@ -1826,11 +1864,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             native_duplex = bool(info_dict.get("native_duplex", False))
             meta = info_dict.get("meta")
             drain_kind = _turn_end_drain_kind(native_duplex, meta if isinstance(meta, Mapping) else None)
+            # Turn-chunked serving (llm2tts_chunked): one resumable request
+            # takes the reply a block of Thinker tokens at a time.
+            turn_chunk = not native_duplex and isinstance(meta, Mapping) and meta.get("turn_chunk") is True
             full_embeds = self._build_condition_embeddings(
                 token_ids,
                 hidden_states,
                 native_duplex=native_duplex,
                 close_text=drain_kind == _DRAIN_UNTIL_SILENT,
+                open_condition=turn_chunk and meta.get("turn_chunk_close") is not True,
             )
             if native_duplex:
                 full_embeds = self._build_streaming_recompute_embeddings(
@@ -1851,6 +1893,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 retained_codes = (
                     base_recent_codes if isinstance(base_recent_codes, torch.Tensor) else list(base_recent_codes)
                 )
+            elif turn_chunk and condition_seq:
+                # generate_with_buffer keeps the repetition-penalty window
+                # across blocks: seed it with the codes confirmed so far.
+                retained_codes = self._turn_chunk_recent_codes(request_id, info_dict)
             offset = max(0, int(info_dict.get("_omni_num_computed_tokens", 0) or 0))
             # The handoff rebuilds only the tail-aligned Talker condition.
             # Materialize zero-token embeddings for any scheduler prompt
@@ -1882,6 +1928,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
             if native_duplex:
                 max_tokens, min_tokens = _native_duplex_chunk_budget(meta if isinstance(meta, Mapping) else None)
+            elif (block_cap := _turn_chunk_open_block_cap(info_dict)) is not None:
+                remaining = int(self._tts_config.max_position_embeddings) - target_len
+                max_tokens = max(min(block_cap, remaining), 1)
+                min_tokens = None
             else:
                 # MiniCPMTTS.generate()'s max_new_token, clamped to what the
                 # Talker context can still hold. Sampler min_tokens (upstream's
@@ -1899,7 +1949,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "min_tokens": min_tokens,
                 "turn_end_drain": drain_kind,
             }
-            if native_duplex:
+            if native_duplex or turn_chunk:
                 state["host_condition_seq"] = condition_seq
             if isinstance(retained_codes, torch.Tensor) or retained_codes:
                 state["recent_codes"] = retained_codes
@@ -1908,7 +1958,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 request_states = {}
                 self._request_audio_states = request_states
             request_states[request_id] = state
-            if native_duplex:
+            if native_duplex or turn_chunk:
                 # A new duplex condition starts a fresh codec segment: drop the
                 # sampler's device-side caches for this request so the next
                 # decode rebuilds them from this condition's state (step, EOS
@@ -2326,6 +2376,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         remaining = int(self._tts_config.max_position_embeddings) - prompt_len
         if not native_duplex_batch:
             limit = torch.clamp(remaining, min=1, max=_OFFLINE_CODEC_MAX_NEW_TOKENS) - 1
+            block_caps = [_turn_chunk_open_block_cap(info) for info in model_intermediate_buffer[:num_reqs]]
+            if any(cap is not None for cap in block_caps):
+                # Open turn-chunked blocks stop at the cap the bridge charged,
+                # as on the K-step path.
+                caps = [_OFFLINE_CODEC_MAX_NEW_TOKENS if cap is None else cap for cap in block_caps]
+                caps += [_OFFLINE_CODEC_MAX_NEW_TOKENS] * (num_reqs - len(caps))
+                row_caps = index_to_device(caps, device, dtype=torch.long)
+                if num_rows != num_reqs:
+                    first_rows = input_batch.expanded_local_pos[:num_rows].long() == 0
+                    row_caps = row_caps.index_select(0, first_rows.long().cumsum(0) - 1)
+                limit = torch.minimum(limit, row_caps - 1)
             self._mrv2_forced_eos = empty | eos_input | (step >= limit)
             self._mrv2_masked_eos = None
         else:
