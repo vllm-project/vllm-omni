@@ -15,6 +15,38 @@ from vllm.triton_utils import triton
 from .attention_normalize import merge_kv_partial, split_kv_partial
 from .contracts import visible
 
+# Shared memory `split_kv_partial` needs at the query-tile/key-tile/head-dim
+# shapes this plan launches, measured from the compiled kernel metadata:
+# 137,728 B at the default three pipeline stages versus 20,480 B at one.
+_SPLIT_KV_SHARED_BYTES = {1: 20480, 3: 137728}
+
+
+def _shared_memory_per_block(device) -> int | None:
+    """Opt-in shared memory per block for *device*, or None if unknown."""
+    try:
+        props = torch.cuda.get_device_properties(device)
+        limit = getattr(props, "shared_memory_per_block_optin", None)
+        if limit is None:
+            limit = getattr(props, "shared_memory_per_block", None)
+        return int(limit) if limit is not None else None
+    except Exception:  # noqa: BLE001 - a CPU or unknown backend keeps the default
+        return None
+
+
+def _split_kv_num_stages(device) -> int:
+    """Deepest pipeline the device can hold, so small-SM parts still launch.
+
+    Three stages need 137,728 B, which exceeds the 101,376 B carve-out of
+    Ada-class parts and aborts the launch; one stage needs 20,480 B. Picking by
+    the device limit keeps pipelining where it fits instead of penalising every
+    GPU for the smallest one. Measured on A100: one stage 112.5 us/launch
+    versus three at 117.1 us, so a fitting device loses nothing either way.
+    """
+    limit = _shared_memory_per_block(device)
+    if limit is not None and limit >= _SPLIT_KV_SHARED_BYTES[3]:
+        return 3
+    return 1
+
 
 class RealizationPagedAttentionPlan:
     """Persistent metadata addresses. update() never replaces captured tensors."""
@@ -188,13 +220,12 @@ class RealizationPagedAttentionPlan:
                 denominator,
                 1,
                 q.shape[0],
-                # Pin the pipeline depth: the default (3 stages) asks for
-                # 137,728 B of shared memory at this tile shape, above the
-                # 101,376 B cap of Ada-class devices -- measured on A100 as
-                # 137728 B at the default vs 20480 B at one stage. Only the
-                # staged loads change; the arithmetic is identical.
+                # Depth is chosen from the device's shared-memory limit: the
+                # three-stage default needs 137,728 B and aborts on parts capped
+                # at 101,376 B, while one stage needs 20,480 B. Only the staged
+                # K/V loads change; the arithmetic is identical.
                 num_warps=4,
-                num_stages=1,
+                num_stages=_split_kv_num_stages(q.device),
             )
             merge_kv_partial[(end - start, q.shape[1])](
                 partial,

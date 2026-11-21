@@ -105,6 +105,12 @@ STRUCTURED_PAYLOAD_KEYS = frozenset(
         "segmentation",
         "video_segmentation",
         "video_depth",
+        # Point-cloud output served alongside video (Cosmos3 and similar).
+        "lidar",
+        # Duo's packed AV latents and the Codec stage's decoded packets. Without
+        # these the Duo codec handoff raises KeyError, and
+        # `_infer_primary_payload_key` would promote a lone latent to the primary
+        # payload and route it into `images`.
         "video_latent",
         "audio_latent",
         "packets",
@@ -112,13 +118,6 @@ STRUCTURED_PAYLOAD_KEYS = frozenset(
         "waveform",
     }
 )
-
-# Keys the formatter already renders into the response body itself: `video` and
-# `image` become ``images``, and `text` becomes the text payload. `audio` is
-# deliberately excluded from this set because it stays in ``multimodal_output``
-# as well. Every key that is not listed here is a structured handoff that must
-# survive the trip for a downstream stage or client.
-MEDIA_RENDER_KEYS = frozenset({"video", "image", "text"})
 
 
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
@@ -301,16 +300,16 @@ def _build_multimodal_output(
     mm_output: DiffusionMultimodalOutput = {}
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
-    # Everything that is not a rendering key is a structured payload a
-    # downstream stage may consume: packed latents, codec `packets`, decoded
-    # `rgb`/`waveform`, `audio`, and newer payload keys such as `lidar`. Listing
-    # them instead of enumerating by exclusion silently dropped payload fields
-    # no one had added yet (the Codec stage then raised KeyError on `packets`
-    # after a successful decode), so the rule is expressed by exclusion.
+    # An allowlist, not a denylist: only keys this formatter knows to be
+    # structured handoffs are copied. A denylist would also forward writer-
+    # specific payloads such as the generic ``output`` key that
+    # ``normalize_diffusion_postprocess_output`` synthesises for a plain tensor
+    # return, duplicating the primary image into ``multimodal_output`` for every
+    # such model. Keys this formatter renders itself (``video``/``image``) are
+    # absent by construction, while ``audio`` stays in both places.
     for key, value in postprocess_output.outputs.items():
-        if key in MEDIA_RENDER_KEYS:
-            continue
-        mm_output[key] = value
+        if key == "audio" or key in STRUCTURED_PAYLOAD_KEYS:
+            mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate
     if (fps := _metadata_video_fps(postprocess_output.metadata)) is not None:

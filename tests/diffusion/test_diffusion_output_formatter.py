@@ -556,3 +556,31 @@ def test_formatter_keeps_the_codec_payload_the_projector_reads(
     )
     for key, value in payload.items():
         assert result.multimodal_output[key] is value
+
+
+def test_plain_tensor_output_does_not_leak_the_primary_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Models that return a bare tensor (e.g. BooguImage) are normalized to
+    # `{"output": <tensor>}` with `primary_key="output"`. That key must not be
+    # copied into `multimodal_output`: it is the rendered response, already
+    # served as `images`, and forwarding it duplicates the payload for every
+    # such model rather than only for Duo.
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    image = torch.zeros(1, 3, 8, 8)
+    postprocess_output = normalize_diffusion_postprocess_output(image)
+    assert postprocess_output.primary_key == "output"
+
+    [result] = format_diffusion_outputs(
+        request=_request("a cat"),
+        od_config=_config("BooguImagePipeline"),
+        diffusion_output=DiffusionOutput(output=image),
+        output_data=image,
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.images == [image]
+    assert "output" not in result.multimodal_output, (
+        "the generic `output` key is the rendered response, not a structured "
+        f"handoff (got {sorted(result.multimodal_output)})"
+    )
