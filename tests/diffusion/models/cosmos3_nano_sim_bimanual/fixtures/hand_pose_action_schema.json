@@ -1,0 +1,559 @@
+{
+  "schema_version": 4,
+  "action_tokens_per_frame": 4,
+  "model_action_dim": 64,
+  "num_embodiment_domains": 32,
+  "default_embodiment": "agibotworld",
+  "embodiments": {
+    "agibotworld": {
+      "domain_id": 15,
+      "raw_action_dim": 29,
+      "layout": {
+        "id": "agibot_backward_framewise_rot6d_v1",
+        "pose_convention": "backward_framewise",
+        "delta_equation": "T_i^-1 @ T_{i+1}",
+        "rotation_representation": "rot6d_columns",
+        "fields": [
+          {
+            "name": "head_translation",
+            "offset": 0,
+            "size": 3,
+            "unit": "meter"
+          },
+          {
+            "name": "head_rotation",
+            "offset": 3,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns"
+          },
+          {
+            "name": "right_translation",
+            "offset": 9,
+            "size": 3,
+            "unit": "meter"
+          },
+          {
+            "name": "right_rotation",
+            "offset": 12,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns"
+          },
+          {
+            "name": "right_gripper",
+            "offset": 18,
+            "size": 1,
+            "unit": "open_fraction",
+            "closed_value": 0.0,
+            "open_value": 1.0
+          },
+          {
+            "name": "left_translation",
+            "offset": 19,
+            "size": 3,
+            "unit": "meter"
+          },
+          {
+            "name": "left_rotation",
+            "offset": 22,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns"
+          },
+          {
+            "name": "left_gripper",
+            "offset": 28,
+            "size": 1,
+            "unit": "open_fraction",
+            "closed_value": 0.0,
+            "open_value": 1.0
+          }
+        ]
+      },
+      "normalizer": {
+        "schema_version": 1,
+        "method": "quantile_rot",
+        "transform": {
+          "type": "affine",
+          "offset": [
+            -9.999930625781417e-07,
+            -0.0005524998996406794,
+            0.0003559999167919159,
+            0.9999845027923584,
+            4.0000013541430235e-06,
+            -1.500011421740055e-06,
+            -1.2999982573091984e-05,
+            0.9999004602432251,
+            2.5000001187436283e-05,
+            0.00016349973157048225,
+            -1.00000761449337e-05,
+            -0.0009459997527301311,
+            0.9978730082511902,
+            0.0009764991700649261,
+            0.0005415007472038269,
+            -0.000837499275803566,
+            0.9979394674301147,
+            0.0003650002181529999,
+            0.5,
+            -0.0002804999239742756,
+            0.0001000002957880497,
+            -0.0005749999545514584,
+            0.9982370138168335,
+            -0.0020874999463558197,
+            0.0002704989165067673,
+            0.002051001414656639,
+            0.9984369874000549,
+            0.000995999202132225,
+            0.5
+          ],
+          "scale": [
+            0.0004729999927803874,
+            0.003732499899342656,
+            0.006959000136703253,
+            1.5497207641601562e-05,
+            0.0005279999459162354,
+            0.00060450000455603,
+            0.000526999996509403,
+            9.950995445251465e-05,
+            0.0004290000069886446,
+            0.0114935003221035,
+            0.0126389991492033,
+            0.014019999653100967,
+            0.0021269917488098145,
+            0.05624449998140335,
+            0.04512050002813339,
+            0.05619250237941742,
+            0.002060502767562866,
+            0.042142998427152634,
+            0.5,
+            0.010402500629425049,
+            0.011284999549388885,
+            0.012179000303149223,
+            0.001762986183166504,
+            0.0467584989964962,
+            0.03916250169277191,
+            0.046834997832775116,
+            0.0015630125999450684,
+            0.0352649986743927,
+            0.5
+          ],
+          "forward_clamp": false
+        },
+        "derivation": {
+          "statistics_block": "global_raw",
+          "low_key": "q01",
+          "high_key": "q99",
+          "range_floor": 9.99999993922529e-09
+        },
+        "source": {
+          "path": "projects/cosmos3/cosmos3/datasets/action/normalizers/agibot_backward_framewise_rot6d.json",
+          "artifact_path": "cosmos3_nano_sim_bimanual_action_sources/4d38b6321a92741c93e8cf1e96cba18979399ddb5c037708d3aaeffd666faa10.json",
+          "sha256": "4d38b6321a92741c93e8cf1e96cba18979399ddb5c037708d3aaeffd666faa10",
+          "repository_revision": "9f82ca15512c9f8d2c3e63fbc459367791a4c166"
+        },
+        "training_config": {
+          "experiment": "cpu_fixture_mecka_agibot_camera",
+          "resolved_sha256": "08f8347a3fbf488d89ba03577398a9665d2320ffc44f801f8595ba135d46199c",
+          "repository_revision": "9f82ca15512c9f8d2c3e63fbc459367791a4c166"
+        },
+        "transform_sha256": "f4401cd61bbd39b2d09b241409b9d8df97ad8a4ef7083239dd62ddf3917b2c6c"
+      }
+    },
+    "camera_pose": {
+      "domain_id": 2,
+      "raw_action_dim": 9,
+      "layout": {
+        "id": "camera_pose_backward_chunk_anchored_16f_rot6d_v1",
+        "pose_convention": "backward_chunk_anchored_16f",
+        "delta_equation": "T_{16*floor(i/16)}^-1 @ T_{i+1}",
+        "rotation_representation": "rot6d_columns",
+        "fields": [
+          {
+            "name": "camera_translation",
+            "offset": 0,
+            "size": 3,
+            "unit": "meter"
+          },
+          {
+            "name": "camera_rotation",
+            "offset": 3,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns"
+          }
+        ]
+      },
+      "normalizer": {
+        "schema_version": 1,
+        "method": "global_asinh",
+        "transform": {
+          "type": "asinh",
+          "offset": [
+            0.0,
+            0.0,
+            0.0,
+            0.8548964858055115,
+            -0.003381490707397461,
+            -0.004325501620769501,
+            0.0018050074577331543,
+            0.8589024543762207,
+            0.01764100044965744
+          ],
+          "scale": [
+            0.28220000863075256,
+            0.28220000863075256,
+            0.28220000863075256,
+            0.14510351419448853,
+            0.524667501449585,
+            0.20766350626945496,
+            0.5281140208244324,
+            0.14109650254249573,
+            0.24154099822044373
+          ],
+          "unit": 0.8813735842704773,
+          "forward_clamp": false
+        },
+        "derivation": {
+          "statistics_block": "global",
+          "low_key": "q01",
+          "high_key": "q99",
+          "range_floor": 9.99999993922529e-09,
+          "source_dim": 59,
+          "channel_start": 0,
+          "channel_count": 9
+        },
+        "source": {
+          "path": "projects/cosmos3/cosmos3/datasets/action/normalizers/global_asinh_v1_backward_anchored_gripper_metric.json",
+          "artifact_path": "cosmos3_nano_sim_bimanual_action_sources/ae695e2c643a5626b3c3564f00705aa3a83ab0da7640549c7340db71172594b0.json",
+          "sha256": "ae695e2c643a5626b3c3564f00705aa3a83ab0da7640549c7340db71172594b0",
+          "repository_revision": "9f82ca15512c9f8d2c3e63fbc459367791a4c166",
+          "pose_convention_override": {
+            "policy": "bimanual_camera_global_asinh_v1",
+            "source_allowed_pose_conventions": [
+              "backward_anchored"
+            ],
+            "effective_pose_convention": "backward_chunk_anchored_16f",
+            "authority": "inference_camera_profile"
+          }
+        },
+        "training_config": {
+          "experiment": "cpu_fixture_mecka_agibot_camera",
+          "resolved_sha256": "08f8347a3fbf488d89ba03577398a9665d2320ffc44f801f8595ba135d46199c",
+          "repository_revision": "9f82ca15512c9f8d2c3e63fbc459367791a4c166"
+        },
+        "transform_sha256": "3bf7867e9e3cc1b1fdceaef6a226023c37745452a97b42736453280eabb2fbc6"
+      }
+    },
+    "hand_pose": {
+      "domain_id": 3,
+      "raw_action_dim": 57,
+      "layout": {
+        "id": "hand_pose_fingertips_backward_framewise_rot6d_v1",
+        "pose_convention": "backward_framewise",
+        "delta_equation": "camera/wrists: T_i^-1 @ T_{i+1}; fingertips: wrist-local at i+1",
+        "rotation_representation": "rot6d_columns",
+        "fields": [
+          {
+            "name": "camera_translation",
+            "offset": 0,
+            "size": 3,
+            "unit": "meter"
+          },
+          {
+            "name": "camera_rotation",
+            "offset": 3,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns"
+          },
+          {
+            "name": "right_wrist_translation",
+            "offset": 9,
+            "size": 3,
+            "unit": "meter"
+          },
+          {
+            "name": "right_wrist_rotation",
+            "offset": 12,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns"
+          },
+          {
+            "name": "right_thumb_tip_position",
+            "offset": 18,
+            "size": 3,
+            "unit": "meter",
+            "frame": "right_wrist"
+          },
+          {
+            "name": "right_index_tip_position",
+            "offset": 21,
+            "size": 3,
+            "unit": "meter",
+            "frame": "right_wrist"
+          },
+          {
+            "name": "right_middle_tip_position",
+            "offset": 24,
+            "size": 3,
+            "unit": "meter",
+            "frame": "right_wrist"
+          },
+          {
+            "name": "right_ring_tip_position",
+            "offset": 27,
+            "size": 3,
+            "unit": "meter",
+            "frame": "right_wrist"
+          },
+          {
+            "name": "right_pinky_tip_position",
+            "offset": 30,
+            "size": 3,
+            "unit": "meter",
+            "frame": "right_wrist"
+          },
+          {
+            "name": "left_wrist_translation",
+            "offset": 33,
+            "size": 3,
+            "unit": "meter"
+          },
+          {
+            "name": "left_wrist_rotation",
+            "offset": 36,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns"
+          },
+          {
+            "name": "left_thumb_tip_position",
+            "offset": 42,
+            "size": 3,
+            "unit": "meter",
+            "frame": "left_wrist"
+          },
+          {
+            "name": "left_index_tip_position",
+            "offset": 45,
+            "size": 3,
+            "unit": "meter",
+            "frame": "left_wrist"
+          },
+          {
+            "name": "left_middle_tip_position",
+            "offset": 48,
+            "size": 3,
+            "unit": "meter",
+            "frame": "left_wrist"
+          },
+          {
+            "name": "left_ring_tip_position",
+            "offset": 51,
+            "size": 3,
+            "unit": "meter",
+            "frame": "left_wrist"
+          },
+          {
+            "name": "left_pinky_tip_position",
+            "offset": 54,
+            "size": 3,
+            "unit": "meter",
+            "frame": "left_wrist"
+          }
+        ]
+      },
+      "normalizer": {
+        "schema_version": 1,
+        "method": "quantile_rot",
+        "transform": {
+          "type": "affine",
+          "offset": [
+            -5.7499855756759644e-05,
+            -0.0042894999496638775,
+            0.0011225002817809582,
+            0.9984135031700134,
+            -0.0003120005130767822,
+            0.0001360001042485237,
+            0.00034799985587596893,
+            0.9984614849090576,
+            0.0004460001364350319,
+            -0.001722501590847969,
+            -0.0004225000739097595,
+            0.001365000382065773,
+            0.9345450401306152,
+            0.0034539997577667236,
+            -0.0009665042161941528,
+            -0.007887497544288635,
+            0.9399615526199341,
+            0.0048364996910095215,
+            -0.03172650188207626,
+            0.0674934983253479,
+            0.094589002430439,
+            -0.012377000413835049,
+            0.05034149810671806,
+            0.12530000507831573,
+            0.015226000919938087,
+            0.04872450232505798,
+            0.11963450163602829,
+            0.03238249942660332,
+            0.045310501009225845,
+            0.1070065051317215,
+            0.04673349857330322,
+            0.03564950078725815,
+            0.08942750096321106,
+            0.0016670003533363342,
+            -0.0004324987530708313,
+            0.0016140006482601166,
+            0.9508439898490906,
+            -0.003751009702682495,
+            0.0015724971890449524,
+            0.007634997367858887,
+            0.9534975290298462,
+            0.0033169984817504883,
+            0.03705250099301338,
+            0.0660490021109581,
+            0.09095150232315063,
+            0.01398950070142746,
+            0.044726498425006866,
+            0.12852850556373596,
+            -0.014411499723792076,
+            0.04277699813246727,
+            0.12370850145816803,
+            -0.03219199925661087,
+            0.03951900079846382,
+            0.11172199994325638,
+            -0.04880499839782715,
+            0.030880499631166458,
+            0.0936184972524643
+          ],
+          "scale": [
+            0.026630500331521034,
+            0.01986449956893921,
+            0.014391500502824783,
+            0.0015864968299865723,
+            0.05620099976658821,
+            0.02385599911212921,
+            0.05625300109386444,
+            0.0015384852886199951,
+            0.027403000742197037,
+            0.04663950204849243,
+            0.04055050015449524,
+            0.04226300120353699,
+            0.06545200943946838,
+            0.319472998380661,
+            0.23978149890899658,
+            0.31929248571395874,
+            0.060035496950149536,
+            0.2178564965724945,
+            0.04828549921512604,
+            0.03778050094842911,
+            0.03536199778318405,
+            0.0264739990234375,
+            0.03951549902558327,
+            0.06304600089788437,
+            0.02267800085246563,
+            0.03866349905729294,
+            0.07248549908399582,
+            0.026646500453352928,
+            0.03867949917912483,
+            0.07088349759578705,
+            0.02774449996650219,
+            0.034263499081134796,
+            0.05590149760246277,
+            0.03951000049710274,
+            0.037232499569654465,
+            0.038040999323129654,
+            0.04915398359298706,
+            0.27514100074768066,
+            0.20159950852394104,
+            0.27488601207733154,
+            0.04650047421455383,
+            0.1903650015592575,
+            0.0506804995238781,
+            0.041460998356342316,
+            0.03736649826169014,
+            0.02603450044989586,
+            0.043913498520851135,
+            0.0633464977145195,
+            0.02294349856674671,
+            0.04421300068497658,
+            0.07142950594425201,
+            0.0263689998537302,
+            0.04369400069117546,
+            0.06884000450372696,
+            0.02920900098979473,
+            0.038376498967409134,
+            0.054505497217178345
+          ],
+          "forward_clamp": false
+        },
+        "derivation": {
+          "statistics_block": "global_raw",
+          "low_key": "q01",
+          "high_key": "q99",
+          "range_floor": 9.99999993922529e-09
+        },
+        "source": {
+          "path": "projects/cosmos3/cosmos3/datasets/action/normalizers/hand_pose_backward_framewise_rot6d.json",
+          "artifact_path": "cosmos3_nano_sim_bimanual_action_sources/cd9a04a7eb997903859f3f2b4a036b4251febd29e17193c883b9458226ec2adb.json",
+          "sha256": "cd9a04a7eb997903859f3f2b4a036b4251febd29e17193c883b9458226ec2adb",
+          "repository_revision": "9f82ca15512c9f8d2c3e63fbc459367791a4c166"
+        },
+        "training_config": {
+          "experiment": "cpu_fixture_mecka_agibot_camera",
+          "resolved_sha256": "08f8347a3fbf488d89ba03577398a9665d2320ffc44f801f8595ba135d46199c",
+          "repository_revision": "9f82ca15512c9f8d2c3e63fbc459367791a4c166"
+        },
+        "transform_sha256": "58c746785e5c6cf3ec9e1c9f9235297be841d79a5f4f5173483fb62106a2ff96"
+      }
+    }
+  },
+  "padding": {
+    "stage": "after_normalization",
+    "value": 0.0
+  },
+  "training_config_excerpt": {
+    "datasets": [
+      {
+        "dataset_class": "AgiBotWorldBetaDataset",
+        "embodiment": "agibotworld",
+        "method": "quantile_rot",
+        "apply_forward_clamp": false,
+        "pose_convention": "backward_framewise",
+        "rotation_format": "rot6d",
+        "stats_filename": "agibot_backward_framewise_rot6d.json"
+      },
+      {
+        "dataset_class": "CameraDatasetSharded",
+        "embodiment": "camera_pose",
+        "method": "pose_scale",
+        "apply_forward_clamp": false,
+        "mode": "forward_dynamics",
+        "pose_convention": "backward_framewise",
+        "rotation_format": "rot6d",
+        "translation_scale": 10.0,
+        "rotation_scale": 1.0
+      },
+      {
+        "dataset_class": "HandPoseDataset",
+        "embodiment": "hand_pose",
+        "method": "quantile_rot",
+        "apply_forward_clamp": false,
+        "pose_convention": "backward_framewise",
+        "rotation_format": "rot6d",
+        "stats_filename": "hand_pose_backward_framewise_rot6d.json",
+        "keypoint_option": "wrist_plus_finger_tips"
+      }
+    ],
+    "experiment": "cpu_fixture_mecka_agibot_camera"
+  },
+  "contract_sha256": "23d103cf6eb8946c46dffbd52079393b6f0f1b36000a17223180a8c2dc414056",
+  "inference_camera_profile": {
+    "pose_convention": "backward_chunk_anchored_16f",
+    "action_normalization": "global_asinh",
+    "translation_scale": 1.0
+  }
+}

@@ -10,8 +10,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestKVSpec,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
+    SupportsDynamicARDiffusion,
 )
 from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
 from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
@@ -40,6 +42,8 @@ __all__ = [
     "ARDiffusionControlInput",
     "ARDiffusionTickRequest",
     "ARDiffusionKVCacheSpec",
+    "ARDiffusionRequestKVSpec",
     "SupportsARDiffusionPipeline",
     "SupportsARDiffusionWarmup",
+    "SupportsDynamicARDiffusion",
 ]

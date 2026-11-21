@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict schema-v1 artifact and deployment configuration for Cosmos3-Nano-Sim-Bimanual."""
 
 from __future__ import annotations
@@ -9,7 +10,14 @@ import math
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_schema import Cosmos3NanoSimBimanualActionSchema
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import Cosmos3NanoSimBimanualActionSchema
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
+    Cosmos3NanoSimBimanualActionConditioning,
+    Cosmos3NanoSimBimanualConditioning,
+    Cosmos3NanoSimBimanualControlVideoConditioning,
+    parse_cosmos3_nano_sim_bimanual_conditioning,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.unified_action_contract import UnifiedActionConditioning
 
 COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION = 1
 COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS = frozenset(
@@ -164,12 +172,7 @@ def _strict_float(value: Any, name: str) -> float:
 
 
 def _recent_past_frames(cache_size: int, sinks: int, name: str) -> int:
-    """Convert a reference cache capacity into Omni's recent past frames.
-
-    Reference capacity includes the sinks and current frame; Omni's
-    window_frames counts only recent past frames, separately from sinks.
-    """
-
+    """Convert a cache capacity that includes the sink prefix and current frame."""
     if not 0 <= sinks < cache_size - 1:
         raise ValueError(f"{name} must leave at least one recent past frame in the cache")
     return cache_size - sinks - 1
@@ -184,18 +187,13 @@ def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Cosmos3-Nano-Sim-Bimanual artifact fixed_step_sampler_config.t_list must be a list")
     t_list = tuple(_strict_float(value, "fixed_step_sampler_config.t_list entry") for value in raw_t_list)
     base_fps = _strict_float(artifact["base_fps"], "base_fps")
+    conditioning = parse_cosmos3_nano_sim_bimanual_conditioning(artifact["conditioning"])
     sink_frames = _strict_int(artifact["sink_frames"], "sink_frames", positive=False)
-    # The exported window_frames is the reference total cache, like
-    # kv_cache_inference_size: 64 with 8 sinks retains 55 recent past frames.
-    window_frames = (
-        None
-        if artifact["window_frames"] is None
-        else _recent_past_frames(
-            _strict_int(artifact["window_frames"], "window_frames"),
-            sink_frames,
-            "Cosmos3-Nano-Sim-Bimanual artifact sink_frames",
-        )
-    )
+    window_frames = artifact["window_frames"]
+    if window_frames is not None:
+        window_frames = _strict_int(window_frames, "window_frames")
+        if isinstance(conditioning, UnifiedActionConditioning):
+            window_frames = _recent_past_frames(window_frames, sink_frames, "Artifact sink_frames")
     return {
         "schema_version": _strict_int(artifact["schema_version"], "schema_version"),
         "chunk_size": _strict_int(artifact["chunk_size"], "chunk_size"),
@@ -223,7 +221,7 @@ def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_id": artifact["checkpoint_id"],
         "checkpoint_iteration": _strict_int(artifact["checkpoint_iteration"], "checkpoint_iteration"),
         "checkpoint_hash": artifact["checkpoint_hash"],
-        "conditioning": Cosmos3NanoSimBimanualActionSchema.model_validate(artifact["conditioning"]),
+        "conditioning": conditioning,
     }
 
 
@@ -232,9 +230,7 @@ class Cosmos3NanoSimBimanualManifest:
     """Immutable schema-v1 artifact fields required by Cosmos3-Nano-Sim-Bimanual runtime."""
 
     schema_version: int = COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION
-    chunk_size: int = 2
-    # Recent past frames retained besides the sinks and the current frame.
-    # Artifacts and deploy overrides state the reference total instead.
+    chunk_size: int = 4
     window_frames: int | None = 96
     sink_frames: int = 0
     text_cache_max_len: int = 512
@@ -253,7 +249,7 @@ class Cosmos3NanoSimBimanualManifest:
     checkpoint_id: str = "unknown"
     checkpoint_iteration: int = 0
     checkpoint_hash: str = "unknown"
-    conditioning: Cosmos3NanoSimBimanualActionSchema | None = None
+    conditioning: Cosmos3NanoSimBimanualConditioning | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION:
@@ -322,26 +318,44 @@ class Cosmos3NanoSimBimanualManifest:
             )
         if self.checkpoint_hash != "unknown" and set(self.checkpoint_hash) == {"0"}:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoint_hash cannot be the all-zero template value")
-        if self.conditioning is not None and not isinstance(self.conditioning, Cosmos3NanoSimBimanualActionSchema):
+        if self.conditioning is not None and not isinstance(
+            self.conditioning,
+            Cosmos3NanoSimBimanualActionConditioning
+            | UnifiedActionConditioning
+            | Cosmos3NanoSimBimanualControlVideoConditioning,
+        ):
             raise ValueError("Cosmos3-Nano-Sim-Bimanual schema v1 requires a recognized conditioning payload")
 
     @property
-    def action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | None:
-        return self.conditioning if isinstance(self.conditioning, Cosmos3NanoSimBimanualActionSchema) else None
+    def action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | UnifiedActionConditioning | None:
+        return (
+            self.conditioning
+            if isinstance(self.conditioning, (Cosmos3NanoSimBimanualActionConditioning, UnifiedActionConditioning))
+            else None
+        )
 
-    def require_action_schema(self) -> Cosmos3NanoSimBimanualActionSchema:
+    def require_action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | UnifiedActionConditioning:
         schema = self.action_schema
         if schema is None:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual action conditioning is unavailable.")
         return schema
+
+    def require_control_video_conditioning(self) -> Cosmos3NanoSimBimanualControlVideoConditioning:
+        conditioning = self.conditioning
+        if not isinstance(conditioning, Cosmos3NanoSimBimanualControlVideoConditioning):
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual control_video conditioning is unavailable.")
+        return conditioning
 
     @property
     def action_tokens_per_frame(self) -> int:
         return self.require_action_schema().action_tokens_per_frame
 
     @property
-    def input_action_dim(self) -> int:
-        return self.require_action_schema().input_action_dim
+    def raw_action_dim(self) -> int:
+        return self.require_action_schema().raw_action_dim
+
+    def raw_action_dim_for(self, embodiment: str) -> int:
+        return self.require_action_schema().raw_action_dim_for(embodiment)
 
     @property
     def max_action_dim(self) -> int:
@@ -361,6 +375,8 @@ class Cosmos3NanoSimBimanualManifest:
 
     @property
     def conditioning_tokens_per_frame(self) -> int:
+        if isinstance(self.conditioning, Cosmos3NanoSimBimanualControlVideoConditioning):
+            return 0
         return self.action_tokens_per_frame
 
     @property
@@ -392,6 +408,9 @@ class Cosmos3NanoSimBimanualManifest:
                 f"missing={missing}, unknown={unknown}."
             )
         manifest = cls(**_parse_artifact(artifact))
+        if manifest.action_schema is None:
+            # Transfer resolves its temporal-frame window on each request.
+            return manifest
         cache_size = deploy_option(od_config, "kv_cache_inference_size")
         sinks = deploy_option(od_config, "attention_sink_size")
         if cache_size is None:
@@ -403,7 +422,6 @@ class Cosmos3NanoSimBimanualManifest:
         sinks = 0 if sinks is None else sinks
         if isinstance(sinks, bool) or not isinstance(sinks, int):
             raise ValueError("attention_sink_size must be an integer")
-        # The effective manifest digest also separates session/cache identities.
         window_frames = _recent_past_frames(cache_size, sinks, "attention_sink_size")
         return replace(manifest, window_frames=window_frames, sink_frames=sinks)
 

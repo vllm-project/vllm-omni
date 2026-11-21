@@ -24,3 +24,21 @@ COSMOS3_NANO_SIM_BIMANUAL_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+COSMOS3_NANO_SIM_TRANSFER_PIPELINE = PipelineConfig(
+    model_type="cosmos3_nano_sim_transfer",
+    default_deploy_config_name="cosmos3_nano_sim_transfer.yaml",
+    model_arch="Cosmos3NanoSimTransferPipeline",
+    diffusers_class_name="Cosmos3NanoSimTransferPipeline",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(),
+            final_output=True,
+            final_output_type="video",
+            model_arch="Cosmos3NanoSimTransferPipeline",
+        ),
+    ),
+)

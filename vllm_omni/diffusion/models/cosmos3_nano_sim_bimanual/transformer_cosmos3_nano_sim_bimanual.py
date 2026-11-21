@@ -28,6 +28,10 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     split_interleaved_action_vision_tokens,
     zero_null_action_values,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedLayerInputs,
+    paged_write_attn,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -71,9 +75,10 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
         dense_history: tuple[torch.Tensor, torch.Tensor] | None = None,
         dense_joint_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         dense_history_tokens: int = 0,
+        paged_context: ARDiffusionPagedLayerInputs | None = None,
         num_frames: int,
         tokens_per_frame: int,
-        action_tokens_per_frame: int,
+        action_tokens_per_frame: int | None = None,
         null_action_frame_indexes: tuple[int, ...] = (),
         clean_history_window: tuple[int, int | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -90,6 +95,11 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Bimanual text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}"
             )
+        if dense_history is not None and paged_context is not None:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual attention accepts either dense_history or paged_context, not both"
+            )
+
         batch, seq_len, _ = hidden_states.shape
         q = self.to_q(hidden_states).view(batch, seq_len, self.num_heads_local, self.head_dim)
         k = self.to_k(hidden_states).view(batch, seq_len, self.num_kv_heads_local, self.head_dim)
@@ -98,15 +108,30 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
             q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
             k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
-        v = zero_null_action_values(
-            v,
-            num_frames=num_frames,
-            tokens_per_frame=tokens_per_frame,
-            action_tokens_per_frame=action_tokens_per_frame,
-            null_frame_indexes=null_action_frame_indexes,
-        )
+        if action_tokens_per_frame is None:
+            if null_action_frame_indexes:
+                raise ValueError("Cosmos3-Nano-Sim-Bimanual null action indexes require action conditioning tokens")
+        else:
+            v = zero_null_action_values(
+                v,
+                num_frames=num_frames,
+                tokens_per_frame=tokens_per_frame,
+                action_tokens_per_frame=action_tokens_per_frame,
+                null_frame_indexes=null_action_frame_indexes,
+            )
 
-        if dense_joint_kv is not None:
+        if paged_context is not None:
+            output = paged_write_attn(
+                paged_context,
+                q[0],
+                k[0],
+                v[0],
+                text_k[0, :real_text_kv_len],
+                text_v[0, :real_text_kv_len],
+                self.head_dim**-0.5,
+                framewise_attention=clean_history_window is not None,
+            ).unsqueeze(0)
+        elif dense_joint_kv is not None:
             # Full-history storage is already text + committed history. Only
             # current K/V changes; keep the exact dense attention layout/policy.
             joint_k, joint_v = dense_joint_kv
@@ -248,25 +273,136 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
             sound_dim=sound_dim,
             sound_latent_fps=sound_latent_fps,
         )
-        if not self.action_gen:
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoints must enable action_gen")
-        if self.action_dim != self.manifest.max_action_dim:
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Bimanual action dimension differs between transformer and manifest: "
-                f"{self.action_dim} != {self.manifest.max_action_dim}"
-            )
         if self.temporal_compression_factor != self.manifest.temporal_compression_factor:
             raise ValueError(
                 "Cosmos3-Nano-Sim-Bimanual temporal compression differs between VAE and manifest: "
                 f"{self.temporal_compression_factor} != {self.manifest.temporal_compression_factor}"
             )
+        self._validate_conditioning_config()
         self.temporal_modality_margin = self.manifest.temporal_modality_margin
         self.base_fps = self.manifest.base_fps
         self.enable_fps_modulation = self.manifest.enable_fps_modulation
 
+    def _validate_conditioning_config(self) -> None:
+        """Validate the Humanoid action adapter against loaded modules."""
+
+        action_schema = self.manifest.require_action_schema()
+        action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
+        if not self.action_gen:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoints must enable action_gen")
+        if self.action_dim != action_schema.model_action_dim:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual action dimension differs between transformer and manifest: "
+                f"{self.action_dim} != {action_schema.model_action_dim}"
+            )
+
+    def _prepare_conditioning_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        num_frames: int,
+        action_latents: torch.Tensor | None,
+        action_domain_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Project the Humanoid action payload into per-frame hidden tokens."""
+
+        action_count = self.manifest.action_tokens_per_frame
+        if action_latents is None:
+            action_latents = hidden_states.new_zeros(1, num_frames * action_count, self.action_dim)
+        elif action_latents.ndim == 2:
+            action_latents = action_latents.unsqueeze(0)
+        expected_action_shape = (1, num_frames * action_count, self.action_dim)
+        if tuple(action_latents.shape) != expected_action_shape:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual actions must have shape "
+                f"{expected_action_shape}, got {tuple(action_latents.shape)}"
+            )
+        if action_domain_ids is None:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual action conditioning requires action_domain_ids")
+        if action_domain_ids.ndim == 2:
+            if action_domain_ids.shape != action_latents.shape[:2]:
+                raise ValueError("Per-token domain IDs must match [batch, action tokens]")
+            action_hidden = self.action_proj_in(
+                action_latents.reshape(-1, self.action_dim), action_domain_ids.reshape(-1)
+            ).reshape(1, num_frames * action_count, self.hidden_size)
+        else:
+            action_hidden = self.action_proj_in(action_latents, action_domain_ids)
+        action_hidden = action_hidden + self.action_modality_embed.to(action_hidden.dtype)
+        return action_hidden.view(1, num_frames, action_count, self.hidden_size)
+
+    def _pack_tokens(self, conditioning_tokens: torch.Tensor, vision_tokens: torch.Tensor) -> torch.Tensor:
+        return interleave_action_vision_tokens(conditioning_tokens, vision_tokens)
+
+    def _unpack_tokens(
+        self,
+        hidden: torch.Tensor,
+        *,
+        num_frames: int,
+        conditioning_tokens_per_frame: int,
+        vision_tokens_per_frame: int,
+    ) -> torch.Tensor:
+        _, vision_hidden = split_interleaved_action_vision_tokens(
+            hidden,
+            num_frames=num_frames,
+            action_tokens_per_frame=conditioning_tokens_per_frame,
+            vision_tokens_per_frame=vision_tokens_per_frame,
+        )
+        return vision_hidden
+
     @property
     def num_kv_heads_local(self) -> int:
         return self.num_key_value_heads // get_tensor_model_parallel_world_size()
+
+    @staticmethod
+    def pad_text_kv(
+        layer_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        max_len: int,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        padded: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for key, value in layer_kv:
+            if key.shape != value.shape or key.shape[0] != 1:
+                raise ValueError(
+                    "Cosmos3-Nano-Sim-Bimanual text K/V must be matching batch-one "
+                    f"tensors, got {key.shape} and {value.shape}"
+                )
+            if key.shape[1] > max_len:
+                raise ValueError(
+                    f"Cosmos3-Nano-Sim-Bimanual prompt has {key.shape[1]} KV tokens but text_cache_max_len={max_len}"
+                )
+            pad_len = max_len - key.shape[1]
+            if pad_len:
+                key = torch.cat([key, key.new_zeros(1, pad_len, *key.shape[2:])], dim=1)
+                value = torch.cat([value, value.new_zeros(1, pad_len, *value.shape[2:])], dim=1)
+            padded.append((key, value))
+        return padded
+
+    def _build_position_ids(
+        self,
+        *,
+        frame_start: int,
+        num_frames: int,
+        grid_h: int,
+        grid_w: int,
+        real_text_kv_len: int,
+        fps: float,
+        null_action_frame_indexes: tuple[int, ...],
+    ) -> torch.Tensor:
+        absolute_null_frames = tuple(frame_start + frame for frame in null_action_frame_indexes)
+        return build_interleaved_mrope_position_ids(
+            frame_start=frame_start,
+            num_frames=num_frames,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            text_temporal_offset=real_text_kv_len,
+            temporal_modality_margin=self.temporal_modality_margin,
+            fps=fps,
+            base_fps=self.base_fps,
+            temporal_compression_factor=self.temporal_compression_factor,
+            enable_fps_modulation=self.enable_fps_modulation,
+            action_tokens_per_frame=self.manifest.action_tokens_per_frame,
+            null_action_frames=absolute_null_frames,
+        )
 
     def _current_rope(
         self,
@@ -281,27 +417,22 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         null_action_frame_indexes: tuple[int, ...],
         frame_causal: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        absolute_null_frames = tuple(frame_start + frame for frame in null_action_frame_indexes)
-        # Sequential clean commits treat each frame as its own AR unit. In
-        # particular every null action is colocated with its vision frame;
-        # the ordinary multi-frame denoise packer only colocates the first.
         spans = [(frame_start + i, 1) for i in range(num_frames)] if frame_causal else [(frame_start, num_frames)]
         position_ids = (
             torch.cat(
                 [
-                    build_interleaved_mrope_position_ids(
+                    self._build_position_ids(
                         frame_start=start,
                         num_frames=count,
                         grid_h=grid_h,
                         grid_w=grid_w,
-                        text_temporal_offset=real_text_kv_len,
-                        temporal_modality_margin=self.temporal_modality_margin,
+                        real_text_kv_len=real_text_kv_len,
                         fps=fps,
-                        base_fps=self.base_fps,
-                        temporal_compression_factor=self.temporal_compression_factor,
-                        enable_fps_modulation=self.enable_fps_modulation,
-                        action_tokens_per_frame=self.manifest.action_tokens_per_frame,
-                        null_action_frames=absolute_null_frames,
+                        null_action_frame_indexes=(
+                            ((0,) if start - frame_start in null_action_frame_indexes else ())
+                            if frame_causal
+                            else null_action_frame_indexes
+                        ),
                     )
                     for start, count in spans
                 ],
@@ -323,8 +454,9 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         real_text_kv_len: int,
         frame_start: int,
         fps: float,
-        action_latents: torch.Tensor | None,
-        action_domain_ids: torch.Tensor,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        paged_kv: list[Any] | None = None,
         dense_history: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         dense_attention: CosmosSimDenseAttentionCache | None = None,
         condition_vision: bool = False,
@@ -334,7 +466,8 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         """Denoise or clean-commit one current chunk.
 
-        Clean refreshes commit one frame or a frame-causal batch.
+        ``paged_kv`` is non-committing during denoise. Clean refreshes commit
+        one frame or a frame-causal batch. Dense history is the numerical oracle.
         """
         if self._inductor_cudagraphs:
             # Regional block calls belong to one invocation. Without this,
@@ -354,10 +487,16 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}"
             )
-        if dense_attention is not None and dense_history is not None:
-            raise ValueError("Dense joint storage cannot be combined with separate dense history")
+        if paged_kv is not None and dense_history is not None:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual forward accepts either paged_kv or dense_history, not both")
+        if dense_attention is not None and (paged_kv is not None or dense_history is not None):
+            raise ValueError("Dense joint storage cannot be combined with paged or separate dense history")
         dense_joint_kv = None if dense_attention is None else dense_attention.kv
         dense_history_tokens = 0 if dense_attention is None else dense_attention.history_length
+        if paged_kv is not None and len(paged_kv) != self.num_hidden_layers:
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}"
+            )
         if dense_history is not None and len(dense_history) != self.num_hidden_layers:
             raise ValueError(
                 "Cosmos3-Nano-Sim-Bimanual expected "
@@ -388,29 +527,15 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                 time_embed = self.time_embedder((timestep.reshape(1) * self.timestep_scale).float())
             vision_tokens = vision_tokens + time_embed.to(vision_tokens.dtype).view(1, 1, 1, -1)
 
-        action_count = self.manifest.action_tokens_per_frame
-        actual_tokens_per_frame = action_count + grid_h * grid_w
-        if action_latents is None:
-            action_latents = hidden_states.new_zeros(1, num_frames * action_count, self.action_dim)
-        elif action_latents.ndim == 2:
-            action_latents = action_latents.unsqueeze(0)
-        expected_action_shape = (1, num_frames * action_count, self.action_dim)
-        if tuple(action_latents.shape) != expected_action_shape:
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Bimanual actions must have shape "
-                f"{expected_action_shape}, got {tuple(action_latents.shape)}"
-            )
-        if action_domain_ids.ndim == 2:
-            if action_domain_ids.shape != action_latents.shape[:2]:
-                raise ValueError("Per-token domain IDs must match [batch, action tokens]")
-            action_hidden = self.action_proj_in(
-                action_latents.reshape(-1, self.action_dim), action_domain_ids.reshape(-1)
-            ).reshape(1, num_frames * action_count, self.hidden_size)
-        else:
-            action_hidden = self.action_proj_in(action_latents, action_domain_ids)
-        action_hidden = action_hidden + self.action_modality_embed.to(action_hidden.dtype)
-        action_hidden = action_hidden.view(1, num_frames, action_count, self.hidden_size)
-        hidden = interleave_action_vision_tokens(action_hidden, vision_tokens)
+        conditioning_tokens = self._prepare_conditioning_tokens(
+            hidden_states,
+            num_frames=num_frames,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+        )
+        conditioning_count = int(conditioning_tokens.shape[2])
+        actual_tokens_per_frame = conditioning_count + grid_h * grid_w
+        hidden = self._pack_tokens(conditioning_tokens, vision_tokens)
         freqs_cos, freqs_sin = self._current_rope(
             hidden,
             frame_start=frame_start,
@@ -425,7 +550,24 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         if dense_attention is not None and self._inductor_cudagraphs:
             freqs_cos, freqs_sin = dense_attention.stage_rope(freqs_cos, freqs_sin, geometry.patch_grid)
 
-        collect_current_kv = dense_joint_kv is None
+        if paged_kv is not None:
+            forward_context = paged_kv[0].forward_ctx
+            if forward_context.seq_len != hidden.shape[1]:
+                raise RuntimeError(
+                    "Cosmos3-Nano-Sim-Bimanual paged context token count does not match "
+                    f"this chunk: {forward_context.seq_len} != {hidden.shape[1]}"
+                )
+            forward_context.prepare(
+                device=hidden.device,
+                action_len=real_text_kv_len,
+                query_len=hidden.shape[1],
+            )
+            paged_kv = [layer_context.to_layer_inputs() for layer_context in paged_kv]
+
+        # Only the dense path reads current_kv; in paged mode the K/V are
+        # already in the pool, so keeping 40 layers of them alive per denoise
+        # step would defeat the point of paging.
+        collect_current_kv = paged_kv is None and dense_joint_kv is None
         current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         with self._offload_context("generator"):
             for layer_idx, layer in enumerate(self.gen_layers):
@@ -440,9 +582,10 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                     dense_history=None if dense_history is None else dense_history[layer_idx],
                     dense_joint_kv=None if dense_joint_kv is None else dense_joint_kv[layer_idx],
                     dense_history_tokens=dense_history_tokens,
+                    paged_context=None if paged_kv is None else paged_kv[layer_idx],
                     num_frames=num_frames,
                     tokens_per_frame=actual_tokens_per_frame,
-                    action_tokens_per_frame=action_count,
+                    action_tokens_per_frame=conditioning_count or None,
                     null_action_frame_indexes=null_action_frame_indexes,
                     clean_history_window=history_window or (self.manifest.sink_frames, self.manifest.window_frames)
                     if frame_causal
@@ -452,10 +595,10 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                 if collect_current_kv:
                     current_kv.append((current_k, current_v))
             hidden = self.norm_moe_gen(hidden)
-            _, vision_hidden = split_interleaved_action_vision_tokens(
+            vision_hidden = self._unpack_tokens(
                 hidden,
                 num_frames=num_frames,
-                action_tokens_per_frame=action_count,
+                conditioning_tokens_per_frame=conditioning_count,
                 vision_tokens_per_frame=grid_h * grid_w,
             )
             vision_hidden = vision_hidden.flatten(1, 2)

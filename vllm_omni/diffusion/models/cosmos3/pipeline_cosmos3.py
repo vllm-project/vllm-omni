@@ -33,7 +33,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import fields
 from typing import Any, ClassVar
@@ -416,7 +416,13 @@ def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransfo
 # ---------------------------------------------------------------------------
 # Post-process function (registered in registry.py)
 # ---------------------------------------------------------------------------
-def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_image: bool = False):
+def get_cosmos3_pre_process_func(
+    od_config: OmniDiffusionConfig,
+    *,
+    crop_action_image: bool = False,
+    transfer_target_size: tuple[int, int] | Callable[[OmniDiffusionRequest], tuple[int, int]] | None = None,
+    transfer_direct_resize: bool = False,
+):
     """Build the request preprocessor for Cosmos3 image/video inputs.
 
     Every request receives a model-owned forward-schedule compatibility key
@@ -432,8 +438,12 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
     and padding rules. ``crop_action_image`` retains the padded encoding canvas
     while setting output dimensions to the aligned content size. Transfer requests store
     ``additional_information.preprocessed_transfer_video`` for optional input
-    video conditioning. Cosmos3 sound generation is not driven by
-    ``multi_modal_data["audio"]``; it is enabled later from sampling params.
+    video conditioning. By default Transfer selects an aspect bucket from the
+    source media; ``transfer_target_size`` instead fixes the output geometry
+    while retaining aspect-preserving resize and center crop unless
+    ``transfer_direct_resize`` is enabled. Cosmos3 sound
+    generation is not driven by ``multi_modal_data["audio"]``; it is enabled
+    later from sampling params.
     """
     from .guardrails import check_text_safety, ensure_initialized, is_guardrails_enabled
 
@@ -455,9 +465,17 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
         return normalize_action_mode(_extra_args(request).get("action_mode"))
 
     def _set_transfer_size_from_image(request: OmniDiffusionRequest, image: PIL.Image.Image) -> tuple[int, int]:
-        extra = _extra_args(request)
-        resolution = extra.get("resolution", extra.get("image_size", 720))
-        target_w, target_h = find_closest_target_size(image.height, image.width, resolution)
+        if transfer_target_size is None:
+            extra = _extra_args(request)
+            resolution = extra.get("resolution", extra.get("image_size", 720))
+            target_w, target_h = find_closest_target_size(image.height, image.width, resolution)
+        else:
+            resolved_target = transfer_target_size(request) if callable(transfer_target_size) else transfer_target_size
+            target_h, target_w = (int(value) for value in resolved_target)
+            if target_h <= 0 or target_w <= 0:
+                raise ValueError(
+                    f"Cosmos3 fixed Transfer target dimensions must be positive, got {target_h}x{target_w}."
+                )
         request.sampling_params.height = target_h
         request.sampling_params.width = target_w
         return int(target_h), int(target_w)
@@ -797,6 +815,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
                     height=int(target_h),
                     width=int(target_w),
                     max_frames=transfer_max_frames_from_extra_args(extra),
+                    direct_resize_mode="bicubic" if transfer_direct_resize else None,
                 )
                 prompt["additional_information"]["preprocessed_transfer_video"] = uint8_cthw_to_normalized_5d(
                     transfer_frames,

@@ -28,10 +28,10 @@ def production():
 
 
 def test_prepared_actions_are_not_normalized_twice():
-    pipe, _ = fake_pipeline()
+    pipe, _ = fake_pipeline(unified=True)
     pipe.manifest = production()
     x = torch.arange(118, dtype=torch.float32).reshape(2, 59)
-    y = pipe._prepare_action(embodiment="agibotworld", action_value=x, action_space="normalized_unified_v1")
+    y = pipe._prepare_raw_action(embodiment="agibotworld", action_value=x, action_space="normalized_unified_v1")
     assert torch.equal(y[:, :59].float(), x)
     assert y.shape == (2, 64) and not torch.count_nonzero(y[:, 59:])
 
@@ -45,8 +45,8 @@ def test_per_row_domains_follow_action_chunks():
 
 @pytest.mark.parametrize("domain", [15, [15], torch.tensor(15), torch.tensor([15])])
 def test_singleton_domain_representations_share_session_identity(domain):
-    pipe, state = fake_pipeline()
-    pipe.forward(request(9, domain_id=domain, close_session=False))
-    baseline, baseline_state = fake_pipeline()
-    baseline.forward(request(9, domain_id=15, close_session=False))
+    pipe, state = fake_pipeline(unified=True)
+    pipe.forward(request(9, unified=True, domain_id=domain, close_session=False))
+    baseline, baseline_state = fake_pipeline(unified=True)
+    baseline.forward(request(9, unified=True, domain_id=15, close_session=False))
     assert state.fingerprint == baseline_state.fingerprint

@@ -1,0 +1,22 @@
+# Cosmos3-Nano-Sim-Transfer offline dense-oracle deployment. The checkpoint path
+# and immutable schema-v1 conditioning contract come from transformer/config.json.
+# Use cosmos3_nano_sim_transfer_paged.yaml for managed K/V pools.
+
+pipeline: cosmos3_nano_sim_transfer
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+default_resolution: [720, 1280]
+max_pixels: 921600
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Cosmos3NanoSimTransferPipeline
+    model_config:
+      action_gen: false
+      default_fps: 15.0
+      # Fresh full-video requests can overlap Wan decode with generation.
+      overlap_vae_decode: true
