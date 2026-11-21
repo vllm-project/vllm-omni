@@ -8,13 +8,17 @@
 # which is in turn adapted from FastVideo (https://github.com/hao-ai-lab/FastVideo).
 # This version generalizes the height-only sharding to shard along height or
 # width and adds the Wan causal-conv ``feat_cache`` handling.
-"""Spatially-sharded Wan VAE decode.
+"""Spatially-sharded Wan VAE decode and encode.
 
 The existing distributed Wan VAE path shards *tiles*.  This module adds an
-opt-in decode backend that shards decoder feature maps along height or width and
-exchanges boundary rows/columns before spatial convolutions.  It is
-intentionally decode-only and keeps checkpoint loading unchanged by patching the
-already-loaded decoder.
+opt-in backend that shards decoder feature maps along height or width and
+exchanges boundary rows/columns before spatial convolutions.  It keeps
+checkpoint loading unchanged by patching the already-loaded decoder in place.
+
+Encode reuses the same halo modules on a parameter-sharing copy of the encoder,
+so the original encoder stays available for the tile-parallel fallback.  It runs
+only when the split extent divides into equal shards that stay even through
+every stride-2 downsample, which makes it exact with respect to untiled encode.
 """
 
 from __future__ import annotations
@@ -36,7 +40,9 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_utils import _persistent_input_buffer
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.families import is_role
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.install import reference_forward_copy
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -263,6 +269,62 @@ def _ensure_recv_buf(recv_buf: torch.Tensor | None, reference: torch.Tensor) -> 
     return recv_buf
 
 
+def _halo_exchange_uses_all_gather() -> bool:
+    """Whether to exchange halos with one all-gather instead of batched point-to-point.
+
+    An all-gather moves strictly more data -- every rank receives ``2 * world_size`` halo
+    rows and keeps two of them -- so it only pays off where point-to-point latency, not
+    halo bandwidth, dominates. That is the case on XCCL and is not the case on NCCL.
+
+    Per exchange of one 720p/81f halo, ``(1, 96, 6, 722, 1)`` bf16, 100 iterations after 10
+    warm-up (one 720p encode runs ~525 exchanges)::
+
+        ranks | XCCL (Arc Pro B70)        | NCCL (RTX PRO 6000)
+              | p2p    all-gather  a2a    | p2p    all-gather  a2a
+        ------+---------------------------+--------------------------
+            2 | 0.438  0.099      0.122   | 0.053  0.082      0.054
+            4 | 1.435  0.126      0.142   | 0.093  0.199      0.121
+            8 | 2.528  0.388      1.008   | 0.143  0.502      0.373
+
+    XCCL point-to-point costs 8-18x NCCL's and is dominated by per-exchange setup, not by
+    the 55 KB payload: it is already 0.44 ms between two ranks, and with ``CCL_ZE_CACHE=0``
+    it reaches 130 ms. No oneCCL topology or transport setting changed it
+    (``CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0`` made no difference). An all-gather
+    sidesteps that per-exchange cost, which is why XPU takes it.
+
+    On NCCL point-to-point is already fast, so an all-gather would cost 1.5-3.5x as much and
+    the end-to-end VAE agrees: at 8 NCCL ranks, forcing all-gather moves encode from 0.62 s
+    to 0.71 s and decode from 0.99 s to 1.36 s. All-to-all was measured on both backends and
+    never wins.
+    """
+    return current_omni_platform.is_xpu()
+
+
+def _halo_exchange_all_gather(
+    *,
+    rank: int,
+    world_size: int,
+    group: dist.ProcessGroup,
+    top_row_ref: torch.Tensor,
+    bottom_row_ref: torch.Tensor,
+    recv_top_buf: torch.Tensor,
+    recv_bottom_buf: torch.Tensor,
+) -> None:
+    """Exchange halos with one all-gather: every rank publishes its (top, bottom) rows."""
+    send = torch.stack((top_row_ref, bottom_row_ref))
+    # Concatenated along dim 0 (not stacked) so gloo accepts it as well.
+    gathered = send.new_empty((world_size * 2, *send.shape[1:]))
+    dist.all_gather_into_tensor(gathered, send, group=group)
+    if rank > 0:
+        recv_top_buf.copy_(gathered[2 * (rank - 1) + 1])
+    else:
+        recv_top_buf.zero_()
+    if rank < world_size - 1:
+        recv_bottom_buf.copy_(gathered[2 * (rank + 1)])
+    else:
+        recv_bottom_buf.zero_()
+
+
 def _halo_exchange_p2p(
     *,
     rank: int,
@@ -273,6 +335,17 @@ def _halo_exchange_p2p(
     recv_top_buf: torch.Tensor,
     recv_bottom_buf: torch.Tensor,
 ) -> None:
+    if _halo_exchange_uses_all_gather():
+        _halo_exchange_all_gather(
+            rank=rank,
+            world_size=world_size,
+            group=group,
+            top_row_ref=top_row_ref,
+            bottom_row_ref=bottom_row_ref,
+            recv_top_buf=recv_top_buf,
+            recv_bottom_buf=recv_bottom_buf,
+        )
+        return
     p2p_ops = []
     if rank > 0:
         prev_rank = _global_rank(group, rank - 1)
@@ -838,7 +911,8 @@ def _patch_decoder_modules(
         if is_role(child, "causal_conv3d"):
             _replace_child(module, name, child, group, split_dim)
             continue
-        if isinstance(child, nn.Conv2d) and not inside_attention:
+        # ZeroPad2d only occurs in the encoder's stride-2 downsample.
+        if isinstance(child, (nn.Conv2d, nn.ZeroPad2d)) and not inside_attention:
             _replace_child(module, name, child, group, split_dim)
             continue
         _patch_decoder_modules(child, group, split_dim, inside_attention=inside_attention)
@@ -1021,3 +1095,187 @@ def spatial_shard_decode(
     if not return_dict:
         return (out,)
     return DecoderOutput(sample=out)
+
+
+def _encoder_downsample_count(encoder: nn.Module) -> int:
+    return sum(
+        1
+        for module in encoder.modules()
+        if module.__class__.__name__ == "WanResample" and str(getattr(module, "mode", "")).startswith("downsample")
+    )
+
+
+def _quant_conv_is_pointwise(vae: Any) -> bool:
+    """Whether ``quant_conv`` is 1x1 spatially, so running it per strip is exact.
+
+    ``spatial_shard_encode`` applies it to the local strip, before the all-gather.
+    Every Wan-family VAE uses a 1x1x1 ``quant_conv``; a wider spatial kernel would
+    read across a strip boundary and would need a halo of its own.
+    """
+    kernel_size = getattr(getattr(vae, "quant_conv", None), "kernel_size", None)
+    if kernel_size is None:
+        return False
+    if isinstance(kernel_size, int):
+        return kernel_size == 1
+    return tuple(kernel_size)[-2:] == (1, 1)
+
+
+def _encoder_shard_stride(vae: Any, encoder: nn.Module) -> int | None:
+    """The shard-extent multiple that keeps every stride-2 downsample exact, or ``None`` if unsure.
+
+    Counted from the encoder's downsampling ``WanResample`` modules and cross-checked against the
+    config's spatial compression (the input is already patchified, so divide that out). The check
+    matters because the one-pixel halo per layer is only enough while each shard stays even through
+    every downsample, and encode has no ``_zero_invalid_extent`` backstop the way decode does: an
+    undercount would let an odd extent through the gate and produce wrong latents instead of
+    falling back.
+    """
+    counted = 2 ** _encoder_downsample_count(encoder)
+    # No config to cross-check against means no guarantee, so decline rather than trust the count.
+    scale_factor_spatial = getattr(getattr(vae, "config", None), "scale_factor_spatial", None)
+    if scale_factor_spatial is None:
+        return None
+    patch_size = getattr(vae.config, "patch_size", None) or 1
+    expected, remainder = divmod(int(scale_factor_spatial), patch_size)
+    if remainder or counted != expected:
+        logger.warning(
+            "Wan VAE spatial sharded encode counted %s downsampling stages (stride %s) but the "
+            "config implies stride %s (scale_factor_spatial=%s, patch_size=%s); falling back to the "
+            "unsharded encode path.",
+            _encoder_downsample_count(encoder),
+            counted,
+            scale_factor_spatial if remainder else expected,
+            scale_factor_spatial,
+            patch_size,
+        )
+        return None
+    return counted
+
+
+def _encode_cache_contract_holds(vae: Any, encoder: nn.Module) -> bool:
+    """Whether Diffusers' private encode feature-cache protocol is still the one we drive.
+
+    ``spatial_shard_encode`` runs Diffusers' untiled loop by hand: ``clear_cache`` sizes
+    ``_enc_feat_map`` from ``_cached_conv_counts["encoder"]`` and each halo conv of the copy
+    consumes exactly one slot. If a Diffusers release changes how that cache is sized or counted,
+    decline here instead of failing with an ``IndexError`` midway through the temporal loop.
+    """
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    counts = getattr(vae, "_cached_conv_counts", None)
+    if not callable(getattr(vae, "clear_cache", None)) or not isinstance(counts, dict):
+        logger.warning(
+            "Wan VAE spatial sharded encode needs Diffusers' clear_cache/_cached_conv_counts "
+            "protocol; falling back to the unsharded encode path."
+        )
+        return False
+    # Counted the way clear_cache() sizes _enc_feat_map, so a rename or a layout change shows up here.
+    found = sum(1 for module in encoder.modules() if isinstance(module, WanCausalConv3d))
+    if found == 0 or counts.get("encoder") != found:
+        logger.warning(
+            "Wan VAE spatial sharded encode expected %s cached encoder convs but the encoder has "
+            "%s; falling back to the unsharded encode path.",
+            counts.get("encoder"),
+            found,
+        )
+        return False
+    return True
+
+
+def can_spatial_shard_encode(vae: Any, x: torch.Tensor, *, split_dim: str, world_size: int) -> bool:
+    """Whether ``x`` (already patchified) splits into exact, stride-aligned encoder shards."""
+    encoder = getattr(vae, "encoder", None)
+    if encoder is None or x.ndim != 5 or world_size <= 1:
+        return False
+    if not _quant_conv_is_pointwise(vae):
+        return False
+    if not _encode_cache_contract_holds(vae, encoder):
+        return False
+    stride = _encoder_shard_stride(vae, encoder)
+    if stride is None:
+        return False
+    return x.shape[_spatial_dim(split_dim)] % (world_size * stride) == 0
+
+
+def install_wan_spatial_shard_encode(vae: Any, group: dist.ProcessGroup, split_dim: str = "height") -> nn.Module:
+    """Build (once) and return the halo-exchanging copy of ``vae.encoder``.
+
+    The copy shares every parameter with ``vae.encoder``, so it costs no weight
+    memory and follows device moves of the VAE. It is kept outside the module
+    tree so ``state_dict`` and ``named_modules`` are unchanged. A given VAE
+    instance is bound to a single ``split_dim``.
+    """
+    _spatial_dim(split_dim)
+    sharded = vae.__dict__.get("_vllm_omni_wan_spatial_shard_encoder")
+    if sharded is not None:
+        installed_split_dim = vae.__dict__["_vllm_omni_wan_spatial_shard_encode_split_dim"]
+        if installed_split_dim != split_dim:
+            raise ValueError(
+                "Wan spatial-shard VAE encoder was already built for "
+                f"{installed_split_dim!r} split; create a fresh VAE instance to use {split_dim!r} split."
+            )
+        return sharded
+    encoder = getattr(vae, "encoder", None)
+    if encoder is None:
+        raise ValueError("Wan spatial-shard VAE encode requires an encoder module.")
+
+    # Shares parameters and buffers, and leaves any fast-path forwards behind: they inline the
+    # convolutions the halo modules below replace.
+    sharded = reference_forward_copy(encoder)
+    _patch_decoder_modules(sharded, group, split_dim)
+    # The halo modules copy their source weights on construction; point them back at the shared ones.
+    for name, module in sharded.named_modules():
+        if isinstance(module, (WanDistConv2d, WanDistCausalConv3d)):
+            source = encoder.get_submodule(name)
+            module.weight = source.weight
+            module.bias = source.bias
+
+    # Each halo conv of the copy consumes one _enc_feat_map slot, so a 1:1 replacement is what
+    # makes driving Diffusers' cache by hand safe. can_spatial_shard_encode already checked the
+    # original against _cached_conv_counts; this catches a copy that lost or gained one.
+    cached = (getattr(vae, "_cached_conv_counts", None) or {}).get("encoder")
+    halo_convs = sum(1 for module in sharded.modules() if isinstance(module, WanDistCausalConv3d))
+    if cached is not None and halo_convs != cached:
+        raise RuntimeError(
+            "Wan spatial-shard VAE encoder copy has "
+            f"{halo_convs} halo causal convs but Diffusers caches {cached} encoder conv slots."
+        )
+
+    vae.__dict__["_vllm_omni_wan_spatial_shard_encoder"] = sharded
+    vae.__dict__["_vllm_omni_wan_spatial_shard_encode_split_dim"] = split_dim
+    logger.info("Installed Wan VAE %s-sharded encode.", split_dim)
+    return sharded
+
+
+def spatial_shard_encode(
+    vae: Any,
+    x: torch.Tensor,
+    *,
+    group: dist.ProcessGroup,
+    split_dim: str = "height",
+) -> torch.Tensor:
+    """Encode patchified ``x`` sharded along ``split_dim``; every rank returns the full moments.
+
+    Mirrors the untiled Diffusers ``_encode`` temporal loop, including
+    ``quant_conv``, which runs on the local strip and so has to be pointwise
+    (:func:`_quant_conv_is_pointwise` gates on that). Callers must check
+    :func:`can_spatial_shard_encode` first; every rank of ``group`` must call
+    this with the same ``x``.
+    """
+    encoder = install_wan_spatial_shard_encode(vae, group, split_dim=split_dim)
+    rank, world_size = _rank_world(group)
+    dim = _spatial_dim(split_dim)
+    local_extent = x.shape[dim] // world_size
+    x = _narrow_along_dim(x, dim, rank * local_extent, local_extent).contiguous()
+
+    vae.clear_cache()
+    try:
+        chunks = []
+        for i in range(1 + (x.shape[2] - 1) // 4):
+            vae._enc_conv_idx = [0]
+            frames = x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
+            chunks.append(encoder(frames, feat_cache=vae._enc_feat_map, feat_idx=vae._enc_conv_idx))
+        enc = vae.quant_conv(torch.cat(chunks, dim=2))
+    finally:
+        vae.clear_cache()
+    return all_gather_along_dim(enc, group=group, dim=dim)
