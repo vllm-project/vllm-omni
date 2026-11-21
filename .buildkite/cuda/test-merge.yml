@@ -86,6 +86,14 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-merge-pipeline
     steps:
+      - label: "TTS · Zonos3-Mini Test"
+        source_file_dependencies: tts_zonos3_function
+        timeout_in_minutes: 30
+        commands:
+          - pip install 'fla-core==0.5.2' 'zyphra-textnorm==0.1.0'
+          - pytest -s -v tests/e2e/online_serving/test_zonos3_mini.py -m 'advanced_model and cuda' --run-level advanced_model
+        mirror_hardwares: l4_1
+
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies: tts_qwen3_tts_function
         timeout_in_minutes: 40

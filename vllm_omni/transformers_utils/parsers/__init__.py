@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Custom vLLM config parsers for vllm-omni."""
 
 from __future__ import annotations
@@ -5,10 +8,11 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "Zonos3ConfigParser": "vllm_omni.transformers_utils.parsers.zonos3",
     "VoxtralTTSConfigParser": "vllm_omni.transformers_utils.parsers.voxtral_tts",
 }
 
-__all__ = ["VoxtralTTSConfigParser"]
+__all__ = ["VoxtralTTSConfigParser", "Zonos3ConfigParser"]
 
 
 def __getattr__(name: str):
@@ -27,3 +31,4 @@ def __dir__():
 # Eagerly import parser modules so their registry side-effects run as soon as
 # `vllm_omni.transformers_utils.parsers` is imported.
 from vllm_omni.transformers_utils.parsers import voxtral_tts as _voxtral_tts  # noqa: F401, E402
+from vllm_omni.transformers_utils.parsers import zonos3 as _zonos3  # noqa: F401, E402

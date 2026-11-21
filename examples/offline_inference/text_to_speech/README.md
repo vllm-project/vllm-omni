@@ -10,6 +10,9 @@ For online serving, see [`examples/online_serving/text_to_speech/`](../../online
 list of supported architectures across all modalities, see
 [Supported Models](../../../docs/models/supported_models.md).
 
+ZONOS3-Mini's qualified example uses the online Speech API; see its
+[startup recipe](../../../recipes/Zyphra/ZONOS3-Mini-RTX3090.md).
+
 ## Supported Models
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |

@@ -1,0 +1,36 @@
+# Single-stage AR and packed Codec, with a GPU-only RVQ handoff.
+# Launch with FLA_TILELANG=0 and the zonos3 optional dependency installed.
+pipeline: zonos3
+model_runner: v2
+async_chunk: true
+dtype: bfloat16
+stages:
+  - stage_id: 0
+    config_format: zonos3
+    devices: '0'
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    max_model_len: 2048
+    gpu_memory_utilization: 0.6
+    # Two global-attention layers, four KV heads, head_dim=32, BF16:
+    # 32 * 2048 * 2 layers * 2 (K/V) * 4 * 32 * 2 bytes = 64 MiB.
+    # Reserve 128 MiB for block rounding and the null block, rather than filling
+    # the GPU with KV for thousands of requests the scheduler cannot admit.
+    kv_cache_memory_bytes: 134217728
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    enforce_eager: false
+    async_scheduling: true
+    compilation_config:
+      mode: 3
+      cudagraph_mode: FULL_AND_PIECEWISE
+      splitting_ops: [vllm::unified_attention, vllm::unified_attention_with_output, vllm::zonos3_gdn_core]
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    default_sampling_params:
+      temperature: 0.75
+      top_k: 80
+      top_p: 0.69
+      repetition_penalty: 2.4
+      max_tokens: 1024
+      detokenize: false
+    skip_mm_profiling: true
