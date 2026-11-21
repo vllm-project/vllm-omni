@@ -117,11 +117,13 @@ class ComponentQuantizationConfig(QuantizationConfig):
         return self._default
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
-        """Apply a weight mapper to every routed quantization config."""
+        """Apply a weight mapper to each unique routed config once per call."""
+        mapped_configs: set[int] = set()
         for quant_config in self._components.values():
-            if quant_config is not None:
+            if quant_config is not None and id(quant_config) not in mapped_configs:
                 quant_config.apply_vllm_mapper(hf_to_vllm_mapper)
-        if self._default is not None:
+                mapped_configs.add(id(quant_config))
+        if self._default is not None and id(self._default) not in mapped_configs:
             self._default.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def get_name(self) -> str:
