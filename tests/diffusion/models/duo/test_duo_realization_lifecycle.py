@@ -277,3 +277,39 @@ def test_close_session_rejects_a_stale_fence():
 
     with pytest.raises(ValueError, match="Stale Realization session fence"):
         pipe.close_session("sess/epoch/1", 1)
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected"),
+    [
+        pytest.param(166912, 3, id="a100_fits_three_stages"),
+        pytest.param(137728, 3, id="exactly_three_stage_budget"),
+        pytest.param(137727, 1, id="one_byte_short"),
+        pytest.param(101376, 1, id="ada_carve_out"),
+        pytest.param(49152, 1, id="default_block_limit"),
+        pytest.param(None, 1, id="unknown_device"),
+    ],
+)
+def test_split_kv_stage_count_follows_the_device_shared_memory_limit(monkeypatch, limit, expected):
+    # The three-stage launch needs 137,728 B and aborts on parts capped at
+    # 101,376 B, so the depth has to follow the device rather than being pinned.
+    # This pins the threshold: a device exactly at the budget keeps the pipelined
+    # form, one byte below falls back.
+    from vllm_omni.diffusion.models.duo import attention
+
+    monkeypatch.setattr(attention, "_shared_memory_per_block", lambda _device: limit)
+
+    assert attention._split_kv_num_stages(object()) == expected
+
+
+def test_split_kv_stage_count_never_raises_on_an_unknown_backend(monkeypatch):
+    # Reporting the limit can fail off CUDA; that must degrade to the single
+    # stage instead of raising during planner construction.
+    from vllm_omni.diffusion.models.duo import attention
+
+    def _boom(_device):
+        raise RuntimeError("no CUDA device")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", _boom)
+
+    assert attention._split_kv_num_stages(object()) == 1
