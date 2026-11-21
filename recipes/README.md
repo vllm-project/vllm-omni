@@ -78,6 +78,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
+| [`Gradium/Phonon-31M-EN-RTX3090.md`](./Gradium/Phonon-31M-EN-RTX3090.md) | English default-voice streaming TTS, B=1, TP=1 | 1x RTX 3090 24GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
 | [`higurashi-ai/Haru-4B-H200.md`](./higurashi-ai/Haru-4B-H200.md) | Live full-duplex spoken dialogue over `/v1/realtime?duplex=1` (character card + voice reference) | 1x NVIDIA H200 141GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
