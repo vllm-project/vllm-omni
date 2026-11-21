@@ -100,7 +100,7 @@ TINY_DIFFUSION_JOBS = (
     (
         "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
         "mi300_2",
-        12,
+        14,
         "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only",
         "artifacts/rocm-tiny-diffusion-2gpu/**/*",
     ),
@@ -703,7 +703,7 @@ _NIGHTLY_UNITS_PROMOTIONS = (
         "UNUSED_ARTIFACT_DIR",
         "bash .buildkite/amd/scripts/run-omni-processor-test.sh",
     ),
-    ("Simple · Pi0.5 CPU Test", 103, "Pi0.5 CPU", "PI05_CPU_ARTIFACT_DIR", "pytest -sv"),
+    ("Simple · Pi0.5 CPU Test", 104, "Pi0.5 CPU", "PI05_CPU_ARTIFACT_DIR", "pytest -sv"),
     (
         "Simple · PersonaPlex Temporal Streaming Test",
         3,
@@ -726,11 +726,16 @@ def test_nightly_units_promotion_execution_guard(
     pytest_status = 1 if scenario == "pytest-failure" else 124 if scenario == "timeout" else 0
     timeout_status = 124 if scenario == "timeout" else None
     tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    expected_message = f"Expected exactly {count} executed {name} tests"
+    extra_env = {"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)}
+    if label == "Simple · Pi0.5 CPU Test":
+        expected_message = "Expected every collected Pi0.5 CPU test to run and pass"
+        extra_env["PI05_CPU_COLLECTED"] = str(count)
     _assert_nightly_junit_guard(
         tmp_path,
         step_label=label,
         command_fragment=command_fragment,
-        expected_message=f"Expected exactly {count} executed {name} tests",
+        expected_message=expected_message,
         artifact_env=artifact_env,
         job_id_prefix="nightly-units-guard",
         pytest_status=pytest_status,
@@ -740,7 +745,38 @@ def test_nightly_units_promotion_execution_guard(
         errors=int(scenario == "error"),
         timeout_status=timeout_status,
         expected_status={"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5),
-        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+        extra_env=extra_env,
+    )
+
+
+def test_pi05_nightly_collection_guard_uses_the_runtime_selector_and_fails_closed(tmp_path: Path) -> None:
+    step = _find_step("Simple · Pi0.5 CPU Test", AMD_NIGHTLY_PIPELINE)
+    collect_command = next(command for command in step["commands"] if "--collect-only" in command)
+    run_command = next(command for command in step["commands"] if "pytest -sv" in command)
+    selector = "tests/diffusion/models/pi05/test_pi05_units.py -m 'core_model and cpu'"
+
+    assert selector in collect_command
+    assert selector in run_command
+    assert "grep -c '::' || true" in collect_command
+
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label="Simple · Pi0.5 CPU Test",
+        command_fragment="pytest -sv",
+        expected_message="Expected every collected Pi0.5 CPU test to run and pass",
+        artifact_env="PI05_CPU_ARTIFACT_DIR",
+        job_id_prefix="nightly-units-zero-collection",
+        pytest_status=0,
+        tests=104,
+        skipped=0,
+        failures=0,
+        errors=0,
+        timeout_status=None,
+        expected_status=5,
+        extra_env={
+            "BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path),
+            "PI05_CPU_COLLECTED": "0",
+        },
     )
 
 

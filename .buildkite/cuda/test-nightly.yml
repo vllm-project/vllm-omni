@@ -182,6 +182,7 @@ steps:
         source_file_dependencies:
           - tts_qwen3_tts_function
           - tts_cosyvoice3_voice_isolation
+          - tts_yue2_function
         timeout_in_minutes: 120
         env:
           VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .

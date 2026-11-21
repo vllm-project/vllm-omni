@@ -678,10 +678,14 @@ def test_from_pipeline_config_preserves_current_pipeline_config_object():
 )
 @pytest.mark.parametrize("cli_prefix", [None, "", "stage_0_"], ids=["defaults", "global-cli", "stage-cli"])
 def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_prefix, monkeypatch, tmp_path):
+    from vllm.platforms import current_platform as host_platform
+
     from vllm_omni import platforms
     from vllm_omni.engine.arg_utils import OmniEngineArgs
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    host_is_npu = host_platform.device_type == "npu"
 
     # Select CUDA before resolving a fresh deploy; the production merge applies its overlay once.
     monkeypatch.setattr(platforms.current_omni_platform, "device_name", "cuda")
@@ -707,6 +711,12 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
         assert resolved.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
         assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["vllm_c", "native"]
         assert resolved.compilation_config.custom_ops == ["none", "+rotary_embedding"]
+        # All other CLI checks above must pass before marking this host limit.
+        if host_is_npu and resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is not True:
+            pytest.xfail(
+                "Ascend host normalizes the CUDA-only QK norm/RoPE fusion flag despite the mocked Omni platform"
+            )
+        assert args["compilation_config"].pass_config.enable_qk_norm_rope_fusion is True
         assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is True
     elif filename == "minicpmo_4_5.yaml":
         assert resolved.kernel_config.ir_op_priority.rms_norm == ["native"]
