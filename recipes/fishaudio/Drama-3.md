@@ -1,12 +1,5 @@
 # Fish Audio Drama 3
 
-> **Unavailable with vLLM 0.34 / V2-only execution.** The DAC stage requires the retired Model Runner V1.
-> The commands, configurations, and measurements below are historical reference,
-> not installation or serving instructions for this version. Configuration loading
-> rejects the V1 profile; changing its runner flag does not add V2 support.
->
-> Historical online serving for TTS
-
 ## Summary
 
 - Vendor: FishAudio
@@ -15,9 +8,9 @@
 - Mode: Online serving with the OpenAI-compatible `/v1/audio/speech` API, or offline with `Omni`
 - Maintainer: Community
 
-## Historical integration
+## Model
 
-This recipe records the earlier `fishaudio/drama-3` integration. Drama 3 is a
+Drama 3 is a
 35B-total / 3B-active MoE text backbone (Qwen3.5 MoE: hybrid gated-delta-net
 and full attention, block-FP8 routed experts) with a codebook tower that
 decodes 10 codebooks per frame. It outputs 44.1 kHz mono audio through the
@@ -34,7 +27,7 @@ Stage 0  fish_omni (LLM AR, Model Runner V2; one forward samples a whole frame)
   └─ codebook tower (13 layers, paged KV beside the backbone's) samples codes 1..9
   │   10-codebook frames, streamed in chunks (shared-memory connector)
   ▼
-Stage 1  dac_decoder (FishSpeechDACDecoder) → 44.1 kHz audio
+Stage 1  dac_decoder (FishSpeechDACDecoder, Model Runner V2 on CUDA) → 44.1 kHz audio
 ```
 
 ## References
@@ -68,6 +61,8 @@ Notes:
   automatically (HF `model_type=fish_omni`). Both stages share one GPU
   through a private MPS daemon; stage 0 runs on Model Runner V2 with CUDA
   graphs (FULL for decode steps, PIECEWISE for steps with prompt rows).
+  Stage 1 (the DAC) also runs on Model Runner V2 on CUDA and replays its own
+  CUDA graphs per window size.
 - The checkpoint's `bsgemm-moe` quantization maps to vLLM's block-FP8 MoE
   kernels for the routed experts; all other weights stay bf16.
 
