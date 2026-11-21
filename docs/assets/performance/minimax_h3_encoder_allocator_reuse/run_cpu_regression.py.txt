@@ -1,0 +1,41 @@
+"""Execute actual CPU fixtures without framework platform bootstrap or NPU imports."""
+import logging
+import os
+from pathlib import Path
+import sys
+import types
+
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+root = Path.cwd()
+sys.path.insert(0, str(root))
+for name in ["vllm_omni", "vllm_omni.diffusion", "vllm_omni.diffusion.models",
+             "vllm_omni.diffusion.models.minimax_h3", "vllm_omni.diffusion.offloader",
+             "vllm_omni.diffusion.cache"]:
+    module = types.ModuleType(name)
+    module.__path__ = [str(root.joinpath(*name.split(".")))]
+    sys.modules[name] = module
+    if "." in name:
+        parent, child = name.rsplit(".", 1)
+        setattr(sys.modules[parent], child, module)
+sys.modules["vllm"] = types.ModuleType("vllm")
+logger = types.ModuleType("vllm.logger")
+logger.init_logger = logging.getLogger
+sys.modules["vllm.logger"] = logger
+
+def unexpected(*args, **kwargs):
+    raise AssertionError("The existing CPU fixture must supply platform operations")
+
+platform = types.ModuleType("vllm_omni.platforms")
+platform.current_omni_platform = types.SimpleNamespace(
+    Stream=unexpected, Event=unexpected, current_stream=unexpected, stream=unexpected,
+    empty_cache=unexpected, synchronize=unexpected, get_device_memory=unexpected, is_rocm=lambda: False)
+sys.modules["vllm_omni.platforms"] = platform
+sys.modules["vllm_omni"].platforms = platform
+sys.path.append("/opt/tiger/lsy/.tmp/20261118-h3-pr10168-config/python-tools")
+import pytest
+
+assert "torch_npu" not in sys.modules
+status = pytest.main(["--noconftest", "-p", "pytest_mock", "-o", "addopts=", "-m", "cpu", *sys.argv[1:]])
+assert "torch_npu" not in sys.modules, "CPU regression imported an accelerator backend unexpectedly"
+raise SystemExit(status)

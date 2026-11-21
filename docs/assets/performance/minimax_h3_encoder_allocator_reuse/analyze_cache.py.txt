@@ -1,0 +1,70 @@
+"""Analyze cache-only repair while keeping numerical and packing paths fixed."""
+import argparse
+import json
+from pathlib import Path
+import random
+import statistics as st
+
+ROOT = Path(__file__).resolve().parent
+parser = argparse.ArgumentParser()
+parser.add_argument("job")
+args = parser.parse_args()
+manifest = json.loads((ROOT / "run-manifest.json").read_text())
+groups = []
+allrows = []
+for stage in manifest["stages"]:
+    rows = json.loads((ROOT / "jobs" / args.job / stage["name"] / "records.json").read_text())
+    assert len(rows) == 7 and all(r["status"] == "ok" for r in rows)
+    assert sum(r["phase"] == "warmup" for r in rows) == 2
+    assert all(r["rank_stats"][i]["allocator_reuse"]["live_weight_storage_released"] for r in rows for i in range(8))
+    groups.append([r for r in rows if r["phase"] == "formal"])
+    allrows.extend(rows)
+assert len({r["sha256"] for r in allrows}) == 1
+times = [st.mean(r["response"]["started_at_unix"] for r in g) for g in groups]
+weight = (times[1] - times[0]) / (times[2] - times[0])
+def metric(key):
+    values = [[r[key] for r in g] for g in groups]
+    means = [st.mean(v) for v in values]
+    control = (1 - weight) * means[0] + weight * means[2]
+    saving = control - means[1]
+    rng = random.Random(42)
+    samples = []
+    for _ in range(10000):
+        resampled = []
+        for v in values:
+            x = []
+            while len(x) < len(v):
+                start = rng.randrange(len(v))
+                x.extend(v[(start + i) % len(v)] for i in range(2))
+            resampled.append(st.mean(x[:len(v)]))
+        samples.append((1 - weight) * resampled[0] + weight * resampled[2] - resampled[1])
+    samples.sort()
+    interval = [samples[250], samples[9750]]
+    return {"samples": values, "means": means, "sd": [st.stdev(v) for v in values],
+            "control": control, "fixed": means[1], "saved": saving,
+            "percent": saving / control * 100, "block_bootstrap95": interval,
+            "benefit_confirmed": interval[0] > 0}
+memory = {}
+for stage, group in zip(manifest["stages"], groups):
+    memory[stage["name"]] = {}
+    for rank in range(8):
+        rows = [r["rank_stats"][rank]["allocator_reuse"] for r in group]
+        events = [e for r in rows for e in r["events"]]
+        memory[stage["name"]][str(rank)] = {
+            "empty_cache_calls_per_request": [r["empty_cache_calls"] for r in rows],
+            "policy_present": [r["policy_present"] for r in rows],
+            "mean_host_cache_release_s": st.mean(e["host_release_s"] for e in events),
+            "mean_reserved_after_release": st.mean(e["after"]["reserved"] for e in events),
+            "mean_allocated_after_release": st.mean(e["after"]["allocated"] for e in events),
+            "mean_cached_after_release": st.mean(e["after"]["cached"] for e in events),
+            "forced_release_events": sum(e["force"] for e in events)}
+result = {"job": args.job, "comparison": "unfixed packed / fixed bounded allocator reuse / unfixed packed",
+          "baseline_source": manifest["runtimes"]["before"]["revision"],
+          "candidate_source": manifest["runtimes"]["fixed"]["revision"],
+          "warmups_per_arm": 2, "formals_per_arm": 5, "requests": 21,
+          "weight_storage_released": True, "media_sha256": allrows[0]["sha256"],
+          "interpolation_weight": weight, "completed_encoder": metric("completed_encoder_s"),
+          "http_e2e": metric("http_e2e_s"), "cache": memory,
+          "limits": "one matched A/B/A window with circular length-two block bootstrap; no universal drift guarantee"}
+(ROOT / "cache-analysis.json").write_text(json.dumps(result, indent=2) + "\n")
+print(json.dumps({k: v for k, v in result.items() if k != "cache"}, indent=2))

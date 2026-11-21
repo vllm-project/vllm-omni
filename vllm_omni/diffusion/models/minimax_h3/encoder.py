@@ -1300,11 +1300,17 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not getattr(self, "_omni_layerwise_enabled", False):
             modules.extend(self.vision.blocks)
             modules.extend(self.text_model.layers)
+        # Keep freed allocator blocks reusable after discarding the live GPU
+        # weights. Native layerwise deployments have no component cache,
+        # unlike DLO; without this policy every packed offload empties it.
+        cache_retention = getattr(self, "_omni_component_cache", None)
+        if cache_retention is None:
+            cache_retention = BoundedAllocatorCache(self.device_target)
         self._omni_non_block_stager = PinnedModuleStager(
             modules,
             self.device_target,
             pin_memory=pin_memory,
-            cache_retention=getattr(self, "_omni_component_cache", None),
+            cache_retention=cache_retention,
             pack_by_dtype=True,
         )
 

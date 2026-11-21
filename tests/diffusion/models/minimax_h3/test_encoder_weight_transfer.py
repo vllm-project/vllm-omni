@@ -70,3 +70,66 @@ def test_pipeline_rejects_unsupported_transfer_before_loading_weights(mocker, un
     )
     with pytest.raises(ValueError, match="local MiniMax-H3 NPU text encoder selected for layer offload"):
         scope[owner.name](od_config=config)
+
+
+def _encoder_staging_methods():
+    source = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/encoder.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MiniMaxH3Qwen3VLEncoder")
+    methods: list[ast.stmt] = [
+        n
+        for n in owner.body
+        if isinstance(n, ast.FunctionDef) and n.name in {"prepare_packed_offload", "load_to_device"}
+    ]
+    module = ast.Module(body=ast.parse("from __future__ import annotations").body + methods, type_ignores=[])
+    return source, ast.fix_missing_locations(module)
+
+
+@pytest.mark.parametrize("supplied_cache", [False, True])
+def test_packed_staging_reuses_supplied_cache_or_creates_bounded_policy(mocker, supplied_cache):
+    source, module = _encoder_staging_methods()
+    existing = mocker.sentinel.component_cache if supplied_cache else None
+    factory = mocker.Mock(return_value=mocker.sentinel.bounded_cache)
+    stager = mocker.Mock()
+    scope = {"PinnedModuleStager": stager, "BoundedAllocatorCache": factory}
+    exec(compile(module, str(source), "exec"), scope)
+    encoder = mocker.Mock(
+        is_loaded=True,
+        device_target=mocker.Mock(type="npu"),
+        _omni_non_block_stager=None,
+        _omni_layerwise_enabled=True,
+        _omni_layerwise_hooks=(),
+        _omni_component_cache=existing,
+        _omni_non_block_modules=mocker.Mock(return_value=[mocker.sentinel.module]),
+    )
+    scope["prepare_packed_offload"](encoder)
+    assert stager.call_args.kwargs["cache_retention"] is (existing if supplied_cache else factory.return_value)
+    assert stager.call_args.kwargs["pack_by_dtype"] is True
+    # Cache reuse must not turn into live GPU weight residency.
+    assert "retain_device_storage" not in stager.call_args.kwargs
+    if supplied_cache:
+        factory.assert_not_called()
+    else:
+        factory.assert_called_once_with(encoder.device_target)
+
+
+def test_default_unpacked_layerwise_staging_does_not_enable_new_cache_policy(mocker):
+    source, module = _encoder_staging_methods()
+    factory = mocker.Mock()
+    stager = mocker.Mock()
+    scope = {"PinnedModuleStager": stager, "BoundedAllocatorCache": factory}
+    exec(compile(module, str(source), "exec"), scope)
+    encoder = mocker.Mock(
+        is_loaded=True,
+        device_target=mocker.Mock(type="npu"),
+        _omni_non_block_stager=None,
+        _omni_layerwise_enabled=True,
+        _omni_layerwise_hooks=(),
+        _omni_component_cache=None,
+        _omni_non_block_modules=mocker.Mock(return_value=[mocker.sentinel.module]),
+    )
+    scope["load_to_device"](encoder)
+    assert stager.call_args.kwargs["cache_retention"] is None
+    assert "pack_by_dtype" not in stager.call_args.kwargs
+    factory.assert_not_called()
+    stager.return_value.load.assert_called_once_with()

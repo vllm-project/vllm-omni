@@ -1,0 +1,38 @@
+"""Recompute published cache-only metrics and verify memory-policy evidence."""
+import ast
+import json
+from pathlib import Path
+import random
+import statistics as st
+import sys
+
+root = Path(__file__).resolve().parent
+data = json.loads(Path(sys.argv[1]).read_text())
+rows = data["requests"]
+assert len(rows) == 21 and len({r["sha256"] for r in rows}) == 1
+groups = []
+for stage in ["encoder_cache_A1", "encoder_cache_B", "encoder_cache_A2"]:
+    selected = [r for r in rows if r["stage"] == stage]
+    assert len(selected) == 7 and sum(r["phase"] == "warmup" for r in selected) == 2
+    assert all(r["status"] == "ok" and r["http_status"] == 200 for r in selected)
+    groups.append([dict(r, response={"started_at_unix": r["started_at_unix"]})
+                   for r in selected if r["phase"] == "formal"])
+    for row in selected:
+        for rank in row["rank_stats"]:
+            cache = rank["allocator_reuse"]
+            assert cache["live_weight_storage_released"]
+            assert cache["policy_present"] == (stage == "encoder_cache_B")
+            for event in cache["events"]:
+                if event["empty_cache_calls"] == 0:
+                    assert event["before"]["cached"] <= event["before"]["total"] * .25
+                    assert event["before"]["free"] >= event["before"]["total"] * .05
+times = [st.mean(r["response"]["started_at_unix"] for r in g) for g in groups]
+weight = (times[1] - times[0]) / (times[2] - times[0])
+tree = ast.parse((root / "analyze_cache.py.txt").read_text())
+metric = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "metric")
+namespace = {"groups": groups, "weight": weight, "st": st, "random": random}
+exec(compile(ast.Module(body=[metric], type_ignores=[]), "archived-cache-analysis", "exec"), namespace)
+for label, key in [("completed_encoder", "completed_encoder_s"), ("http_e2e", "http_e2e_s")]:
+    result = namespace["metric"](key)
+    assert result == data["analysis"][label]
+    print(label, json.dumps({k: v for k, v in result.items() if k != "samples"}))

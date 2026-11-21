@@ -1,0 +1,136 @@
+"""Completed encoder timing and source-loop H2D counts; no formal per-copy hook."""
+from functools import wraps
+import json
+from pathlib import Path
+import time
+import torch
+import torch.distributed as dist
+import observer_base as base
+
+DETAIL = None
+COPY_CONTEXT = None
+
+
+def install():
+    base.install()
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager, _collect_source_groups
+    from vllm_omni.diffusion.offloader.layerwise_backend import LayerwiseOffloadHook
+
+    copy_original = torch.Tensor.copy_
+
+    @wraps(copy_original)
+    def traced_copy(destination, source, *args, **kwargs):
+        value = copy_original(destination, source, *args, **kwargs)
+        if COPY_CONTEXT is not None and destination.device.type == "npu" and source.device.type == "cpu":
+            COPY_CONTEXT["observed_calls"] += 1
+            COPY_CONTEXT["observed_bytes"] += source.numel() * source.element_size()
+        return value
+
+    # The original method is restored before every formal request. Trace callbacks
+    # only prove the derived source-loop counts during excluded warmups.
+    forward_original = MiniMaxH3Pipeline.forward
+
+    @wraps(forward_original)
+    def forward(self, request):
+        global DETAIL
+        DETAIL = None
+        context = base.active()
+        assert context is not None
+        torch.Tensor.copy_ = traced_copy if context["capture"] else copy_original
+        try:
+            value = forward_original(self, request)
+            assert DETAIL is not None
+            path = Path(context["stats_dir"]) / f"rank{dist.get_rank()}.json"
+            record = json.loads(path.read_text())
+            record["encoder_movement"] = DETAIL
+            temporary = path.with_suffix(".paired.tmp")
+            temporary.write_text(json.dumps(record, indent=2) + "\n")
+            temporary.replace(path)
+            print("H3_ENCODER_MOVEMENT " + json.dumps({"nonce": context["nonce"], "rank": dist.get_rank(), **DETAIL}), flush=True)
+            return value
+        finally:
+            torch.Tensor.copy_ = copy_original
+            DETAIL = None
+
+    MiniMaxH3Pipeline.forward = forward
+    encoder_original = MiniMaxH3Pipeline._encode_text_hidden
+
+    @wraps(encoder_original)
+    def encoder(self, *args, **kwargs):
+        global DETAIL
+        owner = self.text_encoder
+        if not hasattr(owner, "_paired_weight_profile"):
+            hooks = tuple(getattr(owner, "_omni_layerwise_hooks", ()))
+            groups = _collect_source_groups(tuple(owner._omni_non_block_modules()))
+            nonblock = sum(group.source.untyped_storage().nbytes() for group in groups)
+            block = sum(t.numel() * t.element_size() for hook in hooks for t in hook.dtype_cpu_flattened_weights.values())
+            owner._paired_weight_profile = {"nonblock_original_storage_bytes": nonblock,
+                "nonblock_original_storage_groups": len(groups), "encoder_block_host_bytes": block,
+                "encoder_host_storage_bytes": block + nonblock,
+                "nonblock_weight_share": nonblock / (block + nonblock), "encoder_layerwise_hooks": len(hooks)}
+            owner._paired_hook_ids = {id(hook) for hook in hooks}
+        DETAIL = {"profile": owner._paired_weight_profile, "nonblock_h2d_calls": 0,
+            "nonblock_h2d_bytes": 0, "block_h2d_calls": 0, "block_h2d_bytes": 0,
+            "block_prefetch_calls": 0, "nonblock_load_submit_s": 0.0, "block_prefetch_submit_s": 0.0,
+            "copy_trace_enabled": bool(base.STATE["active"]["capture"]),
+            "copy_trace_verified": bool(base.STATE["active"]["capture"]),
+            "warmup_copy_observed": {"nonblock_calls": 0, "nonblock_bytes": 0,
+                                     "block_calls": 0, "block_bytes": 0}
+                if base.STATE["active"]["capture"] else None}
+        started = time.perf_counter()
+        value = encoder_original(self, *args, **kwargs)
+        elapsed = time.perf_counter() - started
+        DETAIL["completed_encoder_s"] = elapsed
+        base.STATE["durations"]["completed_encoder"] = elapsed
+        stager = owner._omni_non_block_stager
+        DETAIL["nonblock_materialized_after_encoder"] = stager.loaded
+        DETAIL["nonblock_retained_device_storage"] = bool(stager._device_storages)
+        return value
+
+    MiniMaxH3Pipeline._encode_text_hidden = encoder
+
+    def trace_call(function, obj, kind, calls, byte_count, args, kwargs):
+        global COPY_CONTEXT
+        old = COPY_CONTEXT
+        local = {"observed_calls": 0, "observed_bytes": 0}
+        COPY_CONTEXT = local if base.STATE["active"]["capture"] else None
+        started = time.perf_counter()
+        try:
+            value = function(obj, *args, **kwargs)
+        finally:
+            COPY_CONTEXT = old
+        elapsed = time.perf_counter() - started
+        if base.STATE["active"]["capture"]:
+            assert local["observed_calls"] == calls and local["observed_bytes"] == byte_count, (kind, local, calls, byte_count)
+            DETAIL["warmup_copy_observed"][kind + "_calls"] += local["observed_calls"]
+            DETAIL["warmup_copy_observed"][kind + "_bytes"] += local["observed_bytes"]
+        DETAIL[kind + "_h2d_calls"] += calls
+        DETAIL[kind + "_h2d_bytes"] += byte_count
+        DETAIL[kind + ("_load_submit_s" if kind == "nonblock" else "_prefetch_submit_s")] += elapsed
+        return value
+
+    load_original = PinnedModuleStager._load_once
+
+    @wraps(load_original)
+    def load(self, *args, **kwargs):
+        if DETAIL is None or base.STATE is None or self is not getattr(base.PIPELINE.text_encoder, "_omni_non_block_stager", None):
+            return load_original(self, *args, **kwargs)
+        if not hasattr(self, "_paired_group_bytes"):
+            self._paired_group_bytes = sum(group.master.numel() * group.master.element_size() for group in self._groups)
+        return trace_call(load_original, self, "nonblock", len(self._groups), self._paired_group_bytes, args, kwargs)
+
+    PinnedModuleStager._load_once = load
+    prefetch_original = LayerwiseOffloadHook.prefetch_layer
+
+    @wraps(prefetch_original)
+    def prefetch(self, *args, **kwargs):
+        if DETAIL is None or base.STATE is None or id(self) not in getattr(base.PIPELINE.text_encoder, "_paired_hook_ids", set()):
+            return prefetch_original(self, *args, **kwargs)
+        if not hasattr(self, "_paired_group_bytes"):
+            self._paired_group_bytes = sum(t.numel() * t.element_size() for t in self.dtype_cpu_flattened_weights.values())
+        value = trace_call(prefetch_original, self, "block", len(self.dtype_cpu_flattened_weights), self._paired_group_bytes, args, kwargs)
+        DETAIL["block_prefetch_calls"] += 1
+        return value
+
+    LayerwiseOffloadHook.prefetch_layer = prefetch

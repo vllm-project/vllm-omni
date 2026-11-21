@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -e
+unset PYTHONPATH
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+exec /opt/tiger/lly/.tmp/20261118-h3-pr10352-validation/venv/bin/python /opt/tiger/lsy/.tmp/20261121-pr10169-allocator-reuse-fix/control.py "$@"

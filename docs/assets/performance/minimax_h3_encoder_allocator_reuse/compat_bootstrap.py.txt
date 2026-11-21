@@ -1,0 +1,29 @@
+"""Run-local compatibility for an unused AR Ngram patch on vLLM-Ascend 0.33."""
+from pathlib import Path
+import importlib.util
+import json
+import sys
+
+
+def install(runtime: Path) -> None:
+    name = "vllm_omni.worker_v2.ngram_adapter"
+    path = runtime / "vllm_omni/worker_v2/ngram_adapter.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    original = module.allow_ascend_scheduler_ngram
+
+    def allow_if_available() -> None:
+        from vllm_ascend import mrv2_utils
+        if hasattr(mrv2_utils, "_v2_blacklist"):
+            original()
+        else:
+            print("H3_ACCEPTANCE_COMPAT " + json.dumps({
+                "unused_feature": "MiniCPM-o AR scheduler Ngram",
+                "missing_dependency_api": "vllm_ascend.mrv2_utils._v2_blacklist",
+                "action": "skip unrelated AR patch; H3 diffusion code unchanged",
+            }), flush=True)
+
+    module.allow_ascend_scheduler_ngram = allow_if_available

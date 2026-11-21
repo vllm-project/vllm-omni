@@ -1,0 +1,9 @@
+tree 74be3457ecff88e71612249bc8efc790c1fde325
+parent 7602d7980d8add4277353e8bc162ac1f98d98c19
+author liusiyuan <756087182@qq.com> 1795269252 +0800
+committer liusiyuan <756087182@qq.com> 1795269252 +0800
+
+[Hardware][Ascend] Restore bounded allocator reuse for H3 packed staging
+
+Signed-off-by: liusiyuan <756087182@qq.com>
+Co-authored-by: TRAE CLI <traecli@bytedance.com>

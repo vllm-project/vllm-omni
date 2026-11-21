@@ -24,6 +24,12 @@ vllm serve /path/to/MiniMax-H3 --omni \
 
 The first encoder call builds the packs; later requests reuse them.
 
+## Allocator cache reuse
+
+Packed NPU staging retains freed allocator blocks after releasing live GPU weight tensors. If no DLO component cache was supplied, it creates the existing component-local `BoundedAllocatorCache`: unused cached memory must stay within 25% of device capacity and at least 5% must remain physically free. Pressure, missing telemetry and forced failure cleanup still release the cache; executor shutdown cleanup remains unconditional. Existing DLO policy and default `off` behaviour are preserved.
+
+This is allocator reuse, not GPU weight residency: H2D copies still occur on subsequent loads. The matched [cache-repair benchmark](../../assets/performance/minimax_h3_encoder_allocator_reuse/README.md) reports completed-encoder latency, E2E uncertainty and actual allocated/reserved memory.
+
 ## First-call memory requirement
 
 Packing allocates and copies new CPU masters before rebinding the encoder's
