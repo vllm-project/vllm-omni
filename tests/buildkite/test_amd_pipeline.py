@@ -2430,7 +2430,6 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "files": (
                 "tests/e2e/offline_inference/test_voxcpm2_tts.py",
                 "tests/e2e/online_serving/test_voxcpm2_tts.py",
-                "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py",
                 "tests/e2e/online_serving/test_voxcpm2_tts_lora.py",
             ),
         },
@@ -2669,8 +2668,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py": 3,
         "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py": 3,
         "tests/e2e/offline_inference/test_voxcpm2_tts.py": 3,
-        "tests/e2e/online_serving/test_voxcpm2_tts.py": 2,
-        "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts.py": 4,
         "tests/e2e/online_serving/test_voxcpm2_tts_lora.py": 2,
         "tests/e2e/offline_inference/test_voxtral_tts_expansion.py": 2,
         "tests/e2e/online_serving/test_voxtral_tts_expansion.py": 8,
