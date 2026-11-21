@@ -11,11 +11,12 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
@@ -39,7 +40,7 @@ from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.utils import coerce_param_message_types
-from vllm_omni.errors import client_error_metadata
+from vllm_omni.errors import OmniClientError, client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, disable_watermarking
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
+IDLE_CONTROL_TIMEOUT_S = 120.0
 
 
 class _SubmitRevokedError(Exception):
@@ -105,6 +107,129 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
     """
 
     engine: AsyncOmniEngine
+    _idle_timeout_s: float | None = None
+    _idle_loop: asyncio.AbstractEventLoop | None = None
+    _idle_timer: asyncio.TimerHandle | None = None
+    _idle_transition: asyncio.Task[None] | None = None
+    _idle_error: BaseException | None = None
+    _idle_closed: bool = False
+
+    def enable_idle_sleep(self, timeout_s: float) -> None:
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("--idle-sleep-timeout must be finite and positive")
+        if self._get_pd_separation_pair() or self.weight_transfer_enabled:
+            raise ValueError("Idle sleep cannot be combined with PD or weight transfer")
+        if missing := [s.stage_id for s in self.stage_configs if not s.model_config.enable_sleep_mode]:
+            raise ValueError(f"Idle sleep requires enable_sleep_mode for stage(s) {missing}")
+        self._idle_timeout_s = float(timeout_s)
+        self._arm_idle_sleep()
+
+    def _check_idle_lifecycle(self) -> None:
+        if self._idle_timeout_s is not None and asyncio.current_task() is not self._idle_transition:
+            raise OmniClientError("Automatic idle sleep owns the lifecycle", status_code=409)
+        self._check_idle_available()
+
+    def _check_idle_available(self) -> None:
+        if self._idle_closed or self._idle_error is not None:
+            raise OmniEngineDeadError("Idle sleep closed or failed") from self._idle_error
+
+    @property
+    def errored(self) -> bool:
+        return self._idle_error is not None or super().errored
+
+    @property
+    def is_running(self) -> bool:
+        return self._idle_error is None and super().is_running
+
+    async def check_health(self) -> None:
+        self._check_idle_available()
+        await super().check_health()
+
+    def _arm_idle_sleep(self) -> None:
+        busy = (self._idle_closed, self._idle_error, self._idle_timer, self._idle_transition)
+        if self._idle_timeout_s is None or any(busy) or self.request_states or self._paused or self._sleeping_tags:
+            return
+        self._idle_loop = asyncio.get_running_loop()
+
+        def expire() -> None:
+            if self._idle_timer is timer and not self._idle_closed:
+                self._idle_transition = asyncio.create_task(self._idle_switch(wake=False, timer=timer))
+
+        timer = self._idle_loop.call_later(self._idle_timeout_s, expire)
+        self._idle_timer = timer
+
+    async def _wait_for_admission(self, *, admit: bool = False) -> None:
+        """Return directly into synchronous request registration; never hold the lock across RPCs."""
+        while True:
+            async with self._pause_cond:
+                self._check_idle_available()
+                if self._idle_timer is not None:
+                    self._idle_timer.cancel()
+                    self._idle_timer = None
+                if self._idle_timeout_s is not None and self._idle_transition is None and self._sleeping_tags:
+                    self._idle_transition = asyncio.create_task(self._idle_switch(wake=True))
+                transition = self._idle_transition
+                if transition is None:
+                    await self._pause_cond.wait_for(
+                        lambda: self._idle_closed or (not self._paused and not getattr(self, "_sleeping_tags", None))
+                    )
+                    self._check_idle_available()
+                    if admit:
+                        self._admitting = getattr(self, "_admitting", 0) + 1
+                    return
+            try:
+                await asyncio.shield(transition)
+            except asyncio.CancelledError:
+                self._check_idle_available()
+                raise
+
+    async def _idle_switch(self, *, wake: bool, timer: asyncio.TimerHandle | None = None) -> None:
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(IDLE_CONTROL_TIMEOUT_S):
+                self._check_idle_available()
+                if wake:
+                    await self.wake_up()
+                    if self._paused:
+                        await self.resume_generation()
+                else:
+                    async with self._pause_cond:
+                        if self._idle_timer is not timer:
+                            return
+                        self._idle_timer = None
+                        if self.request_states or self._admitting or self._pending_submits:
+                            return
+                        self._paused = True
+                    await self.sleep(level=1, mode="wait")
+            logger.info("Automatic idle %s completed in %.3fs", "wake" if wake else "sleep", time.monotonic() - started)
+        except (Exception, asyncio.CancelledError) as exc:
+            if not self._idle_closed:
+                self._idle_error = exc
+                logger.error("Automatic idle transition failed", exc_info=True)
+        finally:
+            if self._idle_transition is asyncio.current_task():
+                self._idle_transition = None
+            self._arm_idle_sleep()
+
+    def _cancel_idle_sleep(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+        if self._idle_transition is not None:
+            self._idle_transition.cancel()
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        if self._idle_timeout_s is not None:
+            self._idle_closed = True
+            loop = self._idle_loop
+            with suppress(RuntimeError):
+                if loop is None or asyncio.get_running_loop() is loop:
+                    self._cancel_idle_sleep()
+                    loop = None
+            if loop is not None and not loop.is_closed():
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._cancel_idle_sleep)
+        super().shutdown(timeout)
 
     def _create_engine(self, **engine_kwargs: Any) -> AsyncOmniEngine:
         return AsyncOmniEngine(**engine_kwargs)
@@ -213,6 +338,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # only for internal tracking throughout the request's life.
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
+        if self._idle_timeout_s is not None and arrival_time is None:
+            arrival_time = time.time()
 
         # Wait until generation is resumed if the engine is paused. Non-streaming
         # generate holds an admission slot until add_request completes so sleep()
@@ -225,16 +352,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # against a partially-asleep engine would only be rejected EngineCore
         # side. Park here until the full wake instead of erroring (#8678).
         streaming_input = isinstance(prompt, AsyncGenerator)
-        async with self._pause_cond:
-            await self._pause_cond.wait_for(lambda: not self._paused and not getattr(self, "_sleeping_tags", None))
-            if not streaming_input:
-                self._admitting = getattr(self, "_admitting", 0) + 1
-        admitting = not streaming_input
-
-        logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
-
+        admitting = False
         input_stream_task: asyncio.Task | None = None
         try:
+            await self._wait_for_admission(admit=not streaming_input)
+            admitting = not streaming_input
+
+            logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
             # Backstop: the admission gate above waits out sleeping tags, so
             # this only fires if tags appeared after the gate passed (e.g. a
             # sleep() racing this submit) — fail fast rather than submit into
@@ -367,7 +491,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
             stage_first_ts[0] = submit_ts
-            req_start_ts[request_id] = submit_ts
+            req_start_ts[request_id] = wall_start_ts if self._idle_timeout_s is not None else submit_ts
             if admitting:
                 await self._release_generate_admission()
                 admitting = False
@@ -404,12 +528,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             # ASGI cancellation also affects subsequent awaits. Shield the
             # bounded engine abort before removing the local request state.
             with anyio.CancelScope(shield=True):
-                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+                if request_id in self.request_states:
+                    await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
             self._record_request_failure_once(request_id, reason="stage_error")
-            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            if request_id in self.request_states:
+                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
@@ -425,6 +551,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 with anyio.CancelScope(shield=True):
                     await self._drain_interaction_error_tasks(finished_state)
             self._log_summary_and_cleanup(request_id)
+            self._arm_idle_sleep()
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""
@@ -776,16 +903,20 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Track one stage call; abort it if the caller is cancelled and always drop its state."""
         request_id = f"{self._get_unique_request_id(external_request_id)}-{stage_id}"
         req_state = ClientRequestState(request_id, external_request_id=external_request_id)
-        self.request_states[request_id] = req_state
-        self._final_output_handler()
         try:
+            if self._idle_timeout_s is not None:
+                await self._wait_for_admission()
+            self.request_states[request_id] = req_state
+            self._final_output_handler()
             yield req_state
         except asyncio.CancelledError:
             with anyio.CancelScope(shield=True):
-                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+                if request_id in self.request_states:
+                    await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             raise
         finally:
             self.request_states.pop(request_id, None)
+            self._arm_idle_sleep()
 
     async def _stage_response(self, req_state: ClientRequestState) -> NextStageInputMessage | OutputMessage:
         """Wait for a stage call's response: the next stage input, or the finished output.
@@ -843,6 +974,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         failing the entire call. This keeps AsyncOmni usable while the orchestrator
         control plane is still being filled out.
         """
+        if self._idle_timeout_s is not None and asyncio.current_task() is self._idle_transition:
+            self._check_idle_available()
+            timeout = IDLE_CONTROL_TIMEOUT_S if timeout is None else min(timeout, IDLE_CONTROL_TIMEOUT_S)
         results = await self.engine.collective_rpc_async(
             method=method,
             timeout=timeout,
@@ -1149,6 +1283,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         vLLM EngineCore.sleep). Call this API when you need pause *without*
         freeing GPU memory (e.g. weight sync).
         """
+        self._check_idle_lifecycle()
         if wait_for_inflight_requests:
             mode = "wait"
 
@@ -1202,6 +1337,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def resume_generation(self, stage_ids: list[int] | None = None) -> None:
         """Resume generation after :meth:`pause_generation`."""
+        self._check_idle_lifecycle()
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         if ar_stage_ids:
             logger.info("[%s] Resuming AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
@@ -1232,11 +1368,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Check if frontend admission is paused."""
         async with self._pause_cond:
             return self._paused
-
-    async def is_idle_for_sleep(self) -> bool:
-        """Return whether automatic sleep may close admission."""
-        async with self._pause_cond:
-            return self._admitting == 0 and not self._paused and not self._sleeping_tags and not self.request_states
 
     # EngineClient exposes async operations; OmniBase implements the sync API.
     async def start_profile(  # type: ignore[override]
@@ -1362,6 +1493,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         compatibility; omni stages own their connector teardown inside the
         stage-side release RPC.
         """
+        self._check_idle_lifecycle()
         _ = reset_connector
         ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
         if not ar_stage_ids:
@@ -1411,6 +1543,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # ``_paused = True`` would wedge generate() for good: nothing was
         # slept, so wake_up() has no tags to restore and never reaches the
         # block that clears ``_paused``.
+        self._check_idle_lifecycle()
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
 
         # Block admission before any sleep RPC so generate() waits on
@@ -1538,6 +1671,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         requests. Diffusion-only ``sleep`` uses ``_paused`` only as a race
         guard; this method restores admission after a successful wake.
         """
+        self._check_idle_lifecycle()
         self._final_output_handler()
 
         if getattr(self, "_level2_sleeping", False):

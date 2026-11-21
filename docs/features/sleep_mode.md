@@ -90,42 +90,44 @@ Behavior notes:
 
 ## 2. Usage Examples
 
-### Automatic idle sleep for consumer profiles
+### Automatic idle sleep
 
-Consumer deploy profiles can opt in to automatic level-1 sleep:
+Opt in at the serving entrypoint; omitting `--idle-sleep-timeout` leaves
+automatic sleep disabled:
 
-```yaml
-idle_sleep:
-  timeout_s: 300
-
-stages:
-  - stage_id: 0
-    enable_sleep_mode: true
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni \
+  --enable-sleep-mode --idle-sleep-timeout 300
 ```
 
-MOSS-TTS-Nano provides the shipped opt-in example
-`vllm_omni/deploy/moss_tts_nano_idle_sleep.yaml`. Its base
-`moss_tts_nano.yaml` remains unchanged and does not enable automatic sleep.
-The opt-in profile's 300-second timeout is a qualification candidate, not a
-consumer-GPU support claim.
+The timeout must be finite and positive. Every resolved stage must have
+`enable_sleep_mode` enabled. This experimental policy requires one frontend
+owning the complete local pipeline; duplex sessions, PD and weight transfer
+are unsupported.
 
-The policy is disabled when `idle_sleep` is omitted or `timeout_s` is `null`.
-Every resolved stage must enable sleep mode, and the API server must use one
-worker.
+The timer starts after startup warmup and after the last tracked generation
+finishes. Streaming generation and background video generation remain tracked
+until their engine work finishes. Empty WebSockets, completed responses,
+health, metrics and result retrieval do not keep the GPU awake. Ordinary
+realtime sessions may sleep between turns and wake on the next generation.
 
-Only inference traffic resets the deadline. Active HTTP responses, streaming
-responses, and WebSocket sessions keep the deployment awake for their complete
-transport lifetime. Health, metrics, model-list, documentation, lifecycle
-control, and result-retrieval requests do not reset the deadline.
+Automatic sleep uses level 1 and all stages. A request arriving during sleep
+waits for that transition; the first remaining request then starts shared
+`wake_up()` (followed by `resume_generation()` when AR admission is held).
+Cancelling a request does not cancel the shared transition. Manual sleep, wake,
+pause, resume and KV-release operations return a conflict while the automatic
+policy is enabled.
 
-Automatic sleep always targets every stage with level 1 and waits for active
-engine work. The next inference request transparently runs `wake_up()` followed
-by `resume_generation()` before entering the serving handler. Level 2 is not
-used because discarded weights cannot currently be restored by the automatic
-serving path.
+If a queue submission is still settling when the timer fires, sleep is
+deferred by another full idle interval. Failed or timed-out transitions make
+health fail and reject further generation. The existing engine-death watchdog
+handles shutdown, respecting its keep-alive configuration; automatic retry is
+not attempted.
 
-Level 1 moves weights to host memory. A profile that enables automatic idle
-sleep must document enough host RAM and its measured wake latency.
+Level 1 sleep requires enough host RAM to hold offloaded model weights. The
+example's 300-second timeout is an illustrative value rather than a universal
+default; tune it according to your idle pattern and acceptable cold-wake
+latency. See the [design and verification summary](../design/feature/consumer_idle_sleep.md).
 
 ### Python API Example
 

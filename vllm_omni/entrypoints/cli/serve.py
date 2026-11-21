@@ -197,6 +197,12 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        idle_timeout = getattr(args, "idle_sleep_timeout", None)
+        if idle_timeout is not None:
+            if not math.isfinite(idle_timeout) or idle_timeout <= 0:
+                raise ValueError("--idle-sleep-timeout must be finite and positive")
+            if args.headless or args.stage_id is not None or (getattr(args, "api_server_count", None) or 1) != 1:
+                raise ValueError("--idle-sleep-timeout requires one frontend with the full local pipeline")
         # Only the head owns stage-metric collection; API statistics default on.
         if (
             not bool(getattr(args, "headless", False))
@@ -419,6 +425,13 @@ class OmniServeCommand(CLISubcommand):
             help=_WATERMARK_CONFIG_HELP,
         )
 
+        omni_config_group.add_argument(
+            "--idle-sleep-timeout",
+            type=float,
+            default=None,
+            metavar="SECONDS",
+            help="Automatically sleep idle stages at level 1; omitted disables the policy.",
+        )
         try:
             omni_config_group.add_argument(
                 "--enable-sleep-mode",
