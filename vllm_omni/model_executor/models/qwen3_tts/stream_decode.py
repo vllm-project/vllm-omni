@@ -5,6 +5,7 @@
 import torch
 from vllm.config import VllmConfig
 
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -58,3 +59,15 @@ def stream_ref_context_frames(vllm_config: VllmConfig) -> int:
 
     extra = Predictor._stage_connector_extra_config(vllm_config)
     return int(extra.get("ref_code_context_frames") or extra.get("codec_left_context_frames", 25))
+
+
+def stream_chunk_ramp(vllm_config: VllmConfig, steady: int) -> tuple[int, ...]:
+    """Frames per streamed PCM chunk, by chunk index (``codec_chunk_ramp``).
+
+    Without a ramp the first chunk carries the first frame and every later
+    chunk ``steady`` frames, so playback stalls after the first frame while
+    the second chunk accumulates.
+    """
+    from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM as Predictor
+
+    return tuple(parse_chunk_ramp(Predictor._stage_connector_extra_config(vllm_config), steady=steady) or ())

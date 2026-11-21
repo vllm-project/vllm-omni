@@ -553,7 +553,9 @@ class MTPState:
             # request's stream starts after its reference codes, which prime
             # the decoder state first (as Code2Wav's first-chunk context does).
             if self._audio_buffer is None:
-                self._audio_buffer = StreamingAudioBuffer(int(stream.spf), int(model.stream_chunk_frames))
+                self._audio_buffer = StreamingAudioBuffer(
+                    int(stream.spf), int(model.stream_chunk_frames), getattr(model, "stream_chunk_ramp", ())
+                )
             self._frame_requests = set(rows_req_id)
             slots = meta_np[bsz : 2 * bsz]
             owners, next_pos = self._stream_slots()
