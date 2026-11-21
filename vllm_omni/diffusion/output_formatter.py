@@ -91,8 +91,33 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
     return metadata
 
 
-# Structured (non-media) payloads travel in ``multimodal_output`` under their own key.
-STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation", "video_segmentation", "video_depth"})
+# Structured (non-media) payloads travel in ``multimodal_output`` under their own
+# key. These are the keys this module must treat as payload rather than as the
+# rendered response: the packed AV latents of a Realization snapshot, and the
+# Codec stage's decoded `packets` / `rgb` / `waveform`. A key missing here is
+# not merely absent from ``multimodal_output`` -- ``_infer_primary_payload_key``
+# would also promote it to the primary payload and the formatter would put it in
+# ``images``, which no downstream stage reads.
+STRUCTURED_PAYLOAD_KEYS = frozenset(
+    {
+        "actions",
+        "trajectory",
+        "segmentation",
+        "video_segmentation",
+        "video_depth",
+        # Point-cloud output served alongside video (Cosmos3 and similar).
+        "lidar",
+        # Duo's packed AV latents and the Codec stage's decoded packets. Without
+        # these the Duo codec handoff raises KeyError, and
+        # `_infer_primary_payload_key` would promote a lone latent to the primary
+        # payload and route it into `images`.
+        "video_latent",
+        "audio_latent",
+        "packets",
+        "rgb",
+        "waveform",
+    }
+)
 
 
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
@@ -275,8 +300,15 @@ def _build_multimodal_output(
     mm_output: DiffusionMultimodalOutput = {}
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
+    # An allowlist, not a denylist: only keys this formatter knows to be
+    # structured handoffs are copied. A denylist would also forward writer-
+    # specific payloads such as the generic ``output`` key that
+    # ``normalize_diffusion_postprocess_output`` synthesises for a plain tensor
+    # return, duplicating the primary image into ``multimodal_output`` for every
+    # such model. Keys this formatter renders itself (``video``/``image``) are
+    # absent by construction, while ``audio`` stays in both places.
     for key, value in postprocess_output.outputs.items():
-        if key in {"audio", "lidar"} or key in STRUCTURED_PAYLOAD_KEYS:
+        if key == "audio" or key in STRUCTURED_PAYLOAD_KEYS:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate

@@ -483,3 +483,104 @@ def test_formatter_routes_segmentation_payload_to_multimodal_output(
     # Structured payloads are not images: they travel under their own key.
     assert result.images == []
     assert result.multimodal_output[key] is segmentation
+
+
+def test_formatter_keeps_both_packed_latents_of_an_av_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Realization publishes `{video_latent, audio_latent}` as one packed AV
+    # snapshot and the codec handoff reads both keys. The formatter used to keep
+    # only the ones it recognised, so the audio half was silently dropped and a
+    # downstream stage would receive half a snapshot.
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    payload = {
+        "video_latent": torch.zeros(1, 1280, 96),
+        "audio_latent": torch.zeros(1, 58, 32),
+    }
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {"payload": payload, "metadata": {"phase": "latent_ready"}}
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("prompt-0"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None, finished=False),
+        output_data=payload,
+        postprocess_output=postprocess_output,
+    )
+
+    assert set(payload) <= set(result.multimodal_output), (
+        "both packed latents must survive formatting; dropping one hands the "
+        f"codec half a snapshot (got {sorted(result.multimodal_output)})"
+    )
+    assert result.multimodal_output["audio_latent"] is payload["audio_latent"]
+    assert result.multimodal_output["video_latent"] is payload["video_latent"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"packets": [{"payload": b"jpeg", "metadata": {"block": 0}}]}, id="duo_5_17"),
+        pytest.param(
+            {"rgb": torch.zeros(1, 3, 4, 4), "waveform": torch.zeros(1, 2, 16)},
+            id="legacy_modes",
+        ),
+    ],
+)
+def test_formatter_keeps_the_codec_payload_the_projector_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict,
+) -> None:
+    # The Codec stage returns `packets` for duo_5_17 and `rgb`/`waveform` for the
+    # legacy modes, and DuoDataPlane.project reads those keys off the output
+    # envelope. The formatter used to keep only a fixed key list, so a
+    # successfully decoded block reached projection without its fields and
+    # raised KeyError, which stopped AV delivery entirely.
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {"payload": payload, "metadata": {"session_id": "s", "fence": 0, "block": 0}}
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("prompt-0"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None, finished=True),
+        output_data=payload,
+        postprocess_output=postprocess_output,
+    )
+
+    missing = set(payload) - set(result.multimodal_output)
+    assert not missing, (
+        f"the codec payload keys must survive formatting; missing {sorted(missing)} "
+        "would make the projector raise KeyError instead of publishing AV"
+    )
+    for key, value in payload.items():
+        assert result.multimodal_output[key] is value
+
+
+def test_plain_tensor_output_does_not_leak_the_primary_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Models that return a bare tensor (e.g. BooguImage) are normalized to
+    # `{"output": <tensor>}` with `primary_key="output"`. That key must not be
+    # copied into `multimodal_output`: it is the rendered response, already
+    # served as `images`, and forwarding it duplicates the payload for every
+    # such model rather than only for Duo.
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    image = torch.zeros(1, 3, 8, 8)
+    postprocess_output = normalize_diffusion_postprocess_output(image)
+    assert postprocess_output.primary_key == "output"
+
+    [result] = format_diffusion_outputs(
+        request=_request("a cat"),
+        od_config=_config("BooguImagePipeline"),
+        diffusion_output=DiffusionOutput(output=image),
+        output_data=image,
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.images == [image]
+    assert "output" not in result.multimodal_output, (
+        "the generic `output` key is the rendered response, not a structured "
+        f"handoff (got {sorted(result.multimodal_output)})"
+    )

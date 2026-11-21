@@ -64,6 +64,8 @@ FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "DuoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "DuoCodecPipeline": DiffusionModelMetadata(final_output_type="video"),
     "StableAudioPipeline": DiffusionModelMetadata(final_output_type="audio", supports_audio_generation=True),
     "StableAudio3Pipeline": DiffusionModelMetadata(final_output_type="audio", supports_audio_generation=True),
     "LTX2TextToAudioPipeline": DiffusionModelMetadata(final_output_type="audio", supports_audio_generation=True),

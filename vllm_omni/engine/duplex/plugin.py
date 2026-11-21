@@ -452,6 +452,9 @@ class PartialStageForward:
     is_final_update: bool
     close_only: bool = False
     queue_close_after: bool = False
+    #: A completion notification may settle model state without resubmitting
+    #: downstream, so ``forward=False`` marks a settle-only update.
+    forward: bool = True
     source_stage_id: int | None = None
 
 
