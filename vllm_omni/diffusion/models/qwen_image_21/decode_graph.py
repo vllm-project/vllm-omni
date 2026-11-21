@@ -243,8 +243,10 @@ class QwenImage21DecodeGraphManager:
                         break
             if reason is None and model.transformer_blocks:
                 attn_layer = model.transformer_blocks[0].attn.attn
-                if getattr(attn_layer, "_kv_cache_dtype", None) is not None:
-                    reason = "KV-cache quantization is enabled"
+                if getattr(attn_layer, "_kv_cache_dtype", None) is not None or getattr(
+                    attn_layer, "_has_spec_quantization", False
+                ):
+                    reason = "Attention quantization is enabled"
 
         if reason is not None:
             logger.warning_once("Qwen-Image-2.1 CUDA graph decode disabled: %s. Falling back to eager decode.", reason)

@@ -312,6 +312,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self._kernel_variant = "fa4" if IS_FLASH_ATTN_4 else "aiter" if IS_AITER else None
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
+        backend_kwargs = dict(backend_kwargs or {})
+        self.quant_options = dict(backend_kwargs.pop("quant", None) or {})
+        mindiesd_options = [
+            name
+            for name in ("fp8_fa_mode", "mxfp4_scale_alg", "mxfp4_dst_type_max")
+            if self.quant_options.get(name) is not None
+        ]
+        if mindiesd_options and not current_omni_platform.is_npu():
+            raise ValueError(f"MindIE-SD options {mindiesd_options} require the NPU platform.")
         if backend_kwargs:
             logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -767,7 +776,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             if kv_quant_method != "fp8":
                 raise ValueError(
                     f"CUDA FLASH_ATTN supports only 'fp8' attention precision, got {kv_quant_method!r}. "
-                    "Use the NPU backend for mxfp8/mxfp4 or set diffusion_kv_cache_dtype='auto'."
+                    "Use the NPU backend for mxfp8/mxfp4 or disable attention quantization."
                 )
             return self.forward_fa_quant_cuda(query, key, value, attn_metadata)
 
@@ -913,7 +922,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if reason is not None:
             raise ValueError(
                 f"CUDA attention precision 'fp8' is unavailable: {reason}. "
-                "Set diffusion_kv_cache_dtype to 'auto', or select a backend with fp8 "
+                "Disable attention quantization, or select a backend with fp8 "
                 "support. Automatic precision fallback is not performed."
             )
 
@@ -1115,13 +1124,24 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self,
         method: str,
         query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> None:
         extra = attn_metadata.extra if attn_metadata else {}
+        packed = attn_metadata.packed_padding if attn_metadata else None
+        has_varlen_metadata = (
+            packed is not None
+            or any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k"))
+            or extra.get("npu_attn_varlen")
+        )
+        # Only producer-validated [real, pad] inputs can become dense.
+        supports_packed_padding = packed is not None and method in ("fp8", "mxfp8", "mxfp4")
+
         reason = None
         if self.causal:
             reason = "causal quantized FA is not supported"
-        elif any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or extra.get("npu_attn_varlen"):
+        elif has_varlen_metadata and not supports_packed_padding:
             reason = "packed/varlen metadata requires the float attention path"
         elif attn_metadata is not None and attn_metadata.full_attn_spans is not None:
             reason = "piecewise attention requires the float attention path"
@@ -1131,11 +1151,19 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
         ):
             reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
+        elif (
+            method == "fp8"
+            and self.quant_options.get("fp8_fa_mode") == "C8V16_TILING512"
+            and any(tensor.shape[0] != 1 or tensor.shape[-1] != 128 for tensor in (query, key, value))
+        ):
+            reason = "C8V16_TILING512 requires Q/K/V batch size 1 and head dimensions of 128"
+        elif packed is not None and (self.qkv_layout not in (None, "BSND") or query.shape[0] != 1):
+            reason = "packed padding requires a single BSND sequence"
         if reason is not None:
             raise ValueError(
                 f"NPU attention precision {method!r} is unavailable: {reason}. "
-                "Set diffusion_kv_cache_dtype to a supported method, or set it to "
-                "'auto'. Automatic precision fallback is not performed."
+                "Select a supported quant.precision or diffusion_kv_cache_dtype, or disable "
+                "attention quantization. Automatic precision fallback is not performed."
             )
 
     def forward_fa_quant_npu(
@@ -1148,17 +1176,34 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype", "fp8")
         layout = self.qkv_layout or "BSND"
-        self._validate_quant_request(method, query, attn_metadata)
+        self._validate_quant_request(method, query, key, value, attn_metadata)
+        query_padding = None
+        packed = attn_metadata.packed_padding if attn_metadata else None
+        if packed is not None:
+            q_length, kv_length = packed.q_length, packed.kv_length
+            if not (0 < q_length <= query.shape[1] and 0 < kv_length <= key.shape[1]):
+                raise ValueError("NPU quantized attention packed padding lengths must be within the Q/KV sequences.")
+            # Ulysses and reference-KV restoration have already run. Trim before
+            # quantization so padding cannot affect either scales or softmax.
+            if q_length < query.shape[1]:
+                query_padding = query[:, q_length:]
+            query, key, value = query[:, :q_length], key[:, :kv_length], value[:, :kv_length]
         try:
             runtime = self._load_quant_runtime(method)
         except ImportError as exc:
             raise ImportError(
                 f"NPU attention precision {method!r} requires a compatible MindIE-SD "
                 "quant Runtime. Install a compatible MindIE-SD build, select another "
-                "diffusion_kv_cache_dtype, or set it to 'auto'. Automatic precision "
+                "quant.precision or diffusion_kv_cache_dtype, or disable quantization. Automatic precision "
                 "fallback is not performed."
             ) from exc
         kwargs = dict(precision=method, layout=layout, scale=self.softmax_scale)
+        if method == "fp8" and self.quant_options.get("fp8_fa_mode") is not None:
+            kwargs["fp8_fa_mode"] = self.quant_options["fp8_fa_mode"]
+        elif method == "mxfp4":
+            for name in ("mxfp4_scale_alg", "mxfp4_dst_type_max"):
+                if self.quant_options.get(name) is not None:
+                    kwargs[name] = self.quant_options[name]
         # Apply Omni's deterministic Q/K rotation before every Dense quantized path.
         if method in ("fp8", "mxfp8", "mxfp4"):
             from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
@@ -1167,7 +1212,17 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             kwargs.update(q_rot=rotation, k_rot=rotation)
         logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", method, layout)
         # Execution errors propagate. Never retry with another precision.
-        return runtime(query, key, value, **kwargs)
+        out = runtime(query, key, value, **kwargs)
+        if packed is not None and (out.shape[1] != query.shape[1] or out.dtype != query.dtype):
+            raise ValueError(
+                "MindIE-SD quant_attention must preserve the original query sequence length and dtype, "
+                "including when applying internal alignment padding. "
+                f"Expected length={query.shape[1]}, dtype={query.dtype}; "
+                f"got length={out.shape[1]}, dtype={out.dtype}."
+            )
+        # Restore the Q shape before the reverse Ulysses exchange by reusing the
+        # query suffix; pad rows are outside the real document and are not consumed.
+        return torch.cat((out, query_padding), dim=1) if query_padding is not None else out
 
     @staticmethod
     def _npu_fusion_attention(
