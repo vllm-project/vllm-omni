@@ -86,4 +86,3 @@ def test_fa2_branch_matches_sdpa_block_mask() -> None:
 
     # Both branches run attention in bf16 and differ only in kernel accumulation order.
     torch.testing.assert_close(fa2[:, :150], reference[:, :150], atol=2e-2, rtol=2e-2)
-
