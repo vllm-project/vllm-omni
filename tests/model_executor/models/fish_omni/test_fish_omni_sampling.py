@@ -16,7 +16,13 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.model_executor.models.fish_omni.sampling import EMPTY_RAS_SLOT, RAS_WINDOW_FRAMES, FusedFrameSampler
+from vllm_omni.model_executor.models.fish_omni.reference_sampling import ReferenceFrameSampler
+from vllm_omni.model_executor.models.fish_omni.sampling import (
+    EMPTY_RAS_SLOT,
+    RAS_TOP_K,
+    RAS_WINDOW_FRAMES,
+    FusedFrameSampler,
+)
 
 pytestmark = [
     pytest.mark.core_model,
@@ -31,7 +37,7 @@ ROWS = 2000
 MAX_TOP_K = 32
 CANDIDATES = torch.tensor([EOS, *range(SEMANTIC_BEGIN, SEMANTIC_BEGIN + CODEBOOK_SIZE)])
 # Near-tied candidates: the arg-max semantic token, end of speech, and two more
-# semantic tokens; top_p 0.95 drops the last of them.
+# semantic tokens.
 ARGMAX, OTHER_A, OTHER_B = SEMANTIC_BEGIN + 1, SEMANTIC_BEGIN + 2, SEMANTIC_BEGIN + 3
 
 
@@ -114,6 +120,127 @@ def _sample(logits, history):
     )
 
 
+def _graph_sampler(rows):
+    return FusedFrameSampler(max_top_k=MAX_TOP_K, num_codebooks=10, max_rows=rows, device=torch.device("cuda"))
+
+
+def _graph_main_inputs(rows, dtype=torch.float32):
+    sampler = _graph_sampler(rows)
+    logits = torch.full((rows, CANDIDATES.numel()), -30.0, dtype=dtype, device="cuda")
+    column = {int(token): index for index, token in enumerate(CANDIDATES)}
+    logits[:, column[OTHER_A]] = 0.0
+    logits[:, column[OTHER_B]] = 0.01
+    logits[:, column[ARGMAX]] = 0.02
+    candidate_ids = CANDIDATES.cuda()
+    ras_window = torch.full((rows, RAS_WINDOW_FRAMES), EMPTY_RAS_SLOT, dtype=torch.long, device="cuda")
+    temperature = torch.ones(rows, dtype=torch.float32, device="cuda")
+    top_k = torch.ones(rows, dtype=torch.long, device="cuda")
+    top_p = torch.ones(rows, dtype=torch.float32, device="cuda")
+    noise = sampler.noise(rows, torch.device("cuda")).fill_(0.5)
+    return sampler, (logits, candidate_ids, ras_window, temperature, top_k, top_p, noise)
+
+
+def _capture_graph(call):
+    """Warm up Triton, then capture and replay a fixed-shape sampler call."""
+    warmup_stream = torch.cuda.Stream()
+    with torch.cuda.stream(warmup_stream):
+        call()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(warmup_stream)
+    torch.accelerator.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(capture_stream):
+        with torch.cuda.graph(graph):
+            graph_outputs = call()
+    graph.replay()
+    torch.accelerator.synchronize()
+    return graph, graph_outputs
+
+
+def _replay_snapshot(graph, graph_outputs):
+    graph.replay()
+    torch.accelerator.synchronize()
+    if isinstance(graph_outputs, tuple):
+        return tuple(output.clone() for output in graph_outputs)
+    return graph_outputs.clone()
+
+
+def test_main_tokens_cuda_graph_matches_eager():
+    sampler, inputs = _graph_main_inputs(rows=4, dtype=torch.bfloat16)
+    eager = tuple(output.clone() for output in sampler.main_tokens(*inputs, SEMANTIC_BEGIN, CODEBOOK_SIZE))
+    graph, graph_outputs = _capture_graph(lambda: sampler.main_tokens(*inputs, SEMANTIC_BEGIN, CODEBOOK_SIZE))
+    replay = _replay_snapshot(graph, graph_outputs)
+
+    torch.testing.assert_close(replay[0], eager[0], rtol=0, atol=0)
+    torch.testing.assert_close(replay[1], eager[1], rtol=0, atol=0)
+
+
+def test_code_cuda_graph_matches_eager():
+    rows = 17
+    sampler = _graph_sampler(rows)
+    logits = torch.full((rows, 64), -30.0, dtype=torch.float32, device="cuda")
+    logits[:, 0] = 0.5
+    logits[:, 1] = 0.4
+    temperature = torch.ones(rows, dtype=torch.float32, device="cuda")
+    top_k = torch.full((rows,), 2, dtype=torch.long, device="cuda")
+    top_p = torch.ones(rows, dtype=torch.float32, device="cuda")
+    noise = sampler.noise(rows, torch.device("cuda")).fill_(0.5)
+    inputs = (logits, temperature, top_k, top_p, noise, 0)
+    assert not noise[:, MAX_TOP_K + RAS_TOP_K :].is_contiguous()
+
+    eager = sampler.code(*inputs).clone()
+    graph, graph_outputs = _capture_graph(lambda: sampler.code(*inputs))
+    replay = _replay_snapshot(graph, graph_outputs)
+
+    torch.testing.assert_close(replay, eager, rtol=0, atol=0)
+
+
+def test_code_cuda_graph_observes_input_updates():
+    rows = 4
+    sampler = _graph_sampler(rows)
+    logits = torch.full((rows, 64), -30.0, dtype=torch.float32, device="cuda")
+    logits[:, 0] = 0.5
+    logits[:, 1] = 0.4
+    temperature = torch.ones(rows, dtype=torch.float32, device="cuda")
+    top_k = torch.ones(rows, dtype=torch.long, device="cuda")
+    top_p = torch.ones(rows, dtype=torch.float32, device="cuda")
+    noise = sampler.noise(rows, torch.device("cuda")).fill_(0.5)
+    inputs = (logits, temperature, top_k, top_p, noise, 0)
+    graph, graph_outputs = _capture_graph(lambda: sampler.code(*inputs))
+    before = _replay_snapshot(graph, graph_outputs)
+    assert bool((before == 0).all())
+
+    top_k.copy_(torch.full_like(top_k, 2))
+    noise[:, MAX_TOP_K + RAS_TOP_K : MAX_TOP_K + RAS_TOP_K + 2].copy_(
+        torch.tensor([0.01, 0.99], dtype=noise.dtype, device=noise.device)
+    )
+    expected = sampler.code(*inputs).clone()
+    after = _replay_snapshot(graph, graph_outputs)
+
+    assert bool((expected == 1).all())
+    assert bool((after == 1).all())
+    assert not torch.equal(before, after)
+
+
+def test_main_tokens_cuda_graph_observes_ras_updates():
+    sampler, inputs = _graph_main_inputs(rows=4)
+    logits, candidate_ids, ras_window, temperature, top_k, top_p, noise = inputs
+    noise[:, MAX_TOP_K] = 0.01
+    noise[:, MAX_TOP_K + 1] = 0.99
+    graph, graph_outputs = _capture_graph(lambda: sampler.main_tokens(*inputs, SEMANTIC_BEGIN, CODEBOOK_SIZE))
+    before = _replay_snapshot(graph, graph_outputs)
+    assert bool((before[0] == ARGMAX).all())
+
+    ras_window[:, -1].copy_(torch.full((ras_window.shape[0],), ARGMAX, device=ras_window.device))
+    expected = tuple(output.clone() for output in sampler.main_tokens(*inputs, SEMANTIC_BEGIN, CODEBOOK_SIZE))
+    after = _replay_snapshot(graph, graph_outputs)
+
+    torch.testing.assert_close(after[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(after[1], expected[1], rtol=0, atol=0)
+    assert bool((after[0] != before[0]).all())
+
+
 def test_non_repeated_token_keeps_first_draw():
     tokens, code_zero = _sample(_logits(ARGMAX, OTHER_A), history=[OTHER_A, OTHER_B])
     assert bool((tokens == ARGMAX).all())
@@ -123,7 +250,7 @@ def test_non_repeated_token_keeps_first_draw():
 def test_repeated_semantic_token_is_redrawn():
     tokens, _ = _sample(_logits(ARGMAX, OTHER_A), history=[OTHER_B, ARGMAX])
     kept = (tokens == ARGMAX).float().mean().item()
-    assert 0.3 < kept < 0.7
+    assert abs(kept - 1 / 3) < 0.05
     assert set(tokens.tolist()) <= {ARGMAX, OTHER_A, OTHER_B}
 
 
@@ -140,3 +267,40 @@ def test_end_of_speech_is_never_redrawn():
 def test_repeat_outside_window_keeps_first_draw():
     tokens, _ = _sample(_logits(ARGMAX, OTHER_A), history=[ARGMAX] + [OTHER_B] * RAS_WINDOW_FRAMES)
     assert bool((tokens == ARGMAX).all())
+
+
+def test_reference_sampling_compiles_and_replays_as_it_runs_eagerly():
+    """The model compiles the sampler into its forward and replays decode steps as FULL CUDA
+    graphs; with the same noise, both must draw every code the eager step draws."""
+    rows = 8
+    generator = torch.Generator().manual_seed(13)
+    sampler = ReferenceFrameSampler(fallback="ras", num_codebooks=10, width=4096)
+    candidate_ids = torch.arange(1000, 1000 + 4096, device="cuda")
+    main_logits = (torch.randn(rows, 4096, generator=generator) * 2.0).cuda()
+    head_logits = (torch.randn(rows, 4096, generator=generator) * 2.0).cuda()
+    window = torch.full((rows, RAS_WINDOW_FRAMES), EMPTY_RAS_SLOT, device="cuda")
+    window[::2, 3] = candidate_ids[main_logits[::2].argmax(dim=-1)]
+    temperature, top_k, top_p = _rows(1.0, rows=rows), _rows(-1, torch.long, rows), _rows(1.0, rows=rows)
+    epsilon_cutoff = _rows(1e-3, rows=rows)
+    noise = sampler.noise(rows, torch.device("cuda"))
+
+    def step():
+        main_tokens, code_zero = sampler.main_tokens(
+            main_logits, candidate_ids, window, temperature, top_k, top_p, epsilon_cutoff, noise, 1001, 4096
+        )
+        codes = [sampler.code(head_logits, temperature, top_k, top_p, noise, index) for index in range(9)]
+        return torch.stack([main_tokens, code_zero, *codes])
+
+    eager = step()
+    assert torch.equal(torch.compile(step, fullgraph=True)(), eager)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    noise.uniform_(generator=None)
+    graph.replay()
+    assert torch.equal(captured, step())

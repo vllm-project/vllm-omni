@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections.abc import Generator, Iterable
 from dataclasses import dataclass, field
 
@@ -241,14 +241,14 @@ class ModelOptFp8CheckpointAdapter:
             return
 
         missing_scale_names = ", ".join(repr(name) for name in sorted(state.pending_weights))
-        raise ValueError(f"Missing ModelOpt FP8 weight_scale for full-precision target weights: {missing_scale_names}")
+        raise ValueError(f"Missing ModelOpt weight scales for full-precision target weights: {missing_scale_names}")
 
     def _log_adaptation_summary(self, state: _AdaptState) -> None:
         if not state.skipped_scales and not state.dequantized_weights:
             return
 
         logger.info_once(
-            "Adapted ModelOpt FP8 %s weights: dequantized %d full-precision weights, skipped %d scale tensors",
+            "Adapted ModelOpt %s weights: dequantized %d full-precision weights, skipped %d scale tensors",
             self._source_label,
             state.dequantized_weights,
             state.skipped_scales,
@@ -279,6 +279,9 @@ class ModelOptFp8CheckpointAdapter:
 
 class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
     _PRE_QUANT_SCALE_SUFFIX = ".pre_quant_scale"
+    _NVFP4_BLOCK_SIZE = 16
+    _NVFP4_DECODE_ROWS = 1024
+    _FULL_PRECISION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
     @staticmethod
     def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
@@ -288,6 +291,152 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
             and quant_config.get_name() == "modelopt_fp4"
             and bool(getattr(quant_config, "is_checkpoint_nvfp4_serialized", False))
         )
+
+    @staticmethod
+    def _get_nvfp4_scale_names(weight_name: str) -> tuple[str, str]:
+        if not weight_name.endswith(".weight"):
+            raise ValueError(f"Missing ModelOpt NVFP4 weight scale names for weight {weight_name!r}")
+        base_name = weight_name[: -len(".weight")]
+        return base_name + ".weight_scale", base_name + ".weight_scale_2"
+
+    def _is_packed_nvfp4_for_full_precision_target(self, tensor: torch.Tensor, target_name: str | None) -> bool:
+        # Models may intentionally keep some layers in full precision (for
+        # example AdaLN modulation linears) even when the checkpoint stores
+        # them as packed NVFP4. The checkpoint tensor is the global uint8
+        # [N, K/2]. The parameter is either the full [N, K] tensor or, for a
+        # column-parallel layer, the rank-local [N/tp, K] shard. Dequantize
+        # the global tensor; the existing weight loader shards the rows.
+        if target_name is None or tensor.dtype != torch.uint8 or tensor.ndim != 2:
+            return False
+        target = self._loadable_tensors[target_name]
+        if target.dtype not in self._FULL_PRECISION_DTYPES or target.ndim != 2:
+            return False
+        packed_rows, packed_cols = tensor.shape
+        local_rows, local_cols = target.shape
+        if local_cols != packed_cols * 2:
+            return False
+        if packed_rows == local_rows:
+            return True
+        tp_size = getattr(target, "tp_size", None)
+        # output_dim 0 is the row axis that ColumnParallelLinear shards.
+        # Row-parallel targets fail the K check above and stay packed.
+        return (
+            getattr(target, "output_dim", None) == 0
+            and isinstance(tp_size, int)
+            and tp_size > 1
+            and packed_rows == local_rows * tp_size
+        )
+
+    def _target_dtype_for_dequantization(
+        self,
+        tensor: torch.Tensor,
+        target_name: str | None,
+    ) -> torch.dtype | None:
+        if target_name is not None and self._is_packed_nvfp4_for_full_precision_target(tensor, target_name):
+            return self._loadable_tensors[target_name].dtype
+        return super()._target_dtype_for_dequantization(tensor, target_name)
+
+    def _get_missing_nvfp4_scale(self, weight_name: str, state: _AdaptState) -> str | None:
+        for scale_name in self._get_nvfp4_scale_names(weight_name):
+            if scale_name not in state.scale_tensors:
+                return scale_name
+        return None
+
+    def _maybe_dequantize_or_defer_weight(
+        self,
+        name: str,
+        output_name: str,
+        tensor: torch.Tensor,
+        target_dtype: torch.dtype,
+        state: _AdaptState,
+    ) -> torch.Tensor | None:
+        if tensor.dtype != torch.uint8:
+            return super()._maybe_dequantize_or_defer_weight(name, output_name, tensor, target_dtype, state)
+
+        missing_scale_name = self._get_missing_nvfp4_scale(name, state)
+        if missing_scale_name is not None:
+            state.pending_weights.setdefault(missing_scale_name, []).append((name, output_name, tensor, target_dtype))
+            return None
+
+        state.dequantized_weights += 1
+        return self._dequantize_weight(name, tensor, state, target_dtype)
+
+    def _flush_pending_weights(
+        self,
+        scale_name: str,
+        state: _AdaptState,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        for (
+            weight_name,
+            output_name,
+            weight_tensor,
+            target_dtype,
+        ) in state.pending_weights.pop(scale_name, []):
+            if weight_tensor.dtype == torch.uint8:
+                # NVFP4 needs both the block scale and the global scale.
+                missing_scale_name = self._get_missing_nvfp4_scale(weight_name, state)
+                if missing_scale_name is not None:
+                    state.pending_weights.setdefault(missing_scale_name, []).append(
+                        (weight_name, output_name, weight_tensor, target_dtype)
+                    )
+                    continue
+            yield output_name, self._dequantize_weight(weight_name, weight_tensor, state, target_dtype)
+            state.dequantized_weights += 1
+
+    def _dequantize_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        state: _AdaptState,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if loaded_weight.dtype != torch.uint8:
+            return super()._dequantize_weight(name, loaded_weight, state, target_dtype)
+
+        block_scale_name, global_scale_name = self._get_nvfp4_scale_names(name)
+        if block_scale_name not in state.scale_tensors or global_scale_name not in state.scale_tensors:
+            raise ValueError(f"Missing ModelOpt NVFP4 weight scales for full-precision target weight {name!r}")
+        block_scale = state.scale_tensors[block_scale_name]
+        global_scale = state.scale_tensors[global_scale_name]
+
+        rows, packed_cols = loaded_weight.shape
+        cols = packed_cols * 2
+        expected_block_scale_shape = (rows, cols // self._NVFP4_BLOCK_SIZE)
+        if cols % self._NVFP4_BLOCK_SIZE or tuple(block_scale.shape) != expected_block_scale_shape:
+            raise ValueError(
+                f"Unsupported ModelOpt NVFP4 weight_scale shape {tuple(block_scale.shape)} for packed weight "
+                f"{name!r} of shape {tuple(loaded_weight.shape)}; expected {expected_block_scale_shape}"
+            )
+        if global_scale.numel() != 1:
+            raise ValueError(
+                f"Unsupported ModelOpt NVFP4 weight_scale_2 shape {tuple(global_scale.shape)} for weight {name!r}"
+            )
+        if block_scale.dtype == torch.uint8:
+            block_scale = block_scale.view(torch.float8_e4m3fn)
+        elif block_scale.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"Unsupported ModelOpt NVFP4 weight_scale dtype {block_scale.dtype} for weight {name!r}; "
+                "expected torch.float8_e4m3fn or raw torch.uint8 bytes"
+            )
+
+        from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import break_fp4_bytes
+
+        device = loaded_weight.device
+        scale = block_scale.to(device=device, dtype=torch.float32) * global_scale.to(
+            device=device, dtype=torch.float32
+        ).reshape(())
+        # Decode bounded row chunks into one destination tensor. A whole-tensor
+        # break_fp4_bytes call expands every packed byte to an int64 index and
+        # float32 buffers; for [18432, 1536] that transiently held ~1.2 GB host
+        # memory per rank, which is paid again on every TP rank.
+        output = torch.empty(rows, cols, dtype=target_dtype, device=device)
+        for start in range(0, rows, self._NVFP4_DECODE_ROWS):
+            end = min(start + self._NVFP4_DECODE_ROWS, rows)
+            values = break_fp4_bytes(loaded_weight[start:end], torch.float32).reshape(
+                end - start, -1, self._NVFP4_BLOCK_SIZE
+            )
+            output[start:end] = (values * scale[start:end].unsqueeze(-1)).reshape(end - start, cols).to(target_dtype)
+        return output
 
     def adapt(
         self,

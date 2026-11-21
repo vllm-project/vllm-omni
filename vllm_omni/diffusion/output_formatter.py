@@ -92,7 +92,7 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
 
 
 # Structured (non-media) payloads travel in ``multimodal_output`` under their own key.
-STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation", "video_segmentation"})
+STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation", "video_segmentation", "video_depth"})
 
 
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
@@ -276,7 +276,7 @@ def _build_multimodal_output(
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
     for key, value in postprocess_output.outputs.items():
-        if key == "audio" or key in STRUCTURED_PAYLOAD_KEYS:
+        if key in {"audio", "lidar"} or key in STRUCTURED_PAYLOAD_KEYS:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate

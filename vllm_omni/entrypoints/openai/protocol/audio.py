@@ -167,6 +167,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0.0,
         description="Target audio duration in seconds (MOSS-SoundEffect). Converted to ~12.5 frames/s internally.",
     )
+    token_count: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=_INT64_MAX,
+        description="Optional target for new audio, in codec frames (12.5/s), for MOSS-TTS Local. "
+        "Does not change max_new_tokens. Resolve automatic estimates on the client before sending.",
+    )
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
@@ -213,8 +220,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         ge=_INT64_MIN,
         le=_INT64_MAX,
-        description="Random seed for reproducible generation. When set, ensures "
-        "deterministic output for the same input text and seed value.",
+        description="Random seed for reproducible generation. An explicitly set seed isolates the "
+        "request from other batched work: it waits for the engine to drain and runs alone, which makes "
+        "its output byte-reproducible but lowers throughput while it runs. A seed copied from a stage's "
+        "default_sampling_params does not trigger this.",
     )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
@@ -663,6 +672,10 @@ class StreamingSpeechSessionConfig(BaseModel):
     language: str | None = None
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = Field(
+        default=None,
+        description="Target sample rate of the returned audio. If omitted, use the model's native sample rate.",
+    )
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(
@@ -687,11 +700,20 @@ class StreamingSpeechSessionConfig(BaseModel):
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector. Mutually exclusive with ref_audio.",
     )
+    # The fields below mean the same as on OpenAICreateSpeechRequest; the
+    # handler validates them by building that request at session.config time.
+    ref_audio_codes: list[list[StrictInt]] | None = None
+    ref_audio_2: str | None = None
+    ambient_sound: str | None = None
+    duration_seconds: float | None = Field(default=None, ge=0.0)
+    token_count: StrictInt | None = Field(default=None, gt=0, le=_INT64_MAX)
+    cache_salt: str | None = None
+    extra_params: dict[str, Any] | None = None
     stream_audio: bool = Field(
         default=False,
         description=(
-            "If true, send raw PCM audio chunks progressively over WebSocket. "
-            "Requires response_format='pcm'. WebSocket streaming currently requires "
+            "If true, send PCM or WAV audio chunks progressively over WebSocket. "
+            "Requires response_format='pcm' or 'wav'. WebSocket streaming currently requires "
             "speed=1.0, including for models with native speed control."
         ),
     )
@@ -728,9 +750,9 @@ class StreamingSpeechSessionConfig(BaseModel):
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
         if self.stream_audio:
-            if self.response_format != "pcm":
+            if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
-                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm'. "
+                    "WebSocket streaming audio (stream_audio=true) requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
                 )
             if self.speed is None:
@@ -740,4 +762,11 @@ class StreamingSpeechSessionConfig(BaseModel):
                     "WebSocket stream_audio=true currently requires speed=1.0; "
                     "native speed control is only available through HTTP streaming."
                 )
+        if (self.duration_seconds is not None or self.token_count is not None) and (
+            self.split_granularity != "none" or self.text_input_mode != "buffered"
+        ):
+            raise ValueError(
+                "duration_seconds and token_count set the length of a whole request, so they require "
+                "split_granularity='none' and text_input_mode='buffered'."
+            )
         return self

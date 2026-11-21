@@ -289,6 +289,93 @@ async def test_generate_rejects_unreadable_cached_mix(tmp_path, monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ([], cli.DEFAULT_JUDGE_FRAME_MAX_SIDE),
+        (["--judge-frame-max-side", "768"], 768),
+        (["--judge-frame-max-side", "0"], None),
+    ],
+)
+def test_cli_evaluate_forwards_judge_frame_max_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: list[str], expected: int | None
+):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(cli, "DuplexJudge", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "evaluate_sample", lambda *args, **kwargs: seen.append(kwargs["judge_frame_max_side"]))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", *flag]
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+    assert seen == [expected]
+
+
+def test_cli_evaluate_rejects_negative_judge_frame_max_side(tmp_path: Path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", "--judge-frame-max-side", "-1"]
+    with pytest.raises(ValueError, match="--judge-frame-max-side"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+
+@pytest.mark.parametrize(
+    ("sample_ids", "cached_score"),
+    [(["cached"], {}), (["new", "cached"], {"judge_frame_max_side": 1920})],
+    ids=["fully-cached-legacy", "partial-resume"],
+)
+def test_cli_evaluate_rejects_mismatched_cached_rtd_cap(tmp_path, monkeypatch, sample_ids, cached_score):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": sample_id, "split": "RTD_OCR"} for sample_id in sample_ids]))
+    score_root = tmp_path / "scores"
+    cached_path = score_root / "RTD_OCR" / "cached.json"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_text(json.dumps(cached_score))
+    seen = []
+    monkeypatch.setattr(cli, "evaluate_sample", lambda sample, *args, **kwargs: seen.append(sample.id))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    with pytest.raises(ValueError, match=r"cached\.json.*judge_frame_max_side.*--overwrite.*--score-root"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+    assert seen == []
+    assert list(cached_path.parent.iterdir()) == [cached_path]
+    assert json.loads(cached_path.read_text()) == cached_score
+
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args([*args, "--overwrite"]))
+    assert seen == sample_ids
+
+
+def test_cli_evaluate_reuses_matching_rtd_and_legacy_pr_scores(tmp_path, monkeypatch):
+    samples = [{"id": "rtd", "split": "RTD_OCR"}, {"id": "pr", "split": "PR_correction"}]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(samples))
+    score_root = tmp_path / "scores"
+    for sample, score in zip(samples, ({"judge_frame_max_side": 768}, {})):
+        path = score_root / sample["split"] / f"{sample['id']}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(score))
+
+    def unexpected_evaluation(*args, **kwargs):
+        pytest.fail("compatible cached scores should be reused")
+
+    monkeypatch.setattr(cli, "evaluate_sample", unexpected_evaluation)
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--response-root", str(tmp_path / "responses")]
+    args += ["--score-root", str(score_root), "--judge-model", "mock-judge", "--judge-frame-max-side", "768"]
+    assert cli.run(parser.parse_args(args)) == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True])
 async def test_generate_rejects_unpaced_server_vad_before_preparation_or_cache(tmp_path, monkeypatch, cached):
@@ -378,16 +465,28 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
             pace=pace,
         )
 
+    # The reply's media timestamp is the local media clock when its delta is
+    # processed. At the realtime pace the delta lands before the drain
+    # padding advances the clock (0.8s, the clip's own duration); as fast as
+    # possible the first padded unit is already on the wire when the delta
+    # is read, so the reply is stamped one unit later (1.8s).
+    sentence_time = 0.8 if pace == "realtime" else 1.8
     assert json.loads(result.output.read_text(encoding="utf-8")) == {
-        "sentences": [{"sentence": "Done.", "start": 0.8, "end": 0.8}],
-        "chunks": [{"text": "Done.", "current_time": 0.8}],
+        "sentences": [{"sentence": "Done.", "start": sentence_time, "end": sentence_time}],
+        "chunks": [{"text": "Done.", "current_time": sentence_time}],
     }
     meta = json.loads(result.output.with_name("sample.meta.json").read_text(encoding="utf-8"))
     assert meta["response_done"] is True
     assert meta["drain_timeout"] is None
     assert meta["unit_ms"] == 1000
     assert meta["clock"] == ("media" if pace == "realtime" else "invalid")
-    assert len([event for event in received if event["type"] == "input_audio_buffer.append"]) == 1
+    # The clip is the wire before the commit; the drain padding that follows
+    # it streams zeroed units by design and is not part of the clip.
+    commit_at = next(
+        (index for index, event in enumerate(received) if event["type"] == "input_audio_buffer.commit"),
+        len(received),
+    )
+    assert len([event for event in received[:commit_at] if event["type"] == "input_audio_buffer.append"]) == 1
     assert "duplex_request_metrics" not in meta
     assert result.request_metrics
     assert result.request_metrics[0]["sample_id"] == "sample"
@@ -415,14 +514,19 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
 async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detection, duration, audio_duration, fps):
     import websockets
 
+    from tests.benchmarks.duplex.test_omni_duplex_eval_media import _make_synthetic_mp4
     from vllm_omni.protocol.realtime.items import validate_realtime_video_frames
 
     pcm = b"\x01\x00" * round(audio_duration * 16000)
-    # Keep the real frame-time generator; only JPEG decoding is replaced here.
-    monkeypatch.setattr(
-        media, "extract_jpeg", lambda path, *, timestamp, quality: b"\xff\xd8" + str(timestamp).encode()
+    # Keep the real timestamp grid. iter_jpegs opens the container (it no longer
+    # calls extract_jpeg), so the clip must exist. JPEG bytes stay timestamp-tagged
+    # so each sample remains unique on the wire.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(_make_synthetic_mp4(duration=duration + 1.0))
+    frames = tuple(
+        (timestamp, b"\xff\xd8" + str(timestamp).encode())
+        for timestamp, _ in media.iter_jpegs(clip, fps=fps, duration=duration)
     )
-    frames = tuple(media.iter_jpegs("unused.mp4", fps=fps, duration=duration))
     prepared = runner.PreparedSample(pcm, frames, duration, None, None)
     received = []
     server_turns = turn_detection == "server_vad"
@@ -478,7 +582,14 @@ async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detectio
             expected_pcm += b"\0\0"
         else:
             expected_pcm = expected_pcm[:-2]
-    appends = [event for event in received if event["type"] == "input_audio_buffer.append"]
+    # The clip is the wire before the commit (server VAD sends no commit and
+    # streams the whole clip): the drain padding after it streams zeroed
+    # units by design and is not part of the clip.
+    commit_at = next(
+        (index for index, event in enumerate(received) if event["type"] == "input_audio_buffer.commit"),
+        len(received),
+    )
+    appends = [event for event in received[:commit_at] if event["type"] == "input_audio_buffer.append"]
     assert b"".join(base64.b64decode(event["audio"]) for event in appends) == expected_pcm
     sent_frames = []
     pending_images = []
@@ -521,16 +632,21 @@ async def test_generate_finishes_a_silent_session_on_the_post_commit_listen(tmp_
     appended = []
 
     async def handler(websocket):
+        committed = False
         async for raw in websocket:
             event = json.loads(raw)
             if event["type"] == "session.update":
                 await websocket.send(json.dumps({"type": "session.created"}))
             elif event["type"] == "input_audio_buffer.append":
-                appended.append(base64.b64decode(event["audio"]))
+                # The clip is the wire before the commit; the zeroed drain
+                # padding that follows it is not part of the clip.
+                if not committed:
+                    appended.append(base64.b64decode(event["audio"]))
                 # A decision for an earlier unit does not end the session.
                 listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
                 await websocket.send(json.dumps(listen))
             elif event["type"] == "input_audio_buffer.commit":
+                committed = True
                 await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
                 await websocket.send(json.dumps(listen))
             elif event["type"] == "session.close":

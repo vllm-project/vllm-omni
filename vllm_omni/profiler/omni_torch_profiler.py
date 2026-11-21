@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Mapping
 from datetime import datetime
+from inspect import signature
 from typing import Any, Literal
 
 import torch
@@ -63,6 +65,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self._table_path: str | None = None
 
         self._activities = activities
+        self._profiler_kwargs: dict[str, Any] = {}
         self._session_dir: str | None = None
         self._artifact_paths: dict[str, str | None] = {}
         self._memory_history_enabled = False
@@ -77,6 +80,22 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
             )
 
         self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
+        # The wait/warmup/active ProfilerConfig knobs need a profiler
+        # schedule; without one they were silently ignored and
+        # max_iterations was the only bound (#9286).
+        self._schedule = self._build_schedule(profiler_config)
+        self._uses_schedule = self._schedule is not None
+        self._initial_warmup_steps_remaining = self._schedule_warmup_steps(profiler_config)
+        self._warmup_steps_remaining = self._initial_warmup_steps_remaining
+        # step() calls the repeat=1 cycle consumes: every wait and warmup
+        # step plus the active steps (start() already consumed schedule
+        # step 0 on platforms whose formula subtracts it). Past this budget
+        # a further profiler.step() would run the profiler past
+        # RECORD_AND_SAVE, which torch / torch_npu may reject.
+        self._schedule_cycle_steps = (
+            self._initial_warmup_steps_remaining + profiler_config.active_iterations if self._uses_schedule else 0
+        )
+        self._schedule_steps_consumed = 0
         self.profiler = self._create_profiler(profiler_config, activities)
 
     def _rank(self) -> int:
@@ -89,6 +108,58 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """
         return ["CPU", "CUDA"]
 
+    def _build_schedule(self, profiler_config: ProfilerConfig):
+        """Build the profiler schedule from the wait/warmup/active knobs.
+
+        Mirrors vLLM's TorchProfilerWrapper: the schedule is only built when
+        wait or warmup iterations are requested, so the default configuration
+        keeps recording every iteration. Subclasses may return a
+        platform-native schedule object instead.
+        """
+        if profiler_config.warmup_iterations > 0 or profiler_config.wait_iterations > 0:
+            return torch.profiler.schedule(
+                skip_first=0,
+                wait=profiler_config.wait_iterations,
+                warmup=profiler_config.warmup_iterations,
+                active=profiler_config.active_iterations,
+                repeat=1,
+            )
+        return None
+
+    def _schedule_warmup_steps(self, profiler_config: ProfilerConfig) -> int:
+        """Non-active step() calls before the first RECORD step.
+
+        ``torch.profiler.profile.start()`` consumes schedule step 0 (WAIT or
+        WARMUP), so only wait + warmup - 1 non-active steps remain to be
+        advanced through step(). Subclasses whose profiler runtime does not
+        consume step 0 on start must override this.
+        """
+        return max(profiler_config.wait_iterations + profiler_config.warmup_iterations - 1, 0)
+
+    @override
+    def _profiler_step(self) -> bool:
+        """Advance the schedule when one is configured.
+
+        Warmup steps record nothing and do not count toward max_iterations,
+        matching vLLM's TorchProfilerWrapper. Once the repeat=1 cycle is
+        exhausted the session stops itself: a further profiler.step() would
+        run the profiler past RECORD_AND_SAVE, which torch / torch_npu may
+        reject, and no further data would be recorded anyway.
+        """
+        if self._uses_schedule:
+            if self._schedule_steps_consumed >= self._schedule_cycle_steps:
+                logger.info_once(
+                    "Profiler schedule cycle (wait + warmup + active) exhausted; stopping the profiling session."
+                )
+                self.stop()
+                return False
+            self.profiler.step()
+            self._schedule_steps_consumed += 1
+            if self._warmup_steps_remaining > 0:
+                self._warmup_steps_remaining -= 1
+                return False
+        return True
+
     def _create_profiler(
         self,
         profiler_config: ProfilerConfig,
@@ -98,14 +169,47 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
 
         Override in subclasses for platform-specific profiler creation.
         """
-        return torch.profiler.profile(
-            activities=[TorchProfilerActivityMap[a] for a in activities],
-            record_shapes=profiler_config.torch_profiler_record_shapes,
-            profile_memory=profiler_config.torch_profiler_with_memory,
-            with_stack=profiler_config.torch_profiler_with_stack,
-            with_flops=profiler_config.torch_profiler_with_flops,
-            on_trace_ready=self._on_trace_ready,
-        )
+        kwargs = {
+            "activities": [TorchProfilerActivityMap[a] for a in activities],
+            "record_shapes": profiler_config.torch_profiler_record_shapes,
+            "profile_memory": profiler_config.torch_profiler_with_memory,
+            "with_stack": profiler_config.torch_profiler_with_stack,
+            "with_flops": profiler_config.torch_profiler_with_flops,
+            "on_trace_ready": self._on_trace_ready,
+        }
+        if self._schedule is not None:
+            kwargs["schedule"] = self._schedule
+        kwargs.update(self._profiler_kwargs)
+        try:
+            signature(torch.profiler.profile).bind(**kwargs)
+        except TypeError as exc:
+            raise TypeError(f"Invalid profiler_kwargs: {exc}") from exc
+        return torch.profiler.profile(**kwargs)
+
+    def set_profiler_kwargs(self, profiler_kwargs: dict | None) -> None:
+        """Apply constructor overrides to the next inactive profiling session."""
+        if profiler_kwargs is not None and not isinstance(profiler_kwargs, Mapping):
+            raise TypeError("profiler_kwargs must be a mapping or None")
+        kwargs = dict(profiler_kwargs or {})
+        if self._active:
+            if kwargs:
+                logger.warning("Ignoring profiler_kwargs because profiling is active")
+            return
+        # Mutable or opaque options may have changed in place since construction.
+        if (
+            all(value is None or type(value) in (bool, int, float, str, bytes) for value in kwargs.values())
+            and kwargs == self._profiler_kwargs
+            and not kwargs.get("acc_events", False)
+        ):
+            return
+        previous_kwargs = self._profiler_kwargs
+        self._profiler_kwargs = kwargs
+        try:
+            profiler = self._create_profiler(self.profiler_config, self._activities)
+        except Exception:
+            self._profiler_kwargs = previous_kwargs
+            raise
+        self.profiler = profiler
 
     def set_trace_filename(self, filename: str) -> None:
         """Set the trace filename before starting profiling.
@@ -383,13 +487,18 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self._artifact_paths[name] = path
         return path
 
-    @override
     def _start(self) -> None:
         self._ensure_session_dir()
         self._try_enable_memory_history()
+        if self._uses_schedule:
+            # A schedule runs one wait->warmup->active cycle (repeat=1); a
+            # reused profiler object would sit past the exhausted cycle on a
+            # second session, so rebuild it the way vLLM's wrapper does.
+            self.profiler = self._create_profiler(self.profiler_config, self._activities)
+            self._warmup_steps_remaining = self._initial_warmup_steps_remaining
+            self._schedule_steps_consumed = 0
         self.profiler.start()
 
-    @override
     def _stop(self) -> None:
         """Stop profiler, export trace via on_trace_ready, and dump table."""
         self.profiler.stop()
@@ -488,7 +597,6 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         if self.dump_cpu_time_total and rank == 0:
             logger.info(self.profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=50))
 
-    @override
     def annotate_context_manager(self, name: str):
         return torch.profiler.record_function(name)
 

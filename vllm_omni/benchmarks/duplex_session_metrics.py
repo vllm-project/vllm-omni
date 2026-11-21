@@ -42,11 +42,15 @@ _TEXT_DELTA_TYPES = frozenset(
 #: Per-response latencies exported as flat ``mean_/median_/p99_<name>`` keys,
 #: the shape perf baselines read (like ``mean_ttft_ms``). Every response
 #: counts once, however many responses its session had.
+#: ``(row field, flatten name, console label, summary digits, print unit)``.
 DUPLEX_RESPONSE_LATENCY_FIELDS = (
-    ("ttft_ms", "duplex_response_ttft_ms", "server TTFT"),
-    ("ttfp_ms", "duplex_response_ttfp_ms", "server TTFP"),
-    ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT"),
-    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client append TTFP"),
+    ("ttft_ms", "duplex_response_ttft_ms", "server TTFT", 3, "ms"),
+    ("ttfp_ms", "duplex_response_ttfp_ms", "server TTFP", 3, "ms"),
+    ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT", 3, "ms"),
+    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client append TTFP", 3, "ms"),
+    ("client_rtf", "duplex_client_rtf", "client append RTF", 6, ""),
+    ("busy_rtf", "duplex_busy_rtf", "busy RTF", 6, ""),
+    ("stall_ratio", "duplex_stall_ratio", "stall ratio", 6, ""),
 )
 _STREAM_MEASUREMENT_ORIGIN = {
     "ttft": "input stream start to first non-empty text delta",
@@ -161,6 +165,62 @@ def session_stats_turn_metrics(
     }
 
 
+def apply_session_stats_to_request_metrics(
+    request_metrics: Sequence[dict[str, object]],
+    session_stats: Mapping[str, object] | None,
+) -> None:
+    """Copy RFC #8325 turn fields onto request rows that share a ``response_id``.
+
+    No-op when ``session_stats`` is omitted (server did not collect, or the
+    client never asked). Same keys as the Seed-TTS probe's ``turn_session_stats``.
+    """
+    if session_stats is None:
+        return
+    turns = session_stats.get("turns")
+    if not isinstance(turns, list):
+        return
+    stages = session_stats.get("stages")
+    stage_ids = (
+        [stage["stage_id"] for stage in stages if isinstance(stage, Mapping)] if isinstance(stages, list) else None
+    )
+    by_response: dict[str, Mapping[str, object]] = {}
+    for turn in turns:
+        if not isinstance(turn, Mapping):
+            continue
+        for response_id in turn.get("response_ids") or ():
+            if isinstance(response_id, str):
+                by_response[response_id] = turn
+    for metric in request_metrics:
+        response_id = metric.get("response_id")
+        if not isinstance(response_id, str):
+            continue
+        turn = by_response.get(response_id)
+        derived = session_stats_turn_metrics(turn, stage_ids=stage_ids) if turn is not None else {"final": False}
+        chunks = turn.get("chunks") if turn is not None else None
+        reported_stage_ids = sorted(
+            {
+                work["stage_id"]
+                for chunk in (chunks if isinstance(chunks, list) else ())
+                if isinstance(chunk, Mapping)
+                for work in chunk.get("stage_work") or ()
+                if isinstance(work, Mapping) and work.get("spans") and "stage_id" in work
+            }
+        )
+        metric.update(
+            {
+                "busy_rtf": derived.get("busy_rtf"),
+                "stall_ratio": derived.get("stall_ratio"),
+                "server_generation_ms": derived.get("generation_ms"),
+                "server_turn_span_ms": derived.get("turn_span_ms"),
+                "server_stall_ms": derived.get("stall_ms"),
+                "server_audio_ms": derived.get("audio_ms"),
+                "server_stats_final": bool(derived.get("final")),
+                "server_missing_stage_ids": derived.get("missing_stage_ids", []),
+                "server_stage_ids": reported_stage_ids,
+            }
+        )
+
+
 def _client_response_latencies(
     collector: EventCollector,
     response_id: str,
@@ -194,12 +254,15 @@ def collect_duplex_session_metrics(
     *,
     stream_start: float,
     session_id: str | None,
+    session_stats: Mapping[str, object] | None = None,
 ) -> DuplexSessionMetricBundle:
     """Build per-response and session/stream metrics for one duplex session.
 
     ``stream_start`` is the client monotonic time just before input media is
     pushed. Per-response TTFT/TTFP prefer server ``response_request_metrics``
     when present; RTF and the session ``stream_*`` window stay client-receive.
+    ``session_stats`` is the raw ``session.stats`` document when the client
+    fetched it before close; omitted rows keep client metrics only.
     """
     from vllm_omni.clients.duplex import summarize_session_request_metrics
 
@@ -249,6 +312,7 @@ def collect_duplex_session_metrics(
             output_tokens += int(stage0.get("output_token_count") or 0)
         if isinstance(raw_metric, dict) or copied_stages or isinstance(stage0, dict):
             request_metrics.append(metric)
+    apply_session_stats_to_request_metrics(request_metrics, session_stats)
     session_metrics = summarize_session_request_metrics(
         request_metrics,
         session_id=session_id,
@@ -298,8 +362,8 @@ def duplex_response_latency_metrics(request_metrics: Sequence[Mapping[str, objec
     from vllm_omni.clients.duplex import distribution_summary
 
     result: dict[str, float | int] = {}
-    for field, name, _ in DUPLEX_RESPONSE_LATENCY_FIELDS:
-        summary = distribution_summary(_finite_nonnegative(request_metrics, field))
+    for field, name, _label, digits, _unit in DUPLEX_RESPONSE_LATENCY_FIELDS:
+        summary = distribution_summary(_finite_nonnegative(request_metrics, field), digits=digits)
         if summary is None:
             continue
         result[f"num_{name}_samples"] = summary["count"]
@@ -314,11 +378,13 @@ def print_duplex_response_latency_metrics(metrics: Mapping[str, float | int]) ->
     if not metrics:
         return
     print("{s:{c}^{n}}".format(s=" Duplex Per-Response Latency ", n=50, c="="))
-    for _, name, label in DUPLEX_RESPONSE_LATENCY_FIELDS:
+    for _field, name, label, digits, unit in DUPLEX_RESPONSE_LATENCY_FIELDS:
         if f"mean_{name}" not in metrics:
             continue
         for stat, title in (("mean", "Mean"), ("median", "Median"), ("p99", "P99")):
-            print("{:<40} {:<10.2f}".format(f"{title} {label} (ms):", metrics[f"{stat}_{name}"]))
+            heading = f"{title} {label} ({unit}):" if unit else f"{title} {label}:"
+            printed_digits = 2 if unit == "ms" else digits
+            print(f"{{:<40}} {{:<10.{printed_digits}f}}".format(heading, metrics[f"{stat}_{name}"]))
     print("=" * 50)
 
 

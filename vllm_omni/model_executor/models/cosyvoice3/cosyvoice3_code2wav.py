@@ -33,11 +33,13 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    compile_cosyvoice3_padded_dit,
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
     cosyvoice3_full_response_enabled,
     cosyvoice3_packed_inference_enabled,
     cosyvoice3_packed_streaming_enabled,
+    cosyvoice3_stage1_npu_graph_enabled,
 )
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
@@ -97,9 +99,13 @@ class CosyVoice3Code2Wav(nn.Module):
     # the tensors and copy to host without taking another device snapshot.
     owns_generation_output_storage = True
 
-    def __init__(self, config: CosyVoice3Config):
+    def __init__(self, config: CosyVoice3Config, *, enable_npu_graphs: bool = False):
         super().__init__()
         self.config = config
+        # Keep existing NPU deployments unchanged unless the adapter is
+        # explicitly requested. Runtime-wide NPU settings are applied only
+        # after load_weights confirms that this stage is placed on NPU.
+        self._enable_npu_graphs = enable_npu_graphs and cosyvoice3_stage1_npu_graph_enabled()
 
         # Build flow matching components
         pre_lookahead_layer = PreLookaheadLayer(**config.flow["pre_lookahead_layer"])
@@ -567,14 +573,15 @@ class CosyVoice3Code2Wav(nn.Module):
 
         Build each prompt/continuation contiguously before right padding. Padding
         the prompt and continuation separately would insert a gap in conditioning.
-        The default keeps exact-length CPU-F0 HiFT. The opt-in Hopper profile
-        uses packed Flow, batched HiFT, and FP64 GPU F0.
+        The default keeps exact-length per-request HiFT. The opt-in packed
+        profile uses packed Flow and batched HiFT. Both paths use GPU FP32 F0
+        on CUDA by default; COSYVOICE3_F0_ON_CPU=1 selects CPU F0.
         """
         if not items:
             return []
         if stream_items:
             if not cosyvoice3_packed_streaming_enabled():
-                raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on Hopper")
+                raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on a GPU with FA2/FA3")
             if any(bool(item.get("finalize", False)) != bool(items[0].get("finalize", False)) for item in items):
                 raise ValueError("Use forward_streaming_batch to group mixed finalization states")
         if len(items) > 8:
@@ -774,6 +781,14 @@ class CosyVoice3Code2Wav(nn.Module):
         if f0_folded == 0:
             logger.warning("HiFT F0 predictor had no weight-norm layers to fold; check config drift")
         self.hift.eval()
+        # Some lightweight loaders construct this module with ``__new__`` and
+        # attach only the components needed by ``load_weights``. Treat a
+        # missing graph flag as disabled, matching the adapter's opt-in
+        # contract and preserving those compatibility paths.
+        if getattr(self, "_enable_npu_graphs", False) and device.type == "npu":
+            from vllm_omni.platforms.npu.models.cosyvoice3_graph import enable_cosyvoice3_graphs
+
+            enable_cosyvoice3_graphs(self.flow_model.decoder, self.hift)
         if device.type == "cuda" and cosyvoice3_packed_streaming_enabled():
             if os.getenv("COSYVOICE3_CACHED_ISTFT", "0") == "1":
                 self.hift.enable_cached_istft()
@@ -782,3 +797,8 @@ class CosyVoice3Code2Wav(nn.Module):
                 self.hift.enable_decode_graphs()
                 logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")
+        if self.config.cosyvoice3_compile_dit:
+            # Like HiFT folding, cuDNN QKV packing changes state_dict keys.
+            # Reload original checkpoints only into a fresh model instance.
+            compile_cosyvoice3_padded_dit(self.flow_model.decoder.estimator, device)
+            logger.info("CosyVoice3 padded DiT compilation configured; first-use compilation occurs during warmup")

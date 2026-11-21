@@ -2,9 +2,9 @@
 # Verified on 1x H100.
 #
 # Runner selection:
-#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA
-#   for this model. Set `model_runner: v1` to opt out. The `platforms:`
-#   sections at the end of this file keep V1 on NPU, XPU, ROCm and MUSA.
+#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default on CUDA, ROCm,
+#   NPU and XPU. V1 overrides are unsupported with vLLM 0.34; MUSA still
+#   requests V1 and is rejected.
 #   See docs/configuration/stage_configs.md ("Qwen3-TTS with Model Runner V2").
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
@@ -14,7 +14,7 @@
 #     first-chunk latency low, and the MRV2 profiles rely on that bound.
 #   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
-#   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
+#   * Stage 0 uses the existing platform graph defaults.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
 model_runner: v2
@@ -24,6 +24,12 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Opt in to the stateful streaming decoder on CUDA.
+      # New ICL reference lengths trigger lazy graph capture and may increase
+      # first-packet latency; warm up with representative references before measuring.
+      # Continuous incremental history differs from legacy window recomputation
+      # and may change WER. Validate quality on your workload before enabling.
+      decode_streaming: false
       talker_first_audio: true
       codec_streaming: true
       connector_get_sleep_s: 0.01
@@ -61,10 +67,15 @@ connectors:
       #     decode_chunk_frames + decode_left_context_frames (325 by default).
       #     Extra stateless shapes may be added (union, not intersection) with:
       #       decode_cudagraph_capture_sizes: [97, 400]
-      # Graph batch size defaults to 1. Add larger buckets only when needed:
-      #   decode_cudagraph_batch_sizes: [1, 2, 4]
+      # Graph batch size defaults to 1. Use [1, 2, 4] to cover batches up to
+      # decode_batch_max_size (B3 pads to B4). Extra buckets increase warmup
+      # time and graph memory for either backend.
+      # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
+      # Qwen3-TTS NPU optimization defaults are owned by the model and loader.
+      # Set explicit overrides here or in stage additional_config; CUDA keeps
+      # its existing defaults when these options are omitted.
 
 stages:
   - stage_id: 0
@@ -142,8 +153,8 @@ stages:
 
 platforms:
   rocm:
-    # MRV2 is not qualified on ROCm; keep the legacy V1 runner.
-    model_runner: v1
+    # vLLM 0.34 supports only MRV2. Keep Code2Wav eager on ROCm below.
+    model_runner: v2
     stages:
       - stage_id: 1
         # MIOpen Conv1d cannot be invoked while vLLM captures the outer
@@ -151,17 +162,20 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
-    model_runner: v1
+    model_runner: v2
     stages:
       - stage_id: 0
         enforce_eager: false
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          # Full decode graphs require Model Runner V2 on NPU.
+          cudagraph_mode: FULL_AND_PIECEWISE
       - stage_id: 1
+        async_scheduling: false
+        additional_config:
+          npu_incremental_codec: false
         compilation_config:
           cudagraph_mode: PIECEWISE
   xpu:
-    model_runner: v1
     stages:
       - stage_id: 1
         # Level Zero cannot capture the Code2Wav graph.

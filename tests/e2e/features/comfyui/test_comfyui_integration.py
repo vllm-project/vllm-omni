@@ -20,7 +20,7 @@ from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import av
 import pytest
@@ -69,6 +69,7 @@ class ServerCase(NamedTuple):
     stage_list: list
     stage_configs: list[Any]
     outputs: list[OmniRequestOutput]
+    supported_tasks: tuple[str, ...]
     tokenizer: Any = None
 
 
@@ -634,8 +635,36 @@ def mock_async_omni(
         _mock_preprocess_chat,
     )
 
-    if server_case.tokenizer is not None:
-        mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=server_case.tokenizer)
+    # Voice clone resolves inline ref_audio and estimates prompt length before
+    # the mocked engine runs. Those steps must not fetch a checkpoint or decode
+    # media: the client call has no deadline, so a stuck fetch holds the worker.
+    async def _resolve_ref_audio_without_fetch(self, ref_audio_str: str):
+        del self, ref_audio_str
+        import numpy as np
+
+        return np.zeros(24000, dtype=np.float32), 24000, "test-ref-audio"
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.serving_speech.OmniOpenAIServingSpeech._resolve_ref_audio_array",
+        _resolve_ref_audio_without_fetch,
+    )
+
+    def _fake_tokenizer(text, padding=False, **kwargs):
+        del padding, kwargs
+        return {"input_ids": [1] * max(len(text), 1)}
+
+    mocker.patch(
+        "transformers.AutoTokenizer.from_pretrained",
+        return_value=server_case.tokenizer if server_case.tokenizer is not None else _fake_tokenizer,
+    )
+
+    import comfyui_vllm_omni.nodes as comfy_nodes
+
+    class _DeadlineClient(comfy_nodes.VLLMOmniClient):
+        def __init__(self, base_url: str, timeout: float | None = 60, **kwargs):
+            super().__init__(base_url, timeout=60 if timeout is None else timeout, **kwargs)
+
+    monkeypatch.setattr(comfy_nodes, "VLLMOmniClient", _DeadlineClient)
 
     mock_instance = mocker.AsyncMock(spec=RealAsyncOmni)
     mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
@@ -663,7 +692,7 @@ def mock_async_omni(
     mock_instance.input_processor = mocker.MagicMock()
     mock_instance.shutdown = mocker.MagicMock()
     mock_instance.get_vllm_config = mocker.AsyncMock(return_value=None)
-    mock_instance.get_supported_tasks = mocker.AsyncMock(return_value=["generate"])
+    mock_instance.get_supported_tasks = mocker.AsyncMock(return_value=server_case.supported_tasks)
     mock_instance.get_tokenizer = mocker.AsyncMock(return_value=server_case.tokenizer)
 
     mock_async_omni_cls.return_value = mock_instance
@@ -671,7 +700,7 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
+def api_server(server_case: ServerCase, mock_async_omni, tmp_path, single_threaded_cpu):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
     # Override the STORAGE_MANAGER path to a writable temp directory before
     # forking the server subprocess.  The default /tmp/storage may be owned
@@ -701,15 +730,27 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
         except Exception:
             traceback.print_exc()
 
-    server_process = multiprocessing.Process(target=run_server)
+    # The mocks live in this process, so the server must be forked, not spawned.
+    # xdist workers may already have switched the global start method to spawn.
+    # single_threaded_cpu caps the parent thread pools before this fork and
+    # restores them after the test, so later tests on the worker are unaffected.
+    del single_threaded_cpu
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("API server fixture forks so the child inherits the mocked engine")
+    # typeshed types get_context() as BaseContext, which does not declare Process.
+    fork_context = cast(Any, multiprocessing.get_context("fork"))
+    server_process = fork_context.Process(target=run_server)
     server_process.start()
 
     # Wait for the server to be ready by polling the health endpoint.
-    wait_time = 30
-    wait_poll_interval = 1
-    for _ in range(wait_time // wait_poll_interval):
+    wait_time = 60
+    # Each parametrized case starts a lightweight mocked server. Avoid adding
+    # a full second to every startup while keeping the same request timeout.
+    wait_poll_interval = 0.1
+    deadline = time.monotonic() + wait_time
+    while time.monotonic() < deadline:
         try:
-            response = requests.get(f"http://127.0.0.1:{port}/health", timeout=wait_poll_interval)
+            response = requests.get(f"http://127.0.0.1:{port}/health", timeout=1)
             if response.status_code == 200:
                 break
         except requests.RequestException:
@@ -744,6 +785,7 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
                 stage_list=["diffusion"],
                 stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_images_endpoint()],
+                supported_tasks=("x2i",),
             ),
             "Tongyi-MAI/Z-Image-Turbo",
             False,
@@ -755,6 +797,7 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
                 stage_list=["diffusion"],
                 stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],
+                supported_tasks=("x2i",),
             ),
             "ByteDance-Seed/BAGEL-7B-MoT",
             False,
@@ -766,6 +809,7 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
                 stage_list=["diffusion"],
                 stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_images_endpoint()],
+                supported_tasks=("x2i",),
             ),
             "Qwen/Qwen-Image-Edit",
             True,
@@ -777,6 +821,7 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
                 stage_list=["diffusion"],
                 stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],
+                supported_tasks=("x2i",),
             ),
             "ByteDance-Seed/BAGEL-7B-MoT",
             True,
@@ -845,6 +890,7 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
                     _make_stage_config("llm", is_comprehension=False, model_stage="code2wav"),
                 ],
                 outputs=[_build_audio_chat_output(), _build_text_output("Understanding response")],
+                supported_tasks=("generate", "speech"),
             ),
             id="multimodal-understanding",
         )
@@ -899,6 +945,7 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
                 stage_list=["llm"],
                 stage_configs=[_make_stage_config("llm", model_stage="qwen3_tts")],
                 outputs=[_build_audio_speech_output()],
+                supported_tasks=("speech",),
             ),
             VLLMOmniTTS,
             {
@@ -917,6 +964,7 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
                 stage_list=["llm"],
                 stage_configs=[_make_stage_config("llm", model_stage="qwen3_tts")],
                 outputs=[_build_audio_speech_output()],
+                supported_tasks=("speech",),
             ),
             VLLMOmniVoiceClone,
             {
@@ -971,6 +1019,7 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
                 stage_list=["diffusion"],
                 stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             False,
@@ -982,6 +1031,7 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
                 stage_list=["diffusion"],
                 stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             True,
@@ -1049,6 +1099,7 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
                 }
             ],
             outputs=[],
+            supported_tasks=("x2v",),
         )
     ],
     indirect=True,
@@ -1094,6 +1145,7 @@ async def test_seedvr2_restoration_node(api_server: str, monkeypatch: pytest.Mon
                 stage_list=["diffusion"],
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             id="minimax-h3",
         ),
@@ -1252,6 +1304,7 @@ async def test_video_generation_node_rejects_h3_keyframes_for_other_models(keyfr
                 stage_list=["diffusion"],
                 stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             "MiniMaxAI/MiniMax-H3",
             id="canonical_model_name",
@@ -1262,6 +1315,7 @@ async def test_video_generation_node_rejects_h3_keyframes_for_other_models(keyfr
                 stage_list=["diffusion"],
                 stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             "fasth3",
             # A --served-model-name alias lookup_model_spec cannot resolve to H3. The
@@ -1313,6 +1367,7 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
                 stage_list=["diffusion"],
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, sampling_params=None),
             "image_audio",
@@ -1324,6 +1379,7 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
                 stage_list=["diffusion"],
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_LOCK_SOURCE, sampling_params=None),
             "image_audio_lock_source",
@@ -1335,6 +1391,7 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
                 stage_list=["diffusion"],
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),
             "multi_video",
@@ -1346,6 +1403,7 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
                 stage_list=["diffusion"],
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MIXED, sampling_params=None),
             "mixed",
@@ -1477,6 +1535,7 @@ def test_yue2_params_rejects_incompatible_abc(cot: str, abc: str, message: str) 
                 _make_stage_config("llm", model_stage="minimax_music3_acoustic"),
             ],
             outputs=[_build_audio_speech_output()],
+            supported_tasks=("speech",),
             tokenizer=_build_music_tokenizer(),
         )
     ],
@@ -1513,6 +1572,7 @@ async def test_music_generation_node_minimax_music3(api_server: str, sampling_ca
                 stage_list=["diffusion"],
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             id="minimax-h3",
         ),
@@ -1562,6 +1622,7 @@ async def test_video_generation_node_minimax_h3_latent_mask_editing(api_server: 
                 stage_list=["diffusion"],
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
+                supported_tasks=("x2v",),
             ),
             id="minimax-h3",
         ),

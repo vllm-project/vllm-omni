@@ -66,7 +66,7 @@ def _collective_worker(rank, rendezvous, backend):
         model = object.__new__(module.MiniMaxH3Pipeline)
         torch.nn.Module.__init__(model)
         model.device = device
-        model.od_config = SimpleNamespace(enable_layerwise_offload=False)
+        model.od_config = SimpleNamespace(diffusion_offload_config=None, enable_layerwise_offload=False)
         model.video_vae = VisualCodec()
         model.audio_vae = AudioCodec()
         model.partition = "combined"
