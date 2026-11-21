@@ -166,6 +166,36 @@ Content-Type: application/json
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
+### Sampling overrides
+
+Speech requests can override the first AR stage's temperature and repetition
+penalty at the top level or through `extra_params`. Explicit top-level values
+take precedence over nested values, then the stage's `default_sampling_params`;
+omitted or `null` values do not override them. `temperature` must be finite and
+nonnegative; `repetition_penalty` must be finite and positive, with `1.0`
+disabling repetition scaling for the first AR stage.
+
+For Qwen3-TTS, request `temperature` also controls the residual Subtalker's
+temperature and sampling switch. Without a request override, an effective
+first-stage temperature of zero also makes the Subtalker greedy; other values
+keep its deployment defaults. Explicit `extra_params.subtalker_sampling_params`
+fields override residual defaults and take precedence over temperature
+inheritance; `{}` keeps residual defaults without inheriting temperature.
+Accepted fields are `do_sample` (boolean), `temperature` (finite, nonnegative),
+`top_k` (-1 or a nonnegative integer, capped at the residual vocabulary size),
+and `top_p` (only `1.0` is supported).
+
+This request makes both Qwen3-TTS predictors greedy and disables the first
+stage's repetition penalty:
+
+```json
+{
+  "input": "Hello, how are you?",
+  "temperature": 0.0,
+  "repetition_penalty": 1.0
+}
+```
+
 ### Response Format
 
 The response shape depends on the streaming parameters:
