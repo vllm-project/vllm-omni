@@ -52,3 +52,7 @@ cosmos-guardrail>=0.3.1
 # these are long-stable APIs with no version-specific need for 1.18.
 scipy>=1.11.0
 s3tokenizer==0.3.0
+# Storage layer for generated video artifacts and job records: OpenDAL's fs
+# service is the default backend, S3-compatible object stores are selected with
+# VLLM_OMNI_SERVER_STORAGE__TYPE=s3.
+opendal>=0.47.5

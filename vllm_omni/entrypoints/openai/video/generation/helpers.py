@@ -70,6 +70,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
 from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.video.paths import lidar_storage_key
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
     _decode_image_bytes,
@@ -360,7 +361,7 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
 
 
 def _lidar_storage_key(video_id: str) -> str:
-    return f"{video_id}.lidar.safetensors"
+    return lidar_storage_key(video_id)
 
 
 async def _cleanup_video(video_id: str):
@@ -437,15 +438,27 @@ async def _run_video_generation_job(
                 **result.lidar_metadata,
             )
 
-        save_context = await STORAGE_MANAGER.save(result.video_bytes, video_id)
+        file_name = f"{video_id}.{job.file_extension}"
+        save_context = await STORAGE_MANAGER.save(
+            video_id,
+            result.video_bytes,
+            content_type=job.media_type,
+            content_disposition=f'attachment; filename="{file_name}"',
+        )
         if result.lidar_bytes is not None:
-            await STORAGE_MANAGER.save(result.lidar_bytes, _lidar_storage_key(video_id))
+            lidar_key = _lidar_storage_key(video_id)
+            await STORAGE_MANAGER.save(
+                lidar_key,
+                result.lidar_bytes,
+                content_type=lidar.media_type,
+                content_disposition=f'attachment; filename="{lidar_key}"',
+            )
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
         updated_fields = {
             "status": VideoGenerationStatus.COMPLETED,
             "progress": 100,
-            "file_name": f"{video_id}.{job.file_extension}",
+            "file_name": file_name,
             "completed_at": save_context.created_at,
             "inference_time_s": time.perf_counter() - started_at,
             "stage_durations": result.stage_durations,
@@ -457,7 +470,9 @@ async def _run_video_generation_job(
         if save_context.expires_at is not None:
             updated_fields["expires_at"] = save_context.expires_at
 
-        await VIDEO_STORE.update_fields(video_id, updated_fields)
+        # Published only after the record is durable: a client that is told the
+        # job completed must still find it (and its artifact) after a restart.
+        await VIDEO_STORE.update_fields(video_id, updated_fields, durable=True)
     except (EngineGenerateError, EngineDeadError) as exc:
         logger.exception("Video generation failed (engine error) for id=%s", video_id)
 

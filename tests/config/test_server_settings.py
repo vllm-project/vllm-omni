@@ -9,6 +9,14 @@ from vllm_omni.config.server_settings import ServerSettings
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 ENV_VARS = [
+    "VLLM_OMNI_SERVER_STORAGE__TYPE",
+    "VLLM_OMNI_SERVER_STORAGE__BUCKET",
+    "VLLM_OMNI_SERVER_STORAGE__REGION",
+    "VLLM_OMNI_SERVER_STORAGE__ENDPOINT_URL",
+    "VLLM_OMNI_SERVER_STORAGE__PREFIX",
+    "VLLM_OMNI_SERVER_STORAGE__PRESIGN",
+    "VLLM_OMNI_SERVER_STORAGE__PRESIGN_EXPIRES",
+    "VLLM_OMNI_SERVER_STORAGE__PROXY",
     "VLLM_OMNI_SERVER_STORAGE__PATH",
     "VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY",
     "VLLM_OMNI_SERVER_STORAGE__FILE_TTL",
@@ -82,3 +90,30 @@ def test_new_env_var_wins_over_deprecated_alias(monkeypatch):
         storage = ServerSettings().storage
 
     assert storage.path == "/new/path"
+
+
+def test_s3_backend_requires_a_bucket(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__TYPE", "s3")
+
+    with pytest.raises(ValueError, match="bucket"):
+        ServerSettings().storage
+
+
+def test_s3_backend_reads_nested_env_vars(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__TYPE", "s3")
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__BUCKET", "omni-videos")
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__REGION", "us-east-1")
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__ENDPOINT_URL", "http://minio:9000")
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__PREFIX", "omni")
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__PRESIGN", "false")
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__PROXY", "true")
+
+    storage = ServerSettings().storage
+
+    assert storage.type == "s3"
+    assert storage.bucket == "omni-videos"
+    assert storage.region == "us-east-1"
+    assert storage.endpoint_url == "http://minio:9000"
+    assert storage.prefix == "omni"
+    assert storage.presign is False
+    assert storage.proxy is True
