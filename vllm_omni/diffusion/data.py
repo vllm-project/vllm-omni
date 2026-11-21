@@ -328,6 +328,25 @@ class DiffusionParallelConfig:
     allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
+    ulysses_overlap_chunks: int = 0
+    """Overlap the strict Ulysses all-to-all with attention compute (0 disables).
+
+    Splits each rank's heads into this many chunks and exchanges them on a side
+    CUDA stream, so one chunk's Q/K/V transfer and output return overlap the
+    attention of the neighbouring chunks. Layers whose ``num_heads //
+    ulysses_degree`` it does not divide, or that use masks, joint tensors or
+    paged KV, keep the standard path. Requires CUDA, strict pure Ulysses
+    (ring and AllGather degrees 1) and ``ulysses_a2a_permute=False``.
+    """
+
+    ulysses_overlap_int8: bool = False
+    """Send Q/K/V as int8 with one fp32 scale per (token, head) on the overlapped path.
+
+    Roughly halves the Q/K/V all-to-all volume and is lossy: values are
+    dequantized to the input dtype before attention. The attention output is
+    exchanged in the input dtype. Requires ``ulysses_overlap_chunks > 0``.
+    """
+
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -427,6 +446,22 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
+        if self.ulysses_overlap_chunks < 0:
+            raise ValueError(f"ulysses_overlap_chunks must be >= 0, but got {self.ulysses_overlap_chunks}")
+        if self.ulysses_overlap_int8 and self.ulysses_overlap_chunks == 0:
+            raise ValueError("ulysses_overlap_int8 requires ulysses_overlap_chunks > 0")
+        if self.ulysses_overlap_chunks > 0 and (
+            self.ulysses_mode != "strict"
+            or self.ring_degree != 1
+            or self.allgather_degree != 1
+            or self.ulysses_a2a_permute
+        ):
+            raise ValueError(
+                "ulysses_overlap_chunks requires strict pure Ulysses: ulysses_mode='strict', ring_degree=1, "
+                "allgather_degree=1 and ulysses_a2a_permute=False. "
+                f"Got ulysses_mode={self.ulysses_mode!r}, ring_degree={self.ring_degree}, "
+                f"allgather_degree={self.allgather_degree}, ulysses_a2a_permute={self.ulysses_a2a_permute}."
+            )
 
         # Validate HSDP configuration
         if self.use_hsdp:

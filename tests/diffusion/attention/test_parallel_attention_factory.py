@@ -45,3 +45,16 @@ def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, e
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
     assert strategy.call_args.kwargs["ulysses_a2a_permute"] is enabled
+
+
+@pytest.mark.parametrize(("chunks", "int8"), [(0, False), (2, False), (2, True)])
+def test_overlap_settings_are_forwarded_to_pure_ulysses(monkeypatch, parallel_context, chunks, int8):
+    parallel_context.ulysses_overlap_chunks = chunks
+    parallel_context.ulysses_overlap_int8 = int8
+    strategy = Mock()
+    monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
+
+    factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
+
+    assert strategy.call_args.kwargs["overlap_chunks"] == chunks
+    assert strategy.call_args.kwargs["overlap_int8"] is int8

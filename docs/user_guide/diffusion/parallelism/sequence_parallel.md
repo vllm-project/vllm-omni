@@ -232,6 +232,8 @@ In `DiffusionParallelConfig`:
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
 | `ulysses_a2a_permute` | bool | `False` | Enable CUDA copy engines (CE) for strict Ulysses; disabled uses NCCL. On NPU, use platform SHMEM. |
+| `ulysses_overlap_chunks` | int | `0` | Overlap the strict Ulysses all-to-all with attention by exchanging each rank's heads in this many chunks on a side CUDA stream. `0` disables. |
+| `ulysses_overlap_int8` | bool | `False` | On the overlapped path, send Q/K/V as int8 with one scale per token and head (lossy). Requires `ulysses_overlap_chunks > 0`. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -250,6 +252,29 @@ vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-permute
 
 On NPU, the flag retains the existing
 [NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).
+
+### Overlapping the Ulysses all-to-all
+
+Without NVLink, the strict Ulysses all-to-all can take a large share of every
+attention layer, because it runs on the compute stream. Set
+`ulysses_overlap_chunks=k` (CLI: `--ulysses-overlap-chunks k`) to split each
+rank's heads into `k` chunks and exchange them on a side CUDA stream: one
+chunk's transfer then overlaps the attention of its neighbours, and only the
+first chunk's input and the last chunk's output stay exposed.
+
+`k` must divide `num_heads / ulysses_degree`. Attention calls that it does not
+divide, or that use masks, joint tensors, paged KV or a batch larger than one,
+keep the standard path. The option requires CUDA, `ulysses_mode="strict"`,
+`ring_degree=1`, `allgather_degree=1` and `ulysses_a2a_permute=False`.
+
+Add `ulysses_overlap_int8=True` (CLI: `--ulysses-overlap-int8`) to also send
+Q/K/V as int8 with one fp32 scale per token and head, which roughly halves the
+transfer. It is lossy: compare outputs at the same seed before adopting it.
+
+```bash
+vllm serve MiniMaxAI/MiniMax-H3 --omni --task-type ref2va --usp 4 \
+  --ulysses-overlap-chunks 2 --ulysses-overlap-int8
+```
 
 ## Best Practices
 

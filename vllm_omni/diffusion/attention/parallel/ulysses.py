@@ -244,8 +244,13 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
+        overlap_chunks: int = 0,
+        overlap_int8: bool = False,
     ) -> None:
         self._sp_group = sp_group
+        # Chunked all-to-all overlap (see ulysses_overlap.py); Attention._forward_impl applies it per call.
+        self.overlap_chunks = int(overlap_chunks)
+        self.overlap_int8 = bool(overlap_int8)
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
