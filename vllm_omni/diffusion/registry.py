@@ -414,6 +414,11 @@ _DIFFUSION_MODELS = {
         "pipeline_magi2",
         "Magi2Pipeline",
     ),
+    "KyutaiAuraPipeline": (
+        "kyutai_aura",
+        "pipeline_kyutai_aura",
+        "KyutaiAuraPipeline",
+    ),
     "OmniVoicePipeline": (
         "omnivoice",
         "pipeline_omnivoice",
@@ -554,6 +559,8 @@ def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
 _NO_CACHE_ACCELERATION = {
     # Praxis-1 jointly denoises video and actions in its own Euler window loop.
     "Praxis1Pipeline",
+    # Kyutai AURA runs 4 causal steps per chunk over its own rolling K/V history.
+    "KyutaiAuraPipeline",
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
@@ -853,6 +860,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SanaVideoPipeline": "get_sana_video_post_process_func",
     "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
     "Magi2Pipeline": "get_magi2_post_process_func",
+    "KyutaiAuraPipeline": "get_kyutai_aura_post_process_func",
     "SeedVR2Pipeline": "get_seedvr2_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
