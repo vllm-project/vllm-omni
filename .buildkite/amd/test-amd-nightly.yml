@@ -621,53 +621,31 @@ steps:
             ' "$$QWEN_IMAGE_ARTIFACT_DIR/pytest.xml"
 
 
-  # Full-model Stable Audio CPU offload. READY keeps the core_model Qwen-Image
-  # cases, and MERGE runs this file under TORCH_SDPA. This lane is the default
-  # ROCm backend and stays non-blocking while the ROCm memory threshold is unset.
+  # Qualify Stable Audio CPU offload with the default ROCm attention backend.
   - group: ":full_moon: Stable Audio CPU Offload MI300 Nightly"
     steps:
       - label: "Stable Audio CPU Offload"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 60
         source_file_dependencies:
           - diffusion_offloader
           - diffusion_stable_audio_function
+          - rocm_diffusion_nightly_runner
+        env:
+          STABLE_AUDIO_ROCM_CPU_OFFLOAD_CHECK: "1"
         artifact_paths:
           - artifacts/rocm-stable-audio-cpu-offload/**/*
         commands:
-          - export STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-stable-audio-cpu-offload"
-          - mkdir -p "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR"
           # Restore the provenance-checked unmasked BF16 AITER MHA module used
           # by the default ROCm diffusion backend before either inference path.
           - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
-          - |
-            node='tests/diffusion/offloader/test_diffusion_cpu_offload.py::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
-            pytest --collect-only -q \
-              tests/diffusion/offloader/test_diffusion_cpu_offload.py \
-              -m 'full_model and rocm and MI325 and cards_1' \
-              --run-level full_model > "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt"
-            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
-              "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 1 ]]; then
-              echo "Expected exactly one Stable Audio CPU-offload node, found $$count." >&2
-              cat "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
           - >-
-            timeout --signal=TERM --kill-after=2m 45m
-            pytest -s -v -ra
-            tests/diffusion/offloader/test_diffusion_cpu_offload.py
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 45m rocm-stable-audio-cpu-offload
+            'tests/diffusion/offloader/test_diffusion_cpu_offload.py::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
             -m 'full_model and rocm and MI325 and cards_1'
-            --run-level full_model
-            --durations=0
-            --junitxml="$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.xml"
-            2>&1 | tee "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.log"
-          - >-
-            tail -n 100 "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.log" >
-            "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"
-
 
   # CUDA nightly "Diffusion · Offloader Test" selects this full_model node.
   # The ROCm mark is cards_1. The existing 512 MB savings check stays in the
@@ -2370,7 +2348,7 @@ steps:
       - label: "MiniCPM-o 4.5 Duplex Function"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: [omni_minicpmo_4_5_duplex_function, ci_rocm]
         artifact_paths:
