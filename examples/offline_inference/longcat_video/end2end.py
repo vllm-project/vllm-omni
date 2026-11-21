@@ -18,13 +18,12 @@ import torch
 from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
     prepare_longcat_video_avatar_model_for_omni,
 )
-from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Generate LongCat-Video-Avatar A2V/AI2V video.")
     parser.add_argument("--model", default="meituan-longcat/LongCat-Video-Avatar-1.5")
     parser.add_argument("--base-model-dir", default=None, help="Optional local LongCat-Video base model directory.")
@@ -36,6 +35,16 @@ def parse_args():
     parser.add_argument("--input-json", default=None, help="Official LongCat Avatar JSON case for AI2V.")
     parser.add_argument("--output", default="longcat_avatar_output.mp4")
     parser.add_argument("--resolution", choices=["480p", "720p"], default="480p")
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Pixel height override for AT2V/AI2V; requires --width. "
+        "Dimensions must align with the VAE and transformer patches (multiples of 16 for Avatar 1.5). "
+        "Use --height 512 --width 768 for a BSA-compatible 480p spatial grid. "
+        "The default 480p AT2V size 480x832 falls back to dense attention.",
+    )
+    parser.add_argument("--width", type=int, default=None, help="Pixel width override; requires --height.")
     parser.add_argument("--num-frames", type=int, default=93)
     parser.add_argument("--num-segments", default="1", help="Number of AVC segments, or 'auto' to cover full audio.")
     parser.add_argument("--num-cond-frames", type=int, default=13)
@@ -47,6 +56,13 @@ def parse_args():
     parser.add_argument("--use-distill", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-int8", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--enable-bsa",
+        action="store_true",
+        default=False,
+        help="Enable LongCat Avatar BSA for equal-length, chunk-aligned self-attention. "
+        "Other attention shapes, including unequal-length AI2V/AVC attention, stay dense.",
+    )
+    parser.add_argument(
         "--build-components-on-gpu",
         action="store_true",
         default=False,
@@ -55,7 +71,12 @@ def parse_args():
     parser.add_argument("--use-kv-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--offload-kv-cache", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--enforce-eager", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if (args.height is None) != (args.width is None):
+        parser.error("--height and --width must be provided together.")
+    if args.height is not None and (args.height <= 0 or args.width <= 0):
+        parser.error("--height and --width must be positive.")
+    return args
 
 
 def _extract_frames(output: Any):
@@ -204,6 +225,8 @@ def _create_merged_audio_for_case(
 
 def main():
     args = parse_args()
+    from vllm_omni.entrypoints.omni import Omni
+
     input_case = None
     input_asset_root = None
     audio_for_mux = args.audio
@@ -224,6 +247,7 @@ def main():
         "resolution": args.resolution,
         "use_distill": args.use_distill,
         "use_int8": args.use_int8,
+        "enable_bsa": args.enable_bsa,
         "build_components_on_gpu": args.build_components_on_gpu,
     }
     if args.base_model_dir:
@@ -270,6 +294,8 @@ def main():
             OmniDiffusionSamplingParams(
                 generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed),
                 seed=args.seed,
+                height=args.height,
+                width=args.width,
                 guidance_scale=1.0 if args.use_distill else 4.0,
                 guidance_scale_2=1.0 if args.use_distill else 4.0,
                 num_inference_steps=args.num_inference_steps,
