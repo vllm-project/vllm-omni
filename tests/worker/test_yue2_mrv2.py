@@ -15,15 +15,18 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
+from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.model_executor.models.yue2.model_state import Yue2ModelState, Yue2Sampler
-from vllm_omni.model_executor.models.yue2.runtime import Yue2ForCausalLM, Yue2SchedulerOutput
+from vllm_omni.model_executor.models.yue2.runtime import Yue2ForCausalLM, Yue2Scheduler, Yue2SchedulerOutput
 from vllm_omni.model_executor.models.yue2.yue2 import CODEC_OFFSET, MUSIC_END
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.request import OmniRequest
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.staged_writes import StagedWrites
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -159,6 +162,66 @@ def test_detachment_does_not_cancel_audio_and_phase_replacement_does(state, mock
     # A later abort still reaches model cleanup after the native slot is gone.
     runner.finish_requests(replace(schedule, finished_req_ids={"synthesizing"}, replaced_req_ids=set()))
     state.model.on_requests_finished.assert_called_with({"synthesizing"})
+
+
+def test_waiting_semantic_cfg_pair_releases_its_old_abc_slot(mocker, monkeypatch):
+    from tests.core.sched.test_omni_cfg_ar_scheduler import _scheduler
+
+    # Keep the native four-slot allocator and add/remove paths; only the
+    # device-backed buffers and runner components are stubbed on CPU.
+    mocker.patch("vllm.v1.worker.gpu.states.UvaBackedTensor")
+    mocker.patch("vllm.v1.worker.gpu.states.StagedWriteTensor")
+    runner = object.__new__(OmniARModelRunner)
+    runner.req_states = RequestState(4, 32, 32, 0, 16, torch.device("cpu"))
+    runner.model = mocker.Mock(spec=Yue2ForCausalLM)
+    runner.model_state = object.__new__(Yue2ModelState)
+    runner.model_state.model = runner.model
+    runner.model_state.intermediate_buffer = OmniIntermediateBuffer(4)
+    runner.model_state._mtp_state = mocker.Mock(spec=MTPState)
+    runner.model_state.rope_state = runner.model_state.prompt_embeds_state = None
+    runner._staged_writes = StagedWrites()
+    runner._mm_rng_state = runner.sampler = runner.speculator = runner.adaptive_verification = None
+    runner.pooling_runner = runner.pp_handler = runner.encoder_cache = runner.prompt_logprobs_worker = None
+    runner.is_last_pp_rank = False
+    runner.draft_tokens_handler = set()
+    runner.block_tables, runner.lora_state = mocker.Mock(), mocker.Mock()
+
+    active = ("c", "d")
+    first, second = ("a", "a-negative"), ("b", "b-negative")
+    requests = {rid: OmniRequest(rid, [1, 2], SamplingParams(max_tokens=8), None) for rid in (*active, *first, *second)}
+    scheduler = _scheduler(
+        monkeypatch,
+        [requests[rid] for rid in (*first, *second)],
+        [requests[rid] for rid in active],
+        scheduler_cls=Yue2Scheduler,
+    )
+    scheduler._rejected = {}
+    scheduler.max_num_active_reqs = scheduler.max_num_running_reqs = 4
+    scheduler._pairs = {pos: {"cond": pos, "uncond": neg} for pos, neg in (first, second)}
+    scheduler._request_pairs = {rid: pos for pos, neg in (first, second) for rid in (pos, neg)}
+
+    def admit(schedule, new_ids):
+        # The base scheduler test fixture reports token counts only. Supply
+        # the corresponding new rows to exercise the real MRv2 admission.
+        schedule.scheduled_new_reqs = [OmniNewRequestData.from_request(requests[rid], ([],), [1, 2]) for rid in new_ids]
+        runner.finish_requests(schedule)
+        runner.add_requests(schedule)
+
+    admit(Yue2SchedulerOutput.make_empty(), (*active, "a", "b"))
+    requests["a"].yue2_reset_phase = requests["b"].yue2_reset_phase = True
+    for pair in (first, second):
+        step = scheduler.schedule()
+        assert set(step.num_scheduled_tokens) == {*active, *pair}
+        assert [req.request_id for req in scheduler.waiting] == (list(second) if pair == first else [])
+        admit(step, pair)
+        assert set(runner.req_states.req_id_to_index) == {*active, *pair}
+        assert step.replaced_req_ids == ({"a", "b"} if pair == first else set())
+        runner.finish_requests(replace(Yue2SchedulerOutput.make_empty(), finished_req_ids=set(pair)))
+        for rid in pair:
+            scheduler.running.remove(scheduler.requests.pop(rid))
+    runner.finish_requests(replace(Yue2SchedulerOutput.make_empty(), finished_req_ids=set(active)))
+    assert not runner.req_states.req_id_to_index
+    assert sorted(runner.req_states.free_indices) == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

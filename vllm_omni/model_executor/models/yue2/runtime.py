@@ -199,10 +199,13 @@ class Yue2SchedulerBase(OmniARScheduler):
             output = OmniCFGARScheduler.schedule(self, throttle_prefills)
         else:
             output = OmniARScheduler.schedule(self, throttle_prefills)
-        acoustic = {rid for rid, r in self.requests.items() if getattr(r, "yue2_acoustic", False)}
+        acoustic = set()
         replaced = set()
-        for rid in output.num_scheduled_tokens:
-            request = self.requests[rid]
+        for rid, request in self.requests.items():
+            if getattr(request, "yue2_acoustic", False):
+                acoustic.add(rid)
+            # A queued semantic pair no longer owns its old ABC slot. Release
+            # it before the runner admits any new rows on this step.
             if getattr(request, "yue2_reset_phase", False):
                 replaced.add(rid)
                 request.yue2_reset_phase = False
