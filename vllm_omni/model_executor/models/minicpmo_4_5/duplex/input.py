@@ -69,8 +69,6 @@ class _QueuedVisionHold(PcmAppendReservation):
 class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
     __slots__ = (
         "_active",
-        "_force_listen",
-        "_is_speech",
         "_owner",
         "_raw",
         "_sample_rate_hz",
@@ -89,8 +87,6 @@ class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
         payload: dict[str, object] | None,
         raw: bytes,
         sample_rate_hz: int,
-        force_listen: bool,
-        is_speech: bool,
         spans: list[_PcmSpan] | None = None,
         turn_had_speech: bool = False,
         video_frames: list[str] | None = None,
@@ -101,8 +97,6 @@ class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
         self.payload = payload
         self._raw = raw
         self._sample_rate_hz = sample_rate_hz
-        self._force_listen = force_listen
-        self._is_speech = is_speech
         self._spans = list(spans or [])
         self._turn_had_speech = turn_had_speech
         self._video_frames = list(video_frames or [])
@@ -277,8 +271,6 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
             payload=payload,
             raw=b"",
             sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int) else 0,
-            force_listen=bool(payload.get("force_listen", False)),
-            is_speech=bool(payload.get("is_speech", False)),
             turn_had_speech=bool(payload.get("is_speech", False)),
         )
         self._reservations.append(reservation)
@@ -344,8 +336,6 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
                 payload=out,
                 raw=b"",
                 sample_rate_hz=sample_rate_hz,
-                force_listen=bool(out.get("force_listen", False)),
-                is_speech=False,
                 turn_had_speech=self._turn_had_speech,
                 video_frames=frames if isinstance(frames, list) else [],
                 # A frame popped in the same call was never charged. One that
@@ -406,8 +396,6 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
             payload=out,
             raw=reserved_raw,
             sample_rate_hz=sample_rate_hz,
-            force_listen=bool(out.get("force_listen", False)),
-            is_speech=bool(out.get("is_speech", False)),
             spans=reserved_spans,
             turn_had_speech=self._turn_had_speech,
             video_frames=attached_frames,
@@ -474,8 +462,6 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
                 payload=None,
                 raw=b"",
                 sample_rate_hz=self._sample_rate_hz or 0,
-                force_listen=self._buffer_force_listen(),
-                is_speech=self._buffer_is_speech(),
                 turn_had_speech=had_speech,
             )
             self._reservations.append(reservation)
