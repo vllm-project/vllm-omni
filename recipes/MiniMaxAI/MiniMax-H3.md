@@ -669,9 +669,9 @@ vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors 
 ```
 
 This deployment defaults to 50 steps. For a Turbo file, send
-`num_inference_steps: 8` with each request. Do not use the `_turbo`
-deployments: they carry LightX2V's 5-step defaults for the official
-checkpoint.
+`num_inference_steps=8` with each request. Do not use the `_turbo`
+deployments: they carry the official LightX2V four-step defaults
+(five sigma points, `flow_shift=6`).
 
 ## AMD ROCm (gfx942 / gfx950)
 
