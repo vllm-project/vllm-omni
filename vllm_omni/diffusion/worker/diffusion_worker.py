@@ -55,6 +55,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
     shutdown_kv_connector,
 )
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.distributed.errors import DistributedExecutionError
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     get_cfg_group,
@@ -2259,6 +2260,11 @@ class WorkerProc:
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
                         self._return_result(result, rpc_id=rpc_id)
+                except DistributedExecutionError:
+                    # Exit without distributed teardown: peers may be blocked.
+                    # The executor's process monitor terminates the whole group.
+                    logger.exception("Fatal distributed execution failure on worker %s", self.gpu_id)
+                    os._exit(1)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)
@@ -2322,6 +2328,9 @@ class WorkerProc:
                     if not isinstance(msg, (OmniDiffusionRequest, list)):
                         raise TypeError(f"Unsupported generation request type: {type(msg).__name__}")
                     output = self.worker.execute_model(msg, self.od_config)
+                except DistributedExecutionError:
+                    logger.exception("Fatal distributed execution failure on worker %s", self.gpu_id)
+                    os._exit(1)
                 except Exception as e:
                     logger.error(
                         f"Error executing forward in event loop: {e}",

@@ -361,9 +361,12 @@ class DiffusionParallelConfig:
       convolutions.
     - "spatial_shard_width": Same as "spatial_shard_height" but sharded along width.
 
-    The "spatial_shard_*" modes are decode-only and currently require
-    ``vae_patch_parallel_size`` to match the DiT group size; otherwise the VAE
-    falls back to tile-parallel decode at runtime.
+    The "spatial_shard_*" modes are decode-only. Wan requires
+    ``vae_patch_parallel_size`` to match the DiT group size; a mismatch uses
+    its tile-parallel fallback for non-streaming decode above the tile threshold.
+    Qwen-Image VAEs (including Ming-Image) require the size to match the VAE
+    executor process-group size and raise ValueError on mismatch, without
+    falling back to tile decode.
     """
 
     use_hsdp: bool = False
