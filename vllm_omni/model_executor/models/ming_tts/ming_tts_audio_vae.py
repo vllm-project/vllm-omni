@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 import warnings
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -15,6 +15,10 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
+from vllm_omni.model_executor.models.common.ming.batched_vae_decoder import (
+    BatchedStreamingVAEDecoder,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import read_bool_flag
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, MingTTSConfig
@@ -45,6 +49,23 @@ class MingAudioVAEModel(nn.Module):
         self._past_key_values: dict[str, Any] = {}
         self._stream_state: dict[str, tuple[Any, Any, Any]] = {}
         self._state_access_times: OrderedDict[str, float] = OrderedDict()
+
+        # vae_batched_decode (stage-config extra, default off): route the
+        # stage-2 decode through BatchedStreamingVAEDecoder -- every active
+        # stream's new latents in one packed pass with CUDA graphs, per-stream
+        # KV in a bounded paged ring instead of a growing DynamicCache.
+        # Measured on the Ming-omni-tts-0.5B decoder geometry (H100, bf16):
+        # ~11x faster per-stream decode at max_num_seqs=1, ~25x at 4 streams.
+        # One stream may decode at most MAX_STREAM_POSITIONS=16384 decoder
+        # tokens (~1024 patches, ~82 s of audio); a longer stream fails
+        # loudly at that bound.
+        extra = self._extra_config()
+        self._batched_enabled = read_bool_flag(extra, "vae_batched_decode", False)
+        self._batched: BatchedStreamingVAEDecoder | None = None
+        if self._batched_enabled:
+            # Multi-patch chunks decode in one call; the holdback upsampler
+            # emits the same samples, as early, as one patch per call.
+            self.audio.decoder.upsampling.frame_holdback = True
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         hidden_size = int(self.ming_config.llm_hidden_size)
@@ -107,6 +128,8 @@ class MingAudioVAEModel(nn.Module):
             runtime_infos = kwargs.get("runtime_additional_information")
             info_list = runtime_infos if isinstance(runtime_infos, list) else None
         info_list = info_list or [{}]
+        if self._batched_enabled:
+            return self._forward_batched(info_list)
         num_reqs = max(len(info_list), 1)
         sr_tensor = torch.tensor(int(self.ming_config.sample_rate), dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32, device=self.vllm_config.device_config.device)
@@ -215,6 +238,138 @@ class MingAudioVAEModel(nn.Module):
             },
         )
 
+    def _forward_batched(self, info_list: list[dict[str, Any]]) -> OmniOutput:
+        """Batched decode path (``vae_batched_decode``): the same payload
+        validation as the per-patch path, but every active stream's chunk of
+        the step decodes in one packed decoder pass."""
+        sr_tensor = torch.tensor(int(self.ming_config.sample_rate), dtype=torch.int32)
+        device = self.vllm_config.device_config.device
+        dtype = next(self.audio.parameters()).dtype
+        empty = torch.zeros((0,), dtype=torch.float32, device=device)
+        outputs: list[torch.Tensor | None] = []
+        pending: list[tuple[int, str, torch.Tensor, bool]] = []
+        for idx in range(max(len(info_list), 1)):
+            info = info_list[idx] if idx < len(info_list) and isinstance(info_list[idx], dict) else {}
+            meta = info.get("meta") or {}
+            kv_meta = info.get("kv_metadata") or {}
+            has_ming_context = _has_ming_context(info)
+            if has_ming_context and KEY_REQUEST_ID not in info and KEY_REQUEST_ID not in kv_meta:
+                raise RuntimeError(
+                    f"Ming Stage-2 received a payload without {KEY_REQUEST_ID}. keys={sorted(info.keys())}"
+                )
+            request_id = _resolve_request_id(info, idx)
+            self._touch_request_state(request_id)
+            chunk_id = _coerce_optional_int(_first_present(info.get(KEY_CHUNK_ID), kv_meta.get(KEY_CHUNK_ID)))
+            finished = _coerce_finished(
+                _first_present(
+                    meta.get("stream_finished"),
+                    meta.get("finished"),
+                    info.get("stream_finished"),
+                    kv_meta.get("stream_finished"),
+                    torch.tensor(True),
+                )
+            )
+            stripped = bool(
+                _first_present(
+                    meta.get("_ming_payload_stripped"),
+                    info.get("_ming_payload_stripped"),
+                    kv_meta.get("_ming_payload_stripped"),
+                    False,
+                )
+            )
+            if stripped:
+                raise RuntimeError(
+                    "Ming Stage-2 payload was stripped before model entry. "
+                    f"request_id={request_id} chunk_id={chunk_id} keys={sorted(info.keys())}"
+                )
+            latent = _first_present(
+                info.get("latent"),
+                info.get("ming_latent_patches"),
+                kv_meta.get("ming_latent_patches"),
+            )
+            # Validate on the host; all chunks of the step move to the device together below.
+            latent_tensor = (
+                None
+                if latent is None
+                else _coerce_latent_chunk(
+                    latent,
+                    device=latent.device if isinstance(latent, torch.Tensor) else torch.device("cpu"),
+                    dtype=latent.dtype if isinstance(latent, torch.Tensor) else torch.float32,
+                    latent_dim=self.ming_config.latent_dim,
+                    patch_size=self.ming_config.patch_size,
+                )
+            )
+            if latent_tensor is None or latent_tensor.numel() == 0:
+                if has_ming_context and not finished:
+                    raise RuntimeError(
+                        "Ming Stage-2 received no latent chunk for an unfinished request. "
+                        f"request_id={request_id} chunk_id={chunk_id} keys={sorted(info.keys())}"
+                    )
+                if finished:
+                    self._clear_request_state(request_id)
+                outputs.append(empty)
+                continue
+            outputs.append(None)
+            pending.append((idx, request_id, latent_tensor, finished))
+
+        if pending:
+            # One host-to-device copy for every chunk instead of a blocking copy each.
+            chunks = [item[2] for item in pending]
+            if all(chunk.device.type == "cpu" for chunk in chunks):
+                host = torch.cat([chunk.to(torch.float32) for chunk in chunks])
+                if device.type == "cuda":
+                    host = host.pin_memory()
+                moved = host.to(device, non_blocking=True).to(dtype).split([chunk.shape[0] for chunk in chunks])
+            else:
+                moved = [chunk.to(device=device, dtype=dtype) for chunk in chunks]
+            pending = [
+                (idx, request_id, chunk, finished) for (idx, request_id, _, finished), chunk in zip(pending, moved)
+            ]
+
+        decoder = self._batched_decoder()
+        while pending:
+            # A request with several queued chunks decodes them in order.
+            seen: set[str] = set()
+            batch: list[tuple[int, str, torch.Tensor, bool]] = []
+            rest: list[tuple[int, str, torch.Tensor, bool]] = []
+            for item in pending:
+                (rest if item[1] in seen else batch).append(item)
+                seen.add(item[1])
+            waveforms = decoder.decode([(request_id, latent, finished) for _, request_id, latent, finished in batch])
+            for (idx, request_id, _, finished), waveform in zip(batch, waveforms, strict=True):
+                outputs[idx] = waveform
+                if finished:
+                    self._clear_request_state(request_id)
+            pending = rest
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={"model_outputs": outputs, "sr": [sr_tensor] * len(outputs)},
+        )
+
+    def _extra_config(self) -> dict[str, Any]:
+        model_config = getattr(self.vllm_config, "model_config", None)
+        connector = getattr(model_config, "stage_connector_config", None)
+        if isinstance(connector, Mapping):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        return dict(extra) if isinstance(extra, Mapping) else {}
+
+    def _batched_decoder(self) -> BatchedStreamingVAEDecoder:
+        if self._batched is None:
+            max_seqs = int(getattr(self.vllm_config.scheduler_config, "max_num_seqs", 64))
+            self._batched = BatchedStreamingVAEDecoder(self.audio.decoder, max_streams=max(256, 4 * max_seqs))
+        return self._batched
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        # Backstop for requests that end without a final finished=True payload
+        # (e.g. aborted); the normal path clears state in forward. Scoped to
+        # the batched path so the default per-patch path is untouched.
+        if not self._batched_enabled:
+            return
+        for request_id in finished_req_ids:
+            self._clear_request_state(request_id)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
         if not weights:
@@ -241,12 +396,18 @@ class MingAudioVAEModel(nn.Module):
                 f"MingAudioVAEModel: skipped {len(skipped)} checkpoint keys during load. First few: {skipped[:8]}",
                 stacklevel=2,
             )
+        if self._batched_enabled and next(self.audio.parameters()).is_cuda:
+            # The stage runs eagerly; its decoder captures its own graphs once
+            # the weights are in place, before memory profiling.
+            self._batched_decoder().capture_graphs()
         return loaded
 
     def _clear_request_state(self, request_id: str) -> None:
         self._past_key_values.pop(request_id, None)
         self._stream_state.pop(request_id, None)
         self._state_access_times.pop(request_id, None)
+        if self._batched is not None:
+            self._batched.release(request_id)
 
     def _touch_request_state(self, request_id: str) -> None:
         now = time.monotonic()
