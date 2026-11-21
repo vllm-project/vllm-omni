@@ -20,6 +20,11 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     VIDEO_HISTORY_HEADER,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompt import (
+    drop_oldest_visual_frame,
+    interleave_history,
+    validate_working_messages,
+)
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
     JOYAI_TTS_CLOSE_ONLY_KEY,
     JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY,
@@ -87,6 +92,7 @@ def render_joyai_session_prompt(
     summary: str = "",
     visual_summaries: Sequence[str] = (),
     context_blocks: Sequence[str] = (),
+    working_messages: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[Any]]:
     """Fit ASR's query, preserving the standing instruction and current input.
 
@@ -98,9 +104,22 @@ def render_joyai_session_prompt(
     history, images, image_token_counts = list(history), list(images), list(image_token_counts)
     recent_history = history.copy()
     visual_summaries = list(visual_summaries)
+    if working_messages is not None:
+        # Only prompt-local content lists are mutated during frame eviction.
+        working_messages = [
+            {
+                **message,
+                "content": list(message["content"]) if isinstance(message["content"], list) else message["content"],
+            }
+            for message in working_messages
+        ]
     rebudget_history = False
     while True:
-        content = [{"type": "image"} for _ in images]
+        content = (
+            list(working_messages[-1]["content"])
+            if working_messages is not None
+            else [{"type": "image"} for _ in images]
+        )
         content.extend({"type": "text", "text": block} for block in blocks)
         content.append(
             {
@@ -112,7 +131,16 @@ def render_joyai_session_prompt(
         )
         memory = render_joyai_memory_prefix(summary, visual_summaries)
         prefix = [{"role": "user", "content": value} for value in (memory, instruction) if value]
-        messages = [{"role": "system", "content": system}, *prefix, *history, {"role": "user", "content": content}]
+        if working_messages is not None:
+            turns = interleave_history(
+                history,
+                [*working_messages[:-1], {**working_messages[-1], "content": content}],
+                set(),
+                history_query_headers=False,
+            )
+        else:
+            turns = [*history, {"role": "user", "content": content}]
+        messages = [{"role": "system", "content": system}, *prefix, *turns]
         rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         text_tokens = processor.tokenizer(text=[rendered])["input_ids"][0]
         if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
@@ -132,6 +160,8 @@ def render_joyai_session_prompt(
             visual_summaries.pop(0)
             rebudget_history = True
         elif len(images) > 1:
+            if working_messages is not None:
+                drop_oldest_visual_frame(working_messages)
             images.pop(0)
             image_token_counts.pop(0)
         else:
@@ -203,6 +233,8 @@ def asr_to_joyai(
                 or any(type(count) is not int or count < 0 for count in image_token_counts)
             ):
                 raise OmniClientError("joyai_image_token_counts must contain one non-negative integer per image")
+            if "working_messages" in context:
+                validate_working_messages(context["working_messages"], context["history"], len(images))
             # ASR determines the query length. Apply the same history/visual
             # eviction policy as direct observations only once it is known.
             joyai_input["prompt"], images = render_joyai_session_prompt(
@@ -217,6 +249,7 @@ def asr_to_joyai(
                 summary=context.get("summary", ""),
                 visual_summaries=context.get("visual_summaries", []),
                 context_blocks=(delegation_context,) if delegation_context else (),
+                working_messages=context.get("working_messages"),
             )
             visual_inputs = {"image": images} if images else {}
         if requires_multimodal_data and visual_inputs:
@@ -344,7 +377,7 @@ def joyai_action_to_tts(
             if not spoken_text:
                 continue
 
-        tts_metadata = _build_tts_metadata(request_prompt, spoken_text)
+        tts_metadata: dict[str, Any] = _build_tts_metadata(request_prompt, spoken_text)
         _validate_talker_speaker(tts_metadata, target_model_config)
         talker_prompt_length = 1 if close_only else _compute_talker_prompt_length(tts_metadata, target_model_config)
         # Sentence 2+ is submit_update on the same Talker id after 2150. The AR
