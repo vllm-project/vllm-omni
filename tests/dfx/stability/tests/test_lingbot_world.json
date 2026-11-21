@@ -1,7 +1,7 @@
 [
     {
         "test_name": "test_lingbot_world_realtime_stability",
-        "description": "LingBot-World 2.0 realtime streaming 24h: 8-GPU Ulysses SP-8 compiled topology (usp4_compiled.yaml base + SP8 stage_overrides), one WS /v1/realtime/video session per batch, 40 chunks/session at 16 fps (12 fps real-time basis).",
+        "description": "LingBot-World 2.0 realtime streaming 24h: 8-GPU Ulysses SP-8 compiled topology (usp4_compiled.yaml base + SP8 stage_overrides), one WS /v1/realtime/video session per batch, 40 chunks/session at 16 fps (12 fps real-time basis). Each completed CUDA rollout checks stop/close/transport-loss recovery and post-recovery memory growth.",
         "mark": [
             {
                 "hardware_marks": {
@@ -40,7 +40,9 @@
                 "target_fps": 12,
                 "seed": 42,
                 "camera_pattern": "forward",
-                "flow_shift": 5.0
+                "flow_shift": 5.0,
+                "lifecycle_checks": true,
+                "lifecycle_memory_growth_budget_bytes": 268435456
             }
         ]
     },

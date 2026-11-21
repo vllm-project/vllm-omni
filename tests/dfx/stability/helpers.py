@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stability helpers for resource monitoring and benchmark execution."""
 
 from __future__ import annotations
@@ -310,6 +313,7 @@ def _run_one_vllm_bench_batch(
     batch_index: int,
 ) -> dict[str, Any]:
     base = _build_base_args(params, host, port)
+    flow: float | int | None
     if request_rate is not None:
         args = base + ["--request-rate", str(request_rate), "--num-prompts", str(num_prompts)]
         flow = request_rate
@@ -429,7 +433,7 @@ def _run_one_lingbot_world_batch(
     _num_prompts: int,
     _request_rate: float | None,
     _max_concurrency: int | None,
-    _result_dir: str,
+    result_dir: str,
     batch_index: int,
 ) -> dict[str, Any]:
     """Run one LingBot-World realtime streaming session.
@@ -442,8 +446,9 @@ def _run_one_lingbot_world_batch(
     """
     benchmark_script = Path(REPO_ROOT / "benchmarks" / "lingbot_world" / "benchmark_lingbot_world_realtime.py")
     num_chunks = int(params.get("num_chunks", 16))
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="stability_lingbot_world_", delete=False) as tmp:
-        out_path = Path(tmp.name)
+    Path(result_dir).mkdir(parents=True, exist_ok=True)
+    artifact_dir = Path(tempfile.mkdtemp(prefix=f"lingbot-world-batch-{batch_index}-", dir=result_dir))
+    out_path = artifact_dir / "benchmark.json"
     try:
         cmd: list[str] = [
             sys.executable,
@@ -469,6 +474,8 @@ def _run_one_lingbot_world_batch(
             "duration_sec",
             "num_prompts_per_batch",
             "sessions",
+            "lifecycle_checks",
+            "lifecycle_memory_growth_budget_bytes",
         }
         for key, value in params.items():
             if key in skip_keys or value is None:
@@ -482,7 +489,8 @@ def _run_one_lingbot_world_batch(
                 cmd.extend([flag, json.dumps(value, ensure_ascii=False, separators=(",", ":"))])
             else:
                 cmd.extend([flag, str(value)])
-        if "image" not in params:
+        image = params.get("image")
+        if image is None:
             # LingBot-World is image-conditioned and the first frame is required.
             # Default to a local synthetic frame so the benchmark never fetches
             # vLLM's remote public asset (unreachable behind a self-signed TLS /
@@ -490,13 +498,28 @@ def _run_one_lingbot_world_batch(
             from tests.helpers.media import generate_synthetic_image
 
             synthetic = generate_synthetic_image(832, 480, seed=42)
-            cmd.extend(["--image", synthetic["file_path"]])
+            image = synthetic["file_path"]
+            cmd.extend(["--image", image])
         cmd.extend(["--num-chunks", str(num_chunks)])
 
+        (artifact_dir / "command.json").write_text(json.dumps(cmd, indent=2) + "\n", encoding="utf-8")
         print(f"\n[Stability][Batch {batch_index}] LingBot-World benchmark command:")
         print(shlex.join(cmd))
 
-        proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+        # Direct script execution puts benchmarks/ first on sys.path. Ensure
+        # the selected source wins over an editable install of another checkout.
+        paths = [str(REPO_ROOT)]
+        if inherited := os.environ.get("PYTHONPATH"):
+            paths.append(inherited)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(paths)},
+        )
+        (artifact_dir / "client.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+        (artifact_dir / "client.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
         if proc.stdout:
             print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
         if proc.stderr:
@@ -525,17 +548,26 @@ def _run_one_lingbot_world_batch(
                 "duration": 0.0,
                 "errors": ["No LingBot-World session completed"],
             }
+        if params.get("lifecycle_checks", False):
+            from tests.dfx.stability.lingbot_world import run_lifecycle_checks
+
+            run_lifecycle_checks(
+                host,
+                port,
+                model,
+                Path(image),
+                artifact_dir / "lifecycle.json",
+                memory_budget=params.get("lifecycle_memory_growth_budget_bytes", 256 * 2**20),
+            )
         duration = float((document.get("metrics") or {}).get("wall_seconds", 0.0) or 0.0)
         return {"completed": completed, "failed": 0, "duration": duration, "errors": []}
-    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, AssertionError) as exc:
         return {
             "completed": 0,
             "failed": 1,
             "duration": 0.0,
             "errors": [f"LingBot-World batch failed: {type(exc).__name__}: {exc}"],
         }
-    finally:
-        out_path.unlink(missing_ok=True)
 
 
 def merge_batch_results(batch_results: list[dict[str, Any]], total_duration_sec: float) -> dict[str, Any]:
