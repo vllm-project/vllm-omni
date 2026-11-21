@@ -347,24 +347,16 @@ class CosyVoice3Code2Wav(nn.Module):
         if finalize:
             return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), None
 
-        # Clone GPU views so each request owns its cache and does not retain
-        # the full batch allocation or alias a later inference output.
+        # Clone so each request owns its cache and does not retain the full
+        # batch allocation or alias a later inference output. The clone stays
+        # on the HiFT device: the per-chunk host round-trip it replaces cost a
+        # blocking D2H plus an H2D re-upload of the mel window and phase
+        # accumulator on every streaming chunk, for tensors this small
+        # (~tens of KB per request).
         new_state = {
-            "mel": (
-                f0_input_mel.detach().clone()
-                if cosyvoice3_packed_streaming_enabled()
-                else f0_input_mel.detach().cpu().contiguous()
-            ),
+            "mel": f0_input_mel.detach().clone(),
             "mel_offset": window_offset - f0_margin,
-            "phase_acc": (
-                (
-                    new_phase_acc.detach().clone()
-                    if cosyvoice3_packed_streaming_enabled()
-                    else new_phase_acc.detach().cpu().contiguous()
-                )
-                if new_phase_acc is not None
-                else None
-            ),
+            "phase_acc": None if new_phase_acc is None else new_phase_acc.detach().clone(),
         }
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
