@@ -49,9 +49,23 @@ class RotaryPositionalEmbeddings(nn.Module):
         cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
         self.register_buffer("cache", cache, persistent=False)
 
-    def forward(self, x: torch.Tensor, *, input_pos: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        input_pos: torch.Tensor | None = None,
+        pos_max: int | None = None,
+    ) -> torch.Tensor:
         seq_len = x.size(1)
-        needed_seq_len = seq_len if input_pos is None else int(input_pos.max().item()) + 1
+        if input_pos is None:
+            needed_seq_len = seq_len
+        elif pos_max is not None:
+            # The caller knows the largest position as a host int (it built
+            # input_pos from one); using it avoids a device-to-host sync
+            # here, which otherwise fires twice per layer per decode call.
+            needed_seq_len = pos_max + 1
+        else:
+            needed_seq_len = int(input_pos.max().item()) + 1
         if (
             not getattr(self, "_rope_ready", False)
             or self.theta.device != x.device
@@ -137,6 +151,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         cache: CausalCodecDecoderCache | None = None,
         input_pos: Tensor | None = None,
+        pos_max: int | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         qkv = self.c_attn(x)
@@ -144,8 +159,8 @@ class Attention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        q = self.rotary_embed(q.transpose(1, 2), input_pos=input_pos).transpose(1, 2)
-        k = self.rotary_embed(k.transpose(1, 2), input_pos=input_pos).transpose(1, 2)
+        q = self.rotary_embed(q.transpose(1, 2), input_pos=input_pos, pos_max=pos_max).transpose(1, 2)
+        k = self.rotary_embed(k.transpose(1, 2), input_pos=input_pos, pos_max=pos_max).transpose(1, 2)
         if cache is None:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
@@ -171,8 +186,9 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         cache: CausalCodecDecoderCache | None = None,
         input_pos: Tensor | None = None,
+        pos_max: int | None = None,
     ) -> torch.Tensor:
-        x = x + self.att(self.att_norm(x), cache=cache, input_pos=input_pos)
+        x = x + self.att(self.att_norm(x), cache=cache, input_pos=input_pos, pos_max=pos_max)
         return x + self.mlp(self.ffn_norm(x))
 
 
@@ -206,10 +222,14 @@ class CausalVocosBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor, cache: CausalCodecDecoderCache | None = None) -> torch.Tensor:
         input_pos = None
+        pos_max = None
         if cache is not None:
             input_pos = cache.input_positions(x.size(1), x.device).expand(x.size(0), -1)
+            # Host-side largest position: cache.position is a Python int, so
+            # the rope cache sizing below needs no device read.
+            pos_max = cache.position + x.size(1) - 1
         for block in self.transformers:
-            x = block(x, cache=cache, input_pos=input_pos)
+            x = block(x, cache=cache, input_pos=input_pos, pos_max=pos_max)
         if cache is not None:
             cache.advance(x.size(1))
         return self.final_layer_norm(x)
@@ -329,12 +349,24 @@ class AudexSpeechTokenEmbedder(nn.Module):
             )
         self.codebook_levels = tuple(int(level) for level in codebook_levels)
         self.project_out = nn.Linear(token_embed_dim, output_dim)
+        # levels/basis are constants per device; building them on every call
+        # costs a host-to-device copy per embed (and is illegal during CUDA
+        # graph capture), so cache them lazily.
+        self._radix_constants: dict[torch.device, tuple[Tensor, Tensor]] = {}
+
+    def _get_radix_constants(self, device: torch.device) -> tuple[Tensor, Tensor]:
+        cached = self._radix_constants.get(device)
+        if cached is None:
+            levels = torch.tensor(self.codebook_levels, dtype=torch.long, device=device)
+            basis = torch.cumprod(torch.cat([levels.new_ones(1), levels[:-1]]), dim=0)
+            cached = (levels, basis)
+            self._radix_constants[device] = cached
+        return cached
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.size(-1) != 1:
             raise ValueError(f"indices last dimension must be 1, got {indices.size(-1)}")
-        levels = torch.tensor(self.codebook_levels, dtype=torch.long, device=indices.device)
-        basis = torch.cumprod(torch.cat([levels.new_ones(1), levels[:-1]]), dim=0)
+        levels, basis = self._get_radix_constants(indices.device)
         level_indices = (indices.long() // basis) % levels
         dtype = self.project_out.weight.dtype
         codes = level_indices.to(dtype=dtype)
@@ -390,12 +422,14 @@ class AudexCausalSpeechDecoderModel(PreTrainedModel):
         chunk_frames: int = 1,
         sample_rate: int | None = None,
         return_numpy: bool = True,
+        graph_runner: Any = None,
     ) -> AudexCausalSpeechDecoderSession:
         return AudexCausalSpeechDecoderSession(
             decoder=self,
             chunk_frames=chunk_frames,
             sample_rate=sample_rate or self.config.sample_rate,
             return_numpy=return_numpy,
+            graph_runner=graph_runner,
         )
 
     def forward(
@@ -415,6 +449,7 @@ class AudexCausalSpeechDecoderSession:
         chunk_frames: int,
         sample_rate: int,
         return_numpy: bool,
+        graph_runner: Any = None,
     ):
         if chunk_frames <= 0:
             raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
@@ -422,6 +457,7 @@ class AudexCausalSpeechDecoderSession:
         self.chunk_frames = chunk_frames
         self.sample_rate = sample_rate
         self.return_numpy = return_numpy
+        self._graph_runner = graph_runner
         self.cache = decoder.create_cache()
         self.buffer: list[list[int]] = []
 
@@ -455,6 +491,26 @@ class AudexCausalSpeechDecoderSession:
 
     def _decode_buffered_frames(self, emit_frames: int, *, flush: bool) -> torch.Tensor:
         with torch.inference_mode():
+            # Steady-state chunks (full emit width, complete lookahead window)
+            # can be served by a CUDA-graphed replay; anything else — the
+            # flush tail with padded lookahead, a different emit width, or a
+            # position past the runner's cap — falls through to the eager
+            # path below, which is always correct.
+            if self._graph_runner is not None and emit_frames == self.chunk_frames:
+                lookahead = self.decoder.lookahead_steps
+                future = self.buffer[emit_frames : emit_frames + lookahead] if lookahead else []
+                if len(future) == lookahead and all(
+                    len(frame) == 1 for frame in self.buffer[: emit_frames + lookahead]
+                ):
+                    wav = self._graph_runner.decode(
+                        [frame[0] for frame in self.buffer[:emit_frames]],
+                        [frame[0] for frame in future],
+                        self.cache,
+                    )
+                    if wav is not None:
+                        # the runner returns a view of a static output buffer
+                        # reused by the next replay
+                        return wav.clone()
             vq_emb = self._embed_speech_token_frames(self.buffer[:emit_frames])
             lookahead_vq_emb = None
             if self.decoder.lookahead_steps > 0:
