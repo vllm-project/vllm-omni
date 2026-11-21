@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.glm_tts import glm_tts as glm_tts_module
 from vllm_omni.model_executor.models.glm_tts.glm_tts import (
     GLMTTSForConditionalGeneration,
     _glm_tts_allowed_token_ids,
+    _glm_tts_mrv2_cutoffs,
     _glm_tts_mrv2_ras_supported,
     _glm_tts_mrv2_sample,
     _glm_tts_repeated_rows,
@@ -72,6 +73,43 @@ def test_glm_tts_mrv2_ras_falls_back_for_logprobs_and_explicit_penalties(mocker)
     assert not _glm_tts_mrv2_ras_supported(sampler, rows, return_logprobs=False)
 
 
+def test_glm_tts_mrv2_cutoffs_are_batch_composition_independent(mocker) -> None:
+    states = mocker.Mock()
+    states.vocab_size = 100
+    states.top_k.gpu = torch.full((2,), 100, dtype=torch.int32)
+    states.top_p.gpu = torch.ones(2)
+    states.get_top_k_top_p.side_effect = [
+        (None, None, False),
+        (
+            torch.tensor([100, 2], dtype=torch.int32),
+            torch.tensor([1.0, 0.9]),
+            False,
+        ),
+    ]
+
+    alone = _glm_tts_mrv2_cutoffs(
+        states,
+        torch.tensor([0]),
+        np.array([0]),
+        4,
+        default_top_p=0.8,
+        default_top_k=3,
+    )
+    co_batched = _glm_tts_mrv2_cutoffs(
+        states,
+        torch.tensor([0, 1]),
+        np.array([0, 1]),
+        4,
+        default_top_p=0.8,
+        default_top_k=3,
+    )
+
+    assert alone[0].tolist() == [3]
+    assert alone[1].tolist() == pytest.approx([0.8])
+    assert co_batched[0].tolist() == [3, 2]
+    assert co_batched[1].tolist() == pytest.approx([0.8, 0.9])
+
+
 def test_glm_tts_mrv2_ras_uses_generated_history_and_v1_nucleus_order(mocker) -> None:
     sampler = mocker.Mock()
     sampler.return_sampling_mask = False
@@ -81,6 +119,9 @@ def test_glm_tts_mrv2_ras_uses_generated_history_and_v1_nucleus_order(mocker) ->
     sampler.logit_bias_state = None
     sampler.sampling_states.temperature.gpu = torch.tensor([1.0])
     sampler.sampling_states.seeds.gpu = torch.tensor([123], dtype=torch.long)
+    sampler.sampling_states.vocab_size = 16
+    sampler.sampling_states.top_k.gpu = torch.tensor([2], dtype=torch.int32)
+    sampler.sampling_states.top_p.gpu = torch.tensor([0.3])
     sampler.sampling_states.get_top_k_top_p.return_value = (
         torch.tensor([2], dtype=torch.int32),
         torch.tensor([0.3]),

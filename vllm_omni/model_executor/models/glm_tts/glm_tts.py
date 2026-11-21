@@ -141,6 +141,41 @@ def _glm_tts_mrv2_ras_supported(
     return True
 
 
+def _glm_tts_mrv2_cutoffs(
+    states: Any,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
+    vocab_size: int,
+    *,
+    default_top_p: float,
+    default_top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply GLM-TTS defaults to each request with a neutral cutoff."""
+    top_k, top_p, _ = states.get_top_k_top_p(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        vocab_size,
+    )
+    num_rows = int(expanded_idx_mapping.shape[0])
+    if top_p is None:
+        top_p = states.top_p.gpu.new_full((num_rows,), default_top_p)
+    else:
+        top_p = torch.where(
+            top_p == 1.0,
+            top_p.new_full(top_p.shape, default_top_p),
+            top_p,
+        )
+    if top_k is None:
+        top_k = states.top_k.gpu.new_full((num_rows,), default_top_k)
+    else:
+        top_k = torch.where(
+            top_k == states.vocab_size,
+            top_k.new_full(top_k.shape, default_top_k),
+            top_k,
+        )
+    return top_k, top_p
+
+
 def _glm_tts_mrv2_sample(
     sampler: MRv2Sampler,
     logits: torch.Tensor,
@@ -220,16 +255,15 @@ def _glm_tts_mrv2_sample(
     temperature = states.temperature.gpu
     row_temperature = temperature[rows]
     weighted_scores = allowed_logits / row_temperature.clamp_min(eps).unsqueeze(1)
-    top_k, top_p, _ = states.get_top_k_top_p(
+    top_k, top_p = _glm_tts_mrv2_cutoffs(
+        states,
         expanded_idx_mapping,
         idx_mapping_np,
         weighted_scores.shape[-1],
+        default_top_p=default_top_p,
+        default_top_k=default_top_k,
     )
     num_rows, vocab = weighted_scores.shape
-    if top_p is None:
-        top_p = weighted_scores.new_full((num_rows,), default_top_p)
-    if top_k is None:
-        top_k = torch.full((num_rows,), default_top_k, dtype=torch.int32, device=weighted_scores.device)
 
     sorted_scores, sorted_ids = weighted_scores.sort(dim=1, descending=True, stable=True)
     ranks = torch.arange(vocab, device=weighted_scores.device).unsqueeze(0)
