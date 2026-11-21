@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Visual turn ordering shared by direct JoyAI prompts and ASR handoffs."""
 
+import regex as re
+
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
 
@@ -131,7 +133,8 @@ def drop_oldest_visual_frame(messages: list[dict[str, object]]) -> None:
         for part_index, part in enumerate(content):
             if part.get("type") == "image":
                 start = part_index
-                if part_index and content[part_index - 1].get("text", "").endswith(" seconds>"):
+                # Captions may end in a timestamp without being a frame timestamp.
+                if part_index and re.fullmatch(r"<-?[0-9]+\.[0-9] seconds>", content[part_index - 1].get("text", "")):
                     start -= 1
                 del content[start : part_index + 1]
                 if not content:

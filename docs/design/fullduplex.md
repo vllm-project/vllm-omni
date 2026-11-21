@@ -1480,6 +1480,8 @@ frames survives prompt assembly; pending consolidation records alone do not
 keep it alive. Non-empty committed replies
 still referenced by the observation ledger remain eligible at the recent-history
 boundary even after their frames leave the prompt.
+Frame eviction removes only the standalone generated timestamp paired with the
+frame; neighboring user text remains, even when it ends with a timestamp.
 
 For a speech-only follow-up without a new or working-window frame, the ASR
 handoff includes the latest frame still awaiting visual consolidation. It keeps
