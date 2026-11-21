@@ -140,6 +140,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Qwen/Qwen-Image-2512.md`](./Qwen/Qwen-Image-2512.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt FP8 / mixed FP8/NVFP4 | 1x A800 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |
 | [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat; offline end-to-end text-to-speech on XPU | 1x A100 80GB / 5x Intel Arc Pro B70 32GB |
+| [`Qwen/Qwen3-Omni-DGX-Spark-GB10.md`](./Qwen/Qwen3-Omni-DGX-Spark-GB10.md) | Single-GB10 text/audio input to Chinese text + speech serving | 1x NVIDIA DGX Spark (GB10) |
 | [`Qwen/Qwen3-TTS.md`](./Qwen/Qwen3-TTS.md) | Text-to-speech serving (CustomVoice / VoiceDesign / Base) | 1x H100/A100 80GB / 1x AMD MI300X |
 | [`Qwen/Qwen3-TTS-RTX4070TiSUPER.md`](./Qwen/Qwen3-TTS-RTX4070TiSUPER.md) | Text-to-speech serving on a 16 GB consumer card (0.6B CustomVoice) | 1x RTX 4070 Ti SUPER 16GB |
 | [`Qwen/Qwen3-TTS-Ascend910B3.md`](./Qwen/Qwen3-TTS-Ascend910B3.md) | Text-to-speech serving (1.7B CustomVoice / VoiceDesign / Base), qualified on v0.28.0 | 1x Ascend 910B3 64GB |
