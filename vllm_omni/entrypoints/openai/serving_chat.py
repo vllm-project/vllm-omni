@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import dataclasses
 import json
 import time
 import uuid
@@ -3598,6 +3599,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             gen_params = OmniDiffusionSamplingParams()
         else:
             gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine))
+        # Re-run the dataclass constructor through dataclasses.replace so
+        # __post_init__ rejects an unsupported quality value here, before any
+        # stage runs; setting the attribute directly, or routing it through
+        # _set_if_supported below, would skip that check.
+        gen_params = dataclasses.replace(gen_params, quality=extra_body.get("quality"))
         self._set_if_supported(
             gen_params,
             height=height,
@@ -3605,7 +3611,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             seed=seed,
             num_outputs_per_prompt=extra_body.get("num_outputs_per_prompt"),
             generator_device=generator_device,
-            quality=extra_body.get("quality"),
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
             true_cfg_scale=extra_body.get("true_cfg_scale", extra_body.get("cfg_scale")),
