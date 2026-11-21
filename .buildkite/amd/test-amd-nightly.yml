@@ -129,8 +129,9 @@ steps:
             set -euo pipefail
             export ROCM_QWEN3_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-accuracy"
             mkdir -p "$$ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"
+            export ROCM_QWEN3_ACCURACY_COLLECTED="$$(pytest -q tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model" --collect-only 2>/dev/null | grep -c '::' || true)"
             timeout --signal=TERM --kill-after=2m 165m pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model" --junitxml="$$ROCM_QWEN3_ACCURACY_ARTIFACT_DIR/pytest.xml"
-            python -c 'import sys, xml.etree.ElementTree as ET
+            python -c 'import os, sys, xml.etree.ElementTree as ET
             root = ET.parse(sys.argv[1]).getroot()
             if root.tag not in {"testsuite", "testsuites"}:
                 raise SystemExit("Unexpected JUnit root")
@@ -139,9 +140,11 @@ steps:
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
             failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
             errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
-            if tests != 4 or skipped != 0 or failures != 0 or errors != 0:
-                print("Expected exactly 4 executed Qwen3-Omni accuracy tests; "
-                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+            collected = int(os.environ.get("ROCM_QWEN3_ACCURACY_COLLECTED", "0") or 0)
+            if collected <= 0 or tests != collected or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected every collected Qwen3-Omni accuracy test to run and pass: "
+                      f"collected={collected}, tests={tests}, skipped={skipped}, "
+                      f"failures={failures}, errors={errors}", file=sys.stderr)
                 raise SystemExit(5)
             ' "$$ROCM_QWEN3_ACCURACY_ARTIFACT_DIR/pytest.xml"
             RUN_QWEN3_ACCURACY

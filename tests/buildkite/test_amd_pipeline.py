@@ -3353,7 +3353,6 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
 
 
 _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS = (
-    ("Qwen3-Omni Accuracy", 4, "Qwen3-Omni accuracy", "ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"),
     ("Qwen3-Omni Documentation Examples", 7, "Qwen3-Omni documentation", "ROCM_QWEN3_DOC_ARTIFACT_DIR"),
     ("Wan2.2 I2V Accuracy 2 GPU", 3, "Wan2.2 I2V accuracy", "ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"),
     ("HunyuanImage3 LoRA Accuracy", 1, "HunyuanImage3 LoRA accuracy", "ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"),
@@ -3365,6 +3364,44 @@ _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS = (
     ),
     ("MiniMax-H3 Timeline Guide Accuracy", 1, "MiniMax-H3 timeline accuracy", "ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR"),
 )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["pass", "wrong-count", "zero-collection", "skipped", "failure", "error", "pytest-failure", "timeout"],
+)
+def test_qwen3_accuracy_collection_execution_guard(tmp_path: Path, scenario: str) -> None:
+    step = _find_step("Qwen3-Omni Accuracy", AMD_NIGHTLY_PIPELINE)
+    commands = "\n".join(step["commands"])
+    selector = (
+        "tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py "
+        '-m "full_model and rocm and MI325 and cards_2" --run-level "full_model"'
+    )
+
+    assert step["grade"] == "Blocking"
+    assert commands.count(selector) == 2
+    assert "--collect-only" in commands
+    assert "grep -c '::' || true" in commands
+
+    collected_tests = 0 if scenario == "zero-collection" else 2
+    tests = 2 + int(scenario == "wrong-count")
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label="Qwen3-Omni Accuracy",
+        command_fragment="RUN_QWEN3_ACCURACY",
+        expected_message="Expected every collected Qwen3-Omni accuracy test to run and pass",
+        artifact_env="ROCM_QWEN3_ACCURACY_ARTIFACT_DIR",
+        job_id_prefix="qwen3-accuracy-guard",
+        pytest_status=int(scenario == "pytest-failure"),
+        tests=tests,
+        collected_tests=collected_tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=124 if scenario == "timeout" else None,
+        expected_status={"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5),
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
 
 
 @pytest.mark.parametrize("label,count,name,artifact_env", _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS)
@@ -3457,6 +3494,7 @@ def _assert_nightly_junit_guard(
     expected_status: int,
     failures: int = 0,
     errors: int = 0,
+    collected_tests: int | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> None:
     step = _find_step(step_label, pipeline_path)
@@ -3485,9 +3523,19 @@ def _assert_nightly_junit_guard(
     write_executable(
         "pytest",
         'xml_path=""\n'
+        "collect_only=0\n"
         'for arg in "$@"; do\n'
-        '  case "$arg" in --junitxml=*) xml_path="${arg#*=}" ;; esac\n'
+        '  case "$arg" in\n'
+        "    --collect-only) collect_only=1 ;;\n"
+        '    --junitxml=*) xml_path="${arg#*=}" ;;\n'
+        "  esac\n"
         "done\n"
+        "if (( collect_only )); then\n"
+        "  for ((i=0; i<FAKE_COLLECTED_TESTS; i++)); do\n"
+        '    printf "tests/fake.py::test_%s\\n" "$i"\n'
+        "  done\n"
+        '  exit "$FAKE_PYTEST_STATUS"\n'
+        "fi\n"
         'mkdir -p "$(dirname "$xml_path")"\n'
         'printf \'<testsuite tests="%s" skipped="%s" failures="0" errors="0"/>\\n\' \\\n'
         '  "$FAKE_JUNIT_TESTS" "$FAKE_JUNIT_SKIPPED" > "$xml_path"\n'
@@ -3514,6 +3562,7 @@ def _assert_nightly_junit_guard(
             "FAKE_JUNIT_SKIPPED": str(skipped),
             "FAKE_JUNIT_FAILURES": str(failures),
             "FAKE_JUNIT_ERRORS": str(errors),
+            "FAKE_COLLECTED_TESTS": str(tests if collected_tests is None else collected_tests),
             "FAKE_TIMEOUT_STATUS": "" if timeout_status is None else str(timeout_status),
             "TEST_COMMANDS": run_command.replace("$$", "$"),
         }
