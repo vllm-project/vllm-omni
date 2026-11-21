@@ -1865,6 +1865,7 @@ def test_sub_config_fields_match_structured_scopes():
         "allgather_degree",
         "ulysses_mode",
         "ulysses_a2a_permute",
+        "ulysses_a2a_backend",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
         "vae_parallel_mode",
@@ -2137,6 +2138,7 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
                 stage_id=0,
                 ulysses_degree=2,
                 ulysses_a2a_permute=True,
+                ulysses_a2a_backend="flashinfer",
             )
         ]
     )
@@ -2145,6 +2147,19 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.ulysses_a2a_permute is True
+    assert stage.parallel_config.ulysses_a2a_backend == "flashinfer"
+
+
+@pytest.mark.parametrize(
+    "values, message",
+    [
+        ({"ulysses_a2a_permute": True, "ulysses_a2a_backend": "nccl"}, "must be 'copy_engine' or 'flashinfer'"),
+        ({"ulysses_a2a_backend": "flashinfer"}, "requires ulysses_a2a_permute=True"),
+    ],
+)
+def test_diffusion_parallel_config_rejects_invalid_ulysses_a2a_backend(values, message):
+    with pytest.raises(ValueError, match=message):
+        OmniStageDiffusionParallelConfig(ulysses_degree=2, **values)
 
 
 def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():

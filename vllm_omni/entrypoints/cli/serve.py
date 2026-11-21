@@ -827,6 +827,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-backend",
+            type=str,
+            default=None,
+            choices=["copy_engine", "flashinfer"],
+            help=(
+                "Transport for --ulysses-a2a-permute on CUDA: 'copy_engine' (default) or 'flashinfer' "
+                "(FlashInfer UlyssesCommunicator one-sided NVLink kernels for the Q/K/V scatter and output gather)."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",

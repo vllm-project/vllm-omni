@@ -799,6 +799,7 @@ DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_degree", 4),
     ("ulysses_mode", "advanced_uaa"),
     ("ulysses_a2a_permute", True),
+    ("ulysses_a2a_backend", "flashinfer"),
     ("ring_degree", 2),
     ("allgather_degree", 8),
     ("use_hsdp", True),
@@ -833,6 +834,8 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
             # Standalone HSDP (all other parallelism at 1) cannot
             # auto-calculate its shard size; pass one explicitly.
             factory_kwargs["hsdp_shard_size"] = 2048
+        if knob == "ulysses_a2a_backend":
+            factory_kwargs["ulysses_a2a_permute"] = True
         stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"

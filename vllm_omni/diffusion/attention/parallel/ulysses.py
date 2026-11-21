@@ -244,6 +244,7 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
+        ulysses_a2a_backend: str = "copy_engine",
     ) -> None:
         self._sp_group = sp_group
         self._ulysses_pg = sp_group.ulysses_group
@@ -251,6 +252,7 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
+        self._flashinfer_a2a = ulysses_a2a_permute and ulysses_a2a_backend == "flashinfer"
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -266,6 +268,10 @@ class UlyssesParallelAttention:
             )
             if _a2a_permute_enabled(ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
                 ensure_a2a_permute_available()
+                if self._flashinfer_a2a:
+                    from vllm_omni.diffusion.distributed.flashinfer_ulysses import ensure_flashinfer_ulysses_available
+
+                    ensure_flashinfer_ulysses_available()
 
     @property
     def enabled(self) -> bool:
@@ -554,7 +560,12 @@ class UlyssesParallelAttention:
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                query, key, value = ulysses_qkv_fwd_group(query, key, value, group_name, ulysses_world_size)
+                if self._flashinfer_a2a and gate_compress is None:
+                    from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_qkv
+
+                    query, key, value = ulysses_fi_qkv(query, key, value, group_name, ulysses_world_size)
+                else:
+                    query, key, value = ulysses_qkv_fwd_group(query, key, value, group_name, ulysses_world_size)
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
                 if self._use_sync:
@@ -738,7 +749,10 @@ class UlyssesParallelAttention:
             ctx.gather_idx,
             dist.get_world_size(ctx.ulysses_pg),
         ):
-            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+            if self._flashinfer_a2a:
+                from vllm_omni.diffusion.distributed.flashinfer_ulysses import ulysses_fi_o as ulysses_o_rev
+            else:
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
             output = ulysses_o_rev(
                 attn_output,

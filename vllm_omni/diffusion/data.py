@@ -328,6 +328,14 @@ class DiffusionParallelConfig:
     allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
+    ulysses_a2a_backend: str = "copy_engine"
+    """Transport for ``ulysses_a2a_permute`` on CUDA: ``"copy_engine"`` or ``"flashinfer"``.
+
+    ``"flashinfer"`` runs the strict Q/K/V scatter and output gather through FlashInfer's ``UlyssesCommunicator``
+    (one-sided NVLink kernels writing straight into peers' registered outputs); gate and joint exchanges keep
+    the copy engines.
+    """
+
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -427,6 +435,11 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
+        assert self.ulysses_a2a_backend in {"copy_engine", "flashinfer"}, (
+            f"ulysses_a2a_backend must be 'copy_engine' or 'flashinfer', but got {self.ulysses_a2a_backend!r}."
+        )
+        if self.ulysses_a2a_backend != "copy_engine" and not self.ulysses_a2a_permute:
+            raise ValueError("ulysses_a2a_backend requires ulysses_a2a_permute=True")
 
         # Validate HSDP configuration
         if self.use_hsdp:

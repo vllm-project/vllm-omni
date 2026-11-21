@@ -8,7 +8,7 @@ import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import factory, ulysses
-from vllm_omni.diffusion.distributed import a2a_permute
+from vllm_omni.diffusion.distributed import a2a_permute, flashinfer_ulysses
 from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -77,6 +77,60 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
     output = strategy.post_attention(q, context)
     assert output.shape == (1, 5 if joint else 3, 4, 16)
     assert calls == (["qkv", "gate", "sync", "reverse", "sync"] if use_sync else ["qkv", "gate", "reverse"])
+
+
+@pytest.mark.parametrize("with_gate", [False, True])
+def test_flashinfer_backend_routes_qkv_and_reverse(monkeypatch, with_gate):
+    """FlashInfer carries Q/K/V and the output; gate_compress keeps Q/K/V on the copy engines."""
+    calls = []
+    platform = SimpleNamespace(is_npu=lambda: False, synchronize=lambda: None)
+    monkeypatch.setattr(ulysses, "current_omni_platform", platform)
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
+    monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: calls.append("ce_init"))
+    monkeypatch.setattr(flashinfer_ulysses, "ensure_flashinfer_ulysses_available", lambda: calls.append("fi_init"))
+    group = SimpleNamespace(
+        ulysses_group=SimpleNamespace(group_name="ulysses"),
+        ulysses_world_size=2,
+        ulysses_rank=0,
+        ring_world_size=1,
+        allgather_world_size=1,
+    )
+    monkeypatch.setattr(ulysses.dist, "get_world_size", lambda pg: 2)
+    strategy = ulysses.UlyssesParallelAttention(
+        group, 2, 1, False, ulysses_a2a_permute=True, ulysses_a2a_backend="flashinfer"
+    )
+    query, key, value, gate = (torch.randn(1, 3, 4, 16) for _ in range(4))
+
+    def qkv(name):
+        def exchange(q, k, v, group_name, world_size):
+            assert (group_name, world_size) == ("ulysses", 2)
+            calls.append(name)
+            return tuple(t[:, :, :2].repeat(1, 2, 1, 1) for t in (q, k, v))
+
+        return exchange
+
+    def reverse(name):
+        def exchange(tensor, group_name, world_size):
+            assert (group_name, world_size) == ("ulysses", 2)
+            calls.append(name)
+            return tensor[:, :3].repeat(1, 1, 2, 1)
+
+        return exchange
+
+    monkeypatch.setattr(a2a_permute, "ulysses_qkv_fwd_group", qkv("ce_qkv"))
+    monkeypatch.setattr(
+        a2a_permute, "ulysses_qkv_fwd", lambda t, g, w: calls.append("ce_gate") or t[:, :, :2].repeat(1, 2, 1, 1)
+    )
+    monkeypatch.setattr(a2a_permute, "ulysses_o_rev", reverse("ce_reverse"))
+    monkeypatch.setattr(flashinfer_ulysses, "ulysses_fi_qkv", qkv("fi_qkv"))
+    monkeypatch.setattr(flashinfer_ulysses, "ulysses_fi_o", reverse("fi_reverse"))
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "strict")
+    metadata = AttentionMetadata(extra={"gate_compress": gate} if with_gate else {})
+    q, k, v, metadata, context = strategy.pre_attention(query, key, value, metadata)
+    assert q.shape == k.shape == v.shape == (1, 6, 2, 16)
+    assert strategy.post_attention(q, context).shape == (1, 3, 4, 16)
+    qkv_calls = ["ce_qkv", "ce_gate"] if with_gate else ["fi_qkv"]
+    assert calls == ["ce_init", "fi_init", *qkv_calls, "fi_reverse"]
 
 
 @pytest.mark.parametrize(

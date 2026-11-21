@@ -303,6 +303,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     allgather_degree: int
     ulysses_mode: str
     ulysses_a2a_permute: bool
+    ulysses_a2a_backend: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     vae_parallel_mode: str
@@ -905,6 +906,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
     ulysses_a2a_permute: bool = False
+    ulysses_a2a_backend: str = "copy_engine"
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
@@ -926,6 +928,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
+        if self.ulysses_a2a_backend not in {"copy_engine", "flashinfer"}:
+            raise ValueError("ulysses_a2a_backend must be 'copy_engine' or 'flashinfer'")
+        if self.ulysses_a2a_backend != "copy_engine" and not self.ulysses_a2a_permute:
+            raise ValueError("ulysses_a2a_backend requires ulysses_a2a_permute=True")
         if self.vae_parallel_mode not in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}:
             raise ValueError(
                 "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
