@@ -107,6 +107,18 @@ optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
 from OpenAPI in that mode; configured handlers retain upstream vLLM routing.
 
+The server uses the deployed model's generation tasks to initialize its speech,
+audio generation, and video handlers. Unsupported speech and audio generation
+requests return HTTP 404, and unsupported image and video generation requests
+return HTTP 503 before reaching the engine. Diffusion image models also support
+image generation through Chat Completions. Segmentation and depth routes check
+their own model capabilities.
+
+Diffusion pipelines can declare additional output modalities alongside their
+default output. LingBot Video serves both images and videos; its image requests
+must set `num_frames=1` to override shared video defaults. LingBot World retains
+video-only serving capabilities because it requires causal multi-frame blocks.
+
 An optional `--video-output-warmup` request runs through the streaming video
 handler before HTTP serving starts. The frontend owns request validation,
 draining generation and encoding, and the startup deadline. It does not expose
@@ -215,6 +227,16 @@ stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`
 Streaming input pumps take an admission slot immediately before each EngineCore
 ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
+Shutdown closes request registration and sends a fatal error to every live
+request queue before cancelling the output pump, in one callback on the
+serving event loop. It wakes generators parked on paused or sleeping admission
+and releases first-input waiters before cancelling the input pump. Engine
+teardown runs in the shutdown caller after the live serving loop has queued
+the fatal errors and cancelled the output pump. Downstream stage submissions
+await request-queue capacity so this callback can run under backpressure.
+Shutdown, abort, and generator cleanup cancel each input pump only once so
+its iterator can finish asynchronous cleanup. Duplex closes registered session
+handles on the serving loop after closing admission.
 Video output sessions shield final task cleanup and unfinished-request abort
 from ASGI cancellation, including disconnects immediately after `session.done`.
 Video encoding and encoder close run on one worker per stream so encoding does

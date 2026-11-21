@@ -228,7 +228,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # side. Park here until the full wake instead of erroring (#8678).
         streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
-            await self._pause_cond.wait_for(self._can_admit_generate)
+            await self._pause_cond.wait_for(self._generation_admission_ready)
             if not streaming_input:
                 self._admitting = getattr(self, "_admitting", 0) + 1
         admitting = not streaming_input
@@ -415,8 +415,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
+            self._cancel_input_pump(input_stream_task)
             if admitting:
                 await self._release_generate_admission()
             reservations = getattr(self, "_interaction_reservations", {})
@@ -428,8 +427,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     await self._drain_interaction_error_tasks(finished_state)
             self._log_summary_and_cleanup(request_id)
 
-    def _can_admit_generate(self) -> bool:
-        """Return whether the frontend admission gate is open for new submits."""
+    def _generation_admission_ready(self) -> bool:
+        self._check_frontend_admission()
         return (
             not self._paused and not getattr(self, "_sleeping_tags", None) and getattr(self, "_inflight_sleeps", 0) == 0
         )
@@ -442,6 +441,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             and getattr(self, "_inflight_sleeps", 0) == 0
         ):
             self._paused = False
+
+    def _on_frontend_shutdown(self) -> None:
+        loop = self._output_loop
+        if loop is not None and loop.is_running():
+            loop.create_task(self._notify_generation_waiters())
+
+    async def _notify_generation_waiters(self) -> None:
+        async with self._pause_cond:
+            self._pause_cond.notify_all()
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""
@@ -501,7 +509,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 async with self._pause_cond:
                     # Same full-wake condition as generate()'s gate: streaming
                     # ADDs must not race a partially-asleep or sleeping engine either (#8678).
-                    await self._pause_cond.wait_for(self._can_admit_generate)
+                    await self._pause_cond.wait_for(self._generation_admission_ready)
                     self._admitting = getattr(self, "_admitting", 0) + 1
             try:
                 await submit_factory()
@@ -723,6 +731,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         input_stream_task = asyncio.create_task(handle_inputs())
         req_state.input_stream_task = input_stream_task
+        req_state.first_chunk_submitted = first_chunk_submitted
         return input_stream_task
 
     @staticmethod
@@ -791,8 +800,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Track one stage call; abort it if the caller is cancelled and always drop its state."""
         request_id = f"{self._get_unique_request_id(external_request_id)}-{stage_id}"
         req_state = ClientRequestState(request_id, external_request_id=external_request_id)
-        self.request_states[request_id] = req_state
         self._final_output_handler()
+        self.request_states[request_id] = req_state
         try:
             yield req_state
         except asyncio.CancelledError:
