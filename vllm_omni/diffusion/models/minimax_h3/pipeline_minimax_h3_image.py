@@ -50,7 +50,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan
-from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT
+from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -424,11 +424,19 @@ class MiniMaxH3ImagePipeline(
         self.text_encoder_tp_size = tp_size
         self.text_encoder_group = self._build_text_encoder_group(tp_size)
         encoder_root = self._resolve_text_encoder_root(model_index, root)
+        # Online DiT quantization initializes the pipeline on the accelerator.
+        # Keep the large offloaded text tower on CPU during loading. Preserve
+        # the vision tower's initialization device: its FP32 RoPE frequencies
+        # depend on that device's arithmetic. The offloader owns runtime moves.
+        text_model_init_device = (
+            torch.device("cpu") if resolve_offload(od_config).offloads(TEXT_ENCODER_COMPONENT) else None
+        )
         self.text_encoder = MiniMaxH3Qwen3VLEncoder(
             os.path.join(encoder_root, "text_encoder"),
             device=self.device,
             load_model=rank < tp_size,
             encoder_group=self.text_encoder_group,
+            text_model_init_device=text_model_init_device,
         )
         if rank >= tp_size:
             # Ranks outside the text-encoder TP group hold no encoder weights.
