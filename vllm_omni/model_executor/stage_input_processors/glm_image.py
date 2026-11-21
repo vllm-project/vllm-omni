@@ -178,6 +178,12 @@ def _parse_generated_tokens(
             raise ValueError(
                 f"i2i token parse failed: actual_tokens={actual_tokens} < expected_large_tokens={large_image_tokens}"
             )
+    elif actual_tokens > small_image_tokens + large_image_tokens:
+        raise ValueError(
+            f"t2i token parse failed: actual_tokens={actual_tokens}, "
+            f"expected_tokens={small_image_tokens + large_image_tokens} for {height}x{width}; "
+            "refusing to truncate the generated image grid"
+        )
     elif actual_tokens >= small_image_tokens + large_image_tokens:
         # Text-to-image: extract large image tokens after small image tokens
         large_start = small_image_tokens
