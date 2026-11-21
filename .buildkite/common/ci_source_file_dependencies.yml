@@ -1673,6 +1673,7 @@ source_file_dependencies:
   diffusion_lingbot_function:
     - *lingbot_video
     - *lingbot_world
+    - vllm_omni/diffusion/model_metadata.py
     - vllm_omni/diffusion/offloader/
     - tests/e2e/online_serving/test_lingbot_video.py
     - tests/e2e/online_serving/test_lingbot_video_expansion.py
