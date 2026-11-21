@@ -33,6 +33,8 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 _MIN_FREE_VRAM = 16 * 1024**3
+WHISPER_TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+WHISPER_TEMPERATURE_FALLBACK_SEED = 0
 
 
 _synthetic_media_fallback_dir: Path | None = None
@@ -823,12 +825,21 @@ def _whisper_process_reserved_gib() -> float:
 
 
 def _whisper_transcribe_in_current_process(
-    output_path: str, model_size: str = "small", language: str | None = None
+    output_path: str,
+    model_size: str = "small",
+    language: str | None = None,
+    temperature_fallback: bool = False,
 ) -> tuple[str, str, float]:
     model = _get_whisper_model(model_size)
+    if temperature_fallback:
+        import torch
+
+        # Seed only the isolated ASR worker. This keeps fallback sampling
+        # reproducible without modifying the model server or pytest RNG state.
+        torch.manual_seed(WHISPER_TEMPERATURE_FALLBACK_SEED)
     text = model.transcribe(
         output_path,
-        temperature=0.0,
+        temperature=WHISPER_TEMPERATURE_FALLBACK if temperature_fallback else 0.0,
         word_timestamps=True,
         condition_on_previous_text=False,
         # None keeps whisper's auto-detection. Do not default this to a
@@ -952,7 +963,13 @@ def _unpack_transcribe_worker_result(result: object) -> tuple[str, str, float]:
     return str(text), str(device), reserved
 
 
-def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
+def convert_audio_file_to_text(
+    output_path: str,
+    model_size: str = "small",
+    language: str | None = None,
+    *,
+    temperature_fallback: bool = False,
+) -> str:
     """Convert an audio file to text in a reused, isolated subprocess.
 
     The worker outlives the call so its Whisper model is loaded once rather than
@@ -975,7 +992,13 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
             executor = _get_transcriber()
             try:
                 text, device, reserved_gib = _unpack_transcribe_worker_result(
-                    executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
+                    executor.submit(
+                        _whisper_transcribe_in_current_process,
+                        output_path,
+                        model_size,
+                        language,
+                        temperature_fallback,
+                    ).result()
                 )
                 with _TRANSCRIBER_LOCK:
                     _TRANSCRIBER_DEVICE = device
@@ -1011,6 +1034,8 @@ def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small", lan
 
 
 __all__ = [
+    "WHISPER_TEMPERATURE_FALLBACK",
+    "WHISPER_TEMPERATURE_FALLBACK_SEED",
     "_merge_base64_audio_to_segment",
     "concat_audio",
     "convert_audio_bytes_to_text",

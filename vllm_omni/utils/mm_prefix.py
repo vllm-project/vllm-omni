@@ -14,7 +14,9 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 _RUNNER_MODULES = (
-    "vllm.v1.worker.gpu_model_runner",
+    # vLLM 0.34 moved the runner module (aac1b2a4f3); the pin's live
+    # compute_mm_prefix_ranges alias lives in gpu/model_states/default.py.
+    "vllm.v1.worker.gpu.model_runner",
     "vllm.v1.worker.gpu.model_states.default",
 )
 

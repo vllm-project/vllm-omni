@@ -781,7 +781,7 @@ def test_duplex_single_session_still_image_input(omni_server, tmp_path: Path) ->
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) -> None:
     result = asyncio.run(

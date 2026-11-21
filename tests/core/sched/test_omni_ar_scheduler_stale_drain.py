@@ -133,7 +133,8 @@ def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: 
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [session.request_id]
     model_runner_output.routed_experts = None
     model_runner_output.inter_stage_outputs = None
 
