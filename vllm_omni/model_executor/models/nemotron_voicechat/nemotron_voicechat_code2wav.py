@@ -238,7 +238,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
             if left_context_frames > 0 and codec_cache is None:
                 # Prefix re-decode path: slice off the samples already emitted.
                 wav = wav[left_context_frames * self._wav_per_frame :]
-            audios[i] = wav.detach().to(dtype=torch.float32).cpu()
+            audios[i] = wav.detach().to(dtype=torch.float32)
             logger.debug(
                 "Nemotron VoiceChat code2wav output: request=%s frames=%s samples=%s",
                 cache_request_id,
