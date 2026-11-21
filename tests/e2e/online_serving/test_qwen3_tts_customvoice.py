@@ -148,6 +148,7 @@ def test_cached_predictor_streaming_audio(omni_server, online_client, run_level)
             "response_format": "wav",
             "task_type": "CustomVoice",
             "voice": "vivian",
+            "transcript_escalation_model": "large-v3",
             **codec_budget(run_level),
         },
         request_num=4,
