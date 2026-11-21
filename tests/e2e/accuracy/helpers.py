@@ -327,6 +327,11 @@ def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) 
     return errs
 
 
+def validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
+    """Public accuracy-gate helper for DFX and other cross-package callers."""
+    return _validate_daily_omni(result, min_accuracy=min_accuracy)
+
+
 def _validate_videomme(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
     errs: list[str] = []
     acc = result.get("videomme_accuracy")
@@ -416,6 +421,22 @@ def _validate_seed_tts(
         )
     )
     return errs
+
+
+def validate_seed_tts(
+    result: dict[str, Any],
+    *,
+    max_mean_wer: float | None,
+    min_mean_sim: float | None,
+    min_mean_utmos: float | None,
+) -> list[str]:
+    """Public accuracy-gate helper for DFX and other cross-package callers."""
+    return _validate_seed_tts(
+        result,
+        max_mean_wer=max_mean_wer,
+        min_mean_sim=min_mean_sim,
+        min_mean_utmos=min_mean_utmos,
+    )
 
 
 def _seed_tts_floor_errors(

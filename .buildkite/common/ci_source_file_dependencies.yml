@@ -903,8 +903,14 @@ source_file_dependencies:
     - *minicpmo_4_5
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/conftest.py
+    - tests/e2e/accuracy/helpers.py
     - tests/dfx/perf/tests/test_minicpmo_4_5_ready.json
     - tests/dfx/perf/tests/test_minicpmo_4_5.json
+    - vllm_omni/benchmarks/data_modules/daily_omni_dataset.py
+    - vllm_omni/benchmarks/data_modules/daily_omni_eval.py
+    - vllm_omni/benchmarks/data_modules/seed_tts_dataset.py
+    - vllm_omni/benchmarks/data_modules/seed_tts_eval.py
+    - vllm_omni/deploy/minicpmo_4_5_turn.yaml
 
   omni_minicpmo_4_5_a3_2card_perf:
     - *minicpmo_4_5

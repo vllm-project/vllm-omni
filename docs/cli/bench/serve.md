@@ -437,13 +437,15 @@ or heard in the clip, such as the word-repetition prompts in
 `PR_post_event_reminder` and `RTD_Omni`; a clip without an audio track keeps the
 instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
 The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
-runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
-It points `--deploy-config` at stock `minicpmo_4_5.yaml` and applies
-`duplex_session.max_sessions: 8` plus `duplex_session.collect_stats: true` through
-inline `server_params.update` on a temporary copy, the same path as the Qwen3-Omni
-C8 jobs. Score floors come from the accuracy-config `baseline`: H100, B200 and A3
-have calibrated entries, while uncalibrated hardware such as ROCm MI325 omits a
-baseline and still records complete generation, publication and judging.
+runs with `question` on the same 120 `PR_correction` IDs as Qwen3-Omni; the
+Qwen3-Omni `server_vad` nightly also uses `question`. It points `--deploy-config` at
+stock `minicpmo_4_5.yaml` and applies `duplex_session.max_sessions: 8` plus
+`duplex_session.collect_stats: true` through inline `server_params.update` on a
+temporary copy, with prefix caching left off. The job records the correction
+success rate without a numeric floor: every selected ID must complete and be
+judged, and `mean_all_success` must be finite in `[0, 1]`. The shared
+soundtrack 66-ID accuracy-config floors remain available for other callers that
+set `duplex_eval_accuracy_config`.
 
 Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
@@ -570,7 +572,7 @@ The standalone `generate` command remains available. It still skips an existing
 sample unless `--overwrite` is set, and it reuses that sample only when the
 recorded mix matches (metadata without a mix counts as `question`). A different
 mix is rejected instead of returning the other artifact. This integration does
-not add nightly jobs. The MiniCPM-o job above selects `soundtrack`.
+not add nightly jobs. The MiniCPM-o job above selects `question`.
 
 For shuffled runs, use `evaluate --ids` with the successful selected sample IDs
 instead of `--limit`. Failed sessions have no judge input; do not silently drop
@@ -788,18 +790,20 @@ excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_te
 
 The checked-in local performance configuration points `--deploy-config` at stock
 `minicpmo_4_5.yaml` and applies `duplex_session.max_sessions: 8` plus
-`duplex_session.collect_stats: true` through inline `server_params.update`. It
-measures eight deterministic cases from `1q1a`, `1q1a_math`, and
-`1qna` (24 videos total), with no benchmark warmups and a maximum concurrency of eight. Each subset also sends one readiness request before its
-measured cases. Case WAV, transcript, event, and evaluation artifacts are written to a temporary directory during the
-run and deleted afterwards; they are not kept under `tests/dfx/perf/results/omniinteract/`. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
-(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After each subset finishes it
-scores All Global IA-QTF1 through that local judge and writes a `result_acc_*.json` next to the performance
-JSON (`ACC_BENCH_RESULT_DIR`, else `BENCHMARK_DIR`). After all three subsets finish, pooled TP/FP/FN are written as
-`result_acc_*_omniinteract_aggregate_*.json`. Accuracy is published only in those `result_acc_*.json` files; the
-perf `result_test_*.json` keeps generation and latency metrics but no `omniinteract.accuracy` block.
-This is protocol-compatible with the paper metric, not a GPT-4o
-paper-table score. Run it from the repository root with two visible GPUs:
+`duplex_session.collect_stats: true` through inline `server_params.update`, with
+prefix caching left off. It replays all 60 `1q1a_math` clips once at concurrency
+8, with no benchmark warmups. Case WAV, transcript, event, and evaluation
+artifacts are written to a temporary directory during the run and deleted
+afterwards; they are not kept under `tests/dfx/perf/results/omniinteract/`. The
+runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
+(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to
+the process). After the subset finishes it scores All Global IA-QTF1 through that
+local judge and writes a `result_acc_*.json` next to the performance JSON
+(`ACC_BENCH_RESULT_DIR`, else `BENCHMARK_DIR`). Accuracy is published only in
+those `result_acc_*.json` files; the perf `result_test_*.json` keeps generation
+and latency metrics but no `omniinteract.accuracy` block. This is
+protocol-compatible with the paper metric, not a GPT-4o paper-table score. Run
+it from the repository root with two visible GPUs:
 
 ```bash
 export HF_HOME=/path/to/persistent/huggingface-cache
@@ -815,9 +819,9 @@ The first run downloads the pinned OmniInteract archive and the judge weights in
 It requires every case to commit its input, complete any emitted response lifecycles, and publish the expected WAV,
 transcript, event, and result artifacts without errors while the temporary output directory exists. A valid LISTEN-only case may have no response audio or transcript
 chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
-signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
-All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
-`omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
+signal, not a transport failure. Accuracy must finish with `status=ok`, `failed==0`, and
+`evaluated + skipped == 60`. All Global IA-QTF1 must be finite. There is no numeric
+IA-QTF1 floor; skipped sessions from the official eligibility policy do not fail the job.
 
 `test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
 using the existing `vllm_omni/deploy/qwen3_omni_duplex.yaml` via

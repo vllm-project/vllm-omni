@@ -881,6 +881,49 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     assert prepared.model_type == "covo_audio"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("limit", [None, 7, 8192])
+def test_covo_audio_request_budget_reaches_engine(limit, stream):
+    server = object.__new__(OmniOpenAIServingSpeech)
+    default = SamplingParams(max_tokens=256, temperature=0.8, extra_args={"sentinel": 17})
+    decoder_default = SamplingParams(max_tokens=1)
+    seen = []
+
+    def record_generate(**kwargs):
+        seen.append(kwargs)
+        return iter(())
+
+    server._diffusion_mode = False
+    server._tts_model_type = "covo_audio"
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=[default, decoder_default], generate=record_generate
+    )
+    server._adapter = CovoAudioAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._adapter._tokenizer = SimpleNamespace(apply_chat_template=lambda *_args, **_kwargs: [11, 12, 13])
+    server._refresh_uploaded_speakers = lambda: None
+    server._validate_speech_sample_rate = lambda _request: None
+    server._log_request = lambda *_args: None
+    server._speech_output_policies = {}
+    server.request_logger = None
+
+    asyncio.run(
+        server._prepare_speech_generation(
+            OpenAICreateSpeechRequest(input="Hello", max_new_tokens=limit, stream=stream, response_format="pcm"),
+            request_id="covo-budget",
+        )
+    )
+
+    assert len(seen) == 1
+    observed = seen[0]["sampling_params_list"]
+    assert observed[0].max_tokens == (limit if limit is not None else 256)
+    assert observed[0].temperature == 0.8 and observed[0].extra_args == {"sentinel": 17}
+    assert observed[1].max_tokens == 1
+    assert seen[0]["prompt"]["prompt_token_ids"] == [11, 12, 13]
+    assert default.max_tokens == 256 and default.extra_args == {"sentinel": 17}
+    assert decoder_default.max_tokens == 1
+
+
 @pytest.mark.parametrize("voice", [None, "DB30"])
 def test_ming_flash_omni_build_constructs_prepared_request(voice):
     server = SimpleNamespace(uploaded_speakers={})
