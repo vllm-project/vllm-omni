@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
@@ -14,9 +13,13 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from torch import Tensor, nn
 
-# ResnetBlock is platform-dispatched in the layers package __init__: CUDA gets a
-# fused GroupNorm+SiLU kernel, every other backend gets the plain PyTorch block.
-from vllm_omni.diffusion.models.hunyuan_image3.layers import ResnetBlock
+# Hardware-specific VAE layers are selected by the layers package dispatcher.
+from vllm_omni.diffusion.models.hunyuan_image3.layers import (
+    AttnBlock,
+    ResnetBlock,
+    VaeConv3d,
+    vae_group_norm_for_conv,
+)
 
 
 class DiagonalGaussianDistribution:
@@ -69,46 +72,12 @@ def forward_with_checkpointing(module, *inputs, use_checkpointing=False):
         return module(*inputs)
 
 
-class AttnBlock(nn.Module):
-    """Attention with torch sdpa implementation."""
-
-    def __init__(self, in_channels: int):
-        super().__init__()
-        self.in_channels = in_channels
-
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-
-        # The memory concern is already handled via VAE tiling,
-        # so there's no need to chunk here — calling nn.Conv3d directly is fine.
-        self.q = nn.Conv3d(in_channels, in_channels, kernel_size=1)
-        self.k = nn.Conv3d(in_channels, in_channels, kernel_size=1)
-        self.v = nn.Conv3d(in_channels, in_channels, kernel_size=1)
-        self.proj_out = nn.Conv3d(in_channels, in_channels, kernel_size=1)
-
-    def attention(self, h_: Tensor) -> Tensor:
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
-        b, c, f, h, w = q.shape
-        q = rearrange(q, "b c f h w -> b 1 (f h w) c").contiguous()
-        k = rearrange(k, "b c f h w -> b 1 (f h w) c").contiguous()
-        v = rearrange(v, "b c f h w -> b 1 (f h w) c").contiguous()
-        h_ = nn.functional.scaled_dot_product_attention(q, k, v)
-
-        return rearrange(h_, "b 1 (f h w) c -> b c f h w", f=f, h=h, w=w, c=c, b=b)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return x + self.proj_out(self.attention(x))
-
-
 class DownsampleDCAE(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, add_temporal_downsample: bool = True):
         super().__init__()
         factor = 2 * 2 * 2 if add_temporal_downsample else 1 * 2 * 2
         assert out_channels % factor == 0
-        self.conv = nn.Conv3d(in_channels, out_channels // factor, kernel_size=3, stride=1, padding=1)
+        self.conv = VaeConv3d(in_channels, out_channels // factor, kernel_size=3, stride=1, padding=1)
 
         self.add_temporal_downsample = add_temporal_downsample
         self.group_size = factor * in_channels // out_channels
@@ -128,7 +97,7 @@ class UpsampleDCAE(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, add_temporal_upsample: bool = True):
         super().__init__()
         factor = 2 * 2 * 2 if add_temporal_upsample else 1 * 2 * 2
-        self.conv = nn.Conv3d(in_channels, out_channels * factor, kernel_size=3, stride=1, padding=1)
+        self.conv = VaeConv3d(in_channels, out_channels * factor, kernel_size=3, stride=1, padding=1)
 
         self.add_temporal_upsample = add_temporal_upsample
         self.repeats = factor * out_channels // in_channels
@@ -165,7 +134,7 @@ class Encoder(nn.Module):
         self.num_res_blocks = num_res_blocks
 
         # downsampling
-        self.conv_in = nn.Conv3d(in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1)
+        self.conv_in = VaeConv3d(in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1)
 
         self.down = nn.ModuleList()
         block_in = block_out_channels[0]
@@ -197,7 +166,7 @@ class Encoder(nn.Module):
 
         # end
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = nn.Conv3d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_out = VaeConv3d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
         self.gradient_checkpointing = False
 
@@ -222,8 +191,7 @@ class Encoder(nn.Module):
         # end
         group_size = self.block_out_channels[-1] // (2 * self.z_channels)
         shortcut = rearrange(h, "b (c r) f h w -> b c r f h w", r=group_size).mean(dim=2)
-        h = self.norm_out(h)
-        h = F.silu(h)
+        h = vae_group_norm_for_conv(h, self.norm_out)
         h = self.conv_out(h)
         h += shortcut
         return h
@@ -253,7 +221,7 @@ class Decoder(nn.Module):
 
         # z to block_in
         block_in = block_out_channels[0]
-        self.conv_in = nn.Conv3d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
+        self.conv_in = VaeConv3d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
 
         # middle
         self.mid = nn.Module()
@@ -283,7 +251,7 @@ class Decoder(nn.Module):
 
         # end
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = nn.Conv3d(block_in, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_out = VaeConv3d(block_in, out_channels, kernel_size=3, stride=1, padding=1)
 
         self.gradient_checkpointing = False
 
@@ -307,8 +275,7 @@ class Decoder(nn.Module):
                 h = forward_with_checkpointing(self.up[i_level].upsample, h, use_checkpointing=use_checkpointing)
 
         # end
-        h = self.norm_out(h)
-        h = F.silu(h)
+        h = vae_group_norm_for_conv(h, self.norm_out)
         h = self.conv_out(h)
         return h
 

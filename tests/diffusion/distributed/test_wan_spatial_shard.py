@@ -426,7 +426,9 @@ def test_single_pass_conv_input_matches_cat_pad_halo_on_two_ranks(monkeypatch, s
     """Same bytes as cat -> F.pad -> halo_exchange, halos included, on either rank of a pair."""
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (rank, 2))
 
-    def fake_p2p(*, rank, world_size, group, top_row_ref, bottom_row_ref, recv_top_buf, recv_bottom_buf):
+    def fake_p2p(
+        *, rank, world_size, group, top_row_ref, bottom_row_ref, recv_top_buf, recv_bottom_buf, communication_guard=None
+    ):
         # A neighbour's halo is whatever it sent; stand in with a marker derived from our own edge so
         # both the reference and the single-pass path see the same exchange. Global edges stay zero.
         recv_top_buf.copy_(top_row_ref * 0 + 7.0) if rank > 0 else recv_top_buf.zero_()
