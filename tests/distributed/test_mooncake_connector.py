@@ -16,7 +16,7 @@ import torch
 import transformers.configuration_utils
 from transformers import Qwen3OmniMoeConfig
 from vllm import SamplingParams
-from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, DeviceConfig, KVEventsConfig, KVTransferConfig, SchedulerConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -41,7 +41,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
 )
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 from vllm.renderers.base import BaseRenderer
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.output import KVConnectorBlockState, NewRequestData, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -54,6 +56,7 @@ from vllm_omni.distributed.kv_transfer.mooncake.config import MooncakeConfig
 from vllm_omni.distributed.kv_transfer.mooncake.connector import (
     Attempt,
     JointMetadata,
+    JointStoreScheduler,
     JointStoreWorker,
     OmniMooncakeStoreConnector,
     PendingSave,
@@ -245,6 +248,9 @@ def connector(monkeypatch):
     connector._saves = {}
     connector._reserved_bytes = 0
     connector._scheduler_attempts = {}
+    connector._local_tokens = {}
+    connector.local_prefix_caching = False
+    connector._prefix_cache_promoter = None
     connector._lookup_started = {}
     connector._lookup_stats = MooncakeStoreConnectorStats()
     connector._lookup_probe = None
@@ -307,7 +313,7 @@ def save_prefix(connector, attempt, blocks):
         store.objects["kv:" + block_hash.hex()] = b"kv"
 
 
-def begin_read(connector, attempt, tokens=8):
+def begin_read(connector, attempt, tokens=8, local_tokens=0):
     connector.meta = MooncakeStoreConnectorMetadata({attempt.token}, set())
     connector.meta.requests.append(
         ReqMeta(
@@ -315,7 +321,7 @@ def begin_read(connector, attempt, tokens=8):
             token_len_chunk=tokens,
             block_hashes=attempt.hashes,
             num_prompt_tokens=attempt.prompt_len,
-            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=tokens, can_load=True),
+            load_spec=LoadSpec(vllm_cached_tokens=local_tokens, kvpool_cached_tokens=tokens, can_load=True),
             block_ids=([11, 12, 13],),
         )
     )
@@ -1038,7 +1044,6 @@ def test_duplex_sessions_pass_startup_guard(supported_config):
         ("model_config", "model_stage", "talker", "Thinker only"),
         ("model_config", "multimodal_config", MultiModalConfig(mm_processor_cache_gb=0), "content-hashed"),
         ("model_config", "engine_output_type", "text", "capture outputs"),
-        ("cache_config", "enable_prefix_caching", True, "local prefix caching"),
         (None, "speculative_config", object(), "speculation"),
         (None, "lora_config", object(), "LoRA"),
         ("kv_transfer_config", "kv_load_failure_policy", "fail", "recompute"),
@@ -1295,7 +1300,7 @@ def scheduler_role(monkeypatch):
 @pytest.fixture
 def lookup_connector(scheduler_role):
     """A scheduler-role connector from its constructor, using the pinned lookup client."""
-    scheduler_role.setattr(connector_module, "MooncakeStoreScheduler", lookup_scheduler)
+    scheduler_role.setattr(connector_module, "JointStoreScheduler", lookup_scheduler)
     connector = OmniMooncakeStoreConnector(scheduler_role_config(), KVConnectorRole.SCHEDULER, BLOCK16_KV_CONFIG)
     client = connector.connector_scheduler.client
     gate = LookupRpcGate()
@@ -1317,7 +1322,7 @@ def test_scheduler_role_uses_the_pinned_async_lookup_client(lookup_connector):
 
 
 def test_namespace_isolates_resolved_physical_kv_layouts(scheduler_role):
-    scheduler_role.setattr(connector_module, "MooncakeStoreScheduler", lookup_scheduler)
+    scheduler_role.setattr(connector_module, "JointStoreScheduler", lookup_scheduler)
     # Use the resolved config, not the environment that selected it.
     scheduler_role.setenv("VLLM_KV_CACHE_LAYOUT", "LBHNC")
     namespaces = []
@@ -1364,7 +1369,7 @@ def test_constructor_rejects_lookup_clients_that_break_the_stall_guard(scheduler
             scheduler.lookup_async = False
         return scheduler
 
-    scheduler_role.setattr(connector_module, "MooncakeStoreScheduler", changed_scheduler)
+    scheduler_role.setattr(connector_module, "JointStoreScheduler", changed_scheduler)
     try:
         with pytest.raises(ValueError, match="one at a time"):
             OmniMooncakeStoreConnector(scheduler_role_config(), KVConnectorRole.SCHEDULER, BLOCK16_KV_CONFIG)
@@ -1653,3 +1658,308 @@ def test_scheduler_reports_how_long_requests_waited_for_lookup(lookup_connector)
     assert waits[0]["duration_seconds"] >= connector.settings.load_timeout_seconds
     # Handing the records over leaves nothing to report twice.
     assert connector.get_kv_connector_stats() is None
+
+
+def test_two_level_configuration_accepts_content_hashed_local_cache(supported_config):
+    config, kv_config = supported_config
+    config.cache_config.enable_prefix_caching = True
+    config.model_config.multimodal_config = MultiModalConfig(mm_processor_cache_gb=0)
+    OmniMooncakeStoreConnector._validate_supported(config, kv_config)
+
+
+def test_full_local_hit_never_issues_store_lookup(connector):
+    connector.local_prefix_caching = True
+    connector.connector_scheduler.reused_tokens = {}
+    connector.connector_scheduler.client.lookup = Mock(side_effect=AssertionError("unexpected Store lookup"))
+    request = SimpleNamespace(request_id="hot", num_prompt_tokens=9, num_tokens=9, block_hashes=[b"a", b"b"])
+    assert connector.get_num_new_matched_tokens(request, 8) == (0, False)
+    assert connector._local_tokens == {"hot": 8}
+    assert connector.connector_scheduler.reused_tokens == {"hot": 8}
+
+
+def test_mixed_lookup_only_queries_suffix_and_translates_native_boundaries(connector):
+    connector.local_prefix_caching = True
+    connector.connector_scheduler.reused_tokens = {}
+    lookup = connector.connector_scheduler.client.lookup = Mock(
+        return_value=MooncakeLookupResult(8, (TailKeyBoundary(0, 8),))
+    )
+    request = SimpleNamespace(
+        request_id="mixed",
+        num_prompt_tokens=17,
+        num_tokens=17,
+        block_hashes=[b"local", b"external-1", b"external-2", b"missing"],
+    )
+    assert connector.get_num_new_matched_tokens(request, 4) == (8, True)
+    lookup.assert_called_once_with("mixed", 13, request.block_hashes[1:], non_block=True)
+    spec = connector.connector_scheduler.load_specs["mixed"]
+    assert (spec.vllm_cached_tokens, spec.kvpool_cached_tokens) == (4, 12)
+    assert spec.tail_key_boundaries == (TailKeyBoundary(0, 12),)
+    assert connector.connector_scheduler.reused_tokens["mixed"] == 12
+
+
+def test_changed_local_boundary_discards_pending_suffix_lookup(connector):
+    connector.local_prefix_caching = True
+    connector.connector_scheduler.reused_tokens = {}
+    connector.connector_scheduler.client.lookup = Mock(return_value=None)
+    request = SimpleNamespace(
+        request_id="mixed", num_prompt_tokens=17, num_tokens=17, block_hashes=[b"a", b"b", b"c", b"d"]
+    )
+    assert connector.get_num_new_matched_tokens(request, 8) == (None, False)
+    assert connector.get_num_new_matched_tokens(request, 4) == (None, False)
+    assert connector.connector_scheduler.client.discarded == ["mixed"]
+    assert connector.connector_scheduler.client.lookup.call_args.args[2] == request.block_hashes[1:]
+
+
+def test_mixed_load_ignores_evicted_store_local_rows_and_promotes_before_completion(connector):
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector)
+    save_prefix(connector, attempt, 2)
+    local_key = hs_key(connector.namespace, attempt.hashes[0])
+    connector.connector_worker.store.objects.pop(local_key)
+    connector.connector_worker.store.objects.pop(local_key + ":ready")
+    promoted = []
+    connector.set_prefix_cache_promoter(lambda ids, rows: promoted.append((ids, rows)))
+    pending = begin_read(connector, attempt, local_tokens=4)
+    assert connector.request_cache_stats(attempt.req_id)["external_tokens"] == 0
+    assert pending.block_ids == frozenset({12})
+    assert pending.reserved_bytes == 3 * 4 * connector._row_bytes + connector_module._HS_HEADER_ALLOWANCE
+    connector.native_result = KVConnectorTransferResults(finished_recving={attempt.token})
+    assert not connector.get_transfer_results(set()).finished_recving
+    connector._read_executor.run()
+    result = connector.get_transfer_results(set())
+    assert result.finished_recving == {attempt.req_id}
+    assert not result.failed_recving
+    assert promoted[0][0] == [12]
+    assert torch.equal(promoted[0][1]["hidden"], captures(4, 8)["hidden"])
+    assert connector.connector_worker.store.batch_reads == [2]
+    assert connector.request_cache_stats(attempt.req_id)["external_tokens"] == 4
+
+
+@pytest.mark.parametrize("failure", ["missing", "promotion"])
+def test_failed_mixed_load_does_not_publish_or_touch_local_rows(connector, failure):
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector)
+    save_prefix(connector, attempt, 2)
+    local_rows = captures(0, 4)
+    touched = []
+
+    def promote(ids, rows):
+        touched.extend(ids)
+        raise ValueError("injected pool failure")
+
+    connector.set_prefix_cache_promoter(promote)
+    if failure == "missing":
+        connector.connector_worker.store.objects.pop(hs_key(connector.namespace, attempt.hashes[1]))
+    begin_read(connector, attempt, local_tokens=4)
+    connector._read_executor.run()
+    connector.native_result = KVConnectorTransferResults(finished_recving={attempt.token})
+    result = connector.get_transfer_results(set())
+    assert result.failed_recving == result.finished_recving == {attempt.req_id}
+    assert touched == ([] if failure == "missing" else [12])
+    assert torch.equal(local_rows["hidden"], captures(0, 4)["hidden"])
+    assert connector.request_cache_stats(attempt.req_id)["external_tokens"] == 0
+    assert connector._reserved_bytes == 0
+
+
+def test_two_level_capture_stages_only_computed_blocks_and_leaves_merge_to_pool(connector):
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector, prompt_len=13)
+    attempt.local_tokens, attempt.external_tokens = 4, 4
+    output = connector.capture_step(attempt.req_id, attempt.token, 8, 13, captures(8, 13))
+    assert torch.equal(output["hidden"], captures(8, 13)["hidden"])
+    assert connector.request_cache_stats(attempt.req_id) == {
+        "local_tokens": 4,
+        "external_tokens": 4,
+        "recomputed_tokens": 5,
+    }
+    save = next(iter(connector._saves.values()))
+    assert [(start, end) for start, end, _ in save.blocks] == [(8, 12)]
+    assert recorded(connector.connector_worker, "prefix_tokens") == [
+        (4, 0, "local", 0),
+        (4, 0, "external", 0),
+        (5, 0, "recomputed", 0),
+    ]
+
+
+def test_replayed_final_loaded_token_is_counted_as_compute_once(connector):
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector, prompt_len=8)
+    attempt.external_tokens = 8
+    output = connector.capture_step(attempt.req_id, attempt.token, 7, 8, captures(7, 9))
+    assert torch.equal(output["hidden"], captures(7, 9)["hidden"])
+    assert connector.request_cache_stats(attempt.req_id) == {
+        "local_tokens": 0,
+        "external_tokens": 7,
+        "recomputed_tokens": 1,
+    }
+    assert not connector._saves
+
+
+@pytest.mark.parametrize(
+    "prompt_len, expected_suffix", [(33, []), (49, list(range(32, 48)))], ids=["no-new-block", "one-new-block"]
+)
+def test_build_connector_meta_saves_only_new_blocks_after_mixed_hit(
+    connector, monkeypatch, prompt_len, expected_suffix
+):
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.cache_config = CacheConfig(block_size=16, enable_prefix_caching=True)
+    config.kv_transfer_config = KVTransferConfig(kv_connector="OmniMooncakeStoreConnector", kv_role="kv_both")
+    config.kv_events_config = KVEventsConfig(enable_kv_cache_events=True)
+    register_all_kvcache_specs(config)
+    client = Mock(spec=LookupKeyClient)
+    client.lookup.return_value = MooncakeLookupResult(16)
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler.LookupKeyClient", lambda _: client
+    )
+    connector.connector_scheduler = JointStoreScheduler(config, BLOCK16_KV_CONFIG)
+    connector.block_size = 16
+    connector.local_prefix_caching = True
+    pool = BlockPool(num_gpu_blocks=16, enable_caching=True, hash_block_size=16)
+    connector.bind_gpu_block_pool(pool)
+
+    prompt = list(range(prompt_len))
+    request = Request("mixed", prompt, SamplingParams(max_tokens=1), None)
+    request.block_hashes.extend([b"local", b"external", b"new"][: prompt_len // 16])
+    blocks = KVCacheBlocks((pool.get_new_blocks((prompt_len + 15) // 16),))
+    assert connector.get_num_new_matched_tokens(request, 16) == (16, True)
+    connector.update_state_after_alloc(request, blocks, 16)
+    (load,) = connector.build_connector_meta(SchedulerOutput.make_empty()).requests
+    assert load.load_spec == LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=True)
+    assert not load.can_save
+
+    # On the next step the first two blocks are available and the suffix runs.
+    request.num_computed_tokens = 32
+    block_ids = blocks.get_block_ids()
+    step = SchedulerOutput.make_empty()
+    step.scheduled_new_reqs = [NewRequestData.from_request(request, block_ids, prefill_token_ids=prompt)]
+    step.num_scheduled_tokens = {"mixed": prompt_len - 32}
+    step.total_num_scheduled_tokens = prompt_len - 32
+    step.kv_connector_block_state = KVConnectorBlockState({"mixed"}, lambda _: block_ids, {})
+    (save,) = connector.build_connector_meta(step).requests
+
+    assert (save.token_ids_start, save.token_len_chunk) == (32, 32 + len(expected_suffix))
+    assert save.token_ids == expected_suffix
+    assert save.can_save == bool(expected_suffix)
+    assert (save.store_job_id is not None) == bool(expected_suffix)
+
+
+def test_native_save_cursor_starts_after_reused_blocks_without_rewinding(monkeypatch):
+    worker = JointStoreWorker.__new__(JointStoreWorker)
+    worker.kv_send_thread = SimpleNamespace(done_task_lock=threading.Lock(), _saved_offset={"ongoing": 12})
+    metadata = MooncakeStoreConnectorMetadata(set(), set())
+    metadata.requests = [
+        ReqMeta("first", 12, ([1, 2, 3],), [], can_save=True, token_ids_start=8),
+        ReqMeta("ongoing", 16, ([1, 2, 3, 4],), [], can_save=True, token_ids_start=8),
+    ]
+    monkeypatch.setattr(MooncakeStoreWorker, "wait_for_save", lambda self, meta: None)
+    worker.wait_for_save(metadata)
+    assert worker.kv_send_thread._saved_offset == {"first": 8, "ongoing": 12}
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_promotion_does_not_hold_capture_lock_and_rechecks_attempt(connector, cancel):
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector)
+    save_prefix(connector, attempt, 2)
+
+    def promote(ids, rows):
+        # The output-builder thread may need the connector before it can
+        # release a local staging slot that promotion is waiting to claim.
+        acquired = threading.Event()
+
+        def capture_peer():
+            with connector._lock:
+                acquired.set()
+
+        peer = threading.Thread(target=capture_peer)
+        peer.start()
+        try:
+            assert acquired.wait(2), "promotion held the capture lock"
+        finally:
+            peer.join(timeout=2)
+        if cancel:
+            attempt.cancelled = True
+            connector._attempts[attempt.req_id] = Attempt(attempt.req_id, "successor", attempt.prompt_len)
+
+    connector.set_prefix_cache_promoter(promote)
+    begin_read(connector, attempt, local_tokens=4)
+    connector._read_executor.run()
+    connector.native_result = KVConnectorTransferResults(finished_recving={attempt.token})
+    result = connector.get_transfer_results(set())
+    assert result.finished_recving == (set() if cancel else {attempt.req_id})
+    assert connector.request_cache_stats(attempt.req_id)["external_tokens"] == (0 if cancel else 4)
+    assert connector._reserved_bytes == 0
+
+
+def test_combined_aligned_prompt_keeps_final_block_for_compute(connector):
+    connector.local_prefix_caching = True
+    connector.connector_scheduler.reused_tokens = {}
+    lookup = connector.connector_scheduler.client.lookup = Mock(
+        return_value=MooncakeLookupResult(12, (TailKeyBoundary(0, 12),))
+    )
+    request = SimpleNamespace(
+        request_id="mixed",
+        num_prompt_tokens=16,
+        num_tokens=16,
+        block_hashes=[b"local", b"external-1", b"external-2", b"tail"],
+    )
+    assert connector.get_num_new_matched_tokens(request, 4) == (8, True)
+    spec = connector.connector_scheduler.load_specs["mixed"]
+    assert (spec.vllm_cached_tokens, spec.kvpool_cached_tokens) == (4, 12)
+    assert spec.tail_key_boundaries == (TailKeyBoundary(0, 12),)
+    # On the next request all reusable whole blocks are local; the last block
+    # is recomputed without consulting Mooncake, just like native local APC.
+    request.request_id = "next"
+    assert connector.get_num_new_matched_tokens(request, 12) == (0, False)
+    assert lookup.call_count == 1
+
+
+def test_resumed_local_hit_counts_only_prompt_rows(connector):
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector, prompt_len=9)
+    attempt.local_tokens = 12
+    connector.capture_step(attempt.req_id, attempt.token, 12, 9, captures(12, 13))
+    assert connector.request_cache_stats(attempt.req_id) == {
+        "local_tokens": 9,
+        "external_tokens": 0,
+        "recomputed_tokens": 0,
+    }
+    assert not connector._saves
+
+
+def test_internal_pool_write_failure_is_not_reported_as_recoverable_load(connector, monkeypatch):
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+    from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector)
+    save_prefix(connector, attempt, 2)
+    manager = OmniPrefixCacheManager(PrefixCacheConfig(num_blocks=16, block_size=4), eager=True)
+    connector.set_prefix_cache_promoter(manager.promote_blocks)
+
+    def broken_write(*args):
+        raise RuntimeError("injected local pool writer failure")
+
+    monkeypatch.setattr(manager._pool, "write", broken_write)
+    begin_read(connector, attempt, local_tokens=4)
+    connector._read_executor.run()
+    connector.native_result = KVConnectorTransferResults(finished_recving={attempt.token})
+    try:
+        # The manager cannot recover its writer invariants after this failure.
+        # Returning failed_recving would falsely promise a healthy retry.
+        with pytest.raises(RuntimeError, match="local pool writer failure"):
+            connector.get_transfer_results(set())
+        assert not recorded(connector.connector_worker, "joint_load")
+    finally:
+        manager.shutdown()
+
+
+def test_missing_local_pool_binding_is_a_configuration_error(connector):
+    connector.local_prefix_caching = True
+    attempt = install_attempt(connector)
+    save_prefix(connector, attempt, 2)
+    begin_read(connector, attempt, local_tokens=4)
+    connector._read_executor.run()
+    connector.native_result = KVConnectorTransferResults(finished_recving={attempt.token})
+    with pytest.raises(RuntimeError, match="not initialized"):
+        connector.get_transfer_results(set())

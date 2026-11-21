@@ -194,6 +194,15 @@ def check_prefix_cache_kv_transfer(kv_transfer_config: object) -> None:
     KV loaded from a producer also shows up as ``num_computed_tokens``; the
     manager would read it as a local hit with no rows behind it.
     """
+    # This connector publishes the matching stage-output rows into the local
+    # pool before reporting a successful KV receive. Other consumers cannot
+    # make that guarantee.
+    if (
+        getattr(kv_transfer_config, "kv_connector", None) == "OmniMooncakeStoreConnector"
+        and getattr(kv_transfer_config, "kv_connector_module_path", None)
+        == "vllm_omni.distributed.kv_transfer.mooncake.connector"
+    ):
+        return
     if kv_transfer_config is not None and getattr(kv_transfer_config, "is_kv_consumer", False):
         raise OmniPrefixCacheUnmatchError(
             "omni prefix caching cannot tell locally cached tokens from KV received "

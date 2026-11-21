@@ -10,7 +10,7 @@ import torch
 
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheDelivery, PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.group_view import MRv2FullAttentionGroupView, check_mrv2_prefix_cache_layout
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, OmniPrefixCacheUnmatchError, PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -214,3 +214,53 @@ def test_resume_above_watermark_replays_gap(harness):
     assert harness.mgr.step_rewrite_req_ids(s5) == {"a"}
     out = harness.mgr.materialize(s5, ["a"], include_uncached=False)
     assert torch.equal(out.hidden_states["a"], rows_for(range(4, 10)))
+
+
+def test_external_promotion_combines_local_external_and_fresh_rows(harness):
+    # One local block followed by a noncontiguous external destination.
+    harness.mgr.discard_step(harness.step([("warm", 0, 4)], new=[("warm", 0, [0])])[1])
+    external = torch.full((4, HIDDEN), 42.0)
+    harness.mgr.promote_blocks([3], {HIDDEN_KEY: external})
+    _, step_id = harness.step([("mixed", 8, 2)], new=[("mixed", 8, [0, 3, 4])], finished=["warm"])
+    expected = torch.cat((rows_for(range(4)), external, rows_for([16, 17])))
+    assert torch.equal(harness.mgr.materialize(step_id, ["mixed"]).hidden_states["mixed"], expected)
+    # A later request serves the promoted block entirely through local lookup.
+    _, step_id = harness.step([("local", 8, 2)], new=[("local", 8, [0, 3, 5])], finished=["mixed"])
+    expected = torch.cat((rows_for(range(4)), external, rows_for([20, 21])))
+    assert torch.equal(harness.mgr.materialize(step_id, ["local"]).hidden_states["local"], expected)
+
+
+def test_external_promotion_preserves_delayed_read_on_recycled_slots(harness):
+    harness.mgr.promote_blocks([3], {HIDDEN_KEY: torch.full((4, HIDDEN), 7.0)})
+    slots = torch.arange(12, 16)
+    with harness.mgr._state_lock:
+        pending = harness.mgr._slot_ref(slots, HIDDEN_KEY, "old")
+    harness.mgr.promote_blocks([3], {HIDDEN_KEY: torch.full((4, HIDDEN), 9.0)})
+    assert torch.equal(harness.mgr._fetch_source(pending), torch.full((4, HIDDEN), 7.0))
+    assert torch.equal(harness.mgr._pool.rows(HIDDEN_KEY, slots), torch.full((4, HIDDEN), 9.0))
+    assert not harness.mgr._pending_reads
+
+
+def test_external_promotion_chunks_and_releases_all_resources():
+    cfg = PrefixCacheConfig(num_blocks=8, block_size=4, staging_capacity_tokens=3, staging_depth=1)
+    manager = OmniPrefixCacheManager(cfg, eager=True)
+    try:
+        for value in range(10):
+            rows = torch.full((12, HIDDEN), float(value))
+            manager.promote_blocks([2, 4, 6], {HIDDEN_KEY: rows})
+            slots = torch.tensor([8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27])
+            assert torch.equal(manager._pool.rows(HIDDEN_KEY, slots), rows)
+            assert manager._controller.in_flight_tasks() == 0
+            assert manager._controller._staged_bytes == 0
+            assert not manager._request_tasks.tasks
+            assert not manager._step_ctxs
+            assert not manager._slot_status.task_slots
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("blocks,rows", [([16], 4), ([1, 1], 8), ([1], 3), ([], 0)])
+def test_invalid_external_promotion_does_not_mutate_pool(harness, blocks, rows):
+    with pytest.raises(ValueError, match="promotion"):
+        harness.mgr.promote_blocks(blocks, {HIDDEN_KEY: torch.zeros((rows, HIDDEN))})
+    assert not harness.mgr._pool.keys()

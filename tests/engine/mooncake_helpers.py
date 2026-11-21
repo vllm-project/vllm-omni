@@ -40,15 +40,21 @@ class AuditedGPUARWorker(GPUARWorker):
     def init_device(self):
         import vllm_omni.model_executor.stage_input_processors.qwen3_omni as qwen_handoff
         from vllm_omni.distributed.kv_transfer.mooncake.connector import OmniMooncakeStoreConnector
+        from vllm_omni.worker_v2.prefix_cache import MRv2PrefixCacheMixin
 
         directory = Path(os.environ[AUDIT_ENV])
         capture_step = OmniMooncakeStoreConnector.capture_step
         read_blocks = OmniMooncakeStoreConnector._read_hs_blocks
         merge_rows = qwen_handoff._merge_talker_prefill_rows
+        save_local = MRv2PrefixCacheMixin._prefix_cache_save_mrv2
 
         def audited_read(connector, attempt, tokens):
             if (directory / FAIL_HS_READ).exists():
-                _record(directory, "injected_failure", {"request_id": attempt.req_id, "tokens": tokens})
+                _record(
+                    directory,
+                    "injected_failure",
+                    {"request_id": attempt.req_id, "tokens": tokens, "local_tokens": attempt.local_tokens},
+                )
                 raise ValueError("injected HS read failure")
             return read_blocks(connector, attempt, tokens)
 
@@ -73,9 +79,16 @@ class AuditedGPUARWorker(GPUARWorker):
                         "prompt_len": prompt_len,
                         "fresh_rows": tensors["embedding"].shape[0],
                         "inserted_rows": inserted,
+                        **connector.request_cache_stats(req_id),
                     },
                 )
             return merged
+
+        def audited_local(runner, *args, **kwargs):
+            rewrite = save_local(runner, *args, **kwargs)
+            if rewrite is not None:
+                _record(directory, "local_rewrite", {"requests": [req_id for _, req_id in rewrite.rows]})
+            return rewrite
 
         def audited_merge(embed, hidden, prompt_token_ids, hf_config):
             packed = merge_rows(embed, hidden, prompt_token_ids, hf_config)
@@ -99,5 +112,6 @@ class AuditedGPUARWorker(GPUARWorker):
 
         OmniMooncakeStoreConnector.capture_step = audited_capture
         OmniMooncakeStoreConnector._read_hs_blocks = audited_read
+        setattr(MRv2PrefixCacheMixin, "_prefix_cache_save_mrv2", audited_local)
         qwen_handoff._merge_talker_prefill_rows = audited_merge
         super().init_device()

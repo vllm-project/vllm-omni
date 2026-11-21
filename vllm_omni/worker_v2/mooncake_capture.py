@@ -25,8 +25,31 @@ if TYPE_CHECKING:
     from vllm_omni.distributed.kv_transfer.mooncake.connector import OmniMooncakeStoreConnector
     from vllm_omni.outputs import OmniModelRunnerOutput
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+    from vllm_omni.worker_v2.prefix_cache import MRv2PrefixCacheMixin
 
 OutputFinalizer = Callable[["OmniModelRunnerOutput"], "OmniModelRunnerOutput"]
+
+
+def bind_mooncake_prefix_cache(runner: MRv2PrefixCacheMixin) -> None:
+    """Bind promotion after both the native connector and local pool exist."""
+    connector = cast("OmniMooncakeStoreConnector", runner.kv_connector.kv_connector)
+    cache = runner.omni_prefix_cache
+    if cache is None:
+        raise RuntimeError("Mooncake local caching requires the stage-output pool")
+
+    def promote(block_ids: list[int], tensors: dict[str, torch.Tensor]) -> None:
+        # Buffered decode writes can still refer to slots since reclaimed for
+        # this receive. Flush them before claiming the external destination.
+        runner._prefix_cache_flush_decode()
+        cache.promote_blocks(
+            block_ids,
+            {
+                "hidden_states.layer_0": tensors["embedding"],
+                f"hidden_states.layer_{connector.hidden_layer}": tensors["hidden"],
+            },
+        )
+
+    connector.set_prefix_cache_promoter(promote)
 
 
 @dataclass(frozen=True)
