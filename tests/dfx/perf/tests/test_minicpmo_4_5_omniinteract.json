@@ -1,11 +1,15 @@
 [
   {
     "test_name": "test_minicpmo_4_5_omniinteract",
+    "description": "Provisional H200 mean_duplex_busy_rtf baselines: 2026-11-18 single-day response means for 1q1a, 1q1a_math and 1qna (44, 16 and 17 valid samples), rounded to four decimals without margin. Source: JiusiServe/omni-reviewbot@71cb3bb12cca, vLLM-Omni@7a92afde03ef. Local device label L20X maps to H200. Higher Busy RTF variability is accepted; this short window does not establish stability. H100 calibration remains pending.",
     "mark": [
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": [
+              "H100",
+              "H200"
+            ]
           },
           "num_cards": 2
         }
@@ -70,7 +74,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H200": {
+            "mean_duplex_busy_rtf": [
+              2.9042
+            ]
+          }
+        }
       },
       {
         "dataset_name": "omniinteract",
@@ -106,7 +117,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H200": {
+            "mean_duplex_busy_rtf": [
+              0.9131
+            ]
+          }
+        }
       },
       {
         "dataset_name": "omniinteract",
@@ -142,7 +160,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H200": {
+            "mean_duplex_busy_rtf": [
+              0.6782
+            ]
+          }
+        }
       }
     ]
   }

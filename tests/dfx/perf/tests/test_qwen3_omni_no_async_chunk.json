@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_qwen3_omni",
-    "description": "random row: fixed workload (Thinker 900 / Talker 1536 tokens, min_tokens == max_tokens) for comparable audio RTF, see #8100. H100 and A3 baselines use equal-weight daily means from 2026-10-08 through 2026-10-14 (H100: 5 comparable days; A3: 6 days), after verifying recorded per-request stage token counts; no added margin.",
+    "description": "random row: fixed workload (Thinker 900 / Talker 1536 tokens, min_tokens == max_tokens) for comparable audio RTF, see #8100. Selected non-regressing H100 values use equal-weight daily means from 2026-11-10 through 2026-11-16 (7 comparable days), with recorded stage token counts verified, sample daily CV <=5%, and every day within 10% of the window median; rounded to 4 decimals with no added margin. Regressing or unstable values retain their prior references. A3 values are retained because the window has only 4 comparable days; the random row retains its 2026-10-08 through 2026-10-14 reference. These archived measurements do not validate the current revision.",
     "mark": [
       {
         "hardware_marks": {
@@ -168,14 +168,14 @@
               215.2391,
               296.4664,
               430.4905,
-              812.2658
+              568.2295
             ],
             "mean_tpot_ms": [
-              6.6888,
-              10.9254,
-              13.9474,
-              18.1473,
-              23.9778
+              5.022,
+              8.2965,
+              10.2715,
+              13.172,
+              16.8911
             ],
             "mean_e2el_ms": [
               18752.4068,
@@ -256,7 +256,7 @@
               316.1369
             ],
             "mean_tpot_ms": [
-              6.4382
+              4.6932
             ],
             "mean_e2el_ms": [
               3757.4875
@@ -344,7 +344,7 @@
               272.1915
             ],
             "mean_tpot_ms": [
-              7.0756
+              5.2147
             ],
             "mean_e2el_ms": [
               4085.4559
@@ -434,7 +434,7 @@
               464.283
             ],
             "mean_tpot_ms": [
-              9.1347
+              6.1598
             ],
             "mean_e2el_ms": [
               5246.8779
