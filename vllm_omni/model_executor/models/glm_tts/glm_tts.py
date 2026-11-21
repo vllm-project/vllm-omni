@@ -9,10 +9,13 @@ Analogous to Fish Speech Slow AR and Qwen3-TTS Talker models.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
+from functools import partial
+from types import MethodType
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
@@ -46,6 +49,7 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.worker.gpu.sample.sampler import Sampler as MRv2Sampler
 
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one as _ras_sample_one
@@ -84,6 +88,194 @@ def _tensor_param_values(
     if len(values) < count:
         values.extend([values[-1]] * (count - len(values)))
     return [float(value) for value in values[:count]]
+
+
+def _glm_tts_allowed_token_ids(
+    ats: int,
+    ate: int,
+    eoa: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compact MRv2 vocabulary: audio tokens followed by EOA when distinct."""
+    audio_ids = torch.arange(ats, ate + 1, dtype=torch.long, device=device)
+    if ats <= eoa <= ate:
+        return audio_ids
+    return torch.cat((audio_ids, audio_ids.new_tensor([eoa])))
+
+
+def _glm_tts_repeated_rows(
+    history: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    output_mask: torch.Tensor,
+    row_temperature: torch.Tensor,
+    *,
+    win_size: int,
+    tau_r: float,
+    eps: float,
+) -> torch.Tensor:
+    """Return rows whose first RAS draw repeats generated output too often."""
+    repeats = ((history == sampled_token_ids.unsqueeze(1)) & output_mask).sum(dim=1)
+    return (repeats >= win_size * tau_r) & output_mask.any(dim=1) & (row_temperature >= eps)
+
+
+def _glm_tts_mrv2_ras_supported(
+    sampler: MRv2Sampler,
+    idx_mapping_np: np.ndarray,
+    return_logprobs: bool,
+) -> bool:
+    """Match the V1 cases that use RAS instead of the standard sampler."""
+    if return_logprobs or bool(getattr(sampler, "return_sampling_mask", False)):
+        return False
+    penalties = getattr(sampler, "penalties_state", None)
+    if penalties is not None:
+        if np.any(penalties.frequency_penalty.np[idx_mapping_np] != 0):
+            return False
+        if np.any(penalties.presence_penalty.np[idx_mapping_np] != 0):
+            return False
+    from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+
+    for processor in getattr(sampler, "logits_processors", ()):  # pragma: no branch - fixed native list
+        if isinstance(processor, BadWordsState) and np.any(processor.num_bad_words.np[idx_mapping_np] != 0):
+            return False
+    return True
+
+
+def _glm_tts_mrv2_sample(
+    sampler: MRv2Sampler,
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
+    pos: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray | None = None,
+    return_logprobs: bool = False,
+    *,
+    fallback_sample: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    ats: int,
+    ate: int,
+    eoa: int,
+    default_top_p: float,
+    default_top_k: int,
+    win_size: int,
+    tau_r: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GLM-TTS RAS on MRv2, excluding prompt tokens from repetition history."""
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    allowed_key = (logits.device.type, logits.device.index, ats, ate, eoa)
+    allowed_ids = getattr(sampler, "_glm_tts_allowed_ids", None)
+    if not isinstance(allowed_ids, torch.Tensor) or getattr(sampler, "_glm_tts_allowed_key", None) != allowed_key:
+        allowed_ids = _glm_tts_allowed_token_ids(ats, ate, eoa, device=logits.device)
+        sampler._glm_tts_allowed_ids = allowed_ids
+        sampler._glm_tts_allowed_key = allowed_key
+
+    if not _glm_tts_mrv2_ras_supported(sampler, idx_mapping_np, return_logprobs):
+        allowed_logits = logits.index_select(1, allowed_ids)
+        logits = torch.full_like(logits, float("-inf"))
+        logits.index_copy_(1, allowed_ids, allowed_logits)
+        return fallback_sample(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            seq_lens_upper_bound_np,
+            return_logprobs=return_logprobs,
+        )
+
+    # Native logits processors mutate their input. Preserve the caller-owned
+    # logits while matching the upstream sampler's FP32 processing buffer.
+    logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+    logit_bias_state = getattr(sampler, "logit_bias_state", None)
+    if logit_bias_state is not None:
+        logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+    else:
+        from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
+        from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+
+        ctx = LogitsContext(
+            expanded_idx_mapping=expanded_idx_mapping,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_local_pos=expanded_local_pos,
+            input_ids=input_ids,
+            pos=pos,
+            seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+        )
+        # GLM-TTS RAS owns repetition handling. Preserve all other request
+        # constraints, including min-tokens masking of EOA.
+        for processor in sampler.logits_processors:
+            if not isinstance(processor, PenaltiesState):
+                logits = processor.apply(logits, ctx)
+
+    allowed_logits = logits.index_select(1, allowed_ids)
+    states = sampler.sampling_states
+    rows = expanded_idx_mapping.long()
+    temperature = states.temperature.gpu
+    row_temperature = temperature[rows]
+    weighted_scores = allowed_logits / row_temperature.clamp_min(eps).unsqueeze(1)
+    top_k, top_p, _ = states.get_top_k_top_p(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        weighted_scores.shape[-1],
+    )
+    num_rows, vocab = weighted_scores.shape
+    if top_p is None:
+        top_p = weighted_scores.new_full((num_rows,), default_top_p)
+    if top_k is None:
+        top_k = torch.full((num_rows,), default_top_k, dtype=torch.int32, device=weighted_scores.device)
+
+    sorted_scores, sorted_ids = weighted_scores.sort(dim=1, descending=True, stable=True)
+    ranks = torch.arange(vocab, device=weighted_scores.device).unsqueeze(0)
+    top_k_keep = (top_k.unsqueeze(1) <= 0) | (ranks < top_k.unsqueeze(1))
+    top_k_scores = sorted_scores.masked_fill(~top_k_keep, float("-inf"))
+    # Match the existing V1 GLM-TTS helper: normalize over the top-k subset,
+    # then apply top-p to that truncated distribution.
+    sorted_probs = top_k_scores.softmax(dim=1)
+    keep = (sorted_probs.cumsum(dim=1) - sorted_probs) < top_p.unsqueeze(1)
+    keep &= top_k_keep
+    nucleus = top_k_scores.masked_fill(~keep, float("-inf"))
+    seeds = states.seeds.gpu
+    draws = gumbel_sample(nucleus, expanded_idx_mapping, temperature, seeds, pos, False, False)
+    sampled_local = sorted_ids.gather(1, draws.unsqueeze(1)).squeeze(1)
+    sampled_token_ids = allowed_ids.index_select(0, sampled_local.long())
+    if win_size <= 0:
+        return sampled_token_ids, logits
+
+    req_states = sampler.req_states
+    total_len = req_states.total_len.gpu[rows].long()
+    prompt_len = req_states.prompt_len.gpu[rows].long()
+    offsets = total_len.unsqueeze(1) - 1 - torch.arange(win_size, device=weighted_scores.device).unsqueeze(0)
+    output_mask = offsets >= prompt_len.unsqueeze(1)
+    history = req_states.all_token_ids.gpu[rows.unsqueeze(1), offsets.clamp_min(0)]
+    rejected = _glm_tts_repeated_rows(
+        history,
+        sampled_token_ids,
+        output_mask,
+        row_temperature,
+        win_size=win_size,
+        tau_r=tau_r,
+        eps=eps,
+    )
+    # Official GLM-TTS RAS resamples from the original allowed distribution,
+    # rather than deleting the repeated draw as CosyVoice3 does.
+    replacement_local = gumbel_sample(
+        weighted_scores,
+        expanded_idx_mapping,
+        temperature,
+        seeds,
+        pos,
+        False,
+        True,
+    )
+    sampled_local = torch.where(rejected, replacement_local, sampled_local)
+    return allowed_ids.index_select(0, sampled_local.long()), logits
 
 
 def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> str:
@@ -1197,6 +1389,28 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
+
+    def mrv2_custom_sampler(self, sampler: MRv2Sampler) -> tuple[MRv2Sampler, None] | None:
+        """Install GLM-TTS's official audio-only RAS policy on MRv2."""
+        if self.model_stage != "glm_tts":
+            return None
+        fallback_sample = sampler.sample
+        sampler.sample = MethodType(
+            partial(
+                _glm_tts_mrv2_sample,
+                fallback_sample=fallback_sample,
+                ats=self._ats,
+                ate=self._ate,
+                eoa=self._eoa,
+                default_top_p=self._ras_top_p,
+                default_top_k=self._ras_top_k,
+                win_size=self._ras_win_size,
+                tau_r=self._ras_tau_r,
+                eps=self._sampling_eps,
+            ),
+            sampler,
+        )
+        return sampler, None
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         """Package hidden states, speech tokens, and voice clone data into OmniOutput.
