@@ -3415,6 +3415,31 @@ class TestPlatformOverrides:
         assert deploy.stages[0].engine_extras["block_size"] == 128
 
     @pytest.mark.parametrize(
+        "filename,pipeline_key",
+        [
+            ("fish_omni.yaml", "fish_omni"),
+            ("fish_qwen3_omni.yaml", "fish_qwen3_omni"),
+            ("fish_qwen3_omni_2gpu.yaml", "fish_qwen3_omni"),
+            ("fish_qwen3_omni_high_concurrency_single_gpu.yaml", "fish_qwen3_omni"),
+            ("fish_qwen3_omni_high_concurrency_dual_gpu.yaml", "fish_qwen3_omni"),
+        ],
+    )
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_fish_profiles_resolve_both_stages_on_v2(self, monkeypatch, platform, filename, pipeline_key):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        stage0, dac = merge_pipeline_deploy(resolve_pipeline_config(pipeline_key), deploy)
+        assert stage0.yaml_engine_args["use_v2_model_runner"]
+        assert dac.yaml_engine_args["use_v2_model_runner"]
+        assert dac.yaml_engine_args["supports_native_mrv2_data_plane"]
+        if pipeline_key == "fish_qwen3_omni":
+            assert stage0.yaml_engine_args["enforce_eager"] is (platform != "cuda")
+            assert stage0.yaml_engine_args["supports_native_mrv2_data_plane"]
+            assert not stage0.yaml_engine_args["enable_prefix_caching"]
+
+    @pytest.mark.parametrize(
         "filename,pipeline_key,cuda_default_runner,cuda_v1_stages",
         [
             ("qwen3_tts.yaml", "qwen3_tts", "v2", ()),

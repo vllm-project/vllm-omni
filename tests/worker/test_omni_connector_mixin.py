@@ -1321,7 +1321,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
     def test_poll_single_request_accepts_tensor_audio_codes(self):
         host = self._make_host(rank=0)
         host._scheduling_metadata_adapter = MagicMock()
-        audio_codes = torch.tensor([[10, 11, 12]], dtype=torch.long)
+        audio_codes = torch.tensor([10, 11, 12], dtype=torch.long)
         payload = {
             "codes": {"audio": audio_codes},
             "meta": {"finished": torch.tensor(False)},
@@ -1341,6 +1341,26 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertEqual(
             host.get_omni_connector_output().request_metadata,
             {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12))},
+        )
+        host._scheduling_metadata_adapter.extract.assert_not_called()
+        host.shutdown_omni_connectors()
+
+    def test_poll_single_request_schedules_a_codes_window_as_one_placeholder(self):
+        # A [codebooks, frames] window is one placeholder token, as in the V1
+        # chunk transfer adapter; the consumer reads the codes from the payload.
+        host = self._make_host(rank=0)
+        host._scheduling_metadata_adapter = MagicMock()
+        window = torch.arange(30, dtype=torch.long).reshape(10, 3)
+        payload = {"codes": {"audio": window}, "meta": {"finished": torch.tensor(False)}}
+        host._omni_connector.get.return_value = (payload, 1)
+
+        with patch.object(host, "_get_local_tp_group", return_value=None):
+            self.assertTrue(host._poll_single_request("r1"))
+
+        self.assertTrue(torch.equal(host.get_local_stage_payload("r1")["codes"]["audio"], window))
+        self.assertEqual(
+            host.get_omni_connector_output().request_metadata,
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(0,))},
         )
         host._scheduling_metadata_adapter.extract.assert_not_called()
         host.shutdown_omni_connectors()

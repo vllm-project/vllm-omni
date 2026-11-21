@@ -129,8 +129,8 @@ class FishSpeechDACDecoder(nn.Module):
         # Opt-in, CUDA only: the decoder runs channels-last (no NCHW<->NHWC
         # reformatting, fast dilated convs, a fused Snake), its window
         # transformer compiled, as its own CUDA graphs per (batch, frames)
-        # bucket of the streaming windows (captured during the profiling run,
-        # where the codec loads). Otherwise the module decoder runs.
+        # bucket of the streaming windows (captured when the codec loads).
+        # Otherwise the module decoder runs.
         self._channels_last = None
         self._cuda_graphs = bool(extra_cfg.get("fish_speech_dac_cuda_graphs", False))
         # Keep every request's convolution history and window-transformer
@@ -275,6 +275,17 @@ class FishSpeechDACDecoder(nn.Module):
             self._output_sample_rate,
         )
 
+    @torch.inference_mode()
+    def capture_auxiliary_graphs(self) -> None:
+        """Load the codec before the worker is ready.
+
+        On Model Runner V1 the warmup dummy run loads it. Model Runner V2 has
+        no such run for this stage, so without this hook the first request
+        would load the codec and, with ``fish_speech_dac_cuda_graphs``, compile
+        its window transformer and capture every graph.
+        """
+        self._ensure_codec_loaded()
+
     def _capture_graphs(self, device: torch.device) -> None:
         from vllm_omni.model_executor.models.fish_speech.dac_channels_last import (
             DACDecodeGraphs,
@@ -363,6 +374,10 @@ class FishSpeechDACDecoder(nn.Module):
         if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
             return None
 
+        if codes.ndim == 1:
+            # Flat codes are also the input_ids, which forward() decodes. Model
+            # Runner V2 puts them in runtime info too; skip them without a warning.
+            return None
         q = self._num_codebooks
         codes = codes.to(device=device, dtype=torch.long, non_blocking=True).contiguous()
         if codes.ndim != 2 or codes.shape[0] != q:

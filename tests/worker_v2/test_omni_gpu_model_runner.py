@@ -817,6 +817,8 @@ def _make_graph_contract_model(architecture, stage):
     ("architecture", "stage"),
     [
         ("BreezeForConditionalGeneration", None),
+        ("FishOmniForConditionalGeneration", None),
+        ("FishSpeechSlowARForConditionalGeneration", None),
         ("HiggsAudioV3TalkerForConditionalGeneration", None),
         ("Ming3TTSForConditionalGeneration", "llm"),
         ("MiniMaxMusic3TalkerForConditionalGeneration", None),
