@@ -23,6 +23,11 @@ def aura_duplex_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
         supports_scheduler_native_append=False,
         supports_core_resumable_request=False,
         supports_concurrent_turn_requests=True,
+        # A bare response.create answers an accepted tool result with no new
+        # audio/video turn of its own (plan_append's ``{"type": "conversation"}``
+        # branch). AURA has no other text-only input path today, so this does
+        # not also open a generic typed-text turn.
+        supports_text_only_turn=True,
         # Video required, audio optional (vision-only / silent+frames legal).
         required_input_modalities=frozenset({"video"}),
         optional_input_modalities=frozenset({"audio"}),

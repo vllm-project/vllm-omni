@@ -52,6 +52,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "AuraQwen3VLForConditionalGeneration": "qwen3_vl",
+    "AuraQwen3_5ForConditionalGeneration": "qwen3_5",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.

@@ -30,6 +30,31 @@ is used even if the command-line `--model` points at one component checkpoint.
 
 Silent Stage1 outputs (`<|silent|>` / id `151669`) skip TTS for that turn.
 
+## AURA_v2
+
+AURA_v2 (`AuraQwen3_5ForConditionalGeneration`, Qwen3.5 hybrid thinker) uses
+the same pipeline with its own deploy files. Both set `async_chunk: true`.
+
+| Profile | Deploy file | Layout |
+| --- | --- | --- |
+| 2-GPU (recommended) | `vllm_omni/deploy/aura_omni_v2_2gpu.yaml` | Stage1 on GPU 1, CUDA graphs, up to 16 sessions |
+| 1-GPU | `vllm_omni/deploy/aura_omni_v2.yaml` | all stages on GPU 0, eager, one session |
+
+```bash
+vllm serve aurateam/AURA_2 --omni --trust-remote-code \
+  --deploy-config vllm_omni/deploy/aura_omni_v2_2gpu.yaml --port 8091
+python examples/online_serving/aura_omni/smoke_duplex_realtime_client.py \
+  --url ws://127.0.0.1:8091/v1/realtime --model aurateam/AURA_2
+```
+
+Every reply starts with `<|silent|>` (id `248070`, no speech) or `<|respond|>`
+(id `248077`). Frames-only commits allow proactive replies. Tool calls go out
+as `response.function_call_arguments.done`; the web demo
+(`python -m examples.online_serving.aura_omni.realtime_web`) runs them and the
+model speaks the result. Hardware, numbers and limits are in
+`recipes/AURA/AURA_v2-H200.md`; the design is in
+[Full-Duplex Runtime (AURA_v2)](../../../design/aura_v2_duplex.md).
+
 ## GPU Utilization Recommendation
 
 `gpu_memory_utilization` in `vllm_omni/deploy/aura_omni.yaml` controls how much
