@@ -33,6 +33,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import (
     OmniMRotaryEmbedding,
@@ -46,6 +47,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -411,7 +413,16 @@ class Qwen2_5OmniForConditionalGeneration(
             # Code2Wav decodes one request per forward (its deploy uses max_num_seqs=1).
             speaker = resolve_speaker(info.get("speaker") if isinstance(info, dict) else None)
             audio_tensor = self.generate_audio(code, speaker) if code.numel() else torch.zeros(0, device=code.device)
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
+            sample_rate = defs.resolve_audio_sample_rate(self.token2wav_config)
+            # `sr` is the audio sample rate metadata consumed by downstream
+            # audio serving and stage-local audio metrics.
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": audio_tensor,
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(sample_rate),
+                },
+            )
 
         return OmniOutput(
             text_hidden_states=torch.cat(

@@ -31,6 +31,7 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     VoxtralTTSMultiModalProcessor,
     VoxtralTTSProcessingInfo,
 )
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
@@ -327,7 +328,12 @@ class VoxtralTTSForConditionalGeneration(
                 batch_audio_arrays = self.audio_tokenizer.decode_helper_batch_async([audio_tokens])
                 return OmniOutput(
                     text_hidden_states=None,
-                    multimodal_outputs={"audio": batch_audio_arrays},
+                    multimodal_outputs={
+                        "audio": batch_audio_arrays,
+                        SAMPLE_RATE_KEY: make_sample_rate_tensors(
+                            self.audio_tokenizer.sampling_rate, len(batch_audio_arrays)
+                        ),
+                    },
                 )
             all_audio_tokens, all_ctx_frames = parse_batched_audio_input(
                 input_ids, num_codebooks=self.audio_tokenizer.num_codebooks
@@ -341,7 +347,12 @@ class VoxtralTTSForConditionalGeneration(
 
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"audio": batch_audio_arrays},
+                multimodal_outputs={
+                    "audio": batch_audio_arrays,
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(
+                        self.audio_tokenizer.sampling_rate, len(batch_audio_arrays)
+                    ),
+                },
             )
 
     _DEFAULT_CFG_ALPHA = 1.2
