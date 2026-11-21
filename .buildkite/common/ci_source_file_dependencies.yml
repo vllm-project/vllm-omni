@@ -1673,12 +1673,28 @@ source_file_dependencies:
   diffusion_lingbot_function:
     - *lingbot_video
     - *lingbot_world
+    - vllm_omni/diffusion/model_metadata.py
     - vllm_omni/diffusion/offloader/
-    - tests/e2e/online_serving/test_lingbot_video.py
     - tests/e2e/online_serving/test_lingbot_video_expansion.py
     - tests/e2e/online_serving/test_lingbot_video_moe.py
     - tests/e2e/online_serving/test_lingbot_video_offload.py
     - tests/e2e/offline_inference/test_lingbot_world_v2.py
+
+  # Ready/Merge LingBot-World one-block step. Changes that touch only LingBot-Video do not trigger it.
+  diffusion_lingbot_world_function: &lingbot_world_function
+    - *lingbot_world
+    - vllm_omni/model_executor/models/lingbot_world/
+    - tests/e2e/offline_inference/test_lingbot_world_v2.py
+    - tests/helpers/client.py
+    - tests/helpers/runtime.py
+
+  diffusion_lingbot_world_npu_function:
+    - *lingbot_world_function
+    - tests/assets/qwen_image_edit/qwen_image_edit_2511_test2.png
+    - tests/e2e/accuracy/lingbot_world/configs/npu_usp4_offload.yaml
+    - vllm_omni/experimental/ar_diffusion/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/diffusion/distributed/autoencoders/
 
   diffusion_lingbot_perf:
     - *lingbot_video
