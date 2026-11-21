@@ -160,7 +160,7 @@ that do not belong in the shared contract should be stored in `state.extra`.
 Queueing and lifecycle metadata remain in the scheduler's request state.
 
 Current native pipelines that explicitly enable step execution include
-Qwen-Image, BAGEL, HunyuanImage3, and Helios. Step execution alone does not
+Qwen-Image, SD3, BAGEL, HunyuanImage3, and Helios. Step execution alone does not
 imply continuous-batching support: Qwen-Image accepts batched step states.
 BAGEL accepts batched step states for image generation with its default,
 think-mode, and single-stage deploy configs. Only the diffusion stage uses the
