@@ -27,11 +27,12 @@ import torch.nn.functional as F
 from .multiview_flex_attention import MultiviewAttentionContext
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
-    META_IDENTITY_K,
-    META_IDENTITY_Q,
+    META_K_START,
     META_KEY_STREAM,
     META_MAX_SEQLEN_K,
     META_MAX_SEQLEN_Q,
+    META_Q_START,
+    STAGING_FIELDS,
     TENSORS_PER_PASS,
     MultiviewMasklessPlan,
     build_multiview_maskless_plan,
@@ -174,6 +175,18 @@ def merge_step(
     return acc, acc_lse
 
 
+def merge_rows(
+    acc: torch.Tensor, acc_lse: torch.Tensor, out: torch.Tensor, lse: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`merge_step` on an FP32 copy of ``acc``, returned in ``acc``'s dtype.
+
+    With an FP32 accumulator this is ``merge_step``; with output rows in the
+    query dtype it is the same FP32 arithmetic followed by the final cast.
+    """
+    merged, merged_lse = merge_step(acc.float(), acc_lse, out, lse)
+    return merged.to(acc.dtype), merged_lse
+
+
 def _merge_attention_outputs(outputs: list[torch.Tensor], lse_tensors: list[torch.Tensor]) -> torch.Tensor:
     """All-branches reference merge with ``[..., tokens, heads]`` FP32 LSE (tests and oracles)."""
     if not outputs or len(outputs) != len(lse_tensors):
@@ -184,18 +197,63 @@ def _merge_attention_outputs(outputs: list[torch.Tensor], lse_tensors: list[torc
     return acc.to(outputs[0].dtype)
 
 
-_compiled_merge_step: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
+_compiled_merge_rows: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
 
 
-def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
-    # Elementwise over chunk rows: one dynamic-shape graph serves every chunk
-    # length and every geometry.  CPU (tests) runs eager.
+def _merge_rows_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    # Elementwise over chunk rows: one dynamic-shape graph per accumulator dtype
+    # serves every chunk length and every geometry.  CPU (tests) runs eager.
     if device.type != "cuda":
-        return merge_step
-    global _compiled_merge_step
-    if _compiled_merge_step is None:
-        _compiled_merge_step = torch.compile(merge_step, fullgraph=True, dynamic=True)
-    return _compiled_merge_step
+        return merge_rows
+    global _compiled_merge_rows
+    if _compiled_merge_rows is None:
+        _compiled_merge_rows = torch.compile(merge_rows, fullgraph=True, dynamic=True)
+    return _compiled_merge_rows
+
+
+Rows = slice | torch.Tensor
+
+
+def _pass_rows(start: int, index: torch.Tensor) -> Rows:
+    """Stream rows a pass reads: a slice when the planner marked them contiguous, else the index."""
+    return slice(start, start + index.numel()) if start >= 0 else index
+
+
+def _gather(tensor: torch.Tensor, rows: Rows) -> torch.Tensor:
+    return tensor[rows] if isinstance(rows, slice) else tensor.index_select(0, rows)
+
+
+def _scatter(tensor: torch.Tensor, rows: Rows, value: torch.Tensor) -> None:
+    if isinstance(rows, slice):
+        tensor[rows].copy_(value)
+    else:
+        tensor.index_copy_(0, rows, value.to(tensor.dtype))
+
+
+def _chunk_rows(rows: Rows, chunk: slice) -> Rows:
+    if isinstance(rows, slice):
+        return slice(rows.start + chunk.start, min(rows.start + chunk.stop, rows.stop))
+    return rows[chunk]
+
+
+def _append_staged_stream(
+    key_streams: list[torch.Tensor], value_streams: list[torch.Tensor], staging: torch.Tensor
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Concatenate the plan's ``(stream, start, length)`` ranges into one more key/value stream."""
+    if staging.ndim != 2 or staging.shape[1] != STAGING_FIELDS or staging.shape[0] == 0:
+        raise ValueError(f"Maskless staging must be a non-empty [R, {STAGING_FIELDS}] tensor.")
+    ranges = staging.tolist()
+    for stream, start, length in ranges:
+        if not 0 <= stream < len(key_streams) or start < 0 or length <= 0:
+            raise ValueError(f"Maskless staging range {(stream, start, length)} is invalid.")
+        if start + length > key_streams[stream].shape[0]:
+            raise ValueError(
+                f"Maskless staging range {(stream, start, length)} exceeds key stream {stream} "
+                f"of {key_streams[stream].shape[0]} tokens."
+            )
+    keys = torch.cat([key_streams[stream][start : start + length] for stream, start, length in ranges])
+    values = torch.cat([value_streams[stream][start : start + length] for stream, start, length in ranges])
+    return [*key_streams, keys], [*value_streams, values]
 
 
 def _maskless_attention_impl(
@@ -209,13 +267,16 @@ def _maskless_attention_impl(
     """Run the planned passes over ``q[0]`` and merge them.
 
     ``key_streams[i]``/``value_streams[i]`` are packed ``[tokens, H_kv, D]``
-    tensors; each pass's ``META_KEY_STREAM`` selects the stream it gathers keys
+    tensors; each pass's ``META_KEY_STREAM`` selects the stream it reads keys
     from. The bidirectional multiview op passes ``[GEN, UND]``; causal variants
-    append further streams such as retained KV history.
+    append further streams such as retained KV history. A trailing staging
+    tensor in ``plan`` (see ``STAGING_FIELDS``) appends one more stream, built
+    once per call from contiguous ranges of the others.
     """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("Maskless multiview attention requires B == 1.")
-    if num_passes <= 0 or len(plan) != num_passes * TENSORS_PER_PASS:
+    staged = len(plan) - num_passes * TENSORS_PER_PASS
+    if num_passes <= 0 or staged not in (0, 1):
         raise ValueError(f"Maskless plan carries {len(plan)} tensors for {num_passes} passes.")
     if not key_streams or len(key_streams) != len(value_streams):
         raise ValueError("Maskless attention needs matching non-empty key and value stream lists.")
@@ -236,14 +297,24 @@ def _maskless_attention_impl(
     if kv_heads <= 0 or heads % kv_heads:
         raise ValueError("Maskless attention requires an integral GQA ratio.")
     kernel = get_pass_kernel(kernel_name)
-    merge = _merge_step_for(q.device)
+    merge = _merge_rows_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
     # inference-mode temporaries.
     result = torch.empty_like(q)
+    result_rows = result[0]
     with torch.inference_mode():
-        acc: torch.Tensor | None = None
-        acc_lse: torch.Tensor | None = None
+        if staged:
+            key_streams, value_streams = _append_staged_stream(key_streams, value_streams, plan[-1])
+        # The first pass covers every row and seeds the accumulators. With at
+        # most one merge, rows go straight to the output: the merge runs in FP32
+        # and rounds once, exactly as an FP32 accumulator would. Longer plans
+        # keep FP32 rows between merges.
+        if num_passes <= 2:
+            acc = result_rows
+        else:
+            acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
+        acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
         for index in range(num_passes):
             q_index, k_index, cu_seqlens_q, cu_seqlens_k, meta = plan[
                 index * TENSORS_PER_PASS : (index + 1) * TENSORS_PER_PASS
@@ -253,14 +324,17 @@ def _maskless_attention_impl(
             stream = int(meta_values[META_KEY_STREAM])
             if not 0 <= stream < len(key_streams):
                 raise ValueError(f"Maskless pass addresses key stream {stream}, but {len(key_streams)} were given.")
-            identity_q, identity_k = bool(meta_values[META_IDENTITY_Q]), bool(meta_values[META_IDENTITY_K])
+            q_rows = _pass_rows(int(meta_values[META_Q_START]), q_index)
+            k_rows = _pass_rows(int(meta_values[META_K_START]), k_index)
+            if isinstance(q_rows, slice) and q_rows.stop > planned_tokens:
+                raise ValueError(f"Maskless pass reads query rows {q_rows} of {planned_tokens}.")
+            if isinstance(k_rows, slice) and k_rows.stop > key_streams[stream].shape[0]:
+                raise ValueError(f"Maskless pass reads key rows {k_rows} of {key_streams[stream].shape[0]}.")
             # Actual heads here are already partitioned by TP and Ulysses.
             validate_indexing([max_seqlen_q], heads, head_dim)
             validate_indexing([max_seqlen_k], kv_heads, head_dim)
-            keys, values = key_streams[stream], value_streams[stream]
-            queries = q[0] if identity_q else q[0].index_select(0, q_index)
-            if not identity_k:
-                keys, values = keys.index_select(0, k_index), values.index_select(0, k_index)
+            queries = _gather(q[0], q_rows)
+            keys, values = _gather(key_streams[stream], k_rows), _gather(value_streams[stream], k_rows)
             out, lse = kernel(
                 queries,
                 keys,
@@ -277,37 +351,21 @@ def _maskless_attention_impl(
                     f"Maskless pass kernel returned output {tuple(out.shape)} and LSE {tuple(lse.shape)} "
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
-            if acc is None:
-                # The same-view pass covers every row and seeds the accumulators.
-                acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
-                acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
-                for start in range(0, rows, MERGE_CHUNK_SIZE):
-                    chunk = slice(start, start + MERGE_CHUNK_SIZE)
-                    if identity_q:
-                        acc[chunk].copy_(out[chunk])
-                        acc_lse[chunk].copy_(lse[chunk])
-                    else:
-                        acc.index_copy_(0, q_index[chunk], out[chunk].float())
-                        acc_lse.index_copy_(0, q_index[chunk], lse[chunk].float())
-            else:
-                for start in range(0, rows, MERGE_CHUNK_SIZE):
-                    chunk = slice(start, start + MERGE_CHUNK_SIZE)
-                    if identity_q:
-                        merged, merged_lse = merge(acc[chunk], acc_lse[chunk], out[chunk], lse[chunk])
-                        acc[chunk].copy_(merged)
-                        acc_lse[chunk].copy_(merged_lse)
-                    else:
-                        gather = q_index[chunk]
-                        merged, merged_lse = merge(
-                            acc.index_select(0, gather), acc_lse.index_select(0, gather), out[chunk], lse[chunk]
-                        )
-                        acc.index_copy_(0, gather, merged)
-                        acc_lse.index_copy_(0, gather, merged_lse)
+            for start in range(0, rows, MERGE_CHUNK_SIZE):
+                chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                target = _chunk_rows(q_rows, chunk)
+                if index == 0:
+                    _scatter(acc, target, out[chunk])
+                    _scatter(acc_lse, target, lse[chunk])
+                else:
+                    merged, merged_lse = merge(_gather(acc, target), _gather(acc_lse, target), out[chunk], lse[chunk])
+                    _scatter(acc, target, merged)
+                    _scatter(acc_lse, target, merged_lse)
             del out, lse
-        assert acc is not None
-        for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
-            chunk = slice(start, start + MERGE_CHUNK_SIZE)
-            result[0, chunk].copy_(acc[chunk])
+        if acc is not result_rows:
+            for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
+                chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                result_rows[chunk].copy_(acc[chunk])
     return result
 
 

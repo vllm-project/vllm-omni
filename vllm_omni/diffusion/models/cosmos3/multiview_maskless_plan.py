@@ -45,8 +45,16 @@ from .multiview_flex_attention import (
 TENSORS_PER_PASS = 5
 #: ``meta`` is a CPU int64 vector so the attention op reads host integers
 #: without a device synchronization and Dynamo never guards on prompt lengths.
-META_MAX_SEQLEN_Q, META_MAX_SEQLEN_K, META_KEY_STREAM, META_IDENTITY_Q, META_IDENTITY_K, META_GEN_TOKENS = range(6)
+#: ``META_Q_START``/``META_K_START`` hold the first row when the pass's queries
+#: or keys are one ascending run of consecutive stream rows (the executor
+#: slices instead of gathering), else ``-1``.
+META_MAX_SEQLEN_Q, META_MAX_SEQLEN_K, META_KEY_STREAM, META_Q_START, META_K_START, META_GEN_TOKENS = range(6)
 META_SIZE = 6
+#: A plan may end with one CPU int64 ``[R, STAGING_FIELDS]`` tensor of
+#: ``(stream, start, length)`` rows. The executor concatenates those contiguous
+#: ranges into one extra key stream, appended after the caller's streams, so a
+#: varlen segment can read keys of several streams in one call.
+STAGING_FIELDS = 3
 #: ``META_KEY_STREAM`` indexes the executor's key-stream list. The bidirectional
 #: multiview plan passes ``[GEN, UND]``, so stream 1 is "keys from UND"; causal
 #: variants add further streams (for example retained KV history).
@@ -110,6 +118,14 @@ def _expand_runs(run_starts: torch.Tensor, run_lengths: torch.Tensor, runs: Sequ
     return base + torch.arange(total, dtype=torch.int64)
 
 
+def contiguous_start(index: torch.Tensor) -> int:
+    """First row of ``index`` if it is one ascending run of consecutive rows, else ``-1``."""
+    if index.numel() == 0:
+        return -1
+    start = int(index[0])
+    return start if torch.equal(index, torch.arange(start, start + index.numel(), dtype=index.dtype)) else -1
+
+
 def _cumulative_offsets(lengths: Sequence[int]) -> torch.Tensor:
     if sum(lengths) >= _INT32_LIMIT:
         raise ValueError("Cosmos3 maskless attention exceeds int32 cumulative sequence offsets.")
@@ -137,15 +153,12 @@ def _materialize_pass(
         raise ValueError(f"Cosmos3 maskless pass {name!r} would attend a query more than once.")
     q_index = _expand_runs(run_starts, run_lengths, query_runs, num_und_tokens)
     k_index = _expand_runs(run_starts, run_lengths, key_runs, 0 if keys_from_und else num_und_tokens)
-    key_stream_tokens = num_und_tokens if keys_from_und else num_gen_tokens
-    identity_q = q_index.numel() == num_gen_tokens and bool(torch.equal(q_index, torch.arange(num_gen_tokens)))
-    identity_k = k_index.numel() == key_stream_tokens and bool(torch.equal(k_index, torch.arange(key_stream_tokens)))
     meta = torch.zeros(META_SIZE, dtype=torch.int64)
     meta[META_MAX_SEQLEN_Q] = max(query_lengths)
     meta[META_MAX_SEQLEN_K] = max(key_lengths)
     meta[META_KEYS_FROM_UND] = int(keys_from_und)
-    meta[META_IDENTITY_Q] = int(identity_q)
-    meta[META_IDENTITY_K] = int(identity_k)
+    meta[META_Q_START] = contiguous_start(q_index)
+    meta[META_K_START] = contiguous_start(k_index)
     meta[META_GEN_TOKENS] = num_gen_tokens
     k_index = k_index.to(device)
     if keys_from_und and k_index.numel() > 1:

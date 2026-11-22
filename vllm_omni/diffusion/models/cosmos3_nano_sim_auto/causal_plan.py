@@ -5,11 +5,13 @@
 Every GEN query of the current chunk attends one softmax over the union of the
 keys the replay predicate admits from three streams: the current chunk, the
 chunks retained in the KV ring (``HISTORY``) and the caption documents
-(``UND``). The planner partitions that key set into unmasked variable-length
-attention passes whose partial results the shared maskless executor merges by
-log-sum-exp (:mod:`..cosmos3.multiview_maskless_attention`). Each admitted
-(query, key) pair is covered by exactly one pass, so the merge equals the
-masked softmax.
+(``UND``). The planner partitions that key set into at most two unmasked
+variable-length attention passes, split by view, whose partial results the
+shared maskless executor merges by log-sum-exp
+(:mod:`..cosmos3.multiview_maskless_attention`). A pass's segments read keys
+of all three streams from one staged copy, so the split costs one merge. Each
+admitted (query, key) pair is covered by exactly one pass, so the merge equals
+the masked softmax.
 
 The predicate reproduces what the reference rolling inference actually runs:
 the teacher-forcing replay role rules (``_teacher_forcing_pair_predicate``)
@@ -34,13 +36,14 @@ import torch
 
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_plan import (
     META_GEN_TOKENS,
-    META_IDENTITY_K,
-    META_IDENTITY_Q,
+    META_K_START,
     META_KEY_STREAM,
     META_MAX_SEQLEN_K,
     META_MAX_SEQLEN_Q,
+    META_Q_START,
     META_SIZE,
     MasklessPass,
+    contiguous_start,
 )
 
 from .layout import (
@@ -59,7 +62,8 @@ from .layout import (
 STREAM_CURRENT = 0
 STREAM_HISTORY = 1
 STREAM_UND = 2
-STREAM_NAMES = ("current", "history", "und")
+#: The executor appends the plan's staged ``[current | ring slots | captions]`` stream after the three inputs.
+STREAM_STAGED = 3
 
 #: Reference tolerances: the window and caption bounds compare float32 seconds.
 WINDOW_EPS = 1e-4
@@ -289,51 +293,56 @@ Segment = tuple[tuple[int, ...], tuple[int, ...]]
 
 @dataclass(frozen=True, eq=False)
 class CausalMasklessPlan:
-    """Passes in merge order; the first pass covers every GEN query row."""
+    """Passes in merge order; the first pass covers every GEN query row.
+
+    Passes read keys from the staged stream ``STREAM_STAGED``: the ``staging``
+    rows ``(stream, start, length)`` concatenate the current chunk, each
+    populated ring slot and the captions, in that order.
+    """
 
     num_gen_tokens: int
     num_history_tokens: int
     num_und_tokens: int
     passes: tuple[MasklessPass, ...]
+    #: CPU int64 ``[R, STAGING_FIELDS]``; ``HISTORY`` starts are virtual until :meth:`with_history_offsets`.
+    staging: torch.Tensor
     query_runs: RunTable
     key_runs: tuple[RunTable, RunTable, RunTable]
-    #: Run-level truth table ``[Q, K_current + K_history + K_und]`` (diagnostics and tests).
+    #: Run-level truth table ``[Q, K_current + K_history + K_und]``; pass segments use these key columns.
     allowed: torch.Tensor
 
     def flatten(self) -> list[torch.Tensor]:
-        return [tensor for attention_pass in self.passes for tensor in attention_pass.tensors()]
+        return [*(tensor for attention_pass in self.passes for tensor in attention_pass.tensors()), self.staging]
 
     def with_history_offsets(self, slot_physical_bases: Sequence[int], frame_unit: int) -> CausalMasklessPlan:
-        """Remap HISTORY key indexes from virtual ``slot * frame_unit + offset`` to physical pool slots.
+        """Remap staged HISTORY ranges from virtual ``slot * frame_unit + offset`` to physical pool slots.
 
         ``slot_physical_bases[s]`` is the first flat-pool slot of the page that
         holds ring slot ``s`` (``block_id * block_size``); with block == frame
-        unit the remap is a per-slot additive shift.
+        unit the remap is a per-slot additive shift. Only the host-side staging
+        rows change, so the remap costs no device work.
         """
         if frame_unit < 1:
             raise ValueError(f"frame_unit must be positive, got {frame_unit}.")
-        bases = torch.tensor(list(slot_physical_bases), dtype=torch.int64)
-        passes = []
-        for attention_pass in self.passes:
-            if int(attention_pass.meta[META_KEY_STREAM]) != STREAM_HISTORY:
-                passes.append(attention_pass)
-                continue
-            k_index = attention_pass.k_index
-            slot = torch.div(k_index, frame_unit, rounding_mode="floor")
-            if slot.numel() and int(slot.max()) >= bases.numel():
-                raise ValueError("History key index addresses a ring slot without a physical page.")
-            remapped = k_index - slot * frame_unit + bases.to(k_index.device)[slot]
-            meta = attention_pass.meta.clone()
-            meta[META_IDENTITY_K] = 0
-            passes.append(replace(attention_pass, k_index=remapped, meta=meta))
-        return replace(self, passes=tuple(passes))
+        bases = list(slot_physical_bases)
+        rows = []
+        for stream, start, length in self.staging.tolist():
+            if stream == STREAM_HISTORY:
+                slot = start // frame_unit
+                if slot >= len(bases):
+                    raise ValueError("History key index addresses a ring slot without a physical page.")
+                if (start + length - 1) // frame_unit != slot:
+                    raise ValueError("A staged history range crosses a ring page.")
+                start = start - slot * frame_unit + bases[slot]
+            rows.append((stream, start, length))
+        return replace(self, staging=_staging_tensor(rows))
 
 
-def _expand(runs: RunTable, selected: Sequence[int]) -> torch.Tensor:
+def _expand(starts: torch.Tensor, lengths: torch.Tensor, selected: Sequence[int]) -> torch.Tensor:
     if not selected:
         return torch.empty(0, dtype=torch.int64)
     index = torch.tensor(list(selected), dtype=torch.int64)
-    starts, lengths = runs.start[index], runs.length[index]
+    starts, lengths = starts[index], lengths[index]
     total = int(lengths.sum())
     base = torch.repeat_interleave(starts - (torch.cumsum(lengths, 0) - lengths), lengths)
     return base + torch.arange(total, dtype=torch.int64)
@@ -361,48 +370,80 @@ def _segments(mask: torch.Tensor) -> list[Segment]:
     return segments
 
 
+def _staging_tensor(rows: Sequence[tuple[int, int, int]]) -> torch.Tensor:
+    staging = torch.tensor(list(rows), dtype=torch.int64)
+    if staging.shape[0] > 1:
+        # The number of populated ring slots varies per chunk kind; keep it symbolic.
+        torch._dynamo.mark_dynamic(staging, 0)
+    return staging
+
+
+def _stage_keys(
+    current_tokens: int,
+    history: Sequence[RingSlot],
+    num_history_tokens: int,
+    und_tokens: int,
+    key_tables: Sequence[RunTable],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Staging rows and the staged start of every key run (current, then history, then UND runs)."""
+    staged_history = torch.full((num_history_tokens,), -1, dtype=torch.int64)
+    ranges = [(STREAM_CURRENT, 0, current_tokens)]
+    cursor = current_tokens
+    for slot in history:
+        length = slot.metadata.num_tokens
+        if not length:
+            continue
+        if bool((staged_history[slot.base : slot.base + length] >= 0).any()):
+            raise ValueError("Cosmos3 causal maskless ring slots overlap in virtual coordinates.")
+        ranges.append((STREAM_HISTORY, slot.base, length))
+        staged_history[slot.base : slot.base + length] = torch.arange(cursor, cursor + length)
+        cursor += length
+    if und_tokens:
+        ranges.append((STREAM_UND, 0, und_tokens))
+    current_runs, history_table, und_runs = key_tables
+    starts = torch.cat([current_runs.start, staged_history[history_table.start], und_runs.start + cursor])
+    return _staging_tensor(ranges), starts
+
+
 def _materialize(
     name: str,
-    stream: int,
     segments: Sequence[Segment],
     *,
     query_runs: RunTable,
-    key_runs: RunTable,
-    key_stream_tokens: int,
+    key_starts: torch.Tensor,
+    key_lengths: torch.Tensor,
     num_gen_tokens: int,
     device: torch.device,
 ) -> MasklessPass:
     query_lengths = [int(query_runs.length[list(q_runs)].sum()) for q_runs, _ in segments]
-    key_lengths = [int(key_runs.length[list(k_runs)].sum()) for _, k_runs in segments]
-    if any(length == 0 for length in (*query_lengths, *key_lengths)):
+    key_lengths_per_segment = [int(key_lengths[list(k_runs)].sum()) for _, k_runs in segments]
+    if any(length == 0 for length in (*query_lengths, *key_lengths_per_segment)):
         raise RuntimeError(f"Cosmos3 causal maskless pass {name!r} planned an empty varlen segment.")
     q_order = [run for q_runs, _ in segments for run in q_runs]
     k_order = [run for _, k_runs in segments for run in k_runs]
     if len(set(q_order)) != len(q_order):
         raise RuntimeError(f"Cosmos3 causal maskless pass {name!r} would attend a query more than once.")
-    q_index = _expand(query_runs, q_order)
-    k_index = _expand(key_runs, k_order)
-    identity_q = q_index.numel() == num_gen_tokens and bool(torch.equal(q_index, torch.arange(num_gen_tokens)))
-    identity_k = k_index.numel() == key_stream_tokens and bool(torch.equal(k_index, torch.arange(key_stream_tokens)))
+    q_index = _expand(query_runs.start, query_runs.length, q_order)
+    k_index = _expand(key_starts, key_lengths, k_order)
     meta = torch.zeros(META_SIZE, dtype=torch.int64)
     meta[META_MAX_SEQLEN_Q] = max(query_lengths)
-    meta[META_MAX_SEQLEN_K] = max(key_lengths)
-    meta[META_KEY_STREAM] = stream
-    meta[META_IDENTITY_Q] = int(identity_q)
-    meta[META_IDENTITY_K] = int(identity_k)
+    meta[META_MAX_SEQLEN_K] = max(key_lengths_per_segment)
+    meta[META_KEY_STREAM] = STREAM_STAGED
+    meta[META_Q_START] = contiguous_start(q_index)
+    meta[META_K_START] = contiguous_start(k_index)
     meta[META_GEN_TOKENS] = num_gen_tokens
     k_index = k_index.to(device)
-    if stream != STREAM_CURRENT and k_index.numel() > 1:
+    if k_index.numel() > 1:
         # Prompt lengths and ring population vary per request/chunk kind; keep
         # those shapes symbolic so the compiled GEN layers are reused.
         torch._dynamo.mark_dynamic(k_index, 0)
     return MasklessPass(
         name=name,
-        keys_from_und=stream == STREAM_UND,
+        keys_from_und=False,
         q_index=q_index.to(device),
         k_index=k_index,
         cu_seqlens_q=_cumulative(query_lengths).to(device),
-        cu_seqlens_k=_cumulative(key_lengths).to(device),
+        cu_seqlens_k=_cumulative(key_lengths_per_segment).to(device),
         meta=meta,
         segments=tuple(segments),
     )
@@ -416,65 +457,56 @@ def build_causal_maskless_plan(
     window_seconds: float,
     device: torch.device | str = "cpu",
 ) -> CausalMasklessPlan:
-    """Partition the replay predicate into unmasked varlen passes over three key streams.
+    """Partition the replay predicate into at most two unmasked varlen passes over a staged key stream.
 
-    Pass order: ``same_view_current`` (covers every row; seeds the merge),
-    ``cross_view_current``, ``same_view_history``, ``cross_view_history``,
-    ``caption``. Within a pass, query runs with identical admitted key sets
-    share one varlen segment. Categories are disjoint (same vs. different view,
-    current vs. history stream, UND), so every admitted pair lands in exactly
-    one pass; the build asserts this against the run-level truth table.
+    ``same_view`` reads the query's own view in the current chunk and in the
+    ring plus its captions, and covers (seeds) every row; ``cross_view`` reads
+    the windowed other views of the current chunk and the ring. Within a pass,
+    query runs with identical admitted key sets share one varlen segment whose
+    keys span every stream, so one call replaces a pass per stream and the
+    executor merges once. The two passes split the admitted pairs by view, so
+    every pair lands in exactly one pass; the build asserts this against the
+    run-level truth table.
     """
     device = torch.device(device)
     if current.num_tokens == 0:
         raise ValueError("The current chunk has no GEN tokens.")
     query_runs = sensor_runs(current, stream=STREAM_CURRENT)
     key_tables = (query_runs, history_runs(history), caption_runs(captions))
-    allowed_by_stream = [pair_allowed(query_runs, table, window_seconds=window_seconds) for table in key_tables]
+    allowed = torch.cat([pair_allowed(query_runs, table, window_seconds=window_seconds) for table in key_tables], 1)
     num_history_tokens = max((slot.base + slot.metadata.num_tokens for slot in history), default=0)
-    stream_tokens = (current.num_tokens, num_history_tokens, captions.num_tokens)
-
-    plan_spec: list[tuple[str, int, torch.Tensor]] = []
-    for stream, prefix in ((STREAM_CURRENT, "current"), (STREAM_HISTORY, "history")):
-        table = key_tables[stream]
-        if table.num_runs == 0:
-            continue
-        same_view = query_runs.view_id[:, None] == table.view_id[None, :]
-        plan_spec.append((f"same_view_{prefix}", stream, allowed_by_stream[stream] & same_view))
-        plan_spec.append((f"cross_view_{prefix}", stream, allowed_by_stream[stream] & ~same_view))
-    if key_tables[STREAM_UND].num_runs:
-        plan_spec.append(("caption", STREAM_UND, allowed_by_stream[STREAM_UND]))
+    staging, key_starts = _stage_keys(current.num_tokens, history, num_history_tokens, captions.num_tokens, key_tables)
+    key_lengths = torch.cat([table.length for table in key_tables])
+    key_view = torch.cat([table.view_id for table in key_tables])
+    key_is_und = torch.cat([table.is_und for table in key_tables])
+    own_view = (query_runs.view_id[:, None] == key_view[None, :]) | key_is_und[None, :]
+    plan_spec = (("same_view", allowed & own_view), ("cross_view", allowed & ~own_view))
 
     # Every query attends itself through its own view, so the first pass seeds every row.
-    first_rows = plan_spec[0][2].any(dim=1)
-    if plan_spec[0][0] != "same_view_current" or not bool(first_rows.all()):
+    if not bool(plan_spec[0][1].any(dim=1).all()):
         raise RuntimeError("Cosmos3 causal maskless same-view pass must cover every GEN query run.")
 
     passes: list[MasklessPass] = []
-    coverage = [torch.zeros_like(mask, dtype=torch.int64) for mask in allowed_by_stream]
-    for name, stream, mask in plan_spec:
+    coverage = torch.zeros_like(allowed, dtype=torch.int64)
+    for name, mask in plan_spec:
         segments = _segments(mask)
         if not segments:
             continue
         for q_runs, k_runs in segments:
-            coverage[stream][torch.tensor(q_runs)[:, None], torch.tensor(k_runs)[None, :]] += 1
+            coverage[torch.tensor(q_runs)[:, None], torch.tensor(k_runs)[None, :]] += 1
         passes.append(
             _materialize(
                 name,
-                stream,
                 segments,
                 query_runs=query_runs,
-                key_runs=key_tables[stream],
-                key_stream_tokens=stream_tokens[stream],
+                key_starts=key_starts,
+                key_lengths=key_lengths,
                 num_gen_tokens=current.num_tokens,
                 device=device,
             )
         )
-    for stream, (count, mask) in enumerate(zip(coverage, allowed_by_stream, strict=True)):
-        if not torch.equal(count, mask.to(torch.int64)):
-            raise RuntimeError(
-                f"Cosmos3 causal maskless plan does not cover the {STREAM_NAMES[stream]} predicate exactly once."
-            )
+    if not torch.equal(coverage, allowed.to(torch.int64)):
+        raise RuntimeError("Cosmos3 causal maskless plan does not cover the replay predicate exactly once.")
     if passes[0].q_index.numel() != current.num_tokens:
         raise RuntimeError("Cosmos3 causal maskless first pass must cover every GEN row.")
     return CausalMasklessPlan(
@@ -482,9 +514,10 @@ def build_causal_maskless_plan(
         num_history_tokens=num_history_tokens,
         num_und_tokens=captions.num_tokens,
         passes=tuple(passes),
+        staging=staging,
         query_runs=query_runs,
         key_runs=key_tables,
-        allowed=torch.cat(allowed_by_stream, dim=1),
+        allowed=allowed,
     )
 
 

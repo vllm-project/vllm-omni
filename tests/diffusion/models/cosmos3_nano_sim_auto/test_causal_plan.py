@@ -21,10 +21,13 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.cosmos3 import multiview_maskless_attention as m
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_attention import maskless_attention_streams
-from vllm_omni.diffusion.models.cosmos3.multiview_maskless_plan import META_IDENTITY_K, META_KEY_STREAM
+from vllm_omni.diffusion.models.cosmos3.multiview_maskless_plan import META_K_START, META_KEY_STREAM, META_Q_START
 from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.causal_plan import (
+    STREAM_CURRENT,
     STREAM_HISTORY,
+    STREAM_STAGED,
     STREAM_UND,
     CausalMasklessPlan,
     build_causal_maskless_plan,
@@ -101,6 +104,7 @@ def scenario(
     joint: bool = True,
     num_views: int = 2,
     lidar_condition: bool = False,
+    device: str = "cpu",
 ) -> Scenario:
     schedule = build_chunk_schedule(
         rgb_latents=7,
@@ -131,7 +135,7 @@ def scenario(
     current, _ = chunk_token_metadata(items(chunk_index), step=chunk_index, pass_kind=pass_kind)
     docs = captions(num_views)
     plan = build_causal_maskless_plan(
-        current=current, history=slots, captions=caption_metadata(docs), window_seconds=WINDOW, device="cpu"
+        current=current, history=slots, captions=caption_metadata(docs), window_seconds=WINDOW, device=device
     )
     return Scenario(plan, current, slots, docs)
 
@@ -238,10 +242,37 @@ def test_plan_matches_token_level_oracle(chunk_index: int, pass_kind: str, joint
     expected = _token_oracle(scn)
     assert planned.shape == expected.shape
     assert torch.equal(planned, expected), (planned ^ expected).nonzero()
-    # Every GEN row is seeded by the first pass and attends at least itself.
-    assert scn.plan.passes[0].name == "same_view_current"
+    # The varlen calls the executor runs cover exactly the same pairs, once each.
+    assert torch.equal(_token_pair_counts(scn.plan), expected.to(torch.int64))
+    # Every GEN row is seeded by the first pass and attends at least itself; at most one merge follows.
+    assert [attention_pass.name for attention_pass in scn.plan.passes] in (["same_view"], ["same_view", "cross_view"])
+    assert int(scn.plan.passes[0].meta[META_Q_START]) == 0
     assert scn.plan.passes[0].q_index.numel() == scn.plan.num_gen_tokens
     assert bool(planned.diagonal()[: scn.plan.num_gen_tokens].all())
+
+
+def _token_pair_counts(plan: CausalMasklessPlan) -> torch.Tensor:
+    """Expand every varlen segment through the staging rows into ``[GEN, current + history + und]`` counts."""
+    offsets = {
+        STREAM_CURRENT: 0,
+        STREAM_HISTORY: plan.num_gen_tokens,
+        STREAM_UND: plan.num_gen_tokens + plan.num_history_tokens,
+    }
+    column = torch.cat(
+        [torch.arange(start, start + length) + offsets[stream] for stream, start, length in plan.staging.tolist()]
+    )
+    counts = torch.zeros(plan.num_gen_tokens, offsets[STREAM_UND] + plan.num_und_tokens, dtype=torch.int64)
+    for attention_pass in plan.passes:
+        assert int(attention_pass.meta[META_KEY_STREAM]) == STREAM_STAGED
+        for field, index in ((META_Q_START, attention_pass.q_index), (META_K_START, attention_pass.k_index)):
+            first = int(index[0])
+            contiguous = torch.equal(index, torch.arange(first, first + index.numel()))
+            assert int(attention_pass.meta[field]) == (first if contiguous else -1)
+        q_bounds, k_bounds = attention_pass.cu_seqlens_q.tolist(), attention_pass.cu_seqlens_k.tolist()
+        for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
+            assert qb > qa and kb > ka, "no empty varlen segment"
+            counts[attention_pass.q_index[qa:qb, None], column[attention_pass.k_index[ka:kb]][None, :]] += 1
+    return counts
 
 
 def test_chunk0_condition_frames_read_only_their_own_view() -> None:
@@ -324,7 +355,14 @@ def test_chunk_two_reads_sink_and_previous_chunk_with_window() -> None:
     assert row[scn.k_history(1, view_id=0, role=ROLE_CLEAN_TARGET, frame_id=1)]
     assert not row[scn.k_history(1, view_id=1, role=ROLE_CLEAN_TARGET, frame_id=1)]  # gap 0.6
     assert row[scn.k_history(1, view_id=1, role=ROLE_CLEAN_TARGET, frame_id=2)]  # gap 0.4
-    assert any(name.endswith("history") for name in (attention_pass.name for attention_pass in scn.plan.passes))
+    # Both ring slots are staged, in slot order, between the current chunk and the captions.
+    gen, und = scn.plan.num_gen_tokens, scn.plan.num_und_tokens
+    assert scn.plan.staging.tolist() == [
+        [STREAM_CURRENT, 0, gen],
+        [STREAM_HISTORY, 0, scn.slots[0].metadata.num_tokens],
+        [STREAM_HISTORY, UNIT, scn.slots[1].metadata.num_tokens],
+        [STREAM_UND, 0, und],
+    ]
 
 
 def test_clean_pass_is_chunk_causal() -> None:
@@ -358,42 +396,110 @@ def _random_streams(scn: Scenario, *, heads: int = 2, kv_heads: int = 1, dim: in
     return q, streams
 
 
-@pytest.mark.parametrize("chunk_index", [0, 1, 3])
-def test_streams_op_matches_masked_softmax(chunk_index: int) -> None:
-    scn = scenario(chunk_index)
-    q, streams = _random_streams(scn)
-    keys = [k for k, _ in streams]
-    values = [v for _, v in streams]
-    out = maskless_attention_streams(q, keys, values, scn.plan.flatten(), len(scn.plan.passes), "torch")
+def _dense_softmax(scn: Scenario, q: torch.Tensor, streams) -> torch.Tensor:
     mask = dense_token_mask(scn.plan)
     hist = scn.plan.num_history_tokens
-    all_k = torch.cat([keys[0], keys[1][:hist], keys[2]]).double()
-    all_v = torch.cat([values[0], values[1][:hist], values[2]]).double()
-    ratio = q.shape[2] // all_k.shape[1]
-    scores = torch.einsum("qhd,khd->hqk", q[0].double(), all_k.repeat_interleave(ratio, 1)) / math.sqrt(q.shape[-1])
+    keys = torch.cat([streams[0][0], streams[1][0][:hist], streams[2][0]]).double()
+    values = torch.cat([streams[0][1], streams[1][1][:hist], streams[2][1]]).double()
+    ratio = q.shape[2] // keys.shape[1]
+    scores = torch.einsum("qhd,khd->hqk", q[0].double(), keys.repeat_interleave(ratio, 1)) / math.sqrt(q.shape[-1])
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
-    expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), all_v.repeat_interleave(ratio, 1))
-    torch.testing.assert_close(out[0].double(), expected, rtol=1e-5, atol=1e-5)
+    return torch.einsum("hqk,khd->qhd", scores.softmax(-1), values.repeat_interleave(ratio, 1))
 
 
-def test_history_remap_shifts_each_slot_to_its_page() -> None:
+def _run(plan: CausalMasklessPlan, q: torch.Tensor, streams, kernel: str = "torch") -> torch.Tensor:
+    keys = [k for k, _ in streams]
+    values = [v for _, v in streams]
+    return maskless_attention_streams(q, keys, values, plan.flatten(), len(plan.passes), kernel)
+
+
+@pytest.mark.parametrize("chunk_size", [m.MERGE_CHUNK_SIZE, 3])
+@pytest.mark.parametrize(("chunk_index", "joint"), [(0, True), (1, True), (3, True), (3, False)])
+def test_streams_op_matches_masked_softmax(
+    monkeypatch: pytest.MonkeyPatch, chunk_index: int, joint: bool, chunk_size: int
+) -> None:
+    # Small merge chunks split the sliced cross-view rows mid-segment.
+    monkeypatch.setattr(m, "MERGE_CHUNK_SIZE", chunk_size)
+    scn = scenario(chunk_index, joint=joint)
+    q, streams = _random_streams(scn)
+    out = _run(scn.plan, q, streams)
+    torch.testing.assert_close(out[0].double(), _dense_softmax(scn, q, streams), rtol=1e-5, atol=1e-5)
+
+
+def test_rgb_cross_view_pass_slices_its_query_rows() -> None:
+    scn = scenario(3, joint=False)
+    same_view, cross_view = scn.plan.passes
+    # Packed [control | target]: the cross-view pass reads exactly the target rows.
+    targets = int((scn.current.role != ROLE_CONTROL).sum())
+    assert int(same_view.meta[META_Q_START]) == 0
+    assert int(cross_view.meta[META_Q_START]) == scn.plan.num_gen_tokens - targets
+    assert cross_view.q_index.numel() == targets
+
+
+def test_history_remap_moves_only_staged_slots_to_their_pages() -> None:
     scn = scenario(2)
     bases = [100, 300]
     remapped = scn.plan.with_history_offsets(bases, UNIT)
-    for before, after in zip(scn.plan.passes, remapped.passes, strict=True):
-        if int(before.meta[META_KEY_STREAM]) != STREAM_HISTORY:
-            assert torch.equal(before.k_index, after.k_index)
-            continue
-        slots = torch.div(before.k_index, UNIT, rounding_mode="floor")
-        expected = before.k_index - slots * UNIT + torch.tensor(bases)[slots]
-        assert torch.equal(after.k_index, expected)
-        assert int(after.meta[META_IDENTITY_K]) == 0
+    # Pass tensors address the staged stream and are shared untouched.
+    assert all(a is b for a, b in zip(scn.plan.passes, remapped.passes, strict=True))
+    expected = [
+        [stream, bases[start // UNIT] + start % UNIT if stream == STREAM_HISTORY else start, length]
+        for stream, start, length in scn.plan.staging.tolist()
+    ]
+    assert remapped.staging.tolist() == expected
+    # A physical pool holding each slot at its page reproduces the virtual-ring result.
+    q, streams = _random_streams(scn)
+    pool_k = torch.randn(400 + UNIT, *streams[1][0].shape[1:])
+    pool_v = torch.randn_like(pool_k)
+    for slot, base in zip(scn.slots, bases, strict=True):
+        length = slot.metadata.num_tokens
+        pool_k[base : base + length] = streams[1][0][slot.base : slot.base + length]
+        pool_v[base : base + length] = streams[1][1][slot.base : slot.base + length]
+    physical = [streams[0], (pool_k, pool_v), streams[2]]
+    torch.testing.assert_close(_run(remapped, q, physical), _run(scn.plan, q, streams), rtol=0, atol=0)
     with pytest.raises(ValueError, match="without a physical page"):
         scn.plan.with_history_offsets([100], UNIT)
 
 
-def test_caption_pass_marks_und_stream() -> None:
+def test_streams_op_rejects_staging_outside_its_stream() -> None:
+    scn = scenario(2)
+    q, streams = _random_streams(scn)
+    short_history = (streams[1][0][:UNIT], streams[1][1][:UNIT])
+    with pytest.raises(ValueError, match="exceeds key stream 1"):
+        _run(scn.plan, q, [streams[0], short_history, streams[2]])
+
+
+def test_chunk_one_stages_one_ring_slot_and_reads_it_in_both_passes() -> None:
     scn = scenario(1)
-    names = [attention_pass.name for attention_pass in scn.plan.passes]
-    assert names[0] == "same_view_current" and names[-1] == "caption"
-    assert int(scn.plan.passes[-1].meta[META_KEY_STREAM]) == STREAM_UND
+    gen, und = scn.plan.num_gen_tokens, scn.plan.num_und_tokens
+    assert [attention_pass.name for attention_pass in scn.plan.passes] == ["same_view", "cross_view"]
+    assert scn.plan.staging.tolist() == [
+        [STREAM_CURRENT, 0, gen],
+        [STREAM_HISTORY, 0, scn.slots[0].metadata.num_tokens],
+        [STREAM_UND, 0, und],
+    ]
+    history_columns = range(scn.plan.query_runs.num_runs, scn.plan.query_runs.num_runs + scn.plan.key_runs[1].num_runs)
+    und_columns = range(scn.plan.allowed.shape[1] - scn.plan.key_runs[2].num_runs, scn.plan.allowed.shape[1])
+    for attention_pass in scn.plan.passes:
+        k_runs = {run for _, runs in attention_pass.segments for run in runs}
+        assert k_runs & set(history_columns)
+        # Captions are same-view keys: the cross-view pass never reads them.
+        assert bool(k_runs & set(und_columns)) == (attention_pass.name == "same_view")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and vLLM's bundled FlashAttention")
+@pytest.mark.parametrize("fa_version", [2, 3, 4])
+@pytest.mark.parametrize("chunk_index", [0, 3])
+def test_cuda_streams_op_matches_masked_softmax(fa_version: int, chunk_index: int) -> None:
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    if not is_fa_version_supported(fa_version):
+        pytest.skip(f"FlashAttention {fa_version} is unavailable on this device")
+    # Staging, the sliced cross-view rows and the compiled single merge on real varlen kernels.
+    scn = scenario(chunk_index, device="cuda")
+    q, streams = _random_streams(scn, heads=4, kv_heads=2, dim=128)
+    q, streams = q.bfloat16(), [(k.bfloat16(), v.bfloat16()) for k, v in streams]
+    with torch.inference_mode():
+        out = _run(scn.plan, q.cuda(), [(k.cuda(), v.cuda()) for k, v in streams], kernel=f"fa{fa_version}")
+    torch.testing.assert_close(out[0].double().cpu(), _dense_softmax(scn, q, streams), atol=2e-2, rtol=2e-2)

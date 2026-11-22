@@ -22,10 +22,10 @@ from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
     padded_multiview_flex_attention,
 )
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_plan import (
-    META_IDENTITY_K,
-    META_IDENTITY_Q,
+    META_K_START,
     META_MAX_SEQLEN_K,
     META_MAX_SEQLEN_Q,
+    META_Q_START,
     TENSORS_PER_PASS,
     build_multiview_maskless_plan,
 )
@@ -151,11 +151,15 @@ def test_plan_covers_predicate_exactly_once(window: float, views: int, controls:
         assert attention_pass.meta[META_MAX_SEQLEN_K] == max(k_lengths)
         assert attention_pass.meta.device.type == "cpu"
         assert attention_pass.cu_seqlens_q.dtype == attention_pass.cu_seqlens_k.dtype == torch.int32
+        for field, index in ((META_Q_START, attention_pass.q_index), (META_K_START, attention_pass.k_index)):
+            first = int(index[0])
+            contiguous = torch.equal(index, torch.arange(first, first + index.numel()))
+            assert int(attention_pass.meta[field]) == (first if contiguous else -1)
     # The same-view pass needs no gathers when each view's tokens are already
     # contiguous: no control items, or a single camera view (control and target
     # items of one view follow each other in the packed stream).
     identity = (not controls) or views == 1
-    assert bool(same_view.meta[META_IDENTITY_Q]) == bool(same_view.meta[META_IDENTITY_K]) == identity
+    assert (int(same_view.meta[META_Q_START]) == 0) == (int(same_view.meta[META_K_START]) == 0) == identity
     assert len(plan.flatten()) == TENSORS_PER_PASS * len(plan.passes)
 
 
@@ -283,6 +287,37 @@ def test_chunked_merge_is_exact_for_any_chunk_size(monkeypatch: pytest.MonkeyPat
     torch.testing.assert_close(
         multiview_attention(*qkv, prepared_context(spec, num_und)), dense_reference(spec, *qkv), atol=1e-6, rtol=1e-5
     )
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_two_pass_plan_rounds_once_like_an_fp32_accumulator(dtype: torch.dtype) -> None:
+    # One view without controls: the same-view and caption passes both cover every row.
+    spec = layout(views=1, controls=False, lidar=False)
+    num_und = sum(spec.caption_lengths)
+    context = prepared_context(spec, num_und)
+    q, k, v, k_und, v_und = tensors(spec, num_und, dtype=dtype)
+    plan = context.maskless.plan
+    assert context.maskless.num_passes == 2
+    outputs, lses = [], []
+    for index, (keys, values) in enumerate(((k[0], v[0]), (k_und[0], v_und[0]))):
+        q_index, k_index, cu_seqlens_q, cu_seqlens_k, meta = plan[
+            index * TENSORS_PER_PASS : (index + 1) * TENSORS_PER_PASS
+        ]
+        assert q_index.numel() == spec.gen_tokens
+        out, lse = m.torch_reference_pass_kernel(
+            q[0][q_index],
+            keys[k_index],
+            values[k_index],
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=int(meta[META_MAX_SEQLEN_Q]),
+            max_seqlen_k=int(meta[META_MAX_SEQLEN_K]),
+        )
+        outputs.append(torch.empty_like(out).index_copy_(0, q_index, out))
+        lses.append(torch.empty_like(lse).index_copy_(0, q_index, lse))
+    expected = m._merge_attention_outputs(outputs, lses)
+    assert torch.equal(multiview_attention(q, k, v, k_und, v_und, context)[0], expected)
 
 
 @pytest.mark.cpu
