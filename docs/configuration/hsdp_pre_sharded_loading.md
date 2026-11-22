@@ -9,10 +9,10 @@ engine configuration.
 
 Each rank reads rank-local slices of checkpoint tensors, including packed integer
 weights such as NVFP4; only scalar tensors are replicated. This avoids
-materializing a full CPU copy of the checkpoint, reduces CPU memory use and
-redundant checkpoint I/O, and can improve loading speed. Real transformer
-blocks are materialized and sharded one at a time, limiting temporary GPU
-memory use.
+materializing a full CPU copy of the checkpoint and redundant checkpoint I/O.
+Real transformer blocks are materialized, processed and sharded one at a time:
+during loading each rank holds its checkpoint slices for every DiT group plus
+at most one gathered block.
 
 The pre-sharded strategy reads rank-local slices from ordinary Hugging Face
 safetensors checkpoints into FSDP-owned proxy storage. No converted checkpoint is
