@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Launch GLM-TTS server + Gradio demo together.
 #
 # Usage:
@@ -19,9 +22,8 @@ vllm-omni serve "$MODEL" \
     --deploy-config "$REPO_ROOT/vllm_omni/deploy/glm_tts.yaml" \
     --host 0.0.0.0 \
     --port "$PORT" \
-    --gpu-memory-utilization 0.9 \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
     --trust-remote-code \
-    --enforce-eager \
     --omni &
 SERVER_PID=$!
 
@@ -34,7 +36,7 @@ trap cleanup EXIT
 
 # Wait for server to be ready.
 echo "Waiting for server to start..."
-for i in $(seq 1 120); do
+for _ in $(seq 1 120); do
     if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
         echo "Server ready."
         break

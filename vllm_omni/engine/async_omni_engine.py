@@ -20,6 +20,7 @@ from vllm.multimodal.cache import ShmObjectStoreSenderCache
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
+from vllm_omni.config.stage_config import STREAMING_UPDATE_TRANSFORM_ATTR
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
@@ -310,11 +311,16 @@ class AsyncOmniEngine(OmniEngineBase):
                     inject_global_id(item, request_id)
 
             prompt_transform_func = getattr(self, "prompt_transform_func", None)
+            if message_type == "streaming_update":
+                prompt_transform_func = getattr(
+                    prompt_transform_func, STREAMING_UPDATE_TRANSFORM_ATTR, prompt_transform_func
+                )
             if prompt_transform_func is not None:
                 prompt = prompt_transform_func(
                     copy.copy(prompt),
                     effective_sampling_params_list,
                 )
+                params = effective_sampling_params_list[0]
                 if isinstance(prompt, dict):
                     raw_dirs = prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
                     if isinstance(raw_dirs, list) and all(isinstance(path, str) for path in raw_dirs):
@@ -662,6 +668,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     companions = self._build_cfg_companions(
                         request_id, msg.original_prompt, stage0_params, effective_spl
                     )
+            msg.cfg_companion_ids = {companion.role: companion.companion_id for companion in companions} or None
         except BaseException:
             # Companion construction runs under this guard too: a failure after
             # the ADD message exists must still release its preprocessed
@@ -938,7 +945,7 @@ class AsyncOmniEngine(OmniEngineBase):
 
     async def add_next_stage_input_async(self, msg: NextStageInputMessage) -> None:
         """Send a next stage input returned by an earlier request to the Orchestrator."""
-        self.request_queue.sync_q.put(msg)
+        await self._put_request_queue(msg)
 
     def add_streaming_update(
         self,

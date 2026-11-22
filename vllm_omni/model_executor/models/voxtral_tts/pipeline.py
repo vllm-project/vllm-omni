@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Voxtral TTS pipeline topology (frozen).
 
 Stage 0: audio_generation  — text → acoustic latents (LLM_AR, tokenizer owner).
@@ -23,6 +23,7 @@ VOXTRAL_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="audio_generation",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             final_output=False,
             final_output_type="text",
@@ -35,6 +36,7 @@ VOXTRAL_TTS_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="audio_tokenizer",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

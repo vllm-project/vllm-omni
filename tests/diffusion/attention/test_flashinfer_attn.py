@@ -122,6 +122,19 @@ def test_auto_flashinfer_backend_kwargs_select_cute_dsl_on_blackwell(monkeypatch
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((8, 0), "fa2"), ((9, 0), "fa3"), ((10, 0), "cute-dsl"), ((12, 0), "fa2"), ((12, 1), "fa2")],
+)
+def test_auto_flashinfer_backend_by_capability(monkeypatch, capability, expected):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+
+    assert FlashInferAttentionImpl._select_backend("auto") == expected
+    spec = AttentionSpec(backend="FLASHINFER_ATTN")
+    assert FlashInferAttentionBackend.supports_attention_mask(spec) is (expected != "cute-dsl")
+
+
+@pytest.mark.cpu
 def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (9, 0))
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
