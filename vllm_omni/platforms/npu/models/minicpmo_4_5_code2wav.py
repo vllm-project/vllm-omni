@@ -13,6 +13,7 @@ from weakref import WeakKeyDictionary
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.minicpmo_4_5.config import stage_connector_extra
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 logger = init_logger(__name__)
@@ -359,7 +360,7 @@ def _patched_build_backend(self) -> None:
     if self.backend is not None:
         return
 
-    extra = self._extra_config()
+    extra = stage_connector_extra(self.vllm_config)
     if bool(extra.get(_BF16_ATTENTION_CACHE_KEY, False)):
         raise ValueError(
             "MiniCPM-o Code2Wav code2wav_bfloat16_attention_cache is "
