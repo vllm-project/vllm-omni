@@ -5,10 +5,12 @@
 The oracle below re-derives the reference replay rules per token in plain
 Python (independently of the vectorised run-level predicate), and the
 hand-written expectations encode specific consequences of those rules read
-from the imaginaire4 predicate: condition frames read only themselves, their
-own controls and captions; controls never read current targets; cross-view
-reads are past-only within 0.4 s; chunk 1 sees only chunk 0 and chunk k >= 2
-sees chunks 0 and k-1.
+from the imaginaire4 predicate and its maskless replay partitions: condition
+frames read only themselves, their own controls and captions; controls never
+read current targets and read clean history of their own view only (the
+maskless cross-view partition excludes controls); cross-view reads are
+past-only within 0.4 s; chunk 1 sees only chunk 0 and chunk k >= 2 sees chunks
+0 and k-1.
 """
 
 from __future__ import annotations
@@ -201,7 +203,8 @@ def _pair(q: dict, k: dict) -> bool:
     if q_role == ROLE_CONTROL:
         if k_role == ROLE_CONTROL:
             return same_view and step_le
-        return k_clean_sensor and k["step"] < q["step"] and in_scope
+        # Reference maskless replay: the cross-view partition excludes control queries.
+        return k_clean_sensor and k["step"] < q["step"] and same_view
     if q_role == ROLE_TARGET_CONDITION:
         if k_role == ROLE_TARGET_CONDITION:
             return same_view and q["frame"] == k["frame"]
@@ -265,7 +268,7 @@ def test_chunk0_condition_frames_read_only_their_own_view() -> None:
     assert row[scn.k_und(0) :].all()
 
 
-def test_controls_never_read_current_targets_but_read_windowed_clean_history() -> None:
+def test_controls_never_read_current_targets_and_read_only_own_view_clean_history() -> None:
     scn = scenario(2)
     mask = dense_token_mask(scn.plan)
     control = scn.q(view_id=0, role=ROLE_CONTROL, frame_id=3)  # t = 0.6, step 2
@@ -276,14 +279,21 @@ def test_controls_never_read_current_targets_but_read_windowed_clean_history() -
     assert row[scn.k_current(view_id=0, role=ROLE_CONTROL, frame_id=4)]
     assert row[scn.k_history(0, view_id=0, role=ROLE_CONTROL)]
     assert row[scn.k_history(1, view_id=0, role=ROLE_CONTROL, frame_id=1)]
-    # Clean history: own view unrestricted, other views only inside the 0.4 s window.
+    # Clean history: own view unrestricted. The reference maskless cross-view partition
+    # excludes control queries, so other views stay hidden even inside the 0.4 s window.
     assert row[scn.k_history(0, view_id=0, role=ROLE_TARGET_CONDITION)]
+    assert row[scn.k_history(1, view_id=0, role=ROLE_CLEAN_TARGET, frame_id=1)]
+    assert row[scn.k_history(1, view_id=0, role=ROLE_CLEAN_TARGET, frame_id=2)]
     assert not row[scn.k_history(0, view_id=1, role=ROLE_TARGET_CONDITION)]  # gap 0.6
-    assert row[scn.k_history(1, view_id=1, role=ROLE_CLEAN_TARGET, frame_id=1)]  # gap 0.4
-    assert row[scn.k_history(1, view_id=1, role=ROLE_CLEAN_TARGET, frame_id=2)]  # gap 0.2
-    assert not row[scn.k_history(1, view_id=LIDAR_VIEW, role=ROLE_CLEAN_TARGET, frame_id=1)]  # gap 0.5
-    assert row[scn.k_history(1, view_id=LIDAR_VIEW, role=ROLE_CLEAN_TARGET, frame_id=2)]  # gap 0.4
-    assert row[scn.k_history(1, view_id=LIDAR_VIEW, role=ROLE_CLEAN_TARGET, frame_id=4)]  # gap 0.2
+    assert not row[scn.k_history(1, view_id=1, role=ROLE_CLEAN_TARGET, frame_id=1)]  # gap 0.4
+    assert not row[scn.k_history(1, view_id=1, role=ROLE_CLEAN_TARGET, frame_id=2)]  # gap 0.2
+    assert not row[scn.k_history(1, view_id=LIDAR_VIEW, role=ROLE_CLEAN_TARGET, frame_id=2)]  # gap 0.4
+    assert not row[scn.k_history(1, view_id=LIDAR_VIEW, role=ROLE_CLEAN_TARGET, frame_id=4)]  # gap 0.2
+    # Control rows never enter a cross-view pass.
+    control_runs = scn.plan.query_runs.role == ROLE_CONTROL
+    for attention_pass in scn.plan.passes:
+        if attention_pass.name.startswith("cross_view"):
+            assert not any(bool(control_runs[list(q_runs)].any()) for q_runs, _ in attention_pass.segments)
 
 
 def test_cross_view_window_is_past_only_for_current_and_history() -> None:

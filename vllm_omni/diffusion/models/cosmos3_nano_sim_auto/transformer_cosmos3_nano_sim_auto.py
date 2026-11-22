@@ -3,7 +3,8 @@
 """Causal rolling multiview Cosmos3 transformer for Cosmos3-Nano-Sim-Auto.
 
 The weights are the Cosmos3 MoT generator (plus LiDAR projections for joint
-checkpoints). What changes is the GEN attention: every current token attends
+checkpoints and, when the artifact declares one, the physical rig-view
+embedding table). What changes is the GEN attention: every current token attends
 one softmax over the keys the replay predicate admits from three streams --
 the current chunk, the KV ring of committed chunks and the per-camera caption
 documents -- executed as log-sum-exp-merged maskless passes planned on the host
@@ -23,7 +24,11 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_attention import maskless_attention_streams
-from vllm_omni.diffusion.models.cosmos3.multiview_packing import patchify_sensor, unpatchify_sensor
+from vllm_omni.diffusion.models.cosmos3.multiview_packing import (
+    add_rig_view_embedding,
+    patchify_sensor,
+    unpatchify_sensor,
+)
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     Cosmos3CrossAttention,
     Cosmos3GenDecoderLayer,
@@ -191,10 +196,10 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
 
     def validate_loaded_weights(self, loaded: set[str]) -> None:
         loaded = {name.removeprefix("transformer.") for name in loaded}
-        if any(name.endswith("rig_view_embed.weight") for name in loaded):
+        if self.rig_view_embed is None and any(name.endswith("rig_view_embed.weight") for name in loaded):
             raise ValueError(
-                "Cosmos3-Nano-Sim-Auto checkpoints have no rig view embedding; this artifact belongs to the "
-                "bidirectional Cosmos3-Nano-Transfer-Auto pipeline."
+                "Cosmos3-Nano-Sim-Auto checkpoint carries rig_view_embed.weight but the artifact declares no "
+                "rig_view_embedding; re-export the checkpoint with the current imaginaire4 exporter."
             )
         required = {name for name, _ in self.named_parameters()}
         missing = sorted(f"transformer.{name}" for name in required - loaded)
@@ -246,6 +251,14 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
             width = self.lidar_patch_hw[0] * self.lidar_patch_hw[1] * int(self.manifest.lidar["latent_channels"])
             self.lidar_proj_in = torch.nn.Linear(width, self.hidden_size)
             self.lidar_proj_out = torch.nn.Linear(self.hidden_size, width)
+        # Physical rig identity: one trained row per MADS camera ID plus a final
+        # LiDAR row, added to control and target tokens alike.
+        self.rig_view_embed: torch.nn.Embedding | None = None
+        self.rig_lidar_id: int | None = None
+        if self.manifest.rig_view_embedding is not None:
+            rig = self.manifest.rig_view_embedding
+            self.rig_view_embed = torch.nn.Embedding(int(rig["num_embeddings"]), self.hidden_size)
+            self.rig_lidar_id = int(rig["lidar_id"])
 
     @property
     def num_kv_heads_local(self) -> int:
@@ -333,17 +346,31 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
         latents: Sequence[torch.Tensor],
         *,
         timestep: torch.Tensor | None,
+        rig_view_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Project every item's latents and add the timestep to generated target frames only.
+        """Project every item's latents, add rig identity, then the timestep to generated target frames only.
 
-        ``timestep`` is ``None`` for clean refresh forwards: controls, observed
-        condition frames and committed-clean targets never receive a time embed.
+        ``rig_view_ids`` holds the physical rig row of every camera in request
+        order (``[V]``) and is required exactly when the artifact declares a rig
+        table; camera items add their camera's row and LiDAR items the reserved
+        LiDAR row, controls and targets alike (reference order: projection, rig
+        identity, timestep). ``timestep`` is ``None`` for clean refresh
+        forwards: controls, observed condition frames and committed-clean
+        targets never receive a time embed.
         """
         if len(items) != len(latents):
             raise ValueError(f"{len(items)} items but {len(latents)} latent tensors.")
+        if (self.rig_view_embed is None) != (rig_view_ids is None):
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Auto rig_view_ids must be given exactly when the artifact declares a rig table."
+            )
         time_embedding = None
         if timestep is not None:
             time_embedding = self._embed_timestep(timestep.reshape(1), self.proj_in.weight.dtype).view(1, 1, -1)
+        camera_rows = None
+        if self.rig_view_embed is not None:
+            assert rig_view_ids is not None and self.rig_lidar_id is not None
+            camera_rows = self.rig_view_embed(rig_view_ids.to(self.rig_view_embed.weight.device))  # [V, D]
         embeddings = []
         for item, latent in zip(items, latents, strict=True):
             expected_frames = len(item.view_ids) * len(item.frames)
@@ -354,6 +381,17 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
                 )
             project = self.lidar_proj_in if item.is_lidar else self.proj_in
             hidden = project(patchify_sensor(latent.to(self.proj_in.weight.dtype), self._item_patch(item)))
+            if camera_rows is not None:
+                assert self.rig_view_embed is not None and self.rig_lidar_id is not None
+                if item.is_lidar:
+                    rows = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
+                else:
+                    if camera_rows.shape[0] != len(item.view_ids):
+                        raise ValueError(
+                            f"{camera_rows.shape[0]} rig view ids for a {len(item.view_ids)}-camera {item.kind} item."
+                        )
+                    rows = camera_rows
+                add_rig_view_embedding(hidden, rows, len(item.view_ids))
             if time_embedding is not None and not item.is_control:
                 generated = torch.tensor(
                     [frame not in item.condition_frames for frame in item.frames],
@@ -380,6 +418,7 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
         write_slots: torch.Tensor | None = None,
         kv_pools: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         collect_kv: bool = False,
+        rig_view_ids: torch.Tensor | None = None,
     ) -> Cosmos3NanoSimAutoTransformerOutput:
         """Denoise (``timestep`` set) or clean-refresh (``timestep`` None) one chunk.
 
@@ -387,6 +426,7 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
         ``history_kv`` the per-layer ring keys ``[tokens, H_kv, D]`` (flat pool
         views or the dense ring), or ``None`` for chunk 0. ``write_slots`` with
         ``kv_pools`` publishes the refresh K/V into the paged pool.
+        ``rig_view_ids`` are the request cameras' physical rig rows (``[V]``).
         """
         if self._inductor_cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
@@ -401,7 +441,7 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
         if timestep is not None and timestep.numel() != 1:
             raise ValueError(f"timestep must hold one value, got {tuple(timestep.shape)}.")
 
-        hidden = self.embed_items(items, latents, timestep=timestep)
+        hidden = self.embed_items(items, latents, timestep=timestep, rig_view_ids=rig_view_ids)
         freqs_cos, freqs_sin = self.chunk_rope(items, text_extent=text_extent, device=hidden.device, dtype=hidden.dtype)
         empty_history = und_kv[0][0].new_empty(0, self.num_kv_heads_local, self.head_dim)
         current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []

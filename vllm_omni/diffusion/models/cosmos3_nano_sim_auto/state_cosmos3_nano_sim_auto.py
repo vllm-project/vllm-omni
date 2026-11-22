@@ -106,6 +106,8 @@ class Cosmos3NanoSimAutoSessionState:
     next_chunk: int = 0
     # Request geometry (fixed for the session).
     cameras: tuple[str, ...] = ()
+    #: Physical rig rows of ``cameras`` (``[V]``), or ``None`` when the artifact has no rig table.
+    rig_view_ids: torch.Tensor | None = None
     joint: bool = False
     height: int = 0
     width: int = 0
@@ -152,6 +154,7 @@ class Cosmos3NanoSimAutoSessionState:
         self.fingerprint = None
         self.terminal = False
         self.next_chunk = 0
+        self.rig_view_ids = None
         self.rgb_control_latents = None
         self.rgb_target_latents = None
         self.lidar_control_latents = None

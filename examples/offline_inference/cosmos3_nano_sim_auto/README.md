@@ -10,11 +10,11 @@ for joint checkpoints, a numeric LiDAR HD-map control (plus an optional measured
    ```bash
    PYTHONPATH="$PWD/packages/cosmos3:$PWD" python -m cosmos3.scripts.prepare_multiview_lidar \
        packages/cosmos3/inputs/omni_multiview/wsm_transfer_i2v.jsonl --output /data/sim_auto_rgb \
-       --rolling --num-views 7 --num-frames 297 --fps 30
+       --rolling --num-views 7 --num-frames 297 --fps 30 --seed 0
    # joint RGB + LiDAR
    PYTHONPATH="$PWD/packages/cosmos3:$PWD" python -m cosmos3.scripts.prepare_multiview_lidar \
        packages/cosmos3/inputs/omni_multiview/wsm_lidar_transfer_i2v.jsonl --output /data/sim_auto_joint \
-       --rolling --num-views 7 --num-frames 297 --fps 30
+       --rolling --num-views 7 --num-frames 297 --fps 30 --seed 0
    ```
 
 3. Run:
@@ -35,7 +35,9 @@ returns them when `sampling_params.extra_args["return_latents"] = True`; this is
 of whether decoded LiDAR output was requested.
 
 For parity, use the same compatible deduplicated checkpoint, ordered cameras, prepared inputs,
-33- or 93-frame horizon, and seed on both sides. Compare RGB with RGB and joint with joint;
+horizon and seed on both sides. The reference applies `--seed` unchanged to every sample of an
+input file, so prepared requests carry that one seed and `--seed` here is only the fallback for
+requests without one. Compare RGB with RGB and joint with joint;
 their noise shapes and chunk seed clocks differ. Start at TP1, then repeat at TP4. Reference
 and vLLM outputs can both be loaded with `torch.load(path, map_location="cpu", weights_only=True)[0]`.
 GPU latent parity and TP4 validation remain pending.

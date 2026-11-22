@@ -34,7 +34,7 @@ def test_dense_refresh_reads_previous_chunk_until_all_layers_finish() -> None:
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    state = Cosmos3NanoSimAutoSessionState(session_id="test", dense_ring=ring)
+    state = Cosmos3NanoSimAutoSessionState(session_id="test", dense_ring=ring, rig_view_ids=torch.tensor([5]))
     host = SimpleNamespace(
         manifest=SimpleNamespace(cache_chunks=2, sink_chunks=1),
         device=torch.device("cpu"),
@@ -54,6 +54,8 @@ def test_dense_refresh_reads_previous_chunk_until_all_layers_finish() -> None:
         def refresh(**kwargs):
             assert kwargs["write_slots"] is None and kwargs["kv_pools"] is None
             assert kwargs["collect_kv"]
+            # Committed K/V must carry the same rig identity as the denoising passes.
+            assert kwargs["rig_view_ids"] is state.rig_view_ids
             for actual, expected in zip(kwargs["history_kv"], before, strict=True):
                 torch.testing.assert_close(actual[0], expected[0])
                 torch.testing.assert_close(actual[1], expected[1])

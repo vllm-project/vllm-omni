@@ -8,8 +8,10 @@ object in ``transformer/config.json``. It records everything the rolling
 causal multiview student needs at inference that is not an architecture field:
 the sensor clock and chunk partition, the KV ring, the replay visibility
 policy, the segmented prompt policy, mRoPE constants, the fixed-step student
-schedule and the optional LiDAR tokenizer contract. Validation is exact: unknown
-or missing fields fail, and deployment YAML may not override artifact data.
+schedule, the optional LiDAR tokenizer contract and the optional physical rig
+table. Validation is exact: unknown or missing fields fail (only
+``rig_view_embedding`` may be absent, for early exports), and deployment YAML
+may not override artifact data.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vllm_omni.diffusion.models.cosmos3.lidar import validate_lidar_config
+from vllm_omni.diffusion.models.cosmos3.multiview_config import _validated_rig_view_embedding
 from vllm_omni.diffusion.models.cosmos3.multiview_packing import spatial_patch_hw
 from vllm_omni.diffusion.models.cosmos3.multiview_prompts import MADS_CAMERA_ATTRIBUTES
 
@@ -48,6 +51,9 @@ ARTIFACT_FIELDS = frozenset(
         "inference_defaults",
     }
 )
+#: Early schema-v1 exports predate rig embeddings and omit the key; current exports always write it
+#: (``null`` when the student has no rig table).
+OPTIONAL_ARTIFACT_FIELDS = frozenset({"rig_view_embedding"})
 RGB_FIELDS = frozenset(
     {"latent_channels", "latent_patch_size", "vae_spatial_compression_factor", "temporal_compression_factor"}
 )
@@ -123,11 +129,13 @@ def deploy_option(config: Any, key: str, default: Any = None) -> Any:
     return default
 
 
-def _exact_fields(payload: Any, allowed: frozenset[str], name: str) -> dict[str, Any]:
+def _exact_fields(
+    payload: Any, allowed: frozenset[str], name: str, optional: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Cosmos3-Nano-Sim-Auto artifact {name} must be an object, got {type(payload).__name__}.")
     missing = sorted(allowed - payload.keys())
-    unknown = sorted(payload.keys() - allowed)
+    unknown = sorted(payload.keys() - allowed - optional)
     if missing or unknown:
         raise ValueError(
             f"Cosmos3-Nano-Sim-Auto artifact {name} field set mismatch: missing={missing}, unknown={unknown}. "
@@ -212,6 +220,8 @@ class Cosmos3NanoSimAutoManifest:
     # Optional LiDAR tokenizer contract (validated by the shared LiDAR validator).
     lidar: dict[str, Any] | None = None
     lidar_latent_patch_size_hw: tuple[int, int] | None = None
+    # Optional physical rig table: one trained row per MADS camera ID plus a final LiDAR row.
+    rig_view_embedding: dict[str, Any] | None = None
     schema_version: int = COSMOS3_NANO_SIM_AUTO_SCHEMA_VERSION
     attention_mode: str = "multiview"
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -245,11 +255,18 @@ class Cosmos3NanoSimAutoManifest:
         """Stable fingerprint of the artifact contract for session fingerprints."""
         return hashlib.sha256(json.dumps(self.raw, sort_keys=True, default=str).encode()).hexdigest()
 
+    def rig_camera_ids(self, cameras: list[str] | tuple[str, ...]) -> list[int] | None:
+        """Physical rig rows of the request's cameras in request order, or ``None`` without a rig table."""
+        if self.rig_view_embedding is None:
+            return None
+        camera_ids = self.rig_view_embedding["camera_ids"]
+        return [int(camera_ids[camera]) for camera in cameras]
+
     # -- construction ----------------------------------------------------
 
     @classmethod
     def from_artifact(cls, artifact: Any) -> Cosmos3NanoSimAutoManifest:
-        payload = _exact_fields(_mapping(artifact) or artifact, ARTIFACT_FIELDS, "root")
+        payload = _exact_fields(_mapping(artifact) or artifact, ARTIFACT_FIELDS, "root", OPTIONAL_ARTIFACT_FIELDS)
         schema = _int(payload["schema_version"], "schema_version")
         if schema != COSMOS3_NANO_SIM_AUTO_SCHEMA_VERSION:
             raise ValueError(
@@ -267,6 +284,9 @@ class Cosmos3NanoSimAutoManifest:
             or len(set(cameras)) != len(cameras)
         ):
             raise ValueError("Cosmos3-Nano-Sim-Auto cameras must be unique MADS camera keys.")
+        rig = payload.get("rig_view_embedding")
+        if rig is not None:
+            rig = _validated_rig_view_embedding({"rig_view_embedding": rig}, cameras)
         rgb = _exact_fields(payload["rgb"], RGB_FIELDS, "rgb")
         chunk = _exact_fields(payload["chunk"], CHUNK_FIELDS, "chunk")
         ring = _exact_fields(payload["ring"], RING_FIELDS, "ring")
@@ -377,6 +397,7 @@ class Cosmos3NanoSimAutoManifest:
             default_fps=_float(defaults["fps"], "inference_defaults.fps", positive=True),
             lidar=lidar,
             lidar_latent_patch_size_hw=lidar_patch,
+            rig_view_embedding=rig,
             raw=json.loads(json.dumps(payload, default=str)),
         )
 

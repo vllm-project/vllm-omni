@@ -11,12 +11,16 @@ log-sum-exp (:mod:`..cosmos3.multiview_maskless_attention`). Each admitted
 (query, key) pair is covered by exactly one pass, so the merge equals the
 masked softmax.
 
-The predicate is a term-for-term port of the reference teacher-forcing replay
-rules with the production policy folded in: causal control visibility, controls
-reading strictly-past clean sensor history, chunk-causal clean passes, the
-decomposed view scope with a 0.4 s past-only cross-view window, and
-deduplicated cross-view keys. Planning is host-side; only index tensors move
-to the device.
+The predicate reproduces what the reference rolling inference actually runs:
+the teacher-forcing replay role rules (``_teacher_forcing_pair_predicate``)
+intersected with the reference maskless replay partitions
+(``build_replay_maskless_plan``), with the production policy folded in: causal
+control visibility, controls reading strictly-past clean sensor history,
+chunk-causal clean passes, the decomposed view scope with a 0.4 s past-only
+cross-view window, and deduplicated cross-view keys. The maskless cross-view
+partition excludes control queries and keys, so controls read only their own
+view (the Flex predicate alone would let controls read windowed cross-view
+clean history). Planning is host-side; only index tensors move to the device.
 """
 
 from __future__ import annotations
@@ -208,7 +212,9 @@ def pair_allowed(q: RunTable, k: RunTable, *, window_seconds: float) -> torch.Te
     steps <= the query's), ``controls_read_strict_past_clean_rgb=True``,
     ``clean_pass_causality="chunk"``, decomposed scope with a past-only window
     and deduplicated cross-view keys (a key is counted once; same-view and
-    windowed cross-view are disjoint by construction here).
+    windowed cross-view are disjoint by construction here). As in the
+    reference maskless partitions, control queries and control keys never take
+    part in cross-view attention: controls read same-view clean history only.
     """
     if not (math.isfinite(window_seconds) and window_seconds >= 0):
         raise ValueError(f"window_seconds must be finite and non-negative, got {window_seconds}.")
@@ -251,7 +257,9 @@ def pair_allowed(q: RunTable, k: RunTable, *, window_seconds: float) -> torch.Te
     target_to_und = q_is_target & caption_reaches_query
     condition_to_und = q_is_condition_like & caption_reaches_query
     control_to_control = q_is_control & k_is_control & same_view & control_step_allowed
-    control_to_clean_history = q_is_control & k_is_clean_sensor & (k_step < q_step) & in_scope
+    # The reference cross-view partition drops control queries (``~q.is_control``), so only the
+    # same-view part of the replay rule survives for controls.
+    control_to_clean_history = q_is_control & k_is_clean_sensor & (k_step < q_step) & same_view
     condition_to_itself = q_is_condition & k_is_condition & same_frame & same_view
     condition_to_control = q_is_condition & k_is_control & same_view & control_step_allowed
     # Condition K/V is reused across chunks, so it must not encode noisy targets of its own chunk.

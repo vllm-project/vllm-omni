@@ -748,6 +748,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             )
 
         state.cameras = tuple(cameras)
+        rig_rows = self.manifest.rig_camera_ids(cameras)
+        state.rig_view_ids = None if rig_rows is None else torch.tensor(rig_rows, dtype=torch.long, device=self.device)
         state.joint = joint
         state.height, state.width, state.fps, state.num_frames = height, width, fps, num_frames
         state.schedule = schedule
@@ -946,6 +948,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                     und_kv=und_kv,
                     history_kv=history_kv,
                     runtime=runtime,
+                    rig_view_ids=state.rig_view_ids,
                 )
                 targets = [item for item in items if not item.is_control]
                 preds = []
@@ -1046,6 +1049,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             write_slots=write_slots,
             kv_pools=pools,
             collect_kv=bound is None,
+            rig_view_ids=state.rig_view_ids,
         )
         if bound is not None:
             bound.kv_cache.commit_chunk(adapter)

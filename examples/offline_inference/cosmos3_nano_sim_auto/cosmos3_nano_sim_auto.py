@@ -268,7 +268,12 @@ def _parse_args() -> argparse.Namespace:
         "--deploy-config", default=None, help="Deploy YAML (defaults to vllm_omni/deploy/cosmos3_nano_sim_auto.yaml)."
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=0, help="Base seed; request seeds win when present.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed of every request without its own seed (like the reference --seed); request seeds win.",
+    )
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
@@ -297,7 +302,8 @@ def main() -> None:
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=args.tensor_parallel_size),
     )
     for index, request in enumerate(requests):
-        seed = int(request.get("seed", args.seed + index))
+        # imaginaire4 applies --seed unchanged to every sample of an input file.
+        seed = int(request.get("seed", args.seed))
         name = _safe_name(str(request.get("name", f"sample_{index:04d}")), f"sample_{index:04d}")
         sample_dir = args.output_dir / name / "0"
         sample_dir.mkdir(parents=True, exist_ok=True)
