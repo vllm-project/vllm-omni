@@ -277,6 +277,6 @@ about 127 ms per frame eagerly and 16 ms from its graph (20 ms for batches of
 | Concurrent requests | 8 in flight, further requests wait | — |
 | Truncation report (`x-audio-truncated`) | supported | [Truncated audio](../../docs/serving/speech_api.md#truncated-audio) |
 | CUDA graphs | stage 0: backbone decode steps and the depth decoder's frame step; stage 1 runs eagerly (`enforce_eager: true`) | — |
-| Prefix caching | disabled in both stages | — |
+| Prefix caching | disabled in both stages; stage 0 does not start with it enabled | — |
 | `--no-async-chunk` | not supported | — |
 | WebSocket text input, batch endpoint, offline `Omni` inference | not qualified | — |

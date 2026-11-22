@@ -10,12 +10,15 @@ from collections.abc import Iterator
 from fnmatch import fnmatch
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import vllm.distributed.parallel_state as parallel_state
 from transformers import CsmConfig, CsmForConditionalGeneration
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
 
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmAdapter
 from vllm_omni.model_executor.models.csm.csm_mimi import CODEC_PREFIX, codec_weight_name
 from vllm_omni.model_executor.models.csm.csm_talker import (
     REFERENCE_AUDIO_KEY,
@@ -86,12 +89,12 @@ def _config(**overrides) -> CsmConfig:
 
 
 def _build_talker(
-    config: CsmConfig, monkeypatch: pytest.MonkeyPatch, **model_config
+    config: CsmConfig, monkeypatch: pytest.MonkeyPatch, *, enable_prefix_caching: bool = False, **model_config
 ) -> CsmTalkerForConditionalGeneration:
     single_rank = SimpleNamespace(rank_in_group=0, world_size=1, is_first_rank=True, is_last_rank=True)
     monkeypatch.setattr(parallel_state, "_PP", single_rank)
     monkeypatch.setattr(parallel_state, "_TP", single_rank)
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(cache_config=CacheConfig(enable_prefix_caching=enable_prefix_caching))
     object.__setattr__(
         vllm_config,
         "model_config",
@@ -231,6 +234,11 @@ def test_only_the_transformers_shards_are_read() -> None:
 def test_untied_codebook_embeddings_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match="untied codebook embeddings"):
         _build_talker(_config(tie_codebooks_embeddings=False), monkeypatch)
+
+
+def test_prefix_caching_is_rejected_when_the_model_is_built(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="enable_prefix_caching=False"):
+        _build_talker(_config(), monkeypatch, enable_prefix_caching=True)
 
 
 def test_stop_and_empty_frame_rules() -> None:
@@ -460,6 +468,57 @@ def test_prompt_that_does_not_match_the_recording_is_rejected(
             **{REFERENCE_AUDIO_KEY: _waveform(1920 * 6)},
         )
     assert talker._references == {}
+
+
+def _adapter_prompt(config: CsmConfig, recording: np.ndarray, sample_rate: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token ids and codec waveform the serving adapter builds for a reference recording."""
+    model_config = SimpleNamespace(model="csm-test", hf_config=config, max_model_len=2048)
+    engine = SimpleNamespace(model_config=model_config)
+    adapter = CsmAdapter(SpeechServingContext(server=SimpleNamespace(_tts_executor=None), engine_client=engine))
+    # Fixed turn tokens stand in for the tokenizer.
+    adapter._turn_ids = lambda speaker_id, text: [11, 12, 13]
+    prompt = adapter._build_prompt("Say this.", 0, "I said that.", (recording, sample_rate))
+    return torch.tensor(prompt["prompt_token_ids"]), prompt["additional_information"][REFERENCE_AUDIO_KEY]
+
+
+def test_adapter_placeholder_count_equals_the_codec_frame_count_at_every_length(
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]],
+) -> None:
+    talker, _ = loaded
+    recording = _waveform(240001).numpy()
+    # One-sample steps across a frame boundary and more than two periods of every smaller encoder stride.
+    lengths = [1, 2, *range(1920 * 2 - 130, 1920 * 2 + 131), 239999, 240000, 240001]
+    for samples in lengths:
+        input_ids, waveform = _adapter_prompt(talker.config, recording[:samples], 24000)
+        placeholders = int((input_ids == talker.config.audio_token_id).sum())
+        with torch.no_grad():
+            codes = talker.codec_model.encode(waveform[None, None]).audio_codes
+        assert codes.shape[-1] == placeholders, samples
+
+
+@pytest.mark.parametrize("sample_rate", [8000, 16000, 22050, 24000, 32000, 44100, 48000])
+def test_talker_accepts_the_adapter_prompt_at_any_sample_rate(
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]], sample_rate: int
+) -> None:
+    talker, _ = loaded
+    mono = _waveform(sample_rate * 2).numpy()
+    first = round(1.37 * sample_rate)
+    recordings = [mono[:samples] for samples in range(first, first + 5)]
+    recordings.append(np.stack([mono[:first], mono[3 : first + 3]], axis=1))
+    for recording in recordings:
+        # The adapter resamples once and counts frames on the waveform it sends; the talker encodes that waveform.
+        input_ids, waveform = _adapter_prompt(talker.config, recording, sample_rate)
+        with torch.no_grad():
+            talker.preprocess(
+                input_ids,
+                None,
+                req_id="a",
+                _omni_is_prefill=True,
+                _omni_num_computed_tokens=0,
+                _omni_prompt_len=input_ids.shape[0],
+                **{REFERENCE_AUDIO_KEY: waveform},
+            )
+        assert talker._references == {}
 
 
 def test_finished_requests_drop_their_reference(loaded: tuple[CsmTalkerForConditionalGeneration, set[str]]) -> None:

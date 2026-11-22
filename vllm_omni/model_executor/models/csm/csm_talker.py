@@ -113,6 +113,9 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         config = vllm_config.model_config.hf_config
         if not getattr(config, "tie_codebooks_embeddings", True):
             raise ValueError("CSM checkpoints with untied codebook embeddings are not supported")
+        if vllm_config.cache_config.enable_prefix_caching:
+            # A prefix hit skips prompt tokens, and reference audio is embedded as the prompt passes preprocess.
+            raise ValueError("CSM requires enable_prefix_caching=False")
         self.config = config
         self.num_codebooks = int(config.num_codebooks)
         self.codebook_vocab_size = int(config.vocab_size)
