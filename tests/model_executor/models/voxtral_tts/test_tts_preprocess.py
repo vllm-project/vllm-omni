@@ -40,7 +40,8 @@ class FakeAudioGeneration(nn.Module):
             return [values.unsqueeze(-1).expand(count, 4)]
         return [torch.full((1, 4), 7.0)]
 
-    def compute_mm_logits(self, hidden_states, cfg_alpha):
+    def compute_mm_logits(self, hidden_states, cfg_alpha, noise=None):
+        assert noise is None
         self.cfg_alpha = cfg_alpha
         batch_size = hidden_states.shape[0] if hidden_states.ndim > 1 else 1
         fake_eos = torch.arange(batch_size, device=hidden_states.device, dtype=hidden_states.dtype)
@@ -205,27 +206,19 @@ def test_tts_preprocess_keeps_legacy_top_level_audio_feedback():
 
 
 def test_v1_preprocess_delta_preserves_existing_codes_audio():
-    from types import SimpleNamespace
-
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
     model = _make_voxtral_tts_model()
     audio_tokens = torch.tensor([[[5, 6, 7, 8]]])
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = model
-    runner.model_intermediate_buffer = {"request-a": {"codes": {"audio": audio_tokens}}}
-    runner.requests = {"request-a": SimpleNamespace()}
+    codes = {"audio": audio_tokens}
 
-    _, _, update = model.tts_preprocess(
+    _, output_embeds, update = model.tts_preprocess(
         torch.tensor([model._audio_token_id]),
         torch.zeros((1, 4)),
-        codes={"audio": audio_tokens},
+        codes=codes,
     )
-    runner._update_intermediate_buffer("request-a", update)
 
-    codes = runner.model_intermediate_buffer["request-a"]["codes"]
-    torch.testing.assert_close(codes["audio"], audio_tokens)
-    assert codes["audio_history"] == []
+    assert update == {"codes": {"audio_history": []}}
+    assert codes["audio"] is audio_tokens
+    torch.testing.assert_close(output_embeds, torch.full((1, 4), 5.0))
 
 
 def test_mrv2_preprocess_delta_preserves_existing_codes_audio():
@@ -249,20 +242,12 @@ def test_mrv2_preprocess_delta_preserves_existing_codes_audio():
 
 
 def test_v1_output_hook_persists_feedback_from_preprocess_state_delta():
-    from types import SimpleNamespace
-
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
     model = _make_voxtral_tts_model()
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = model
-    runner.model_intermediate_buffer = {}
-    runner.requests = {"request-a": SimpleNamespace()}
+    request_info: dict[str, Any] = {}
 
     _, _, update = model.tts_preprocess(torch.tensor([5]), torch.zeros((1, 4)))
     assert update == {"codes": {"audio_history": []}}
-    runner._update_intermediate_buffer("request-a", update)
-    request_info = runner.model_intermediate_buffer["request-a"]
+    request_info.setdefault("codes", {}).update(update["codes"])
 
     output = model.make_omni_output(
         torch.zeros((1, 4)),
@@ -270,13 +255,12 @@ def test_v1_output_hook_persists_feedback_from_preprocess_state_delta():
         runtime_additional_information=[request_info],
     )
 
-    codes = runner.model_intermediate_buffer["request-a"]["codes"]
+    codes = request_info["codes"]
     torch.testing.assert_close(codes["audio_history"][0], torch.ones((1, 1, 4)))
     assert "audio" not in codes
 
     postprocess_update = model.tts_postprocess(output.text_hidden_states, output.multimodal_outputs)
-    runner._update_intermediate_buffer("request-a", postprocess_update)
-    codes = runner.model_intermediate_buffer["request-a"]["codes"]
+    codes.update(postprocess_update["codes"])
     torch.testing.assert_close(codes["audio"], torch.ones((1, 1, 4)))
     torch.testing.assert_close(codes["audio_history"][0], torch.ones((1, 1, 4)))
 
@@ -285,7 +269,7 @@ def test_v1_output_hook_persists_feedback_from_preprocess_state_delta():
         torch.zeros((1, 4)),
         _omni_prompt_len=4,
         _omni_num_computed_tokens=4,
-        **runner.model_intermediate_buffer["request-a"],
+        **request_info,
     )
     torch.testing.assert_close(output_embeds, torch.ones((1, 4)))
 
@@ -314,6 +298,7 @@ def test_make_omni_output_keeps_feedback_request_local():
     torch.testing.assert_close(output_frames[1], torch.full((1, 1, 4), 2.0))
     torch.testing.assert_close(output.text_hidden_states[:, 0], torch.tensor([0.0, 1.0]))
     assert not hasattr(model, "post_process_idx")
+
 
 @pytest.mark.parametrize("keep_history_on_device", [False, True])
 def test_store_feedback_frames_updates_only_history(keep_history_on_device):
@@ -420,12 +405,8 @@ def test_make_omni_output_mrv2_uses_request_slots_and_sampling_cfg():
 
     torch.testing.assert_close(buffer.buffers[0]["codes"]["audio"], torch.full((1, 1, 4), 1.0))
     torch.testing.assert_close(buffer.buffers[1]["codes"]["audio"], torch.full((1, 1, 4), 2.0))
-    torch.testing.assert_close(
-        buffer.buffers[0]["codes"]["audio_history"][0], torch.full((1, 1, 4), 1.0)
-    )
-    torch.testing.assert_close(
-        buffer.buffers[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0)
-    )
+    torch.testing.assert_close(buffer.buffers[0]["codes"]["audio_history"][0], torch.full((1, 1, 4), 1.0))
+    torch.testing.assert_close(buffer.buffers[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0))
 
 
 def test_make_omni_output_mrv2_filters_intermediate_prefill_frames_by_request():

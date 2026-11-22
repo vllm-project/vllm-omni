@@ -99,8 +99,8 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
             values = audio_tokens[0, :, 0].to(torch.float32)
             return [values.unsqueeze(-1).expand(-1, 4)]
 
-        def compute_mm_logits(self, hidden_states, cfg_alpha):
-            del cfg_alpha
+        def compute_mm_logits(self, hidden_states, cfg_alpha, noise=None):
+            del cfg_alpha, noise
             fake_eos = torch.zeros((hidden_states.shape[0], 1), dtype=hidden_states.dtype)
             return fake_eos, {"codes": {"audio": self.next_frames}}
 
@@ -136,7 +136,7 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
 
     def emit_mrv2_frames(req_ids, request_infos, values, scheduled_tokens):
         model.model.next_frames = [torch.full((1, 1, 4), value) for value in values]
-        return model.make_omni_output_mrv2(
+        output = model.make_omni_output_mrv2(
             torch.zeros((len(req_ids), 4)),
             input_batch=SimpleNamespace(
                 num_reqs=len(req_ids),
@@ -148,28 +148,29 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
             req_states=None,
             model_intermediate_buffer=request_infos,
         )
+        for row, request_info in enumerate(request_infos):
+            update = model.tts_postprocess(
+                output.text_hidden_states[row : row + 1],
+                output.multimodal_outputs,
+                _omni_batch_row=row,
+            )
+            req_index = next(
+                index for index, buffer in enumerate(state.intermediate_buffer.buffers) if buffer is request_info
+            )
+            state.intermediate_buffer.update(req_index, update)
+        return output
 
-    first_output = emit_mrv2_frames(["request-a"], [state.intermediate_buffer.buffers[0]], [101.0], [4])
+    emit_mrv2_frames(["request-a"], [state.intermediate_buffer.buffers[0]], [101.0], [4])
 
     def runner_output(req_ids):
         return ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
             sampled_token_ids=[[42] for _ in req_ids],
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[],
         )
 
-    first_codes = state.intermediate_buffer.buffers[0]["codes"]
-    assert "audio" not in first_codes
-    torch.testing.assert_close(first_codes["audio_history"][0], torch.full((1, 1, 4), 101.0))
-    postprocess_update = model.tts_postprocess(
-        torch.zeros((1, 4)),
-        first_output.multimodal_outputs,
-        _omni_batch_row=0,
-    )
-    state.intermediate_buffer.update(0, postprocess_update)
     first_codes = state.intermediate_buffer.buffers[0]["codes"]
     torch.testing.assert_close(first_codes["audio"], torch.full((1, 1, 4), 101.0))
     torch.testing.assert_close(first_codes["audio_history"][0], torch.full((1, 1, 4), 101.0))

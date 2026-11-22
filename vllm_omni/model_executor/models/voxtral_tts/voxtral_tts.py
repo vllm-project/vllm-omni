@@ -123,6 +123,8 @@ class VoxtralTTSForConditionalGeneration(
         if self.model_stage == "audio_generation":
             self.has_preprocess = True
             self.has_postprocess = True
+            # MRv2 postprocess writes codes.audio after make_omni_output stores
+            # replay history, so the runner needs this step's structured output.
             self.postprocess_requires_multimodal_outputs = True
             self.requires_raw_input_tokens = True
             self.set_custom_preprocess(self.tts_preprocess)
@@ -839,12 +841,16 @@ class VoxtralTTSForConditionalGeneration(
         logits_indices = input_batch.logits_indices[:num_reqs].to(device=model_outputs.device, dtype=torch.long)
         input_hidden_states = model_outputs.index_select(0, logits_indices)
         cfg_alpha = self._cfg_alpha_from_request_infos(model_intermediate_buffer, input_hidden_states)
+        generators = self._get_tts_local_generators(input_hidden_states.device, model_intermediate_buffer)
+        noise = self._make_acoustic_noise(input_hidden_states, generators)
         if self._cudagraph_acoustic_transformer is not None:
             fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
-                input_hidden_states, cfg_alpha=cfg_alpha
+                input_hidden_states, cfg_alpha=cfg_alpha, noise=noise
             )
         else:
-            fake_eos, multimodal_outputs = self.model.compute_mm_logits(input_hidden_states, cfg_alpha=cfg_alpha)
+            fake_eos, multimodal_outputs = self.model.compute_mm_logits(
+                input_hidden_states, cfg_alpha=cfg_alpha, noise=noise
+            )
         model_outputs[logits_indices, 0] = fake_eos.reshape(-1)
         num_computed_prefill = input_batch.num_computed_prefill_tokens_np[:num_reqs]
         num_scheduled_tokens = input_batch.num_scheduled_tokens[:num_reqs]

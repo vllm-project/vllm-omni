@@ -87,7 +87,11 @@ class _CaptureAudioGeneration(nn.Module):
             }
         )
         fake_eos = torch.zeros(hidden_states.shape[0], dtype=hidden_states.dtype)
-        return fake_eos, {"codes": {"audio": []}}
+        frames = [
+            torch.zeros((1, 1, N_ACOUSTIC_CODEBOOK + 1), device=hidden_states.device)
+            for _ in range(hidden_states.shape[0])
+        ]
+        return fake_eos, {"codes": {"audio": frames}}
 
 
 class _CaptureAcousticGraph:
@@ -103,7 +107,11 @@ class _CaptureAcousticGraph:
             }
         )
         fake_eos = torch.zeros(hidden_states.shape[0], dtype=hidden_states.dtype)
-        return fake_eos, {"codes": {"audio": []}}
+        frames = [
+            torch.zeros((1, 1, N_ACOUSTIC_CODEBOOK + 1), device=hidden_states.device)
+            for _ in range(hidden_states.shape[0])
+        ]
+        return fake_eos, {"codes": {"audio": frames}}
 
 
 def _make_voxtral_model():
@@ -149,8 +157,10 @@ def test_request_acoustic_stream_follows_request_across_batch_changes():
             idx_mapping_np=indices,
             num_reqs=size,
             logits_indices=torch.arange(size),
+            num_computed_prefill_tokens_np=[0] * size,
             query_start_loc_np=range(size),
             num_scheduled_tokens=[1] * size,
+            prefill_len_np=[1] * size,
         )
         state.postprocess_model_output(torch.zeros((size, 4)), batch, SimpleNamespace())
         return model.model.calls[-1]["noise"]
