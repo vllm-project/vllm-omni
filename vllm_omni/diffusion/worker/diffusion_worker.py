@@ -1375,6 +1375,16 @@ class DiffusionWorker:
             return False
         return self.lora_manager.add_adapter(lora_request)
 
+    def export_runtime_lora(self, adapter_id: int, *, max_bytes: int) -> bytes:
+        if self.lora_manager is None:
+            raise RuntimeError("Runtime LoRA is disabled")
+        return self.lora_manager.export_runtime_adapter(adapter_id, max_bytes=max_bytes)
+
+    def restore_runtime_lora(self, payload: bytes, *, max_bytes: int) -> bool:
+        if self.lora_manager is None:
+            raise RuntimeError("Runtime LoRA is disabled")
+        return self.lora_manager.restore_runtime_adapter(payload, max_bytes=max_bytes)
+
     def submit_interaction(
         self,
         request_id: str,
