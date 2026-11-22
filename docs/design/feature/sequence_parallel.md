@@ -7,6 +7,7 @@ This section describes how to add Sequence Parallel (SP) to a diffusion transfor
 ## Table of Contents
 
 - [Overview](#overview)
+- [Packed QKV exchanges](#packed-qkv-exchanges)
 - [UAA Mode (Experimental)](#uaa-mode-experimental)
 - [Approach 1: Non-Intrusive `_sp_plan` (Recommended)](#approach-1-non-intrusive-_sp_plan-recommended)
 - [Approach 2: Intrusive Modification (For Complex Cases)](#approach-2-intrusive-modification-for-complex-cases)
@@ -49,9 +50,10 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer
 symmetric memory directly into the final attention layout. It requires
-TorchNPU's NPUSHMEM allocator and an installed `libshmem.so` on the loader
-search path. This backend does not build a repository C++/AscendC extension;
-Triton uses its normal JIT toolchain.
+TorchNPU's NPUSHMEM allocator and the native SHMEM runtime. The backend
+loads the runtime from the installed `cann-shmem` wheel, or from the loader
+search path for a separately installed `libshmem.so`. Triton uses its normal
+JIT toolchain; no repository C++/AscendC extension is built.
 
 The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
 `ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all
@@ -64,6 +66,50 @@ the process group.
 The NPU attention factory rejects Ulysses × AllGather-KV when this option is
 enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
 The same topology remains available through the standard communication path.
+
+## Packed QKV exchanges
+
+Set `VLLM_OMNI_PACKED_QKV=1` before worker startup to opt into a packed
+Q/K/V exchange. The option is platform-neutral and defaults to off. All ranks
+in each Ulysses group must use the same setting; changing it requires rebuilding
+the attention strategies, normally by restarting the workers.
+
+In strict Ulysses, eligible `[B, S_local, H, D]` Q/K/V tensors copy directly
+into a destination-major `[world_size, B, S_local, H_local, 3, D]` wire
+buffer. One ordinary `torch.distributed.all_to_all_single` exchanges Q/K/V;
+the receive buffer is unpacked into three contiguous attention inputs.
+The reverse output exchange restores `[B, S_local, H, D]` in one collective.
+This changes three forward plus one reverse exchanges into one forward plus
+one reverse exchange. The logical payload is unchanged.
+
+The path requires all of the following:
+
+- `ulysses_degree > 1` and the standard head-to-sequence layout
+  (`scatter_idx=2`, `gather_idx=1`).
+- Strict Ulysses mode, equal positive Q/K/V shapes, matching dtypes and devices,
+  and a head count divisible by `ulysses_degree`.
+- Inference tensors without gradients and no `gate_compress` tensor.
+- A process-group backend that supports `all_to_all_single` for those tensors.
+
+The existing strict-mode requirement for equally sized local sequence shards
+still applies. Strided producers, batch sizes greater than one, masked padding,
+and replicated joint Q/K/V in either the front or rear position preserve their
+existing ordering and metadata. Each call owns its staging and output storage;
+later calls cannot overwrite a previous result. The implementation uses the
+process group's normal collective backend without peer-memory mappings or a
+persistent workspace.
+
+Advanced UAA, unequal Q/K/V shapes (including GQA), gradients, and compressed
+gates retain their existing exchanges. An explicitly selected
+`--ulysses-a2a-permute` backend keeps precedence.
+
+Benchmark with the flag off and on using the same model, precision, topology,
+sequence shape, concurrency, and warmup. Larger messages and staging copies can
+offset the reduction in collective launches; fewer collectives alone do not
+guarantee lower end-to-end latency or peak memory. Collect profiler-disabled
+serving measurements separately from traces, and include packing/unpacking
+copies when comparing communication costs. Enabling the option on another
+platform does not establish correctness or a performance gain for that backend.
 
 ---
 

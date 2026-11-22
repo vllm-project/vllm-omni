@@ -116,6 +116,16 @@ DIFFUSION_TEST_SETTINGS = {
         check_i2v_t2v_divergence=False,
         check_multi_output=False,
     ),
+    "WanPipeline": DiffusionModelTestOpts(
+        model="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        builder=diff_model_builders.tiny_wan_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        model_type_marker=ModelTypeMarker.DIFFUSION,
+        extra_test_groups=[
+            [DiffusionAccs.PIPELINE_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL],
+        ],
+    ),
     "QwenImagePipeline": DiffusionModelTestOpts(
         model="Qwen/Qwen-Image",
         builder=diff_model_builders.tiny_qwen_image_builder,

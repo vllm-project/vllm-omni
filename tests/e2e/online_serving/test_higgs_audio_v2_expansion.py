@@ -137,6 +137,11 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                # Concurrent Higgs samples can leave a brief tail that
+                # whisper-small mishears as extra words. Confirm a weak fast
+                # transcript with the stronger ASR model before treating it
+                # as a semantic regression, matching the Higgs v3 gate.
+                "transcript_escalation_model": "large-v3",
             },
             request_num=3,
         )

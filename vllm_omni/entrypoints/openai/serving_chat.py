@@ -7,6 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
@@ -153,7 +154,7 @@ from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     is_image_generation_stage,
     is_single_stage_diffusion,
-    parse_lora_request,
+    parse_lora_requests,
     resolve_diffusion_od_config,
 )
 from vllm_omni.errors import OmniClientError
@@ -1114,7 +1115,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Keep OMNI compatibility args wired while delegating rendering
         # to the upstream async renderer pipeline.
-        default_template_kwargs = merge_kwargs(
+        resolved_template_kwargs = merge_kwargs(
             default_template_kwargs,
             dict(
                 tools=tool_dicts,
@@ -1125,17 +1126,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenize=isinstance(renderer.tokenizer, MistralTokenizer),
             ),
         )
-
         tok_params = request.build_tok_params(self.model_config)
         mm_config = self.model_config.multimodal_config
         chat_params = request.build_chat_params(
             default_template,
             default_template_content_format,
         ).with_defaults(
-            default_template_kwargs,
+            resolved_template_kwargs,
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
+        # HF templates such as MiMo-Audio's use output modalities to select
+        # model task tokens. Apply this server-owned value after request-level
+        # chat_template_kwargs so clients cannot select a task that disagrees
+        # with the public request. Mistral's renderer does not accept arbitrary
+        # template variables.
+        if not isinstance(renderer.tokenizer, MistralTokenizer):
+            chat_params = replace(
+                chat_params,
+                chat_template_kwargs={
+                    **chat_params.chat_template_kwargs,
+                    "vllm_omni_output_modalities": getattr(request, "modalities", None),
+                },
+            )
 
         deferred_multi_modal_data: dict[str, Any] | None = None
         if entry_stage_id == 0 and self._needs_multistage_multimodal_split():
@@ -3533,13 +3546,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if lora_body and isinstance(lora_body, dict):
+                if lora_body and isinstance(lora_body, (dict, list)):
                     try:
-                        lora_req, lora_scale = parse_lora_request(lora_body)
-                        if lora_req is not None:
-                            default_stage_params.lora_request = lora_req
-                            if lora_scale is not None:
-                                default_stage_params.lora_scale = lora_scale
+                        lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                        if lora_reqs:
+                            default_stage_params.lora_request = lora_reqs
+                            default_stage_params.lora_scale = lora_scales
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
             elif stage_type == "llm" and idx > 0 and is_image_generation_stage(stage_cfg):
@@ -3618,13 +3630,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             sigmas=extra_body.get("sigmas"),
         )
 
-        if lora_body and isinstance(lora_body, dict):
+        if lora_body and isinstance(lora_body, (dict, list)):
             try:
-                lora_req, lora_scale = parse_lora_request(lora_body)
-                if lora_req is not None:
-                    gen_params.lora_request = lora_req
-                    if lora_scale is not None:
-                        gen_params.lora_scale = lora_scale
+                lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                if lora_reqs:
+                    gen_params.lora_request = lora_reqs
+                    gen_params.lora_scale = lora_scales
             except Exception as e:  # pragma: no cover - safeguard
                 logger.warning("Failed to parse LoRA request: %s", e)
 
@@ -4034,13 +4045,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     gen_params.resolution = resolution
 
                 # Parse per-request LoRA.
-                if lora_body and isinstance(lora_body, dict):
+                if lora_body and isinstance(lora_body, (dict, list)):
                     try:
-                        lora_req, lora_scale = parse_lora_request(lora_body)
-                        if lora_req is not None:
-                            gen_params.lora_request = lora_req
-                            if lora_scale is not None:
-                                gen_params.lora_scale = lora_scale
+                        lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                        if lora_reqs:
+                            gen_params.lora_request = lora_reqs
+                            gen_params.lora_scale = lora_scales
                     except Exception as exc:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", exc)
 

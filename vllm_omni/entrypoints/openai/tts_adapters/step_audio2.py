@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Step-Audio2 serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -33,15 +33,24 @@ class StepAudio2Adapter(ARTTSAdapter):
     ) -> PreparedRequest:
         """Build a chat prompt ending at ``<tts_start>``.
 
-        The assistant turn deliberately omits ``<|im_end|>`` so the thinker
+        The assistant turn deliberately omits ``<|EOT|>`` so the thinker
         continues by generating audio tokens.
         """
-        system_prompt = request.instructions or "You are a voice assistant. Read the text aloud."
+        system_prompt = request.instructions or "以自然的语速读出下面的文字。"
         prompt = {
             "prompt": (
-                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                f"<|im_start|>user\n{request.input}<|im_end|>\n"
-                "<|im_start|>assistant\n<tts_start>"
+                f"<|BOT|>system\n{system_prompt}<|EOT|>"
+                f"<|BOT|>human\n{request.input}<|EOT|>"
+                "<|BOT|>assistant\n<tts_start>"
             )
         }
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="step_audio2")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)

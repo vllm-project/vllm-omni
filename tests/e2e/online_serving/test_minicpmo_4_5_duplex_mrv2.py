@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real-weight duplex concurrency guard for the CUDA MRv2 default and ROCm V1 fallback."""
+"""Real-weight duplex concurrency guard for CUDA and ROCm MRv2 defaults."""
 
 import asyncio
 import json
@@ -30,9 +30,9 @@ _SERVER = OmniServerParams(
     server_args=["--trust-remote-code"],
 )
 
-# ``minicpmo_4_5.yaml`` runs the CUDA Thinker and Code2Wav on MRv2 (the multi-frame
-# Talker stays on V1) and resolves every ROCm stage to V1. The AMD READY
-# lane executes the resolver contract before selecting these real-weight cases.
+# ``minicpmo_4_5.yaml`` resolves all three stages to MRv2 on CUDA and ROCm.
+# The AMD READY lane executes the resolver contract before selecting these
+# real-weight cases.
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
