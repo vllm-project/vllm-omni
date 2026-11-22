@@ -24,9 +24,8 @@ Devices:
 ```
 
 `vllm-omni doctor --json` produces the same data for scripts and CI. Recipes that have never been
-measured on a small device are absent by design; see [Minimum memory tiers](../models/memory_tiers.md)
-for the full ladder: 3 variants fit 8 GiB, none documents a minimum in the 12 GiB band, and 11 fit
-16 GiB at the time of writing.
+measured on a small device are absent by design. For the full ladder: 3 variants fit 8 GiB, none
+documents a minimum in the 12 GiB band, and 11 fit 16 GiB at the time of writing.
 
 ## A verified 6 GiB speech stack
 
@@ -66,8 +65,8 @@ curl -X POST http://localhost:8123/v1/audio/speech \
        \"response_format\": \"wav\"}" --output reply.wav
 ```
 
-The recipe ([`recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml`](../../recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml))
-carries the same numbers and a longer usage guide.
+See [`recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml)
+for the recipe with the same numbers and a longer usage guide.
 
 ### 2. Speech to text
 
