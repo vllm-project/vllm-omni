@@ -40,13 +40,15 @@ def encode_payload(payload: NextStageInputMessage | RequestOutput) -> str:
     return base64.b64encode(OmniMsgpackEncoder().encode(payload)).decode("ascii")
 
 
-def decode_stage_input(data: str, stage_types: Sequence[str]) -> NextStageInputMessage:
+def decode_stage_input(
+    data: str, stage_types: Sequence[str], *, stage_order: Sequence[int] | None = None
+) -> NextStageInputMessage:
     """Decode a next stage input encoded by `encode_payload`.
 
     The codec returns structs and dataclasses as plain containers, which we rebuild based on stage type.
     """
     stage_input = NextStageInputMessage(**OmniMsgpackDecoder().decode(base64.b64decode(data)))
-    stage_input.check_stage_ids(len(stage_types))
+    stage_input.check_stage_ids(len(stage_types), stage_order=stage_order)
     if stage_types[stage_input.receiver_stage_id] != "diffusion":
         stage_input.requests = [msgspec.convert(request, OmniEngineCoreRequest) for request in stage_input.requests]
     stage_input.sampling_params_list = [
@@ -107,7 +109,11 @@ class ServingRun:
             raise OmniClientError(f"Stage {request.stage_id} takes the stage_input returned by the previous call")
         if request.sampling_params is not None:
             raise OmniClientError("Only the stage 0 call takes sampling_params; later calls carry them in stage_input")
-        stage_input = decode_stage_input(request.stage_input, self.stage_types)
+        stage_input = decode_stage_input(
+            request.stage_input,
+            self.stage_types,
+            stage_order=self.engine_client._configured_stage_routing().stage_order,
+        )
         if stage_input.receiver_stage_id != request.stage_id:
             raise OmniClientError(
                 f"stage_input is for stage {stage_input.receiver_stage_id}, not stage {request.stage_id}"

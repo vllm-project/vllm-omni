@@ -20,6 +20,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS
 from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexStageRequestContext, DuplexStageSubmission
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
@@ -58,6 +59,7 @@ class _FakePool:
     """Single-replica LLM pool that records the requests it is sent."""
 
     stage_type = "llm"
+    final_output = True
 
     def __init__(self, role: str, stage_client: Any = None) -> None:
         self.stage_client = stage_client if stage_client is not None else SimpleNamespace()
@@ -68,6 +70,9 @@ class _FakePool:
 
     def live_replica_ids(self) -> list[int]:
         return [0]
+
+    async def pick(self, request_id, *, request_state):
+        return 0
 
     async def submit_initial(
         self,
@@ -99,6 +104,7 @@ def _orchestrator(payload_func: Any = None, cls: type[Orchestrator] = Orchestrat
     code2wav_client = None if payload_func is None else _client(payload_func)
     orchestrator = object.__new__(cls)
     orchestrator.stage_pools = [_FakePool("sender"), _FakePool("receiver"), _FakePool("receiver", code2wav_client)]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.async_chunk = True
     orchestrator.request_states = {}
     orchestrator._emit_tx_edge = lambda **_kwargs: None
@@ -215,6 +221,7 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
     )
     streaming = case.get("streaming", False)
     req_state.streaming.enabled = streaming
+    orchestrator.request_states[req_state.request_id] = req_state
     stage0_kwargs = case.get("stage0", {"resumable": False})
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
@@ -259,6 +266,7 @@ async def test_prewarmed_native_stop_keeps_only_required_downstream_requests_ope
     orchestrator.replica_placement = None
     if stage_count == 4:
         orchestrator.stage_pools.append(_FakePool("receiver"))
+    orchestrator._stage_routing = StageRouting.from_transitions(stage_count)
     params = [SamplingParams(max_tokens=8, temperature=0, stop_token_ids=[7]) for _ in range(stage_count)]
     entry_request = build_engine_core_request_from_tokens(
         "req", {"prompt_token_ids": list(_TOKENS)}, params[0], resumable=entry_resumable
@@ -270,6 +278,7 @@ async def test_prewarmed_native_stop_keeps_only_required_downstream_requests_ope
         final_stage_id=stage_count - 1,
         session_owned=session_owned,
     )
+    orchestrator.request_states[state.request_id] = state
 
     assert await orchestrator._prewarm_async_chunk_stages("req", entry_request, state)
 

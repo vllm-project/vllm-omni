@@ -15,6 +15,7 @@ import asyncio
 import pytest
 
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaList, ReplicaStatus
+from vllm_omni.engine.orchestrator import OrchestratorRequestState
 from vllm_omni.engine.stage_pool import StagePool, session_id_of, session_reset_requested
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -342,7 +343,7 @@ def _submit(pool, mocker, request_id: str, *, extra: dict | None = None):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     params = OmniDiffusionSamplingParams(extra_args=extra or {})
-    req_state = mocker.Mock(sampling_params_list=[params], trace=None)
+    req_state = OrchestratorRequestState(request_id=request_id, sampling_params_list=[params])
     return asyncio.run(pool.submit_initial(request_id, req_state, request=mocker.Mock(payload_sender_info=None)))
 
 
@@ -363,7 +364,7 @@ def _submit_tick(pool, mocker, request_id: str, *, session_id: str, reset: bool 
 
     tick = ARDiffusionTickRequest(session_id=session_id, request_id=request_id, chunk_index=0, reset=reset)
     params = OmniDiffusionSamplingParams(extra_args=tick.to_extra_args())
-    req_state = mocker.Mock(sampling_params_list=[params], trace=None)
+    req_state = OrchestratorRequestState(request_id=request_id, sampling_params_list=[params])
     return asyncio.run(pool.submit_initial(request_id, req_state, request=mocker.Mock(payload_sender_info=None)))
 
 
@@ -402,7 +403,7 @@ def test_submit_initial_rejects_explicit_replica_conflicting_with_session_holder
     holder = _submit(pool, mocker, "r1", extra={"session_id": "s1"})
     other = 1 - holder
     params = OmniDiffusionSamplingParams(extra_args={"session_id": "s1"})
-    req_state = mocker.Mock(sampling_params_list=[params], trace=None)
+    req_state = OrchestratorRequestState(request_id="r2", sampling_params_list=[params])
     kwargs = {"requested_replica_id": other} if pin_kind == "requested" else {"pinned_replica_id": other}
 
     with pytest.raises(StageUnavailableError, match="held by replica"):

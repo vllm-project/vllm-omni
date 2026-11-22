@@ -27,6 +27,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.distributed.omni_coordinator import (
@@ -269,8 +270,8 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[Any] | None = None) -> None:
+        self.request_states: dict[str, Any] = {}
         self.request_outputs = list(request_outputs or [])
-        self.request_states: dict[str, object] = {}
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
 
@@ -465,6 +466,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    stage_transitions: tuple[tuple[int, int], ...] | None = None,
     weight_sharing: SharingRuntime | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
@@ -499,6 +501,7 @@ def _build_harness(
                 output_async_queue=output_queue.async_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
+                stage_transitions=stage_transitions,
                 async_chunk=async_chunk,
                 log_stats=log_stats,
             )
@@ -1181,6 +1184,7 @@ async def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(multimodal_config=mm_config)),
         ),
     ]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     seen_uuids: dict[str, str] = {}
 
     def process_inputs(*, request_id, prompt, params, **kwargs):
@@ -2313,7 +2317,7 @@ def _routing_replica(input_addr: str, status: ReplicaStatus = ReplicaStatus.UP) 
 def _distributed_routing_pool(
     statuses: tuple[ReplicaStatus, ...] = (ReplicaStatus.UP, ReplicaStatus.UP),
 ) -> tuple[StagePool, list[FakeStageClient], _RoutingHub]:
-    clients = [FakeStageClient() for _ in statuses]
+    clients = [FakeStageClient(final_output=True) for _ in statuses]
     addresses = [f"tcp://replica-{index}" for index in range(len(statuses))]
     for client, address in zip(clients, addresses, strict=True):
         client.client_addresses = {"input_address": address}
@@ -2434,7 +2438,7 @@ def test_bind_requested_replica_validates_once(mocker: MockerFixture) -> None:
 async def test_stage_pool_automatic_routing_still_skips_down_replica() -> None:
     pool, _, _ = _distributed_routing_pool((ReplicaStatus.DOWN, ReplicaStatus.UP))
 
-    assert await pool._pick_or_select("automatic") == 1
+    assert await pool.pick("automatic") == 1
 
 
 @pytest.mark.asyncio
@@ -2839,7 +2843,7 @@ async def test_stage_pool_pinned_submit_never_falls_back(operation: str, failure
     async def fail_selection(*args, **kwargs):
         raise AssertionError("pinned dispatch must not select another replica")
 
-    monkeypatch.setattr(pool, "_pick_or_select", fail_selection)
+    monkeypatch.setattr(pool, "pick", fail_selection)
     with pytest.raises(StageUnavailableError, match="pinned replica"):
         await getattr(pool, operation)("pinned", state, request, pinned_replica_id=pinned_replica_id)
 
@@ -2859,7 +2863,7 @@ async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeyp
     async def fail_selection(*args, **kwargs):
         raise AssertionError("pinned dispatch must not select another replica")
 
-    monkeypatch.setattr(pool, "_pick_or_select", fail_selection)
+    monkeypatch.setattr(pool, "pick", fail_selection)
     with pytest.raises(StageUnavailableError, match="replica 0 keyed by pinned"):
         await pool.submit_initial("pinned", state, request, pinned_replica_id=1, expected_replica_id=0)
 
@@ -2979,6 +2983,7 @@ async def test_handle_streaming_update_unknown_request_is_dropped() -> None:
     orchestrator.async_chunk = False
     orchestrator.request_states = {}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     add_request_calls: list[str] = []
 
     async def record_add_request(msg) -> None:
@@ -3061,6 +3066,7 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
 def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [mocker.Mock()]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.stage_pools[0].get_bound_client.return_value = None
     req_state = SimpleNamespace(native_kv_transfer_id="xfer-req")
     output = SimpleNamespace(kv_transfer_params={"num_transfer_tokens": 4})
@@ -3125,6 +3131,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
         )
     }
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
 
     await orchestrator._handle_streaming_update(
         StageSubmissionMessage(
@@ -3169,6 +3176,7 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-stream": req_state}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -3314,7 +3322,7 @@ async def test_submit_to_stage_excludes_llm_replica_wait(monkeypatch) -> None:
         t_submit_start=time.perf_counter(),
     )
 
-    assert seen_at_submit == [-1.0]
+    assert seen_at_submit == [1_000.0]
     assert req_state.stage_submit_ts[1] == pytest.approx(2_000.0)
     assert req_state.stage_submit_perf[1] == pytest.approx(11.0)
 
@@ -3352,6 +3360,7 @@ async def test_disabled_stage_metrics_preserve_completion_routing() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-no-metrics": req_state}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -3850,7 +3859,7 @@ async def test_submit_and_abort_engine_death_evicts_replica_and_fails_request_on
             await super().abort_requests_async(request_ids)
             raise EngineDeadError("engine is still dead during abort")
 
-    dead, survivor = DeadClient(), FakeStageClient()
+    dead, survivor = DeadClient(final_output=True), FakeStageClient(final_output=True)
     processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
     pool = StagePool(
         0,
@@ -4005,8 +4014,8 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
 @pytest.mark.asyncio
 async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator_factory) -> None:
     """CFG companions should be routed to the same stage-0 replica as their parent."""
-    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=True)
     default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
     stage_pools = _build_stage_pools(
         [[stage0_r0, stage0_r1]],
@@ -4330,6 +4339,7 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     second = _Pool(fail_once=True)
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [first, second]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
 
     with pytest.raises(RuntimeError, match="stage abort failed"):
         await orchestrator._abort_request_ids(["req-a"])
@@ -4369,6 +4379,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
         stage_pools=[],
     )
     orchestrator.stage_pools = pools
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
     mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
     cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
@@ -4854,7 +4865,10 @@ async def test_add_request_rejects_parallel_samples_beyond_the_entry_stage(
     mocker, n: int, stages: list[str], final_stage_id: int, resumable: bool, accepted: bool
 ) -> None:
     # "per-sample-kv <type>": the entry stage sends one KV per sample to that stage.
-    pools = [StagePool(index, FakeStageClient(stage_type=kind.split()[-1])) for index, kind in enumerate(stages)]
+    pools = [
+        StagePool(index, FakeStageClient(stage_type=kind.split()[-1], final_output=index == final_stage_id))
+        for index, kind in enumerate(stages)
+    ]
     if any(kind.startswith("per-sample-kv") for kind in stages):
         pools[0]._stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": True})
@@ -4914,7 +4928,10 @@ def test_per_sample_kv_is_not_used_with_async_chunk(async_chunk: bool, feeds: bo
 @pytest.mark.parametrize(("n", "accepted"), [(6, True), (7, False)])
 async def test_add_request_bounds_per_sample_n_by_max_num_seqs(mocker, n: int, accepted: bool) -> None:
     # The diffusion stage holds every sample's KV prefix at once.
-    pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
+    pools = [
+        StagePool(0, FakeStageClient(stage_type="llm")),
+        StagePool(1, FakeStageClient(stage_type="diffusion", final_output=True)),
+    ]
     pools[0]._stage_vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": True}),
         scheduler_config=SimpleNamespace(max_num_seqs=6),
@@ -4953,7 +4970,10 @@ async def test_add_request_bounds_per_sample_n_by_max_num_seqs(mocker, n: int, a
 
 @pytest.mark.asyncio
 async def test_add_request_drops_a_client_per_sample_kv_count(mocker) -> None:
-    pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
+    pools = [
+        StagePool(0, FakeStageClient(stage_type="llm")),
+        StagePool(1, FakeStageClient(stage_type="diffusion", final_output=True)),
+    ]
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
         output_async_queue=asyncio.Queue(),
@@ -5022,7 +5042,7 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
     artifact_dir.mkdir()
     pool = StagePool(
         0,
-        FakeStageClient(),
+        FakeStageClient(final_output=True),
         stage_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
             speculative_config=SimpleNamespace(use_dflash=lambda: method == "dflash") if method else None,
@@ -5128,7 +5148,11 @@ async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_subm
     artifact_dir = tmp_path / "request-artifacts"
     artifact_dir.mkdir()
     pools = [StagePool(0, FakeStageClient()), StagePool(1, FakeStageClient())]
-    pools.append(_audio_stage_pool(_audio_stage_client("llm")) if watermark_final else StagePool(2, FakeStageClient()))
+    pools.append(
+        _audio_stage_pool(_audio_stage_client("llm"))
+        if watermark_final
+        else StagePool(2, FakeStageClient(final_output=True))
+    )
     assert pools[2].will_watermark(SamplingParams(n=2)) is watermark_final
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -5288,6 +5312,7 @@ async def test_shared_cancel_drains_active_work_and_removes_queued_request(orche
 @pytest.mark.parametrize("shared", [False, True])
 async def test_shared_kv_ready_waits_for_ar_terminal_output(mocker, shared):
     orch = object.__new__(Orchestrator)
+    orch._stage_routing = StageRouting.from_transitions(2)
     orch.async_chunk = False
     orch.weight_sharing = mocker.Mock(spec=SharingRuntime) if shared else None
     orch.request_states = {
