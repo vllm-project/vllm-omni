@@ -41,12 +41,18 @@ class DiffusionModelMetadata:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_multiview_reference_inputs: bool = False
     # Multipart controls are exposed as ``control_reference`` plus
     # ``control_type`` by the video API.  A pipeline that opts in receives the
     # persisted upload through ``extra_args[control_type]["control_path"]``.
     supported_control_upload_types: tuple[str, ...] = ()
     attention_mask_free: bool = False
     final_output_type: str | None = None
+    # Additional generation outputs for the default topology (e.g. Cosmos3
+    # can return images even though its default output is video).
+    additional_output_types: tuple[str, ...] = ()
+    # Whether a standalone audio output is served through /v1/audio/generate.
+    supports_audio_generation: bool = False
     # Whether ``/v1/videos`` accepts source media plus per-token video/audio
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
@@ -510,6 +516,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     ),
     "LingBotVideoPipeline": DiffusionModelMetadata(
         final_output_type="video",
+        additional_output_types=("image",),
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
@@ -561,10 +568,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
         serving_capabilities=COSMOS3_CAPABILITIES,
+        additional_output_types=("image",),
     ),
     "Cosmos3OmniPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+        additional_output_types=("image",),
         serving_capabilities=COSMOS3_CAPABILITIES,
     ),
     "SanaVideoPipeline": DiffusionModelMetadata(
@@ -579,6 +588,18 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_TO_VIDEO,
             sources=("vllm_omni/diffusion/models/sana_video/pipeline_sana_video_i2v.py",),
+        ),
+    ),
+    "Cosmos3MultiviewPipeline": DiffusionModelMetadata(
+        supports_multiview_reference_inputs=True,
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            unknown_operations=("video_generation",),
+            unknown_reason="requires_multiview_conditioning",
+            sources=(
+                "vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3_multiview.py",
+                "vllm_omni/model_extras/cosmos3.py",
+            ),
         ),
     ),
     "SanaWmPipeline": DiffusionModelMetadata(
@@ -741,6 +762,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         ),
     ),
     "LTX2TextToAudioPipeline": DiffusionModelMetadata(
+        final_output_type="audio",
+        supports_audio_generation=True,
         serving_capabilities=declare_capabilities(
             AUDIO_RESPONSE,
             TEXT_TO_AUDIO,
@@ -867,13 +890,13 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Pi05Pipeline": DiffusionModelMetadata(
         serving_capabilities=declare_capabilities(
             unsupported_reason="outside_standard_operations",
-            sources=("vllm_omni/diffusion/models/pi05/pipeline_pi05.py",),
+            sources=("vllm_omni/diffusion/models/pi/pi05/pipeline_pi05.py",),
         ),
     ),
     "Pi0Pipeline": DiffusionModelMetadata(
         serving_capabilities=declare_capabilities(
             unsupported_reason="outside_standard_operations",
-            sources=("vllm_omni/diffusion/models/pi0/pipeline_pi0.py",),
+            sources=("vllm_omni/diffusion/models/pi/pi0/pipeline_pi0.py",),
         ),
     ),
     "QwenImageDMD2Pipeline": DiffusionModelMetadata(
@@ -914,6 +937,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         ),
     ),
     "StableAudio3Pipeline": DiffusionModelMetadata(
+        final_output_type="audio",
+        supports_audio_generation=True,
         serving_capabilities=declare_capabilities(
             AUDIO_RESPONSE,
             TEXT_TO_AUDIO,
@@ -921,6 +946,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         ),
     ),
     "StableAudioPipeline": DiffusionModelMetadata(
+        final_output_type="audio",
+        supports_audio_generation=True,
         serving_capabilities=declare_capabilities(
             AUDIO_RESPONSE,
             TEXT_TO_AUDIO,
@@ -992,7 +1019,6 @@ _DIFFUSION_MODEL_METADATA_ALIASES = {
     "LTX2TwoStagePipeline": "LTX2Pipeline",
     "LTX2DistilledOneStagePipeline": "LTX2DistilledPipeline",
     "LTX2DistilledTwoStagePipeline": "LTX2DistilledPipeline",
-    "LingBotWorldCausalDMDPipeline": "LingBotVideoPipeline",
     "BooguImageTurboPipeline": "BooguImagePipeline",
 }
 

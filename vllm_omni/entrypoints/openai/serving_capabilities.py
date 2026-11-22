@@ -291,6 +291,12 @@ class OmniServingCapabilities:
                         exposure = "disabled"
                     if requires_image_chat(image_stages) and get_route_handler(state, "/v1/chat/completions") is None:
                         exposure = "disabled"
+                    supported_tasks = getattr(state, "supported_tasks", None)
+                    if supported_tasks is None:
+                        if exposure == "enabled":
+                            exposure = "unknown"
+                    elif "x2i" not in supported_tasks:
+                        exposure = "disabled"
                 if path in {"/v1/videos", "/v1/videos/sync", "/v1/realtime/video"}:
                     handler = get_route_handler(state, path)
                     video_stages = getattr(handler, "_stage_configs", None)

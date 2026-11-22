@@ -109,6 +109,27 @@ def test_image_and_audio_outputs_do_not_imply_editing_or_tts():
     assert tta.get("audio_generation").support == "unsupported"
 
 
+def test_phonon_declaration_preserves_speech_without_assuming_chat_prompts():
+    declaration = resolve_pipeline_config("gradium_phonon_tts").serving_capabilities
+    assert _profile(declaration, "speech", "text_to_speech").support == "supported"
+    audio = _profile(declaration, "chat", "audio_response")
+    assert audio.support == "unknown"
+    assert audio.reason_code == "chat_prompt_contract_undeclared"
+    assert _profile(declaration, "chat", "text_response").support == "unsupported"
+    for operation in ("image_generation", "image_edit", "video_generation", "audio_generation"):
+        assert declaration.get(operation).support == "unsupported"
+
+
+def test_multiview_declaration_does_not_inherit_standard_video_profiles():
+    declaration = get_diffusion_model_metadata("Cosmos3MultiviewPipeline").serving_capabilities
+    video = declaration.get("video_generation")
+    assert video.support == "unknown"
+    assert video.reason_code == "requires_multiview_conditioning"
+    assert all(profile.support == "unknown" for profile in video.profiles)
+    for operation in set(OPERATIONS) - {"video_generation"}:
+        assert declaration.get(operation).support == "unsupported"
+
+
 def test_declarations_preserve_existing_metadata_overrides_and_defaults():
     # Discovery must not change task/handler initialization through unrelated
     # metadata fields, including entries that previously resolved via aliases.

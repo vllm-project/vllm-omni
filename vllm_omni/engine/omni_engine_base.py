@@ -25,7 +25,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config import WatermarkConfig
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
-from vllm_omni.config.omni_config import StageConfigType
+from vllm_omni.config.omni_config import StageConfigType, VllmOmniDiffusionStageConfig
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
 )
 from vllm_omni.config.weight_sharing import WeightSharingConfig
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
@@ -78,6 +79,36 @@ _REQUEST_QUEUE_MAXSIZE = 256
 # Output messages one serving-loop wakeup takes before yielding the event loop.
 _OUTPUT_DRAIN_MAX_BATCH = 256
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
+
+
+def _derive_supported_tasks(stage_configs: Sequence[StageConfigType]) -> tuple[str, ...]:
+    """Derive serving tasks from the deployed topology without loading model weights."""
+    tasks: set[str] = set()
+    for stage in stage_configs:
+        if stage.is_comprehension:
+            tasks.add("generate")
+        if not stage.final_output:
+            continue
+
+        output_types = {stage.final_output_type}
+        audio_task = "speech"
+        if isinstance(stage, VllmOmniDiffusionStageConfig):
+            model_class = stage.diffusion_config.model_class_name or stage.model_config.model_arch
+            metadata = get_diffusion_model_metadata(model_class)
+            # A custom topology may select a different output, e.g. Cosmos3
+            # policy serving uses an action stage instead of the video stage.
+            if stage.final_output_type == metadata.final_output_type:
+                output_types.update(metadata.additional_output_types)
+            if metadata.supports_audio_generation:
+                audio_task = "audio_generate"
+
+        if "audio" in output_types:
+            tasks.add(audio_task)
+        if "image" in output_types:
+            tasks.add("x2i")
+        if "video" in output_types:
+            tasks.add("x2v")
+    return tuple(sorted(tasks)) or ("generate",)
 
 
 def load_and_resolve_stage_configs(
@@ -476,12 +507,7 @@ class OmniEngineBase:
             )
             for client in self.stage_clients
         ]
-        supported_tasks: set[str] = set()
-        if any(getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs):
-            supported_tasks.add("generate")
-        if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
-            supported_tasks.add("speech")
-        self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+        self.supported_tasks = _derive_supported_tasks(self.stage_configs)
 
     def _bootstrap_orchestrator(
         self,

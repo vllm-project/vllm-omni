@@ -12,9 +12,8 @@ duplicated across stages. The VAE decoder is a separate repository
 
 Sampling is model-owned. ``sampling_constraints`` pins ``detokenize`` and the
 union of both phase end tokens; ``extra_args`` carry the phase and the
-request-local sampling preset, and must be present in the stage's
-``default_sampling_params`` so ``has_sampling_extra_args`` turns on and the
-per-request args reach the model's forward.
+request-local sampling preset. The V2 model state reads each request's
+sampling parameters before every forward or CUDA graph replay.
 """
 
 from dataclasses import replace

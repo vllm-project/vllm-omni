@@ -117,6 +117,8 @@ class MiniMaxMusic3Adapter(ARTTSAdapter):
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
         del sampling_params_list, has_inline_ref_audio
+        if request.instructions is None:
+            raise ValueError("MiniMax Music 3 requires 'instructions' describing the music")
         prompt = build_prompt(request.instructions, request.input)
         # Submit token ids, not text. Guidance needs a companion whose prompt is
         # the same length with the caption-and-lyrics span replaced, and that
@@ -124,10 +126,15 @@ class MiniMaxMusic3Adapter(ARTTSAdapter):
         # leave the expansion with nothing to build the twin from, and a request
         # that decodes unguided produces a different song.
         token_ids = self._tokenizer().encode(prompt)
-        if len(token_ids) > MAX_PROMPT_TOKENS:
+        # Stage 0 needs room for at least one audio frame and its delivery step.
+        engine_client = self.ctx.engine_client
+        if engine_client is None:
+            raise RuntimeError("MiniMax Music 3 speech serving requires an engine client")
+        max_prompt_tokens = min(MAX_PROMPT_TOKENS, engine_client.model_config.max_model_len - 2)
+        if len(token_ids) > max_prompt_tokens:
             raise ValueError(
                 f"MiniMax Music 3 prompt is {len(token_ids)} tokens; "
-                f"the maximum is {MAX_PROMPT_TOKENS}. Shorten the caption or the lyrics."
+                f"the maximum is {max_prompt_tokens}. Shorten the caption or the lyrics."
             )
         # The frame budget is enforced by the model, not by the engine's
         # max_tokens. The model needs one decode step beyond the last frame to

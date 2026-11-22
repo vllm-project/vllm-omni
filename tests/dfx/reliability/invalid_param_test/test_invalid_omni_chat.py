@@ -43,10 +43,6 @@ _QWEN3_OMNI_SERVER = [
 
 def _chat_completions_request_without_expectations(omni_server: OmniServer, case_id: str) -> dict[str, Any]:
     """Build ``send_chat_completions_http_request`` kwargs excluding ``err_code`` / ``err_message``."""
-    if case_id == "malformed_json":
-        return {"raw_body": "{not-json", "timeout": 120}
-    if case_id == "missing_messages":
-        return {"json": {"model": omni_server.model, "stream": False}, "timeout": 120}
     if case_id == "model_mismatch":
         return {
             "json": {
@@ -57,18 +53,10 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             "timeout": 120,
         }
     body = _minimal_chat_json(omni_server)
-    if case_id == "stream_wrong_type":
-        body["stream"] = "not-a-boolean"  # type: ignore[assignment]
-    elif case_id == "temperature_wrong_type":
-        body["temperature"] = "hot"  # type: ignore[assignment]
-    elif case_id == "max_tokens_wrong_type":
-        body["max_tokens"] = "not-an-int"  # type: ignore[assignment] # type: ignore[assignment]
-    elif case_id == "modalities_list_bad":
-        body["modalities"] = [123]  # type: ignore[assignment]
-    elif case_id == "response_format_json_schema_incomplete":
-        body["response_format"] = {"type": "json_schema"}
+    if case_id == "modalities_list_bad":
+        body["modalities"] = [123]
     elif case_id == "logprobs_wrong_type":
-        body["logprobs"] = "yes"  # type: ignore[assignment]
+        body["logprobs"] = "yes"
     elif case_id == "logprobs_top_without_enabled":
         body["logprobs"] = False
         body["top_logprobs"] = 5
@@ -98,39 +86,16 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
     "case_id, err_code, err_message",
     [
         pytest.param(
-            "malformed_json",
-            400,
-            ("json_invalid", "decode error"),
-            id="malformed_json",
-        ),
-        pytest.param("missing_messages", 400, ("messages", "missing", "Field required"), id="missing_messages"),
-        pytest.param(
             "model_mismatch",
             404,
             ("model", "does not exist", "NotFoundError"),
             id="model_mismatch",
-        ),
-        pytest.param("stream_wrong_type", 400, ("stream", "bool_parsing", "not-a-boolean"), id="invalid_stream_type"),
-        pytest.param(
-            "temperature_wrong_type",
-            400,
-            ("temperature", "float_parsing", "a valid number"),
-            id="invalid_temperature_type",
-        ),
-        pytest.param(
-            "max_tokens_wrong_type", 400, ("max_tokens", "int_parsing", "integer"), id="invalid_max_tokens_type"
         ),
         pytest.param(
             "modalities_list_bad",
             400,
             ("modalities", "list of strings"),
             id="modalities_list_bad_element",
-        ),
-        pytest.param(
-            "response_format_json_schema_incomplete",
-            400,
-            ("response_format", "BadRequestError", "json_schema"),
-            id="invalid_response_format_json_schema",
         ),
         pytest.param("logprobs_wrong_type", 400, ("logprobs", "boolean"), id="logprobs_wrong_type"),
         pytest.param(

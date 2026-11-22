@@ -7,6 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
@@ -1121,7 +1122,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Keep OMNI compatibility args wired while delegating rendering
         # to the upstream async renderer pipeline.
-        default_template_kwargs = merge_kwargs(
+        resolved_template_kwargs = merge_kwargs(
             default_template_kwargs,
             dict(
                 tools=tool_dicts,
@@ -1132,17 +1133,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenize=isinstance(renderer.tokenizer, MistralTokenizer),
             ),
         )
-
         tok_params = request.build_tok_params(self.model_config)
         mm_config = self.model_config.multimodal_config
         chat_params = request.build_chat_params(
             default_template,
             default_template_content_format,
         ).with_defaults(
-            default_template_kwargs,
+            resolved_template_kwargs,
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
+        # HF templates such as MiMo-Audio's use output modalities to select
+        # model task tokens. Apply this server-owned value after request-level
+        # chat_template_kwargs so clients cannot select a task that disagrees
+        # with the public request. Mistral's renderer does not accept arbitrary
+        # template variables.
+        if not isinstance(renderer.tokenizer, MistralTokenizer):
+            chat_params = replace(
+                chat_params,
+                chat_template_kwargs={
+                    **chat_params.chat_template_kwargs,
+                    "vllm_omni_output_modalities": getattr(request, "modalities", None),
+                },
+            )
 
         deferred_multi_modal_data: dict[str, Any] | None = None
         if entry_stage_id == 0 and self._needs_multistage_multimodal_split():

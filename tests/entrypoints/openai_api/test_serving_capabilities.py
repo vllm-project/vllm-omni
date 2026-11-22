@@ -22,11 +22,12 @@ from starlette.datastructures import State
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability, shutdown_unsupported_routes
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, StageConfig, StageType
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.engine.duplex.config import DuplexCapabilities
-from vllm_omni.engine.omni_engine_base import OmniEngineBase
+from vllm_omni.engine.omni_engine_base import OmniEngineBase, _derive_supported_tasks
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
@@ -68,6 +69,7 @@ def _engine(declaration=None):
     client._sleeping_tags = set()
     client.engine = object.__new__(OmniEngineBase)
     client.engine.stage_clients = []
+    client.engine.supported_tasks = ("generate", "x2i", "x2v", "speech", "audio_generate")
     client.engine._diffusion_od_config_view = SimpleNamespace()
     client.engine.stage_configs = [
         StageConfig(stage_id=7, model_stage="encode", stage_type=StageType.LLM).to_omegaconf(),
@@ -93,6 +95,7 @@ def _app(client, *, count=1, restricted=(), missing_chat=False, duplex=False):
     app = FastAPI()
     app.include_router(api_server.router)
     app.state.engine_client = client
+    app.state.supported_tasks = frozenset(client.engine.supported_tasks)
     app.state.stage_configs = client.stage_configs
     app.state.api_server_count = count
     app.state.openai_serving_models = _DiffusionServingModels(
@@ -167,6 +170,38 @@ async def test_execution_observer_cancellation_propagates():
     engine.generate.assert_not_called()
     engine.wake_up.assert_not_called()
     engine.check_health.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tasks,exposure",
+    [
+        (frozenset({"x2i"}), "enabled"),
+        (frozenset({"speech"}), "disabled"),
+        (frozenset(), "disabled"),
+        (None, "unknown"),
+    ],
+)
+def test_image_routes_follow_initialized_task_gate(tasks, exposure):
+    engine = _engine()
+    engine.engine.stage_configs = [
+        StageConfig(0, "diffusion", stage_type=StageType.DIFFUSION, final_output=True, final_output_type="image")
+    ]
+    app = _app(engine)
+    app.state.supported_tasks = tasks
+    app.state.omni_serving_capabilities = OmniServingCapabilities(app, engine)
+    with TestClient(app) as client:
+        routes = _routes(client.get("/v1/omni/capabilities").json())
+        for path in ("/v1/images/generations", "/v1/images/edits"):
+            assert routes[("http", "POST", path)] == exposure
+            if exposure == "disabled":
+                response = (
+                    client.post(path, json={"prompt": "draw"})
+                    if path.endswith("/generations")
+                    else client.post(path, data={"prompt": "edit"})
+                )
+                assert response.status_code == 503
+                assert response.json()["detail"] == "The model does not support image generation"
+    engine.generate.assert_not_called()
 
 
 def test_image_edit_route_requires_its_actual_diffusion_stage_guard():
@@ -486,7 +521,8 @@ async def test_missing_handlers_match_actual_http_rejection(monkeypatch, tmp_pat
             assert response.status_code == 404, response.text
             assert message in response.text
     finally:
-        app.state.openai_serving_video.shutdown()
+        if app.state.openai_serving_video is not None:
+            app.state.openai_serving_video.shutdown()
     engine.generate.assert_not_called()
 
 
@@ -531,19 +567,14 @@ async def build_initialized_test_app(
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
     engine.config_path = None
     engine.input_processor = None
-    engine.engine.stage_configs = [
-        StageConfig(
-            0,
-            "diffusion",
-            stage_type=StageType.DIFFUSION,
-            final_output=True,
-            final_output_type=metadata.final_output_type or "image",
-        ).to_omegaconf()
-    ]
+    engine.engine.stage_configs = StageConfigFactory.create_typed_default_diffusion(
+        "local-checkpoint", {"model_class_name": architecture}
+    ).stage_configs
+    engine.engine.supported_tasks = _derive_supported_tasks(engine.stage_configs)
     engine.engine.stage_vllm_configs = [None]
     engine.engine.stage_clients = []
-    # No backend was started. This is the already-initialized device-config
-    # boundary; model/config resolution itself is never invoked by this test.
+    # Only the typed topology is resolved above; engine workers and checkpoint
+    # loading remain outside this initialized-device boundary.
     monkeypatch.setattr(engine, "get_diffusion_od_config", lambda: None)
     args = api_server.make_arg_parser(FlexibleArgumentParser()).parse_args([])
     args.model = "local-engine-fixture"
@@ -552,7 +583,7 @@ async def build_initialized_test_app(
         args.api_key = [api_key]
     if allowed_origins is not None:
         args.allowed_origins = allowed_origins
-    app = api_server.build_openai_app(args, ("generate",))
+    app = api_server.build_openai_app(args, engine.engine.supported_tasks)
     for path, method in (
         ("/v1/chat/completions", "POST"),
         ("/v1/chat/completions/batch", "POST"),
@@ -570,7 +601,6 @@ async def build_initialized_test_app(
 
 
 async def build_video_capability_test_app(monkeypatch, tmp_path, architecture, task_type=None, multistage=False):
-    from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.config.omni_config import VllmOmniConfig
     from vllm_omni.config.stage_config import DeployConfig
     from vllm_omni.diffusion.capability_resolvers import resolve_minimax_h3_capabilities
@@ -721,7 +751,8 @@ async def test_real_upstream_app_and_omni_handler_initialization(monkeypatch, tm
             assert operation["support"] == "supported" and operation["exposure"] == "enabled"
             assert [model["id"] for model in body["models"]] == ["public-primary", "public-alias"]
     finally:
-        app.state.openai_serving_video.shutdown()
+        if app.state.openai_serving_video is not None:
+            app.state.openai_serving_video.shutdown()
         # The diffusion speech factory owns no TTS executor; its speaker
         # registry is isolated under tmp_path by SPEAKER_SAMPLES_DIR above.
     engine.generate.assert_not_called()
@@ -758,7 +789,8 @@ async def test_real_app_authentication_and_cors_protect_discovery(monkeypatch, t
             assert response.headers["access-control-allow-origin"] == "https://director.example"
             observer.assert_awaited_once()
     finally:
-        app.state.openai_serving_video.shutdown()
+        if app.state.openai_serving_video is not None:
+            app.state.openai_serving_video.shutdown()
     engine.generate.assert_not_called()
     engine.wake_up.assert_not_called()
     engine.check_health.assert_not_called()

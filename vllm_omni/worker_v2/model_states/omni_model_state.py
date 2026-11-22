@@ -17,7 +17,7 @@ import inspect
 import threading
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 import numpy as np
@@ -26,8 +26,9 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -95,6 +96,20 @@ def _make_safe_get_rope(orig_get_rope):
     return _safe_get_rope
 
 
+@dataclass
+class RequestLifecycleUpdate:
+    """Runner transitions before admitting the step's new requests.
+
+    Reset clears both model-owned state and the native slot, allowing the same
+    ID to enter a new phase. Release only frees the native slot; model-owned
+    work remains alive until the scheduler reports a real finish or abort.
+    Neither transition completes the scheduler's request.
+    """
+
+    reset_req_ids: set[str] = field(default_factory=set)
+    release_req_ids: set[str] = field(default_factory=set)
+
+
 class OmniModelState(DefaultModelState):
     """Generic Omni ``ModelState`` — works for **all** Omni model stages.
 
@@ -106,6 +121,21 @@ class OmniModelState(DefaultModelState):
     _has_mtp = False
     preprocess_keeps_mm_inputs = False
     _supports_prefill_token_mask = False
+
+    def get_request_lifecycle(self, scheduler_output: SchedulerOutput) -> RequestLifecycleUpdate | None:
+        """Translate model-specific scheduling metadata without accessing the runner."""
+        return None
+
+    def finalize_runner_output(
+        self, output: ModelRunnerOutput | AsyncModelRunnerOutput, *, idle: bool
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Finalize one AR step on the worker thread, including no-forward steps.
+
+        Called in inference mode after sampling or on a no-forward return,
+        never during dummy execution. Implementations may publish work that outlives
+        native slots. Preserve deferred output unless synchronization is needed.
+        """
+        return output
 
     def __init__(
         self,
@@ -247,8 +277,8 @@ class OmniModelState(DefaultModelState):
         """Adapt existing V1 hooks once, outside the per-step hot path.
 
         Keep the V2 hook precedence for models with an optimized implementation.
-        Both hooks return the same five values; only the embedding argument is
-        optional in the original contract. Errors inside a hook propagate.
+        Both hooks share the return contract; only the embedding argument is
+        optional in the original one. Errors inside a hook propagate.
         """
         hook = getattr(model, "preprocess_decode_batch_mrv2", None)
         if not callable(hook):
@@ -809,20 +839,31 @@ class OmniModelState(DefaultModelState):
                 batch_ids = input_ids.index_select(0, batch_offsets)
                 batch_embeds = embeds.index_select(0, batch_offsets)
 
-            new_ids, new_embeds, batch_hidden, batch_text_step, updates_by_req = batch_decode_preprocess(
+            result = batch_decode_preprocess(
                 input_ids=batch_ids,
                 input_embeds=batch_embeds,
                 req_infos=[entry[4] for entry in decode_entries],
             )
+            # preprocess_phase_contract.md: hooks return five values with
+            # talker_mtp and (input_ids, inputs_embeds, updates) without it.
+            batch_text_step: torch.Tensor | None = None
+            if len(result) == 5:
+                new_ids, new_embeds, batch_hidden, batch_text_step, updates_by_req = result
+                if batch_hidden.shape[0] != batch_size or batch_text_step.shape[0] != batch_size:
+                    raise RuntimeError(
+                        "Batched Omni preprocess changed the request axis: "
+                        f"expected={batch_size} hidden={batch_hidden.shape[0]} "
+                        f"text_step={batch_text_step.shape[0]}"
+                    )
+            elif len(result) == 3 and not self._has_mtp:
+                new_ids, new_embeds, updates_by_req = result
+            else:
+                expected = "five values" if self._has_mtp else "three or five values"
+                raise RuntimeError(f"Batched Omni preprocess must return {expected}, got {len(result)}")
             if len(updates_by_req) != batch_size:
                 raise RuntimeError(
                     "Batched Omni preprocess returned the wrong update count: "
                     f"expected={batch_size} actual={len(updates_by_req)}"
-                )
-            if batch_hidden.shape[0] != batch_size or batch_text_step.shape[0] != batch_size:
-                raise RuntimeError(
-                    "Batched Omni preprocess changed the request axis: "
-                    f"expected={batch_size} hidden={batch_hidden.shape[0]} text_step={batch_text_step.shape[0]}"
                 )
 
             if self._preprocess_result_needs_writeback(batch_ids, new_ids):
@@ -848,7 +889,7 @@ class OmniModelState(DefaultModelState):
                     decode_mtp_rows.append((i, start))
                 batched_indices.add(i)
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
-            if self._has_mtp:
+            if batch_text_step is not None and self._has_mtp:
                 text_step_batches.append(batch_text_step.reshape(batch_size, -1))
 
         for i, req_idx, start, n_tok, info, _is_prefill in preprocess_entries:

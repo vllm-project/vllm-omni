@@ -462,10 +462,16 @@ class TTSModelAdapter(ABC):
     def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
         """Fold engine-side metadata from the mm payload into ``collect``.
 
-        Non-streaming only. The orchestrator surfaces select ``collect``
-        entries as response headers (precedent: ``word_timestamps`` ->
-        ``X-Word-Timestamps``, ``audio_truncated`` -> ``X-Audio-Truncated``);
-        adapters opt in by setting the keys it knows. Default: no-op.
+        Called for the final non-streaming audio output and for each
+        audio-bearing streaming output, including partial or empty audio.
+        When the caller omits its metadata collector, serving supplies a
+        temporary dictionary for each call; adapters must not assume that
+        ``collect`` persists across streaming outputs.
+
+        Set ``audio_synthesis_error=True`` to reject a failed synthesis.
+        Serving also surfaces selected entries as non-streaming response
+        headers, such as ``audio_truncated`` -> ``X-Audio-Truncated``.
+        Default: no-op.
         """
 
     async def warmup(self) -> None:

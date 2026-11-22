@@ -36,6 +36,7 @@ MING_TTS_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="llm",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             hf_config_name="llm_config",
@@ -48,11 +49,15 @@ MING_TTS_PIPELINE = PipelineConfig(
                 "max_tokens": 512,
                 "detokenize": True,
             },
+            # Decode feeds flow-head embeddings and latent history that are not in
+            # the token stream; a recompute would restart the audio at frame 0.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
             model_stage="audio_vae",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

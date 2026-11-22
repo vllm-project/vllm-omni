@@ -14,7 +14,7 @@ from vllm_omni.serving_capabilities import (
 # π0.5 is one diffusion stage (robot observation -> action chunk via flow
 # matching). It is registered in ``OMNI_PIPELINES`` because π0.5 is online-served
 # via ``vllm serve --deploy-config pi05.yaml``. Keep this topology outside the
-# ``pi05`` package: importing a package submodule executes ``pi05.__init__``,
+# ``pi.pi05`` package: importing a package submodule executes ``pi05.__init__``,
 # which imports the runtime pipeline and ``diffusion.data``.
 PI05_PIPELINE = PipelineConfig(
     serving_capabilities=declare_capabilities(
