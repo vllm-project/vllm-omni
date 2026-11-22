@@ -3334,9 +3334,10 @@ class TestPlatformOverrides:
         """The only stochastic Qwen3-Omni stage must stay reproducible.
 
         Dropping this seed (as #4986 did) leaves the talker sampling codec
-        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
-        nightly failures in #6090. Pin it so a cleanup cannot remove it again
-        without failing here.
+        tokens unseeded at temperature 0.9, including both codebook 0 and the
+        residual codebooks. That reopened the audio-vs-text nightly failures
+        in #6090. Pin it so a cleanup cannot remove it again without failing
+        here.
         """
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
