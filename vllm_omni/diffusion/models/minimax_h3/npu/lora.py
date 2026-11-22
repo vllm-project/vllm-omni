@@ -355,6 +355,7 @@ def load_minimax_h3_native_distilled_lora(
     lora_path: str | Path,
     dtype: torch.dtype,
     unsupported_offload_mode: str | None = None,
+    lora_application: str = "runtime",
 ) -> tuple[LoRAModel, PEFTHelper, NativeDistilledLoRASpec] | None:
     """Load a native-layout MiniMax-H3 distilled LoRA through the legacy manager."""
 
@@ -369,6 +370,11 @@ def load_minimax_h3_native_distilled_lora(
                     f"MiniMax-H3 native LoRA requires safetensors metadata key_format={_NATIVE_KEY_FORMAT!r}"
                 )
             return None
+        if lora_application == "merged":
+            raise ValueError(
+                "MiniMax-H3 native distilled LoRA requires --lora-application runtime; "
+                "merged application cannot enforce the adapter's sampling contract"
+            )
         version = metadata.get("native_format_version")
         if version is None:
             if lora_file.name != _NATIVE_FILENAME:

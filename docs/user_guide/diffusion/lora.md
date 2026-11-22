@@ -382,10 +382,22 @@ MiniMax-H3 supports the following few-step mechanisms:
   derives the total step count from the request before the adapter schedule is
   known.
 
+FlashGen native adapters require `--lora-application runtime` (the default).
+The loader rejects `merged` application before reading adapter tensors,
+because a globally merged policy does not select the adapter-declared schedule
+or validate its request contract. Native adapters cannot be stacked with other
+active adapters, including cold-loaded sources that are used transiently
+for composition without entering the adapter cache.
+
+Native v2 FL2VA/Ref2VA exports require request `scale=1.0`, `flow_shift=12`
+and `audio_flow_shift=3`. A zero scale disables the adapter and its sampling
+constraints. See the [MiniMax-H3 recipe](../../../recipes/MiniMaxAI/MiniMax-H3.md#flashgen-native-lora)
+for base partitions and the validated conditioning scope.
+
 Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
 `qkv_proj` LoRA rows with the same `_reorder_grouped_qkv_to_qkv` helper used for
-base-weight loading, then binds the packed Q/K/V slices through the legacy PEFT
-manager without modifying `DiffusionLoRAManager`.
+base-weight loading, then binds the packed Q/K/V slices through the PEFT
+manager.
 
 Both runtime adapters run with distributed layerwise offload in request-mode
 generation, where the manager keeps the LoRA A/B buffers resident on the compute

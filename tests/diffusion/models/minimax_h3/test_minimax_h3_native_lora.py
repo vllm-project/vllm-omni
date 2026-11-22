@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -18,6 +19,7 @@ from vllm_omni.diffusion.models.minimax_h3.npu import lora as lora_module
 from vllm_omni.diffusion.models.minimax_h3.npu.lora import load_minimax_h3_native_distilled_lora
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -171,6 +173,164 @@ def _v2_metadata(task: str) -> dict[str, str]:
         "video_shift": "12",
         "audio_shift": "3",
     }
+
+
+def _native_pipeline(*, application="runtime", partition="fl2va"):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = OmniDiffusionConfig(lora_backend="peft", lora_application=application)
+    pipeline.partition = partition
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+    pipeline.transformer = torch.nn.Module()
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline._turbo_lora_specs = {}
+    pipeline._native_lora_specs = {}
+    return pipeline
+
+
+@pytest.mark.cpu
+def test_native_v2_fl2va_loads_on_combined_partition(tmp_path):
+    pipeline = _native_pipeline(partition="combined")
+    metadata = _v2_metadata("fl2va")
+    spec = lora_module._parse_native_v2(metadata, "combined")
+    path = tmp_path / "fl2va.safetensors"
+    _write_tiny_native(path, metadata=metadata, spec=spec)
+    request = _request(path)
+
+    assert (
+        pipeline._load_diffusion_lora_adapter(lora_request=request, lora_path=tmp_path, dtype=torch.float32) is not None
+    )
+    sampling = OmniDiffusionSamplingParams(lora_request=request, num_inference_steps=4)
+    pipeline._validate_native_sampling(sampling, task="fl2va")
+    parsed = pipeline._native_lora_specs[request.lora_int_id]
+    assert pipeline._resolve_task("fl2va", {}, turbo_spec=None, native_spec=parsed) == "fl2va"
+    with pytest.raises(OmniClientError, match="active adapter requires task='fl2va', got task='ref2va'"):
+        pipeline._validate_native_sampling(sampling, task="ref2va")
+    with pytest.raises(OmniClientError, match="active adapter requires task='fl2va', got task='ref2va'"):
+        pipeline._resolve_task("ref2va", {}, turbo_spec=None, native_spec=parsed)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
+@pytest.mark.parametrize("directory", [False, True])
+def test_native_merged_rejected_before_reading_tensors(tmp_path, monkeypatch, task, directory):
+    pipeline = _native_pipeline(application="merged", partition="ref2va" if task == "ref2va" else "fl2va")
+    path = tmp_path / lora_module._NATIVE_FILENAME
+    metadata = (
+        {
+            "key_format": "minimax-h3-native",
+            "qkv_layout": "grouped",
+            "lora_rank": str(_TINY_RANK),
+            "lora_alpha": str(_TINY_RANK),
+            "base_schedule": "1,0.7,0.4,0.15,0",
+            "tasks": "t2va",
+        }
+        if task == "t2va"
+        else _v2_metadata(task)
+    )
+    # Only metadata is needed to reject merged deployment, even without weights.
+    save_file({}, str(path), metadata=metadata)
+    monkeypatch.setattr(lora_module, "MaxLoRARanks", Literal[4, 128, 512])
+    validate_tensors = Mock(side_effect=AssertionError("merged deployment must fail before reading tensors"))
+    monkeypatch.setattr(lora_module, "_validate_native_tensors", validate_tensors)
+
+    with pytest.raises(ValueError, match="--lora-application runtime"):
+        pipeline._load_diffusion_lora_adapter(
+            lora_request=_request(path), lora_path=tmp_path if directory else path, dtype=torch.float32
+        )
+    validate_tensors.assert_not_called()
+    assert not pipeline._native_lora_specs
+
+
+@pytest.mark.cpu
+def test_native_merged_guard_allows_peft_fallback(tmp_path):
+    path = tmp_path / "adapter_model.safetensors"
+    save_file({}, str(path), metadata={"format": "pt"})
+    assert (
+        load_minimax_h3_native_distilled_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+            lora_application="merged",
+        )
+        is None
+    )
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("native_first", [False, True])
+def test_native_stack_rejected_before_composition(tmp_path, monkeypatch, cached, native_first):
+    from vllm.lora.lora_model import LoRAModel
+
+    pipeline = _native_pipeline()
+    path = tmp_path / "fl2va.safetensors"
+    metadata = _v2_metadata("fl2va")
+    _write_tiny_native(path, metadata=metadata, spec=lora_module._parse_native_v2(metadata, "fl2va"))
+    native = _request(path)
+    peft = LoRARequest("peft", 8, str(tmp_path / "peft"))
+    manager = DiffusionLoRAManager(pipeline=pipeline, device=torch.device("cpu"), dtype=torch.float32)
+
+    def load_source(request):
+        if request.lora_int_id == native.lora_int_id:
+            return pipeline._load_diffusion_lora_adapter(lora_request=request, lora_path=path, dtype=torch.float32)
+        # Loading another source prunes the transient native ID in the old path.
+        pipeline._prune_native_lora_specs()
+        return LoRAModel(lora_model_id=peft.lora_int_id, rank=_TINY_RANK, loras={}), None
+
+    if cached:
+        native_model, _ = load_source(native)
+        manager._registered_adapters[native.lora_int_id] = native_model
+        manager._touch_adapter_info(native.lora_int_id)
+    monkeypatch.setattr(manager, "_load_adapter", load_source)
+    compose = Mock(side_effect=AssertionError("native adapters must be rejected before composition"))
+    activate = Mock()
+    monkeypatch.setattr(manager, "_compose_lora_models", compose)
+    monkeypatch.setattr(manager, "_activate_adapter", activate)
+    requests = [native, peft] if native_first else [peft, native]
+
+    with pytest.raises(OmniClientError, match="native distilled LoRA cannot be composed"):
+        manager.set_active_adapters(requests, [1.0, 1.0])
+    compose.assert_not_called()
+    activate.assert_not_called()
+    assert not manager._composed_adapters
+    assert set(manager.list_adapters()) == ({native.lora_int_id} if cached else set())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("scale", [0.5, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("as_list", [False, True])
+def test_native_v2_requires_unit_request_scale(scale, as_list):
+    pipeline = _native_pipeline()
+    request = _request("fl2va")
+    pipeline._native_lora_specs = {request.lora_int_id: lora_module._parse_native_v2(_v2_metadata("fl2va"), "fl2va")}
+    sampling = OmniDiffusionSamplingParams(
+        lora_request=[request] if as_list else request,
+        lora_scale=[scale] if as_list else scale,
+        num_inference_steps=None,
+    )
+    with pytest.raises(OmniClientError, match="requires lora_scale=1"):
+        pipeline._validate_native_sampling(sampling, task="fl2va")
+
+
+@pytest.mark.cpu
+def test_native_scale_validation_preserves_disabled_adapters_and_v1():
+    pipeline = _native_pipeline()
+    request = _request("fl2va")
+    pipeline._native_lora_specs = {request.lora_int_id: lora_module._parse_native_v2(_v2_metadata("fl2va"), "fl2va")}
+    sampling = OmniDiffusionSamplingParams(lora_request=[request], lora_scale=[0.0], num_inference_steps=50)
+    pipeline._validate_native_sampling(sampling, task="ref2va")
+    pipeline._native_lora_specs[request.lora_int_id] = lora_module.NativeDistilledLoRASpec(
+        DMD2SigmaSchedule.from_positions([1, 0.7, 0.4, 0.15, 0])
+    )
+    sampling.lora_scale = [0.5]
+    sampling.num_inference_steps = 4
+    pipeline._validate_native_sampling(sampling, task="t2va")
 
 
 @pytest.mark.cpu
@@ -1051,90 +1211,23 @@ def test_native_lora_delta_matches_between_cpu_and_cuda(tmp_path):
     assert checked == _EXPECTED_NATIVE_SLICE_PAIRS
 
 
-def _native_hook_pipeline(lora_application: str = "runtime"):
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    torch.nn.Module.__init__(pipeline)
-    pipeline.partition = "fl2va"
-    pipeline.od_config = SimpleNamespace(
-        step_execution=False,
-        enable_cpu_offload=False,
-        enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=False,
-        lora_application=lora_application,
-    )
-    pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_specs = {}
-    return pipeline
-
-
 @pytest.mark.cpu
-def test_native_lora_composition_rejected_on_cold_load(monkeypatch, tmp_path):
-    """A cold FlashGen + PEFT stack registers only its composed ID; the guard must still fire."""
+def test_native_lora_reused_id_clears_classification(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
 
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
     native = _request(path)
-    peft = LoRARequest(lora_name="peft", lora_int_id=8, lora_path=str(tmp_path / "peft"))
-    composed_id = 999
-
-    class _Manager:
-        def list_adapters(self):
-            return [composed_id]
-
-    manager = _Manager()
-    pipeline = _native_hook_pipeline()
-    pipeline._bind_diffusion_lora_manager(manager)
-    # _register_composed_adapter loads each source transiently, without registering it.
+    pipeline = _native_pipeline()
     assert pipeline._load_diffusion_lora_adapter(lora_request=native, lora_path=path, dtype=torch.float32)
+    assert native.lora_int_id in pipeline._native_lora_specs
+
+    # Reloading the same ID as an ordinary adapter clears the native classification.
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", lambda **_: None)
-    pipeline.transformer = torch.nn.Module()
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_adapter", lambda **_: None)
-    pipeline._load_diffusion_lora_adapter(lora_request=peft, lora_path=peft.lora_path, dtype=torch.float32)
-
-    sampling = SimpleNamespace(lora_request=[native, peft], lora_scale=[1.0, 1.0])
-    with pytest.raises(OmniClientError, match="cannot be composed"):
-        pipeline._active_turbo_spec(sampling)
-
-    # Reloading the ID as an ordinary adapter clears the classification.
     pipeline._load_diffusion_lora_adapter(lora_request=native, lora_path=path, dtype=torch.float32)
+    assert native.lora_int_id not in pipeline._native_lora_specs
+    sampling = OmniDiffusionSamplingParams(lora_request=native)
     assert pipeline._active_turbo_spec(sampling) is None
-
-
-@pytest.mark.cpu
-def test_native_lora_rejects_merged_application(tmp_path):
-    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
-    _write_tiny_native(path)
-    pipeline = _native_hook_pipeline("merged")
-
-    with pytest.raises(ValueError, match="--lora-application runtime"):
-        pipeline._load_diffusion_lora_adapter(lora_request=_request(path), lora_path=path, dtype=torch.float32)
-    assert pipeline._native_lora_specs == {}
-
-
-@pytest.mark.cpu
-def test_native_v2_fl2va_loads_on_combined_and_rejects_ref2va(tmp_path):
-    spec = lora_module.NativeDistilledLoRASpec(
-        DMD2SigmaSchedule.from_positions([1, 0.7, 0.4, 0.15, 0]), task="fl2va", rank=_TINY_RANK, qkv_rank=_TINY_RANK
-    )
-    path = tmp_path / "published-fl2va.safetensors"
-    _write_tiny_native(path, metadata=_v2_metadata("fl2va"), spec=spec)
-    loaded = load_minimax_h3_native_distilled_lora(
-        partition="combined", lora_request=_request(path), lora_path=path, dtype=torch.float32
-    )
-    assert loaded is not None
-    parsed = loaded[2]
-    assert parsed.task == "fl2va"
-
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    torch.nn.Module.__init__(pipeline)
-    pipeline.partition = "combined"
-    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
-    pipeline._turbo_lora_specs = {}
-    with pytest.raises(OmniClientError, match="active adapter requires task='fl2va', got task='ref2va'"):
-        pipeline._resolve_task("ref2va", {}, turbo_spec=None, native_spec=parsed)
+    assert pipeline._active_native_spec(sampling) is None

@@ -1585,6 +1585,11 @@ evaluations.
 
 ### FlashGen native LoRA
 
+FlashGen native adapters require `--lora-application runtime` (the default).
+`--lora-application merged` is rejected during loading because the adapter's
+schedule and request validation require runtime activation. An active native
+adapter cannot be stacked with other adapters.
+
 The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
 declares its distilled sigma schedule in safetensors metadata. It is published on
 [ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
@@ -1649,7 +1654,18 @@ single first frame in `input_reference`. Set `task=fl2va` and
 server with `--task-type ref2va`; set `task=ref2va` and send the reference
 image in `input_reference`. Both services use `--lora-backend peft` and may
 preload the published file with `--lora-path`. Select it in the request with
-the usual `lora` field and `scale=1.0`.
+the usual `lora` field and `scale=1.0`. FL2VA exports also load on a
+`--task-type combined` server; requests using that adapter must still select
+`task=fl2va`.
+
+The [four-A5 conditioning validation](https://github.com/vllm-project/vllm-omni/pull/10596#discussion_r4623182377)
+also completed four-step FL2VA requests with a last frame, first and last
+frames, and `continue_from`. First/last output frames matched their input
+images with SSIM 0.982/0.979 in the tested two-frame case. Three keyframes
+and timeline guides were rejected by existing validation. Ref2VA requests
+with a video, image plus audio, and image plus video also completed with
+fully decodable video and audio. Reference audio/video adherence remains
+unverified; these results establish completion for the tested inputs.
 
 The artifact supplies a four-interval base sigma schedule. Omit `sampler`
 to use the H3 default Euler sampler. The adapter requires `flow_shift=12`
@@ -1662,8 +1678,10 @@ The runtime LoRA manager uses a shared buffer rank across wrapped layers. It
 rounds 384 up to the next supported rank, 512, so rank-128 projections reserve
 four times the LoRA buffer capacity they would need at rank 128. The actual
 per-device memory overhead depends on tensor parallelism and the backend.
-The loader applies the exported factors at unit scale before applying the
-request multiplier.
+The exported factors already carry their effective scale. An active v2
+adapter requires request `scale=1.0`; other nonzero scales are rejected.
+`scale=0` disables the adapter and its sampling constraints. Legacy T2VA v1
+request scaling is unchanged.
 
 ### FastH3 adapter
 

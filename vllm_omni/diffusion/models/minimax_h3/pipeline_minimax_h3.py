@@ -764,7 +764,6 @@ class MiniMaxH3Pipeline(
         # Reclaim evicted specs even when adapters are loaded without inference.
         self._prune_native_lora_specs()
         self._native_lora_specs.pop(lora_request.lora_int_id, None)
-        self._native_lora_id_set().discard(lora_request.lora_int_id)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
         if od_config is not None:
@@ -796,18 +795,11 @@ class MiniMaxH3Pipeline(
             lora_path=lora_path,
             dtype=dtype,
             unsupported_offload_mode=" or ".join(offload_modes) or None,
+            lora_application=getattr(od_config, "lora_application", "runtime"),
         )
         if native_loaded is not None:
-            if getattr(od_config, "lora_application", "runtime") == "merged":
-                # Merged policies run without a request LoRA, so the adapter's
-                # four-step schedule and task/shift checks would never apply.
-                raise ValueError(
-                    "MiniMax-H3 FlashGen native LoRA requires --lora-application runtime; "
-                    "merged mode would run the distilled weights on the base schedule"
-                )
             lora_model, peft_helper, spec = native_loaded
             self._native_lora_specs[lora_request.lora_int_id] = spec
-            self._native_lora_id_set().add(lora_request.lora_int_id)
             return lora_model, peft_helper
         return load_minimax_h3_native_adapter(
             transformer=self.transformer,
@@ -816,6 +808,12 @@ class MiniMaxH3Pipeline(
             dtype=dtype,
             unsupported_offload_mode=" or ".join(offload_modes) or None,
         )
+
+    def _validate_diffusion_lora_composition(self, *, lora_model: LoRAModel) -> None:
+        # Transient sources are not in the manager cache. Check each source
+        # immediately after loading, before another load can prune its spec.
+        if lora_model.id in self._native_lora_specs:
+            raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
 
     def _validate_diffusion_lora_binding(
         self,
@@ -855,12 +853,9 @@ class MiniMaxH3Pipeline(
         ]
         if len(specs) > 1:
             raise OmniClientError("MiniMax-H3 supports at most one Turbo adapter in a composition")
-        # Not the pruned spec table: a composed stack registers only its composed
-        # ID, so its sources' specs are pruned even though their deltas are active.
-        if len(adapters) > 1 and any(
-            request.lora_int_id in self._native_lora_id_set() or request.lora_int_id in self._native_lora_specs
-            for request, _ in adapters
-        ):
+        # Request-time fallback; the manager checks each source before composing.
+        self._prune_native_lora_specs()
+        if len(adapters) > 1 and any(request.lora_int_id in self._native_lora_specs for request, _ in adapters):
             raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
         return specs[0] if specs else None
 
@@ -868,16 +863,6 @@ class MiniMaxH3Pipeline(
         self._lora_manager_ref = weakref.ref(manager) if manager is not None else None
         if manager is None:
             self._native_lora_specs.clear()
-            self._native_lora_id_set().clear()
-
-    def _native_lora_id_set(self) -> set[int]:
-        """Every adapter ID last loaded as a native LoRA, including transient
-        composition sources the manager never registers. Never pruned; each
-        real load re-classifies its ID."""
-        ids = self.__dict__.get("_native_lora_ids")
-        if ids is None:
-            ids = self.__dict__["_native_lora_ids"] = set()
-        return ids
 
     def _prune_native_lora_specs(self) -> None:
         ref = getattr(self, "_lora_manager_ref", None)
@@ -902,6 +887,9 @@ class MiniMaxH3Pipeline(
                 f"MiniMax-H3 native LoRA task mismatch: active adapter requires task={spec.task!r}, got task={task!r}"
             )
         if spec.video_shift is not None and spec.audio_shift is not None:
+            for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale):
+                if self._native_lora_specs.get(request.lora_int_id) is spec and scale != 1.0:
+                    raise OmniClientError("MiniMax-H3 native LoRA v2 requires lora_scale=1.0")
             extra = sampling.extra_args or {}
             for key, expected, default in (
                 ("flow_shift", spec.video_shift, self.default_video_shift),
@@ -1090,7 +1078,6 @@ class MiniMaxH3Pipeline(
                 )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_specs: dict[int, NativeDistilledLoRASpec] = {}
-        self._native_lora_ids: set[int] = set()
         self._lora_manager_ref = None
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
