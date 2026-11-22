@@ -286,6 +286,14 @@ class DuplexSessionRunner:
         self._mailbox: asyncio.Queue[DuplexCommand | StageOutput | StageProgress | _RefusedInput | _Internal] = (
             asyncio.Queue()
         )
+        #: Mailbox items the worker has taken, and whether it is handling one.
+        self._taken = 0
+        self._handling = False
+        #: Stage metrics snapshots waiting to be folded, each tagged with the
+        #: number of mailbox items put before it; it folds once that many are
+        #: handled, as if it were a mailbox item, without a worker wakeup.
+        self._deferred_stage_metrics: deque[tuple[int, dict[str, dict[str, object]]]] = deque()
+        self._stage_metrics_fold_requested = False
         # Audio awaiting mailbox dispatch or offloaded decoding is real input
         # too, even before it reaches the PCM buffer. Continuations must not
         # insert a synthetic frame ahead of that already-received audio.
@@ -769,7 +777,31 @@ class DuplexSessionRunner:
         snapshot = self.model.stage_metrics_snapshot(stage_id, metrics, output)
         if snapshot is None or self.run.closing or self.session.state == DuplexSessionState.CLOSED:
             return
-        self._mailbox.put_nowait(_Internal("stage_metrics", {"stage_metrics": snapshot}))
+        # Ordered with the mailbox as if it were an item put now (see
+        # _deferred_stage_metrics), but without waking the worker for it.
+        tag = self._taken + self._mailbox.qsize()
+        self._deferred_stage_metrics.append((tag, snapshot))
+        if tag == self._taken and not self._handling and not self._stage_metrics_fold_requested:
+            # The worker is idle: nothing else will reach this snapshot's turn.
+            self._stage_metrics_fold_requested = True
+            asyncio.get_running_loop().call_soon(self._fold_idle_stage_metrics)
+
+    def _fold_idle_stage_metrics(self) -> None:
+        self._stage_metrics_fold_requested = False
+        if self._worker_stopped or self._handling:
+            return
+        self._fold_deferred_stage_metrics()
+
+    def _fold_deferred_stage_metrics(self) -> None:
+        """Fold every snapshot put before the mailbox item the worker takes next."""
+        deferred = self._deferred_stage_metrics
+        while deferred and deferred[0][0] <= self._taken:
+            _, snapshot = deferred.popleft()
+            try:
+                self.session.stash_stage_metrics(snapshot)
+            except Exception as exc:
+                logger.exception("Duplex session %s failed folding stage metrics: %s", self.session.session_id, exc)
+                self._emit_error("internal_error", str(exc))
 
     def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
         """A stage rejected this session's request: fail the owning response.
@@ -941,7 +973,13 @@ class DuplexSessionRunner:
 
     async def _run(self) -> None:
         while not self._worker_stopped:
+            # Snapshots stashed while the previous item ran, then (after the
+            # wait) those stashed while the worker was parked.
+            self._fold_deferred_stage_metrics()
             item = await self._mailbox.get()
+            self._fold_deferred_stage_metrics()
+            self._taken += 1
+            self._handling = True
             try:
                 await self._handle_item(item)
                 if isinstance(item, (DuplexCommand, StageOutput)):
@@ -951,6 +989,7 @@ class DuplexSessionRunner:
             except Exception as exc:
                 self._report_handler_failure(item, exc)
             finally:
+                self._handling = False
                 if isinstance(item, AppendAudio | AppendText):
                     self._pending_input_appends -= 1
                     if self._pending_input_appends == 0 and self._deferred_silence is not None:
@@ -1067,11 +1106,6 @@ class DuplexSessionRunner:
             self._on_input_clock_expire()
             return
         if self.memory.handle_event(item.kind, item.payload):
-            return
-        if item.kind == "stage_metrics":
-            stage_metrics = item.payload.get("stage_metrics")
-            if isinstance(stage_metrics, Mapping):
-                self.session.stash_stage_metrics(stage_metrics)
             return
         if item.kind == "promote_deferred_overlap":
             if self.run.closing or self.session.state != DuplexSessionState.OPEN:

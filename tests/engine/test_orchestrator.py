@@ -57,6 +57,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     StreamingSegmentState,
     _build_terminal_empty_output,
+    build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.orchestrator_monitor import OrchestratorMonitorBase
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
@@ -5503,3 +5504,38 @@ async def test_stage_pool_counts_cumulative_audio_across_parallel_samples() -> N
     assert metrics.audio_generated_frames == metrics.output_unit_count == 250
     assert metrics.audio_sample_rate == 24000
     assert metrics.audio_duration_s == pytest.approx(250 / 24000)
+
+
+def test_build_engine_core_request_from_tokens_preserves_caller_params() -> None:
+    params = SamplingParams(max_tokens=10, min_tokens=2, temperature=0.7)
+    model_config = SimpleNamespace(max_model_len=100)
+    prompt = {"prompt_token_ids": [1, 2, 3]}
+
+    req1 = build_engine_core_request_from_tokens("req-1", prompt, params, model_config=model_config)
+    req2 = build_engine_core_request_from_tokens("req-2", prompt, params, model_config=model_config)
+
+    # When no clamping is required, params can be aliased and remain unmutated.
+    assert req1.sampling_params is params
+    assert req2.sampling_params is params
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+    assert params.temperature == 0.7
+
+    # Clamping min_tokens creates a clone and does not mutate caller's params.
+    tight_config = SimpleNamespace(max_model_len=4)
+    req3 = build_engine_core_request_from_tokens("req-3", prompt, params, model_config=tight_config)
+    assert req3.sampling_params is not params
+    assert req3.sampling_params.max_tokens == 10
+    assert req3.sampling_params.min_tokens == 1
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+
+    # Defaulting max_tokens=None also clones and leaves caller's params untouched.
+    unbounded = SamplingParams(min_tokens=0, temperature=0.7)
+    unbounded.max_tokens = None
+    req4 = build_engine_core_request_from_tokens(
+        "req-4", prompt, unbounded, model_config=SimpleNamespace(max_model_len=5)
+    )
+    assert req4.sampling_params is not unbounded
+    assert req4.sampling_params.max_tokens == 2
+    assert unbounded.max_tokens is None

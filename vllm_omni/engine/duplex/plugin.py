@@ -548,6 +548,9 @@ class DuplexModelPlugin(ABC):
         return None
 
     projects_intermediate_outputs: bool = False
+    #: False when ``plan_append`` ignores its ``session_config`` (which carries a
+    #: copy of the conversation): appends then skip it and ``prepare_prompt_config``.
+    plans_from_session_config: bool = True
     supports_auxiliary_requests: bool = False
     #: Whether sessions of this model may set ``extra_body.clock == "input"``;
     #: otherwise such a session is refused (``input_clock_unsupported``).

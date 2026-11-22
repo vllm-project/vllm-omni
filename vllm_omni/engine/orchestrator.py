@@ -197,7 +197,16 @@ def build_engine_core_request_from_tokens(
     resumable: bool = False,
     mm_features: list | None = None,
 ) -> OmniEngineCoreRequest:
-    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
+    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt.
+
+    Note:
+        When ``params`` is a ``SamplingParams`` and requires no adjustment
+        (e.g., max_tokens / min_tokens clamping against the remaining context
+        window), ``request.sampling_params`` may alias the caller's ``params``
+        object rather than a deep copy. Downstream stage communication
+        msgspec-encodes the request before its first await, and callers must
+        not mutate ``request.sampling_params`` in-place.
+    """
     if arrival_time is None:
         arrival_time = _time.time()
 
@@ -214,11 +223,15 @@ def build_engine_core_request_from_tokens(
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
-        sampling_params = params.clone()
+        # Clone (a deep copy, built per appended chunk) only to adjust a field;
+        # the request is serialized to the stage and nothing mutates its params.
+        sampling_params = params
         if model_config is not None:
             remaining = model_config.max_model_len - length_from_prompt_token_ids_or_embeds(
                 prompt_token_ids, prompt_embeds
             )
+            if params.max_tokens is None or params.min_tokens > remaining:
+                sampling_params = params.clone()
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
