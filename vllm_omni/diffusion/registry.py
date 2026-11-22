@@ -270,12 +270,12 @@ _DIFFUSION_MODELS = {
         "Gr00tN1d7Pipeline",
     ),
     "Pi0Pipeline": (
-        "pi0",
+        "pi.pi0",
         "pipeline_pi0",
         "Pi0Pipeline",
     ),
     "Pi05Pipeline": (
-        "pi05",
+        "pi.pi05",
         "pipeline_pi05",
         "Pi05Pipeline",
     ),
@@ -434,6 +434,11 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
     ),
+    "Cosmos3MultiviewPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3_multiview",
+        "Cosmos3MultiviewPipeline",
+    ),
     "Cosmos3NanoSimBimanualPipeline": (
         "cosmos3_nano_sim_bimanual",
         "pipeline_cosmos3_nano_sim_bimanual",
@@ -571,6 +576,8 @@ _NO_CACHE_ACCELERATION = {
     "Sam3Model",
     "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
+    # Cache-DiT has not been validated with the model-local FlexAttention mask.
+    "Cosmos3MultiviewPipeline",
     "Cosmos3NanoSimBimanualPipeline",
     "Cosmos3NanoSimTransferPipeline",
     "TaoMateH3Pipeline",
@@ -857,6 +864,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_post_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_post_process_func",
     "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
@@ -877,6 +885,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_ir_op_priority_func",
 }
@@ -916,6 +925,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_pre_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_pre_process_func",
     "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",

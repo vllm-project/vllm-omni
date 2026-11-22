@@ -172,9 +172,11 @@ class FakeInlineOmni:
     def __init__(self) -> None:
         self.opened: list[dict[str, object]] = []
         self.handles: list[FakeInlineHandle] = []
+        self.open_timeouts: list[float | None] = []
 
-    async def open_session(self, config: dict[str, object]) -> FakeInlineHandle:
+    async def open_session(self, config: dict[str, object], *, timeout: float | None = None) -> FakeInlineHandle:
         self.opened.append(dict(config))
+        self.open_timeouts.append(timeout)
         handle = FakeInlineHandle(SESSION_ID)
         self.handles.append(handle)
         handle.deliver(
@@ -214,8 +216,8 @@ def _inline_rig(*, handshake: dict[str, object] | None = SESSION_CREATED) -> Rig
     client, omni = make_inline_client()
     original_open = omni.open_session
 
-    async def open_session(config: dict[str, object]) -> FakeInlineHandle:
-        handle = await original_open(config)
+    async def open_session(config: dict[str, object], *, timeout: float | None = None) -> FakeInlineHandle:
+        handle = await original_open(config, timeout=timeout)
         if handshake is not SESSION_CREATED:
             # Replace the default session.created with the requested first event.
             handle._outbox = asyncio.Queue()
@@ -913,6 +915,27 @@ async def test_inline_handshake_opens_session_with_payload_and_adopts_id():
         await client.send({"type": "session.update", "session": {"instructions": "later"}})
         assert [type(command) for command in handle.commands] == [duplex_commands.UpdateSession]
         assert handle.commands[0].patch == {"instructions": "later"}
+
+
+@pytest.mark.asyncio
+async def test_inline_client_forwards_handshake_timeout_to_open_session():
+    client, omni = make_inline_client(handshake_timeout_s=7.5)
+    async with client:
+        assert client.session_id == SESSION_ID
+    # The client advertises a handshake budget; the session open must honour
+    # it instead of silently falling back to the engine default.
+    assert omni.open_timeouts == [7.5]
+
+
+@pytest.mark.asyncio
+async def test_inline_client_leaves_the_open_timeout_to_the_engine_by_default():
+    omni = FakeInlineOmni()
+    client = InlineDuplexClient(omni, model="test-model")
+    async with client:
+        assert client.session_id == SESSION_ID
+    # Without a caller-supplied budget the client must not forward one, so the
+    # engine's own open default (which a cold start relies on) stays in force.
+    assert omni.open_timeouts == [None]
 
 
 @pytest.mark.asyncio
@@ -1823,3 +1846,94 @@ def test_event_collector_response_text_joins_deltas_per_response():
     assert collector.response_text("r1") == "hello"
     assert collector.response_text("r2") == "other"
     assert collector.response_text("r3") == ""
+
+
+def _stage_event(response_id: str, stage_metrics: dict, *, event_type: str = "response.done") -> dict:
+    return {
+        "type": event_type,
+        "response": {"id": response_id},
+        "vllm_omni": {"stage_metrics": stage_metrics},
+    }
+
+
+def test_timing_summary_keeps_every_stage_snapshot_not_just_stage_zero():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(
+        _stage_event("resp-a", {"0": {"num_tokens_out": 5, "stage_name": "llm"}}, event_type="response.text.delta"),
+        received_at_s=10.1,
+    )
+    collector.add(
+        _stage_event(
+            "resp-a",
+            {
+                "0": {"num_tokens_out": 20, "vllm_ttft_ms": 100.0, "stage_name": "llm"},
+                "1": {"output_unit_count": 3, "stage_name": "token2wav"},
+            },
+        ),
+        received_at_s=10.2,
+    )
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["stage_metrics"] == {
+        "0": {"num_tokens_out": 20, "vllm_ttft_ms": 100.0, "stage_name": "llm"},
+        "1": {"output_unit_count": 3, "stage_name": "token2wav"},
+    }
+    assert timing["stage0_tokens"]["output_token_count"] == 20
+    assert timing["stage0_tokens"]["ttft_ms"] == 100.0
+
+
+def test_timing_summary_keeps_stages_absent_from_later_events():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(
+        _stage_event(
+            "resp-a",
+            {"0": {"num_tokens_out": 4}, "1": {"output_unit_count": 2}},
+            event_type="response.text.delta",
+        ),
+        received_at_s=10.1,
+    )
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 9}}), received_at_s=10.2)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["stage_metrics"] == {"0": {"num_tokens_out": 9}, "1": {"output_unit_count": 2}}
+
+
+def test_timing_summary_stage_snapshots_are_scoped_to_one_response():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 20}}), received_at_s=10.1)
+    collector.add({"type": "response.created", "response": {"id": "resp-b"}}, received_at_s=11.0)
+    collector.add(_stage_event("resp-b", {"0": {"num_tokens_out": 30}}), received_at_s=11.1)
+
+    assert collector.response_ids == ["resp-a", "resp-b"]
+    first = collector.timing_summary(after_s=10.0, response_id="resp-a")
+    second = collector.timing_summary(after_s=10.0, response_id="resp-b")
+
+    assert first["stage_metrics"] == {"0": {"num_tokens_out": 20}}
+    assert second["stage_metrics"] == {"0": {"num_tokens_out": 30}}
+
+
+def test_timing_summary_does_not_hand_out_the_stored_event_snapshot():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 20}}), received_at_s=10.1)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+    timing["stage_metrics"]["0"]["num_tokens_out"] = 999
+
+    assert collector.events[-1]["vllm_omni"]["stage_metrics"]["0"]["num_tokens_out"] == 20
+
+
+def test_timing_summary_omits_stage_metrics_when_the_server_sent_none():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add({"type": "response.done", "response": {"id": "resp-a"}}, received_at_s=10.1)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert "stage_metrics" not in timing
+    assert "stage0_tokens" not in timing

@@ -18,7 +18,9 @@
     "server_params": {
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
-        "--async-chunk"
+        "--async-chunk",
+        "--stage-init-timeout",
+        "900"
       ]
     },
     "benchmark_params": [

@@ -33,6 +33,11 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Runtime process placement
+
+The optional process runtime isolates the orchestrator from the frontend GIL
+and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
+
 ## Playback completion ownership
 
 Cancellation of a retained model stream identifies the response owning its
@@ -1451,6 +1456,14 @@ content and terminator for the next append, including with sliding windows off.
 Sentence-ending punctuation remains a Talker drain hint; it does not decide
 whether the Thinker may end a turn.
 
+An explicit `response.create` may open a latched assistant turn on its first
+silence unit. The sampler consumes that opening marker once per request/unit,
+even if the turn was already open, so repeated decode steps cannot undo a later
+`<|turn_eos|>` decision. The consumed identity lives in the session state.
+Opening a forced response permits the model to speak or listen. Its initial
+listen decision is preserved and closes the response without audio; only an
+already-speaking turn uses the normal listen-to-TTS continuation rewrite.
+
 `<|turn_eos|>` does not terminate the input unit. The Thinker continues until
 a chunk terminator, and the Talker receives all forwarded tokens and their
 hidden states before that boundary, including any text after an intermediate
@@ -1579,6 +1592,28 @@ budgets the JoyAI prompt against JoyAI's generation settings. Session model conf
 comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
+
+JoyAI keeps an empty assistant message for a retained visual observation's
+response when cancellation leaves no committed speech. This preserves the turn
+boundary in both direct and ASR-handoff prompts without restoring unheard text
+or treating cancellation as a model silence decision. The boundary follows the
+existing recent-history budget and disappears when its history item is deleted.
+The ASR handoff retains frame timestamps and observation-to-history references,
+so an old frame precedes its reply boundary and the new transcript accompanies
+only the current observation. Both paths apply the image limit before selecting
+recent history. An empty boundary is omitted when none of its observation's
+frames survives prompt assembly; pending consolidation records alone do not
+keep it alive. Non-empty committed replies
+still referenced by the observation ledger remain eligible at the recent-history
+boundary even after their frames leave the prompt.
+Frame eviction removes only the standalone generated timestamp paired with the
+frame; neighboring user text remains, even when it ends with a timestamp.
+
+For a speech-only follow-up without a new or working-window frame, the ASR
+handoff includes the latest frame still awaiting visual consolidation. It keeps
+that frame's original timestamp and observation-to-history references, before
+the new transcript's turn. Once the frame has been summarized, the summary
+provides its context instead of restoring the cached raw frame.
 
 While idle, JoyAI retains the latest camera frame and one input chunk of audio
 pre-roll. Once speech starts, it keeps the utterance until commit. An idle

@@ -133,7 +133,6 @@ vllm-omni serve "$MODEL" \
     --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --host "$SERVER_HOST" \
     --port "$SERVER_PORT" \
-    --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --omni 2>&1 | tee "$LOG_FILE" &
 SERVER_PID=$!
