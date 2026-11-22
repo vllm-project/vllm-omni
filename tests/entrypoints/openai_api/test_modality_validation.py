@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.renderers.params import ChatParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -94,7 +95,7 @@ async def test_preprocess_chat_owns_output_modalities_template_kwarg(
     renderer.get_tokenizer.return_value = mocker.Mock()
     renderer.render_chat_async = mocker.AsyncMock(return_value=([[]], [{}]))
 
-    chat_params = mocker.Mock()
+    chat_params = ChatParams(chat_template_kwargs={"vllm_omni_output_modalities": client_template_modalities})
     request = mocker.Mock(spec=ChatCompletionRequest)
     request.messages = [{"role": "user", "content": "hello"}]
     request.modalities = request_modalities
@@ -118,8 +119,8 @@ async def test_preprocess_chat_owns_output_modalities_template_kwarg(
         renderer=renderer,
     )
 
-    template_kwargs = chat_params.with_defaults.call_args.args[0]
-    assert template_kwargs["vllm_omni_output_modalities"] == request_modalities
+    rendered_chat_params = renderer.render_chat_async.call_args.args[1]
+    assert rendered_chat_params.chat_template_kwargs["vllm_omni_output_modalities"] == request_modalities
 
 
 @pytest.mark.asyncio
