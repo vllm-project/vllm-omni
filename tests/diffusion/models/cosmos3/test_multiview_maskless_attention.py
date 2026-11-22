@@ -415,40 +415,6 @@ def test_prompt_lengths_do_not_recompile() -> None:
     assert counter.frame_count == 1
 
 
-@pytest.mark.cpu
-def test_ulysses_maskless_trims_padding_and_preserves_batch_one(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import multiview_parallel as parallel
-
-    spec = layout(views=1)
-    num_und = sum(spec.caption_lengths)
-    q, k, v, k_und, v_und = tensors(spec, num_und)
-    cp = 2
-    length = (spec.gen_tokens + cp - 1) // cp
-    padded = [torch.nn.functional.pad(x, (0, 0, 0, 0, 0, length * cp - x.shape[1])) for x in (q, k, v)]
-    for rank in range(cp):
-        full = [x[:, :, rank * (x.shape[2] // cp) : (rank + 1) * (x.shape[2] // cp)] for x in padded]
-        calls = iter(full)
-
-        def exchange(x, group, scatter, gather):
-            assert x.shape[0] == 1
-            if scatter == 2:
-                return next(calls)
-            assert x.shape[1] == length * cp
-            return x[:, rank * length : (rank + 1) * length]
-
-        monkeypatch.setattr(parallel, "_all_to_all", exchange)
-        local_qkv = [x[:, rank * length : (rank + 1) * length] for x in padded] + [k_und, v_und]
-        head_qkv = [x[:, : spec.gen_tokens] for x in full] + [
-            k_und[:, :, rank : rank + 1],
-            v_und[:, :, rank : rank + 1],
-        ]
-        context = prepared_context(spec, num_und)
-        result = parallel.multiview_ulysses_attention(*local_qkv, context, group=object(), rank=rank, world_size=cp)
-        expected = multiview_attention(*head_qkv, context)
-        expected = torch.nn.functional.pad(expected, (0, 0, 0, 0, 0, length * cp - spec.gen_tokens))
-        torch.testing.assert_close(result, expected[:, rank * length : (rank + 1) * length])
-
-
 def _run_ulysses_matches_dense(rank: int, world_size: int, views: int, controls: bool, store: str) -> None:
     import torch.distributed as dist
 

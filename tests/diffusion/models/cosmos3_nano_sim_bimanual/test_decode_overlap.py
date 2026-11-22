@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA ordering, storage lifetime and failure cleanup for overlapped decode."""
 
 import pytest

@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Typed AR-Diffusion control adapter for Cosmos3-Nano-Sim-Bimanual AgiBot ticks."""
 
 from __future__ import annotations

@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pure runtime-resolution policy shared by Cosmos3-Nano-Sim-Bimanual request boundaries."""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
@@ -61,10 +60,6 @@ class Cosmos3NanoSimBimanualGeometry:
         ):
             raise ValueError("Cosmos3-Nano-Sim-Bimanual conditioning_tokens_per_frame must be a non-negative integer.")
         return self.vision_tokens_per_frame + conditioning_tokens_per_frame
-
-    @property
-    def session_key(self) -> tuple[int, int]:
-        return self.height, self.width
 
 
 @dataclass(frozen=True)
@@ -139,19 +134,6 @@ class Cosmos3NanoSimBimanualResolutionPolicy:
         height = math.floor(math.sqrt(self.max_pixels / aspect) / self.alignment) * self.alignment
         width = math.floor(math.sqrt(self.max_pixels * aspect) / self.alignment) * self.alignment
         return self.resolve(max(self.alignment, height), max(self.alignment, width))
-
-    def iter_valid_geometries(self) -> Iterator[Cosmos3NanoSimBimanualGeometry]:
-        """Enumerate every aligned geometry admitted by this policy."""
-
-        max_height = int(math.sqrt(self.max_pixels / self.min_aspect))
-        for height in range(self.alignment, max_height + 1, self.alignment):
-            min_width = max(self.alignment, math.ceil(height * self.min_aspect / self.alignment) * self.alignment)
-            max_width = min(
-                math.floor(height * self.max_aspect / self.alignment) * self.alignment,
-                math.floor(self.max_pixels / height / self.alignment) * self.alignment,
-            )
-            for width in range(min_width, max_width + 1, self.alignment):
-                yield self.resolve(height, width)
 
 
 def _param(params: Any, name: str) -> Any:

@@ -6,10 +6,10 @@ One request is one full rollout: per-camera WSM control videos, per-camera
 captions, an optional first-frame RGB condition and, for joint checkpoints, a
 numeric LiDAR HD-map control (plus an optional measured first sweep). The
 pipeline prepares those inputs once per session, then generates chunk by chunk
-with the four-step student schedule, attending the two-slot KV ring through the
-causal maskless planner and committing each chunk with a clean refresh. On the
-AR-Diffusion engine the ring lives in the runner's paged pool (one padded chunk
-per frame unit, sink 1 / window ``cache_chunks - 1``); on the plain engine a
+with the four-step student schedule, attending the KV ring (the sink chunks plus
+the previous chunk) through the causal maskless planner and committing each
+chunk with a clean refresh. On the AR-Diffusion engine the ring lives in the
+runner's paged pool (one padded chunk per frame unit); on the plain engine a
 model-owned dense ring serves as the numerical oracle.
 
 Tensor parallelism and strict Ulysses split the attention heads: every rank
@@ -39,9 +39,11 @@ from vllm_omni.diffusion.models.cosmos3.multiview_prompts import (
     COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
     format_rig_view_captions,
 )
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+# Re-exported for the diffusion registry, which looks process functions up in this module.
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
-    Cosmos3OmniDiffusersPipeline,
-    get_cosmos3_ir_op_priority_func,
+    get_cosmos3_ir_op_priority_func as get_cosmos3_ir_op_priority_func,  # noqa: F401
 )
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
     COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH,
@@ -60,7 +62,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
-    ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
@@ -72,7 +73,7 @@ from vllm_omni.model_extras.cosmos3 import (
 )
 from vllm_omni.model_extras.cosmos3_lidar import load_lidar_frames
 
-from .causal_plan import CausalMasklessPlan, build_causal_maskless_plan
+from .causal_plan import CausalMasklessPlan, build_causal_maskless_plan, causal_plan_key
 from .config import Cosmos3NanoSimAutoManifest, validate_sim_auto_parallel_config
 from .geometry import (
     Chunk,
@@ -83,6 +84,7 @@ from .geometry import (
     lidar_grid,
     lidar_num_sweeps,
     max_chunk_tokens,
+    max_sweeps_per_chunk,
     paged_frame_unit,
     rgb_grid,
 )
@@ -109,10 +111,38 @@ _SYSTEM_PROMPTS = {
     "av_multiview_transfer": COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
     "av_joint_camera_lidar_transfer": COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT,
 }
+_TICK_KEY = "ar_diffusion_tick"
+
+
+def _lifecycle_flags(extra: Mapping[str, Any]) -> tuple[bool, bool]:
+    """``(reset, close_session)`` of a request: one request is one rollout, so both default to true."""
+    return as_bool(extra.get("reset"), True), as_bool(extra.get("close_session"), True)
 
 
 def get_cosmos3_nano_sim_auto_pre_process_func(od_config: OmniDiffusionConfig):
-    return get_cosmos3_multiview_pre_process_func(od_config)
+    """Multiview text guardrail, then the rollout lifecycle flags written as booleans for the runner.
+
+    The AR-Diffusion runner reads ``reset`` and ``close_session`` with
+    ``bool(...)`` and a false default before the pipeline runs. Writing the
+    pipeline's resolved values back makes it reset before and close after a
+    default rollout, instead of keeping a session whose geometry the next
+    request cannot change. Tick requests (the runner reads their flags from
+    the tick) and non-mapping ``extra_args`` (rejected later) are left as is.
+    """
+    guardrail = get_cosmos3_multiview_pre_process_func(od_config)
+
+    def pre_process(request: Any) -> Any:
+        request = guardrail(request)
+        sp = request.sampling_params
+        extra = {} if sp.extra_args is None else sp.extra_args
+        if not isinstance(extra, Mapping) or _TICK_KEY in extra:
+            return request
+        reset, close_session = _lifecycle_flags(extra)
+        # A new dict: the caller's mapping may be shared, e.g. with stage default sampling params.
+        sp.extra_args = {**extra, "reset": reset, "close_session": close_session}
+        return request
+
+    return pre_process
 
 
 def get_cosmos3_nano_sim_auto_post_process_func(od_config: OmniDiffusionConfig):
@@ -125,10 +155,6 @@ def get_cosmos3_nano_sim_auto_post_process_func(od_config: OmniDiffusionConfig):
         return processed
 
     return post_process
-
-
-def get_cosmos3_nano_sim_auto_ir_op_priority_func(od_config: OmniDiffusionConfig):
-    return get_cosmos3_ir_op_priority_func(od_config)
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -247,10 +273,21 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         return self.manifest.temporal_compression_factor / fps
 
     def _frame_unit(self, *, num_views: int, joint: bool, height: int, width: int, fps: float) -> int:
-        """Paged frame unit for a geometry: the largest (regular) chunk, padded to the page alignment."""
+        """Paged frame unit for a geometry: its largest possible chunk, padded to the page alignment.
+
+        The worst-case geometry's unit sizes the paged pool (:meth:`ar_diffusion_kv_cache_spec`);
+        a dense session uses its own geometry's unit (:meth:`_session_frame_unit`). A
+        regular chunk holds ``frames_per_chunk`` latents and the most sweeps any step can
+        hold, so the unit bounds every chunk of every rollout length, short ones included.
+        """
         lidar_spf = self.manifest.lidar_seconds_per_frame
-        rgb_spf = self._rgb_seconds_per_frame(fps)
-        sweeps_per_chunk = round(self.manifest.frames_per_chunk * rgb_spf / lidar_spf) if joint and lidar_spf else 0
+        sweeps_per_chunk = 0
+        if joint and lidar_spf:
+            sweeps_per_chunk = max_sweeps_per_chunk(
+                frames_per_chunk=self.manifest.frames_per_chunk,
+                rgb_seconds_per_frame=self._rgb_seconds_per_frame(fps),
+                lidar_seconds_per_frame=lidar_spf,
+            )
         regular = Chunk(
             step=1,
             rgb_frames=tuple(range(1, 1 + self.manifest.frames_per_chunk)),
@@ -286,75 +323,25 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             max_scratch_tokens_per_branch=0,
         )
 
-    def _default_geometry(self) -> tuple[int, bool, int, int, float]:
-        width, height = VIDEO_RES_SIZE_INFO[self.manifest.default_resolution]["16,9"]
-        return len(self.manifest.cameras), self.manifest.joint, height, width, self.manifest.default_fps
-
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        num_views, joint, height, width, fps = self._default_geometry()
-        return self._kv_spec(num_views=num_views, joint=joint, height=height, width=width, fps=fps)
+        """The pool is sized once at load for the artifact's worst case.
 
-    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
-        num_views, joint, height, width, fps = self._default_geometry()
-        return ARDiffusionRequestKVSpec(
-            kv_spec=self._kv_spec(num_views=num_views, joint=joint, height=height, width=width, fps=fps),
-            geometry_key=(num_views, joint, height, width, fps),
-        )
-
-    def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
-        sp = request.sampling_params
-        extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}
-        multiview, views = validate_multiview_request(extra, self.manifest.cameras, media_kind=_media_kind)
-        joint = extra.get("lidar") is not None
-        _, _, width, height = _resolve_multiview_geometry(
-            sp, multiview, views, default_resolution=self.manifest.default_resolution
-        )
-        fps = self._request_fps(sp)
-        key = (len(views), joint, height, width, fps)
-        return ARDiffusionRequestKVSpec(
-            kv_spec=self._kv_spec(num_views=len(views), joint=joint, height=height, width=width, fps=fps),
-            geometry_key=key,
-        )
-
-    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
-        sizes = VIDEO_RES_SIZE_INFO[self.manifest.default_resolution]
-        width, height = max(sizes.values(), key=lambda size: size[0] * size[1])
-        num_views = len(self.manifest.cameras)
-        yield ARDiffusionRequestKVSpec(
-            kv_spec=self._kv_spec(
-                num_views=num_views,
+        That is every exported camera, joint if the artifact is joint, and the largest
+        frame unit in tokens among the aspect ratios of the default resolution at the
+        default fps (not the largest pixel area: at 720p every aspect has the same area).
+        """
+        sizes = VIDEO_RES_SIZE_INFO[self.manifest.default_resolution].values()
+        specs = (
+            self._kv_spec(
+                num_views=len(self.manifest.cameras),
                 joint=self.manifest.joint,
                 height=height,
                 width=width,
                 fps=self.manifest.default_fps,
-            ),
-            geometry_key=(num_views, self.manifest.joint, height, width, self.manifest.default_fps),
+            )
+            for width, height in sizes
         )
-
-    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
-        expected = self.ar_diffusion_kv_cache_spec()
-        fields = (
-            "num_layers",
-            "num_kv_heads",
-            "head_size",
-            "frames_per_block",
-            "window_frames",
-            "sink_frames",
-            "reset_at_boundary",
-            "kv_branches",
-            "session_capacity",
-            "cross_attention",
-            "max_scratch_frames_per_branch",
-            "max_scratch_tokens_per_branch",
-        )
-        mismatches = {
-            name: (getattr(expected, name), getattr(spec, name))
-            for name in fields
-            if getattr(expected, name) != getattr(spec, name)
-        }
-        if mismatches:
-            detail = ", ".join(f"{name}=expected {exp!r}, got {got!r}" for name, (exp, got) in mismatches.items())
-            raise ValueError(f"Cosmos3-Nano-Sim-Auto AR-Diffusion structural specification is invalid ({detail}).")
+        return max(specs, key=lambda spec: spec.tokens_per_frame)
 
     @contextmanager
     def bind_ar_diffusion_state(self, session_id, state):
@@ -362,6 +349,23 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             raise RuntimeError("Cosmos3-Nano-Sim-Auto AR-Diffusion state is already bound.")
         if state.session_id != session_id:
             raise ValueError(f"Cosmos3-Nano-Sim-Auto bound session mismatch: {state.session_id!r} != {session_id!r}.")
+        # Deployment overrides in ar_diffusion_kv_config must not contradict the manifest's ring.
+        expected = self.ar_diffusion_kv_cache_spec()
+        pool = state.kv_cache
+        checks = {
+            "chunk_size": (pool.spec.chunk_size, expected.tokens_per_frame),
+            "block_size": (pool.block_size, expected.tokens_per_frame),
+            "window_chunks": (pool.spec.window_chunks, expected.window_frames),
+            "sink_chunks": (pool.spec.sink_chunks, expected.sink_frames),
+            "reset_at_boundary": (pool.spec.reset_at_boundary, expected.reset_at_boundary),
+        }
+        mismatches = [f"{name}={got!r} (expected {want!r})" for name, (got, want) in checks.items() if got != want]
+        if mismatches:
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Auto KV pool contradicts the manifest ring: {', '.join(mismatches)}. "
+                "Remove the conflicting ar_diffusion_kv_config overrides "
+                "(window_chunks, sink_chunks, reset_at_boundary, superpage_tokens)."
+            )
         self._ar_diffusion_kv_state = state
         self._bound_session_id = str(session_id)
         try:
@@ -391,6 +395,33 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             self._states[session_id] = state
         self._states.move_to_end(session_id)
         return state
+
+    def _begin_rollout(self, session_id: str, *, reset: bool, bound: Any) -> Cosmos3NanoSimAutoSessionState:
+        """First side effect of an admitted request: start the rollout from an empty ring.
+
+        The runner resets its session only when the client sends ``reset``, while
+        this pipeline defaults it to true, so a reset also releases the bound
+        session's KV pages and caption cache here. Without that, the pool would
+        still hold the previous rollout's ring when the new one commits chunk 0.
+        """
+        if reset:
+            self._drop_session(session_id)
+            if bound is not None:
+                bound.reset()
+        return self._get_or_create_state(session_id)
+
+    def _end_rollout(self, session_id: str, *, close_session: bool, bound: Any) -> None:
+        """After a successful rollout, drop the session's state and KV when it closes.
+
+        ``reset()`` rather than ``close()`` releases the bound KV: the runner still
+        calls ``finish_request()`` on the state after the forward, which needs open
+        adapters, and it closes the runner session itself when the client asked.
+        """
+        if not close_session:
+            return
+        self._drop_session(session_id)
+        if bound is not None:
+            bound.reset()
 
     # -- request helpers ----------------------------------------------------
 
@@ -482,7 +513,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}
         if sp.extra_args is not None and not isinstance(sp.extra_args, Mapping):
             raise _reject(f"extra_args must be a mapping, got {type(sp.extra_args).__name__}.")
-        if extra.get("ar_diffusion_tick") is not None:
+        if extra.get(_TICK_KEY) is not None:
             raise _reject("typed tick sessions are not supported yet; submit a full rollout request.")
         try:
             if isinstance(prompt_data, Mapping):
@@ -536,10 +567,19 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError("Cosmos3-Nano-Sim-Auto supports exactly one measured LiDAR condition sweep.")
         except (TypeError, ValueError) as exc:
             raise _reject(str(exc)) from exc
+        bound = self._ar_diffusion_kv_state
+        if bound is not None:
+            request_unit = self._frame_unit(num_views=len(views), joint=joint, height=height, width=width, fps=fps)
+            pool_unit = bound.kv_cache.spec.chunk_size
+            if request_unit > pool_unit:
+                raise _reject(
+                    f"this request needs a KV frame unit of {request_unit} tokens but the pool's is {pool_unit}; "
+                    "the pool is sized at load for the artifact's default resolution "
+                    f"{self.manifest.default_resolution!r}."
+                )
 
         session_id = str(extra.get("session_id") or "default")
-        reset = as_bool(extra.get("reset"), True)
-        close_session = as_bool(extra.get("close_session"), True)
+        reset, close_session = _lifecycle_flags(extra)
         if self._bound_session_id is not None and session_id != self._bound_session_id:
             raise _reject(f"request session {session_id!r} does not match bound session {self._bound_session_id!r}.")
         existing = self._states.get(session_id)
@@ -600,49 +640,80 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         ).hexdigest()
 
         # ---- Side effects begin ---------------------------------------------------
-        if reset and existing is not None:
-            self._drop_session(session_id)
-        state = self._get_or_create_state(session_id)
-        bound = self._ar_diffusion_kv_state
-        try:
-            self._prepare_session(
-                state,
-                views=views,
-                cameras=cameras,
-                joint=joint,
-                lidar_request=lidar_request,
-                lidar_condition=lidar_condition,
-                has_condition=has_condition,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                fps=fps,
-                seed=seed,
-                caption_ids=caption_ids,
-                sink_tokens=sink_tokens,
-                bound=bound,
-            )
-            state.fingerprint = fingerprint
-            for chunk in state.schedule[state.next_chunk :]:
-                self._run_chunk(state, chunk, bound)
-            payload, metadata = self._build_payload(
-                state,
-                lidar_request,
-                views,
-                resolution,
-                aspect_ratio,
-                return_latents=as_bool(extra.get("return_latents"), False),
-            )
-        finally:
-            state.terminal = True
-        if close_session and bound is None:
-            self._drop_session(session_id)
+        state = self._begin_rollout(session_id, reset=reset, bound=bound)
+        self._prepare_session(
+            state,
+            views=views,
+            cameras=cameras,
+            joint=joint,
+            lidar_request=lidar_request,
+            lidar_condition=lidar_condition,
+            has_condition=has_condition,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            fps=fps,
+            seed=seed,
+            caption_ids=caption_ids,
+            sink_tokens=sink_tokens,
+            bound=bound,
+        )
+        state.fingerprint = fingerprint
+        for chunk in state.schedule[state.next_chunk :]:
+            self._run_chunk(state, chunk, bound)
+        payload, metadata = self._build_payload(
+            state,
+            lidar_request,
+            views,
+            resolution,
+            aspect_ratio,
+            return_latents=as_bool(extra.get("return_latents"), False),
+        )
+        self._end_rollout(session_id, close_session=close_session, bound=bound)
         return DiffusionOutput(
             output={"payload": payload, "metadata": metadata},
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     # -- preparation ------------------------------------------------------------
+
+    def _session_frame_unit(
+        self,
+        schedule: tuple[Chunk, ...],
+        *,
+        num_views: int,
+        joint: bool,
+        height: int,
+        width: int,
+        fps: float,
+        bound: Any,
+    ) -> int:
+        """Frame unit of a rollout: the bound pool's unit, or the geometry's own unit on the dense path.
+
+        The paged pool is sized once for the artifact's worst case, so a smaller request
+        (fewer cameras, RGB only, a short rollout) pads each chunk to the pool's unit.
+        Fails if a chunk of ``schedule`` does not fit or the pool's pages are not one unit.
+        """
+        if bound is None:
+            frame_unit = self._frame_unit(num_views=num_views, joint=joint, height=height, width=width, fps=fps)
+        else:
+            frame_unit = bound.kv_cache.spec.chunk_size
+            if bound.kv_cache.block_size != frame_unit:
+                raise RuntimeError(
+                    "Cosmos3-Nano-Sim-Auto bound KV pool pages must hold one frame unit: "
+                    f"pool chunk={frame_unit}, block={bound.kv_cache.block_size}."
+                )
+        needed = max_chunk_tokens(
+            schedule,
+            num_views=num_views,
+            rgb_tokens_per_frame=self._rgb_grid(height, width).tokens_per_frame,
+            lidar_tokens_per_sweep=self.lidar_grid.tokens_per_frame if joint and self.lidar_grid else None,
+        )
+        if needed > frame_unit:
+            raise RuntimeError(
+                f"Cosmos3-Nano-Sim-Auto chunk of {needed} tokens exceeds the session's frame unit {frame_unit}."
+            )
+        return frame_unit
 
     def _prepare_session(
         self,
@@ -664,7 +735,6 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         bound: Any,
     ) -> None:
         num_views = len(views)
-        rgb = self._rgb_grid(height, width)
         latents_per_view = latent_frames_from_pixel_frames(num_frames, self.manifest.temporal_compression_factor)
         sweeps = None
         if joint:
@@ -677,21 +747,9 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             rgb_seconds_per_frame=self._rgb_seconds_per_frame(fps),
             lidar_seconds_per_frame=self.manifest.lidar_seconds_per_frame if joint else None,
         )
-        frame_unit = paged_frame_unit(
-            max_chunk_tokens(
-                schedule,
-                num_views=num_views,
-                rgb_tokens_per_frame=rgb.tokens_per_frame,
-                lidar_tokens_per_sweep=self.lidar_grid.tokens_per_frame if joint and self.lidar_grid else None,
-            )
+        frame_unit = self._session_frame_unit(
+            schedule, num_views=num_views, joint=joint, height=height, width=width, fps=fps, bound=bound
         )
-        if bound is not None:
-            spec = bound.kv_cache.spec
-            if spec.chunk_size != frame_unit or bound.kv_cache.block_size != frame_unit:
-                raise RuntimeError(
-                    "Cosmos3-Nano-Sim-Auto bound KV pool geometry does not match the request: "
-                    f"pool chunk={spec.chunk_size}, block={bound.kv_cache.block_size}, request frame unit={frame_unit}."
-                )
 
         control = self._encode_camera_major(views, field="control", height=height, width=width, num_frames=num_frames)
         if control.shape[2] != num_views * latents_per_view:
@@ -840,40 +898,36 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
     def _runtime_plan(
         self,
         state: Cosmos3NanoSimAutoSessionState,
-        chunk: Chunk,
         metadata: TokenMetadata,
-        pass_kind: str,
         bound: Any,
         *,
         reuse_control_kv: bool = False,
     ) -> CausalMasklessRuntime:
+        """Causal maskless plan of one forward over ``metadata``, cached by its exact inputs.
+
+        On the paged path the plan's virtual ring ranges are remapped to the bound pool's pages.
+        """
         history = state.history_slots(frame_unit=state.frame_unit)
-        # Plans depend on the chunk shape, on which ring slots are populated and on
-        # whether chunk 0 is still inside the cross-view window (only for chunk 1);
-        # absolute time otherwise only shifts every stream together.
-        key = (
-            pass_kind,
-            reuse_control_kv,
-            (len(chunk.rgb_frames), len(chunk.lidar_sweeps)),
-            min(chunk.step, 2),
-            tuple(
-                (slot.slot, slot.metadata.num_tokens, int(slot.metadata.role.min()), int(slot.metadata.role.max()))
-                for slot in history
-            ),
-            tuple(sorted(state.rgb_condition_frames & set(chunk.rgb_frames))),
-            tuple(sorted(state.lidar_condition_sweeps & set(chunk.lidar_sweeps))),
-            state.text_extent,
-            tuple(doc.num_tokens for doc in state.caption_documents),
-            state.num_views,
-            state.joint,
+        captions = self._caption_metadata(state)
+        window = self.manifest.cross_view_past_window_seconds
+        # Which history keys a query reads depends on each slot's age, which a slot id
+        # does not determine: the cross-view window can reach past the previous chunk
+        # (e.g. at a higher fps) and LiDAR sweeps need not align with chunk edges. The
+        # key is therefore the planner's own inputs, which repeat for steady-state chunks.
+        key = causal_plan_key(
+            current=metadata,
+            history=history,
+            captions=captions,
+            window_seconds=window,
+            reuse_control_kv=reuse_control_kv,
         )
         plan = self._plan_cache.get(key)
         if plan is None:
             plan = build_causal_maskless_plan(
                 current=metadata,
                 history=history,
-                captions=self._caption_metadata(state),
-                window_seconds=self.manifest.cross_view_past_window_seconds,
+                captions=captions,
+                window_seconds=window,
                 device=self.device,
                 reuse_control_kv=reuse_control_kv,
             )
@@ -886,7 +940,12 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                     f"Cosmos3-Nano-Sim-Auto ring has {len(history)} committed slots but the pool holds "
                     f"{len(block_ids)} blocks."
                 )
-            # Table order is commit order: the pinned sink first, then the most recent chunk.
+            # The pool's table is in commit order and ``with_history_offsets`` indexes it by
+            # slot id. They agree because the manifest allows one rotating slot only: the
+            # sinks are committed first in slot order and the last slot holds the newest chunk.
+            steps = [state.ring_steps[slot.slot] for slot in history]
+            if steps != sorted(steps):
+                raise RuntimeError(f"Cosmos3-Nano-Sim-Auto ring slots are not in commit order: steps {steps}.")
             bases = [block_id * bound.kv_cache.block_size for block_id in block_ids]
             plan = plan.with_history_offsets(bases, state.frame_unit)
         return CausalMasklessRuntime(
@@ -952,10 +1011,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 lidar_size = math.prod(lidar_noisy_shape)
                 local_sweeps = [lidar_target.frames.index(s) for s in noisy_sweeps]
             metadata, _ = chunk_token_metadata(items, step=chunk.step, pass_kind="noisy")
-            runtime = self._runtime_plan(state, chunk, metadata, "noisy", bound)
-            reuse_runtime = (
-                self._runtime_plan(state, chunk, metadata, "noisy", bound, reuse_control_kv=True) if reuse else None
-            )
+            runtime = self._runtime_plan(state, metadata, bound)
+            reuse_runtime = self._runtime_plan(state, metadata, bound, reuse_control_kv=True) if reuse else None
             # The reference seeds RGB rollouts by the chunk's first latent and joint rollouts by the step.
             sample_index = chunk.step if state.joint else chunk.rgb_frames[0]
 
@@ -1083,7 +1140,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         alongside them.
         """
         metadata, _ = chunk_token_metadata(items, step=chunk.step, pass_kind="clean")
-        runtime = self._runtime_plan(state, chunk, metadata, "clean", bound, reuse_control_kv=control_kv is not None)
+        runtime = self._runtime_plan(state, metadata, bound, reuse_control_kv=control_kv is not None)
         latents = self._item_latents(state, items)
         num_real = metadata.num_tokens
         slot = ring_slot_for_step(
@@ -1214,7 +1271,6 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
 
 __all__ = [
     "Cosmos3NanoSimAutoPipeline",
-    "get_cosmos3_nano_sim_auto_ir_op_priority_func",
     "get_cosmos3_nano_sim_auto_post_process_func",
     "get_cosmos3_nano_sim_auto_pre_process_func",
 ]

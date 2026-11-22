@@ -68,7 +68,9 @@ that capacity evict the least-recently-used session through the same lifecycle
 hook used by explicit close and failure cleanup.
 
 Scratch storage is also capability-driven. `frames_per_block` reserves space for
-an uncommitted current video block, while `max_scratch_tokens_per_branch`
+an uncommitted current video block unless `max_scratch_frames_per_branch` sets
+that span explicitly (`0` for a pipeline that never runs a non-committing paged
+forward), while `max_scratch_tokens_per_branch`
 declares the maximum model-specific tokens, such as action/state registers, that
 must coexist with it. `AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH` may increase
 that derived minimum for deployment experiments but cannot reduce it.
@@ -85,24 +87,6 @@ to drop its model-owned state, because partially committed pages cannot be
 trusted. Pipelines must therefore complete every fail-closed check (session
 fingerprint, chunk-index ordering, prompt-length, resolution, action coverage)
 before their first side effect.
-
-## Per-request KV geometry
-
-A pipeline whose KV geometry depends on the request, for example on its
-resolution or full-history length, also implements
-`SupportsDynamicARDiffusion`. Its `ar_diffusion_default_request_spec()` sizes
-the initial pool, and `ar_diffusion_request_spec(request)` returns an
-`ARDiffusionRequestKVSpec` containing the KV requirements and an opaque session
-geometry key. The runner validates effective deployment overrides through
-`validate_ar_diffusion_effective_spec()` and checks the model-declared
-`ar_diffusion_worst_case_request_specs()` against the load-time memory budget.
-
-When a request resolves to different KV requirements, the runner releases every
-session and replaces the pool within that budget. Before releasing anything,
-it rejects the request with `ARDiffusionRequestRejectedError` if the request's
-own session is live without `reset`, or if one session of the new geometry
-cannot fit. A changed session geometry key also requires `reset`, including
-transposed resolutions with identical token counts and KV requirements.
 
 ## DreamZero adapter
 

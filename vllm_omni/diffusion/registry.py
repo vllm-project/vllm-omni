@@ -888,7 +888,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3MultiviewPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_ir_op_priority_func",
-    "Cosmos3NanoSimAutoPipeline": "get_cosmos3_nano_sim_auto_ir_op_priority_func",
+    "Cosmos3NanoSimAutoPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

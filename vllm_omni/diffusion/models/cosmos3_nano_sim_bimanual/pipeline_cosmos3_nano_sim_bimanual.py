@@ -46,7 +46,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     Cosmos3NanoSimBimanualManifest,
     deploy_option,
     resolve_ar_compile_mode,
-    validate_ar_diffusion_kv_overrides,
     validate_sim_parallel_config,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
@@ -72,13 +71,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     prompt_token_hash,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.experimental.ar_diffusion.capability import (
-    ARDiffusionCrossAttentionKVSpec,
-    ARDiffusionKVBranchSpec,
-    ARDiffusionKVCacheSpec,
-    ARDiffusionRequestKVSpec,
-    ARDiffusionRequestRejectedError,
-)
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
@@ -189,23 +182,14 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
 
 
 class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
-    """Cosmos3-Nano-Sim-Bimanual inference with dense-or-paged persistent GEN K/V.
+    """Cosmos3-Nano-Sim-Bimanual inference with persistent dense GEN K/V."""
 
-    The default diffusion engine exercises the dense numerical-oracle path.
-    When the AR-Diffusion runner binds a state, the same attention uses paged
-    storage instead.
-    """
-
-    # The engine's generic warmup request is 512x512 with a one-step sampler,
-    # while Cosmos3-Nano-Sim-Bimanual has request-resolved geometry and checkpoint-defined sampling.
-    # Skip that incompatible request; AR-Diffusion owns any model-valid rollout
-    # warmup when CUDA graphs are enabled.
+    # The generic 512x512 one-step warmup is incompatible with this model's
+    # request-resolved geometry and checkpoint-defined sampling schedule.
     dummy_run_num_frames: ClassVar[int] = 0
     _transformer_cls_override: ClassVar[type[Cosmos3NanoSimBimanualTransformer]] = Cosmos3NanoSimBimanualTransformer
     _MAIN_BRANCH = "main"
     _SESSION_CAPACITY = 1
-    _ar_diffusion_kv_state = None
-    _bound_session_id: str | None = None
     clean_commit_mode: str = "batched"
     overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
@@ -218,7 +202,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         validate_sim_parallel_config(od_config)
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
-        validate_ar_diffusion_kv_overrides(od_config, self.manifest)
         self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "batched")
         self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", True))
         if self.clean_commit_mode not in {"framewise", "batched"}:
@@ -307,182 +290,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             )
         return loaded
 
-    # -- AR-Diffusion pipeline capability ---------------------------------
-
-    def _kv_spec_for_geometry(
-        self, geometry: Cosmos3NanoSimBimanualGeometry, full_history_frames: int = 1
-    ) -> ARDiffusionKVCacheSpec:
-        return ARDiffusionKVCacheSpec(
-            num_layers=self.transformer.num_hidden_layers,
-            num_kv_heads=self.transformer.num_kv_heads_local,
-            head_size=self.transformer.head_dim,
-            tokens_per_frame=geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame),
-            frames_per_block=1,
-            window_frames=self.manifest.window_frames or full_history_frames,
-            sink_frames=self.manifest.sink_frames,
-            kv_branches=(ARDiffusionKVBranchSpec(self._MAIN_BRANCH, 0),),
-            session_capacity=self._SESSION_CAPACITY,
-            cross_attention=(ARDiffusionCrossAttentionKVSpec("text", self.manifest.text_cache_max_len),),
-            max_scratch_frames_per_branch=self.manifest.chunk_size,
-            max_scratch_tokens_per_branch=self.manifest.text_cache_max_len,
-        )
-
-    def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        """Return the default-resolution specification that sizes the initial pool."""
-
-        geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
-        return self._kv_spec_for_geometry(geometry)
-
-    def _request_kv_spec(
-        self, geometry: Cosmos3NanoSimBimanualGeometry, full_history_frames: int = 1
-    ) -> ARDiffusionRequestKVSpec:
-        return ARDiffusionRequestKVSpec(
-            kv_spec=self._kv_spec_for_geometry(geometry, full_history_frames),
-            geometry_key=(geometry.session_key, full_history_frames)
-            if self.manifest.window_frames is None
-            else geometry.session_key,
-        )
-
-    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
-        geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
-        return self._request_kv_spec(geometry)
-
-    def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
-        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(request.sampling_params, None, self.resolution_policy)
-        frames = 1
-        if self.manifest.window_frames is None:
-            # The physical allocation covers the complete admitted rollout.
-            # Streaming requests must declare that total length on every tick.
-            pixels = _admission_int(request.sampling_params.num_frames, "num_frames")
-            factor = self.manifest.temporal_compression_factor
-            if pixels <= 0 or (pixels - 1) % factor:
-                raise ValueError(f"Full history requires num_frames = 1 + {factor} * N")
-            frames = (pixels - 1) // factor + 1
-        return self._request_kv_spec(geometry, frames)
-
-    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
-        """Yield the largest admitted request after enumerating the policy space."""
-
-        worst = max(
-            self.resolution_policy.iter_valid_geometries(),
-            key=lambda geometry: (geometry.vision_tokens_per_frame, geometry.height * geometry.width),
-        )
-        yield self._request_kv_spec(worst)
-
-    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
-        """Validate runner overrides against immutable model structure at load time."""
-
-        expected = self.ar_diffusion_kv_cache_spec()
-        fields = (
-            "num_layers",
-            "num_kv_heads",
-            "head_size",
-            "frames_per_block",
-            "window_frames",
-            "sink_frames",
-            "reset_at_boundary",
-            "kv_branches",
-            "session_capacity",
-            "cross_attention",
-            "max_model_len",
-            "max_scratch_frames_per_branch",
-            "max_scratch_tokens_per_branch",
-            "model_owned_state_bytes_per_session",
-        )
-        mismatches = {
-            name: (getattr(expected, name), getattr(spec, name))
-            for name in fields
-            if not (name == "window_frames" and self.manifest.window_frames is None)
-            if getattr(expected, name) != getattr(spec, name)
-        }
-        if mismatches:
-            detail = ", ".join(
-                f"{name}=expected {expected_value!r}, got {actual_value!r}"
-                for name, (expected_value, actual_value) in mismatches.items()
-            )
-            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual AR-Diffusion structural specification is invalid ({detail}).")
-
-    def _validate_bound_kv_geometry(
-        self,
-        state: Any,
-        geometry: Cosmos3NanoSimBimanualGeometry | None = None,
-    ) -> None:
-        """Check the bound pool against the effective inference settings."""
-
-        cache = state.kv_cache
-        actual = {
-            "num_layers": int(cache.num_layers),
-            "num_kv_heads": int(cache.num_kv_heads),
-            "head_size": int(cache.head_size),
-            # The paging block is a kernel detail and may be smaller than a frame.
-            "tokens_per_frame": int(cache.spec.chunk_size),
-            "frames_per_block": int(cache.frames_per_block),
-            "max_scratch_frames_per_branch": int(cache.max_scratch_frames_per_branch),
-            "max_scratch_tokens_per_branch": int(cache.max_scratch_tokens_per_branch),
-            "window_frames": int(cache.spec.window_chunks),
-            "sink_frames": int(cache.spec.sink_chunks),
-            "reset_at_boundary": bool(cache.spec.reset_at_boundary),
-            "text_cache_max_len": int(cache.cross_attention_lengths.get("text", -1)),
-            "max_model_len": int(cache.max_model_len),
-            "kv_branches": tuple(cache.kv_branches),
-            "model_owned_state_bytes_per_session": int(cache.model_owned_state_bytes_per_session),
-        }
-        expected_spec = self._kv_spec_for_geometry(
-            geometry or self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
-        )
-        expected = {
-            "num_layers": int(self.transformer.num_hidden_layers),
-            "num_kv_heads": int(self.transformer.num_kv_heads_local),
-            "head_size": int(self.transformer.head_dim),
-            "tokens_per_frame": int(expected_spec.tokens_per_frame),
-            "frames_per_block": 1,
-            "max_scratch_frames_per_branch": int(self.manifest.chunk_size),
-            "max_scratch_tokens_per_branch": int(self.manifest.text_cache_max_len),
-            "window_frames": self.manifest.window_frames or actual["window_frames"],
-            "sink_frames": int(self.manifest.sink_frames),
-            "reset_at_boundary": False,
-            "text_cache_max_len": int(self.manifest.text_cache_max_len),
-            "max_model_len": int(expected_spec.max_model_len),
-            "kv_branches": expected_spec.kv_branches,
-            "model_owned_state_bytes_per_session": int(expected_spec.model_owned_state_bytes_per_session),
-        }
-        if geometry is None:
-            # The request is resolved independently in ``forward``. At bind
-            # time only the geometry-dependent block size is intentionally
-            # deferred.
-            expected.pop("tokens_per_frame")
-            actual.pop("tokens_per_frame")
-        mismatches = {name: (expected[name], actual[name]) for name in expected if expected[name] != actual[name]}
-        if mismatches:
-            details = ", ".join(
-                f"{name}=expected {expected_value}, got {actual_value}"
-                for name, (expected_value, actual_value) in mismatches.items()
-            )
-            raise RuntimeError(
-                "Cosmos3-Nano-Sim-Bimanual bound AR-Diffusion KV cache violates the "
-                f"resolved model specification ({details})."
-            )
-
-    @contextmanager
-    def bind_ar_diffusion_state(self, session_id, state):
-        if self._ar_diffusion_kv_state is not None:
-            raise RuntimeError("Cosmos3-Nano-Sim-Bimanual AR-Diffusion state is already bound.")
-        if state.session_id != session_id:
-            raise ValueError(
-                f"Cosmos3-Nano-Sim-Bimanual bound session mismatch: {state.session_id!r} != {session_id!r}."
-            )
-        self._validate_bound_kv_geometry(state)
-        self._ar_diffusion_kv_state = state
-        self._bound_session_id = str(session_id)
-        try:
-            yield
-        finally:
-            self._ar_diffusion_kv_state = None
-            self._bound_session_id = None
-
-    def reset_ar_diffusion_session(self, session_id: str) -> None:
-        self._drop_session(session_id)
-
     def setup_compile(self) -> None:
         """Use the runner's existing compilation hook and shared regional compiler."""
         options = dict(dynamic=self.od_config.diffusion_compile_dynamic, mode=self._ar_compile_mode)
@@ -501,9 +308,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if getattr(self.transformer, "_inductor_cudagraphs", False):
             torch._dynamo.reset()
         self._dense_attention_cache = None
-
-    def close_ar_diffusion_session(self, session_id: str) -> None:
-        self._drop_session(session_id)
 
     def _drop_session(self, session_id: str) -> None:
         state = self._states.pop(str(session_id or "default"), None)
@@ -576,7 +380,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             raise ARDiffusionRequestRejectedError("forward_dynamics requires action conditioning.")
         tick = bool(extra.get("chunk_only", False))
         return _RequestControls(
-            session_id=str(extra.get("session_id") or self._bound_session_id or "default"),
+            session_id=str(extra.get("session_id") or "default"),
             reset=bool(extra.get("reset", False)),
             close_session=bool(extra.get("close_session", False)),
             tick=tick,
@@ -612,27 +416,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if cached is not None:
             return cached
 
-        paged_state = self._ar_diffusion_kv_state
-        if paged_state is not None and paged_state.is_cross_attention_populated(self._MAIN_BRANCH, "text"):
-            pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
-            cached = [(entry["k"], entry["v"]) for entry in pooled]
-        else:
-            raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
-            if paged_state is not None and real_len > self.manifest.text_cache_max_len:
-                raise ValueError(
-                    "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
-                    f"{real_len} > {self.manifest.text_cache_max_len}."
-                )
-            if paged_state is None:
-                cached = raw_kv
-            else:
-                padded = self.transformer.pad_text_kv(
-                    raw_kv,
-                    max_len=self.manifest.text_cache_max_len,
-                )
-                paged_state.populate_cross_attention(self._MAIN_BRANCH, "text", padded)
-                pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
-                cached = [(entry["k"], entry["v"]) for entry in pooled]
+        cached, _ = self.transformer.encode_und_kv(text_ids, text_mask)
         state.text_kv_by_branch[self._MAIN_BRANCH] = cached
         return cached
 
@@ -663,7 +447,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             action_space=action_space,
         )
 
-    # -- Dense/paged transformer bridge -----------------------------------
+    # -- Dense transformer bridge -----------------------------------------
 
     def _append_dense_kv(
         self,
@@ -682,7 +466,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _prepare_dense_attention(self, state, text_kv, real_text_kv_len, geometry, target_frame):
         state.dense_attention = None
-        if self._ar_diffusion_kv_state is not None or self.manifest.window_frames is not None:
+        if self.manifest.window_frames is not None:
             return
         # The Sim pipeline admits one dense session. Keep the backing storage
         # across requests, while activation resets its conditioning/history.
@@ -718,22 +502,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         commit_current: bool,
         frame_causal: bool = False,
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
-        paged_state = self._ar_diffusion_kv_state
         tokens_per_frame = geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame)
         seq_len = hidden_states.shape[2] * tokens_per_frame
-        paged_kv = None
-        dense_history = None
-        dense_cache = getattr(state, "dense_attention", None) if paged_state is None else None
-        if paged_state is not None:
-            paged_kv = paged_state.get_kv_caches(
-                self._MAIN_BRANCH,
-                seq_len=seq_len,
-                commit_current=commit_current,
-                extra_visible_tokens=tokens_per_frame if frame_causal else seq_len,
-                frame_causal=frame_causal,
-            )
-        elif dense_cache is None:
-            dense_history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
+        dense_cache = getattr(state, "dense_attention", None)
+        dense_history = None if dense_cache is not None else state.dense_kv_by_branch.get(self._MAIN_BRANCH)
 
         output = self.transformer(
             hidden_states,
@@ -745,7 +517,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             fps=fps,
             action_latents=action_latents,
             action_domain_ids=action_domain_ids,
-            paged_kv=paged_kv,
             dense_history=dense_history,
             dense_attention=dense_cache,
             condition_vision=condition_vision,
@@ -753,9 +524,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             frame_causal=frame_causal,
             history_window=(self.manifest.sink_frames, self.manifest.window_frames),
         )
-        if paged_state is not None:
-            paged_state.commit_paged_context(self._MAIN_BRANCH)
-        elif commit_current and dense_cache is not None:
+        if commit_current and dense_cache is not None:
             state.dense_kv_by_branch[self._MAIN_BRANCH] = dense_cache.commit(seq_len)
         elif commit_current:
             if dense_history is None and getattr(self.transformer, "_inductor_cudagraphs", False):
@@ -1022,7 +791,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         typed_tick: ARDiffusionTickRequest | None,
         stage_durations: dict[str, float],
     ) -> DiffusionOutput:
-        from vllm_omni.diffusion.utils.guardrail_utils import is_guardrails_enabled
+        from vllm_omni.diffusion.models.cosmos3.guardrails import is_guardrails_enabled
 
         metadata = {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(typed_tick).to_dict()} if typed_tick else {}
         # The legacy Cosmos3 postprocessor owns video guardrails. Keep that
@@ -1139,20 +908,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         except ValueError as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if typed_tick is not None:
-            if self._ar_diffusion_kv_state is None:
-                raise ARDiffusionRequestRejectedError(
-                    "Cosmos3-Nano-Sim-Bimanual typed ticks require ARDiffusionEngine session binding."
-                )
             if typed_tick.prompt is not None and typed_tick.prompt != prompt:
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos3-Nano-Sim-Bimanual ar_diffusion_tick.prompt must match the standard request prompt."
                 )
         session_id = controls.session_id
-        if self._bound_session_id is not None and session_id != self._bound_session_id:
-            raise ARDiffusionRequestRejectedError(
-                "Cosmos3-Nano-Sim-Bimanual request session "
-                f"{session_id!r} does not match bound session {self._bound_session_id!r}."
-            )
         self._request_session_id = session_id
 
         reset = controls.reset
@@ -1176,11 +936,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, None, self.resolution_policy)
         except (TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
-        if self._ar_diffusion_kv_state is not None:
-            # The runner resolved the same serialized H/W to select this pool.
-            # A mismatch here is an internal invariant failure, not a client
-            # admission error, and therefore follows failed-forward cleanup.
-            self._validate_bound_kv_geometry(self._ar_diffusion_kv_state, geometry)
         fps = _admission_float(
             _first_not_none(
                 self._get_sp_param(sp, "resolved_frame_rate", None),
@@ -1244,11 +999,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             use_system_prompt=False,
         )
         real_text_kv_len = int(text_mask[0].sum().item())
-        if self._ar_diffusion_kv_state is not None and real_text_kv_len > self.manifest.text_cache_max_len:
-            raise ARDiffusionRequestRejectedError(
-                "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
-                f"{real_text_kv_len} > {self.manifest.text_cache_max_len}."
-            )
         fingerprint = self._fingerprint(
             text_ids,
             real_text_kv_len=real_text_kv_len,
@@ -1333,13 +1083,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos3-Nano-Sim-Bimanual full rollout target precedes existing "
                     "session state; session reset required."
-                )
-        if self.manifest.window_frames is None and self._ar_diffusion_kv_state is not None:
-            capacity = self._ar_diffusion_kv_state.kv_cache.spec.window_chunks
-            if target_frame > capacity:
-                raise ARDiffusionRequestRejectedError(
-                    f"Full-history rollout needs {target_frame} latent frames; allocated capacity is {capacity}. "
-                    "Set num_frames to the complete session length before starting the rollout."
                 )
         try:
             initial_latent = self._initial_condition_latent(prompt_data, sp, geometry)
@@ -1593,6 +1336,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             typed_tick=typed_tick,
             stage_durations=tick_durations,
         )
-        if close_session and self._ar_diffusion_kv_state is None:
+        if close_session:
             self._drop_session(session_id)
         return result

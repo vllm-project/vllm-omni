@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Keep VAE input pixels separate from the admitted generation geometry."""
 
 from types import SimpleNamespace

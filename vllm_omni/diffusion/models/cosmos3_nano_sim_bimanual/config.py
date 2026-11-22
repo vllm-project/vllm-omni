@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict schema-v1 artifact and deployment configuration for Cosmos3-Nano-Sim-Bimanual."""
 
 from __future__ import annotations
@@ -112,36 +111,6 @@ def validate_sim_parallel_config(config: Any) -> None:
             raise ValueError(f"Cosmos Sim does not support {field}>1: {reason}")
     if getattr(parallel, "enable_expert_parallel", False):
         raise ValueError("Cosmos Sim uses dense MLP blocks; there are no experts to distribute")
-
-
-def validate_ar_diffusion_kv_overrides(config: Any, manifest: Cosmos3NanoSimBimanualManifest) -> None:
-    """Reject AR-Diffusion runner overrides that contradict the manifest history policy.
-
-    The attention mask follows the manifest, so a different paged window, sink,
-    or boundary reset would desynchronize it from the pool. A full-history
-    manifest may cap its pool with ``window_chunks``.
-    """
-    raw = deploy_option(config, "ar_diffusion_kv_config")
-    if raw is None:
-        return
-
-    def value(name: str) -> Any:
-        return raw.get(name) if isinstance(raw, dict) else getattr(raw, name, None)
-
-    window, sinks = value("window_chunks"), value("sink_chunks")
-    conflicts = []
-    if window and manifest.window_frames is not None and window != manifest.window_frames:
-        conflicts.append(f"window_chunks={window} (manifest window_frames={manifest.window_frames})")
-    if sinks and sinks != manifest.sink_frames:
-        conflicts.append(f"sink_chunks={sinks} (manifest sink_frames={manifest.sink_frames})")
-    if value("reset_at_boundary"):
-        conflicts.append("reset_at_boundary=True")
-    if conflicts:
-        raise ValueError(
-            "Cosmos3-Nano-Sim-Bimanual history comes from the checkpoint manifest or "
-            "kv_cache_inference_size/attention_sink_size; remove ar_diffusion_kv_config "
-            f"{', '.join(conflicts)}."
-        )
 
 
 def _exported_artifact_source(config: Any) -> dict[str, Any]:

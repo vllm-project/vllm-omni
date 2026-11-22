@@ -118,17 +118,6 @@ def _deployment_roots(config: Any) -> list[tuple[str, dict[str, Any]]]:
     return roots
 
 
-def deploy_option(config: Any, key: str, default: Any = None) -> Any:
-    """Read one deployment option without inspecting artifact envelopes."""
-    direct = getattr(config, key, None)
-    if direct is not None:
-        return direct
-    for _, root in _deployment_roots(config):
-        if root.get(key) is not None:
-            return root[key]
-    return default
-
-
 def _exact_fields(
     payload: Any, allowed: frozenset[str], name: str, optional: frozenset[str] = frozenset()
 ) -> dict[str, Any]:
@@ -200,11 +189,9 @@ class Cosmos3NanoSimAutoManifest:
     lidar_attends_captions: bool
     # Segmented prompting.
     text_sink_tokens: int
-    use_first_chunk_only: bool
     system_prompt_rgb: str
     system_prompt_joint: str
     fractional_duration: bool
-    emphasize_control_in_prompt: bool
     text_cache_max_len: int
     # mRoPE.
     temporal_modality_margin: int
@@ -322,16 +309,25 @@ class Cosmos3NanoSimAutoManifest:
             "media_text_extent": None,
             "media_rope_scale": 1.0,
             "sink_age_cap_seconds": None,
+            # The pipeline holds each camera's one caption for the whole horizon and
+            # appends no control directive (the Transfer pipelines' prompt suffix).
+            "use_first_chunk_only": True,
+            "emphasize_control_in_prompt": False,
         }
         for key, expected in expected_prompt.items():
-            if prompt[key] != expected:
-                raise ValueError(
-                    f"Cosmos3-Nano-Sim-Auto prompt.{key}={prompt[key]!r} is unsupported; expected {expected!r}."
-                )
+            value = prompt[key]
+            # ``1 == True`` in Python: a Boolean field must also hold a Boolean, and vice versa.
+            if value != expected or isinstance(value, bool) != isinstance(expected, bool):
+                raise ValueError(f"Cosmos3-Nano-Sim-Auto prompt.{key}={value!r} is unsupported; expected {expected!r}.")
         cache_chunks = _int(ring["cache_chunks"], "ring.cache_chunks", minimum=2)
         sink_chunks = _int(ring["sink_chunks"], "ring.sink_chunks", minimum=1)
-        if sink_chunks >= cache_chunks:
-            raise ValueError("Cosmos3-Nano-Sim-Auto ring must retain at least one non-sink chunk.")
+        # The paged ring maps ring slots to pool pages by slot order, which is commit
+        # order only with a single rotating slot; wider windows are not implemented.
+        if cache_chunks - sink_chunks != 1:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Auto ring must keep exactly one non-sink chunk (cache_chunks = sink_chunks + 1), "
+                f"got cache_chunks={cache_chunks}, sink_chunks={sink_chunks}."
+            )
         raw_t_list = sampler["t_list"]
         if not isinstance(raw_t_list, list) or not raw_t_list:
             raise ValueError("Cosmos3-Nano-Sim-Auto fixed_step_sampler_config.t_list must be a non-empty list.")
@@ -375,15 +371,11 @@ class Cosmos3NanoSimAutoManifest:
             cross_view_past_window_seconds=window,
             lidar_attends_captions=lidar_attends_captions,
             text_sink_tokens=_int(prompt["text_sink_tokens"], "prompt.text_sink_tokens", minimum=0),
-            use_first_chunk_only=_bool(prompt["use_first_chunk_only"], "prompt.use_first_chunk_only"),
             system_prompt_rgb=_str(prompt["system_prompt_rgb"], "prompt.system_prompt_rgb", choices=SYSTEM_PROMPT_IDS),
             system_prompt_joint=_str(
                 prompt["system_prompt_joint"], "prompt.system_prompt_joint", choices=SYSTEM_PROMPT_IDS
             ),
             fractional_duration=_bool(prompt["fractional_duration"], "prompt.fractional_duration"),
-            emphasize_control_in_prompt=_bool(
-                prompt["emphasize_control_in_prompt"], "prompt.emphasize_control_in_prompt"
-            ),
             text_cache_max_len=_int(prompt["text_cache_max_len"], "prompt.text_cache_max_len"),
             temporal_modality_margin=_int(
                 mrope["temporal_modality_margin"], "mrope.temporal_modality_margin", minimum=0
@@ -486,6 +478,5 @@ __all__ = [
     "COSMOS3_NANO_SIM_AUTO_ARTIFACT_KEY",
     "COSMOS3_NANO_SIM_AUTO_SCHEMA_VERSION",
     "Cosmos3NanoSimAutoManifest",
-    "deploy_option",
     "validate_sim_auto_parallel_config",
 ]

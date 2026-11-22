@@ -14,21 +14,13 @@ import torch
 from test_action_schema import manifest
 from test_rollout import SOURCE, fake_pipeline, request
 
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
-    Cosmos3NanoSimBimanualResolutionPolicy,
-    resolve_cosmos3_nano_sim_bimanual_geometry,
-)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     append_dense_kv_history,
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-from vllm_omni.experimental.ar_diffusion.capability import (
-    ARDiffusionCrossAttentionKVSpec,
-    ARDiffusionKVBranchSpec,
-    ARDiffusionKVCacheSpec,
-    ARDiffusionRequestKVSpec,
-    ARDiffusionRequestRejectedError,
-)
+from vllm_omni.errors import OmniClientError
+
+ARDiffusionRequestRejectedError = OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 SCHEDULES = [[1.0, 0.9375, 5 / 6, 0.625], [1.0, 5 / 6]]
@@ -39,13 +31,9 @@ def methods():
     cls = next(node for node in tree.body if getattr(node, "name", "") == "Cosmos3NanoSimBimanualPipeline")
     selected = {
         "_denoise_chunk",
-        "_kv_spec_for_geometry",
         "_append_dense_kv",
-        "_transformer_forward",
-        "_request_kv_spec",
-        "ar_diffusion_request_spec",
-        "_validate_bound_kv_geometry",
         "_ensure_text_kv",
+        "_transformer_forward",
     }
     body = [node for node in cls.body if getattr(node, "name", "") in selected]
     body += [node for node in tree.body if getattr(node, "name", "") == "_admission_int"]
@@ -54,12 +42,7 @@ def methods():
     )
     namespace = {
         "torch": torch,
-        "ARDiffusionKVCacheSpec": ARDiffusionKVCacheSpec,
-        "ARDiffusionRequestKVSpec": ARDiffusionRequestKVSpec,
         "ARDiffusionRequestRejectedError": ARDiffusionRequestRejectedError,
-        "resolve_cosmos3_nano_sim_bimanual_geometry": resolve_cosmos3_nano_sim_bimanual_geometry,
-        "ARDiffusionKVBranchSpec": ARDiffusionKVBranchSpec,
-        "ARDiffusionCrossAttentionKVSpec": ARDiffusionCrossAttentionKVSpec,
         "append_dense_kv_history": append_dense_kv_history,
         "logger": Mock(),
     }
@@ -99,21 +82,17 @@ def test_actual_scheduler_uses_checkpoint_sigmas_and_existing_rng(frame, sigmas)
     pipe._reset_mixed_precision.assert_called_once()
 
 
-def test_full_history_reaches_dense_paged_and_batched_paths():
+def test_full_history_reaches_dense_batched_path():
     pipe = methods()()
     pipe.manifest = replace(manifest(), window_frames=None, sink_frames=0)
     pipe._MAIN_BRANCH = "main"
-    pipe._SESSION_CAPACITY = 1
-    pipe.transformer = Mock(num_hidden_layers=1, num_kv_heads_local=1, head_dim=8)
+    pipe.transformer = Mock()
     geometry = SimpleNamespace(tokens_per_frame=lambda _: 1)
-    spec = pipe._kv_spec_for_geometry(geometry, full_history_frames=226)
-    assert spec.window_frames == 226 and spec.sink_frames == 0
     state = SimpleNamespace(dense_kv_by_branch={})
     for frame in range(226):
         value = torch.tensor([[[float(frame)]]])
         pipe._append_dense_kv(state, [(value, value)], geometry)
     assert state.dense_kv_by_branch["main"][0][0].flatten().tolist() == list(range(226))
-    pipe._ar_diffusion_kv_state = None
     state.dense_attention = None
     pipe._transformer_forward(
         state,
@@ -137,7 +116,6 @@ def test_full_history_reaches_dense_paged_and_batched_paths():
 def test_dense_text_kv_is_not_capped_by_manifest_cache_length():
     pipe = methods()()
     pipe._MAIN_BRANCH = "main"
-    pipe._ar_diffusion_kv_state = None
     cached = [(torch.ones(1, 513, 1), torch.ones(1, 513, 1))]
     pipe.transformer = Mock()
     pipe.transformer.encode_und_kv.return_value = (cached, 513)
@@ -163,18 +141,3 @@ def test_checkpoint_schedule_changes_session_fingerprint():
     pipe.manifest = replace(pipe.manifest, t_list=(1.0, 0.9, 0.8, 0.6))
     with pytest.raises(ARDiffusionRequestRejectedError, match="manifest_id|sampler_id|inference_id"):
         pipe.forward(request(17, output_type="latent", chunk_only=True, num_latent_frames=2, reset=False))
-
-
-@pytest.mark.parametrize("pixels,expected", [(65, 17), (257, 65), (901, 226)])
-def test_full_history_allocation_follows_request(pixels, expected):
-    pipe = methods()()
-    pipe.manifest = replace(manifest(), window_frames=None, sink_frames=0)
-    pipe.resolution_policy = Cosmos3NanoSimBimanualResolutionPolicy(default_resolution=(32, 32))
-    pipe.transformer = Mock(num_hidden_layers=1, num_kv_heads_local=1, head_dim=8)
-    pipe._MAIN_BRANCH, pipe._SESSION_CAPACITY = "main", 1
-    req = SimpleNamespace(sampling_params=SimpleNamespace(height=32, width=32, num_frames=pixels))
-    spec = pipe.ar_diffusion_request_spec(req)
-    assert spec.kv_spec.window_frames == expected
-    assert spec.geometry_key == ((32, 32), expected)
-    pipe.manifest = replace(pipe.manifest, window_frames=96)
-    assert pipe.ar_diffusion_request_spec(req).kv_spec.window_frames == 96

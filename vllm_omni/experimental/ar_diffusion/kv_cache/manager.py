@@ -17,6 +17,7 @@ import os
 from collections.abc import Callable, Collection, Iterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, cast
 
 import torch
@@ -30,12 +31,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.diffusion.diffusion_kv.layout import build_kv_cache_tensor
-from vllm_omni.experimental.ar_diffusion.capability import (
-    ARDiffusionCrossAttentionKVSpec,
-    ARDiffusionKVBranchSpec,
-    ARDiffusionKVCacheSpec,
-    ARDiffusionSegmentedKVSpec,
-)
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec, ARDiffusionSegmentedKVSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
     KV_GATHER_ENV,
     ARDiffusionKVConfig,
@@ -54,6 +50,75 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import SegmentedStaging
 
 _log = init_logger(__name__)
+
+
+def _cross_pool_bytes(
+    length: int,
+    heads: int,
+    *,
+    num_branches: int,
+    head_size: int,
+    dtype: torch.dtype,
+    num_layers: int,
+) -> int:
+    """Bytes one linear-attention session needs for its cross-attention K/V."""
+    return int(2 * num_branches * length * heads * head_size * dtype.itemsize * num_layers)
+
+
+def _required_managed_blocks(
+    capacity: int,
+    *,
+    num_local_kv_branches: int,
+    segmented: SegmentedStaging | None,
+    block_size: int,
+    resident_frames: int,
+    blocks_per_frame: int,
+    frames_per_block: int,
+) -> int:
+    """Managed blocks needed to hold ``capacity`` resident sessions.
+
+    Every term here counts *frames*, so each is converted to blocks. Before
+    block size and frame size were allowed to differ this conversion was the
+    identity and the frame counts could be used directly; they cannot once a
+    frame spans several blocks.
+
+    Converting rather than rewriting keeps the budget the same number of
+    *tokens* it always was, so a finer block size does not inflate the
+    requirement -- it only stops the final block of each term from rounding up
+    a whole frame's worth of memory.
+    """
+    if segmented is not None:
+        return (
+            num_local_kv_branches
+            * (capacity * segmented.retained_blocks(block_size) + segmented.pending_blocks(block_size))
+            + 2
+        )
+    per_session_blocks = resident_frames * blocks_per_frame
+    in_flight_blocks = frames_per_block * blocks_per_frame
+    headroom_blocks = 2 * blocks_per_frame
+    return num_local_kv_branches * (capacity * per_session_blocks + in_flight_blocks) + headroom_blocks
+
+
+def _session_required_bytes(
+    capacity: int,
+    *,
+    scratch_reserved_bytes: int,
+    superpage_reserved_bytes: int,
+    history_staging_reserved_bytes: int,
+    cross_attention_bytes_per_session: int,
+    model_owned_state_bytes_per_session: int,
+    managed_blocks_for: Callable[[int], int],
+    page_size_bytes: int,
+) -> int:
+    """Total device bytes needed to hold ``capacity`` resident sessions."""
+    return (
+        scratch_reserved_bytes
+        + superpage_reserved_bytes
+        + history_staging_reserved_bytes
+        + capacity * cross_attention_bytes_per_session
+        + capacity * model_owned_state_bytes_per_session
+        + managed_blocks_for(capacity) * page_size_bytes
+    )
 
 
 class ARDiffusionRequestAdapter:
@@ -136,189 +201,6 @@ def compute_num_blocks(
         raise ValueError(f"gpu_memory_fraction must be in (0, 1], got {gpu_memory_fraction}")
     budget = int(available_bytes * gpu_memory_fraction)
     return max(0, budget // page_size_bytes)
-
-
-@dataclass(frozen=True)
-class ARDiffusionKVCacheMemoryEstimate:
-    """Side-effect-free memory accounting for one prospective KV pool.
-
-    The single source of the pool's memory rules: ``ARDiffusionKVCache`` sizes
-    itself from it, and the runner uses it to admit a replacement pool before
-    releasing the current one.
-    """
-
-    page_size_bytes: int
-    scratch_blocks_per_local_branch: int
-    scratch_num_blocks: int
-    scratch_reserved_bytes: int
-    managed_num_blocks: int
-    history_staging_tokens: int
-    history_staging_reserved_bytes: int
-    cross_attention_bytes_per_session: int
-    cross_attention_reserved_bytes: int
-    model_owned_state_reserved_bytes: int
-    required_bytes: int
-
-
-def ar_diffusion_scratch_blocks_override() -> int:
-    """Read and validate the optional process-wide scratch-block floor."""
-
-    raw = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
-    try:
-        value = int(raw) if raw is not None else 0
-    except ValueError as exc:
-        raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be an integer") from exc
-    if value < 0:
-        raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
-    return value
-
-
-def _superpage_private_pages(
-    config: ARDiffusionKVConfig,
-    block_size: int,
-    max_scratch_tokens_per_branch: int,
-    segmented: ARDiffusionSegmentedKVSpec | None,
-) -> int:
-    if not config.superpage_tokens:
-        return 0
-    if segmented is not None or config.reuse_history_staging or contiguous_kv_gather_enabled():
-        raise ValueError(
-            "superpage_tokens is incompatible with segmented KV, reuse_history_staging or contiguous gather"
-        )
-    if max_scratch_tokens_per_branch:
-        raise ValueError("superpage_tokens does not support action/state KV tokens")
-    if block_size != config.superpage_tokens:
-        raise ValueError("superpage manager pages must match the configured superpage size")
-    # The sink starts at zero and has one boundary. Recent history has two.
-    boundaries = int(config.sink_chunks > 0) + 2
-    return -(-(boundaries * (block_size - 1)) // block_size)
-
-
-def estimate_ar_diffusion_kv_cache_memory(
-    config: ARDiffusionKVConfig,
-    spec: ARDiffusionKVCacheSpec,
-    dtype: torch.dtype,
-    *,
-    session_capacity: int = 1,
-    scratch_blocks_override: int = 0,
-    block_size: int | None = None,
-) -> ARDiffusionKVCacheMemoryEstimate:
-    """Estimate all pool allocations without constructing managers or tensors."""
-
-    if session_capacity <= 0:
-        raise ValueError(f"session_capacity must be positive, got {session_capacity}")
-    if scratch_blocks_override < 0:
-        raise ValueError("scratch_blocks_override must be non-negative")
-    if config.window_chunks is None:
-        raise ValueError("AR-Diffusion memory estimation requires a bounded window")
-    if config.chunk_size != spec.tokens_per_frame:
-        raise ValueError(
-            "AR-Diffusion effective config chunk_size must equal tokens_per_frame: "
-            f"{config.chunk_size} != {spec.tokens_per_frame}"
-        )
-
-    if block_size is None:
-        block_size = config.superpage_tokens or (spec.segmented.block_size if spec.segmented else spec.tokens_per_frame)
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}")
-    blocks_per_frame = -(-spec.tokens_per_frame // block_size)
-    page_size_bytes = int(2 * block_size * spec.num_kv_heads * spec.head_size * dtype.itemsize * spec.num_layers)
-    scratch_frames = spec.frames_per_block
-    if spec.max_scratch_frames_per_branch is not None:
-        scratch_frames = spec.max_scratch_frames_per_branch
-    extra_scratch_blocks = -(-spec.max_scratch_tokens_per_branch // block_size)
-    if spec.tokens_per_frame % block_size and spec.max_scratch_tokens_per_branch:
-        extra_scratch_blocks = max(1, scratch_frames) * -(
-            -(block_size - 1 + spec.max_scratch_tokens_per_branch) // block_size
-        )
-    scratch_blocks_per_local_branch = max(
-        scratch_frames * blocks_per_frame + extra_scratch_blocks,
-        scratch_blocks_override,
-    )
-    if spec.segmented is not None:
-        # Live rows use contiguous staging; only committed segments own pages.
-        scratch_blocks_per_local_branch = 0
-    scratch_num_blocks = spec.num_local_kv_branches * scratch_blocks_per_local_branch
-    scratch_reserved_bytes = scratch_num_blocks * page_size_bytes
-    # Every resident session needs a complete sink + window; only one request
-    # can be in flight, so frames_per_block is counted once. Each frame term is
-    # converted to blocks, which keeps the budget the same number of tokens
-    # when a frame spans several blocks.
-    managed_num_blocks = (
-        spec.num_local_kv_branches
-        * (session_capacity * (spec.sink_frames + spec.window_frames) + spec.frames_per_block)
-        * blocks_per_frame
-        + 2 * blocks_per_frame
-    )
-    # History staging is one contiguous K and V buffer per layer (per local
-    # branch when segmented). It is allocated lazily on the first prepared
-    # forward, after admission, so it is reserved here or that forward could
-    # run out of memory.
-    history_staging_tokens = 0
-    staging_buffers = 1
-    if spec.segmented is not None:
-        managed_num_blocks = (
-            spec.num_local_kv_branches
-            * (
-                session_capacity * spec.segmented.retained_blocks(block_size)
-                + spec.segmented.pending_blocks(block_size)
-            )
-            + 2
-        )
-        history_staging_tokens = spec.segmented.initial_staging_tokens
-        staging_buffers = spec.num_local_kv_branches
-    elif config.reuse_history_staging and contiguous_kv_gather_enabled():
-        # Pad to the width build_block_table uses, plus its action-capacity block.
-        window_blocks = visible_window_blocks(
-            chunk_size=config.chunk_size,
-            block_size=block_size,
-            sink_tokens=config.sink_chunks * config.chunk_size,
-            window_tokens=config.window_chunks * config.chunk_size,
-        )
-        history_staging_tokens = (window_blocks + 1) * block_size
-    history_staging_reserved_bytes = int(
-        2
-        * spec.num_layers
-        * staging_buffers
-        * history_staging_tokens
-        * spec.num_kv_heads
-        * spec.head_size
-        * dtype.itemsize
-    )
-    cross_attention_bytes_per_session = int(
-        2
-        * len(spec.kv_branches)
-        * sum(cache.num_tokens * (cache.num_kv_heads or spec.num_kv_heads) for cache in spec.cross_attention)
-        * spec.head_size
-        * dtype.itemsize
-        * spec.num_layers
-    )
-    cross_attention_reserved_bytes = session_capacity * cross_attention_bytes_per_session
-    model_owned_state_reserved_bytes = session_capacity * spec.model_owned_state_bytes_per_session
-    superpage_reserved_bytes = page_size_bytes * _superpage_private_pages(
-        config, block_size, spec.max_scratch_tokens_per_branch, spec.segmented
-    )
-    required_bytes = (
-        scratch_reserved_bytes
-        + superpage_reserved_bytes
-        + managed_num_blocks * page_size_bytes
-        + cross_attention_reserved_bytes
-        + model_owned_state_reserved_bytes
-        + history_staging_reserved_bytes
-    )
-    return ARDiffusionKVCacheMemoryEstimate(
-        page_size_bytes=page_size_bytes,
-        scratch_blocks_per_local_branch=scratch_blocks_per_local_branch,
-        scratch_num_blocks=scratch_num_blocks,
-        scratch_reserved_bytes=scratch_reserved_bytes,
-        managed_num_blocks=managed_num_blocks,
-        history_staging_tokens=history_staging_tokens,
-        history_staging_reserved_bytes=history_staging_reserved_bytes,
-        cross_attention_bytes_per_session=cross_attention_bytes_per_session,
-        cross_attention_reserved_bytes=cross_attention_reserved_bytes,
-        model_owned_state_reserved_bytes=model_owned_state_reserved_bytes,
-        required_bytes=required_bytes,
-    )
 
 
 def build_kv_manager(
@@ -440,9 +322,7 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
         self.max_scratch_frames_per_branch = int(
             frames_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
         )
-        self.max_scratch_tokens_per_branch = int(max_scratch_tokens_per_branch)
         self.block_size = block_size
-        self.max_model_len = max_model_len
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
@@ -478,11 +358,17 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
         self.superpage_plan: tuple | None = None
         self.superpage_metadata: tuple | None = None
         if self.superpage_size:
-            if block_size % self.visibility_block_size:
+            if segmented is not None or config.reuse_history_staging or contiguous_kv_gather_enabled():
+                raise ValueError(
+                    "superpage_tokens is incompatible with segmented KV, reuse_history_staging or contiguous gather"
+                )
+            if max_scratch_tokens_per_branch:
+                raise ValueError("superpage_tokens does not support action/state KV tokens")
+            if block_size != self.superpage_size or block_size % self.visibility_block_size:
                 raise ValueError("superpage manager pages must be a multiple of the baseline visibility unit")
-            self.superpage_private_pages = _superpage_private_pages(
-                config, block_size, max_scratch_tokens_per_branch, segmented
-            )
+            # Sink starts at zero: one boundary. Recent has two boundaries.
+            boundaries = int(config.sink_chunks > 0) + 2
+            self.superpage_private_pages = -(-(boundaries * (block_size - 1)) // block_size)
         self.superpage_reserved_bytes = (
             2 * num_layers * self.superpage_private_pages * block_size * num_kv_heads * head_size * dtype.itemsize
         )
@@ -499,72 +385,122 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
             reset_at_boundary=config.reset_at_boundary,
         )
 
-        override_blocks = ar_diffusion_scratch_blocks_override()
-        self.blocks_per_frame = -(-config.chunk_size // block_size)
+        # Scratch blocks are outside KVCacheManager ownership. A non-committing
+        # forward needs one block per current frame plus space for any
+        # model-declared action/state tokens that coexist with video KV.
+        declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
+        # frames_per_block counts *frames*; convert to blocks rather than
+        # assuming one block per frame. A frame spans ceil(chunk_size /
+        # block_size) blocks once the two sizes are allowed to differ.
+        blocks_per_frame = -(-config.chunk_size // block_size)
+        self.blocks_per_frame = blocks_per_frame
+        minimum_scratch_blocks = self.max_scratch_frames_per_branch * blocks_per_frame + declared_scratch_blocks
+        override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
+        override_blocks = int(override) if override is not None else 0
+        if override_blocks < 0:
+            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
+        scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
+        if segmented is not None:
+            # Segmented attention writes live rows into contiguous staging;
+            # only clean, immutable segments need physical KV pages.
+            scratch_per_kv_branch = 0
+        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
+        self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
 
-        effective_spec = ARDiffusionKVCacheSpec(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            tokens_per_frame=config.chunk_size,
-            frames_per_block=frames_per_block,
-            window_frames=config.window_chunks,
-            sink_frames=config.sink_chunks,
-            reset_at_boundary=config.reset_at_boundary,
-            kv_branches=kv_branches,
-            session_capacity=session_capacity,
-            cross_attention=tuple(
-                ARDiffusionCrossAttentionKVSpec(name, length, self.cross_attention_kv_heads[name])
-                for name, length in self.cross_attention_lengths.items()
-            ),
-            max_model_len=max_model_len,
-            max_scratch_frames_per_branch=max_scratch_frames_per_branch,
-            max_scratch_tokens_per_branch=max_scratch_tokens_per_branch,
-            model_owned_state_bytes_per_session=model_owned_state_bytes_per_session,
-            segmented=segmented,
-        )
-
-        def estimate(capacity: int) -> ARDiffusionKVCacheMemoryEstimate:
-            return estimate_ar_diffusion_kv_cache_memory(
-                config,
-                effective_spec,
-                dtype,
-                session_capacity=capacity,
-                scratch_blocks_override=override_blocks,
-                block_size=block_size,
-            )
-
-        one_session = estimate(1)
-        page_size_bytes = one_session.page_size_bytes
-        self.scratch_blocks_per_kv_branch = one_session.scratch_blocks_per_local_branch
-        self.scratch_num_blocks = one_session.scratch_num_blocks
-        self.scratch_reserved_bytes = one_session.scratch_reserved_bytes
-        self.history_staging_tokens = one_session.history_staging_tokens
-        self.history_staging_reserved_bytes = one_session.history_staging_reserved_bytes
-        self.cross_attention_bytes_per_session = one_session.cross_attention_bytes_per_session
-        self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
-        if segmented is None and config.reuse_history_staging and not contiguous_kv_gather_enabled():
-            _log.warning(
-                "reuse_history_staging is set but the contiguous K/V gather path (%s=1) is off: "
-                "staging has no consumer and is neither budgeted nor allocated.",
-                KV_GATHER_ENV,
-            )
-
-        # The self-attention pool, scratch pool, staging, and lazily
-        # materialized cross-attention caches share one hard memory budget.
-        # Select the largest feasible resident-session count rather than raising
-        # a block-count floor past that budget.
+        # The self-attention pool, scratch pool, and lazily materialized
+        # cross-attention caches share one hard memory budget. Select the largest
+        # feasible resident-session count rather than raising a block-count floor
+        # past that budget. All resident sessions need a complete sink + window;
+        # only one request can be in flight, so frames_per_block is counted once.
+        page_size_bytes = self.spec.page_size_bytes * num_layers
         self.available_memory_bytes = available_bytes
         self.configured_memory_budget_bytes = int(available_bytes * config.gpu_memory_fraction)
         # Reuse the public helper's validation for the memory fraction/page size.
         compute_num_blocks(available_bytes, config.gpu_memory_fraction, page_size_bytes)
-        if one_session.required_bytes > available_bytes:
+        self.scratch_reserved_bytes = self.scratch_num_blocks * page_size_bytes
+        self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
+        self.cross_attention_bytes_per_session = sum(
+            _cross_pool_bytes(
+                length,
+                self.cross_attention_kv_heads[name],
+                num_branches=len(self.kv_branches),
+                head_size=head_size,
+                dtype=dtype,
+                num_layers=num_layers,
+            )
+            for name, length in self.cross_attention_lengths.items()
+        )
+
+        resident_frames = config.sink_chunks + config.window_chunks
+        required_managed_blocks = partial(
+            _required_managed_blocks,
+            num_local_kv_branches=self.num_local_kv_branches,
+            segmented=segmented,
+            block_size=block_size,
+            resident_frames=resident_frames,
+            blocks_per_frame=self.blocks_per_frame,
+            frames_per_block=self.frames_per_block,
+        )
+
+        # reuse_history_staging keeps one contiguous K and V buffer per layer,
+        # sized to the padded visible window (sink + window plus the
+        # action-capacity block build_block_table always reserves), for the
+        # whole worker. It is allocated lazily on the first prepared forward,
+        # which is after admission, so it has to be reserved here or admission
+        # can succeed and that first forward run out of memory. Only the
+        # contiguous-gather attention path consumes it.
+        self.history_staging_reserved_bytes = 0
+        self.history_staging_tokens = 0
+        if segmented is not None:
+            self.history_staging_tokens = segmented.initial_staging_tokens
+            self.history_staging_reserved_bytes = int(
+                2
+                * num_layers
+                * self.num_local_kv_branches
+                * self.history_staging_tokens
+                * num_kv_heads
+                * head_size
+                * dtype.itemsize
+            )
+        elif config.reuse_history_staging:
+            if contiguous_kv_gather_enabled():
+                # The same width build_block_table pads to: a sink or window
+                # that is not a whole number of blocks spans one more block.
+                window_blocks = visible_window_blocks(
+                    chunk_size=config.chunk_size,
+                    block_size=block_size,
+                    sink_tokens=config.sink_chunks * config.chunk_size,
+                    window_tokens=self.spec.sliding_window,
+                )
+                self.history_staging_tokens = (window_blocks + 1) * block_size
+                self.history_staging_reserved_bytes = int(
+                    2 * num_layers * self.history_staging_tokens * num_kv_heads * head_size * dtype.itemsize
+                )
+            else:
+                _log.warning(
+                    "reuse_history_staging is set but the contiguous K/V gather path (%s=1) is off: "
+                    "staging has no consumer and is neither budgeted nor allocated.",
+                    KV_GATHER_ENV,
+                )
+        required_bytes = partial(
+            _session_required_bytes,
+            scratch_reserved_bytes=self.scratch_reserved_bytes,
+            superpage_reserved_bytes=self.superpage_reserved_bytes,
+            history_staging_reserved_bytes=self.history_staging_reserved_bytes,
+            cross_attention_bytes_per_session=self.cross_attention_bytes_per_session,
+            model_owned_state_bytes_per_session=self.model_owned_state_bytes_per_session,
+            managed_blocks_for=required_managed_blocks,
+            page_size_bytes=page_size_bytes,
+        )
+
+        one_session_bytes = required_bytes(1)
+        if one_session_bytes > available_bytes:
             raise ValueError(
                 "AR-Diffusion available device memory cannot fit one session: "
-                f"available={available_bytes} bytes, required={one_session.required_bytes} bytes "
+                f"available={available_bytes} bytes, required={one_session_bytes} bytes "
                 "(managed self-attention + cross-attention + scratch + model-owned state + K/V staging)."
             )
-        self.memory_budget_bytes = max(self.configured_memory_budget_bytes, one_session.required_bytes)
+        self.memory_budget_bytes = max(self.configured_memory_budget_bytes, one_session_bytes)
         if self.memory_budget_bytes > self.configured_memory_budget_bytes:
             _log.warning(
                 "AR-Diffusion raised the configured memory budget from %d to %d bytes "
@@ -573,16 +509,19 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
                 self.memory_budget_bytes,
             )
 
-        effective_capacity, reserved = 1, one_session
-        for candidate in range(session_capacity, 1, -1):
-            candidate_estimate = estimate(candidate)
-            if candidate_estimate.required_bytes <= self.memory_budget_bytes:
-                effective_capacity, reserved = candidate, candidate_estimate
+        effective_capacity = 0
+        effective_managed_blocks = 0
+        for candidate in range(session_capacity, 0, -1):
+            candidate_managed_blocks = required_managed_blocks(candidate)
+            if required_bytes(candidate) <= self.memory_budget_bytes:
+                effective_capacity = candidate
+                effective_managed_blocks = candidate_managed_blocks
                 break
+        assert effective_capacity > 0
 
         self.session_capacity = effective_capacity
-        self.cross_attention_reserved_bytes = reserved.cross_attention_reserved_bytes
-        self.model_owned_state_reserved_bytes = reserved.model_owned_state_reserved_bytes
+        self.cross_attention_reserved_bytes = self.cross_attention_bytes_per_session * effective_capacity
+        self.model_owned_state_reserved_bytes = self.model_owned_state_bytes_per_session * effective_capacity
         self_attn_budget_bytes = (
             self.memory_budget_bytes
             - self.scratch_reserved_bytes
@@ -592,7 +531,7 @@ class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
             - self.model_owned_state_reserved_bytes
         )
         num_blocks = self_attn_budget_bytes // page_size_bytes
-        assert num_blocks >= reserved.managed_num_blocks
+        assert num_blocks >= effective_managed_blocks
         if effective_capacity < session_capacity:
             _log.warning(
                 "AR-Diffusion resident session capacity reduced from %d to %d by the KV memory budget",

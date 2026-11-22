@@ -6,8 +6,6 @@ pipeline: cosmos3_nano_sim_auto
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16
-default_resolution: [480, 832]
-max_pixels: 921600
 
 stages:
   - stage_id: 0

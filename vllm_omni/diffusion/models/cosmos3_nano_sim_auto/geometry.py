@@ -41,14 +41,6 @@ def lidar_num_sweeps(num_frames: int, *, camera_fps: float, lidar_fps: float) ->
     return max(1, round(num_frames * lidar_fps / camera_fps))
 
 
-def lidar_sweep_ids(num_sweeps: int, *, camera_fps: float, lidar_fps: float) -> tuple[int, ...]:
-    """Camera-clock source frame id of every sweep (``round(i * camera_fps / lidar_fps)``)."""
-    if num_sweeps < 1:
-        raise ValueError(f"num_sweeps must be positive, got {num_sweeps}.")
-    stride = camera_fps / lidar_fps
-    return tuple(round(index * stride) for index in range(num_sweeps))
-
-
 @dataclass(frozen=True)
 class Chunk:
     """One causal step on the shared RGB/LiDAR clock.
@@ -63,10 +55,6 @@ class Chunk:
     lidar_sweeps: tuple[int, ...]
     rgb_prefix_end: int
     lidar_prefix_end: int
-
-    @property
-    def is_first(self) -> bool:
-        return self.step == 0
 
 
 def build_chunk_schedule(
@@ -116,6 +104,25 @@ def build_chunk_schedule(
             raise ValueError(f"Joint chunk {step} must contain both RGB latents and LiDAR sweeps, got {chunk}.")
         chunks.append(chunk)
     return tuple(chunks)
+
+
+def max_sweeps_per_chunk(*, frames_per_chunk: int, rgb_seconds_per_frame: float, lidar_seconds_per_frame: float) -> int:
+    """Most LiDAR sweeps :func:`build_chunk_schedule` puts in one step, over every horizon.
+
+    Step ``k >= 1`` owns the sweeps ``s`` with ``k - 1 < s * r - 1e-5 <= k``
+    (``r = lidar_seconds / chunk_seconds``): a half-open span ``1 / r`` sweeps
+    long. It holds exactly ``1 / r`` sweeps when that is an integer and at most
+    its ceiling otherwise, so rounding the ratio would undercount some chunks.
+    Step 0 owns sweep 0 alone.
+    """
+    if frames_per_chunk < 1:
+        raise ValueError(f"frames_per_chunk must be positive, got {frames_per_chunk}.")
+    for name, value in (("rgb", rgb_seconds_per_frame), ("lidar", lidar_seconds_per_frame)):
+        if not (math.isfinite(value) and value > 0):
+            raise ValueError(f"{name}_seconds_per_frame must be finite and positive, got {value}.")
+    sweeps = frames_per_chunk * rgb_seconds_per_frame / lidar_seconds_per_frame
+    # The tolerance absorbs float error of an integer ratio (e.g. 0.4 / 0.1).
+    return max(1, math.ceil(sweeps - 1e-6))
 
 
 @dataclass(frozen=True)

@@ -62,9 +62,8 @@ model_config:
 ```
 
 - `engine_backend: default` selects dense attention. It used less peak memory
-  with comparable latency in the Bimanual benchmark. The supplied deployment
-  instead selects `vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine`
-  for paged KV storage.
+  with comparable latency in the Bimanual benchmark and is the path used by
+  the supplied deployments.
 - Regional `torch.compile` optimizes transformer blocks; `use_cuda_graphs: true`
   enables Inductor CUDA graph replay to reduce launch overhead and requires
   `enforce_eager: false`.
@@ -75,8 +74,8 @@ model_config:
 - `vae_fast_path: channels_last` optimizes VAE decoding with channels-last memory
   layout to reduce decode time.
 
-`kv_cache_inference_size` and `attention_sink_size` configure sliding history for
-both attention backends without changing the checkpoint manifest. Units are
+`kv_cache_inference_size` and `attention_sink_size` configure sliding history
+without changing the checkpoint manifest. Units are
 latent frames: 64 with 8 sinks retains 8 initial frames and up to 55 recent past
 frames, reserving 1 position for the current frame. Other valid cache/sink sizes
 are supported. Changing the history window can change generated outputs.

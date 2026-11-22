@@ -471,6 +471,56 @@ def _materialize(
     )
 
 
+def _plan_tables(
+    current: TokenMetadata, history: Sequence[RingSlot], captions: CaptionMetadata, window_seconds: float
+) -> tuple[RunTable, tuple[RunTable, RunTable, RunTable], torch.Tensor]:
+    """Query runs, key runs per stream and the run-level replay truth table ``[Q, K]``."""
+    query_runs = sensor_runs(current, stream=STREAM_CURRENT)
+    key_tables = (query_runs, history_runs(history), caption_runs(captions))
+    allowed = torch.cat([pair_allowed(query_runs, table, window_seconds=window_seconds) for table in key_tables], 1)
+    return query_runs, key_tables, allowed
+
+
+def causal_plan_key(
+    *,
+    current: TokenMetadata,
+    history: Sequence[RingSlot],
+    captions: CaptionMetadata,
+    window_seconds: float,
+    reuse_control_kv: bool = False,
+) -> tuple:
+    """Exact cache key of :func:`build_causal_maskless_plan` for the same inputs.
+
+    A plan is built from the run layouts (starts, lengths, views, roles), the
+    ring slots' virtual ranges and the run-level truth table, nothing else.
+    Timestamps and steps enter only through the truth table, so equal keys mean
+    equal passes and staging rows wherever the chunk sits in the rollout and
+    whichever slot holds which chunk. The table is cheap next to a plan build.
+    """
+    query_runs, (_, history_table, caption_table), allowed = _plan_tables(current, history, captions, window_seconds)
+    slots = torch.tensor([(slot.base, slot.metadata.num_tokens) for slot in history], dtype=torch.int64)
+    tensors = (
+        query_runs.start,
+        query_runs.length,
+        query_runs.view_id,
+        query_runs.role,
+        history_table.start,
+        history_table.length,
+        history_table.view_id,
+        caption_table.start,
+        caption_table.length,
+        caption_table.view_id,
+        slots,
+        allowed,
+    )
+    return (
+        reuse_control_kv,
+        current.num_tokens,
+        captions.num_tokens,
+        *((tuple(tensor.shape), tensor.numpy().tobytes()) for tensor in tensors),
+    )
+
+
 def build_causal_maskless_plan(
     *,
     current: TokenMetadata,
@@ -502,9 +552,7 @@ def build_causal_maskless_plan(
     device = torch.device(device)
     if current.num_tokens == 0:
         raise ValueError("The current chunk has no GEN tokens.")
-    query_runs = sensor_runs(current, stream=STREAM_CURRENT)
-    key_tables = (query_runs, history_runs(history), caption_runs(captions))
-    allowed = torch.cat([pair_allowed(query_runs, table, window_seconds=window_seconds) for table in key_tables], 1)
+    query_runs, key_tables, allowed = _plan_tables(current, history, captions, window_seconds)
     num_history_tokens = max((slot.base + slot.metadata.num_tokens for slot in history), default=0)
     staging, key_starts = _stage_keys(
         current,

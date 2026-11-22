@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Read production sampling and unified actions from checkpoint metadata."""
 
 import json
@@ -35,8 +34,6 @@ def test_prepared_actions_are_not_normalized_twice():
     y = pipe._prepare_action(embodiment="agibotworld", action_value=x, action_space="normalized_unified_v1")
     assert torch.equal(y[:, :59].float(), x)
     assert y.shape == (2, 64) and not torch.count_nonzero(y[:, 59:])
-    with pytest.raises(ValueError, match="normalized_unified_v1"):
-        pipe._prepare_action(embodiment="agibotworld", action_value=x, action_space="raw")
 
 
 def test_per_row_domains_follow_action_chunks():

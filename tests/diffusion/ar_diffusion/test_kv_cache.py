@@ -31,52 +31,6 @@ BLOCK = 16
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("tokens_per_frame", [16, 32, 30, 1560])
-def test_memory_estimate_matches_pool_with_separate_paging_size(tokens_per_frame):
-    from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionCrossAttentionKVSpec, ARDiffusionKVCacheSpec
-    from vllm_omni.experimental.ar_diffusion.kv_cache import estimate_ar_diffusion_kv_cache_memory
-
-    config = ARDiffusionKVConfig(enable=True, chunk_size=tokens_per_frame, window_chunks=2, sink_chunks=1)
-    spec = ARDiffusionKVCacheSpec(
-        num_layers=1,
-        num_kv_heads=2,
-        head_size=64,
-        tokens_per_frame=tokens_per_frame,
-        frames_per_block=2,
-        max_scratch_frames_per_branch=4,
-        max_scratch_tokens_per_branch=19,
-        window_frames=2,
-        sink_frames=1,
-        session_capacity=1,
-        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
-        cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 5, 4),),
-        model_owned_state_bytes_per_session=100,
-    )
-    estimate = estimate_ar_diffusion_kv_cache_memory(config, spec, torch.float32, block_size=BLOCK)
-    cache = ARDiffusionKVCache(
-        config,
-        num_layers=spec.num_layers,
-        num_kv_heads=spec.num_kv_heads,
-        head_size=spec.head_size,
-        dtype=torch.float32,
-        block_size=BLOCK,
-        max_model_len=spec.max_model_len,
-        available_bytes=estimate.required_bytes,
-        kv_branches=spec.kv_branches,
-        session_capacity=1,
-        frames_per_block=spec.frames_per_block,
-        max_scratch_frames_per_branch=spec.max_scratch_frames_per_branch,
-        max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
-        cross_attention_lengths=spec.cross_attention_lengths,
-        cross_attention_kv_heads=spec.cross_attention_kv_heads,
-        model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
-    )
-    assert cache.scratch_num_blocks == estimate.scratch_num_blocks
-    assert cache.scratch_reserved_bytes == estimate.scratch_reserved_bytes
-    assert cache.cross_attention_bytes_per_session == estimate.cross_attention_bytes_per_session
-    assert cache.memory_budget_bytes == estimate.required_bytes
-
-
 def make_spec(*, chunk_size=BLOCK, window_chunks=2, sink_chunks=0, reset_at_boundary=False):
     return ChunkWindowSpec(
         block_size=BLOCK,

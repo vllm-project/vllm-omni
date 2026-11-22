@@ -59,6 +59,12 @@ tokens of a request (system prompt, rig header and caption of every camera toget
 16384). Requests above it are rejected, so raise it at export with
 `--cosmos3-nano-sim-auto-text-cache-max-len` for longer captions.
 
+Loading rejects ring shapes and prompt policies the runtime does not implement. The ring must be
+the pinned sink chunks plus one rotating chunk (`ring.cache_chunks = ring.sink_chunks + 1`); only
+the exported `cache_chunks=2`, `sink_chunks=1` has been compared with the reference. The prompt
+must set `use_first_chunk_only: true` (each camera's caption covers the whole horizon) and
+`emphasize_control_in_prompt: false` (no control directive is appended to the captions).
+
 Verify the training run's actual attention policy before export: the exporter validates the
 selected configuration, not the policy used to train the weights. Checkpoints trained with legacy
 (non-deduplicated) maskless attention are **unsupported** here: legacy attention counts some
@@ -74,9 +80,12 @@ that flag. Do not remove the system message when comparing prompts.
 
 Start from [`cosmos3_nano_sim_auto.yaml`](../../vllm_omni/deploy/cosmos3_nano_sim_auto.yaml): the
 AR-Diffusion engine, eager execution, batch size one, 480p. The KV ring lives in the paged pool with
-one padded chunk per frame unit (7 cameras: 16,384 tokens RGB-only; joint 23,616 with the current
-1x1 LiDAR diffusion patch, 18,208 with 2x2); sink and window come from the artifact and cannot be
-overridden. Tensor parallelism and strict Ulysses context parallelism are supported, alone or
+one padded chunk per frame unit. The pool is sized once at load for the exported rig's worst case
+at the artifact's default resolution (every camera, LiDAR on a joint artifact, the aspect ratio
+with the most tokens; 7 cameras at 480p: 16,800 tokens RGB-only, joint 24,032 with the current 1x1
+LiDAR diffusion patch, 18,624 with 2x2); smaller requests pad to that unit, and a request that
+needs a larger one, such as a higher resolution, is rejected on this engine. Sink and window come
+from the artifact and cannot be overridden. Tensor parallelism and strict Ulysses context parallelism are supported, alone or
 combined (reference parity target: TP4 or Ulysses 4 on 4x GB200, equivalent to the reference's
 CP4); ring and all-gather sequence parallelism, CFG, pipeline and VAE patch parallelism are
 rejected. Both TP and Ulysses split attention heads, so query and KV head counts must be divisible

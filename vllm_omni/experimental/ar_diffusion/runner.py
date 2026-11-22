@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import gc
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -26,21 +25,15 @@ from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, StepRequestState
 from vllm_omni.experimental.ar_diffusion.capability import (
     AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE,
     ARDiffusionKVCacheSpec,
-    ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
     SupportsARDiffusionNoisyKV,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
-    SupportsDynamicARDiffusion,
     supports_chunk_step_grouping,
 )
 from vllm_omni.experimental.ar_diffusion.chunk_executor import advance_chunk
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
-from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
-    ARDiffusionKVCache,
-    ar_diffusion_scratch_blocks_override,
-    estimate_ar_diffusion_kv_cache_memory,
-)
+from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
@@ -140,12 +133,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._ar_diffusion_noisy_kv_capability: SupportsARDiffusionNoisyKV | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
-        self._session_geometry_keys: dict[str, object] = {}
         self._session_capacity = 0
         self._perf_e2e_times: list[float] = []
-        self._available_memory_budget: int | None = None
-        self._dynamic_capacity_validated = False
-        self._cache_failure: Exception | None = None
         # Wall-clock start of each request's in-flight stepwise chunk, so
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
         # modes instead of one entry per denoise step.
@@ -179,8 +168,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         )
         if self.pipeline is None:
             return
-        self._available_memory_budget = self._available_memory_bytes()
-        self._preallocate_kv_cache(available_bytes=self._available_memory_budget)
+        self._preallocate_kv_cache()
         # The rollout warmup exists for CUDA graph capture, but a pipeline may
         # also want it in eager mode (first-request kernel selection, lazy
         # allocations); ``ar_diffusion_warmup_eager`` opts in.
@@ -189,119 +177,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self._warmup_ar_rollout()
 
     def _available_memory_bytes(self) -> int:
-        if self.device is None or torch.device(self.device).type == "cpu":
-            raise RuntimeError("AR-Diffusion KV preallocation requires an accelerator device")
-        return int(current_omni_platform.get_free_memory(torch.device(self.device)))
-
-    @staticmethod
-    def _require_request_spec(value: object, source: str) -> ARDiffusionRequestKVSpec:
-        if not isinstance(value, ARDiffusionRequestKVSpec):
-            raise TypeError(f"{source} must return ARDiffusionRequestKVSpec, got {type(value).__name__}")
-        return value
-
-    def _effective_spec(
-        self,
-        capability: SupportsARDiffusionPipeline,
-        spec: ARDiffusionKVCacheSpec,
-    ) -> tuple[ARDiffusionKVCacheSpec, ARDiffusionKVConfig]:
-        """Apply runner overrides and validate the resulting structural contract."""
-
-        config = dataclasses.replace(
-            self.ar_diffusion_kv_config,
-            chunk_size=spec.tokens_per_frame,
-            window_chunks=self.ar_diffusion_kv_config.window_chunks or spec.window_frames,
-            sink_chunks=self.ar_diffusion_kv_config.sink_chunks or spec.sink_frames,
-            reset_at_boundary=self.ar_diffusion_kv_config.reset_at_boundary or spec.reset_at_boundary,
-        )
-        effective = dataclasses.replace(
-            spec,
-            tokens_per_frame=config.chunk_size,
-            window_frames=int(config.window_chunks),
-            sink_frames=config.sink_chunks,
-            reset_at_boundary=config.reset_at_boundary,
-        )
-        if isinstance(capability, SupportsDynamicARDiffusion):
-            capability.validate_ar_diffusion_effective_spec(effective)
-        return effective, config
-
-    @staticmethod
-    def _resolve_paging(
-        spec: ARDiffusionKVCacheSpec, config: ARDiffusionKVConfig
-    ) -> tuple[ARDiffusionKVConfig, int, int]:
-        visibility_block_size = paging_block_size(
-            spec.segmented.block_size if spec.segmented else spec.tokens_per_frame
-        )
-        page = config.superpage_tokens
-        if not page:
-            return config, visibility_block_size, visibility_block_size
-
-        from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import _resolve_fa_version
-
-        if (
-            page > 0
-            and page % visibility_block_size == 0
-            and paging_block_size(page) == page
-            and _resolve_fa_version(spec.head_size) in (3, 4)
-        ):
-            return config, page, visibility_block_size
-
-        logger.warning(
-            "Disabling superpage_tokens=%s: requires legal pages divisible by %s and FA3/FA4",
-            page,
-            visibility_block_size,
-        )
-        return dataclasses.replace(config, superpage_tokens=0), visibility_block_size, visibility_block_size
-
-    def _validate_dynamic_capacity(
-        self,
-        capability: SupportsDynamicARDiffusion,
-        available_bytes: int,
-    ) -> None:
-        """Prove that every model-declared worst geometry can fit one session."""
-
-        request_specs = tuple(capability.ar_diffusion_worst_case_request_specs())
-        if not request_specs:
-            raise ValueError("Dynamic AR-Diffusion capability returned no worst-case request specification")
-        for value in request_specs:
-            request_spec = self._require_request_spec(value, "ar_diffusion_worst_case_request_specs()")
-            effective, config = self._effective_spec(capability, request_spec.kv_spec)
-            config, block_size, _ = self._resolve_paging(effective, config)
-            estimate = estimate_ar_diffusion_kv_cache_memory(
-                config,
-                effective,
-                self.od_config.dtype,
-                scratch_blocks_override=ar_diffusion_scratch_blocks_override(),
-                block_size=block_size,
-            )
-            if estimate.required_bytes > available_bytes:
-                raise ValueError(
-                    "AR-Diffusion available device memory cannot fit one complete worst-geometry session: "
-                    f"available={available_bytes} bytes, required={estimate.required_bytes} bytes, "
-                    f"tokens_per_frame={effective.tokens_per_frame}."
-                )
-
-    def _validate_replacement_spec(self, spec: ARDiffusionKVCacheSpec, config: ARDiffusionKVConfig) -> None:
-        """Admit a replacement pool before releasing live sessions."""
-
-        budget = self._available_memory_budget
-        if budget is None:
-            raise RuntimeError("AR-Diffusion load-time memory budget is unavailable")
-        if spec.segmented is not None:
-            budget = self._segmented_all_rank_min(budget)
-        config, block_size, _ = self._resolve_paging(spec, config)
-        estimate = estimate_ar_diffusion_kv_cache_memory(
-            config,
-            spec,
-            self.od_config.dtype,
-            scratch_blocks_override=ar_diffusion_scratch_blocks_override(),
-            block_size=block_size,
-        )
-        if estimate.required_bytes > budget:
-            raise ARDiffusionRequestRejectedError(
-                "AR-Diffusion KV cache for this request cannot fit one session: "
-                f"available={budget} bytes, required={estimate.required_bytes} bytes, "
-                f"tokens_per_frame={spec.tokens_per_frame}, window_frames={spec.window_frames}."
-            )
+        if self.device is None:
+            raise RuntimeError("AR-Diffusion KV preallocation requires an initialized device")
+        return current_omni_platform.get_free_memory(torch.device(self.device))
 
     @staticmethod
     def _segmented_all_rank_min(value: int) -> int:
@@ -370,12 +248,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             blocks_per_rank,
         )
 
-    def _preallocate_kv_cache(
-        self,
-        *,
-        available_bytes: int | None = None,
-        spec_override: ARDiffusionKVCacheSpec | None = None,
-    ) -> None:
+    def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
         if bool(getattr(self.od_config, "step_execution", False)) and not supports_step_execution(self.pipeline):
             raise ValueError(
@@ -398,35 +271,44 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "ARDiffusionModelRunner currently supports one request at a time; "
                 "request-batch execution would bypass per-request AR session binding."
             )
-        if isinstance(capability, SupportsDynamicARDiffusion) and spec_override is None:
-            request_spec = self._require_request_spec(
-                capability.ar_diffusion_default_request_spec(),
-                "ar_diffusion_default_request_spec()",
-            )
-            raw_spec = request_spec.kv_spec
-        else:
-            raw_spec = spec_override or capability.ar_diffusion_kv_cache_spec()
-        if not isinstance(raw_spec, ARDiffusionKVCacheSpec):
+        spec = capability.ar_diffusion_kv_cache_spec()
+        if not isinstance(spec, ARDiffusionKVCacheSpec):
             raise TypeError(
-                f"ar_diffusion_kv_cache_spec() must return ARDiffusionKVCacheSpec, got {type(raw_spec).__name__}"
+                f"ar_diffusion_kv_cache_spec() must return ARDiffusionKVCacheSpec, got {type(spec).__name__}"
             )
 
-        budget = self._available_memory_bytes() if available_bytes is None else int(available_bytes)
-        if raw_spec.segmented is not None:
-            budget = self._segmented_all_rank_min(budget)
-        if getattr(self, "_available_memory_budget", None) is None:
-            self._available_memory_budget = budget
-        spec, config = self._effective_spec(capability, raw_spec)
-        if isinstance(capability, SupportsDynamicARDiffusion) and not getattr(
-            self, "_dynamic_capacity_validated", False
-        ):
-            self._validate_dynamic_capacity(capability, budget)
-            self._dynamic_capacity_validated = True
-        # Keep deployment overrides separate from this resolved allocation;
-        # otherwise its window becomes an override for every later request.
+        config = dataclasses.replace(
+            self.ar_diffusion_kv_config,
+            chunk_size=spec.tokens_per_frame,
+            window_chunks=self.ar_diffusion_kv_config.window_chunks or spec.window_frames,
+            sink_chunks=self.ar_diffusion_kv_config.sink_chunks or spec.sink_frames,
+            reset_at_boundary=self.ar_diffusion_kv_config.reset_at_boundary or spec.reset_at_boundary,
+        )
+        self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
-        config, block_size, visibility_block_size = self._resolve_paging(spec, config)
+        memory_bytes = self._available_memory_bytes() if available_bytes is None else available_bytes
+        if spec.segmented is not None:
+            memory_bytes = self._segmented_all_rank_min(memory_bytes)
+        block_size = paging_block_size(spec.segmented.block_size if spec.segmented else spec.tokens_per_frame)
+        visibility_block_size = block_size
+        if config.superpage_tokens:
+            from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import _resolve_fa_version
+
+            page = config.superpage_tokens
+            if (
+                page > 0
+                and page % block_size == 0
+                and paging_block_size(page) == page
+                and _resolve_fa_version(spec.head_size) in (3, 4)
+            ):
+                block_size = page
+            else:
+                logger.warning(
+                    "Disabling superpage_tokens=%s: requires legal pages divisible by %s and FA3/FA4", page, block_size
+                )
+                config = dataclasses.replace(config, superpage_tokens=0)
+                self.ar_diffusion_kv_config = config
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,
@@ -436,7 +318,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             block_size=block_size,
             visibility_block_size=visibility_block_size,
             max_model_len=spec.max_model_len,
-            available_bytes=budget,
+            available_bytes=memory_bytes,
             kv_branches=spec.kv_branches,
             session_capacity=spec.session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,
@@ -472,43 +354,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             spec.session_capacity,
         )
 
-    def _rebuild_for_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
-        """Release every session and replace the pool using the load-time budget."""
-
-        failure = getattr(self, "_cache_failure", None)
-        if failure is not None:
-            raise RuntimeError("AR-Diffusion KV cache is permanently failed") from failure
-        try:
-            cleanup_errors: list[Exception] = []
-            for session_id in tuple(self._sessions):
-                try:
-                    self._release_session(session_id, reset_model=False, reason="resolution_rebuild")
-                except Exception as exc:  # noqa: BLE001 - all resident sessions must still be released
-                    exc.__traceback__ = None
-                    cleanup_errors.append(exc)
-            if self._sessions or getattr(self, "_session_geometry_keys", {}):
-                raise RuntimeError("AR-Diffusion session registry was not empty after pool teardown")
-            if cleanup_errors:
-                raise cleanup_errors[0]
-
-            self.release_captured_graphs()
-            old_cache = self.kv_cache
-            self.kv_cache = None
-            self._ar_diffusion_kv_cache_spec = None
-            self._session_capacity = 0
-            del old_cache
-            gc.collect()
-            current_omni_platform.empty_cache()
-
-            budget = self._available_memory_budget
-            if budget is None:
-                raise RuntimeError("AR-Diffusion load-time memory budget is unavailable")
-            self._preallocate_kv_cache(available_bytes=budget, spec_override=spec)
-        except Exception as exc:
-            exc.__traceback__ = None
-            self._cache_failure = exc
-            raise RuntimeError("AR-Diffusion KV cache replacement failed") from exc
-
     def _new_session_state(self, session_id: str) -> ARDiffusionKVState:
         if self.kv_cache is None or self._ar_diffusion_kv_cache_spec is None:
             raise RuntimeError("AR-Diffusion session requested before KV cache initialization")
@@ -533,9 +378,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> None:
         """One release path for reset, close, eviction, and failed forwards."""
         state = self._sessions.pop(session_id, None)
-        geometry_keys = getattr(self, "_session_geometry_keys", None)
-        if geometry_keys is not None:
-            geometry_keys.pop(session_id, None)
         errors: list[Exception] = []
         if state is not None:
             try:
@@ -577,11 +419,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """Release KV and notify the pipeline to drop model-owned state."""
         self._release_session(session_id, reset_model=False, reason="close")
 
-    def _get_or_create_session(
-        self,
-        session_id: str,
-        geometry_key: object | None = None,
-    ) -> ARDiffusionKVState:
+    def _get_or_create_session(self, session_id: str) -> ARDiffusionKVState:
         state = self._sessions.get(session_id)
         if state is None:
             while len(self._sessions) >= self._session_capacity:
@@ -589,10 +427,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 self._release_session(oldest, reset_model=False, reason="lru_eviction")
             state = self._new_session_state(session_id)
             self._sessions[session_id] = state
-            if isinstance(self._ar_diffusion_capability, SupportsDynamicARDiffusion):
-                if not hasattr(self, "_session_geometry_keys"):
-                    self._session_geometry_keys = {}
-                self._session_geometry_keys[session_id] = geometry_key
         self._sessions.move_to_end(session_id)
         return state
 
@@ -622,7 +456,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         *,
         description: str,
         synchronize: bool = True,
-        geometry_key: object | None = None,
     ) -> Iterator[None]:
         """Bind runner-owned KV for one runner invocation and fail closed.
 
@@ -633,7 +466,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         capability = self._ar_diffusion_capability
         if capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
-        state = self._get_or_create_session(session_id, geometry_key)
+        state = self._get_or_create_session(session_id)
         try:
             with capability.bind_ar_diffusion_state(session_id, state):
                 yield
@@ -783,9 +616,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
-        cache_failure = getattr(self, "_cache_failure", None)
-        if cache_failure is not None:
-            raise RuntimeError("AR-Diffusion KV cache is permanently failed") from cache_failure
         # KV assembly only. The pipeline's request forward chooses Cell execution.
         if self._ar_diffusion_noisy_kv_capability is not None:
             started = time.perf_counter()
@@ -812,47 +642,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return super().execute_model(
                 req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
             )
-        capability = self._ar_diffusion_capability
-        if capability is None:
+        if self._ar_diffusion_capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
         session_id, extra_args, tick = self._request_session(req)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-
-        geometry_key: object | None = None
-        requested_spec = self._ar_diffusion_kv_cache_spec
-        if isinstance(capability, SupportsDynamicARDiffusion):
-            try:
-                request_spec = capability.ar_diffusion_request_spec(req)
-            except ARDiffusionRequestRejectedError:
-                raise
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ARDiffusionRequestRejectedError(str(exc)) from exc
-            request_spec = self._require_request_spec(request_spec, "ar_diffusion_request_spec()")
-            geometry_key = request_spec.geometry_key
-            requested_spec, config = self._effective_spec(capability, request_spec.kv_spec)
-
-            geometry_keys = getattr(self, "_session_geometry_keys", {})
-            if session_id in self._sessions and geometry_keys.get(session_id) != geometry_key and not reset:
-                raise ARDiffusionRequestRejectedError(
-                    f"AR-Diffusion session {session_id!r} geometry changed from "
-                    f"{geometry_keys.get(session_id)!r} to {geometry_key!r}; reset is required."
-                )
-
-        if requested_spec is None:
-            raise RuntimeError("AR-Diffusion request specification is unavailable")
-        if requested_spec != self._ar_diffusion_kv_cache_spec:
-            if session_id in self._sessions and not reset:
-                raise ARDiffusionRequestRejectedError(
-                    f"AR-Diffusion session {session_id!r} needs a different KV geometry; reset is required."
-                )
-            self._validate_replacement_spec(requested_spec, config)
-            self._rebuild_for_spec(requested_spec)
-        elif reset:
+        if reset:
             self.reset_session(session_id)
         started = time.perf_counter()
-        with self._bound_ar_session(session_id, description="forward", geometry_key=geometry_key):
+        with self._bound_ar_session(session_id, description="forward"):
             output = super().execute_model(
                 req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
             )

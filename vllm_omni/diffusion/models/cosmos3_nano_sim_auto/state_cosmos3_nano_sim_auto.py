@@ -5,8 +5,8 @@
 The runner owns the paged KV pool; the pipeline owns everything else a
 rollout needs between chunks: the prepared per-camera control latents, the
 observed condition latents, the generated target latents, the compact caption
-K/V, the ring-slot metadata the visibility planner reads, the chunk cursor and
-per-camera decoder caches. ``DenseReplayRing`` is the model-owned twin of the
+K/V, the ring-slot metadata the visibility planner reads and the chunk
+cursor. ``DenseReplayRing`` is the model-owned twin of the
 paged ring used off the AR engine and as the CPU-testable numerical oracle.
 """
 
@@ -102,7 +102,6 @@ class Cosmos3NanoSimAutoSessionState:
 
     session_id: str
     fingerprint: str | None = None
-    terminal: bool = False
     next_chunk: int = 0
     # Request geometry (fixed for the session).
     cameras: tuple[str, ...] = ()
@@ -131,9 +130,6 @@ class Cosmos3NanoSimAutoSessionState:
     ring_metadata: dict[int, TokenMetadata] = field(default_factory=dict)
     ring_steps: dict[int, int] = field(default_factory=dict)
     dense_ring: DenseReplayRing | None = None
-    # Per-camera Wan decoder caches for incremental decode (phase 2); unused by one-shot decode.
-    decoder_caches: list[list[Any] | None] = field(default_factory=list)
-    decoder_initialized: list[bool] = field(default_factory=list)
 
     @property
     def num_views(self) -> int:
@@ -152,7 +148,6 @@ class Cosmos3NanoSimAutoSessionState:
 
     def reset(self) -> None:
         self.fingerprint = None
-        self.terminal = False
         self.next_chunk = 0
         self.rig_view_ids = None
         self.rgb_control_latents = None
@@ -164,8 +159,6 @@ class Cosmos3NanoSimAutoSessionState:
         self.ring_metadata.clear()
         self.ring_steps.clear()
         self.dense_ring = None
-        self.decoder_caches = []
-        self.decoder_initialized = []
 
 
 __all__ = ["Cosmos3NanoSimAutoSessionState", "DenseReplayRing", "ring_slot_for_step"]

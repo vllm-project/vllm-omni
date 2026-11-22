@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Serving parameters exposed by the Cosmos3-Nano-Sim-Bimanual pipeline."""
 
 COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS = frozenset(

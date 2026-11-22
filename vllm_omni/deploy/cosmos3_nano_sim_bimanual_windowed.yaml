@@ -11,7 +11,6 @@ stages:
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: Cosmos3NanoSimBimanualPipeline
-    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     model_config:
       action_gen: true
       action_dim: 64
@@ -23,6 +22,3 @@ stages:
       overlap_vae_decode: true
       kv_cache_inference_size: 64
       attention_sink_size: 8
-      ar_diffusion_kv_config:
-        gpu_memory_fraction: 0.35
-        warmup_cudagraph: false

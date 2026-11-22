@@ -121,17 +121,15 @@ class ARDiffusionKVCacheSpec:
     recent sliding tail and ``sink_frames`` is the separately retained prefix;
     both are expressed in the same frame/block unit.
 
-    ``max_scratch_frames_per_branch`` is the maximum current-video span that a
-    non-committing forward writes to scratch. It defaults to
-    ``frames_per_block``. ``max_scratch_tokens_per_branch`` is the maximum
-    additional non-video KV (for example, action/state registers) that must
-    coexist with that video span.
-
     ``segmented`` opts into exact-token segments instead of frame-window
     retention. Its token bounds govern storage and the model supplies ordered
     retained segment handles; legacy frame fields are not retention policy
     for this path.
 
+    ``max_scratch_frames_per_branch`` is the maximum current-video span that a
+    non-committing forward writes to scratch; it defaults to ``frames_per_block``.
+    ``max_scratch_tokens_per_branch`` is the maximum non-video KV (for example,
+    action/state registers) that must coexist with an uncommitted video block.
     ``model_owned_state_bytes_per_session`` is a conservative upper bound for
     persistent per-session CUDA state outside runner-owned self/cross-attention
     KV and scratch pools.
@@ -219,41 +217,6 @@ class ARDiffusionKVCacheSpec:
     def cross_attention_kv_heads(self) -> dict[str, int]:
         """Per-cache head counts, for the caches that do not use the self-attention head count."""
         return {cache.name: cache.num_kv_heads for cache in self.cross_attention if cache.num_kv_heads is not None}
-
-
-@dataclass(frozen=True)
-class ARDiffusionRequestKVSpec:
-    """Request-specific KV requirements plus an opaque session geometry key."""
-
-    kv_spec: ARDiffusionKVCacheSpec
-    geometry_key: object
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.kv_spec, ARDiffusionKVCacheSpec):
-            raise TypeError(
-                f"AR-Diffusion request kv_spec must be ARDiffusionKVCacheSpec, got {type(self.kv_spec).__name__}"
-            )
-
-
-@runtime_checkable
-class SupportsDynamicARDiffusion(Protocol):
-    """Optional capability for pipelines whose KV geometry varies per request."""
-
-    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
-        """Return the request spec used for initial pool allocation."""
-        ...
-
-    def ar_diffusion_request_spec(self, request: OmniDiffusionRequest) -> ARDiffusionRequestKVSpec:
-        """Resolve one serialized request before runner session admission."""
-        ...
-
-    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
-        """Yield model-computed worst-case specs for startup capacity validation."""
-        ...
-
-    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
-        """Validate the runner's effective structure after deployment overrides."""
-        ...
 
 
 @runtime_checkable

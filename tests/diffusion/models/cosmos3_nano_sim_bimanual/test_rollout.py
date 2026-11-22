@@ -12,12 +12,13 @@ import ast
 import hashlib
 import json
 import math
+import sys
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -49,11 +50,12 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import (
     build_cosmos3_nano_sim_bimanual_action_control,
     parse_cosmos3_nano_sim_bimanual_tick,
 )
-from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
+from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionChunkMetadata, ARDiffusionTickRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+ARDiffusionRequestRejectedError = OmniClientError
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "vllm_omni/diffusion/models/cosmos3_nano_sim_bimanual"
 
@@ -117,15 +119,22 @@ def pipeline_methods() -> type:
     return namespace["Pipeline"]
 
 
+@pytest.fixture(autouse=True)
+def guardrail_gate(monkeypatch):
+    # Execute the real gate without importing GPU guardrail implementations.
+    from vllm_omni.diffusion.utils.guardrail_utils import is_guardrails_enabled
+
+    module = ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
+    monkeypatch.setattr(module, "is_guardrails_enabled", is_guardrails_enabled, raising=False)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+
 def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
     from test_action_schema import manifest
 
     pipe = pipeline_methods()()
     pipe.manifest = manifest()
     pipe._states = {}
-    pipe._bound_session_id = None
-    pipe._ar_diffusion_kv_state = None
-    pipe._request_session_id = None
     pipe._distilled_num_steps = 4
     pipe.default_domain_id = 15
     pipe.default_fps = 30
@@ -295,9 +304,6 @@ def test_failed_decoder_releases_session() -> None:
 
 def test_failed_typed_tick_releases_its_session() -> None:
     pipe, state = fake_pipeline()
-    pipe._bound_session_id = "robot"
-    pipe._ar_diffusion_kv_state = SimpleNamespace(kv_cache=SimpleNamespace(spec=SimpleNamespace(window_chunks=16)))
-    pipe._validate_bound_kv_geometry = Mock()
     pipe._decode_live_latents.side_effect = RuntimeError("decoder failure")
     tick = ARDiffusionTickRequest(
         session_id="robot",

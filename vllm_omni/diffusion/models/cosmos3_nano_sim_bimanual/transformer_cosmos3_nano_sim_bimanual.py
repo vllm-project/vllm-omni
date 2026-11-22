@@ -28,10 +28,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     split_interleaved_action_vision_tokens,
     zero_null_action_values,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
-    ARDiffusionPagedLayerInputs,
-    paged_write_attn,
-)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -75,7 +71,6 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
         dense_history: tuple[torch.Tensor, torch.Tensor] | None = None,
         dense_joint_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         dense_history_tokens: int = 0,
-        paged_context: ARDiffusionPagedLayerInputs | None = None,
         num_frames: int,
         tokens_per_frame: int,
         action_tokens_per_frame: int,
@@ -95,11 +90,6 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Bimanual text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}"
             )
-        if dense_history is not None and paged_context is not None:
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Bimanual attention accepts either dense_history or paged_context, not both"
-            )
-
         batch, seq_len, _ = hidden_states.shape
         q = self.to_q(hidden_states).view(batch, seq_len, self.num_heads_local, self.head_dim)
         k = self.to_k(hidden_states).view(batch, seq_len, self.num_kv_heads_local, self.head_dim)
@@ -116,18 +106,7 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
             null_frame_indexes=null_action_frame_indexes,
         )
 
-        if paged_context is not None:
-            output = paged_write_attn(
-                paged_context,
-                q[0],
-                k[0],
-                v[0],
-                text_k[0, :real_text_kv_len],
-                text_v[0, :real_text_kv_len],
-                self.head_dim**-0.5,
-                framewise_attention=clean_history_window is not None,
-            ).unsqueeze(0)
-        elif dense_joint_kv is not None:
+        if dense_joint_kv is not None:
             # Full-history storage is already text + committed history. Only
             # current K/V changes; keep the exact dense attention layout/policy.
             joint_k, joint_v = dense_joint_kv
@@ -289,30 +268,6 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
     def num_kv_heads_local(self) -> int:
         return self.num_key_value_heads // get_tensor_model_parallel_world_size()
 
-    @staticmethod
-    def pad_text_kv(
-        layer_kv: list[tuple[torch.Tensor, torch.Tensor]],
-        *,
-        max_len: int,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        padded: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for key, value in layer_kv:
-            if key.shape != value.shape or key.shape[0] != 1:
-                raise ValueError(
-                    "Cosmos3-Nano-Sim-Bimanual text K/V must be matching batch-one "
-                    f"tensors, got {key.shape} and {value.shape}"
-                )
-            if key.shape[1] > max_len:
-                raise ValueError(
-                    f"Cosmos3-Nano-Sim-Bimanual prompt has {key.shape[1]} KV tokens but text_cache_max_len={max_len}"
-                )
-            pad_len = max_len - key.shape[1]
-            if pad_len:
-                key = torch.cat([key, key.new_zeros(1, pad_len, *key.shape[2:])], dim=1)
-                value = torch.cat([value, value.new_zeros(1, pad_len, *value.shape[2:])], dim=1)
-            padded.append((key, value))
-        return padded
-
     def _current_rope(
         self,
         hidden: torch.Tensor,
@@ -370,7 +325,6 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         fps: float,
         action_latents: torch.Tensor | None,
         action_domain_ids: torch.Tensor,
-        paged_kv: list[Any] | None = None,
         dense_history: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         dense_attention: CosmosSimDenseAttentionCache | None = None,
         condition_vision: bool = False,
@@ -380,8 +334,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         """Denoise or clean-commit one current chunk.
 
-        ``paged_kv`` is non-committing during denoise. Clean refreshes commit
-        one frame or a frame-causal batch. Dense history is the numerical oracle.
+        Clean refreshes commit one frame or a frame-causal batch.
         """
         if self._inductor_cudagraphs:
             # Regional block calls belong to one invocation. Without this,
@@ -401,16 +354,10 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}"
             )
-        if paged_kv is not None and dense_history is not None:
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual forward accepts either paged_kv or dense_history, not both")
-        if dense_attention is not None and (paged_kv is not None or dense_history is not None):
-            raise ValueError("Dense joint storage cannot be combined with paged or separate dense history")
+        if dense_attention is not None and dense_history is not None:
+            raise ValueError("Dense joint storage cannot be combined with separate dense history")
         dense_joint_kv = None if dense_attention is None else dense_attention.kv
         dense_history_tokens = 0 if dense_attention is None else dense_attention.history_length
-        if paged_kv is not None and len(paged_kv) != self.num_hidden_layers:
-            raise ValueError(
-                f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}"
-            )
         if dense_history is not None and len(dense_history) != self.num_hidden_layers:
             raise ValueError(
                 "Cosmos3-Nano-Sim-Bimanual expected "
@@ -478,24 +425,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         if dense_attention is not None and self._inductor_cudagraphs:
             freqs_cos, freqs_sin = dense_attention.stage_rope(freqs_cos, freqs_sin, geometry.patch_grid)
 
-        if paged_kv is not None:
-            forward_context = paged_kv[0].forward_ctx
-            if forward_context.seq_len != hidden.shape[1]:
-                raise RuntimeError(
-                    "Cosmos3-Nano-Sim-Bimanual paged context token count does not match "
-                    f"this chunk: {forward_context.seq_len} != {hidden.shape[1]}"
-                )
-            forward_context.prepare(
-                device=hidden.device,
-                action_len=real_text_kv_len,
-                query_len=hidden.shape[1],
-            )
-            paged_kv = [layer_context.to_layer_inputs() for layer_context in paged_kv]
-
-        # Only the dense path reads current_kv; in paged mode the K/V are
-        # already in the pool, so keeping 40 layers of them alive per denoise
-        # step would defeat the point of paging.
-        collect_current_kv = paged_kv is None and dense_joint_kv is None
+        collect_current_kv = dense_joint_kv is None
         current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         with self._offload_context("generator"):
             for layer_idx, layer in enumerate(self.gen_layers):
@@ -510,7 +440,6 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                     dense_history=None if dense_history is None else dense_history[layer_idx],
                     dense_joint_kv=None if dense_joint_kv is None else dense_joint_kv[layer_idx],
                     dense_history_tokens=dense_history_tokens,
-                    paged_context=None if paged_kv is None else paged_kv[layer_idx],
                     num_frames=num_frames,
                     tokens_per_frame=actual_tokens_per_frame,
                     action_tokens_per_frame=action_count,

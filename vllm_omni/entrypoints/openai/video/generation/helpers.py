@@ -1307,21 +1307,17 @@ async def _parse_video_form(
         if has_indexes and not supports_multiview:
             raise HTTPException(400, detail="This model does not support multiview uploaded references.")
         if supports_multiview and (input_references or has_indexes or extra.get("multiview") is not None):
-            if (
-                has_latent_edit
-                or parsed_timeline_guides is not None
-                or any(
-                    value is not None
-                    for value in (
-                        input_reference,
-                        parsed_image_reference,
-                        parsed_video_reference,
-                        parsed_audio_reference,
-                        control_reference,
-                        control_type,
-                        source_reference,
-                        mask_reference,
-                    )
+            if has_latent_edit or any(
+                value is not None
+                for value in (
+                    input_reference,
+                    parsed_image_reference,
+                    parsed_video_reference,
+                    parsed_audio_reference,
+                    control_reference,
+                    control_type,
+                    source_reference,
+                    mask_reference,
                 )
             ):
                 raise HTTPException(400, detail="Multiview requests cannot be combined with generic reference fields.")

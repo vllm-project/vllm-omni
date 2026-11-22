@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Schema-5 Bimanual action contract consumed by inference.
 
 Serving validates the prepared 59D layout, domain table, padding, and source

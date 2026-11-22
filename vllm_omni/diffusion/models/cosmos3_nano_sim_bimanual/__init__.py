@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3-Nano-Sim-Bimanual diffusion model family."""
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_schema import Cosmos3NanoSimBimanualActionSchema

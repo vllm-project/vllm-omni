@@ -121,6 +121,10 @@ EXCLUDED_MODELS = [
     # Causal AR bimanual sim model requiring action/camera assets and
     # persistent AR state; covered by tests/diffusion/models/cosmos3_nano_sim_bimanual.
     "Cosmos3NanoSimBimanualPipeline",
+    # Causal rolling multiview AV model; needs a converted checkpoint with an
+    # embedded cosmos3_nano_sim_auto manifest and persistent AR state; covered
+    # by tests/diffusion/models/cosmos3_nano_sim_auto.
+    "Cosmos3NanoSimAutoPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",

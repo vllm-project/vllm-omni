@@ -10,8 +10,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.geometry import (
     latent_frames_from_pixel_frames,
     lidar_grid,
     lidar_num_sweeps,
-    lidar_sweep_ids,
     max_chunk_tokens,
+    max_sweeps_per_chunk,
     paged_frame_unit,
     rgb_grid,
 )
@@ -37,7 +37,6 @@ def reference_schedule(joint: bool):
 def test_reference_horizon_counts() -> None:
     assert latent_frames_from_pixel_frames(297) == 75
     assert lidar_num_sweeps(297, camera_fps=30, lidar_fps=10) == 99
-    assert lidar_sweep_ids(5, camera_fps=30, lidar_fps=10) == (0, 3, 6, 9, 12)
 
 
 def test_joint_schedule_singleton_regular_and_partial_tail() -> None:
@@ -67,6 +66,37 @@ def test_joint_schedule_requires_both_sensors_per_step() -> None:
             rgb_seconds_per_frame=RGB_SPF,
             lidar_seconds_per_frame=1.0,
         )
+
+
+@pytest.mark.parametrize(
+    ("camera_fps", "lidar_fps", "expected"),
+    [
+        (30.0, 10.0, 4),  # the reference clock
+        (30.0, 11.0, 5),  # 4.4 sweeps per chunk: rounding would size for four
+        (30.0, 12.0, 5),  # 4.8
+        (25.0, 10.0, 5),  # 4.8
+        (24.0, 10.0, 5),  # exactly 5
+        (30.0, 20.0, 8),
+        (10.0, 10.0, 12),
+    ],
+)
+def test_max_sweeps_per_chunk_bounds_every_schedule(camera_fps: float, lidar_fps: float, expected: int) -> None:
+    bound = max_sweeps_per_chunk(
+        frames_per_chunk=3, rgb_seconds_per_frame=4 / camera_fps, lidar_seconds_per_frame=1 / lidar_fps
+    )
+    assert bound == expected
+    largest = 0
+    for num_frames in range(5, 400, 4):
+        schedule = build_chunk_schedule(
+            rgb_latents=latent_frames_from_pixel_frames(num_frames),
+            lidar_sweeps=lidar_num_sweeps(num_frames, camera_fps=camera_fps, lidar_fps=lidar_fps),
+            frames_per_chunk=3,
+            rgb_seconds_per_frame=4 / camera_fps,
+            lidar_seconds_per_frame=1 / lidar_fps,
+        )
+        largest = max(largest, *(len(chunk.lidar_sweeps) for chunk in schedule))
+    # Every horizon fits, and long ones reach the bound.
+    assert largest == bound
 
 
 def test_pixel_frames_must_be_wan_aligned() -> None:

@@ -158,8 +158,8 @@ def test_joint_buffer_preserves_attention_and_history_gpu():
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("paged,window", [(False, None), (False, 2), (True, None)])
-def test_pipeline_activates_joint_buffer_only_for_full_dense_history(paged, window):
+@pytest.mark.parametrize("window", [None, 2])
+def test_pipeline_activates_joint_buffer_only_for_full_history(window):
     from types import SimpleNamespace
 
     from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_bimanual import (
@@ -170,7 +170,6 @@ def test_pipeline_activates_joint_buffer_only_for_full_dense_history(paged, wind
     )
 
     pipe = SimpleNamespace(
-        _ar_diffusion_kv_state=object() if paged else None,
         manifest=SimpleNamespace(window_frames=window, conditioning_tokens_per_frame=4),
         _SESSION_CAPACITY=1,
         _MAIN_BRANCH="main",
@@ -179,6 +178,6 @@ def test_pipeline_activates_joint_buffer_only_for_full_dense_history(paged, wind
     text = [(torch.ones(1, 3, 2, 8), torch.ones(1, 3, 2, 8))]
     geometry = SimpleNamespace(tokens_per_frame=lambda _: 10)
     Cosmos3NanoSimBimanualPipeline._prepare_dense_attention(pipe, state, text, 3, geometry, 5)
-    assert (state.dense_attention is not None) == (not paged and window is None)
+    assert (state.dense_attention is not None) == (window is None)
     if state.dense_attention is not None:
         assert state.dense_attention.kv[0][0].shape == (1, 53, 2, 8)

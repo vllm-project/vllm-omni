@@ -156,48 +156,11 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
 
 
 class Cosmos3NanoSimAutoGenDecoderLayer(Cosmos3GenDecoderLayer):
-    """Cosmos3 GEN layer whose attention reads the causal ring; weight names are unchanged."""
+    """Cosmos3 GEN layer whose attention reads the causal ring; weight names are unchanged.
 
-    def __init__(
-        self,
-        *,
-        layer_idx: int | None = None,
-        hidden_size: int,
-        intermediate_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        rms_norm_eps: float,
-        quant_config=None,
-        mlp_cls,
-        cross_attention_cls=None,
-        qk_norm: bool = True,
-        prefix: str = "",
-    ) -> None:
-        del cross_attention_cls  # replaced below; the base default is constructed and discarded
-        super().__init__(
-            layer_idx=layer_idx,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            quant_config=quant_config,
-            mlp_cls=mlp_cls,
-            qk_norm=qk_norm,
-            prefix=prefix,
-        )
-        self.cross_attention = Cosmos3NanoSimAutoJointAttention(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            quant_config=quant_config,
-            qk_norm=qk_norm,
-            prefix=f"{prefix}.cross_attention",
-        )
+    The transformer's ``_cross_attention_cls`` makes the base constructor build
+    :class:`Cosmos3NanoSimAutoJointAttention` as ``cross_attention``.
+    """
 
     def forward(self, hidden_states: torch.Tensor, **attention_kwargs: Any):  # type: ignore[override]
         residual = hidden_states
@@ -218,6 +181,7 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
     #: inherited ``_sp_plan`` hooks target ``gen_sp_prepare``, which this forward never calls.
     ulysses: UlyssesGroup | None = None
     _gen_layer_cls = Cosmos3NanoSimAutoGenDecoderLayer
+    _cross_attention_cls = Cosmos3NanoSimAutoJointAttention
     _repeated_blocks = ["Cosmos3NanoSimAutoGenDecoderLayer"]
 
     def _language_model_kwargs(self) -> dict[str, Any]:

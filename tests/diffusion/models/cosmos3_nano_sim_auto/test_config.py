@@ -169,3 +169,55 @@ def test_invalid_rig_tables_are_rejected(rig: dict, match: str) -> None:
 def test_unknown_root_fields_are_still_rejected() -> None:
     with pytest.raises(ValueError, match=r"unknown=\['view_embedding'\]"):
         Cosmos3NanoSimAutoManifest.from_artifact(_artifact(view_embedding=None))
+
+
+@pytest.mark.parametrize(("cache_chunks", "sink_chunks"), [(2, 1), (3, 2)])
+def test_rings_with_one_rotating_chunk_load(cache_chunks: int, sink_chunks: int) -> None:
+    manifest = Cosmos3NanoSimAutoManifest.from_artifact(
+        _artifact(ring={"cache_chunks": cache_chunks, "sink_chunks": sink_chunks})
+    )
+    assert (manifest.cache_chunks, manifest.sink_chunks) == (cache_chunks, sink_chunks)
+
+
+@pytest.mark.parametrize(
+    ("ring", "match"),
+    [
+        # Two or more rotating slots: the paged pool's commit order and the slot order diverge after a wrap-around.
+        ({"cache_chunks": 3, "sink_chunks": 1}, "exactly one non-sink chunk"),
+        ({"cache_chunks": 8, "sink_chunks": 1}, "exactly one non-sink chunk"),
+        ({"cache_chunks": 4, "sink_chunks": 2}, "exactly one non-sink chunk"),
+        ({"cache_chunks": 2, "sink_chunks": 2}, "exactly one non-sink chunk"),
+        ({"cache_chunks": 1, "sink_chunks": 1}, r"ring.cache_chunks must be >= 2"),
+        ({"cache_chunks": 2, "sink_chunks": 0}, r"ring.sink_chunks must be >= 1"),
+    ],
+)
+def test_unsupported_rings_are_rejected(ring: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        Cosmos3NanoSimAutoManifest.from_artifact(_artifact(ring=ring))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        # Per-chunk captions: the runtime holds each camera's one caption for the whole horizon.
+        ("use_first_chunk_only", False),
+        ("use_first_chunk_only", 1),
+        # The Transfer pipelines' control directive suffix, which Sim-Auto never appends.
+        ("emphasize_control_in_prompt", True),
+        ("emphasize_control_in_prompt", 0),
+        ("context_before", False),
+    ],
+)
+def test_prompt_policies_the_runtime_does_not_implement_are_rejected(key: str, value) -> None:
+    artifact = _artifact()
+    artifact["prompt"][key] = value
+    with pytest.raises(ValueError, match=rf"prompt\.{key}={value!r} is unsupported"):
+        Cosmos3NanoSimAutoManifest.from_artifact(artifact)
+
+
+@pytest.mark.parametrize("key", ["use_first_chunk_only", "emphasize_control_in_prompt"])
+def test_fixed_prompt_flags_must_still_be_exported(key: str) -> None:
+    artifact = _artifact()
+    del artifact["prompt"][key]
+    with pytest.raises(ValueError, match=rf"prompt field set mismatch: missing=\['{key}'\]"):
+        Cosmos3NanoSimAutoManifest.from_artifact(artifact)
