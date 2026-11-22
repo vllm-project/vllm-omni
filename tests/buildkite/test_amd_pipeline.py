@@ -26,6 +26,7 @@ AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
+R2_01_EXPECTED_COUNT = 1456
 AMD_SOURCE_DEPENDENCIES = Path(".buildkite/common/ci_source_file_dependencies.yml")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
@@ -826,7 +827,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1456,
+        R2_01_EXPECTED_COUNT,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -5423,7 +5424,8 @@ _WORKER_ONE_CARD_NODES = (
 def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
-    The V2/shared one-card cases retain their exact IDs after V1 removal. R2-01 still collects 1457 model-executor nodes with a GPU visible and does not run them.
+    The V2/shared cases retain their exact IDs after V1 removal and run in
+    the dedicated worker job.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5473,7 +5475,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1457" in r2_01_command
+    assert f"assert-pytest-collection.sh {R2_01_EXPECTED_COUNT}" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -5580,8 +5582,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
     """READY blocks on the remaining one-card copy cases.
 
     The marker selects both intermediate-buffer residency rows and the three
-    device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1457 model-executor nodes with a GPU visible.
+    device-copy GPU tests. #9552's worker files stay on the other job.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5635,7 +5636,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1457" in r2_01_command
+    assert f"assert-pytest-collection.sh {R2_01_EXPECTED_COUNT}" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
