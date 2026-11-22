@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stateless request and shutdown helpers for :mod:`async_omni_engine`."""
 
 from __future__ import annotations
 
+import asyncio
+import queue
 import threading
 from typing import Any
 
@@ -30,6 +35,66 @@ _RPC_RESULT_ROUTER_CLOSED_MESSAGES = {
     "RPC result router closed",
     "RPC result router is closed",
 }
+
+
+class OutputQueueSink:
+    """Hands orchestrator output to the serving event loop.
+
+    Messages go through the output queue's thread-safe sync side (which the
+    offline ``Omni`` entrypoint reads directly). A waiting serving loop gets
+    one ``call_soon_threadsafe`` wakeup per batch: puts made while a wakeup is
+    already scheduled, or while the loop is draining, add nothing, unlike the
+    janus async side (a task and a lock per put) or an executor hop per
+    message. The queue is unbounded, so ``put`` never blocks the orchestrator.
+    """
+
+    __slots__ = ("_sync_q", "_loop", "_ready", "_wake_scheduled")
+
+    def __init__(self, sync_q: janus.SyncQueue[EngineQueueMessage]) -> None:
+        self._sync_q = sync_q
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ready: asyncio.Event | None = None
+        # Starts set: no serving loop waits until arm_wakeup() clears it.
+        self._wake_scheduled = True
+
+    def put_nowait(self, item: EngineQueueMessage) -> None:
+        self._sync_q.put_nowait(item)
+        if self._wake_scheduled:
+            return
+        self._wake_scheduled = True
+        loop, ready = self._loop, self._ready
+        if loop is not None and ready is not None:
+            try:
+                loop.call_soon_threadsafe(ready.set)
+            except RuntimeError:
+                pass  # serving loop already closed
+
+    async def put(self, item: EngineQueueMessage) -> None:
+        self.put_nowait(item)
+
+    def drain(self, max_messages: int) -> list[EngineQueueMessage]:
+        """Take up to ``max_messages`` queued messages without waiting."""
+        msgs: list[EngineQueueMessage] = []
+        while len(msgs) < max_messages:
+            try:
+                msgs.append(self._sync_q.get_nowait())
+            except queue.Empty:
+                break
+        return msgs
+
+    def arm_wakeup(self) -> asyncio.Event:
+        """Ask for a wakeup on the running loop at the next put.
+
+        Callers must drain once more after arming: a put that landed before
+        the flag was cleared does not wake the loop.
+        """
+        loop = asyncio.get_running_loop()
+        if self._ready is None or self._loop is not loop:
+            self._ready = asyncio.Event()
+            self._loop = loop
+        self._ready.clear()
+        self._wake_scheduled = False
+        return self._ready
 
 
 def is_janus_sync_queue_shutdown(exc: Exception) -> bool:

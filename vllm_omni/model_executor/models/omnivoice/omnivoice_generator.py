@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OmniVoice Generator (Stage 0) - Iterative unmasking with Qwen3 backbone.
 
@@ -256,7 +256,7 @@ class OmniVoiceRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and x.is_cuda:
             return triton_rms_norm(x, self.weight, self.eps)
         variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
@@ -344,7 +344,7 @@ class OmniVoiceMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and gate_up.is_cuda:
             return self.down_proj(triton_swiglu(gate_up))
         gate, up = gate_up.chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
@@ -387,7 +387,7 @@ class OmniVoiceTransformerBlock(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif _TRITON_AVAILABLE:
+        elif _TRITON_AVAILABLE and hidden_states.is_cuda:
             hidden_states, residual = triton_fused_add_rms_norm(
                 hidden_states,
                 residual,
@@ -401,7 +401,7 @@ class OmniVoiceTransformerBlock(nn.Module):
 
         hidden_states = self.self_attn(hidden_states, rope_table, attn_metadata)
 
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and hidden_states.is_cuda:
             # Fused: (attn_out + residual) + RMSNorm in one kernel
             hidden_states, residual = triton_fused_add_rms_norm(
                 hidden_states,

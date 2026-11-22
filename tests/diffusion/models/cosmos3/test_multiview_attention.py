@@ -16,10 +16,8 @@ from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
     MultiviewLayout,
     PaddedAttentionGeometry,
     _make_pair_allowed,
-    _pack_padded_bshd,
-    build_multiview_block_sparsity,
+    build_multiview_block_mask,
     build_multiview_flex_metadata,
-    get_multiview_attention_plan,
     padded_multiview_flex_attention,
     validate_multiview_backend,
 )
@@ -99,8 +97,7 @@ def test_attention_pairs_match_independent_dense_reference(window: float) -> Non
     expected = _dense_reference(layout, geometry)
     torch.testing.assert_close(actual, expected)
     assert metadata.timestamp.dtype == torch.float32
-    sparsity = build_multiview_block_sparsity(metadata)
-    mask = sparsity.to_block_mask()
+    mask = build_multiview_block_mask(metadata)
     torch.testing.assert_close(
         mask.mask_mod(torch.tensor(0), torch.tensor(0), torch.arange(64)[:, None], torch.arange(128)[None, :]), expected
     )
@@ -146,7 +143,7 @@ def test_capture_time_tolerance_at_both_boundaries(
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("backend", ["unknown", "", "flex"])
+@pytest.mark.parametrize("backend", ["fa4", "unknown", "", "flex"])
 def test_backend_validation_rejects_unknown_backends(backend: str) -> None:
     with pytest.raises(ValueError, match="backend must be one of"):
         validate_multiview_backend(backend)
@@ -154,14 +151,14 @@ def test_backend_validation_rejects_unknown_backends(backend: str) -> None:
 
 @pytest.mark.cpu
 def test_backend_validation_accepts_runtime_backends() -> None:
-    assert [validate_multiview_backend(name) for name in ("fa4", "maskless", "triton")] == ["fa4", "maskless", "triton"]
+    assert [validate_multiview_backend(name) for name in ("maskless", "triton")] == ["maskless", "triton"]
     with pytest.raises(RuntimeError, match="no sparse block geometry"):
         _ = _layout(backend="maskless").block_sizes
 
 
-def _numerical_comparison(device: str, backend: str, dtype: torch.dtype, *, compiled: bool = False) -> None:
+def _numerical_comparison(device: str, dtype: torch.dtype) -> None:
     torch.manual_seed(37)
-    layout = _layout(backend=backend)
+    layout = _layout()
     q_block, kv_block = layout.block_sizes
     q_len = math.ceil(layout.gen_tokens / q_block) * q_block
     und_len = math.ceil(layout.max_und_tokens / kv_block) * kv_block
@@ -179,21 +176,7 @@ def _numerical_comparison(device: str, backend: str, dtype: torch.dtype, *, comp
     scores.masked_fill_(~dense_mask, -float("inf"))
     expected = (scores.softmax(-1) @ values.float().repeat_interleave(2, dim=2).transpose(1, 2)).transpose(1, 2)
     context = MultiviewAttentionContext(layout, {})
-    if compiled:
-        from vllm_omni.diffusion.models.cosmos3.multiview_fa4 import multiview_fa4_attention
-
-        plan, padded = get_multiview_attention_plan(
-            context, real_und_len=5, real_q_len=layout.gen_tokens, device=q.device
-        )
-        attention = torch.compile(multiview_fa4_attention, fullgraph=True)
-        actual = attention(
-            _pack_padded_bshd((q, padded.padded_q_len)),
-            _pack_padded_bshd((ku, padded.padded_und_len), (k, padded.padded_q_len)),
-            _pack_padded_bshd((vu, padded.padded_und_len), (v, padded.padded_q_len)),
-            plan,
-        )[:, : layout.gen_tokens]
-    else:
-        actual = padded_multiview_flex_attention(q, k, v, ku, vu, context)
+    actual = padded_multiview_flex_attention(q, k, v, ku, vu, context)
     torch.testing.assert_close(
         actual.float(),
         expected,
@@ -204,12 +187,11 @@ def _numerical_comparison(device: str, backend: str, dtype: torch.dtype, *, comp
 
 @pytest.mark.cpu
 def test_triton_attention_numerically_matches_dense_on_cpu() -> None:
-    _numerical_comparison("cpu", "triton", torch.float32)
+    _numerical_comparison("cpu", torch.float32)
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize(("backend", "compiled"), [("triton", False), ("fa4", False), ("fa4", True)])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA numerical comparison")
-def test_cuda_attention_numerically_matches_dense(backend: str, compiled: bool) -> None:
+def test_cuda_attention_numerically_matches_dense() -> None:
     # Triton's production entrypoint compiles the dynamic-shape Flex kernel.
-    _numerical_comparison("cuda", backend, torch.bfloat16, compiled=compiled)
+    _numerical_comparison("cuda", torch.bfloat16)

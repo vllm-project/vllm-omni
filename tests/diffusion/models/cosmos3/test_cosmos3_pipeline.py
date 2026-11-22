@@ -58,6 +58,47 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cosmos3_conditioning_with_encoder_fastpath(dtype):
+    from types import MethodType
+
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG, bits_equal
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install_wan_vae_encoder_fastpath
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    torch.manual_seed(7)
+    vae = OmniAutoencoderKLWan(**CONFIG).eval().to(dtype)
+    vae.register_to_config(latents_mean=[0.1, -0.2, 0.3, -0.4], latents_std=[0.5, 0.6, 0.7, 0.8])
+    pipeline = SimpleNamespace(
+        vae=vae,
+        dtype=dtype,
+        device=torch.device("cpu"),
+        vae_scale_factor_spatial=16,
+        sampling_dtype=Cosmos3OmniDiffusersPipeline.sampling_dtype,
+    )
+    for name in (
+        "_to_vae_device",
+        "_get_latents_mean_std",
+        "_normalize_vae_latent",
+        "_latent_hw_from_image_size",
+        "_crop_latent_to_image_size",
+    ):
+        setattr(pipeline, name, MethodType(getattr(Cosmos3OmniDiffusersPipeline, name), pipeline))
+    image = torch.rand(1, 3, 32, 32) * 2 - 1
+    video = torch.rand(1, 3, 5, 32, 32) * 2 - 1
+    encode_image = Cosmos3OmniDiffusersPipeline._encode_conditioning_image_latent
+    encode_video = Cosmos3OmniDiffusersPipeline._encode_video_tensor
+    expected_image = encode_image(pipeline, image)
+    expected_video = encode_video(pipeline, video, image_size=[32, 32, 16, 32])
+    assert install_wan_vae_encoder_fastpath(vae).installed
+    bits_equal(encode_image(pipeline, image), expected_image)
+    bits_equal(encode_video(pipeline, video, image_size=[32, 32, 16, 32]), expected_video)
+    assert expected_image.shape == (1, 4, 1, 2, 2)
+    assert expected_video.shape == (1, 4, 2, 1, 2)
+
+
 def test_component_selective_model_offload_fails_before_component_loading(monkeypatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 
@@ -327,6 +368,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "frame_rate": None,
         "resolved_frame_rate": None,
         "max_sequence_length": None,
+        "output_type": None,
         "extra_args": {},
     }
     values.update(overrides)
@@ -1316,7 +1358,7 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
             ),
         )
         output = pipeline.forward(request)
-        return output.output["video"]
+        return output.media.video.tensor
 
     first = run(123)
     second = run(123)
@@ -3247,7 +3289,11 @@ class TestForwardRouting:
 
         output = pipeline.forward(make_request_batch(prompt, sampling_params))
 
-        assert expected["key"] in output.output
+        if expected["key"] == "video":
+            assert output.media is not None
+            assert output.output is None
+        else:
+            assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]
@@ -3490,16 +3536,15 @@ class TestForwardRouting:
 @pytest.mark.parametrize(
     ("override", "fa_version", "expected"),
     [
-        (None, 4, "fa4"),
+        (None, 4, "maskless"),
         (None, 3, "maskless"),
         (None, 2, "maskless"),
         (None, None, "triton"),
         ("triton", 4, "triton"),
-        ("fa4", 3, "fa4"),
         ("maskless", 4, "maskless"),
     ],
 )
-def test_multiview_sparse_backend_follows_vllm_flash_attn_version(
+def test_multiview_backend_defaults_to_maskless_with_vllm_flash_attn(
     monkeypatch: pytest.MonkeyPatch, override: str | None, fa_version: int | None, expected: str
 ) -> None:
     from vllm_omni.diffusion.attention.backends.utils import fa
@@ -3542,108 +3587,7 @@ def test_multiview_sparse_backend_keeps_triton_when_flash_attn_import_fails(
     assert Cosmos3MultiviewPipeline._resolve_attention_backend() == "triton"
 
 
-def test_multiview_fa4_loads_vllm_bundled_flash_attn(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
-
-    cute = types.ModuleType("cutlass.cute")
-    cute.jit = lambda fn: fn
-    cutlass = types.ModuleType("cutlass")
-    cutlass.cute = cute
-    fa_cute = types.ModuleType("vllm.vllm_flash_attn.cute")
-    fa_cute.flash_attn_func = object()
-    fa_cute.utils = types.ModuleType("vllm.vllm_flash_attn.cute.utils")
-    block_sparsity = types.ModuleType("vllm.vllm_flash_attn.cute.block_sparsity")
-    block_sparsity.BlockSparseTensorsTorch = object()
-    for module in (cutlass, cute, fa_cute, fa_cute.utils, block_sparsity):
-        monkeypatch.setitem(sys.modules, module.__name__, module)
-    # The standalone flash-attn-4 package is no longer needed.
-    monkeypatch.setitem(sys.modules, "flash_attn", None)
-    monkeypatch.setitem(sys.modules, "flash_attn.cute", None)
-    monkeypatch.setattr(multiview_fa4, "_load_fa4", multiview_fa4._load_fa4.__wrapped__)
-
-    entry = multiview_fa4._load_fa4()
-
-    assert entry.flash_attn_func is fa_cute.flash_attn_func
-    assert entry.block_sparse_cls is block_sparsity.BlockSparseTensorsTorch
-    assert (entry.mask_mod.__vec_size__, entry.vector_mask_mod.__vec_size__) == (1, 32)
-
-
-def _fa4_test_sparsity() -> SimpleNamespace:
-    return SimpleNamespace(
-        partial_counts=torch.ones(1, dtype=torch.int32),
-        partial_indices=torch.zeros(1, 1, dtype=torch.int32),
-        full_counts=torch.zeros(1, dtype=torch.int32),
-        full_indices=torch.zeros(1, 1, dtype=torch.int32),
-        q_word_base=torch.zeros(256, dtype=torch.int32),
-        k_group_ids=torch.zeros(128, dtype=torch.int32),
-        allowed_words=torch.ones(1, dtype=torch.int32),
-        q_block_size=256,
-        kv_block_size=128,
-        q_len=256,
-        kv_len=128,
-    )
-
-
-@pytest.mark.parametrize(
-    ("capability", "compiled"), [((9, 0), False), ((10, 0), False), ((11, 0), False), ((10, 0), True)]
-)
-def test_multiview_fa4_launch_preserves_sparse_mask_through_custom_op(
-    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], compiled: bool
-) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
-
-    sparsity = _fa4_test_sparsity()
-    q = torch.zeros(1, sparsity.q_len, 4, 8, dtype=torch.bfloat16)
-    k = v = torch.zeros(1, sparsity.kv_len, 2, 8, dtype=torch.bfloat16)
-    kernel = Mock(return_value=(q + 1, None))
-    entry = multiview_fa4._Fa4Entry(kernel, SimpleNamespace, object(), object())
-    monkeypatch.setattr(multiview_fa4, "_load_fa4", lambda: entry)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
-    attention = multiview_fa4.multiview_fa4_attention
-    if compiled:
-        attention = torch.compile(attention, backend="eager", fullgraph=True)
-
-    output = attention(q, k, v, sparsity)
-
-    torch.testing.assert_close(output, q + 1)
-    kernel.assert_called_once()
-    kwargs = kernel.call_args.kwargs
-    assert kwargs["mask_mod"] is (entry.vector_mask_mod if capability[0] in (10, 11) else entry.mask_mod)
-    assert all(
-        actual is expected
-        for actual, expected in zip(
-            kwargs["aux_tensors"], [sparsity.q_word_base, sparsity.k_group_ids, sparsity.allowed_words], strict=True
-        )
-    )
-    block_sparse = kwargs["block_sparse_tensors"]
-    assert block_sparse.block_size == (256, 128)
-    for name, expected in (
-        ("mask_block_cnt", sparsity.partial_counts),
-        ("mask_block_idx", sparsity.partial_indices),
-        ("full_block_cnt", sparsity.full_counts),
-        ("full_block_idx", sparsity.full_indices),
-    ):
-        torch.testing.assert_close(getattr(block_sparse, name), expected[None, None])
-
-
-@pytest.mark.parametrize("field", ["q_len", "kv_len", "q_word_base", "k_group_ids", "q_block_size", "kv_block_size"])
-def test_multiview_fa4_rejects_invalid_mask_before_launch(monkeypatch: pytest.MonkeyPatch, field: str) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
-
-    sparsity = _fa4_test_sparsity()
-    q = torch.zeros(1, sparsity.q_len, 4, 8, dtype=torch.bfloat16)
-    k = v = torch.zeros(1, sparsity.kv_len, 2, 8, dtype=torch.bfloat16)
-    value = getattr(sparsity, field)
-    setattr(sparsity, field, value[:-1] if isinstance(value, torch.Tensor) else value - 1)
-    launch = Mock(side_effect=AssertionError("Invalid mask must fail before the FA4 launch"))
-    monkeypatch.setattr(multiview_fa4, "_cosmos3_multiview_fa4_op", launch)
-
-    with pytest.raises(ValueError, match="Cosmos3 multiview FA4"):
-        multiview_fa4.multiview_fa4_attention(q, k, v, sparsity)
-    launch.assert_not_called()
-
-
-@pytest.mark.parametrize("override", ["flex", "unknown", ""])
+@pytest.mark.parametrize("override", ["fa4", "flex", "unknown", ""])
 def test_multiview_backend_rejects_invalid_overrides(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
         COSMOS3_MULTIVIEW_BACKEND_ENV,

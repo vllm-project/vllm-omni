@@ -6,7 +6,6 @@ import torch
 
 from .multiview_flex_attention import (
     MultiviewAttentionContext,
-    padded_multiview_flex_attention,
     padded_multiview_triton_attention,
 )
 
@@ -27,4 +26,4 @@ def multiview_attention(
         return maskless_multiview_attention(q, k, v, k_und, v_und, context)
     if context.layout.backend == "triton":
         return padded_multiview_triton_attention(q, k, v, k_und, v_und, context)
-    return padded_multiview_flex_attention(q, k, v, k_und, v_und, context)
+    raise ValueError(f"Unsupported Cosmos3 multiview attention backend {context.layout.backend!r}.")

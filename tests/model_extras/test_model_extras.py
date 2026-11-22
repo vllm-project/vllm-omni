@@ -497,6 +497,14 @@ def test_bagel_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_qwen_image_21_extra_registry_declares_sigmas() -> None:
+    assert get_extra_body_params("QwenImage21Pipeline") == frozenset({"sigmas"})
+    assert get_extra_output_params("QwenImage21Pipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("QwenImage21Pipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_qwen_image_21_image_to_image_prompt_builder() -> None:
     dummy_image = Image.new("RGBA", (64, 64))
     result = build_image_to_image_prompt(

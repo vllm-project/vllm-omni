@@ -48,7 +48,16 @@ This distributes frontend and orchestration work across CPU processes.
 Here, a cold input means media or preprocessing caches miss, not that model
 weights must be loaded or GPU kernels compiled. Each frontend has its own
 processor/cache state, so cache duplication, CPU thread contention, and memory
-usage also matter. Multi-API serving does not itself change the output queue,
+usage also matter. Each API process caps its Torch intra-op thread pool at four
+threads (or a lower count already set, e.g. through `OMP_NUM_THREADS`), so the
+small tensor operations of frontend processing do not leave OpenMP workers
+spinning on every core of every API process. This is a process-wide setting:
+single-stage diffusion running inline in an API process shares the cap, while
+separate stage engine processes are unaffected. Set
+`VLLM_OMNI_API_SERVER_TORCH_THREADS` to a higher cap for CPU-heavy preprocessing
+or postprocessing, or to `0` to preserve the existing thread count.
+See [Environment Variables](../configuration/environment_variables.md).
+Multi-API serving does not itself change the output queue,
 move response encoding to an executor, or change the model's numerical scheduler.
 
 Compare `--api-server-count 1`, `2`, and higher counts with the same hardware,

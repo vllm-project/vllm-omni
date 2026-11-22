@@ -71,6 +71,15 @@ class PrefixCacheRunnerMixin:
         """
         return self._omni_cache_policy.needs_full_hidden_states
 
+    def _model_mm_outputs_written_in_sample(self) -> bool:
+        """True when the step snapshot cannot hold the model's mm outputs.
+
+        Such a model appends them in ``sample()``, after
+        ``_prefix_cache_save_step``; the output path discards the step
+        context and builds the payload from the live outputs.
+        """
+        return self._omni_cache_policy.mm_outputs_written_in_sample
+
     def _ensure_omni_prefix_cache(self) -> None:
         """One-shot construction (caller gates on the staged config).
 

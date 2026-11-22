@@ -9,7 +9,7 @@ import io
 import json
 import warnings
 import wave
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -57,13 +57,17 @@ AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
 
 
+def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
+    return exc.parameter in {"input_text", "input_tokens"}
+
+
 class _UnsupportedAudioFormatError(ValueError):
     """The Realtime endpoint only accepts mono PCM16 audio at 24 kHz."""
 
 
 @dataclass(slots=True)
 class _ResolvedResponse:
-    input: list[Any] | None
+    input: list[types.ConversationItem] | None
     instructions: str | None
     modalities: list[str]
     max_output_tokens: int | str
@@ -434,24 +438,31 @@ class OpenAIFullDuplexConnection:
             metadata=metadata,
         )
 
-    async def _prepare_engine_input_with_auto_truncation(
-        self,
-        response: _ResolvedResponse,
-        *,
-        preflight_only: bool = False,
-    ) -> EngineInput | None:
+    async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
         s = self.session
-        max_model_len = getattr(self.engine.model_config, "max_model_len", None)
-        persistent = response.input is None
-        items: list[Any] = s.items if response.input is None else response.input
-        staged_deletions: list[Any] = []
-        if max_model_len is None:
-            return await self._build_full_prompt(
-                tools=response.tools,
-                instructions=response.instructions,
-                items=items,
-                skip_mm_cache=preflight_only,
-            )
+        max_model_len = self.engine.model_config.max_model_len
+        if response.input is None:
+            items = s.model_context_items()
+        else:
+            items = response.input
+
+        async def probe_prompt(
+            current_items: list[types.ConversationItem],
+        ) -> tuple[EngineInput | None, int]:
+            # Budget checks are speculative and may render repeatedly while
+            # truncating, so keep them off the shared sender cache.
+            try:
+                prompt = await self._build_full_prompt(
+                    tools=response.tools,
+                    instructions=response.instructions,
+                    items=current_items,
+                    skip_mm_cache=True,
+                )
+            except VLLMValidationError as exc:
+                if not _is_prompt_limit_error(exc):
+                    raise
+                return None, max_model_len + 1
+            return prompt, len(prompt["prompt_token_ids"])
 
         truncation = s.config.truncation or "auto"
         ratio = 1.0
@@ -477,24 +488,9 @@ class OpenAIFullDuplexConnection:
             trigger = limit
             target = limit
 
-        # Budget checks are speculative and may render repeatedly while
-        # truncating, so keep them off the shared sender cache. Once accepted,
-        # render again through the normal cache path for engine submission.
-        engine_input = await self._build_full_prompt(
-            tools=response.tools,
-            instructions=response.instructions,
-            items=items,
-            skip_mm_cache=True,
-        )
-        total = len(engine_input["prompt_token_ids"])
+        engine_input, total = await probe_prompt(items)
         if total <= trigger:
-            if preflight_only:
-                return engine_input
-            return await self._build_full_prompt(
-                tools=response.tools,
-                instructions=response.instructions,
-                items=items,
-            )
+            return items
         if mode == "disabled":
             logger.warning(
                 "[realtime] token budget exceeded (%d/%d) and truncation is disabled -- rejecting response.create",
@@ -503,68 +499,30 @@ class OpenAIFullDuplexConnection:
             )
             return None
 
-        if persistent:
-            # Preflight truncation is speculative. Work on a snapshot so a
-            # rejected response.create does not delete items from session history.
-            items = list(items)
+        all_items = items
+        if not all_items:
+            return None if total > limit else all_items
 
-        idx = 0
-        while total > target and idx < len(items):
-            item = items[idx]
-            if getattr(item, "role", None) == "system":
-                idx += 1
-                continue
-            if persistent and item.id is not None and s.item_in_progress.get(item.id, False):
-                idx += 1
-                continue
+        low = 1
+        high = len(all_items)
+        feasible_index: int | None = None
+        while low < high:
+            middle = (low + high) // 2
+            items = all_items[middle:]
+            engine_input, total = await probe_prompt(items)
+            if total <= target:
+                high = middle
+                feasible_index = middle
+            else:
+                low = middle + 1
 
-            remove_indexes = [idx]
-            if item.type in ("function_call", "function_call_output"):
-                call_id = getattr(item, "call_id", None)
-                pair_idx = next(
-                    (
-                        other_idx
-                        for other_idx, other in enumerate(items)
-                        if other_idx != idx and getattr(other, "call_id", None) == call_id
-                    ),
-                    None,
-                )
-                if pair_idx is not None:
-                    remove_indexes.append(pair_idx)
-
-            for remove_idx in sorted(remove_indexes, reverse=True):
-                removed = items[remove_idx]
-                if persistent:
-                    staged_deletions.append(removed)
-                del items[remove_idx]
-            engine_input = await self._build_full_prompt(
-                tools=response.tools,
-                instructions=response.instructions,
-                items=items,
-                skip_mm_cache=True,
-            )
-            total = len(engine_input["prompt_token_ids"])
+        if feasible_index != low:
+            items = all_items[low:]
+            engine_input, total = await probe_prompt(items)
 
         if total > limit:
             return None
-        if preflight_only:
-            return engine_input
-        engine_input = await self._build_full_prompt(
-            tools=response.tools,
-            instructions=response.instructions,
-            items=items,
-        )
-        for removed in staged_deletions:
-            if removed.id is None or s.remove_item(removed.id) is None:
-                continue
-            await self._send_event(
-                types.ConversationItemDeletedEvent(
-                    event_id=_gen_id("evt"),
-                    type="conversation.item.deleted",
-                    item_id=removed.id,
-                )
-            )
-        return engine_input
+        return items
 
     async def _handle_response_create(self, event: types.ResponseCreateEvent):
         s = self.session
@@ -585,14 +543,11 @@ class OpenAIFullDuplexConnection:
 
         had_active_response = s.active_response is not None
         try:
-            engine_input = await self._prepare_engine_input_with_auto_truncation(
-                response,
-                preflight_only=had_active_response,
-            )
+            preflight_items = await self._truncate_prompt_items(response)
         except VLLMValidationError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
-        if engine_input is None:
+        if preflight_items is None:
             await self._send_error(
                 "The response input exceeds the model's input token limit",
                 "invalid_request_error",
@@ -604,17 +559,29 @@ class OpenAIFullDuplexConnection:
             if s.active_response is not None:
                 await self._cancel_active_response()
             try:
-                engine_input = await self._prepare_engine_input_with_auto_truncation(response)
+                preflight_items = await self._truncate_prompt_items(response)
             except VLLMValidationError as exc:
                 await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
                 return
-            if engine_input is None:
+            if preflight_items is None:
                 await self._send_error(
                     "The response input exceeds the model's input token limit",
                     "invalid_request_error",
                     event_id=event.event_id,
                 )
                 return
+
+        try:
+            engine_input = await self._build_full_prompt(
+                tools=response.tools,
+                instructions=response.instructions,
+                items=preflight_items,
+            )
+        except VLLMValidationError as exc:
+            await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
+            return
+        if response.input is None:
+            s.commit_model_context_items(preflight_items)
 
         response_id = _gen_id("resp")
         await self._send_event(
@@ -1609,8 +1576,8 @@ class OpenAIFullDuplexConnection:
                 return text
         return ""
 
-    def _resolve_response_input(self, items: list[Any]) -> list[Any]:
-        resolved = []
+    def _resolve_response_input(self, items: list[Any]) -> list[types.ConversationItem]:
+        resolved: list[types.ConversationItem] = []
         for item in items:
             if getattr(item, "type", None) != "item_reference":
                 self._validate_input_item(item)
@@ -1641,7 +1608,7 @@ class OpenAIFullDuplexConnection:
         tools: list | None = None,
         *,
         instructions: str | None = None,
-        items: list | None = None,
+        items: list[types.ConversationItem] | None = None,
         skip_mm_cache: bool = False,
     ) -> EngineInput:
         """Render the effective conversation through normal chat preprocessing."""
@@ -1706,10 +1673,6 @@ class OpenAIFullDuplexConnection:
                     messages.append({"role": "system", "content": text})
 
         request = ChatCompletionRequest(model=self.model_name, messages=messages)
-        tok_params = replace(
-            request.build_tok_params(self.engine.model_config),
-            max_total_tokens=None,
-        )
         _, (engine_input,) = await chat_handler._preprocess_chat(
             request,
             messages,
@@ -1717,7 +1680,6 @@ class OpenAIFullDuplexConnection:
             default_template_content_format=chat_handler.chat_template_content_format,
             default_template_kwargs=chat_handler._effective_chat_template_kwargs(request),
             tool_dicts=converted_tools,
-            tok_params=tok_params,
             skip_mm_cache=skip_mm_cache,
         )
         if engine_input.get("prompt_token_ids") is None:

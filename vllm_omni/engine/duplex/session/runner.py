@@ -530,9 +530,6 @@ class DuplexSessionRunner:
         if item.kind == "commit":
             await self._on_commit(dict(item.payload))
             return
-        if item.kind == "run_payload":
-            await self._run_internal_payload(dict(item.payload))
-            return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
 
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
@@ -701,9 +698,6 @@ class DuplexSessionRunner:
 
     def _require_projector(self) -> RealtimeProjectionState:
         return self.out.require_projector()
-
-    def _is_stale_model_output(self, payload: dict[str, object]) -> bool:
-        return self.out.is_stale_model_output(payload)
 
     def _promote_deferred_overlap_later(self, payload: dict[str, object], precreate_response: bool) -> None:
         """Re-enter the mailbox so the promoted turn is handled in command order."""
@@ -2020,36 +2014,26 @@ class DuplexSessionRunner:
             or model_state.committed_audio_payload is not None
             or realtime_validated_audio_commit
         )
-        committed = None
         if event_type in {"input_audio_buffer.commit", "input.commit"}:
             model_state.input_since_commit = False
             model_state.speech_since_commit = False
-        if event_type != "response.create":
-            committed = (
-                helpers.commit_audio_input(
-                    session,
-                    realtime_item_id=realtime_item_id,
-                    transcript=event.get("transcript"),
-                )
-                if had_uncommitted_audio
-                else None
+        committed = (
+            helpers.commit_audio_input(
+                session,
+                realtime_item_id=realtime_item_id,
+                transcript=event.get("transcript"),
             )
-            self.emit(
-                helpers.audio_committed_payload(
-                    session,
-                    committed=committed,
-                    realtime_item_id=realtime_item_id,
-                    transcript=event.get("transcript"),
-                )
+            if had_uncommitted_audio
+            else None
+        )
+        self.emit(
+            helpers.audio_committed_payload(
+                session,
+                committed=committed,
+                realtime_item_id=realtime_item_id,
+                transcript=event.get("transcript"),
             )
-            return
-        if committed is not None:
-            if isinstance(realtime_item_id, str):
-                session.register_history_item(realtime_item_id, committed.message)
-            self.emit(helpers.input_committed_payload(session, committed, realtime_item_id=realtime_item_id))
-        # NOTE(refactor): the old generic chat-completion fallback response
-        # (`_run_response`) is gone; a native session with a response already in
-        # progress only acknowledges the commit here.
+        )
 
     # ------------------------------------------------------------------ #
     # playback.ack (moved from OmniDuplexSessionHandler)                 #

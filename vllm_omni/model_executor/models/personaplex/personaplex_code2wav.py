@@ -78,6 +78,7 @@ class PersonaPlexCode2Wav(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
+        self._async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
         self.config = vllm_config.model_config.hf_config
 
         # Runner-facing capability flags, matching Qwen3TTSCode2Wav so the
@@ -101,8 +102,8 @@ class PersonaPlexCode2Wav(nn.Module):
         self.mimi: nn.Module | None = None
         self._additional_mimi = nn.ModuleList()
         self._mimi_device: torch.device | None = None
-        self._request_codes: dict[str, torch.Tensor] = {}
         self._request_codec_slots: dict[str, int] = {}
+        self._consumed_full_payload_requests: set[str] = set()
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -168,10 +169,9 @@ class PersonaPlexCode2Wav(nn.Module):
         """Decode flat codebook-major codec ids into PCM via Mimi.
 
         ``input_ids`` per request is ``[k * F]`` (codebook-major), where ``k``
-        is ``self._num_codebooks``. The connector may send either a new delta
-        chunk or the cumulative prefix of a resumable request. Request-local
-        code history identifies the new suffix, and the streaming Mimi decoder
-        consumes each new frame exactly once.
+        is ``self._num_codebooks``. Async inputs contain newly generated delta
+        frames. Sync connector payloads contain the full sequence and may
+        persist across forwards, so they are consumed once per request.
         """
         sr_val = int(self._output_sample_rate)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
@@ -223,10 +223,11 @@ class PersonaPlexCode2Wav(nn.Module):
             frames = n // k
             codes_kf = flat.reshape(k, frames)
             state_id = state_ids[i]
-            delta_kf = self._new_code_suffix(state_id, codes_kf)
-            if delta_kf.shape[1] == 0:
-                continue
-            wav = self._decode_streaming_frames(state_id, delta_kf.to(device=device))
+            if not self._async_chunk and state_id is not None:
+                if state_id in self._consumed_full_payload_requests:
+                    continue
+                self._consumed_full_payload_requests.add(state_id)
+            wav = self._decode_streaming_frames(state_id, codes_kf.to(device=device))
             if wav.numel() > 0:
                 audios[i] = wav.to(dtype=torch.float32).reshape(-1)
 
@@ -262,24 +263,6 @@ class PersonaPlexCode2Wav(nn.Module):
                         request_id = meta.get("request_id")
             resolved.append(str(request_id) if request_id is not None else None)
         return resolved
-
-    def _new_code_suffix(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
-        if request_id is None:
-            return codes_kf
-
-        incoming = codes_kf.detach().to(device="cpu", dtype=torch.long)
-        previous = self._request_codes.get(request_id)
-        if (
-            previous is not None
-            and incoming.shape[1] >= previous.shape[1]
-            and torch.equal(incoming[:, : previous.shape[1]], previous)
-        ):
-            delta = incoming[:, previous.shape[1] :]
-            self._request_codes[request_id] = incoming
-            return delta
-
-        self._request_codes[request_id] = incoming if previous is None else torch.cat([previous, incoming], dim=1)
-        return incoming
 
     def _decode_streaming_frames(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
         codec, ephemeral = self._codec_for_request(request_id)
@@ -338,7 +321,7 @@ class PersonaPlexCode2Wav(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
             state_id = str(request_id)
-            self._request_codes.pop(state_id, None)
+            self._consumed_full_payload_requests.discard(state_id)
             slot = self._request_codec_slots.pop(state_id, None)
             codecs = self._mimi_codecs()
             if slot is not None and slot < len(codecs):

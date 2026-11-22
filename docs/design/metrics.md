@@ -141,17 +141,19 @@ A reverse map `(stage_id, replica_id) -> flat_idx` is maintained on the Orchestr
 
 > Dynamic add/remove of replicas at runtime is intentionally out of scope — the upstream `PrometheusStatLogger` materializes per-engine_idx child metrics at init time, and supporting hot-add would require non-trivial intervention into upstream's per-family child dictionaries.
 
-## Gating: `--log-stats`
+## Gating: `--log-stats` and `--collect-stage-metrics`
 
-All metrics — both the omni-specific `vllm_omni:*` families and the upstream `vllm:*` wrap families — are gated by the user's `--log-stats` CLI flag (default off). The flag is plumbed from `OmniBase.__init__(log_stats=...)` through `AsyncOmniEngine` to the stage-spawn helpers and to the three Prometheus metric classes (`OmniPrometheusMetrics` / `OmniModalityMetrics` / `OmniTransferMetrics`), and is forwarded to `Orchestrator._init_metrics_state(...)`.
+Prometheus emission and upstream engine statistics are gated by `log_stats`. The Python interface defaults to `log_stats=False`, while API serving enables statistics by default unless `--disable-log-stats` is supplied. These defaults are unchanged by the addition of `--collect-stage-metrics`. The setting is plumbed from `OmniBase.__init__(log_stats=...)` through `OmniEngineBase` to the stage-spawn helpers and to the three Prometheus metric classes (`OmniPrometheusMetrics` / `OmniModalityMetrics` / `OmniTransferMetrics`), and is forwarded to `Orchestrator._init_metrics_state(...)`.
 
-Behavior with `--log-stats=off` (default):
+Per-request stage diagnostics are controlled separately by `--collect-stage-metrics`, which defaults to on for backward compatibility. Disabling it skips per-output timestamp/audio bookkeeping, diagnostic calculations, and full response-level stage-metric merging. Lightweight `StageRequestStats` objects still carry token counts and finish reasons into response-level stage metadata, preserving usage accounting and generation validation. Because statistics logging consumes the full metrics for omni-specific observations, `log_stats=True` with `collect_stage_metrics=False` is rejected as an invalid configuration. For API serving, use `--no-collect-stage-metrics --disable-log-stats` to disable stage diagnostics.
+
+Behavior with `log_stats=False` (the Python-interface default, or API serving with `--disable-log-stats`):
 
 - The three `Omni*Metrics` classes register their module-level Gauge / Counter / Histogram families at import time (prometheus_client requires up-front registration), but each `observe / inc / set` method early-returns. The per-label child series for `vllm_omni:*` stay materialized but never have data written to them.
 - `OmniPrometheusStatLogger` is not constructed in `_init_metrics_state`, so the ~65 upstream `vllm:*` wrap families are not registered in the default registry at all.
 - The engine core's `Scheduler.make_stats()` also short-circuits inside upstream (`if not self.log_stats: return None`), so no `SchedulerStats` is produced per step — the per-iteration cost is bounded by the existing upstream gate.
 
-Behavior with `--log-stats=on`: all metric paths fire normally; the orchestrator's per-replica recording is bounded only by `OmniSchedulerMixin.make_stats()`'s per-scheduler 1 Hz throttle (see next section).
+Behavior with `log_stats=True`: all metric paths fire normally; the orchestrator's per-replica recording is bounded only by `OmniSchedulerMixin.make_stats()`'s per-scheduler 1 Hz throttle (see next section).
 
 The overhead with the flag on is small enough that an A/B benchmark on Qwen3-Omni-30B single replica (30 sequential audio requests) showed a mean latency delta of +0.6% (Welch's t = 0.318, n=30, not statistically significant at α=0.05); the `/metrics` line count drops from 1358 to 124 lines when the flag is off.
 

@@ -35,9 +35,10 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_streaming: true
-      # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk.
-      codec_chunk_frames: 5
-      # Emit only the first audio chunk early, then return to codec_chunk_frames.
+      # Mimi runs at 12.5 Hz (80 ms / frame). Send every frame as soon as it
+      # is decoded: a larger chunk holds each frame until the chunk fills,
+      # which adds (codec_chunk_frames - 1) / 2 frames of output latency.
+      codec_chunk_frames: 1
       initial_codec_chunk_frames: 1
 
 stages:

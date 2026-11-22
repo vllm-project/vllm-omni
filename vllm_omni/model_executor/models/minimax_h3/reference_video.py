@@ -688,6 +688,9 @@ def load_audio_file(path: str) -> tuple[torch.Tensor, int]:
             return _soundfile_to_waveform(wav)
 
 
+_AUDIO_EXTRACTION_TIMEOUT_SECONDS = 120
+
+
 def load_video_audio(
     path: str,
     *,
@@ -718,7 +721,7 @@ def load_video_audio(
         if duration_seconds is not None:
             command.extend(["-t", f"{float(duration_seconds):.6f}"])
         command.append(output)
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, timeout=_AUDIO_EXTRACTION_TIMEOUT_SECONDS)
         return load_audio_file(output)
 
 

@@ -67,6 +67,20 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import par
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
+# Voice used when a request names no speaker. Matches the reference
+# ``Qwen3OmniMoeForConditionalGeneration.generate(speaker="Ethan")``; the
+# checkpoint's ``talker_config.speaker_id`` lists "chelsie" first, so taking the
+# first key would silently switch the default to a different (female) voice.
+DEFAULT_SPEAKER = "ethan"
+
+
+def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
+    """Return the speaker key used for requests that do not name one."""
+    if DEFAULT_SPEAKER in speaker_token_ids:
+        return DEFAULT_SPEAKER
+    return next(iter(speaker_token_ids))
+
+
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
 
@@ -552,7 +566,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         generate_audio: bool = True,
-        voice_type: str = "ethan",
+        voice_type: str = DEFAULT_SPEAKER,
         codec: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
@@ -963,7 +977,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 "prefix_caching": talker_hf_config.audio_start_token_id,
             }
 
-        self.default_tts_text_spk_type = list(self.tts_text_spk_token_ids.keys())[0]
+        self.default_tts_text_spk_type = resolve_default_speaker(self.tts_text_spk_token_ids)
 
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 

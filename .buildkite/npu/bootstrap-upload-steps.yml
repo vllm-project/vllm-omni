@@ -89,7 +89,7 @@ steps:
       - image-build-310p
     key: upload-ready-pipeline
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
     command: |
       python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/test-npu-ready.yml
 
@@ -109,4 +109,4 @@ steps:
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/npu/test-npu-nightly.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"

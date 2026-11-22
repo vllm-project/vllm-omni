@@ -35,6 +35,7 @@ from vllm_omni.benchmarks.patch.patch import (
     _iter_image_reference_inputs,
     _iter_video_reference_inputs,
     _omni_request_timeout_s,
+    async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     async_request_openai_image_edits_omni,
     async_request_openai_image_generations_omni,
@@ -472,6 +473,48 @@ async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture)
 
     assert output.success is False
     assert output.error == "EngineCore encountered an issue"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "env", "expected_duration_s"),
+    [
+        # Server-stated format wins over the env fallback.
+        ({"X-Audio-Sample-Rate": "48000", "X-Audio-Channels": "2"}, {}, 1.0),
+        ({"X-Audio-Sample-Rate": "48000", "X-Audio-Channels": "2"}, {"rate": "24000", "channels": "1"}, 1.0),
+        # Older servers send no headers: the env (default 24 kHz mono) applies.
+        ({}, {}, 4.0),
+        ({}, {"rate": "48000", "channels": "2"}, 1.0),
+    ],
+)
+async def test_audio_speech_stream_uses_server_pcm_format(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, headers, env, expected_duration_s
+):
+    from vllm_omni.metrics import definitions as defs
+
+    for key, var in (("rate", defs.AUDIO_SAMPLE_RATE_ENV), ("channels", defs.AUDIO_CHANNELS_ENV)):
+        if key in env:
+            monkeypatch.setenv(var, env[key])
+        else:
+            monkeypatch.delenv(var, raising=False)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=10,
+        output_len=20,
+    )
+    # 1 s of 48 kHz stereo s16le = 192000 bytes.
+    mock_response = MockResponse(200, [b"\x00" * 96000, b"\x00" * 96000])
+    mock_response.headers = headers
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(request_input, mock_session)
+
+    assert output.success is True
+    assert output.audio_duration == pytest.approx(expected_duration_s)
 
 
 @pytest.mark.asyncio

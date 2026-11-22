@@ -15,6 +15,7 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecu
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -91,8 +92,35 @@ def test_emit_step_outputs_finalizes_finished_request_without_stream() -> None:
     assert engine.scheduler.get_request_state(request_id) is None
 
 
+@pytest.mark.parametrize("path", ["request", "step", "unscheduled_step"])
+def test_terminal_output_keeps_original_queue_when_request_id_is_reused(monkeypatch, path) -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    engine.execution_mode = (
+        DiffusionExecutionMode.REQUEST_BATCH if path == "request" else DiffusionExecutionMode.STEP_BATCH
+    )
+    request_id = engine._add_prepared_request(_make_request("reused"))
+    original_queue = engine._out_streams[request_id]
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+    finalize = engine._finalize_finished_request
+
+    def admit_after_finalization(*args, **kwargs):
+        output = finalize(*args, **kwargs)
+        engine._add_prepared_request(_make_request(request_id))
+        return output
+
+    monkeypatch.setattr(engine, "_finalize_finished_request", admit_after_finalization)
+    runner_output = RunnerOutput(request_id=request_id, step_index=None, finished=True, result=None)
+    engine._emit_outputs({request_id}, [] if path == "unscheduled_step" else [request_id], runner_output)
+
+    assert original_queue.qsize() == 1, "the old terminal output must not be sent to the new lifecycle"
+    assert original_queue.get_nowait().aborted
+    assert engine._out_streams[request_id].empty()
+    assert engine.scheduler.get_request_state(request_id).status == DiffusionRequestStatus.WAITING
+
+
 def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine, Mock]:
-    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine = _make_engine()
     engine.od_config = SimpleNamespace(diffusion_kv_mode=mode)
     cleanup = Mock()
     engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup)
@@ -101,8 +129,9 @@ def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine
 
 def test_paged_terminal_output_clears_worker_rows() -> None:
     engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
-    engine._finalize_finished_request = lambda request_id, *_args: request_id
-    engine._put_output = lambda *_args: None
+    for request_id in ("req-0", "req-1"):
+        engine.scheduler.add_request(_make_request(request_id))
+    engine.scheduler.finish_requests(["req-0", "req-1"], DiffusionRequestStatus.FINISHED_COMPLETED)
 
     engine._emit_finished_outputs({"req-0", "req-1"})
 
@@ -125,9 +154,8 @@ def test_paged_abort_clears_worker_rows_before_scheduler_free() -> None:
 
 def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
     engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.DENSE_LEGACY)
-    engine._finalize_finished_request = lambda request_id, *_args: request_id
-    engine._put_output = lambda *_args: None
-    engine.scheduler = SimpleNamespace(get_request_state=lambda _request_id: None)
+    engine.scheduler.add_request(_make_request("req-0"))
+    engine.scheduler.finish_requests("req-0", DiffusionRequestStatus.FINISHED_COMPLETED)
 
     engine._emit_finished_outputs({"req-0"})
     engine._abort_requests(["req-idle"])

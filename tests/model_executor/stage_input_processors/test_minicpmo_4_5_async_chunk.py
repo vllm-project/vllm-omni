@@ -9,6 +9,7 @@ import torch
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
+    _extract_codec_delta,
     tts2code2wav_async_chunk,
     tts2code2wav_full_payload,
     tts2code2wav_token_only,
@@ -80,6 +81,34 @@ def test_empty_full_payload_releases_consumer_wait_gate() -> None:
     assert payload.meta.left_context_size == 0
     assert payload.meta.last_chunk is True
     assert payload.meta.finished.item() is True
+
+
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("audio_shape", [(0,), (0, 1)])
+def test_empty_device_codec_prefill_preserves_next_chunk(flat: bool, audio_shape: tuple[int, ...]) -> None:
+    audio = torch.empty(audio_shape, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+    empty_output = (
+        {"codes.audio": audio, "meta.codec_frame_valid": valid}
+        if flat
+        else {"codes": {"audio": audio}, "meta": {"codec_frame_valid": valid}}
+    )
+    assert _extract_codec_delta(empty_output, "req") == []
+    manager = _manager()
+    request = _request("req")
+    assert tts2code2wav_async_chunk(manager, empty_output, request, False) is None
+    payload = tts2code2wav_async_chunk(manager, _delta(*range(25)), request, False)
+    assert payload is not None
+    assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+    assert payload.meta.chunk_seq == 0
+
+
+def test_device_codec_validity_filters_terminal_token() -> None:
+    output = {
+        "codes": {"audio": torch.tensor([[2], [6561], [3]])},
+        "meta": {"codec_frame_valid": torch.tensor([True, False, True])},
+    }
+    assert _extract_codec_delta(output, "req") == [2, 3]
 
 
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])
@@ -163,6 +192,49 @@ def test_duplex_turn_end_waits_for_terminal_codec_flush() -> None:
     assert _codes(final) == [22, 23, 24]
     assert final.meta.last_chunk is True
     assert final.meta.turn_end is True
+
+
+@pytest.mark.parametrize(
+    "frame_count,delta_frames,body_chunks",
+    [
+        # Single-frame deltas across the 25-frame chunk boundary.
+        (1, 1, 0),
+        (24, 1, 0),
+        (25, 1, 1),
+        (26, 1, 1),
+        (60, 1, 2),
+        # Batched deltas: two full chunks, then a short tail held for the final flush.
+        (52, 25, 2),
+    ],
+)
+def test_duplex_final_segment_preserves_every_code_and_closes_once(
+    frame_count: int, delta_frames: int, body_chunks: int
+) -> None:
+    manager = _manager()
+    request = _request("final-segment")
+    emitted = []
+    bodies = 0
+    for start in range(0, frame_count, delta_frames):
+        codes = range(start, min(start + delta_frames, frame_count))
+        payload = tts2code2wav_async_chunk(manager, _duplex_delta(*codes, turn_end=True), request, False)
+        if payload is not None:
+            assert payload.meta.last_chunk is False
+            assert payload.meta.turn_end is False
+            bodies += 1
+            emitted.extend(_codes(payload)[payload.meta.codec_left_context_frames :])
+    assert bodies == body_chunks
+
+    final = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert final is not None
+    assert final.meta.last_chunk is True
+    assert final.meta.turn_end is True
+    emitted.extend(_codes(final)[final.meta.codec_left_context_frames :])
+    assert emitted == list(range(frame_count))
+
+    duplicate = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert duplicate is not None
+    assert duplicate.codes is None
+    assert not duplicate.meta.last_chunk
 
 
 def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
@@ -281,12 +353,16 @@ def test_sync_token_only_reserves_codec_and_silence_slots() -> None:
     assert prompts[0]["additional_information"] is None
 
 
-def test_empty_final_releases_wait_gate_once() -> None:
+@pytest.mark.parametrize("with_validity", [False, True])
+def test_empty_final_releases_wait_gate_once(with_validity: bool) -> None:
     manager = _manager()
     request = _request("req")
 
-    final = tts2code2wav_async_chunk(manager, None, request, True)
-    duplicate = tts2code2wav_async_chunk(manager, None, request, True)
+    output = _delta() if with_validity else None
+    if output is not None:
+        output["meta"]["codec_frame_valid"] = torch.empty(0, dtype=torch.bool)
+    final = tts2code2wav_async_chunk(manager, output, request, True)
+    duplicate = tts2code2wav_async_chunk(manager, output, request, True)
 
     assert final is not None
     assert _codes(final) == []
@@ -519,3 +595,158 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert payload is not None
     assert payload.meta.cache_epoch == 1
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+def test_mrv2_abort_terminal_drops_pending_codec_frames(aborted: bool) -> None:
+    """The MRv2 snapshot has no scheduler status; its abort mark must behave like V1's FINISHED_ABORTED."""
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    manager = _manager()
+    state = _NativeRequestState(request_id="native", external_req_id="native", prompt_token_ids=[0] * 3)
+    pending = state.snapshot(include_token_history=True, sampled_token_ids=[])
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(10)), pending) is None
+    state.finished = True
+    state.aborted = aborted
+    terminal = tts2code2wav_async_chunk(manager, None, state.snapshot(include_token_history=True))
+    if aborted:
+        assert terminal is None
+        assert "native" not in manager.code_prompt_token_ids
+    else:
+        assert terminal is not None
+        assert _codes(terminal)[3:] == list(range(10))
+
+
+@pytest.mark.parametrize("turn_end", [False, True])
+def test_mrv2_sampled_codec_eos_flushes_resumable_segment(turn_end: bool) -> None:
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    state = _NativeRequestState(
+        request_id="native",
+        external_req_id="native",
+        prompt_token_ids=[0] * 3,
+        resumable=True,
+        sampling_params=SimpleNamespace(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    request = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
+    assert not request.is_finished()  # The session remains available for another unit.
+    payload = tts2code2wav_async_chunk(_manager(), _duplex_delta(*range(7), turn_end=turn_end), request)
+    assert payload is not None
+    assert _codes(payload) == [4218] * 3 + list(range(7))
+    assert payload.meta.tts_is_last_chunk is True
+    assert payload.meta.last_chunk is turn_end
+
+
+def test_old_sampled_eos_cannot_close_the_next_turn():
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    manager = _manager()
+    state = _NativeRequestState(
+        request_id="native",
+        external_req_id="native",
+        prompt_token_ids=[0, 0],
+        resumable=True,
+        sampling_params=SimpleNamespace(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    # The next payload has no newly accepted token, even though the ledger
+    # still ends in the previous segment's EOS.
+    stale = state.snapshot(include_token_history=True)
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(turn_id=8, turn_end=True), stale)
+    assert first is None
+    state.accept_tokens([1])
+    body = tts2code2wav_async_chunk(
+        manager, _duplex_delta(*range(30), turn_id=8, turn_end=True), state.snapshot(include_token_history=True)
+    )
+    assert body is not None and body.meta.last_chunk is False
+    tail = tts2code2wav_async_chunk(
+        manager, _duplex_delta(turn_id=8, turn_end=True), state.snapshot(include_token_history=True), True
+    )
+    assert tail is not None and tail.meta.last_chunk is True
+    assert _codes(body)[3:] + _codes(tail)[3:] == list(range(30))
+
+
+@pytest.mark.parametrize("lookahead", [1, 2, 4])
+def test_mrv2_async_lookahead_cannot_reopen_a_completed_condition(lookahead):
+    manager = _manager()
+    requests = [_request("a"), _request("b")]
+    for request in requests:
+        request.sampling_params = SimpleNamespace(stop_token_ids=[6561])
+
+    def output(request, seq, codes, *, eos=False, turn_end=False):
+        payload = _duplex_delta(*codes, text=f"condition-{seq}", turn_end=turn_end)
+        payload["meta"]["streaming_condition_seq"] = torch.tensor(seq)
+        request.sampled_token_ids = [6561] if eos else []
+        return tts2code2wav_async_chunk(manager, payload, request, False)
+
+    for request in requests:
+        first = output(request, 0, range(25), eos=True)
+        assert first is not None and first.meta.tts_is_last_chunk
+        assert _codes(first)[3:] == list(range(25))
+    for request in reversed(requests):
+        for _ in range(lookahead):
+            assert output(request, 0, [999], eos=True) is None
+        assert output(request, 1, range(25, 35)) is None
+        # Even after a new condition starts, an old snapshot must not close it
+        # or contaminate its queued codes/text.
+        assert output(request, 0, [999], eos=True) is None
+        last = output(request, 1, range(35, 50), eos=True, turn_end=True)
+        assert last is not None and last.meta.last_chunk
+        assert _codes(last)[3:] == list(range(25, 50))
+        assert last.meta.chunk_seq == 1
+        assert output(request, 1, [999], eos=True, turn_end=True) is None
+
+
+@pytest.mark.parametrize("request_terminal", [False, True])
+def test_mrv2_duplex_turn_end_keeps_live_code2wav_stream_open(request_terminal: bool) -> None:
+    # A turn end must not close the Code2Wav stream of a live resumable request,
+    # or the next turn's chunks are never received.
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin as OmniConnectorPayloadTransport,
+    )
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    state = _NativeRequestState(
+        request_id="native",
+        external_req_id="native",
+        prompt_token_ids=[0] * 3,
+        resumable=True,
+        sampling_params=SimpleNamespace(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    state.finished = request_terminal
+    request = state.snapshot(include_token_history=True, sampled_token_ids=None if request_terminal else [6561])
+    payload = tts2code2wav_async_chunk(
+        _manager(), _duplex_delta(*range(7), turn_end=True), request, request.is_finished()
+    )
+
+    assert payload is not None
+    assert payload.meta.last_chunk is True
+    assert payload.meta.turn_end is True
+    assert payload.meta.is_segment_finished.item() is True
+    assert payload.meta.finished.item() is request_terminal
+    metadata = OmniConnectorPayloadTransport._extract_scheduling_metadata({"meta": {"finished": payload.meta.finished}})
+    assert metadata.get("input_terminal", False) is request_terminal
+
+
+@pytest.mark.parametrize("last_valid", [False, True])
+def test_full_payload_accumulates_codec_validity_per_frame(last_valid):
+    """A final invalid/EOS row must not invalidate the whole utterance."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    transport = _OmniConnectorPayloadTransportMixin()
+    transport._pending_full_payload_send = {}
+    transport._full_payload_replace_keys_cached = frozenset()
+    request = _request("req")
+    for code, valid in [(10, True), (0, False), (11, True), (12, last_valid)]:
+        transport.accumulate_full_payload_output(
+            "req",
+            {"codes.audio": torch.tensor([[code]]), "meta.codec_frame_valid": torch.tensor([valid])},
+            request,
+        )
+    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["req"])
+    payload = tts2code2wav_full_payload(_manager(), full, request)
+    assert _codes(payload) == [4218, 4218, 4218, 10, 11] + ([12] if last_valid else [])

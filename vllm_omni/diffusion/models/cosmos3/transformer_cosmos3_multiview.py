@@ -308,14 +308,12 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             from .multiview_maskless_attention import prepare_maskless_context
 
             context = prepare_maskless_context(context, num_und_tokens=int(text_ids.shape[1]), device=camera.device)
-        if layout.backend != "fa4":
-            # Compact prompt-dependent dimensions cross the compiled GEN boundary
-            # as dynamic tensors, so neither new prompts nor the two CFG branches
-            # recompile the GEN layers. Triton pads the UND stream outside the graph.
-            # FA4 still builds its plan inside the graph from the static length.
-            for k_und, v_und in self.cached_kv:
-                torch._dynamo.mark_dynamic(k_und, 1)
-                torch._dynamo.mark_dynamic(v_und, 1)
+        # Compact prompt-dependent dimensions cross the compiled GEN boundary
+        # as dynamic tensors, so neither new prompts nor the two CFG branches
+        # recompile the GEN layers. Triton pads the UND stream outside the graph.
+        for k_und, v_und in self.cached_kv:
+            torch._dynamo.mark_dynamic(k_und, 1)
+            torch._dynamo.mark_dynamic(v_und, 1)
         with self._offload_context("generator"):
             streams = []
             if has_control:

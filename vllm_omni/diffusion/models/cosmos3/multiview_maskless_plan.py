@@ -6,7 +6,7 @@ The maskless backend evaluates the multiview visibility rules as a few
 *unmasked* variable-length attention passes whose partial softmax results are
 merged by log-sum-exp.  Every (query, key) pair the predicate admits is covered
 by exactly one pass, so the merge equals one softmax over the admitted key set:
-the same attention the sparse FA4/Triton backends compute with a mask.
+the same attention the Triton backend computes with a mask.
 
 The planner never re-derives geometry.  It evaluates the production predicate
 on semantic runs, exactly as the sparse block-map builder does, and only

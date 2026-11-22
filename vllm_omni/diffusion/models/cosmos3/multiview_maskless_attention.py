@@ -4,7 +4,7 @@
 
 Planning is host-side (:mod:`.multiview_maskless_plan`).  This module owns the
 pass kernels, the FP32 merge and the custom op that keeps both opaque to
-Dynamo so the GEN layers compile around a single call, as they do for FA4.
+Dynamo so the GEN layers compile around a single call.
 
 Pass-kernel contract (``PASS_KERNELS``): packed ``[total, H, D]`` queries and
 ``[total, H_kv, D]`` keys/values with ``H_kv | H``, int32 cumulative sequence

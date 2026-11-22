@@ -718,11 +718,13 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
 
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
-        self.sequence_parallel_size = (
-            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-        )
-        if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
-            raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
+        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
+        if self.allgather_degree > 1 and self.ring_degree > 1:
+            raise ValueError(
+                "allgather_degree > 1 cannot be composed with ring_degree > 1: the supported "
+                "two-dimensional diffusion SP topology is Ulysses x AllGather-KV "
+                "(ulysses_degree > 1 together with allgather_degree > 1, ring_degree == 1)."
+            )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
         if self.vae_parallel_mode not in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}:
@@ -859,6 +861,7 @@ class _DiffusionConfigProjection:
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
+    vae_encode_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0
@@ -1741,6 +1744,10 @@ class BaseVllmOmniStageConfig:
     @property
     def cfg_kv_collect_func(self) -> str | None:
         return self.stage_pipeline_config.cfg_kv_collect_func
+
+    @property
+    def async_chunk_prewarm_payload_func(self) -> str | None:
+        return self.stage_pipeline_config.async_chunk_prewarm_payload_func
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))

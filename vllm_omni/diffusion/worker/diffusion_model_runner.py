@@ -1085,11 +1085,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def release_step_requests(self, request_ids: Sequence[str]) -> None:
+        """Drop request-owned state after execution/output preparation has returned.
+
+        The cached batch also owns states, including model-private tensors in
+        ``extra``. Invalidate it when its composition contains a retired request;
+        surviving requests retain their own state and are repacked on the next step.
+        """
+        for request_id in request_ids:
+            self.state_cache.pop(request_id, None)
+        batch = getattr(self, "input_batch", None)
+        if batch is not None and any(request_id in batch.request_ids for request_id in request_ids):
+            self.input_batch = None
+
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
         finished_req_ids = scheduler_output.finished_req_ids
-        for request_id in finished_req_ids:
-            self.state_cache.pop(request_id, None)
+        self.release_step_requests(list(finished_req_ids))
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1255,9 +1267,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.input_batch = input_batch
         scatter_latents(states, input_batch)
 
-        for state in states:
-            if interrupted or state.request_denoise_completed:
-                self.state_cache.pop(state.request_id, None)
+        # Include per-request errors, whose cache entries were already removed.
+        self.release_step_requests(
+            [
+                state.request_id
+                for state in states
+                if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
+            ]
+        )
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1362,6 +1379,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             )
         except Exception:
+            self.release_step_requests(scheduler_output.scheduled_request_ids)
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise

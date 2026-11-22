@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Protocol
 
 import msgspec
 from vllm.inputs import PromptType
@@ -13,6 +16,14 @@ from vllm_omni.outputs import OmniRequestOutput
 
 class EngineQueueMessage(msgspec.Struct, forbid_unknown_fields=True):
     pass
+
+
+class OutputQueueWriter(Protocol):
+    """Where the orchestrator thread puts messages for the serving frontend."""
+
+    async def put(self, item: EngineQueueMessage) -> None: ...
+
+    def put_nowait(self, item: EngineQueueMessage) -> None: ...
 
 
 class StageSubmissionMessage(EngineQueueMessage, kw_only=True):

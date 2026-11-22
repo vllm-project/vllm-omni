@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: Qwen
-- Model: `Qwen/Qwen-Image-2.1`
+- Model: `Qwen/Qwen-Image-2.1`, `Qwen/Qwen-Image-2.1-Turbo` (8-step distilled)
 - Task: Text-to-image generation and image-conditioned generation (editing)
 - Mode: Offline inference and online serving with optional step-wise execution
 - Maintainer: Community
@@ -34,6 +34,51 @@ text-to-image.
   [`docs/user_guide/diffusion_features.md`](../../docs/user_guide/diffusion_features.md)
 - Sibling recipes: [`Qwen-Image.md`](./Qwen-Image.md),
   [`Qwen-Image-Edit.md`](./Qwen-Image-Edit.md)
+
+## Qwen-Image-2.1-Turbo (8-step distilled)
+
+`Qwen/Qwen-Image-2.1-Turbo` is the 8-step distilled variant of
+Qwen-Image-2.1 and runs through the same `QwenImage21Pipeline`. Keep these
+differences from the base checkpoint in mind:
+
+- **Do not pass `num_inference_steps`.** The Turbo checkpoint's
+  `model_index.json` ships a fixed `sample_sigmas` grid, which vLLM-Omni
+  loads automatically. An explicit `num_inference_steps` is overridden by
+  `sample_sigmas`, so omit it.
+- **Do not enable CFG.** As a distilled model it runs at CFG=1: leave
+  `true_cfg_scale` at its default (1.0); setting `true_cfg_scale > 1` (and a
+  `negative_prompt`) is not meaningful for the distilled weights.
+- **License:** Qwen Research License (not Apache-2.0) — check the checkpoint
+  card before commercial use.
+
+Offline:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image-2.1-Turbo \
+  --prompt "A ceramic teapot on a wooden table" \
+  --output qwen_image_21_turbo_t2i.png \
+  --cfg-scale 1.0
+```
+
+Online serving works the same as the base model
+(`vllm serve Qwen/Qwen-Image-2.1-Turbo --omni --port 8091`). The sampling
+grid can be overridden per request through the whitelisted `sigmas`
+extra-body parameter (both `/v1/chat/completions` and the multi-stage
+`/v1/images/generations` path). The default 8-step grid is
+`[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]`:
+
+```bash
+curl http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen-Image-2.1-Turbo",
+    "prompt": "A ceramic teapot on a wooden table",
+    "size": "1024x1024",
+    "seed": 42,
+    "sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+  }'
+```
 
 ## Offline Inference
 

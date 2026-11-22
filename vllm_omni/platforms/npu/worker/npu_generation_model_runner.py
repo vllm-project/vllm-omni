@@ -51,6 +51,11 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
+        # Whether the previous execute_model call scheduled no tokens; gates
+        # the idle prefetch in execute_model.
+        self._prev_step_idle = False
+        # Optional model hooks that have failed; each is warned about once.
+        self._failed_optional_model_hooks: set[str] = set()
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
@@ -82,6 +87,23 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
                 self._init_mrope_positions(req_state)
+
+    def _call_optional_model_hook(self, name: str, *args: object) -> None:
+        """Call an optional model hook that must never fail the step.
+
+        An exception escaping execute_model kills the EngineCore, and these
+        hooks only warm caches, so a failure is logged and the step goes on.
+        """
+        hook = getattr(self.model, name, None)
+        if not callable(hook):
+            return
+        try:
+            hook(*args)
+        except Exception:
+            # run_idle_prefetch runs on every idle step (~1 kHz): warn once per hook.
+            log = logger.debug if name in self._failed_optional_model_hooks else logger.warning
+            self._failed_optional_model_hooks.add(name)
+            log("Optional model hook %s failed; continuing without it.", name, exc_info=True)
 
     @torch.inference_mode()
     def execute_model(
@@ -125,6 +147,11 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
 
         self._begin_omni_aux_output_step(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # Recorded before any return below, so every path updates it.
+        prev_step_idle = self._prev_step_idle
+        self._prev_step_idle = num_scheduled_tokens <= 0
+        #  -------------------------------------- Omni-new -------------------------------------------------
         with record_function_or_nullcontext("prepare input"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             if self.model_config.async_chunk and num_scheduled_tokens:
@@ -137,6 +164,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 #  -------------------------------------- Omni-new -------------------------------------------------
                 if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                     self.model.on_requests_finished(scheduler_output.finished_req_ids)
+                # After finished: an id freed and re-added within one step keeps
+                # the new request's prewarm.
+                if prewarms := getattr(scheduler_output, "pending_request_prewarms", None):
+                    self._call_optional_model_hook("on_requests_added", prewarms)
                 #  -------------------------------------- Omni-new -------------------------------------------------
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
@@ -164,6 +195,19 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
                         self._dummy_run(1, skip_gdn_state_update=True)
+                    #  -------------------------------------- Omni-new -------------------------------------------------
+                    # Idle step (e.g. a placeholder waiting for chunk 0): let the
+                    # model run deferred per-request warmup. Numerics match the
+                    # forward below: it adds no autocast or default dtype (the
+                    # ascend forward context is batch/graph metadata only), and
+                    # this call shares its inference_mode, thread, device and
+                    # stream. Skipped on the first idle step after a busy one:
+                    # under async scheduling that step's output may still be in
+                    # flight, and a warmup phase can take ~100 ms. The cost is
+                    # one ~1 ms idle step.
+                    if prev_step_idle:
+                        self._call_optional_model_hook("run_idle_prefetch")
+                    #  -------------------------------------- Omni-new -------------------------------------------------
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)

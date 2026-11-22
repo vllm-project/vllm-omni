@@ -239,7 +239,7 @@ ignored `sigma_max` and inapplicable `negative_metadata_mode` settings.
 - Python: not recorded (vLLM-Omni supports 3.10–3.13)
 - Driver / runtime: NVIDIA driver and CUDA version not recorded; PyTorch 2.13.0
 - vLLM version: a CUDA build of vLLM, whose bundled FlashAttention-4 provides
-  the default sparse kernel on GB200; exact version not recorded
+  the default maskless varlen kernels on GB200
 - vLLM-Omni version or commit: the commit that adds this recipe
 - Guardrails: `cosmos-guardrail` and access to the gated
   `nvidia/Cosmos-1.0-Guardrail` model (see [Safety guardrails](#safety-guardrails))
@@ -337,8 +337,11 @@ pytest -q \
   tests/diffusion/models/cosmos3/test_cosmos3_pipeline.py \
   tests/diffusion/models/cosmos3/test_cosmos3_transformer.py \
   tests/diffusion/models/cosmos3/test_multiview_config.py \
-  tests/diffusion/models/cosmos3/test_multiview_attention.py \
   -k "multiview or lidar or rig"
+
+pytest -q \
+  tests/diffusion/models/cosmos3/test_multiview_attention.py \
+  tests/diffusion/models/cosmos3/test_multiview_maskless_attention.py
 ```
 
 These cover strict checkpoint metadata, single-camera and reordered subsets,
@@ -346,8 +349,9 @@ per-camera captions and negatives, LiDAR conditioning, required rig weights,
 and kernel selection. The attention suite compares both runtime implementations
 to an independent dense reference with mixed sensor clocks, inclusive window
 bounds, unrestricted same-view attention, controls, captions and padding.
-On GB200, the CUDA tests also run Triton's compiled Flex kernel and FA4
-full-graph execution; CPU-only runs skip them.
+On GB200, the CUDA tests also compare maskless attention using bundled FA4
+varlen kernels with Triton's compiled Flex kernel and a dense reference;
+CPU-only runs skip them.
 
 To qualify a checkpoint, generate 29-frame clips in WSM-only and
 vision-conditioned modes for all five ratios at both resolutions with the same
@@ -363,33 +367,32 @@ count, parallel topology, steps, cold/warm latency and peak memory.
   pads spatial axes and crops back before VAE decode; the buckets use 390–400
   spatial tokens per latent frame and camera at 480p and 900–920 at 720p.
 - Attention backend: the pipeline picks a kernel strategy from the shared vLLM
-  FlashAttention version resolver. On GB200 (and other SM100-family GPUs) it
-  selects `fa4`, vLLM's bundled FlashAttention-4 with a 256 × 128 block-sparse
-  mask. Where the resolver reports FlashAttention 3 or 2 (Hopper, Ampere, Ada,
-  consumer Blackwell) it selects `maskless`: the training implementation's
-  strategy of a few unmasked variable-length FlashAttention passes (same view,
-  deduplicated capture-time cross-view rectangles, captions) merged in FP32 by
-  log-sum-exp, which replaces the much slower Triton FlexAttention kernel.
+  FlashAttention version resolver. When bundled FA4, FA3 or FA2 is available,
+  it selects `maskless`, including on GB200 and other Blackwell GPUs: a few
+  unmasked variable-length FlashAttention passes (same view, hierarchical
+  capture-time cross-view rectangles, captions) merged in FP32 by log-sum-exp.
+  On Blackwell, these passes continue to use bundled FA4 varlen kernels.
   `triton` (64 × 64 FlexAttention) remains the fallback when no bundled
-  FlashAttention is importable. All three implement the same visibility rules;
+  FlashAttention is importable. Both implement the same visibility rules;
   the maskless planner verifies at build time that its passes cover the sparse
-  predicate exactly once. Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=fa4|maskless|triton`
-  to pin one; unknown values fail at load time. Goldens taken on one backend must
-  be re-calibrated before they gate another, or pinned to that backend.
+  predicate exactly once. Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND` to `maskless`
+  or `triton` to pin one; the removed `fa4` strategy and unknown values fail at
+  load time. Goldens taken on one backend must be re-calibrated before they
+  gate another, or pinned to that backend.
 - Compilation: the pipeline's `setup_compile()` hook compiles the GEN layers
   statically and regionally, so they specialize per output geometry.
   `--diffusion-compile-dynamic` and its negative form do not change this;
   `--diffusion-compile-granularity full` also uses regional compilation, with a
-  warning; `--enforce-eager` skips it. FA4 and maskless attention run inside
-  the compiled layers as opaque custom ops (the maskless plan's only
+  warning; `--enforce-eager` skips it. Maskless attention runs inside
+  the compiled layers as an opaque custom op (the maskless plan's only
   prompt-dependent tensor is marked dynamic); the Triton attention call runs
-  outside the compiled layers with its own dynamic-shape compile. The fixed
-  text capacity keeps new prompts and both CFG branches from recompiling the
-  GEN layers.
+  outside the compiled layers with its own dynamic-shape compile. Dynamic UND
+  dimensions in maskless and fixed text padding in Triton keep new prompts and
+  both CFG branches from recompiling the GEN layers.
 - Known limitations:
     - Other accelerators, including Hopper, are not qualified by this recipe.
-      Hopper resolves to the `maskless` backend; its parity and latency against
-      `fa4`/`triton` are pending a GPU benchmark.
+      Hopper resolves to the `maskless` backend when bundled FlashAttention is
+      available; its parity and latency against Triton are pending a GPU benchmark.
     - LiDAR CUDA parity, memory and latency have not been qualified.
     - Joint checkpoints load the LiDAR decoder even when a request does not ask
     for LiDAR output; such requests skip decoder execution.

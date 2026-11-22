@@ -780,27 +780,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             patch_size=(1, 2, 2),
         ).float()
 
-    def _stream_prepare_video_tensor(
+    def _stream_video_prep_metadata(
         self,
         frames: np.ndarray,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        """Upload a uint8 ``(T, H, W, 3)`` video as one normalized FP32 tensor.
-
-        The checkpoint's numpy path uploads the whole video as FP32, then
-        ``transform_tensor`` materializes a second normalized copy, then
-        ``encode_temporal`` pads through a full-video ``torch.cat``: three
-        resident pixel-scale copies on the device. Here the padding is
-        replicated on the host, a single preallocated ``(3, T', H, W)`` tensor
-        receives clip-by-clip uploads, and the ``÷255 → (x-mean)/std`` chain
-        runs in place on each clip's staging buffer in the same op order as
-        ``convert_numpy_to_tensor`` → ``transform_tensor``, so peak device
-        memory is the output tensor plus one clip instead of three copies.
-
-        Returns ``None`` whenever the checkpoint contract this mirrors (uint8
-        frames, ``clip_length`` alignment, processor ``transform`` constants)
-        is not discoverable; callers fall back to the legacy path.
-        """
+    ) -> tuple[int, int, Any, Any] | None:
+        """Return the shared stream-prep clip, pad, mean, and std metadata."""
         if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[-1] != 3:
             return None
         if int(frames.shape[0]) == 0:
@@ -841,6 +825,48 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             else:
                 chunks = -(-(num_frames - tail) // clip_length)
                 pad = max(max(chunks, 1) * clip_length + tail - num_frames, 0)
+        return clip_length, pad, mean, std
+
+    def predict_video_latent_shape(self, frames: np.ndarray) -> tuple[int, int, int]:
+        """Predict the checkpoint latent shape for its reference-video input."""
+        effective_frames = int(frames.shape[0])
+        if not _legacy_encode_prep_enabled():
+            prep_metadata = self._stream_video_prep_metadata(frames)
+            if prep_metadata is not None:
+                effective_frames += prep_metadata[1]
+
+        processor = self.model.processor
+        latent_t = int(processor.get_latent_length(effective_frames))
+        height, width = processor._align_to_total_patch_size(int(frames.shape[1]), int(frames.shape[2]))
+        ratio = int(self.model.vae_ratio)
+        return latent_t, int(height // ratio), int(width // ratio)
+
+    def _stream_prepare_video_tensor(
+        self,
+        frames: np.ndarray,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Upload a uint8 ``(T, H, W, 3)`` video as one normalized FP32 tensor.
+
+        The checkpoint's numpy path uploads the whole video as FP32, then
+        ``transform_tensor`` materializes a second normalized copy, then
+        ``encode_temporal`` pads through a full-video ``torch.cat``: three
+        resident pixel-scale copies on the device. Here the padding is
+        replicated on the host, a single preallocated ``(3, T', H, W)`` tensor
+        receives clip-by-clip uploads, and the ``÷255 → (x-mean)/std`` chain
+        runs in place on each clip's staging buffer in the same op order as
+        ``convert_numpy_to_tensor`` → ``transform_tensor``, so peak device
+        memory is the output tensor plus one clip instead of three copies.
+
+        Returns ``None`` whenever the checkpoint contract this mirrors (uint8
+        frames, ``clip_length`` alignment, processor ``transform`` constants)
+        is not discoverable; callers fall back to the legacy path.
+        """
+        prep_metadata = self._stream_video_prep_metadata(frames)
+        if prep_metadata is None:
+            return None
+        clip_length, pad, mean, std = prep_metadata
+        num_frames = int(frames.shape[0])
         if pad:
             frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)])
             num_frames += pad

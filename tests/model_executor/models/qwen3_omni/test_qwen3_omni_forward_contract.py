@@ -43,6 +43,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMModel,
     Qwen3OmniMoeThinkerForConditionalGeneration,
+    _get_capture_key,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -126,6 +127,29 @@ def _make_thinker(inner_output=None) -> tuple[Qwen3OmniMoeThinkerForConditionalG
     return thinker, inner
 
 
+def _overwrite_inputs_embeds(input_ids, positions, intermediate_tensors, *, inputs_embeds, **kwargs):
+    """Mutates the input embeddings by adding 1; we use this to check mutated behavior for compile."""
+    inputs_embeds.add_(1)
+    return inputs_embeds, {"hidden_states": {"layers": {0: inputs_embeds}}}
+
+
+def _overwrite_inputs_embeds_on_first_pp_rank(input_ids, positions, intermediate_tensors, *, inputs_embeds, **kwargs):
+    """Same as ``_overwrite_inputs_embeds``, on a PP rank that sends its captures to the next rank."""
+    inputs_embeds.add_(1)
+    return IntermediateTensors(
+        {"hidden_states": inputs_embeds, "residual": inputs_embeds, _get_capture_key(0): inputs_embeds}
+    )
+
+
+@pytest.fixture
+def first_rank_thinker(monkeypatch) -> Qwen3OmniMoeThinkerForConditionalGeneration:
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True),
+    )
+    return _make_thinker()[0]
+
+
 def _forward_args():
     return {
         "input_ids": torch.zeros(_TOKENS, dtype=torch.long),
@@ -158,6 +182,30 @@ def test_thinker_forward_passes_through_intermediate_tensors():
     thinker, _ = _make_thinker(inner_output=it)
     out = thinker.forward(**_forward_args())
     assert out is it
+
+
+def test_thinker_embedding_capture_survives_overwritten_inputs_embeds(first_rank_thinker):
+    """Ensure the layer-0 capture is the original embeddings, not the overwritten inputs_embeds."""
+    first_rank_thinker.language_model.model = _overwrite_inputs_embeds
+    embeds = torch.randn(_TOKENS, _HIDDEN)
+
+    _, captured = first_rank_thinker.forward(
+        **_forward_args(), inputs_embeds=embeds.clone(), capture_layer_indices=[0], return_hidden_states=True
+    )
+
+    assert torch.equal(captured["hidden_states"]["layers"][0], embeds)
+
+
+def test_thinker_sends_original_embeddings_to_next_pp_rank(first_rank_thinker):
+    """Ensure a non-last PP rank sends the original embeddings as its layer-0 capture."""
+    first_rank_thinker.language_model.model = _overwrite_inputs_embeds_on_first_pp_rank
+    embeds = torch.randn(_TOKENS, _HIDDEN)
+
+    out = first_rank_thinker.forward(
+        **_forward_args(), inputs_embeds=embeds.clone(), capture_layer_indices=[0], return_hidden_states=True
+    )
+
+    assert torch.equal(out[_get_capture_key(0)], embeds)
 
 
 class _ThinkerStub(nn.Module):

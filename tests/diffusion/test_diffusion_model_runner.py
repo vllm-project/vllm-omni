@@ -24,7 +24,9 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -413,7 +415,16 @@ def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypa
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestDiffusionOutputPipeline()
     runner.state_cache = {"aborted-step-request": object()}
-    old_step_batch = object()
+    old_step_batch = InputBatch.make_batch(
+        [
+            StepRequestState(
+                request_id="aborted-step-request",
+                sampling=OmniDiffusionSamplingParams(),
+                latents=torch.zeros(1, 1),
+                timesteps=torch.ones(1),
+            )
+        ]
+    )
     runner.input_batch = old_step_batch
     runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
     runner.remove_diffusion_kv_requests = Mock()

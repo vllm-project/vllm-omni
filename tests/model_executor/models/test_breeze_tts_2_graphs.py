@@ -11,6 +11,7 @@ from vllm.platforms import current_platform
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import (
     BreezeDepthDecoder,
+    BreezeDepthGraph,
     _depth_layer_compile_options,
     sample_logits,
 )
@@ -285,6 +286,8 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
         torch.testing.assert_close(generator.get_state(), reference.get_state(), atol=0, rtol=0)
 
     retired_generators: list[tuple[torch.Generator, torch.Tensor]] = []
+    graph_entries: dict[tuple[int, int, bool], BreezeDepthGraph] = {}
+    eager_generator = torch.Generator(device="cuda").manual_seed(0)
     for temperature, guidance_scale in ((0.9, 1.0), (0.0, 4.0), (0.9, 4.0)):
         batches: tuple[int, ...] = (3, 5, 11, 7, 3, 1)
         if guidance_scale == 1:
@@ -301,7 +304,7 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
             batch_hidden = hidden[rows]
             if guidance_scale != 1:
                 batch_hidden = torch.cat((batch_hidden, uncond[rows]))
-            expected, first_codes = [], []
+            first_codes = []
             for row in rows:
                 # The talker and depth decoder share each request's generator.
                 # Exercise a codebook-0 sample immediately before graph replay.
@@ -311,21 +314,6 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
                 )
                 torch.testing.assert_close(row_first, reference_first, atol=0, rtol=0)
                 first_codes.append(row_first)
-                row_hidden = hidden[row : row + 1]
-                if guidance_scale != 1:
-                    row_hidden = torch.cat((row_hidden, uncond[row : row + 1]))
-                expected.append(
-                    depth._generate_frame(
-                        row_hidden,
-                        reference_first,
-                        depth._allocate_cache(row_hidden),
-                        temperature,
-                        10,
-                        0.8,
-                        reference_generators[row],
-                        guidance_scale=guidance_scale if guidance_scale != 1 else None,
-                    )
-                )
             request_bucket = 1 << (batch - 1).bit_length()
             branches = 2 if guidance_scale != 1 else 1
             graph_key = (request_bucket * branches, branches, temperature == 0)
@@ -343,7 +331,37 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
                     generators=[generators[row] for row in rows],
                     guidance_scale=guidance_scale,
                 )
-            expected_frames = torch.cat(expected)
+            entry = depth._graphs[graph_key]
+            if graph_key in graph_entries:
+                assert entry is graph_entries[graph_key]
+            else:
+                graph_entries[graph_key] = entry
+
+            if temperature > 0:
+                assert entry.noise is not None
+                reference_noise = torch.ones_like(entry.noise)
+                for noise_row, row in enumerate(rows):
+                    for codebook in range(depth.num_codebooks - 1):
+                        reference_noise[noise_row, codebook].exponential_(generator=reference_generators[row])
+                torch.testing.assert_close(entry.noise[:batch], reference_noise[:batch], atol=0, rtol=0)
+            else:
+                assert entry.noise is None
+
+            # Match the graph's padded request bucket, workspace contents, and
+            # sampled noise. A smaller eager batch can select different kernels.
+            expected_frames = depth._generate_frame(
+                entry.hidden.clone(),
+                entry.first.clone(),
+                depth._allocate_cache(entry.hidden),
+                temperature,
+                10,
+                0.8,
+                eager_generator,
+                entry.noise,
+                entry.guidance_scale,
+                entry.parameters,
+                greedy=temperature == 0,
+            )[:batch]
             torch.testing.assert_close(actual, expected_frames, atol=0, rtol=0)
             retained.append((actual, expected_frames.clone()))
             # Check the next codebook-0 sample as well as the depth result: a

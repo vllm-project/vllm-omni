@@ -1328,7 +1328,13 @@ def extract_sensenova_u1_context(
     modulated_input = first_layer.input_layernorm_mot_gen(inputs_embeds)
 
     def run_transformer_blocks():
+        assert indexes is not None
         h = inputs_embeds
+        position_embeddings = (
+            module.model.rotary_emb(h, indexes[0].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[1].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[2].unsqueeze(0)),
+        )
         for layer in module.model.layers:
             h = layer(
                 h,
@@ -1336,6 +1342,7 @@ def extract_sensenova_u1_context(
                 exist_und=exist_und,
                 exist_gen=exist_gen,
                 indexes=indexes,
+                position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
                 **layer_kwargs,

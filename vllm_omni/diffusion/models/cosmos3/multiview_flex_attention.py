@@ -33,26 +33,6 @@ TRITON_KV_BLOCK_SIZE = 64
 TRITON_NUM_STAGES = 1
 TRITON_NUM_WARPS = 4
 
-# FlashAttention-4 runs a fixed 128x128 forward tile on SM100/SM110 and stages
-# two Q tiles per CTA whenever the query length exceeds one tile, so the sparse
-# block map it consumes must be (2 * tile_m, tile_n).  These are not tunable: the
-# kernel derives the same numbers from its own heuristic and rejects metadata
-# that disagrees.  See vLLM's bundled copy,
-# vllm/vllm_flash_attn/cute/interface.py::_get_fwd_config and
-# vllm/vllm_flash_attn/cute/block_sparsity.py::normalize_block_sparse_config.
-FA4_SPARSE_Q_BLOCK_SIZE = 256
-FA4_SPARSE_KV_BLOCK_SIZE = 128
-
-# Coarser blocks admit more disallowed pairs into partially-masked tiles, where
-# the mask_mod resolves them exactly.  Measured on the released 11-view / 21-frame
-# / 30x52 geometry, moving from 64x64 to 256x128 raises visited tiles from 10.66%
-# to 11.43% of the dense rectangle (+7% attention MACs) and raises the partial
-# tile share from 6% to 19%.
-_BACKEND_BLOCK_SIZES: dict[str, tuple[int, int]] = {
-    "triton": (SPARSE_Q_BLOCK_SIZE, SPARSE_KV_BLOCK_SIZE),
-    "fa4": (FA4_SPARSE_Q_BLOCK_SIZE, FA4_SPARSE_KV_BLOCK_SIZE),
-}
-
 # The UND stream is padded to a fixed capacity rather than to the nearest block
 # above each prompt's real length.  A pad that tracks the prompt changes the
 # packed key tensor's sequence dimension, so the block-mask shapes, packing
@@ -72,7 +52,7 @@ DEFAULT_MAX_UND_TOKENS = 4096 + 2
 # ``maskless`` is not a sparse kernel: it runs the same visibility rules as a
 # few unmasked varlen FlashAttention passes merged by log-sum-exp (see
 # ``multiview_maskless_attention``), so it has no block geometry.
-MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted({*_BACKEND_BLOCK_SIZES, "maskless"}))
+MULTIVIEW_BACKENDS: tuple[str, ...] = ("maskless", "triton")
 
 
 def validate_multiview_backend(backend: str) -> str:
@@ -131,18 +111,10 @@ class MultiviewLayout:
     def __post_init__(self) -> None:
         # The pipeline validates the backend, window and geometry once per
         # request. ``dataclasses.replace`` reruns this on every forward, so keep
-        # only the FA4 op registration and the single-rate-per-view invariant
+        # only the maskless op registration and the single-rate-per-view invariant
         # that semantic run grouping depends on.
-        if self.backend == "fa4":
-            # Importing here registers vllm_omni::cosmos3_multiview_fa4 while we
-            # are still host-side.  The attention call site imports the module
-            # lazily too, but that site is inside the regionally compiled GEN
-            # block, and registering a torch.library op from under Dynamo is not
-            # something to rely on.  The module itself defers every CuTe/CUTLASS
-            # import to _load_fa4, so this stays safe on CPU-only hosts.
-            from . import multiview_fa4  # noqa: F401
-        elif self.backend == "maskless":
-            # Same reason: register vllm_omni::cosmos3_maskless_attention host-side.
+        if self.backend == "maskless":
+            # Register the custom op before the regionally compiled GEN layers.
             from . import multiview_maskless_attention  # noqa: F401
         rates_by_view_offset: dict[int, float] = {}
         for item in self.items:
@@ -160,10 +132,9 @@ class MultiviewLayout:
     @property
     def block_sizes(self) -> tuple[int, int]:
         """The ``(q, kv)`` sparse block granularity this backend demands."""
-        sizes = _BACKEND_BLOCK_SIZES.get(self.backend)
-        if sizes is None:
+        if self.backend != "triton":
             raise RuntimeError(f"Cosmos3 multiview backend {self.backend!r} has no sparse block geometry.")
-        return sizes
+        return SPARSE_Q_BLOCK_SIZE, SPARSE_KV_BLOCK_SIZE
 
 
 @dataclass(frozen=True)
@@ -227,11 +198,11 @@ class MultiviewAttentionContext:
     """Runtime wrapper that keeps the request-local caches on the transformer."""
 
     layout: MultiviewLayout
-    #: Sparse backends cache a ``BlockMask``/``MultiviewBlockSparsity``; the
-    #: maskless backend caches its ``MultiviewMasklessPlan`` under its own key.
+    #: Triton caches a ``BlockMask``; maskless caches its ``MultiviewMasklessPlan``
+    #: under its own key.
     mask_cache: MutableMapping[tuple[Any, ...], Any]
     buffer_cache: MutableMapping[tuple[Any, ...], torch.Tensor] = field(default_factory=dict)
-    #: ``MasklessRuntime`` attached by ``prepare_maskless_context``; ``None`` for sparse backends.
+    #: ``MasklessRuntime`` attached by ``prepare_maskless_context``; ``None`` for Triton.
     maskless: Any = None
 
 
@@ -325,7 +296,7 @@ def build_multiview_flex_metadata(
         sample_id[start:end] = 0
         frame_id[start:end] = item_frames
         # Negative sensor IDs distinguish LiDAR from every camera while
-        # retaining the six-vector ABI consumed by both sparse backends.
+        # retaining the six-vector metadata used by both attention backends.
         view_id[start:end] = -2 if item.is_lidar else item_views
         is_control[start:end] = item.is_control
         timestamp[start:end] = item_timestamps
@@ -352,8 +323,7 @@ def _make_pair_allowed(
 
     The returned closure is stored on Triton's ``BlockMask`` and traced by
     Inductor. Materialize scalar options here, outside that closure, so Python
-    strings, booleans, and floats cannot become dynamic captured scalars. The
-    custom FA4 path uses the same closure eagerly to build its packed run table.
+    strings, booleans, and floats cannot become dynamic captured scalars.
     """
     device = q_vectors[2].device
     temporal_window = torch.tensor(cross_view_past_window_seconds, dtype=torch.float32, device=device)
@@ -401,8 +371,7 @@ def _semantic_groups(vectors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, t
         raise ValueError("Cosmos3 multiview semantic grouping fields must have equal lengths.")
     changed = torch.zeros(seq_len, dtype=torch.bool, device=vectors[0].device)
     # Start run zero even when metadata fields contain negative padding or
-    # LiDAR sentinels. The cumulative count therefore produces non-negative
-    # IDs, as required by FA4's unsigned packed-table lookup.
+    # LiDAR sentinels. The cumulative count therefore produces non-negative IDs.
     changed[:1] = True
     for vector in vectors:
         changed[1:] |= vector[1:] != vector[:-1]
@@ -435,99 +404,20 @@ def _block_indices(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return counts, indices.to(torch.int32)
 
 
-def _pack_allowed_bits(group_allowed: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """Pack the ``[q_group, k_group]`` truth table into int32 bit words.
-
-    The kernel-side mask_mod reads one word and tests one bit, so the whole
-    visibility rule set collapses to a few hundred bytes that stay resident in
-    cache.  Bit ``g_k`` of word ``g_q * words_per_row + g_k // 32`` is the
-    answer for that group pair.  Words hold the unsigned 32-bit pattern stored
-    in ``int32``, which is what the CuTe kernel reinterprets.
-    """
-    num_q_groups, num_k_groups = group_allowed.shape
-    words_per_row = (num_k_groups + 31) // 32
-    padded = group_allowed.new_zeros((num_q_groups, words_per_row * 32))
-    padded[:, :num_k_groups] = group_allowed
-    weights = torch.arange(32, device=group_allowed.device, dtype=torch.int64)
-    words = (padded.view(num_q_groups, words_per_row, 32).to(torch.int64) << weights).sum(-1)
-    words = torch.where(words >= 2**31, words - 2**32, words)
-    return words.reshape(-1).to(torch.int32).contiguous(), words_per_row
-
-
-# eq=False: the fields are tensors, so a generated __eq__ would return a tensor
-# rather than a bool. Instances are cache values compared by identity.
-@dataclass(frozen=True, eq=False)
-class MultiviewBlockSparsity:
-    """Backend-neutral sparse block map plus the run-compressed mask table.
-
-    ``partial_*``/``full_*`` are the FlexAttention KV-block layout, which
-    FlashAttention-4 consumes unchanged as ``BlockSparseTensorsTorch``.  The
-    remaining fields are the exact per-element fallback used inside partially
-    masked tiles: a token-to-run id for each side plus the packed truth table
-    over run pairs.  Together they encode the ``_make_pair_allowed`` predicate
-    without the kernel knowing anything about views, frames, or timestamps.
-    """
-
-    partial_counts: torch.Tensor
-    partial_indices: torch.Tensor
-    full_counts: torch.Tensor
-    full_indices: torch.Tensor
-    q_word_base: torch.Tensor
-    k_group_ids: torch.Tensor
-    allowed_words: torch.Tensor
-    q_block_size: int
-    kv_block_size: int
-    metadata: MultiviewFlexMetadata
-
-    @property
-    def q_len(self) -> int:
-        return self.metadata.q_len
-
-    @property
-    def kv_len(self) -> int:
-        return self.metadata.kv_len
-
-    def to_block_mask(self) -> BlockMask:
-        metadata = self.metadata
-        pair_allowed = _make_pair_allowed(
-            metadata.query_vectors(),
-            metadata.key_vectors(),
-            metadata.cross_view_past_window_seconds,
-        )
-
-        def mask_mod(
-            batch: torch.Tensor, head: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-        ) -> torch.Tensor:
-            del batch, head
-            return pair_allowed(q_idx, kv_idx)
-
-        return BlockMask.from_kv_blocks(
-            self.partial_counts[None, None],
-            self.partial_indices[None, None],
-            self.full_counts[None, None],
-            self.full_indices[None, None],
-            BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
-            mask_mod=mask_mod,
-            seq_lengths=(metadata.q_len, metadata.kv_len),
-            compute_q_blocks=False,
-        )
-
-
-def build_multiview_block_sparsity(
+def build_multiview_block_mask(
     metadata: MultiviewFlexMetadata,
     *,
     q_block_size: int = SPARSE_Q_BLOCK_SIZE,
     kv_block_size: int = SPARSE_KV_BLOCK_SIZE,
-) -> MultiviewBlockSparsity:
-    """Compress semantic runs into a sparse block map and a mask lookup table.
+) -> BlockMask:
+    """Compress semantic runs into a Triton FlexAttention block mask.
 
     The projection works at semantic-run and sparse-block granularity.  Its
     largest dense intermediates are block-grid sized (about 10.4M entries for
     the released 11-view geometry at 64x64), never the roughly 42B-token dense
     mask.  The emitted counts/indices use the same full-width contiguous layout
     that ``create_block_mask`` produces, which is the only layout the Triton
-    template and the ``BlockMask`` utilities are exercised with upstream, and
-    the layout FlashAttention-4 validates its own block sparsity against.
+    template and the ``BlockMask`` utilities are exercised with upstream.
     """
     q_vectors = metadata.query_vectors()
     k_vectors = metadata.key_vectors()
@@ -556,22 +446,19 @@ def build_multiview_block_sparsity(
     partial_counts, partial_indices = _block_indices(partial_blocks)
     full_counts, full_indices = _block_indices(full_blocks)
 
-    # Fold the table row stride into the query-side id so the kernel needs no
-    # compile-time shape constant and one compiled mask_mod serves every layout.
-    allowed_words, words_per_row = _pack_allowed_bits(group_allowed)
-    q_word_base = (q_group_ids * words_per_row).to(torch.int32).contiguous()
+    def mask_mod(batch: torch.Tensor, head: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+        del batch, head
+        return pair_allowed(q_idx, kv_idx)
 
-    return MultiviewBlockSparsity(
-        partial_counts=partial_counts,
-        partial_indices=partial_indices,
-        full_counts=full_counts,
-        full_indices=full_indices,
-        q_word_base=q_word_base,
-        k_group_ids=k_group_ids.to(torch.int32).contiguous(),
-        allowed_words=allowed_words,
-        q_block_size=q_block_size,
-        kv_block_size=kv_block_size,
-        metadata=metadata,
+    return BlockMask.from_kv_blocks(
+        partial_counts[None, None],
+        partial_indices[None, None],
+        full_counts[None, None],
+        full_indices[None, None],
+        BLOCK_SIZE=(q_block_size, kv_block_size),
+        mask_mod=mask_mod,
+        seq_lengths=(metadata.q_len, metadata.kv_len),
+        compute_q_blocks=False,
     )
 
 
@@ -585,13 +472,8 @@ def get_multiview_attention_plan(
     real_und_len: int,
     real_q_len: int,
     device: torch.device,
-) -> tuple[BlockMask | MultiviewBlockSparsity, PaddedAttentionGeometry]:
+) -> tuple[BlockMask, PaddedAttentionGeometry]:
     """Build or retrieve the request-local mask for one CFG text length.
-
-    Returns whichever mask representation the layout's backend consumes: a
-    ``BlockMask`` for Triton FlexAttention, or a ``MultiviewBlockSparsity`` for
-    FlashAttention-4.  Both are built from the same run-level projection, so the
-    two backends never disagree about which pairs are visible.
 
     Both padded lengths are pure functions of the layout, never of this call's
     ``real_und_len``: prompts of different lengths produce different masks but
@@ -608,12 +490,11 @@ def get_multiview_attention_plan(
         return cached, geometry
 
     metadata = build_multiview_flex_metadata(layout, geometry, device)
-    sparsity = build_multiview_block_sparsity(
+    plan = build_multiview_block_mask(
         metadata,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
     )
-    plan = sparsity if layout.backend == "fa4" else sparsity.to_block_mask()
     context.mask_cache[key] = plan
     return plan, geometry
 
@@ -675,26 +556,6 @@ def _pack_padded_bhsd(
     return packed
 
 
-def _pack_padded_bshd(
-    *parts: tuple[torch.Tensor, int],
-    buffer_cache: MutableMapping[tuple[Any, ...], torch.Tensor] | None = None,
-    slot: str = "",
-) -> torch.Tensor:
-    """Concatenate and pad ``[B, S, H, D]`` parts, keeping the native layout.
-
-    FlashAttention-4 consumes ``[B, S, H, D]`` directly, so unlike the Triton
-    path this never transposes; the copy is the concatenation the packed layout
-    needs anyway.
-    """
-    reference, batch, heads, head_dim, total_len = _validate_parts(parts)
-    packed = _packing_buffer(buffer_cache, f"bshd:{slot}", reference, (batch, total_len, heads, head_dim))
-    offset = 0
-    for tensor, target_len in parts:
-        packed[:, offset : offset + tensor.shape[1]].copy_(tensor)
-        offset += target_len
-    return packed
-
-
 _compiled_flex_attention = None
 
 
@@ -723,11 +584,8 @@ def flex_attention(
     v: torch.Tensor,
     *,
     block_mask: BlockMask,
-    backend: str,
 ) -> torch.Tensor:
     """Run pinned Triton FlexAttention on contiguous ``[B, H, S, D]`` tensors."""
-    if backend != "triton":
-        raise ValueError(f"Cosmos3-Nano-Transfer-Auto supports only backend='triton', got {backend!r}.")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Cosmos3 multiview FlexAttention requires contiguous [B, H, S, D] inputs.")
     kernel_options = {
@@ -803,27 +661,18 @@ def padded_multiview_flex_attention(
     # has consumed the previous one before the next overwrites them, so the
     # buffers are reused for the whole request instead of being re-zeroed.
     buffers = context.buffer_cache
-    pack = _pack_padded_bshd if context.layout.backend == "fa4" else _pack_padded_bhsd
-    q_padded = pack((q, geometry.padded_q_len), buffer_cache=buffers, slot="q")
-    k_all = pack(
+    q_padded = _pack_padded_bhsd((q, geometry.padded_q_len), buffer_cache=buffers, slot="q")
+    k_all = _pack_padded_bhsd(
         (k_und, geometry.padded_und_len),
         (k, geometry.padded_q_len),
         buffer_cache=buffers,
         slot="k",
     )
-    v_all = pack(
+    v_all = _pack_padded_bhsd(
         (v_und, geometry.padded_und_len),
         (v, geometry.padded_q_len),
         buffer_cache=buffers,
         slot="v",
     )
-    if context.layout.backend == "fa4":
-        # Imported lazily: the CuTe/CUTLASS stack is an optional dependency for
-        # Hopper and Blackwell; this module must stay importable on CPU-only hosts.
-        from .multiview_fa4 import multiview_fa4_attention
-
-        output = multiview_fa4_attention(q_padded, k_all, v_all, plan)
-        return output[:, : geometry.real_q_len]
-
-    output = flex_attention(q_padded, k_all, v_all, block_mask=plan, backend=context.layout.backend)
+    output = flex_attention(q_padded, k_all, v_all, block_mask=plan)
     return output[:, :, : geometry.real_q_len].transpose(1, 2)

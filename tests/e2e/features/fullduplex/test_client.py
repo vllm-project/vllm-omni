@@ -13,7 +13,6 @@ from vllm_omni.experimental.fullduplex.client import (
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
-    write_pcm16_wav,
 )
 from vllm_omni.experimental.fullduplex.video_stacking import (
     concat_frames,
@@ -268,172 +267,16 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.last_received_at("response.output_audio.delta") is not None
 
 
-def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
-    collector = RealtimeEventCollector()
-    collector.add(
-        {"type": "response.created", "response": {"id": "resp-a"}},
-        received_at_s=10.0,
-    )
-    stage_metrics = {
-        "0": {
-            "num_tokens_out": 4,
-            "vllm_ttft_ms": 120.0,
-            "vllm_tpot_ms": 15.0,
-            "vllm_itl_ms": 14.0,
-            "vllm_itls_ms": [10.0, 14.0, 18.0],
-        }
-    }
-    for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
-        collector.add(
-            {
-                "type": "response.output_audio.delta",
-                "response_id": "resp-a",
-                "delta": base64.b64encode(b"audio").decode("ascii"),
-                "sample_rate_hz": 16_000,
-                "metadata": {
-                    "audio_duration_ms": cumulative_audio_ms,
-                    "vllm_omni": {"stage_metrics": stage_metrics},
-                },
-            },
-            received_at_s=received_at_s,
-        )
-    collector.add(
-        {
-            "type": "response.output_audio_transcript.delta",
-            "response_id": "resp-a",
-            "delta": "",
-        },
-        received_at_s=10.1,
-    )
-    collector.add(
-        {
-            "type": "response.output_audio_transcript.delta",
-            "response_id": "resp-a",
-            "delta": "hello",
-        },
-        received_at_s=10.15,
-    )
-    collector.add(
-        {"type": "response.done", "response": {"id": "resp-a"}},
-        received_at_s=10.4,
-    )
-
-    timing = collector.timing_summary(
-        after_s=10.0,
-        input_committed_at_s=9.9,
-        response_id="resp-a",
-    )
-
-    assert timing["stage0_tokens"] == {
-        "source": "engine_stage_metrics",
-        "output_token_count": 4,
-        "ttft_ms": 120.0,
-        "tpot_ms": 15.0,
-        "itls_ms": [10.0, 14.0, 18.0],
-        "inter_token_interval_ms": {
-            "count": 3,
-            "mean": 14.0,
-            "p50": 14.0,
-            "p95": 18.0,
-            "max": 18.0,
-        },
-    }
-    assert timing["audio_output"] == {
-        "source": "client_monotonic_receive",
-        "chunk_count": 3,
-        "response_created_to_first_audio_ms": 200.0,
-        "commit_to_first_audio_ms": 300.0,
-        "inter_chunk_interval_ms": {
-            "count": 2,
-            "mean": 80.0,
-            "p50": 50.0,
-            "p95": 110.0,
-            "max": 110.0,
-        },
-        "chunk_duration_ms": {
-            "count": 3,
-            "mean": 80.0,
-            "p50": 80.0,
-            "p95": 80.0,
-            "max": 80.0,
-        },
-        "max_chunk_gap_ms": 110.0,
-    }
-    assert timing["request_metrics"] == {
-        "source": "client_monotonic_receive",
-        "measurement_origin": {
-            "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
-            "ttfp": "input_audio_buffer.commit client send to first audio packet",
-            "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
-        },
-        "ttft_ms": 250.0,
-        "ttfp_ms": 300.0,
-        "rtf": pytest.approx(1.916667),
-        "audio_generation_ms": 460.0,
-        "audio_duration_ms": 240.0,
-    }
-
-
-def test_response_timing_ignores_unowned_session_level_metrics():
-    collector = RealtimeEventCollector()
-    collector.add(
-        {"type": "response.created", "response": {"id": "resp-a"}},
-        received_at_s=10.0,
-    )
-    collector.add(
-        {
-            "type": "response.output_audio.delta",
-            "response_id": "resp-a",
-            "delta": base64.b64encode(b"audio").decode("ascii"),
-            "metadata": {
-                "vllm_omni": {
-                    "stage_metrics": {
-                        "0": {
-                            "num_tokens_out": 20,
-                            "vllm_ttft_ms": 157.0,
-                            "vllm_tpot_ms": 16.0,
-                            "vllm_itls_ms": [15.0, 17.0],
-                        }
-                    }
-                }
-            },
-        },
-        received_at_s=10.2,
-    )
-    collector.add(
-        {
-            "type": "response.listen",
-            "metadata": {
-                "vllm_omni": {
-                    "stage_metrics": {
-                        "0": {
-                            "num_tokens_out": 2,
-                            "vllm_ttft_ms": 106.0,
-                            "vllm_tpot_ms": 0.0,
-                            "vllm_itls_ms": [],
-                        }
-                    }
-                }
-            },
-        },
-        received_at_s=10.3,
-    )
-
-    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
-
-    assert timing["stage0_tokens"]["output_token_count"] == 20
-    assert timing["stage0_tokens"]["ttft_ms"] == 157.0
-
-
-def test_realtime_client_pcm16_wav_round_trip(tmp_path):
+def test_realtime_client_reads_pcm16_wav(tmp_path):
     path = tmp_path / "audio.wav"
     pcm16 = b"\x01\x00\x02\x00"
 
-    write_pcm16_wav(path, pcm16, sample_rate_hz=16_000)
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(pcm16)
 
-    with wave.open(str(path), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
-        assert wav_file.getframerate() == 16_000
     assert read_pcm16_wav(path) == pcm16
 
 

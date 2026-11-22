@@ -3,8 +3,8 @@
 """Startup warmup probe for duplex ``/v1/realtime``.
 
 Moved out of ``api_server.py`` under P0.2 of #5227. The
-``omni_run_server_worker`` scheduling and ``/v1/realtime`` hold-clients
-preamble stay in ``api_server.py`` until P0.3.
+``omni_run_server_worker`` scheduling stays in ``api_server.py`` until P0.3;
+the hold-clients preamble is ``wait_for_duplex_warmup`` here.
 
 Video-required models default to one short audio-plus-frame turn so the four
 pipeline stages compile real shapes before a client is accepted. That is
@@ -112,6 +112,22 @@ def warmup_silence_unit(plugin: object | None) -> dict[str, object]:
         "format": "pcm_f32le",
         "sample_rate_hz": _DEFAULT_SILENCE_SAMPLE_RATE_HZ,
     }
+
+
+async def wait_for_duplex_warmup(websocket) -> None:
+    """Hold real clients until the startup duplex warmup finishes.
+
+    The warmup connection marks itself with ``vllm_omni_warmup=1`` and passes through.
+    """
+    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
+        try:
+            await asyncio.wait_for(warmup_done.wait(), timeout=DUPLEX_WARMUP_CLIENT_WAIT_S)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning(
+                "Duplex warmup still running after %d s; admitting the client anyway.",
+                DUPLEX_WARMUP_CLIENT_WAIT_S,
+            )
 
 
 async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
@@ -288,5 +304,6 @@ __all__ = [
     "_warmup_duplex_realtime",
     "lookup_duplex_plugin",
     "startup_warmup_kind",
+    "wait_for_duplex_warmup",
     "warmup_silence_unit",
 ]

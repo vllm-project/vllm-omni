@@ -17,7 +17,7 @@ import tempfile
 import wave
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from vllm_omni.experimental.fullduplex.client import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE
 
@@ -79,6 +79,22 @@ def _write_media_bytes(payload: bytes | bytearray, output_dir: str | Path, stem:
     return destination
 
 
+class _CodecContext(Protocol):
+    @property
+    def name(self) -> str | None: ...
+
+
+class _VideoStream(Protocol):
+    @property
+    def codec_context(self) -> _CodecContext: ...
+
+
+def _video_thread_type(stream: _VideoStream) -> str:
+    """HEVC frame threads deadlock after seek; other codecs keep AUTO."""
+    codec = getattr(getattr(stream, "codec_context", None), "name", None)
+    return "SLICE" if codec == "hevc" else "AUTO"
+
+
 def video_duration(path: str | Path) -> float:
     """Return the video duration in seconds using PyAV (no ffprobe subprocess).
 
@@ -101,7 +117,7 @@ def video_duration(path: str | Path) -> float:
             # Last resort: count decodable frames.
             if container.streams.video:
                 stream = container.streams.video[0]
-                stream.thread_type = "AUTO"
+                stream.thread_type = _video_thread_type(stream)
                 frame_count = sum(1 for _ in container.decode(stream))
                 if stream.average_rate and frame_count > 0:
                     return frame_count / float(stream.average_rate)
@@ -130,7 +146,7 @@ def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> byt
         if not container.streams.video:
             raise ValueError(f"no video stream in {path}")
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
+        stream.thread_type = _video_thread_type(stream)
         time_base = stream.time_base
         if time_base is None:
             time_base = 1 / 90000
