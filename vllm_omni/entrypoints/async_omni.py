@@ -959,6 +959,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         engines have no EngineCore pause to hold, so ``wake_up`` restores
         admission and ``sleep → wake → generate`` keeps working.
         """
+        # Validate before touching admission state. Raising after
+        # ``_paused = True`` would wedge generate() for good: nothing was
+        # slept, so wake_up() has no tags to restore and never reaches the
+        # block that clears ``_paused``.
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()
         # coroutines that already passed the pause check have submitted (or
@@ -966,8 +972,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             self._paused = True
             await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
-
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         # EngineCore.sleep resets receiver caches itself; only clear P0 here.
         if 0 in ar_stage_ids:
             await self._clear_frontend_mm_cache()

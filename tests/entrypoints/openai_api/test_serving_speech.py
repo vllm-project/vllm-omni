@@ -61,6 +61,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
@@ -82,6 +83,42 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.mark.parametrize("sse", [False, True])
+@pytest.mark.parametrize("payload", [None, "empty", "valid"])
+@pytest.mark.asyncio
+async def test_moss_empty_stream_is_an_error(mocker, sse, payload):
+    serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    serving._tts_model_type = "moss_tts"
+    serving.engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5")
+    )
+    serving._adapter = MossTTSAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
+    ready = mocker.patch.object(serving, "_mark_ref_audio_artifact_ready_for_request")
+    discard = mocker.patch.object(serving, "_discard_ref_audio_artifact_warmup")
+
+    async def results():
+        if payload is not None:
+            audio = torch.zeros(320) if payload == "valid" else torch.empty(0)
+            yield SimpleNamespace(multimodal_output={"model_outputs": audio, "sr": 24000})
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.empty(0), "sr": 24000})
+
+    if sse:
+        events = [event async for event in serving._generate_audio_sse_events(results(), "moss-empty")]
+        assert any("speech.audio.done" in event for event in events) == (payload == "valid")
+        assert any("speech.audio.error" in event for event in events) == (payload != "valid")
+    else:
+        chunks = serving._generate_audio_chunks(results(), "moss-empty", response_format="wav")
+        if payload == "valid":
+            output = [chunk async for chunk in chunks]
+            assert len(output) == 2 and output[0].startswith(b"RIFF")
+            assert len(output[1]) == 640
+        else:
+            with pytest.raises(TTSGenerationError, match="no audio"):
+                await anext(chunks)
+    assert ready.call_count == int(payload == "valid")
+    assert discard.call_count == int(payload != "valid")
 
 
 class TestAudioMixin:

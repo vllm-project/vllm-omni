@@ -173,7 +173,43 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
-    ("extra", "max_num_seqs", "micro"), [({}, 6, 6), ({}, 64, 16), ({"micro_batch_size": 2}, 6, 2)]
+    ("cuda", "extra", "env", "expected"),
+    [
+        (True, {}, None, True),
+        (False, {}, None, False),
+        (True, {"cfm_fused_body": False}, None, False),
+        (True, {"token2wav_allow_tf32": False}, None, False),
+        (True, {"code2wav_allow_tf32": False}, None, False),
+        (True, {}, "off", False),
+        (True, {"token2wav_allow_tf32": False}, "tf32", True),
+        (True, {"cfm_fused_body": True, "token2wav_allow_tf32": False}, None, True),
+    ],
+)
+def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cuda, extra, env, expected):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    if env is not None:
+        monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", env)
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["fused_body"] is expected
+    assert model._cfm_graph_config["slot_pool"] is False
+    assert model._cfm_graph_config["row_offset_merge"] is False
+
+
+@pytest.mark.parametrize(
+    ("extra", "max_num_seqs", "micro"),
+    [
+        ({}, 6, 6),
+        ({}, 64, 16),
+        ({"micro_batch_size": 2}, 6, 2),
+        ({"max_graph_batch": 8}, 64, 8),
+    ],
 )
 def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_seqs, micro):
     config = _config()
@@ -183,6 +219,8 @@ def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_se
     model = MiniCPMO45Code2Wav(vllm_config=config)
 
     assert model._cfm_graph_config["micro_batch_size"] == micro
+    if "max_graph_batch" in extra:
+        assert model._cfm_graph_config["max_graph_batch"] == extra["max_graph_batch"]
 
 
 def _model(initial: int = 0, minimum: int = 1, *, runtime_prompt_cache_size: int = 4, setup_cache_size: int = 1):
@@ -1701,7 +1739,17 @@ def _padded_decode_adapter(bucket_frames: int) -> tuple[BatchedToken2Wav, int, i
     Returns the adapter, the valid width, and the padding width. Every call
     seeds the same way, so two adapters built here agree on weights and noise.
     """
-    from cosyvoice2.flow.decoder_dit import DiT
+    for name in ("cosyvoice2.flow.decoder_dit", "stepaudio2.cosyvoice2.flow.decoder_dit"):
+        try:
+            import importlib
+
+            decoder_dit = importlib.import_module(name)
+            break
+        except ImportError:
+            pass
+    else:
+        decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
+    DiT = decoder_dit.DiT
 
     torch.manual_seed(23)
     estimator = DiT(
@@ -1809,3 +1857,92 @@ def test_padding_does_not_change_the_valid_frames():
 
     assert int(padded_x.shape[2]) == int(exact_x.shape[2]) == mel_frames
     assert torch.allclose(padded_x, exact_x, atol=1e-5)
+
+
+def test_decode_ragged_batch_mixed_onset_and_continuation():
+    """Ragged batch merging fresh onset and continuation states does not crash stacking conformer caches."""
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    _enable_fake_ragged_kernel(adapter)
+    prompt = adapter.prepare_prompt("shared_p", "/fake/prompt.wav")
+    onset_states = adapter.setup_batch(prompt, 1)
+    state_onset = onset_states[0]
+
+    # Run one decode step on another state so its conformer/estimator caches advance.
+    cont_states_init = adapter.setup_batch(prompt, 1)
+    _, cont_states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        cont_states_init,
+        last_chunk=False,
+    )
+    state_continuation = cont_states[0]
+
+    # Verify conformer caches have mismatched shapes between onset and continuation states.
+    assert (
+        state_onset.flow_cache["conformer_att_cache"].shape
+        != state_continuation.flow_cache["conformer_att_cache"].shape
+    )
+
+    # Ragged decode with both onset and continuation states in a single batch.
+    audios, next_states = adapter.decode_ragged_batch(
+        [torch.tensor([20, 21]), torch.tensor([30, 31])],
+        prompt,
+        [state_onset, state_continuation],
+        last_chunks=[False, False],
+    )
+    assert len(audios) == 2
+    assert len(next_states) == 2
+
+
+def test_row_offset_fallback_reaches_eager_when_replay_declines():
+    """Declined Whole-Euler replay must eager-solve, not recurse through per-offset grouping."""
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), cfm_graph_config={"row_offset_merge": True})
+    _enable_fake_ragged_kernel(adapter)
+    mu, speakers, cond = torch.ones((2, 1, 2)), torch.ones((2, 1)), torch.zeros((2, 1, 2))
+    _, _, stacked = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+    equal_rows = [
+        torch.cat((stacked[:, :, row : row + 1], stacked[:, :, 2 + row : 3 + row]), dim=2) for row in range(2)
+    ]
+    mixed_rows = [equal_rows[0], torch.nn.functional.pad(equal_rows[1], (0, 0, 0, 3))]
+    adapter._whole_euler_graph_wrapper = SimpleNamespace(enabled=True, ragged_body=object(), replay=lambda **_: None)
+    calls = {"n": 0}
+    original = adapter._decode_cfm
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        assert calls["n"] < 8, "row-offset fallback recursed instead of eager-solving"
+        return original(*args, **kwargs)
+
+    adapter._decode_cfm = counting
+    previous_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(64)
+    try:
+        equal_x, _, equal_att = adapter._decode_cfm(
+            mu, speakers, cond, cnn_cache=None, att_cache=equal_rows, valid_lengths=[2, 2]
+        )
+        mixed_x, _, mixed_att = adapter._decode_cfm(
+            mu, speakers, cond, cnn_cache=None, att_cache=mixed_rows, valid_lengths=[2, 2]
+        )
+    finally:
+        sys.setrecursionlimit(previous_limit)
+    assert equal_x.shape[0] == mixed_x.shape[0] == 2
+    assert len(equal_att) == len(mixed_att) == 2
+
+
+def test_tf32_mode_reads_shipped_yaml_key(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _tf32_mode
+
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    assert _tf32_mode({}) == "tf32"
+    assert _tf32_mode({"token2wav_allow_tf32": False}) == "off"
+    assert _tf32_mode({"code2wav_allow_tf32": False}) == "off"
+    assert _tf32_mode({"token2wav_allow_tf32": True}) == "tf32"
+    assert _tf32_mode({"code2wav_allow_tf32": True}) == "tf32"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "0")
+    assert _tf32_mode({}) == "off"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    assert _tf32_mode({}) == "off"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32")
+    assert _tf32_mode({}) == "tf32"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32x3")
+    assert _tf32_mode({}) == "tf32"

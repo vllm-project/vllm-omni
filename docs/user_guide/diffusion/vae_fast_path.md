@@ -7,7 +7,8 @@ convolutional network whose reference implementation in diffusers moves every
 activation through memory several times per layer (normalization, activation,
 causal padding, feature-cache bookkeeping, shortcut upsampling). vLLM-Omni
 installs a fast path on every loaded Wan VAE that fuses this data movement into
-a handful of Triton kernels while leaving the convolutions themselves untouched.
+a handful of Triton kernels. The opt-in `channels_last` level also specializes
+first-frame convolutions that have no history.
 
 ## Levels
 
@@ -15,9 +16,9 @@ The fast path is controlled by `--vae-fast-path` (engine argument
 `vae_fast_path`, deploy-config key `vae_fast_path`):
 
 | Level | Default | Output vs. diffusers | What it does |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `lossless` | yes | bit-identical | Fused RMSNorm epilogue, fused causal-conv input assembly and cache refresh, fused shortcut upsampling and residual adds (with the neighbouring convolution biases folded in), single-pass nearest 2x upsampling, preallocated output assembly. |
-| `channels_last` | no | within tolerance (PSNR typically > 60 dB) | Everything in `lossless`, plus decoder convolution weights converted to channels-last memory format so cuDNN picks its channels-last kernels, and a single-pass channels-last RMSNorm+SiLU kernel that also absorbs the bias of the preceding `conv1`. |
+| `channels_last` | no | within tolerance (PSNR typically > 60 dB) | Everything in `lossless`, plus channels-last convolution weights, a single-pass channels-last RMSNorm+SiLU kernel that also absorbs the preceding `conv1` bias, and Conv2d for supported single-frame causal convolutions without history. |
 | `off` | no | bit-identical | Reference diffusers decoder. |
 
 ```bash
@@ -61,6 +62,12 @@ stages:
 - The `channels_last` level changes the order in which cuDNN accumulates
   convolutions, so outputs differ from the reference in the last bits. Use
   `lossless` when bitwise reproducibility against diffusers matters.
+- For a supported causal convolution with one input frame and no history,
+  the temporal input is `[0, 0, x]`. The `channels_last` level uses Conv2d with
+  the last temporal weight slice, preserving the convolution formula for
+  finite inputs and the existing cache update. Calls with history retain
+  Conv3d. The weight slice is taken on each call, so weight updates and device
+  moves do not leave a stale packed copy.
 - For VAEs kept in fp32, cuDNN's channels-last convolution algorithms run in
   TF32 under PyTorch's default `torch.backends.cudnn.allow_tf32 = True`, which
   dominates the difference to the reference (about 1e-3). Set
@@ -73,10 +80,10 @@ Cosmos3-Nano VAE, 1280x720 x 189 frames, bf16, one GB200 GPU, `bench_wan_vae_dec
 (best of 2 runs after warmup):
 
 | `--vae-fast-path` | Decode time | Speedup | Output vs. `off` |
-|---|-------------|---------|---|
-| `off` | 6.00 s      | 1.00x   | reference |
-| `lossless` | 3.26 s      | 1.84x   | bit-identical |
-| `channels_last` | 2.51 s      | 2.39x   | PSNR 62.6 dB, max abs diff 4.6e-2 |
+| --- | ------------- | --------- | --- |
+| `off` | 6.00 s | 1.00x | reference |
+| `lossless` | 3.26 s | 1.84x | bit-identical |
+| `channels_last` | 2.51 s | 2.39x | PSNR 62.6 dB, max abs diff 4.6e-2 |
 
 Peak decode memory was unchanged (about 13 GiB): it is set by the largest
 activations and the cuDNN workspace, not by the output assembly.
@@ -92,6 +99,22 @@ convolution share and any layout-transpose kernels:
 python benchmarks/diffusion/bench_wan_vae_decode.py --model nvidia/Cosmos3-Nano \
     --size 1280x720 --frames 189 --fast-path off,lossless,channels_last --profile
 ```
+
+For a single-GPU comparison that isolates first-frame Conv2d within
+`channels_last`, use `--first-frame-ablation`. It alternates the two paths,
+disables cuDNN TF32 and autotuning, and prints JSON with every timing sample,
+summary statistics, peak allocated memory and output comparisons. Per-call
+weight packing is included in the measured decode time.
+
+```bash
+python benchmarks/diffusion/bench_wan_vae_decode.py \
+    --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers --size 832x480 --frames 1 \
+    --dtype bf16 --first-frame-ablation --warmup 60 --iters 50 --seed 0
+```
+
+The default input is a seeded latent tensor. `--latents /path/to/latents.pt`
+can instead load a saved VAE input after latent mean/std scaling; the benchmark
+selects the temporal prefix requested by `--frames` and checks its shape.
 
 The same script benchmarks multi-GPU VAE decode when launched with `torchrun`;
 the decode is timed across all ranks and rank 0 reports:

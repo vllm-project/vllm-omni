@@ -294,8 +294,9 @@ def _canonical_video_edit_mask(
     latent_t: int,
     latent_h: int,
     latent_w: int,
+    num_frames: int,
 ) -> torch.Tensor:
-    """Normalize every accepted request shape to one full latent grid."""
+    """Normalize every accepted request shape, including raw frame-space masks, to one full latent grid."""
     mask = _edit_mask(value, name="video_noise_mask")
     token_shape = (latent_t, latent_h // 2, latent_w // 2)
     full_shape = (latent_t, latent_h, latent_w)
@@ -313,10 +314,61 @@ def _canonical_video_edit_mask(
         if not candidate.ndim or candidate.shape[0] != 1:
             break
         candidate = candidate.squeeze(0)
+    if candidate.ndim in (2, 3):
+        return _resize_video_edit_mask(
+            candidate,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            num_frames=num_frames,
+        )
     raise OmniClientError(
         "MiniMax H3 video_noise_mask shape must be "
-        f"scalar, ({row_count},), {token_shape}, or {full_shape}; got {tuple(mask.shape)}"
+        f"scalar, ({row_count},), {token_shape}, {full_shape}, [H, W], or [T, H, W]; got {tuple(mask.shape)}"
     )
+
+
+def _resize_video_edit_mask(
+    mask: torch.Tensor,
+    *,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    num_frames: int,
+) -> torch.Tensor:
+    """Resize a raw ``[H, W]`` or frame-space ``[T, H, W]`` mask to ``[latent_t, latent_h, latent_w]``."""
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    grid = torch.nn.functional.interpolate(mask.unsqueeze(1), size=(latent_h, latent_w), mode="area").squeeze(1)
+    if grid.shape[0] == 1:
+        return grid.expand(latent_t, latent_h, latent_w).contiguous()
+    # Fit to the output length the way the source video is fitted, so the edit boundary does not drift.
+    if grid.shape[0] < num_frames:
+        grid = torch.cat([grid, grid[-1:].expand(num_frames - grid.shape[0], *grid.shape[1:])], dim=0)
+    return _temporal_group_max_pool(grid[:num_frames], latent_t=latent_t)
+
+
+def _temporal_group_max_pool(mask: torch.Tensor, *, latent_t: int) -> torch.Tensor:
+    """Max-pool frames onto the latents the causal video VAE encodes them into."""
+    clip = 17
+    frame_count = mask.shape[0]
+    num_chunks = -(-frame_count // clip)
+    padded = num_chunks * clip
+    if frame_count < padded:
+        mask = torch.cat([mask, mask[-1:].expand(padded - frame_count, *mask.shape[1:])], dim=0)
+    tokens: list[torch.Tensor] = []
+    for c in range(num_chunks):
+        chunk = mask[c * clip : (c + 1) * clip]
+        # Per 17-frame clip, token 0 covers frame 0 and token k covers frames 4k-3..4k; the VAE drops the last 3.
+        tokens.append(chunk[0:1].amax(dim=0))
+        for k in range(1, 5):
+            tokens.append(chunk[4 * k - 3 : 4 * k + 1].amax(dim=0))
+    result = torch.stack(tokens)[:-3]
+    if result.shape[0] != latent_t:
+        raise OmniClientError(
+            f"MiniMax H3 video_noise_mask temporal depth {frame_count} does not map to {latent_t} latents"
+        )
+    return result
 
 
 def _canonical_audio_edit_mask(value: Any, *, audio_t: int) -> torch.Tensor:
@@ -476,6 +528,7 @@ def prepare_encoder_inputs(
             latent_t=latent_t,
             latent_h=height // 16,
             latent_w=width // 16,
+            num_frames=num_frames,
         )
         if raw_video_edit_mask is not None
         else None

@@ -283,7 +283,7 @@ async def test_streaming_speech_does_not_count_empty_payload_as_first_packet(mon
         request_id="speech-test",
         request_arrival_ts=100.0,
     )
-    assert len([chunk async for chunk in chunks]) == 2
+    assert [chunk async for chunk in chunks] == [b"\0\0" * 320]
     assert metrics.ttfp_calls == [("1", "2", pytest.approx(0.25))]
     assert metrics.underrun_calls == [("1", "2", pytest.approx(0.0))]
     assert metrics.continuity_calls == [("1", "2", 100)]
@@ -319,7 +319,11 @@ async def test_streaming_speech_does_not_finalize_continuity_on_validation_error
     def reject_generation(_tts_params, **_kwargs):
         raise RuntimeError("generation validation failed")
 
-    adapter = SimpleNamespace(validates_generation=True, validate_generation=reject_generation)
+    adapter = SimpleNamespace(
+        validates_generation=True,
+        validate_generation=reject_generation,
+        validate_stream_audio=lambda **_kwargs: None,
+    )
     serving = _serving(metrics, adapter=adapter)
     monkeypatch.setattr("vllm_omni.entrypoints.openai.serving_speech.time.time", lambda: 100.25)
 

@@ -74,12 +74,12 @@ def build_app(
     public_realtime_url: str | None = None,
     ref_audio: str | None = None,
     profile: str = "minicpm-native",
-    adapter: str = "stt",
+    turn_mode: str = "manual",
 ) -> FastAPI:
     if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt"}:
         raise ValueError(f"Unknown profile: {profile}")
-    if adapter not in {"stt", "vad"}:
-        raise ValueError(f"Unknown adapter: {adapter}")
+    if turn_mode not in {"manual", "vad"}:
+        raise ValueError(f"Unknown turn mode: {turn_mode}")
     if profile == "qwen3-turn" and ref_audio:
         raise ValueError("Qwen3 profile does not accept --ref-audio")
     if profile == "aura-ptt" and ref_audio:
@@ -116,7 +116,7 @@ def build_app(
             {
                 "model": model,
                 "profile": profile,
-                "adapter": adapter,
+                "turnMode": turn_mode,
                 "realtimePath": public_realtime_url or "v1/realtime",
                 "refAudio": ref_audio_uri,
                 "appVersion": app_version,
@@ -190,9 +190,9 @@ def main(default_profile: str = "minicpm-native") -> None:
     parser.add_argument("--profile", choices=("minicpm-native", "qwen3-turn", "aura-ptt"), default=default_profile)
     parser.add_argument("--ws-backend", "--backend", dest="ws_backend")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--stt", dest="adapter", action="store_const", const="stt")
-    mode.add_argument("--vad", dest="adapter", action="store_const", const="vad")
-    parser.set_defaults(adapter="stt")
+    mode.add_argument("--manual", dest="turn_mode", action="store_const", const="manual")
+    mode.add_argument("--vad", dest="turn_mode", action="store_const", const="vad")
+    parser.set_defaults(turn_mode="manual")
     parser.add_argument(
         "--public-realtime-url",
         help="Browser-visible ws:// or wss:// Realtime URL; defaults to the same-origin proxy.",
@@ -225,7 +225,7 @@ def main(default_profile: str = "minicpm-native") -> None:
             public_realtime_url=args.public_realtime_url,
             ref_audio=args.ref_audio,
             profile=args.profile,
-            adapter=args.adapter,
+            turn_mode=args.turn_mode,
         ),
         host=args.host,
         port=args.port,

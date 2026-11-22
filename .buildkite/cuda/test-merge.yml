@@ -189,6 +189,15 @@ steps:
             '
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · Kandinsky6 Test"
+        source_file_dependencies: diffusion_kandinsky6_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              pytest -s -v tests/e2e/offline_inference/test_kandinsky6.py tests/e2e/online_serving/test_kandinsky6.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            "
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · Wan22 Test"
         source_file_dependencies: diffusion_wan22_function
         commands:

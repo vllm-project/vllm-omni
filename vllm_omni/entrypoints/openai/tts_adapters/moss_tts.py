@@ -21,6 +21,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     OutputPolicy,
     PreparedRequest,
+    TTSGenerationError,
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
@@ -518,6 +519,11 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if 1 in resolve_keys:
             params["ref_audio_2_cache_key"] = resolve_keys[1]
         return params
+
+    def validate_stream_audio(self, *, has_audio: bool) -> None:
+        # Local's sampled binary gate can stop before its first codec frame.
+        if self._moss_variant == "local" and not has_audio:
+            raise TTSGenerationError("MOSS-TTS Local produced no audio output.")
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate any MOSS-TTS-family request (nano + 5 full variants).

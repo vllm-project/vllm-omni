@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Example script for image editing with OmniGen2.
@@ -209,14 +209,14 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Edit an image with Qwen-Image-Edit.")
+    parser = argparse.ArgumentParser(description="Edit images with vLLM-Omni.")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image-Edit",
         help=(
             "Diffusion model name or local path. "
-            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or Qwen/Qwen-Image-Edit-2511"
-            "which supports QwenImageEditPlusPipeline."
+            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509, "
+            "Qwen/Qwen-Image-Edit-2511, or Qwen/Qwen-Image-2.1."
         ),
     )
     parser.add_argument(
@@ -368,7 +368,7 @@ def parse_args() -> argparse.Namespace:
         "--color-format",
         type=str,
         default="RGB",
-        help="For Qwen-Image-Layered, set to RGBA.",
+        help="For Qwen-Image-Layered or Qwen-Image-2.1, set to RGBA to preserve transparency.",
     )
 
     # Cache-DiT specific parameters
@@ -647,6 +647,7 @@ def main():
 
     diffusion_params = OmniDiffusionSamplingParams(
         generator=generator,
+        seed=args.seed,
         true_cfg_scale=args.cfg_scale,
         guidance_scale=args.guidance_scale,
         guidance_scale_2=args.guidance_scale_2,

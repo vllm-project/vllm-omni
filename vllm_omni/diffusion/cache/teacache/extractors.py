@@ -1620,6 +1620,9 @@ def extract_cosmos3_context(
         control_weights=control_weights,
         transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
     )
+    # Cache residuals stay rank-local: shard before the context and its
+    # closures retain prep; postprocess gathers on both misses and hits.
+    prep = module._shard_gen_prep(prep, defer_gather=True)
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
         return (module._run_gen_stack(prep),)

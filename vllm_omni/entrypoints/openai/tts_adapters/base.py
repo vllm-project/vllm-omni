@@ -331,6 +331,9 @@ class TTSModelAdapter(ABC):
         to unrelated TTS models.
         """
 
+    def validate_stream_audio(self, *, has_audio: bool) -> None:
+        """Validate audio availability before recording streaming success."""
+
     def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
         """Fold engine-side metadata from the mm payload into ``collect``.
 

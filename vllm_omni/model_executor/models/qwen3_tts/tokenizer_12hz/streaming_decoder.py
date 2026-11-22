@@ -45,6 +45,7 @@ from vllm.triton_utils import tl, triton
 from vllm_omni.platforms import current_omni_platform
 
 _KERNEL = 7
+_CUDA_SIN = current_omni_platform.is_cuda()
 
 
 # --------------------------------------------------------------------------- kernels
@@ -68,13 +69,15 @@ def _rvq_gather_kernel(codes_ptr, books_ptr, out_ptr, NQ: tl.constexpr, CB: tl.c
 
 
 @triton.jit
-def _fast_sin(y):
+def _fast_sin(y, CUDA_SIN: tl.constexpr = _CUDA_SIN):
     # Two-step reduction to [-pi, pi], then the hardware approximation
     # (absolute error ~4e-7 there): accurate sin's instruction count, not
     # memory, bounds every kernel that applies SnakeBeta.
-    k = tl.extra.cuda.libdevice.rint(y * 0.15915494309189535)
+    k = tl.extra.libdevice.rint(y * 0.15915494309189535)
     r = tl.fma(-k, -1.7484555314695172e-07, tl.fma(-k, 6.2831854820251465, y))
-    return tl.inline_asm_elementwise("sin.approx.f32 $0, $1;", "=r,r", [r], dtype=tl.float32, is_pure=True, pack=1)
+    if CUDA_SIN:
+        return tl.inline_asm_elementwise("sin.approx.f32 $0, $1;", "=r,r", [r], dtype=tl.float32, is_pure=True, pack=1)
+    return tl.sin(r)
 
 
 @triton.jit

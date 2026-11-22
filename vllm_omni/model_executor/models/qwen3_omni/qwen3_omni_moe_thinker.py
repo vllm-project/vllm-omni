@@ -117,6 +117,7 @@ from vllm.multimodal.processing.processor import (
 from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
+from vllm.utils.torch_utils import async_tensor_h2d
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
@@ -129,6 +130,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
+from vllm_omni.model_executor.models.qwen3_omni.vision_encoder_cudagraph import Qwen3OmniVisionEncoderCudaGraphMixin
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
     ComponentQuantizationConfig,
@@ -167,67 +169,62 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         super().__init__(*args, **kwargs)
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        grid_thw,
-    ) -> torch.Tensor:
-        hidden_states = x.to(device=self.device, dtype=self.dtype)
-        hidden_states = self.patch_embed(hidden_states)
-
+    def prepare_encoder_metadata(self, grid_thw) -> dict[str, torch.Tensor]:
+        """Prepare positions and attention metadata outside CUDA graph capture."""
+        if not isinstance(grid_thw, torch.Tensor):
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.int32)
+        metadata = {}
         if self.apply_vit_abs_pos_embed:
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-            hidden_states = hidden_states + pos_embeds
+            metadata["pos_embeds"] = self.fast_pos_embed_interpolate(grid_thw)
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw)
 
-        if isinstance(grid_thw, torch.Tensor):
-            grid_thw_tensor = grid_thw.to(self.device)
-        else:
-            grid_thw_tensor = torch.as_tensor(grid_thw, dtype=torch.int32, device=self.device)
+        rotary_pos_emb_cos = rotary_pos_emb_cos.to(self.device)
+        rotary_pos_emb_sin = rotary_pos_emb_sin.to(self.device)
 
-        try:
-            cu_seqlens = torch.repeat_interleave(
-                grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2],
-                grid_thw_tensor[:, 0],
-            ).cumsum(
-                dim=0,
-                dtype=grid_thw_tensor.dtype if torch.jit.is_tracing() else torch.int32,
-            )
-            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        except RuntimeError:
-            logger.warning(
-                "torch.repeat_interleave not executable, switching to vectorized searchsorted implementation."
-            )
-            repeat_counts = grid_thw_tensor[:, 0]
-            values = grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2]
-            repeat_cumsum = repeat_counts.cumsum(0)
-            total_items = repeat_cumsum[-1].item()
-            indices = torch.searchsorted(
-                repeat_cumsum,
-                torch.arange(total_items, device=grid_thw_tensor.device),
-                right=True,
-            )
-            cu_seqlens = values[indices].cumsum(
-                dim=0,
-                dtype=grid_thw_tensor.dtype if torch.jit.is_tracing() else torch.int32,
-            )
-            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        hidden_states = hidden_states.unsqueeze(1)
-        rotary_pos_emb_cos = rotary_pos_emb_cos.to(hidden_states.device)
-        rotary_pos_emb_sin = rotary_pos_emb_sin.to(hidden_states.device)
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-
-        grid_thw_np = grid_thw_tensor.cpu().numpy().astype(np.int32)
+        # Sequence boundaries come from the host grid, so neither the eager
+        # path nor a replay reads a device value back.
+        grid_thw_np = grid_thw.cpu().numpy().astype(np.int32)
         cu_seqlens_np = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(
             axis=0, dtype=np.int32
         )
         cu_seqlens_np = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens_np])
+        cu_seqlens_host = torch.from_numpy(cu_seqlens_np)
+        if self.device.type == "cpu":
+            cu_seqlens = cu_seqlens_host
+        else:
+            cu_seqlens = async_tensor_h2d(cu_seqlens_host, device=self.device)
+        # Attention reads this scalar on the host. Replay keeps the capture
+        # budget's bound instead.
+        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens_host)
         sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
             self.attn_backend,
             cu_seqlens_np,
             self.device,
         )
+
+        metadata.update(
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        if sequence_lengths is not None:
+            metadata["sequence_lengths"] = sequence_lengths
+        return metadata
+
+    def forward(
+        self, x: torch.Tensor, grid_thw, *, encoder_metadata: dict[str, torch.Tensor] | None = None
+    ) -> torch.Tensor:
+        if encoder_metadata is None:
+            encoder_metadata = self.prepare_encoder_metadata(grid_thw)
+        return self.forward_with_encoder_metadata(x, encoder_metadata)
+
+    def forward_with_encoder_metadata(self, x: torch.Tensor, metadata: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Run patch embedding, vision blocks and all DeepStack mergers."""
+        hidden_states = self.patch_embed(x.to(device=self.device, dtype=self.dtype))
+        if self.apply_vit_abs_pos_embed:
+            hidden_states = hidden_states + metadata["pos_embeds"]
+        hidden_states = hidden_states.unsqueeze(1)
 
         hidden_states_list = []
         deepstack_visual_indexes = self.deepstack_visual_indexes
@@ -235,11 +232,11 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb_cos=rotary_pos_emb_cos,
-                rotary_pos_emb_sin=rotary_pos_emb_sin,
-                max_seqlen=max_seqlen,
-                sequence_lengths=sequence_lengths,
+                cu_seqlens=metadata["cu_seqlens"],
+                rotary_pos_emb_cos=metadata["rotary_pos_emb_cos"],
+                rotary_pos_emb_sin=metadata["rotary_pos_emb_sin"],
+                max_seqlen=metadata["max_seqlen"],
+                sequence_lengths=metadata.get("sequence_lengths"),
             )
 
             if deepstack_visual_indexes is not None and layer_num in deepstack_visual_indexes:
@@ -440,8 +437,6 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ):
-        import torch.nn.functional as F
-
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
         chunk_lengths = torch.tensor(
@@ -1024,6 +1019,7 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
 )
 class Qwen3OmniMoeThinkerForConditionalGeneration(
     nn.Module,
+    Qwen3OmniVisionEncoderCudaGraphMixin,
     SupportsMultiModal,
     SupportsPP,
     SupportsLoRA,
@@ -1143,14 +1139,23 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
             # register buffer for deepstack
             if self.use_deepstack:
+                # Create the buffers on the target device explicitly. They are
+                # built inside the `_mark_tower_model` block, which runs under
+                # vLLM's meta-device `no_init_weights` context when the image and
+                # video limits are both 0 (audio-only serving), so a bare
+                # torch.zeros(...) would stay on meta and the first profile_run
+                # fails with "Tensor on device meta is not on the expected device".
                 self.deepstack_input_embeds = [
                     torch.zeros(
                         vllm_config.scheduler_config.max_num_batched_tokens,
                         thinker_config.text_config.hidden_size,
+                        device=vllm_config.device_config.device,
                     )
                     for _ in range(self.deepstack_num_level)
                 ]
                 self.deepstack_input_embeds_num_tokens = 0
+
+        self._enable_image_encoder_cudagraph()
 
         with self._mark_language_model(vllm_config):
             lm_vllm_config = vllm_config.with_hf_config(

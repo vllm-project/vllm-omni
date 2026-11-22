@@ -318,26 +318,45 @@ def test_failed_output_handoff_retains_decoded_samples(cuda):
     fast.close()
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("enabled,complete", [(False, False), (True, False), (True, True), (True, None)])
+def test_gate_waits_only_for_enabled_inflight_decode(mocker, enabled, complete):
+    # A fixed GPU sleep cannot prove that an event is still pending when the
+    # host reaches gate(), particularly across CUDA and ROCm implementations.
+    fast = object.__new__(MossFirstChunkFastPath)
+    fast._device = torch.device("cuda")
+    fast._gate_main = enabled
+    event = None if complete is None else mocker.Mock()
+    if event is not None:
+        event.query.return_value = complete
+    fast._inflight = event
+    stream = mocker.Mock()
+    current_stream = mocker.patch("torch.cuda.current_stream", return_value=stream)
+    fast.gate()
+    if enabled and complete is False:
+        current_stream.assert_called_once_with(fast._device)
+        stream.wait_event.assert_called_once_with(event)
+    else:
+        current_stream.assert_not_called()
+        stream.wait_event.assert_not_called()
+
+
 @pytest.mark.cuda
-def test_gate_orders_main_stream_after_inflight_fast_decode(cuda):
+def test_gate_hands_inflight_gpu_output_to_main_stream(cuda):
     fast, _, _ = _fast(cuda)
     side = torch.cuda.Stream()
+    output = torch.zeros(16, device=cuda)
+    side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        torch.cuda._sleep(200_000_000)
+        output.fill_(7)
         pending = torch.cuda.Event()
         pending.record(side)
     fast._inflight = pending
-    fast.gate()  # disabled: no wait
-    unordered = torch.cuda.Event()
-    unordered.record()
     fast._gate_main = True
     fast.gate()
-    ordered = torch.cuda.Event()
-    ordered.record()
-    unordered.synchronize()
-    assert not pending.query() and not ordered.query()
-    ordered.synchronize()
-    assert pending.query()
+    received = output.clone()
+    torch.testing.assert_close(received, torch.full_like(received, 7))
+    fast.close()
 
 
 def _cpu_fast(monkeypatch, *, scheduler=None):
@@ -545,3 +564,41 @@ def test_platform_failure_wakes_pending_handoff(monkeypatch):
     assert fast._closed
     with pytest.raises(RuntimeError, match="decode failed"):
         fast.order_after(0)
+
+
+@pytest.mark.cpu
+@pytest.mark.tts
+@pytest.mark.parametrize("limit", [1, 2])
+def test_congested_admission_preserves_routes_and_slots_then_recovers(monkeypatch, limit):
+    import sys
+    from functools import partial
+
+    helpers = sys.modules[__name__]
+    from vllm_omni.model_executor.models.moss_tts.first_chunk_fast_path import MossFirstChunkFastPath
+
+    monkeypatch.setattr(helpers, "MossFirstChunkFastPath", partial(MossFirstChunkFastPath, max_active_streams=limit))
+    fast, session, sink, _ = helpers._cpu_fast(monkeypatch)
+    calls = []
+
+    class Sink:
+        def prepare(self, ids):
+            calls.append(ids)
+            return sink.prepare(ids)
+
+    fast._sink = Sink()
+    thread = threading.Thread()
+    monkeypatch.setattr(thread, "is_alive", lambda: True)
+    fast._thread = thread
+    slots = {f"busy{i}": session.acquire() for i in range(limit)}
+    before_slots, before_free = slots.copy(), session.free.copy()
+    codes = torch.tensor([1, 2])
+    assert not fast.submit("r", "r", codes, slots)
+    assert slots == before_slots and session.free == before_free
+    assert not calls and not fast._decoded and not fast._handoffs and fast._jobs.empty()
+    released = slots.pop("busy0")
+    session.release(released)
+    assert fast.submit("r", "r", codes, slots)
+    codes.fill_(99)
+    job = fast._jobs.get_nowait()
+    assert job.slot == slots["r"] and calls == [["r"]]
+    assert job.codes.tolist() == [[1], [2]]

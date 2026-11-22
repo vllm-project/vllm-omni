@@ -3,6 +3,8 @@
 """Real-shape checks for MammothModa2's fused QK norm/RoPE and shared CUDA
 attention backend against the native shared RMSNorm path."""
 
+import os
+
 import pytest
 import torch
 from diffusers.models.attention_processor import Attention
@@ -10,6 +12,9 @@ from diffusers.models.attention_processor import Attention
 import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
 import vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model as mammoth_dit
 from tests.helpers.mark import hardware_marks
+from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import TransformerBlock
 
@@ -26,11 +31,36 @@ pytestmark = [
 DIM, HEADS, KV_HEADS = 2520, 21, 7
 
 
+@pytest.fixture(autouse=True)
+def _set_diffusion_config():
+    """Construct attention layers with the same config path used in production."""
+    with set_current_diffusion_config(OmniDiffusionConfig()):
+        yield
+
+
 def _norm_attention(head_dim, dtype):
     attn = Attention(query_dim=head_dim * HEADS, heads=HEADS, kv_heads=KV_HEADS, dim_head=head_dim)
     attn.norm_q = RMSNorm(head_dim)
     attn.norm_k = RMSNorm(head_dim)
     return attn.to(device="cuda", dtype=dtype)
+
+
+def test_explicit_attention_backend_environment_reaches_dit_layer():
+    backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+    if backend_name is None or backend_name.lower() == "auto":
+        pytest.skip("no explicit diffusion attention backend")
+    assert backend_name is not None
+
+    block = TransformerBlock(
+        48,
+        6,
+        2,
+        multiple_of=8,
+        ffn_dim_multiplier=1.0,
+        norm_eps=1e-5,
+    )
+    expected_backend = DiffusionAttentionBackendEnum[backend_name.upper()].get_class()
+    assert block.attn.omni_attn.attn_backend is expected_backend
 
 
 def test_unpaired_rope_preserves_native_arithmetic(monkeypatch):

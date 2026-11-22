@@ -12,11 +12,25 @@ require new end-to-end performance measurements after the mainline integration.
 Previously reported numbers do not describe this revised codec backend.
 
 The generic MRv2 profile and the opt-in native V1 duplex H200 profile enable
-TF32 matmuls within Code2Wav forward/capture only; the previous process policy
-is restored afterwards. cuDNN's TF32 policy is independent. TF32 changes rounding.
+ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
+(`torch.backends.cuda.matmul.allow_tf32` on dense QKV/MLP, Triton
+`input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
+The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
+is independent. HiFT stays IEEE FP32. TF32 changes rounding.
 Duplex keeps the mainline V1 session path. Turn results do not establish duplex
 performance or interruption correctness.
 
 The shared asynchronous output snapshot and batched Talker preprocessing also
 apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
+
+CFM graph execution defaults to the fused DiT body on CUDA when TF32 is
+allowed. NVIDIA SM80+ uses tiled TF32 attention; older CUDA devices use the
+fused body's SDPA fallback. Unsupported DiT layouts or non-FP32 attention
+caches retain the original body. Other platforms retain their existing default.
+Set `cfm_fused_body: false` in connector `extra` to restore the original body.
+Disabling TF32 with `token2wav_allow_tf32: false` or
+`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`cfm_fused_body: true` overrides that choice and may use TF32 attention.
+Slot pooling and row-offset merging remain opt-in. Fusion changes floating-point
+rounding and does not promise identical waveforms.

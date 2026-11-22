@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import torch
+from vllm import SamplingParams
 
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
@@ -124,6 +125,60 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert _complete(plane, [{"codes.audio": torch.tensor([[3, 4]])}]) == 0
     assert len(plane.record.batches) == 1
     assert not plane._pending_full_payload_send
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("stop", ["token", "length"])
+def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop):
+    plane._async_chunk = async_chunk
+    plane._full_payload_replace_keys_cached = frozenset()
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(stop_token_ids=[2150], max_tokens=2 if stop == "length" else 10)
+    plane.register_request(request)
+    first, last, stale = (torch.tensor([[value]]) for value in (1, 2, 99))
+    plane.reserve_outputs(["internal"])
+    _complete(plane, [{"codes.audio": first}], token=21)
+    plane.reserve_outputs(["internal"])
+    _complete(plane, [{"codes.audio": last}], token=2150 if stop == "token" else 22)
+    plane.reserve_outputs(["internal"])
+    assert plane.request_terminal({"internal"}) == 0
+    _complete(plane, [{"codes.audio": stale}], token=23)
+
+    payloads = [
+        payload["codes"]["audio"] if async_chunk else payload["codes.audio"]
+        for batch in plane.record.batches
+        for _, payload in batch
+        if payload
+    ]
+    torch.testing.assert_close(torch.cat(payloads), torch.cat([first, last]))
+    terminal, _ = plane.record.batches[-1][0]
+    assert terminal.is_finished()
+    assert terminal.output_token_count == 2
+    assert plane.record.cleaned == ["internal"]
+    assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_native_output_honors_ignore_eos_and_min_tokens(plane, ignore_eos):
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(ignore_eos=ignore_eos, min_tokens=2, max_tokens=10)
+    request.sampling_params.update_from_generation_config({}, eos_token_id=99)
+    plane.register_request(request)
+    for token in (99, 99, 21):
+        _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
+    state = plane._native_requests["internal"]
+    assert state.output_token_ids == ([99, 99, 21] if ignore_eos else [99, 99])
+    assert len(plane.record.batches) == (3 if ignore_eos else 2)
+
+
+def test_resumable_output_keeps_scheduler_owned_segment_boundary(plane):
+    plane.register_request(_new_request())
+    for token in (21, 2150, 22):
+        _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
+    assert plane._native_requests["internal"].output_token_ids == [21, 2150, 22]
+    assert len(plane.record.batches) == 3
 
 
 def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):

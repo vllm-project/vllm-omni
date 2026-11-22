@@ -8,7 +8,7 @@ import torch
 from comfy_api.input import AudioInput, VideoInput
 
 from .utils.api_client import VLLMOmniClient
-from .utils.latent_mask import _align_frame_count, _video_latent_t
+from .utils.latent_mask import _align_frame_count
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
 from .utils.types import (
@@ -1133,13 +1133,13 @@ class VLLMOmniMiniMaxH3TemporalMask:
         else:
             raise ValueError(f"Unknown temporal mask mode: {mode}")
         available = min(frames, math.floor(boundary * 24 + 1e-8))
+        # Snap the preserved prefix to whole VAE clips (5 + 17n frames) so every
+        # latent it maps to is fully preserved.
         prefix = 0 if available < 5 else 5 + 17 * ((available - 5) // 17)
-        preserved = _video_latent_t(prefix) if prefix else 0
-        total = _video_latent_t(frames)
-        mask = torch.ones(total, 1, 1)
-        mask[:preserved] = 0
+        # One slice per output frame; the server pools frames to the latent grid.
+        mask = torch.ones(frames, 1, 1)
+        mask[:prefix] = 0
         indices = torch.arange(frames, device=images.device)
         source_indices = (indices * (source_fps / 24)).floor().long().clamp(max=images.shape[0] - 1)
         preview_images = images.index_select(0, source_indices)
-        preview_mask = mask.index_select(0, torch.arange(frames) * total // frames)
-        return mask, 24.0, preview_images, preview_mask
+        return mask, 24.0, preview_images, mask
