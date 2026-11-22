@@ -70,6 +70,7 @@ from vllm_omni.diffusion.offloader.config import (
     should_offload_component,
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.offloader.offload_plan import BackingKind
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -761,6 +762,11 @@ class MiniMaxH3Pipeline(
         encoder_component_types={"text_encoder": TEXT_ENCODER_COMPONENT},
         encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
         on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
+        # The encoder runs one forward per prompt and reads each block once, so
+        # it may stream from its checkpoint file instead of pinning 48-62GB of
+        # BF16 weights in host RAM.
+        one_shot_component_paths=frozenset({TEXT_ENCODER_COMPONENT}),
+        component_backing={TEXT_ENCODER_COMPONENT: BackingKind.CHECKPOINT_MMAP},
     )
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "encode_prompt",
