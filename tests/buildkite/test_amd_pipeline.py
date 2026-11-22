@@ -1419,6 +1419,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "slow and rocm and MI325 and cards_2",
             "tests/dfx/reliability/test_qwen3_omni.py",
         ),
+        "Reliability Test · qwen3-omni replicas": (
+            "mi300_4",
+            "slow and rocm and MI325 and cards_4",
+            "tests/dfx/reliability/test_qwen3_omni_replica.py",
+        ),
         "Reliability Test · wan22": (
             "mi300_2",
             "slow and rocm and MI325 and cards_2",
@@ -1433,6 +1438,11 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "mi300_1",
             "slow and rocm and MI325 and cards_1",
             "tests/dfx/reliability/test_minicpmo_4_5.py",
+        ),
+        "Reliability Test · minicpmo-4.5 replicas": (
+            "mi300_4",
+            "slow and rocm and MI325 and cards_3",
+            "tests/dfx/reliability/test_minicpmo_4_5_replica.py",
         ),
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": (
             "mi300_1",
@@ -1480,6 +1490,15 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "collection_message": "Expected exactly 14 Qwen3-Omni reliability nodes",
             "junit_message": ("Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips"),
         },
+        "Reliability Test · qwen3-omni replicas": {
+            "artifact_path": "artifacts/rocm-qwen3-omni-replica-reliability/**/*",
+            "artifact_env": "ROCM_QWEN3_REPLICA_ARTIFACT_DIR",
+            "expected_nodes": 5,
+            "expected_skipped": 1,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 5 Qwen3-Omni replica reliability nodes",
+            "junit_message": ("Expected exactly 5 executed Qwen3-Omni replica reliability tests with 1 known skip"),
+        },
         "Reliability Test · wan22": {
             "artifact_path": "artifacts/rocm-wan22-reliability/**/*",
             "artifact_env": "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
@@ -1497,6 +1516,15 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "timeout": "220m",
             "collection_message": "Expected exactly 14 MiniCPM-o 4.5 reliability nodes",
             "junit_message": "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
+        },
+        "Reliability Test · minicpmo-4.5 replicas": {
+            "artifact_path": "artifacts/rocm-minicpmo-replica-reliability/**/*",
+            "artifact_env": "ROCM_MINICPMO_REPLICA_ARTIFACT_DIR",
+            "expected_nodes": 5,
+            "expected_skipped": 1,
+            "timeout": "220m",
+            "collection_message": "Expected exactly 5 MiniCPM-o 4.5 replica reliability nodes",
+            "junit_message": ("Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 1 known skip"),
         },
         "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
@@ -1548,6 +1576,41 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         assert f"tests != {expected_nodes} or skipped != {expected_skipped}" in command
 
 
+def test_weekly_replica_reliability_is_blocking_rocm_coverage() -> None:
+    jobs = {
+        "Reliability Test · qwen3-omni replicas": (
+            "omni_qwen3_omni_replica_reliability",
+            Path("tests/dfx/reliability/test_qwen3_omni_replica.py"),
+            "slow and rocm and MI325 and cards_4",
+        ),
+        "Reliability Test · minicpmo-4.5 replicas": (
+            "omni_minicpmo_4_5_replica_reliability",
+            Path("tests/dfx/reliability/test_minicpmo_4_5_replica.py"),
+            "slow and rocm and MI325 and cards_3",
+        ),
+    }
+
+    for label, (dependency, source_path, marker) in jobs.items():
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        command = "\n".join(step["commands"])
+
+        assert step["grade"] == "Blocking"
+        assert step["agent_pool"] == "mi300_4"
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 240
+        assert step["source_file_dependencies"] == dependency
+        assert "retry" not in step
+        assert marker in command
+
+        source = source_path.read_text(encoding="utf-8")
+        assert 'res = {"cuda": "H100", "rocm": "MI325"}' in source
+        assert "10391" not in source
+        assert source.count("10378") == 1
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+
 def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
     group = _find_group("Reliability Test", AMD_WEEKLY_PIPELINE)
     affected_labels = {
@@ -1593,6 +1656,14 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             "Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips",
         ),
         (
+            "Reliability Test · qwen3-omni replicas",
+            "ROCM_QWEN3_REPLICA_ARTIFACT_DIR",
+            "qwen3-replica-reliability-guard",
+            5,
+            1,
+            "Expected exactly 5 executed Qwen3-Omni replica reliability tests with 1 known skip",
+        ),
+        (
             "Reliability Test · wan22",
             "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
             "wan22-reliability-guard",
@@ -1615,6 +1686,14 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
             14,
             0,
             "Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips",
+        ),
+        (
+            "Reliability Test · minicpmo-4.5 replicas",
+            "ROCM_MINICPMO_REPLICA_ARTIFACT_DIR",
+            "minicpmo-replica-reliability-guard",
+            5,
+            1,
+            "Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 1 known skip",
         ),
         (
             "Reliability Test · Invalid parameters · MI300 · Single-GPU",
@@ -1643,9 +1722,11 @@ def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
     ),
     ids=(
         "qwen3-omni",
+        "qwen3-omni-replicas",
         "wan22",
         "hunyuan-image",
         "minicpmo",
+        "minicpmo-replicas",
         "invalid-parameters-single",
         "invalid-parameters-2gpu",
         "audio",
@@ -5920,6 +6001,6 @@ def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 36
-    assert sum(step["grade"] == "Blocking" for step in steps) == 34
+    assert len(steps) == 38
+    assert sum(step["grade"] == "Blocking" for step in steps) == 36
     assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS
