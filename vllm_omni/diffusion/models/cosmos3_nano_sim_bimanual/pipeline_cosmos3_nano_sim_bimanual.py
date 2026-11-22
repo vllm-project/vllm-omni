@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Causal autoregressive pipeline for Cosmos3-Nano-Sim-Bimanual checkpoints."""
 
 from __future__ import annotations
@@ -945,29 +946,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         finally:
             self._reset_mixed_precision()
 
-    def _can_batch_clean_commit(self) -> bool:
-        """Whether one frame-causal forward may refresh several clean frames.
-
-        That forward gives each frame its own block-table row, so every frame
-        must end on a page boundary. A frame the paging unit does not divide
-        (the default 720x1280 is 924 tokens against 16-token pages) is
-        committed frame by frame instead.
-        """
-
-        paged_state = self._ar_diffusion_kv_state
-        if paged_state is None:
-            return True
-        cache = paged_state.kv_cache
-        if cache.spec.chunk_size % cache.block_size == 0:
-            return True
-        logger.warning_once(
-            "Cosmos3-Nano-Sim-Bimanual: frames of %d tokens are not a multiple of the %d-token KV page; "
-            "clean K/V is committed frame by frame instead of batched.",
-            cache.spec.chunk_size,
-            cache.block_size,
-        )
-        return False
-
     def _commit_clean_chunk(
         self,
         state: Cosmos3NanoSimBimanualSessionState,
@@ -1533,11 +1511,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                         terminal_request=terminal_request,
                     )
                 )
-                if (
-                    getattr(self, "clean_commit_mode", "batched") == "batched"
-                    and commit_frames
-                    and self._can_batch_clean_commit()
-                ):
+                if getattr(self, "clean_commit_mode", "batched") == "batched" and commit_frames:
                     # The helper returns a contiguous prefix, excluding only
                     # the global terminal frame when no continuation is needed.
                     count = len(commit_frames)

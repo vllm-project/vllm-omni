@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Check checkpoint schedules and full-history admission without model weights."""
 
 from __future__ import annotations
@@ -44,7 +45,6 @@ def methods():
         "_request_kv_spec",
         "ar_diffusion_request_spec",
         "_validate_bound_kv_geometry",
-        "_can_batch_clean_commit",
     }
     body = [node for node in cls.body if getattr(node, "name", "") in selected]
     body += [node for node in tree.body if getattr(node, "name", "") == "_admission_int"]
