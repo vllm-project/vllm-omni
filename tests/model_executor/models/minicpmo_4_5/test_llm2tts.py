@@ -35,39 +35,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _HIDDEN_DIM = 4
 
 
-@pytest.mark.skip(reason="Legacy fused Talker metadata is replaced by separate Talker and Code2Wav stage payloads.")
-def test_native_duplex_talker_emits_empty_text_metadata_to_clear_previous_segment() -> None:
-    class _Talker:
-        _ar_last_chunk_flags = [True]
-        _ar_turn_end_flags = [True]
-
-        def __call__(self, **kwargs):
-            del kwargs
-            return None, torch.zeros(0, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    torch.nn.Module.__init__(model)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=_HIDDEN_DIM)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.tensor([1]),
-        positions=torch.tensor([0]),
-        runtime_additional_information=[
-            {
-                "native_duplex": True,
-                "duplex": {"turn_id": 1, "epoch": 0},
-                "meta": {"native_duplex_segment_text": ""},
-            }
-        ],
-    )
-
-    assert output.multimodal_outputs is not None
-    assert output.multimodal_outputs["meta.llm_output_text_utf8"].numel() == 0
-    assert output.multimodal_outputs["meta.audio_text_total_chars"].tolist() == [0]
-
-
 def test_tts_embed_input_ids_uses_active_talker_embedding(monkeypatch) -> None:
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     torch.nn.Module.__init__(model)

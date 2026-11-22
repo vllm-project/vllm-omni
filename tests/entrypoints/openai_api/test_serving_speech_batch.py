@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E tests for the /v1/audio/speech/batch endpoint.
 
@@ -33,7 +33,12 @@ default_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+            server_args=[
+                "--trust-remote-code",
+                "--stage-overrides",
+                '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+                "--disable-log-stats",
+            ],
         ),
         id="qwen3-tts-batch-default",
     )
@@ -307,7 +312,12 @@ batch2_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=BATCH2_STAGE_CONFIG_PATH,
-            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+            server_args=[
+                "--trust-remote-code",
+                "--stage-overrides",
+                '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+                "--disable-log-stats",
+            ],
         ),
         id="qwen3-tts-batch-max2",
     )

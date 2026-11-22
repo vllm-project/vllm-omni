@@ -317,5 +317,6 @@ def test_collect_attaches_session_stats_and_flattens_busy_rtf(capsys) -> None:
     assert report["mean_duplex_stall_ratio"] == 0.0
     print_duplex_response_latency_metrics(duplex_response_latency_metrics(bundle.request_metrics))
     printed = capsys.readouterr().out
-    assert "Mean busy RTF:" in printed
-    assert "Mean stall ratio:" in printed
+    lines = [" ".join(line.split()) for line in printed.splitlines()]
+    assert "Mean busy RTF: 0.200000" in lines
+    assert "Mean stall ratio: 0.000000" in lines

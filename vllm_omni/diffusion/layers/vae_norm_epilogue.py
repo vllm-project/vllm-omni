@@ -137,7 +137,11 @@ def rms_norm_scale(
     ``x`` must be a contiguous ``(N, C, S)`` tensor, ``denom`` a contiguous fp32
     ``(N, 1, S)`` tensor and ``gamma`` a contiguous ``(C,)`` tensor of ``x``'s dtype.
     """
-    if not HAS_TRITON or not on_kernel_device(x):
+    if x.device.type == "musa":
+        # MUSA runs the epilogue without SiLU, which is not bit-exact there.
+        if not HAS_TRITON or silu:
+            return None
+    elif not HAS_TRITON or not on_kernel_device(x):
         return None
     if x.dim() != 3 or x.dtype not in _SUPPORTED_DTYPES:
         return None

@@ -26,16 +26,16 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
-from .batched_token2wav import (
+from .code2wav.graphs import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
     PromptFeatures,
     row_offset_signature,
     state_shape_signature,
 )
-from .code2wav_watchdog import Code2WavWatchdog
-from .config_flags import read_bool_flag
-from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.watchdog import Code2WavWatchdog
+from .config import read_bool_flag, resolve_token2wav_trt_config, stage_connector_extra
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -405,7 +405,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
         from vllm_omni.platforms import current_omni_platform
 
-        extra = self._extra_config()
+        extra = stage_connector_extra(self.vllm_config)
         # Resolved on every platform so an invalid value fails at startup
         # instead of inside the first forward/prefetch (_stage_matmul_policy).
         self._tf32_mode = _tf32_mode(extra)
@@ -424,6 +424,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # competes with the thinker's decode on a shared GPU.
         self._ref_prefetch_enabled = read_bool_flag(extra, "token2wav_ref_prefetch", True)
         self._ref_prefetch_setup = read_bool_flag(extra, "token2wav_ref_prefetch_setup", False)
+        self._ref_cpu_prefetch_workers = int(extra.get("token2wav_ref_cpu_prefetch_workers", 0))
+        if self._ref_cpu_prefetch_workers < 0:
+            raise ValueError("token2wav_ref_cpu_prefetch_workers must be >= 0")
         self._ref_prefetch_max_waiters = int(extra.get("token2wav_ref_prefetch_max_waiters", 1))
         if self._ref_prefetch_max_waiters < 1:
             raise ValueError("token2wav_ref_prefetch_max_waiters must be >= 1")
@@ -493,14 +496,21 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
-            # Default on for CUDA and NPU. CUDA uses tiled TF32 attention on
-            # SM80+ and SDPA otherwise, so it respects the TF32 opt-out; NPU
-            # uses packed QKV, in-place KV and ACLNN AddLayerNorm, independent
-            # of TF32. An explicit ``cfm_fused_body`` overrides either default.
+            # CUDA FP32 fusion respects the TF32 opt-out. FP16 CFM and NPU
+            # fusion do not depend on TF32. An explicit ``cfm_fused_body``
+            # overrides these defaults.
             "fused_body": read_bool_flag(
                 extra,
                 "cfm_fused_body",
-                (current_omni_platform.is_cuda() and self._tf32_mode != "off") or current_omni_platform.is_npu(),
+                (
+                    current_omni_platform.is_cuda()
+                    and (
+                        self._tf32_mode != "off"
+                        or read_bool_flag(extra, "token2wav_float16", False)
+                        or read_bool_flag(extra, "cfm_float16", False)
+                    )
+                )
+                or current_omni_platform.is_npu(),
             ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
@@ -522,6 +532,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._ref_setup_batch_size = int(extra.get("ref_setup_batch_size", 1))
+        if self._ref_setup_batch_size < 1:
+            raise ValueError("ref_setup_batch_size must be positive")
         self._initial_batch_size = int(extra.get("code2wav_initial_batch_size", 0))
         if self._initial_batch_size < 0:
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
@@ -592,15 +605,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         logger.info("Default prompt normalized onto the %.2fs window: %s", self._ref_max_seconds, path)
         self._default_prompt_normalized = (str(path), cache_id)
         return self._default_prompt_normalized
-
-    def _extra_config(self) -> dict[str, Any]:
-        model_config = getattr(self.vllm_config, "model_config", None)
-        connector = getattr(model_config, "stage_connector_config", None)
-        if isinstance(connector, Mapping):
-            extra = connector.get("extra", connector)
-        else:
-            extra = getattr(connector, "extra", None)
-        return dict(extra) if isinstance(extra, Mapping) else {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -1043,6 +1047,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             features.append(prompts[key])
             if states[row] is None:
                 fresh.setdefault(key, []).append(row)
+        if self._ref_setup_batch_size > 1 and fresh:
+            keys = list(fresh)
+            initial = self.backend.setup_prompts([prompts[key] for key in keys], self._ref_setup_batch_size)
+            for key, state in zip(keys, initial, strict=True):
+                for row in fresh[key]:
+                    states[row] = state
+            fresh = {}
         for key, rows in fresh.items():
             self._watchdog.phase(
                 "setup/cfm",
@@ -1574,6 +1585,8 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
+                "meta.duplex_audio_cache_epoch": [torch.tensor(item.cache_epoch, dtype=torch.int64) for item in items],
+                "meta.duplex_audio_chunk_seq": [torch.tensor(item.chunk_seq, dtype=torch.int64) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
             },
@@ -1589,10 +1602,11 @@ class MiniCPMO45Code2Wav(nn.Module):
     def on_requests_added(self, prewarms: list[OmniRequestPrewarm]) -> None:
         """Queue reference prefetches for new async-chunk placeholders.
 
-        Only validates and enqueues; :meth:`run_idle_prefetch` does the work
-        (the prompt, plus the setup with ``token2wav_ref_prefetch_setup``).
-        A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
-        GPU and NPU generation runners call this hook and
+        By default only validates and enqueues; :meth:`run_idle_prefetch` does
+        the work (plus setup with ``token2wav_ref_prefetch_setup``). Optional
+        CPU workers materialize and pin references within the same pin budget.
+        A bad payload is logged and skipped, never raised. The MRv2 GPU
+        and NPU generation runners call this hook and
         :meth:`run_idle_prefetch`; runners without these optional hooks prepare
         the reference inline at chunk 0.
         """
@@ -1633,6 +1647,21 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 continue
             self._prefetch_queue[state_id] = _RefPrefetch(ref_audio=ref_audio, sample_rate=sample_rate)
+            workers = getattr(self, "_ref_cpu_prefetch_workers", 0)
+            if workers and ref_audio.device.type == "cpu":
+                if not self._prefetch_pin_available(state_id):
+                    continue
+                try:
+                    cache_key, entry = self._materialize_runtime_prompt(ref_audio, sample_rate)
+                    entry.pins.add(state_id)
+                    self._prefetch_pins[state_id] = cache_key
+                    if not self.backend.prefetch_prompt_cpu(entry.cache_id, entry.path, workers):
+                        self._drop_prefetch(state_id)
+                        continue
+                    self._trim_runtime_prompts()
+                except Exception:
+                    logger.exception("MiniCPM-o CPU reference prefetch failed for %s", state_id)
+                    self._drop_prefetch(state_id)
 
     @torch.inference_mode()
     def run_idle_prefetch(self) -> bool:
@@ -1680,6 +1709,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         ):
             return self._run_prefetch_phase(state_id, record)
 
+    def _prefetch_pin_available(self, state_id: str) -> bool:
+        # An accepted CPU job already holds this request's pin. Its later idle
+        # phase may reuse that pin even when the budget is full.
+        return state_id in self._prefetch_pins or len(self._prefetch_pins) < max(1, self._runtime_prompt_cache_size)
+
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
         """Run the next phase of ``record``; see ``run_idle_prefetch``."""
         entry = record.entry
@@ -1689,7 +1723,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # pinned entries are never trimmed. The record waits at the
                 # head until a pin is released; its own chunk 0 or finish
                 # still drops it as usual.
-                if len(self._prefetch_pins) >= max(1, self._runtime_prompt_cache_size):
+                if not self._prefetch_pin_available(state_id):
                     return False
                 # Phase A. The pin keeps the entry (and with it the backend's
                 # prompt features) alive until chunk 0 or finish releases it.
@@ -1788,12 +1822,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         # that package's hard-coded `.cuda()` calls, and auto-applies the
         # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
         # on NPU.
-        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
             MiniCPMO45Token2wav as Token2wav,
         )
         from vllm_omni.platforms import current_omni_platform
 
-        extra = self._extra_config()
+        extra = stage_connector_extra(self.vllm_config)
         # Hub repo ids only need to become local directories once the vocoder
         # assets are actually read; unit tests construct this model with fake
         # paths and must not trigger a hub download (#5442).
@@ -1832,8 +1866,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Parsed before the platform branches: a typo in a shared stage config
         # must fail at startup on every platform, not only where the toggle is
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
-        device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
-        use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
+        device_spk = read_bool_flag(
+            extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+        )
+        # An explicit stage key wins over its legacy MINICPMO_TOKEN2WAV_TRT* env
+        # var (#6232). Keys are validated on every platform; the env vars are
+        # read (and warn) only where they take effect.
+        trt_config = resolve_token2wav_trt_config(extra, cuda=current_omni_platform.is_cuda())
+        use_trt = trt_config.enabled
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
         # when it cannot apply, including explicit overrides that predate it:
@@ -1866,10 +1906,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
-            dtype_name = str(
-                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
-            ).lower()
-            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            dtype_name = trt_config.dtype
+            trt_dtype = torch.float32 if dtype_name == "fp32" else torch.float16
             max_batch = int(extra.get("token2wav_trt_max_batch", 16))
             device = next(token2wav.flow.parameters()).device
             trt_stepper = build_dit_trt_stepper(
@@ -1877,6 +1915,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 device=device,
                 dtype=trt_dtype,
                 max_batch=max_batch,
+                cache_dir=trt_config.cache_dir,
             )
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()
@@ -1893,23 +1932,32 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             token2wav.enable_trt_spk_embedding(cpu_reference=True)
             logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
-        elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
+        elif device_spk:
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
             # "token2wav_device_spk": false in the stage extra config falls
             # back to the CPU onnxruntime path (accuracy triage).
-            if device_spk:
+            flow_parameter = next(token2wav.flow.parameters(), None)
+            if flow_parameter is not None and flow_parameter.device.type != "cpu":
                 token2wav.enable_device_spk_embedding(use_trt=False)
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
             else:
-                logger.info(
-                    "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
-                    "(token2wav_device_spk=false)"
+                logger.warning(
+                    "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime",
+                    "flow has no parameters" if flow_parameter is None else "flow is on CPU",
                 )
+        else:
+            logger.info(
+                "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
+                "(token2wav_device_spk=false)"
+            )
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
-            token2wav.enable_speaker_cuda_graph(self.vllm_config)
-            logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
+            if token2wav.enable_speaker_cuda_graph(self.vllm_config):
+                logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
+        if read_bool_flag(extra, "token2wav_s3_cuda_graph", False):
+            if token2wav.enable_s3_cuda_graph(self.vllm_config):
+                logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1944,12 +1992,9 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         ``OmniGPUWorkerBase.compile_or_warm_up_model`` calls this right after the
         runner's own init work, i.e. weights loaded, profiling done, nothing
-        served yet. Runners that capture their own graphs (CUDA V1) already run a
-        dummy forward at that point, which fires the deferred sweep first and
-        leaves this a no-op; runners that do not (MRv2, NPU) would otherwise
-        defer the sweep to the first real request, where a C8 duplex replay
-        stalls every in-flight stream for ~1-2 s per graph while its first-wave
-        sessions time out.
+        served yet. If a dummy forward already fired the deferred sweep, this
+        is a no-op. Otherwise, warmup avoids deferring the sweep to the first
+        real request, which would stall every in-flight stream during capture.
 
         Capturing here rather than in ``load_weights`` also keeps the allocator
         layout the runner already uses: a sweep at weight-load time raises the
@@ -1957,11 +2002,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         at concurrency 8.
 
         ``cfm_graph_precapture_at_init`` can turn it off. It stays on by default
-        because this is where CUDA V1 already swept: the runner's own warmup has
-        run by now, so the capture reuses the allocator it warmed instead of
+        because the runner's own warmup has run by now, so capture reuses the
+        allocator it warmed instead of
         raising the reserved footprint the way a weight-load-time sweep does.
         """
-        if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
+        if stage_connector_extra(self.vllm_config).get("cfm_graph_precapture_after_load") is not None:
             logger.warning_once(
                 "MiniCPM-o Code2Wav: cfm_graph_precapture_after_load is ignored; "
                 "the startup sweep is controlled by cfm_graph_precapture_at_init"
@@ -1977,7 +2022,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runners without a warmup forward (Model Runner V2, Ascend) paid for the
         capture on their first real request. Only an explicit ``false`` opts out.
         """
-        return read_bool_flag(self._extra_config(), "cfm_graph_precapture_at_init", True)
+        return read_bool_flag(stage_connector_extra(self.vllm_config), "cfm_graph_precapture_at_init", True)
 
     def _precapture_before_serve(self) -> None:
         """Run the precapture sweep once, under the context ``forward`` uses.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MiniMax Music 3 batched payload partitioning.
 
 The stage-0 payload is split per request by indexing list values: a list is
@@ -15,9 +15,14 @@ and no engine are needed.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minimax_music3.frame_state import RequestARState
+from vllm_omni.model_executor.models.minimax_music3.prompt import SPECIAL_TOKEN_IDS
 from vllm_omni.model_executor.models.minimax_music3.talker import (
     MiniMaxMusic3TalkerForConditionalGeneration as Talker,
 )
@@ -130,3 +135,90 @@ class TestPartialBatches:
         talker.make_omni_output(torch.zeros(1, _WIDTH), model_intermediate_buffer=infos)
         assert "latent" not in infos[0]
         assert "meta" not in infos[0]
+
+
+class TestWholeSongWithoutAsyncChunk:
+    """With ``async_chunk: false`` the engine collects stage 0's outputs and
+    ``ar2acoustic`` hands stage 1 the whole song, so the talker must publish it
+    once, from frame 0."""
+
+    @staticmethod
+    def _talker(total_frames: int) -> tuple[Talker, RequestARState]:
+        talker = Talker.__new__(Talker)
+        talker.publishes_windows = False
+        state = RequestARState(seed=5, max_frames=total_frames)
+        talker._states = {"song": state}
+        return talker, state
+
+    def test_the_song_is_published_once_when_it_ends(self) -> None:
+        talker, state = self._talker(450)
+        for index in range(450):
+            state.frames.append(torch.full((1, _WIDTH), float(index)))
+            state.codes.append(torch.full((1, 8), index))
+            state.generated_frames += 1
+            # Past several window boundaries, and nothing is published.
+            assert talker.postprocess(None, None, global_request_id="song") == {}
+
+        state.finished = True
+        span = talker.postprocess(None, None, global_request_id="song")
+        assert span["latent"][:, 0].tolist() == [float(index) for index in range(450)]
+        assert span["codes"]["audio"].shape == (450, 8)
+        assert span["meta"]["num_processed_tokens"] == 0
+        assert span["meta"]["last_chunk"] is True
+        assert span["meta"]["audio_seed"] == 5
+        assert talker.postprocess(None, None, global_request_id="song") == {}
+
+    def test_idle_rows_get_placeholders_of_the_published_dtypes(self) -> None:
+        """The engine joins each request's outputs, so a float32 placeholder
+        would turn the bf16 song it is later joined with into float32."""
+        talker = Talker.__new__(Talker)
+        infos = [{}, _info(seed=777, start=0, frames=2, last=True)]
+        output = talker.make_omni_output(torch.zeros(2, _WIDTH, dtype=torch.bfloat16), model_intermediate_buffer=infos)
+
+        idle = _payload_for(output, 0)
+        assert idle["latent"].numel() == 0
+        assert idle["latent"].dtype == torch.bfloat16
+        assert idle["codes.audio"].dtype == torch.long
+
+
+@pytest.mark.parametrize(("prompt_tokens", "frame_limit", "expected_frames"), [(7, 9, 2), (5, 2, 2), (8, 9, 1)])
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_final_audio_fits_in_context(prompt_tokens, frame_limit, expected_frames, async_chunk, monkeypatch):
+    # Force a non-EOS draw on every step so only the length limits can end the song.
+    max_model_len = 10
+    talker = Talker.__new__(Talker)
+    talker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=max_model_len))
+    talker.publishes_windows = async_chunk
+    talker._states = {}
+    talker._row_seeds = [5, 5]
+    talker._row_pair_ids = ["song", "song"]
+    talker._row_roles = ["cond", "uncond"]
+    talker._row_sample_eligible = [True, True]
+    talker._row_prompt_tokens = [prompt_tokens, prompt_tokens]
+    talker._row_max_frames = [frame_limit, frame_limit]
+    talker.c0_logit_ids = torch.tensor([0, 1])
+    logits = torch.tensor([[0.0, 1000.0], [0.0, 1000.0]])
+    hidden = torch.ones(2, _WIDTH)
+
+    # Use CPU indices and fixed depth outputs in place of GPU staging and model weights.
+    def cpu_vectors(cond, uncond, seeds, positions, device):
+        return torch.tensor([cond, uncond, seeds, positions], device=device)
+
+    monkeypatch.setattr(talker, "_stage_step_vectors", cpu_vectors)
+    monkeypatch.setattr(talker, "_depth_decode", Mock(return_value=(torch.zeros(1, 8, dtype=torch.long), hidden[:1])))
+
+    for step in range(1, max_model_len - prompt_tokens + 1):
+        info = talker.postprocess(None, global_request_id="song")
+        output = talker.make_omni_output(hidden, model_intermediate_buffer=[info, {}])
+        talker._last_logits_hidden = hidden
+        tokens = talker.sample(logits, None).sampled_token_ids[:, 0].tolist()
+        if tokens == [SPECIAL_TOKEN_IDS["<|audio_end|>"]] * 2:
+            assert step == expected_frames + 1
+            payload = _payload_for(output, 0)
+            assert payload["meta.last_chunk"] is True
+            assert payload["meta.num_processed_tokens"] == 0
+            assert payload["latent"].shape[0] == payload["meta.codec_chunk_frames"] == expected_frames
+            assert payload["codes.audio"].shape == (expected_frames, 8)
+            return
+        assert output.multimodal_outputs is None
+    pytest.fail("Engine reached max_model_len before the talker delivered the final audio")

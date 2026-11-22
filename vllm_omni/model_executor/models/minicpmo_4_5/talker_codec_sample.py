@@ -16,23 +16,28 @@ different codec distribution than a single-frame deployment would.
 
 Order and defaults follow the engine's single-frame path so that enabling the
 multi-frame (K-step) decode does not change the sampling semantics:
-``vllm/v1/sample/sampler.py`` for the temperature/min-p/top-k/top-p order,
-``logits_processor/builtin.py`` for the censoring, bias and min-p processors and
-``model_executor/layers/utils.py`` for the penalties. Every added knob is a
+``vllm/v1/worker/gpu/sample/sampler.py`` for the logit pipeline and
+``vllm/v1/worker/gpu/sample/logits_processor.py`` for its processors. Every added knob is a
 no-op at its default value.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = init_logger(__name__)
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
+# Temperature cutoff for treating a row as greedy.
+_SAMPLING_EPS = 1e-5
 
 # Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
 # 200-case bit-exact verification). Two independent controls:
@@ -44,6 +49,19 @@ HISTORY_WINDOW = 16
 _FUSED_PRELUDE_OK = True
 _FUSED_PRELUDE_WARMED = False
 _PRELUDE_BLOCK = 1024
+
+# Engine step 7d (top-k + top-p) runs as one Triton kernel on NPU when both
+# filters are active -- the stochastic tail right after the fused prelude.
+# Same two controls as the prelude: ``talker_codec_fused_tail: false`` in the
+# stage connector's ``extra`` block forces the eager chain (accuracy triage),
+# and ``_TAIL_FUSION_OK`` is a process-wide permanent latch fed by the first
+# failed compile/launch. The eager pair is launch-overhead-bound at this
+# vocab (per-op fixed cost dominates: 6562-wide and 25-wide eager ops time
+# the same), so the fusion removes launches, not arithmetic.
+_TAIL_FUSION_OK = True
+_TAIL_FUSION_WARMED = False
+# The pairwise pass is single-block; wide candidate sets stay eager.
+_TAIL_MAX_CANDIDATES = 64
 
 try:  # Triton is NPU-only; other backends keep the eager prologue.
     import triton
@@ -117,9 +135,158 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         scores = scores / tl.where(temperature == 0, 1.0, temperature)
         tl.store(out_ptr + row * vocab + offsets, scores, valid)
 
+    @triton.jit
+    def _topk_topp_mask_kernel(
+        vals_ptr,
+        idx_ptr,
+        out_ptr,
+        top_p,
+        K: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+        KP: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+        CAND: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+    ):
+        """Single-block fused top-k + top-p mask over one B=1 logits row.
+
+        Semantics equal the eager chain it replaces (top-k ``masked_fill_``
+        then the ascending-cumsum top-p): candidate ``i`` is removed iff the
+        prob mass of strictly-smaller candidates plus its own prob stays
+        ``<= 1 - top_p`` -- the ascending ``cumsum <= 1 - top_p`` predicate
+        evaluated on the top-k-filtered distribution. The largest candidate
+        is never removed (total mass 1 > 1 - top_p for top_p < 1), so the
+        eager guard ``remove[..., -1:] = False`` holds by construction.
+        Ties are ordered by candidate index: inside a tie group the cumsum is
+        the strict prefix plus ``k`` copies of the (equal) ``q``, so a group
+        keeps the same number of members whatever order it is walked in.
+        Which members those are does depend on the order -- here the order
+        ``torch.topk`` returns, in the eager path the order of ``torch.sort``
+        with its default ``stable=False`` -- and neither order is specified,
+        so only the kept count and the kept values are guaranteed to match
+        the eager path, not the identity of the kept members. ``-inf`` top-k
+        padding candidates carry zero prob and sort before every finite value,
+        so both paths always remove them.
+
+        The eager top-k drops only logits strictly below the kth value, so
+        the candidate row is wider than ``K``: the host loads ``CAND >= K``
+        candidates and the kernel keeps every one at or above ``vals[K - 1]``
+        -- ties included -- instead of truncating the tied tail. Reading the
+        boundary value needs no host round-trip (``K - 1 < CAND`` always, and
+        this kernel runs inside graph capture): a one-hot selection reduced
+        with ``tl.max`` extracts it.
+
+        ``out`` arrives pre-filled with ``-inf`` from the caller and the kernel
+        only scatters the kept candidates: filling and scattering from the same
+        program let two lanes order their writes to one address arbitrarily.
+        """
+        offs = tl.arange(0, KP)
+        cand = offs < CAND
+        v = tl.load(vals_ptr + offs, mask=cand, other=float("-inf"))
+        # Tie-inclusive kth threshold, matching the eager ``masked_fill_``.
+        kth = tl.max(tl.where(offs == K - 1, v, float("-inf")), axis=0)
+        cand = cand & (v >= kth)
+        mx = tl.max(v, axis=0)
+        e = tl.where(cand, tl.exp(v - mx), 0.0)
+        q = e / tl.sum(e, axis=0)
+        # The ascending order must be decided on the raw logits, not on q:
+        # softmax is monotonic so v_j < v_i iff q_j < q_i, but tl.exp and the
+        # eager softmax exp can differ by ~1e-7 relative -- enough to flip the
+        # order of near-equal neighbours on near-flat rows, which shifts the
+        # ascending prefix by one candidate. The raw logits carry no
+        # computation and therefore no implementation drift.
+        vi = tl.reshape(v, (KP, 1))
+        vj = tl.reshape(v, (1, KP))
+        qj = tl.reshape(q, (1, KP))
+        # Equal candidates accumulate too, in index order. A strictly-less
+        # prefix leaves a tie group at ``smaller == 0``, and 25 equal candidates
+        # with ``top_p=0.85`` would then lose every member and return an all
+        # ``-inf`` row, while the eager cumsum keeps a prefix of the group.
+        ii = tl.reshape(offs, (KP, 1))
+        jj = tl.reshape(offs, (1, KP))
+        before = (vj < vi) | ((vj == vi) & (jj < ii))
+        smaller = tl.sum(tl.where(before, qj, 0.0), axis=1)
+        keep = cand & ((smaller + q) > (1.0 - top_p))
+        gids = tl.load(idx_ptr + offs, mask=cand, other=0)
+        tl.store(out_ptr + gids, v, mask=keep)
+
+    @triton.jit
+    def _validate_argmax(probabilities, ratios, output, valid, n: tl.constexpr, block: tl.constexpr):
+        offsets = tl.arange(0, block)
+        p = tl.load(probabilities + offsets, offsets < n, other=0.0)
+        r = tl.load(ratios + offsets, offsets < n, other=-float("inf"))
+        finite_nonnegative = (p >= 0.0) & (p < float("inf"))
+        legal = (tl.sum(finite_nonnegative.to(tl.int32), 0) == block) & (tl.sum(p, 0) > 0.0)
+        token = tl.argmax(r, 0, tie_break_left=True)
+        tl.store(output, token.to(tl.int64))
+        tl.store(valid, legal)
+
     _HAS_TRITON = True
 except Exception:  # pragma: no cover - triton missing/CPU
     _HAS_TRITON = False
+
+
+def _sample_cuda(probabilities: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+    if (
+        _HAS_TRITON
+        and probabilities.is_cuda
+        and probabilities.dtype == torch.float32
+        and probabilities.ndim == 2
+        and probabilities.shape[0] == 1
+        and probabilities.is_contiguous()
+        and 0 < probabilities.shape[1] <= 8192
+    ):
+        noise = torch.empty_like(probabilities).exponential_(1, generator=generator)
+        ratios = probabilities / noise
+        output = torch.empty(1, dtype=torch.long, device=probabilities.device)
+        valid = torch.empty(1, dtype=torch.bool, device=probabilities.device)
+        width = probabilities.shape[1]
+        _validate_argmax[(1,)](probabilities, ratios, output, valid, width, triton.next_power_of_2(width))
+        torch._assert_async(valid, "probability tensor contains inf, nan or a negative value, or has zero mass")
+        return output
+    return torch.multinomial(probabilities, 1, generator=generator).reshape(1)
+
+
+def draw_seeded_codec_ids(
+    processed_logits: torch.Tensor,
+    *,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    temperature: torch.Tensor,
+    host_temperature: np.ndarray,
+    generators: dict[int, torch.Generator],
+    has_topp_only_rows: bool = True,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    """Return one codec id per row using per-request seeded exponential draws.
+
+    MRv2 normally uses a different Triton Gumbel stream. Keep the model
+    exponential stream so a seed produces the same codec sequence.
+
+    ``temperature`` is one value per row, on the same device as
+    ``processed_logits``; ``host_temperature`` holds the same values on the
+    host, so branch decisions never read the device. An all-greedy batch
+    returns the argmax and does not touch ``generators``. A mixed batch draws
+    every row, then restores the argmax on greedy rows.
+    """
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+    from vllm_omni.utils.seeded_exponential import categorical_sample as random_sample
+
+    if processed_logits.ndim != 2:
+        raise ValueError(f"codec logits must be 2D, got {tuple(processed_logits.shape)}")
+    num_rows = processed_logits.shape[0]
+    if temperature.shape[0] != num_rows or host_temperature.shape[0] != num_rows:
+        raise ValueError(
+            f"temperature rows {temperature.shape[0]}/{host_temperature.shape[0]} != logit rows {num_rows}"
+        )
+    host_greedy = host_temperature < _SAMPLING_EPS
+    # All-greedy steps must not advance the request generators.
+    if host_greedy.all():
+        return processed_logits.argmax(dim=-1)
+    filtered = apply_top_k_top_p(processed_logits.clone(), top_k, top_p, has_topp_only_rows=has_topp_only_rows)
+    sampled = random_sample(filtered.softmax(dim=-1, dtype=torch.float32), generators, use_fp64_gumbel)
+    if host_greedy.any():
+        greedy = temperature.reshape(-1) < _SAMPLING_EPS
+        sampled = torch.where(greedy, processed_logits.argmax(dim=-1), sampled)
+    return sampled
 
 
 @dataclass(frozen=True)
@@ -202,6 +369,8 @@ class TalkerCudaKStepState:
             # Deterministic buffer: snapshot/restore compares it bit-for-bit.
             prelude_scores=torch.zeros((rows, VOCAB_SIZE), dtype=torch.float32, device=device),
         )
+
+    exponential_noise: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         # EOS id the native prelude was compiled/lauched for; None means eager.
@@ -300,6 +469,8 @@ class TalkerCudaKStepState:
         eos_token_id: int,
         sampling: tuple,
         generators: tuple,
+        *,
+        batched_noise: bool = False,
     ) -> torch.Tensor:
         fused_scores = None
         if (
@@ -365,15 +536,20 @@ class TalkerCudaKStepState:
             for local_row, row in enumerate(rows):
                 filtered[row] = scores[local_row : local_row + 1]
 
+        if batched_noise:
+            assert self.exponential_noise is not None
+            scores = scores if len(groups) == 1 else torch.cat(filtered)
+            sampled_ids = (scores.softmax(dim=-1) / self.exponential_noise[frame]).argmax(dim=-1)
+            return self.advance(sampled_ids, frame, eos_token_id)
+
         sampled = []
         for row, (config, generator) in enumerate(zip(sampling, generators)):
             temperature = config[0]
             scores = filtered[row]
-            token = (
-                torch.multinomial(scores.softmax(-1), 1, generator=generator).reshape(1)
-                if temperature
-                else scores.argmax(dim=-1)
-            )
+            if temperature:
+                token = _sample_cuda(scores.softmax(-1), generator)
+            else:
+                token = scores.argmax(dim=-1)
             sampled.append(token)
         return self.advance(torch.cat(sampled), frame, eos_token_id)
 
@@ -520,7 +696,7 @@ def _repetition_penalty_scaling(
     """Repetition penalty over the codec history window (engine step 6a).
 
     ``alpha = penalty ** frequency`` with the sign-dependent branch, matching the
-    model's single-frame ``_apply_batched_repetition_penalty``.
+    model's single-frame codec-window penalty.
     """
     positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=logits.device).reshape(1, -1)
     valid = positions < state.history_len.reshape(-1, 1)
@@ -635,6 +811,90 @@ def warmup_fused_prelude(device: torch.device, enabled: bool = True) -> None:
     )
 
 
+def _topk_topp_fused(
+    logits: torch.Tensor,
+    top_k: int,
+    top_p: float,
+) -> torch.Tensor | None:
+    """Fused top-k + top-p mask on NPU; ``None`` falls back to the eager chain.
+
+    One ``torch.topk`` for the candidate set, one Triton kernel for both
+    masks. The returned row matches the eager top-k/top-p pair on the kept
+    count, the kept logits and the ``-inf`` elsewhere; with tied finite
+    logits the kept *members* may differ, since neither this kernel's tie
+    order (``torch.topk``'s) nor the eager one (``torch.sort``'s) is
+    specified. The caller's softmax + ``torch.multinomial`` input is
+    therefore unchanged in shape, dtype and RNG stream.
+
+    The eager top-k keeps every logit at or above the kth value -- ties
+    included -- so the candidate set is wider than ``keep``: up to
+    ``_TAIL_MAX_CANDIDATES`` candidates are loaded and the kernel re-derives
+    the kth value in-register (it runs inside graph capture, so no host-side
+    data-dependent branch is possible) and keeps the whole tie group. A tie
+    group larger than ``_TAIL_MAX_CANDIDATES`` cannot widen further on the
+    host; the kernel then keeps the candidates that fit the capacity. The
+    dropped members are indistinguishable from the kept ones in logit value,
+    and a >64-wide group of *identical finite* logits does not occur in
+    practice, while a tied ``-inf`` tail carries zero probability mass and
+    does not change the normalized distribution the sampler sees.
+    """
+    global _TAIL_FUSION_OK
+    if not _TAIL_FUSION_OK or logits.device.type != "npu":
+        return None
+    # The kernel's grid is (1,): it scatters into exactly one row of the host
+    # pre-filled ``out``. Batched logits go to the eager chain instead.
+    if logits.dim() != 2 or int(logits.shape[0]) != 1:
+        return None
+    keep = min(int(logits.shape[-1]), int(top_k))
+    if keep > _TAIL_MAX_CANDIDATES:
+        return None
+    # One candidate means the kernel is instantiated at KP == 1, and the Ascend
+    # Triton compiler aborts (ttir_to_linalg) on those degenerate reduction
+    # shapes. An abort cannot be caught below, so defer that case to eager.
+    if keep < 2:
+        return None
+    vocab = int(logits.shape[-1])
+    # cand_n >= keep always here, so the kernel's kth read (position K - 1)
+    # stays inside the loaded set.
+    cand_n = min(vocab, _TAIL_MAX_CANDIDATES)
+    vals, idx = torch.topk(logits, cand_n, dim=-1)
+    out = torch.full_like(logits, float("-inf"))
+    kp = 1 << (cand_n - 1).bit_length()
+    try:
+        _topk_topp_mask_kernel[(1,)](
+            vals,
+            idx,
+            out,
+            float(top_p),
+            K=keep,
+            KP=kp,
+            CAND=cand_n,
+            num_warps=8,
+        )
+    except Exception as exc:
+        # Same latch contract as the prelude: process-wide, permanent, and a
+        # failure inside an already captured graph replay never lands here.
+        _TAIL_FUSION_OK = False
+        logger.warning("fused talker codec tail disabled after a kernel failure: %s", exc)
+        return None
+    return out
+
+
+def warmup_fused_tail(device: torch.device, enabled: bool = True) -> None:
+    """Compile the fused tail kernel once, before any graph capture.
+
+    Same contract as :func:`warmup_fused_prelude`: running it here settles
+    ``_TAIL_FUSION_OK`` outside capture, so a compile failure downgrades the
+    process instead of poisoning a capture that just saw a failed launch.
+    Idempotent, and a no-op off NPU, without Triton, or when disabled.
+    """
+    global _TAIL_FUSION_WARMED
+    if not enabled or _TAIL_FUSION_WARMED or not _HAS_TRITON or device.type != "npu":
+        return
+    _TAIL_FUSION_WARMED = True
+    _topk_topp_fused(torch.zeros(1, VOCAB_SIZE, device=device), 25, 0.85)
+
+
 def prepare_codec_logits(
     raw_logits: torch.Tensor,
     state: TalkerCodecDeviceState,
@@ -651,6 +911,7 @@ def prepare_codec_logits(
     presence_penalty: float = 0.0,
     eos_window_masked: bool = False,
     fused_prelude: bool = True,
+    fused_tail: bool = True,
 ) -> torch.Tensor:
     """Prepare and filter logits without changing native NPU RNG semantics.
 
@@ -659,7 +920,9 @@ def prepare_codec_logits(
     ``min_tokens_stop_ids`` widens the censored stop set beyond the codec EOS;
     ``frequency_penalty``/``presence_penalty`` subtract the whole-stream counts.
     ``fused_prelude=False`` (stage connector ``extra`` key
-    ``talker_codec_fused_prelude``) forces the eager chain for accuracy triage.
+    ``talker_codec_fused_prelude``) forces the eager chain for accuracy triage;
+    ``fused_tail=False`` (``talker_codec_fused_tail``) does the same for the
+    top-k/top-p pair.
     Every one of them is a no-op at its default value.
     """
     stop_ids = _stop_id_tuple(eos_token_id, min_tokens_stop_ids)
@@ -698,10 +961,18 @@ def prepare_codec_logits(
         probabilities = torch.softmax(logits, dim=-1)
         min_p_threshold = probabilities.amax(dim=-1, keepdim=True) * min_p
         logits.masked_fill_(probabilities < min_p_threshold, float("-inf"))
-    return _truncate_codec_logits(logits, top_k=top_k, top_p=top_p)
+    return _truncate_codec_logits(logits, top_k=top_k, top_p=top_p, fused_tail=fused_tail)
 
 
-def _truncate_codec_logits(logits: torch.Tensor, *, top_k: int, top_p: float) -> torch.Tensor:
+def _truncate_codec_logits(logits: torch.Tensor, *, top_k: int, top_p: float, fused_tail: bool = True) -> torch.Tensor:
+    # Engine step 7d: top-k then top-p over the filtered distribution. On NPU
+    # the pair runs as one Triton kernel when both filters are active (the
+    # deployment pins top_k=25/top_p=0.85) -- the eager pair is dominated by
+    # per-launch overhead at this vocab. Either path leaves the caller's
+    # softmax + multinomial input identical in shape, dtype and RNG stream.
+    tail = _topk_topp_fused(logits, top_k, top_p) if (fused_tail and top_k > 0 and 0.0 < float(top_p) < 1.0) else None
+    if tail is not None:
+        return tail
     # Engine step 7d: top-k first (topk_topp_sampler.py:392).
     if top_k > 0:
         keep = min(VOCAB_SIZE, int(top_k))
@@ -866,7 +1137,7 @@ def greedy_codec_sample(
 
     The engine's greedy branch returns the argmax after the censoring masks, the
     logit bias and the penalties, and skips temperature, min-p, top-k and top-p
-    entirely (``vllm/v1/sample/sampler.py:30-60``), so no top-k mask belongs on
+    entirely, so no top-k mask belongs on
     this path -- masking candidates below the argmax cannot change the argmax
     itself. Every other filter is the same one the random path uses.
 
