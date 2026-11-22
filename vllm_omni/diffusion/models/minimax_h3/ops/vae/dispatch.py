@@ -12,6 +12,7 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.platforms import current_omni_platform
 
+from .causal_reflect_pad import try_causal_reflect_pad_exact
 from .qk_norm_rope import try_qk_norm_rope_exact
 from .scaled_residual import try_scaled_residual_exact
 
@@ -28,6 +29,7 @@ ScaledResidualOp = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor],
     torch.Tensor | None,
 ]
+CausalReflectPadOp = Callable[..., torch.Tensor | None]
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class H3VAEOperatorSet:
     supports: Callable[[torch.device], bool]
     qk_norm_rope: QKNormRopeOp
     scaled_residual: ScaledResidualOp
+    causal_reflect_pad: CausalReflectPadOp | None = None
 
 
 def _supports_cuda_capability(device: torch.device, expected: int) -> bool:
@@ -81,6 +84,7 @@ H3_VAE_OPERATOR_TABLE: tuple[H3VAEOperatorSet, ...] = (
         supports=_supports_cuda_sm90,
         qk_norm_rope=try_qk_norm_rope_exact,
         scaled_residual=try_scaled_residual_exact,
+        causal_reflect_pad=try_causal_reflect_pad_exact,
     ),
     H3VAEOperatorSet(
         supports=_supports_cuda_sm100,

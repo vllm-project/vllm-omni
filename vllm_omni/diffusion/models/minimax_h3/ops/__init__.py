@@ -2,6 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 model-specific optimized operators."""
 
-from .vae import install_h3_vae_optimizations
+from .vae import install_h3_vae_encoder_fusion, install_h3_vae_optimizations
 
-__all__ = ["install_h3_vae_optimizations"]
+__all__ = ["install_h3_vae_encoder_fusion", "install_h3_vae_optimizations"]
