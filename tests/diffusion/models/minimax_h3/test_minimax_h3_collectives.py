@@ -150,15 +150,19 @@ def test_two_rank_conditioning_and_errors_gloo(tmp_path):
 
 
 @pytest.mark.cpu
-def test_object_broadcasts_use_the_cpu_group(monkeypatch):
-    """Object broadcasts must not run on the device (HCCL) group.
+def test_object_collectives_use_the_cpu_group_and_tensor_collectives_keep_the_device_group(monkeypatch):
+    """Object collectives must not run on the device (HCCL) group.
 
-    ``broadcast_object_list`` serializes the payload and runs two
-    collectives. On a device group it allocates device buffers and drives the
-    device backend, which is what fails with ``EI0006
-    Communication_Error_Get_Socket`` on ``HcclBroadcast`` when the device
-    backend has to cross an interconnect domain (issue #10645). The payload
-    has to travel host-side over the gloo group instead.
+    ``broadcast_object_list`` and ``all_gather_object`` serialize the payload
+    and run collectives over Python objects. On a device group they allocate
+    device buffers and drive the device backend, which is what fails with
+    ``EI0006 Communication_Error_Get_Socket`` on ``HcclBroadcast`` when the
+    device backend has to cross an interconnect domain (issue #10645). The
+    payload has to travel host-side over the gloo group instead.
+
+    The tensor broadcasts are the opposite case: they move device tensors and
+    have to stay on the device group. Both directions are pinned here, so a
+    later change cannot swap them.
     """
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
 
@@ -167,20 +171,47 @@ def test_object_broadcasts_use_the_cpu_group(monkeypatch):
     world = SimpleNamespace(device_group=device_group, cpu_group=cpu_group)
     monkeypatch.setattr(module, "get_world_group", lambda: world)
 
-    seen: list[object] = []
+    object_groups: list[object] = []
+    tensor_groups: list[object] = []
 
     def fake_broadcast_object_list(obj_list, src=0, group=None, **kwargs):
-        seen.append(group)
+        object_groups.append(group)
+
+    def fake_all_gather_object(output_list, obj, group=None, **kwargs):
+        object_groups.append(group)
+
+    def fake_broadcast(tensor, src=0, group=None, **kwargs):
+        tensor_groups.append(group)
 
     monkeypatch.setattr(module.dist, "broadcast_object_list", fake_broadcast_object_list)
+    monkeypatch.setattr(module.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(module.dist, "broadcast", fake_broadcast)
     monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(module.dist, "get_rank", lambda group: 0)
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
 
     module._broadcast_rank0_exception(None)
+    assert object_groups == [cpu_group]
 
-    assert seen == [cpu_group]
-    assert device_group not in seen
+    # The local-media error-status gather moves Python objects too, so it has
+    # to take the same host-side route.
+    model = object.__new__(module.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(model)
+    model.device = torch.device("cpu")
+    model.video_vae = SimpleNamespace(is_distributed_enabled=lambda: False)
+    model.audio_vae = SimpleNamespace()
+    model._broadcast_media_conditioning = lambda conditioning: conditioning
+    monkeypatch.setattr(module, "encode_media", lambda media, **kwargs: SimpleNamespace())
+
+    model._encode_local_media(object())
+    assert object_groups == [cpu_group, cpu_group]
+
+    # The tensor broadcasts move device tensors and stay on the device group.
+    module._broadcast_tensor(torch.ones(2, 3), dtype=torch.float32, device=torch.device("cpu"))
+    assert tensor_groups == [device_group, device_group]
+
+    assert device_group not in object_groups
+    assert cpu_group not in tensor_groups
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=2)

@@ -3034,7 +3034,10 @@ class MiniMaxH3Pipeline(
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
     def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        # The error-status gather moves Python objects, so it has to travel
+        # host-side over the gloo group like every other object collective
+        # here (issue #10645). The tensor broadcasts keep the device group.
+        group, rank, world_size = _dit_cpu_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
         if distributed_video:
             media = self._distribute_media_inputs(media)
