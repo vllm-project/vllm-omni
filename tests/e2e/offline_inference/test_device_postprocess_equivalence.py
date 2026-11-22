@@ -4,8 +4,9 @@
 
 Runs the whole engine twice with the same seed, once per flag state, and compares
 the frames a client receives. WAN denormalizes historical bfloat16 output in the
-input dtype while device preparation computes in float32, so the paths may differ
-by one 255th.
+input dtype while device preparation computes in float32. Same-input reduction
+stays within one 255th; independent full-model ROCm runs can widen the extreme to
+two while remaining bounded by the aggregate differing-pixel guard.
 
 Run with a WAN2.2 checkpoint::
 
