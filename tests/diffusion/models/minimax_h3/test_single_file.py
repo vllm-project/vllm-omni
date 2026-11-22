@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import glob
 import json
 from fnmatch import fnmatch
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
+    _add_safetensors_source,
     build_checkpoint_binding_plan,
     build_checkpoint_mmap_plan,
 )
@@ -411,3 +413,36 @@ def test_single_file_base_download_excludes_dense_dits(monkeypatch, tmp_path, pa
 )
 def test_base_source_pins_only_the_default_repository(args, expected):
     assert resolve_minimax_h3_base_source(args) == expected
+
+
+@pytest.mark.parametrize(
+    ("folders", "name"),
+    [
+        (["H3[a][b][c]"], "x[1][2][3].safetensors"),
+        (["a[1]", "b[2]", "c[3]"], "m[4].safetensors"),
+        (["H3[[beta]]"], "m[[x]].safetensors"),
+        (["H3[beta", "x]y"], "m]x[.safetensors"),
+        (["H3[a-z]"], "m[0-9].safetensors"),
+        (["H3[!x]"], "m[!y].safetensors"),
+        (["H3*star?"], "m*?.safetensors"),
+        (["H3 [test]"], "model [b].safetensors"),
+    ],
+    ids=["repeated", "nested-dirs", "doubled", "unbalanced", "range", "negated", "star-question", "spaces"],
+)
+def test_special_characters_in_path(tmp_path, folders, name):
+    # Every file lives under pytest's per-test tmp_path, which pytest cleans up.
+    folder = tmp_path.joinpath(*folders)
+    folder.mkdir(parents=True)
+    target = str(folder / name)
+    save_file({"weight": torch.zeros(1)}, target)
+    save_file({"decoy": torch.zeros(1)}, folder / "decoy.safetensors")
+    patterns = [glob.escape(name)]
+
+    loader = object.__new__(DiffusersPipelineLoader)
+    loader.load_config = LoadConfig()
+    _, files, use_safetensors = loader._prepare_weights(str(folder), None, None, False, patterns)
+    assert files == [target] and use_safetensors
+
+    bindings: dict[str, tuple[str, str]] = {}
+    _add_safetensors_source(str(folder), "transformer.", None, bindings, allow_patterns=patterns)
+    assert bindings == {"transformer.weight": ("weight", target)}
