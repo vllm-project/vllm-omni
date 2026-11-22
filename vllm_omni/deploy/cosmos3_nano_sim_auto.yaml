@@ -11,7 +11,7 @@ max_pixels: 921600
 
 stages:
   - stage_id: 0
-    # Inherit CUDA_VISIBLE_DEVICES; the requested TP size determines the GPU count.
+    # Inherit CUDA_VISIBLE_DEVICES; TP x Ulysses determines the GPU count.
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: Cosmos3NanoSimAutoPipeline
