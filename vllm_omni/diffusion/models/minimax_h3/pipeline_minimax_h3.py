@@ -3159,9 +3159,25 @@ class MiniMaxH3Pipeline(
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
+        encode_error = None
         if rank < self.text_encoder_tp_size:
             ids = self._distribute_encode_inputs(ids, vision_kwargs)
-            hidden = self._encode_text_hidden(ids, vision_kwargs)
+            # The encoder forward is rank-local work that the other DiT ranks
+            # wait for through the broadcasts below. An operator failure here
+            # (an Ascend tiling error, an OOM, a shape mismatch) must reach
+            # every rank the same way a preparation failure does: otherwise
+            # this rank leaves the function while the peers block in
+            # ``_broadcast_tensor`` on a collective nobody will join, and the
+            # whole worker wedges until the collective times out.
+            try:
+                hidden = self._encode_text_hidden(ids, vision_kwargs)
+            except Exception as exc:
+                encode_error = exc
+        # Every rank calls this helper, including the ranks that did not run
+        # the encoder: it is a collective, and the ranks that skipped the
+        # encoder are exactly the ones that would otherwise wait in the
+        # broadcast below for a rank that failed.
+        _broadcast_rank0_exception(encode_error)
         return (
             _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
             _broadcast_tensor(tags, dtype=torch.long, device=self.device),
