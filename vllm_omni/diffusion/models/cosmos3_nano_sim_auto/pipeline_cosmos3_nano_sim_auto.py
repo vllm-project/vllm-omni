@@ -93,7 +93,11 @@ from .layout import (
     committed_metadata,
 )
 from .state_cosmos3_nano_sim_auto import Cosmos3NanoSimAutoSessionState, DenseReplayRing, ring_slot_for_step
-from .transformer_cosmos3_nano_sim_auto import CausalMasklessRuntime, Cosmos3NanoSimAutoTransformer
+from .transformer_cosmos3_nano_sim_auto import (
+    CausalMasklessRuntime,
+    Cosmos3NanoSimAutoTransformer,
+    item_token_ranges,
+)
 
 logger = init_logger(__name__)
 
@@ -182,6 +186,9 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 patch_size=self.manifest.lidar_latent_patch_size_hw,
             )
         self._maskless_kernel: str | None = None
+        # Later forwards of a chunk reuse the control K/V of its first forward
+        # (exact; ``model_config["reuse_control_kv"] = False`` recomputes it for A/B checks).
+        self._reuse_control_kv = bool((od_config.model_config or {}).get("reuse_control_kv", True))
         self._plan_cache: dict[tuple, CausalMasklessPlan] = {}
         self._states: OrderedDict[str, Cosmos3NanoSimAutoSessionState] = OrderedDict()
 
@@ -825,6 +832,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         metadata: TokenMetadata,
         pass_kind: str,
         bound: Any,
+        *,
+        reuse_control_kv: bool = False,
     ) -> CausalMasklessRuntime:
         history = state.history_slots(frame_unit=state.frame_unit)
         # Plans depend on the chunk shape, on which ring slots are populated and on
@@ -832,6 +841,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         # absolute time otherwise only shifts every stream together.
         key = (
             pass_kind,
+            reuse_control_kv,
             (len(chunk.rgb_frames), len(chunk.lidar_sweeps)),
             min(chunk.step, 2),
             tuple(
@@ -853,6 +863,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 captions=self._caption_metadata(state),
                 window_seconds=self.manifest.cross_view_past_window_seconds,
                 device=self.device,
+                reuse_control_kv=reuse_control_kv,
             )
             self._plan_cache[key] = plan
         if bound is not None and history:
@@ -910,6 +921,9 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         )
         und_kv = self._und_kv(state, bound)
         history_kv = self._history_kv(state, bound)
+        reuse = self._reuse_control_kv and any(item.is_control for item in items)
+        # Collected by the chunk's first forward, then read by every later one.
+        control_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         if noisy_rgb_frames or noisy_sweeps:
             latents = self._item_latents(state, items)
@@ -927,10 +941,14 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 local_sweeps = [lidar_target.frames.index(s) for s in noisy_sweeps]
             metadata, _ = chunk_token_metadata(items, step=chunk.step, pass_kind="noisy")
             runtime = self._runtime_plan(state, chunk, metadata, "noisy", bound)
+            reuse_runtime = (
+                self._runtime_plan(state, chunk, metadata, "noisy", bound, reuse_control_kv=True) if reuse else None
+            )
             # The reference seeds RGB rollouts by the chunk's first latent and joint rollouts by the step.
             sample_index = chunk.step if state.joint else chunk.rgb_frames[0]
 
             def velocity(x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+                nonlocal control_kv
                 current = list(latents)
                 if rgb_size:
                     noisy_rgb = rgb_base.clone()
@@ -953,9 +971,13 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                     text_extent=state.text_extent,
                     und_kv=und_kv,
                     history_kv=history_kv,
-                    runtime=runtime,
+                    runtime=runtime if control_kv is None else reuse_runtime,
                     rig_view_ids=state.rig_view_ids,
+                    control_kv=control_kv,
+                    collect_control_kv=reuse and control_kv is None,
                 )
+                if output.control_kv is not None:
+                    control_kv = output.control_kv
                 targets = [item for item in items if not item.is_control]
                 preds = []
                 if rgb_size:
@@ -1000,8 +1022,36 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 )
 
         if chunk.step != state.schedule[-1].step:
-            self._commit_chunk(state, chunk, items, und_kv, history_kv, bound)
+            self._commit_chunk(state, chunk, items, und_kv, history_kv, bound, control_kv=control_kv)
         state.next_chunk = chunk.step + 1
+
+    @staticmethod
+    def _token_rows(items: Sequence[StreamItem], *, controls: bool, device: torch.device | str) -> torch.Tensor:
+        """Packed chunk rows of the control (or non-control) items."""
+        rows = [torch.arange(start, start + length) for start, length in item_token_ranges(items, controls=controls)]
+        return torch.cat(rows).to(device)
+
+    @classmethod
+    def _chunk_kv(
+        cls,
+        items: Sequence[StreamItem],
+        control_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        computed_kv: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Interleave cached control K/V and a targets-only forward's ``[1, N, H_kv, D]`` K/V in packing order."""
+        device = computed_kv[0][0].device
+        control_rows = cls._token_rows(items, controls=True, device=device)
+        computed_rows = cls._token_rows(items, controls=False, device=device)
+        merged = []
+        for (control_k, control_v), (key, value) in zip(control_kv, computed_kv, strict=True):
+            layer = []
+            for cached, computed in ((control_k, key), (control_v, value)):
+                full = computed.new_empty(1, control_rows.numel() + computed_rows.numel(), *computed.shape[2:])
+                full[0].index_copy_(0, control_rows, cached.to(computed.dtype))
+                full[0].index_copy_(0, computed_rows, computed[0])
+                layer.append(full)
+            merged.append((layer[0], layer[1]))
+        return merged
 
     def _commit_chunk(
         self,
@@ -1011,10 +1061,17 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         und_kv: list[tuple[torch.Tensor, torch.Tensor]],
         history_kv: list[tuple[torch.Tensor, torch.Tensor]] | None,
         bound: Any,
+        *,
+        control_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
-        """Clean refresh forward that publishes the chunk's K/V into its ring slot."""
+        """Clean refresh forward that publishes the chunk's K/V into its ring slot.
+
+        With ``control_kv`` (cached by the chunk's denoising forwards) only the
+        non-control items are recomputed; the cached control K/V is published
+        alongside them.
+        """
         metadata, _ = chunk_token_metadata(items, step=chunk.step, pass_kind="clean")
-        runtime = self._runtime_plan(state, chunk, metadata, "clean", bound)
+        runtime = self._runtime_plan(state, chunk, metadata, "clean", bound, reuse_control_kv=control_kv is not None)
         latents = self._item_latents(state, items)
         num_real = metadata.num_tokens
         slot = ring_slot_for_step(
@@ -1035,6 +1092,12 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                     key_pool.index_fill_(0, padding, 0)
                     value_pool.index_fill_(0, padding, 0)
             write_slots = slots[:num_real]
+            if control_kv is not None:
+                control_slots = write_slots[self._token_rows(items, controls=True, device=write_slots.device)]
+                for (key_pool, value_pool), (key, value) in zip(pools, control_kv, strict=True):
+                    key_pool.index_copy_(0, control_slots, key.to(key_pool.dtype))
+                    value_pool.index_copy_(0, control_slots, value.to(value_pool.dtype))
+                write_slots = write_slots[self._token_rows(items, controls=False, device=write_slots.device)]
         else:
             assert state.dense_ring is not None
             # History still aliases the slot being replaced. Collect fresh K/V without
@@ -1053,12 +1116,16 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             kv_pools=pools,
             collect_kv=bound is None,
             rig_view_ids=state.rig_view_ids,
+            control_kv=control_kv,
         )
         if bound is not None:
             bound.kv_cache.commit_chunk(adapter)
         else:
             assert state.dense_ring is not None
-            state.dense_ring.publish(slot, refreshed.current_kv, num_real)
+            current_kv = refreshed.current_kv
+            if control_kv is not None:
+                current_kv = self._chunk_kv(items, control_kv, current_kv)
+            state.dense_ring.publish(slot, current_kv, num_real)
         state.record_commit(slot=slot, step=chunk.step, metadata=committed_metadata(metadata))
 
     # -- outputs ------------------------------------------------------------------

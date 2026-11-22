@@ -1,15 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Token embedding of the Sim-Auto transformer: physical rig identity and timestep gating."""
+"""Sim-Auto transformer: token embedding (rig identity, timestep gating) and control K/V reuse."""
+
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.causal_plan import build_causal_maskless_plan
 from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.geometry import Chunk, SensorGrid
-from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.layout import build_chunk_items
+from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.layout import (
+    ITEM_ORDER,
+    CaptionDocument,
+    RingSlot,
+    build_chunk_items,
+    caption_metadata,
+    chunk_token_metadata,
+    committed_metadata,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.transformer_cosmos3_nano_sim_auto import (
+    CausalMasklessRuntime,
+    Cosmos3NanoSimAutoGenDecoderLayer,
+    Cosmos3NanoSimAutoJointAttention,
     Cosmos3NanoSimAutoTransformer,
+    item_token_ranges,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -36,9 +52,8 @@ class _Host(nn.Module):
         return self.time.to(dtype).view(1, -1)
 
 
-def _joint_items():
-    chunk = Chunk(step=1, rgb_frames=(1, 2), lidar_sweeps=(1,), rgb_prefix_end=3, lidar_prefix_end=2)
-    items = build_chunk_items(
+def _chunk_items(chunk: Chunk):
+    return build_chunk_items(
         chunk,
         num_views=2,
         rgb_grid=SensorGrid(2, 2, 1, 1),
@@ -47,6 +62,10 @@ def _joint_items():
         lidar_seconds_per_frame=0.1,
         rgb_condition_frames={1},
     )
+
+
+def _joint_items():
+    items = _chunk_items(Chunk(step=1, rgb_frames=(1, 2), lidar_sweeps=(1,), rgb_prefix_end=3, lidar_prefix_end=2))
     generator = torch.Generator().manual_seed(1)
     latents = []
     for item in items:
@@ -113,4 +132,217 @@ def test_rig_weights_must_match_the_declared_table() -> None:
     with pytest.raises(ValueError, match="declares no rig_view_embedding"):
         Cosmos3NanoSimAutoTransformer.validate_loaded_weights(
             without_rig, names | {"transformer.rig_view_embed.weight"}
+        )
+
+
+# -- Control K/V reuse ------------------------------------------------------------
+
+HEADS, KV_HEADS, HEAD_DIM, LAYERS = 2, 1, 4, 2
+
+
+def _module(cls, **attributes):
+    """An instance of ``cls`` holding only ``attributes`` (skips the vLLM-parallel constructor)."""
+    module = cls.__new__(cls)
+    nn.Module.__init__(module)
+    for name, value in attributes.items():
+        setattr(module, name, value)
+    return module
+
+
+class _ForwardHost(_Host):
+    """Real forward, GEN layers and joint attention over plain linears; item-local fake RoPE."""
+
+    forward = Cosmos3NanoSimAutoTransformer.forward
+    embed_items = Cosmos3NanoSimAutoTransformer.embed_items
+    _inductor_cudagraphs = False
+    num_hidden_layers = LAYERS
+    num_kv_heads_local = KV_HEADS
+    head_dim = HEAD_DIM
+
+    def __init__(self) -> None:
+        super().__init__(rig=False)
+
+        def qk_norm():
+            return SimpleNamespace(weight=torch.rand(HEAD_DIM, dtype=torch.float64) + 0.5, variance_epsilon=1e-6)
+
+        def attention():
+            return _module(
+                Cosmos3NanoSimAutoJointAttention,
+                to_q=nn.Linear(HIDDEN, HEADS * HEAD_DIM),
+                to_k=nn.Linear(HIDDEN, KV_HEADS * HEAD_DIM),
+                to_v=nn.Linear(HIDDEN, KV_HEADS * HEAD_DIM),
+                to_out=nn.Linear(HEADS * HEAD_DIM, HIDDEN),
+                num_heads_local=HEADS,
+                num_kv_heads_local=KV_HEADS,
+                head_dim=HEAD_DIM,
+                qk_norm=True,
+                norm_q=qk_norm(),
+                norm_k=qk_norm(),
+            )
+
+        self.gen_layers = nn.ModuleList(
+            _module(
+                Cosmos3NanoSimAutoGenDecoderLayer,
+                input_layernorm=nn.LayerNorm(HIDDEN),
+                cross_attention=attention(),
+                post_attention_layernorm=nn.LayerNorm(HIDDEN),
+                mlp=nn.Sequential(nn.Linear(HIDDEN, 2 * HIDDEN), nn.SiLU(), nn.Linear(2 * HIDDEN, HIDDEN)),
+            )
+            for _ in range(LAYERS)
+        )
+        self.norm_moe_gen = nn.LayerNorm(HIDDEN)
+        self.proj_out = nn.Linear(HIDDEN, CHANNELS)
+        self.lidar_proj_out = nn.Linear(HIDDEN, CHANNELS)
+
+    def _offload_context(self, name: str):
+        return nullcontext()
+
+    def chunk_rope(self, items, *, text_extent: int, device: torch.device, dtype: torch.dtype):
+        # Like the real mRoPE ids, every item's angles depend on that item alone.
+        positions = torch.cat(
+            [
+                torch.arange(item.num_tokens) + 7.0 * item.frames[0] + 31.0 * ITEM_ORDER.index(item.kind)
+                for item in items
+            ]
+        )
+        angles = positions[:, None] * torch.linspace(0.1, 1.0, HEAD_DIM // 2)[None, :]
+        angles = torch.cat([angles, angles], dim=-1).to(device=device, dtype=dtype)
+        return angles.cos()[None, :, None], angles.sin()[None, :, None]
+
+
+def _context(items, pass_kind: str, generator: torch.Generator):
+    """Plans (full and targets-only) plus the ring and caption K/V of chunk 1."""
+    chunk0 = _chunk_items(Chunk(step=0, rgb_frames=(0,), lidar_sweeps=(0,), rgb_prefix_end=1, lidar_prefix_end=1))
+    ring = RingSlot(0, 0, committed_metadata(chunk_token_metadata(chunk0, step=0, pass_kind="clean")[0]))
+    documents = [CaptionDocument(view, 2 + view, start_seconds=0.0, end_seconds=10.0) for view in range(2)]
+    current, _ = chunk_token_metadata(items, step=1, pass_kind=pass_kind)
+
+    def runtime(reuse: bool) -> CausalMasklessRuntime:
+        plan = build_causal_maskless_plan(
+            current=current,
+            history=[ring],
+            captions=caption_metadata(documents),
+            window_seconds=0.4,
+            reuse_control_kv=reuse,
+        )
+        return CausalMasklessRuntime(plan.flatten(), len(plan.passes), "torch")
+
+    def kv(*shape):
+        return tuple(torch.randn(*shape, KV_HEADS, HEAD_DIM, generator=generator, dtype=torch.float64) for _ in "kv")
+
+    streams = {
+        "text_extent": 0,
+        "und_kv": [kv(1, sum(doc.num_tokens for doc in documents)) for _ in range(LAYERS)],
+        "history_kv": [kv(ring.metadata.num_tokens) for _ in range(LAYERS)],
+    }
+    return runtime(False), runtime(True), streams
+
+
+@torch.no_grad()
+def test_targets_only_forwards_with_cached_control_kv_match_full_forwards() -> None:
+    torch.manual_seed(0)
+    host = _ForwardHost().double()
+    generator = torch.Generator().manual_seed(5)
+    items, latents = _joint_items()
+    latents = [latent.double() for latent in latents]
+    controls = torch.cat([torch.arange(a, a + n) for a, n in item_token_ranges(items, controls=True)])
+    targets = torch.cat([torch.arange(a, a + n) for a, n in item_token_ranges(items, controls=False)])
+    full_noisy, reuse_noisy, streams = _context(items, "noisy", generator)
+
+    first = host.forward(
+        items=items,
+        latents=latents,
+        timestep=torch.tensor([900.0]),
+        runtime=full_noisy,
+        collect_control_kv=True,
+        **streams,
+    )
+    assert len(first.control_kv) == LAYERS
+    assert all(key.shape == (controls.numel(), KV_HEADS, HEAD_DIM) for key, _ in first.control_kv)
+    later = [latent if item.is_control else torch.randn_like(latent) for item, latent in zip(items, latents)]
+    expected = host.forward(
+        items=items,
+        latents=later,
+        timestep=torch.tensor([500.0]),
+        runtime=full_noisy,
+        collect_control_kv=True,
+        **streams,
+    )
+    # Neither the targets nor the timestep reach the controls' K/V.
+    for (k_first, v_first), (k_later, v_later) in zip(first.control_kv, expected.control_kv, strict=True):
+        assert torch.equal(k_first, k_later) and torch.equal(v_first, v_later)
+    # A targets-only forward ignores control latents entirely.
+    poisoned = [torch.full_like(x, float("nan")) if item.is_control else x for item, x in zip(items, later)]
+    actual = host.forward(
+        items=items,
+        latents=poisoned,
+        timestep=torch.tensor([500.0]),
+        runtime=reuse_noisy,
+        control_kv=first.control_kv,
+        **streams,
+    )
+    assert actual.control_kv is None
+    for got, want in zip(actual.targets, expected.targets, strict=True):
+        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+
+    # Clean refresh: the forward publishes only its own (target) tokens; the pipeline adds the controls.
+    full_clean, reuse_clean, _ = _context(items, "clean", generator)
+    num_tokens = sum(item.num_tokens for item in items)
+    slots = torch.arange(num_tokens) + 3
+
+    def pools():
+        return [
+            tuple(torch.zeros(num_tokens + 3, KV_HEADS, HEAD_DIM, dtype=torch.float64) for _ in "kv")
+            for _ in range(LAYERS)
+        ]
+
+    full_pools, reuse_pools = pools(), pools()
+    refreshed = host.forward(
+        items=items,
+        latents=later,
+        timestep=None,
+        runtime=full_clean,
+        write_slots=slots,
+        kv_pools=full_pools,
+        collect_kv=True,
+        **streams,
+    )
+    reused = host.forward(
+        items=items,
+        latents=poisoned,
+        timestep=None,
+        runtime=reuse_clean,
+        write_slots=slots[targets],
+        kv_pools=reuse_pools,
+        collect_kv=True,
+        control_kv=first.control_kv,
+        **streams,
+    )
+    for got, want in zip(reused.targets, refreshed.targets, strict=True):
+        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+    for layer in range(LAYERS):
+        for got, want, cached in zip(reused.current_kv[layer], refreshed.current_kv[layer], first.control_kv[layer]):
+            torch.testing.assert_close(got[0], want[0, targets], rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(cached, want[0, controls], rtol=0, atol=0)
+        for got, want in zip(reuse_pools[layer], full_pools[layer], strict=True):
+            torch.testing.assert_close(got[slots[targets]], want[slots[targets]], rtol=1e-6, atol=1e-6)
+            assert not got[slots[controls]].any()
+
+
+def test_control_kv_reuse_rejects_mismatched_caches() -> None:
+    host = _ForwardHost().double()
+    items, latents = _joint_items()
+    full_noisy, reuse_noisy, streams = _context(items, "noisy", torch.Generator().manual_seed(0))
+    cache = [(torch.zeros(1, KV_HEADS, HEAD_DIM), torch.zeros(1, KV_HEADS, HEAD_DIM))] * LAYERS
+    with pytest.raises(ValueError, match="control tokens"):
+        host.forward(items=items, latents=latents, timestep=None, runtime=reuse_noisy, control_kv=cache, **streams)
+    with pytest.raises(ValueError, match="either collects control K/V or reuses it"):
+        host.forward(
+            items=items,
+            latents=latents,
+            timestep=None,
+            runtime=full_noisy,
+            control_kv=cache,
+            collect_control_kv=True,
+            **streams,
         )

@@ -62,8 +62,10 @@ from .layout import (
 STREAM_CURRENT = 0
 STREAM_HISTORY = 1
 STREAM_UND = 2
-#: The executor appends the plan's staged ``[current | ring slots | captions]`` stream after the three inputs.
-STREAM_STAGED = 3
+#: Control K/V of the current chunk cached by an earlier forward (``reuse_control_kv`` plans).
+STREAM_CONTROL = 3
+#: The executor appends the plan's staged ``[current chunk | ring slots | captions]`` stream after the inputs.
+STREAM_STAGED = 4
 
 #: Reference tolerances: the window and caption bounds compare float32 seconds.
 WINDOW_EPS = 1e-4
@@ -293,16 +295,22 @@ Segment = tuple[tuple[int, ...], tuple[int, ...]]
 
 @dataclass(frozen=True, eq=False)
 class CausalMasklessPlan:
-    """Passes in merge order; the first pass covers every GEN query row.
+    """Passes in merge order; the first pass covers every query row.
 
     Passes read keys from the staged stream ``STREAM_STAGED``: the ``staging``
-    rows ``(stream, start, length)`` concatenate the current chunk, each
-    populated ring slot and the captions, in that order.
+    rows ``(stream, start, length)`` concatenate the current chunk (in packing
+    order), each populated ring slot and the captions. With
+    ``reuse_control_kv`` the queries are the chunk's non-control tokens in
+    packing order, and the staged chunk takes its control ranges from
+    ``STREAM_CONTROL`` and its other ranges from ``STREAM_CURRENT``.
     """
 
     num_gen_tokens: int
     num_history_tokens: int
     num_und_tokens: int
+    #: Rows of the forward's queries: ``num_gen_tokens``, or the non-control tokens with ``reuse_control_kv``.
+    num_query_tokens: int
+    reuse_control_kv: bool
     passes: tuple[MasklessPass, ...]
     #: CPU int64 ``[R, STAGING_FIELDS]``; ``HISTORY`` starts are virtual until :meth:`with_history_offsets`.
     staging: torch.Tensor
@@ -379,16 +387,29 @@ def _staging_tensor(rows: Sequence[tuple[int, int, int]]) -> torch.Tensor:
 
 
 def _stage_keys(
-    current_tokens: int,
+    current: TokenMetadata,
     history: Sequence[RingSlot],
     num_history_tokens: int,
     und_tokens: int,
     key_tables: Sequence[RunTable],
+    *,
+    reuse_control_kv: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Staging rows and the staged start of every key run (current, then history, then UND runs)."""
     staged_history = torch.full((num_history_tokens,), -1, dtype=torch.int64)
-    ranges = [(STREAM_CURRENT, 0, current_tokens)]
-    cursor = current_tokens
+    if reuse_control_kv:
+        # Same staged layout as a full forward: only the source of each chunk range changes.
+        control = current.is_control
+        starts = _run_boundaries(control).tolist()
+        cursors = {STREAM_CONTROL: 0, STREAM_CURRENT: 0}
+        ranges = []
+        for start, end in zip(starts, [*starts[1:], current.num_tokens]):
+            stream = STREAM_CONTROL if bool(control[start]) else STREAM_CURRENT
+            ranges.append((stream, cursors[stream], end - start))
+            cursors[stream] += end - start
+    else:
+        ranges = [(STREAM_CURRENT, 0, current.num_tokens)]
+    cursor = current.num_tokens
     for slot in history:
         length = slot.metadata.num_tokens
         if not length:
@@ -410,9 +431,10 @@ def _materialize(
     segments: Sequence[Segment],
     *,
     query_runs: RunTable,
+    query_starts: torch.Tensor,
     key_starts: torch.Tensor,
     key_lengths: torch.Tensor,
-    num_gen_tokens: int,
+    num_query_tokens: int,
     device: torch.device,
 ) -> MasklessPass:
     query_lengths = [int(query_runs.length[list(q_runs)].sum()) for q_runs, _ in segments]
@@ -423,7 +445,7 @@ def _materialize(
     k_order = [run for _, k_runs in segments for run in k_runs]
     if len(set(q_order)) != len(q_order):
         raise RuntimeError(f"Cosmos3 causal maskless pass {name!r} would attend a query more than once.")
-    q_index = _expand(query_runs.start, query_runs.length, q_order)
+    q_index = _expand(query_starts, query_runs.length, q_order)
     k_index = _expand(key_starts, key_lengths, k_order)
     meta = torch.zeros(META_SIZE, dtype=torch.int64)
     meta[META_MAX_SEQLEN_Q] = max(query_lengths)
@@ -431,7 +453,7 @@ def _materialize(
     meta[META_KEY_STREAM] = STREAM_STAGED
     meta[META_Q_START] = contiguous_start(q_index)
     meta[META_K_START] = contiguous_start(k_index)
-    meta[META_GEN_TOKENS] = num_gen_tokens
+    meta[META_GEN_TOKENS] = num_query_tokens
     k_index = k_index.to(device)
     if k_index.numel() > 1:
         # Prompt lengths and ring population vary per request/chunk kind; keep
@@ -456,6 +478,7 @@ def build_causal_maskless_plan(
     captions: CaptionMetadata,
     window_seconds: float,
     device: torch.device | str = "cpu",
+    reuse_control_kv: bool = False,
 ) -> CausalMasklessPlan:
     """Partition the replay predicate into at most two unmasked varlen passes over a staged key stream.
 
@@ -467,6 +490,14 @@ def build_causal_maskless_plan(
     executor merges once. The two passes split the admitted pairs by view, so
     every pair lands in exactly one pass; the build asserts this against the
     run-level truth table.
+
+    ``reuse_control_kv`` plans a targets-only forward: the queries are the
+    chunk's non-control tokens and the chunk's control keys come from
+    ``STREAM_CONTROL``, the control K/V an earlier forward of the same chunk
+    computed. That cache is exact because control queries read no non-control
+    key of their own chunk (checked here) and the rest of what they read --
+    control latents without a time embedding, the ring and the captions -- is
+    fixed for the whole chunk.
     """
     device = torch.device(device)
     if current.num_tokens == 0:
@@ -475,15 +506,41 @@ def build_causal_maskless_plan(
     key_tables = (query_runs, history_runs(history), caption_runs(captions))
     allowed = torch.cat([pair_allowed(query_runs, table, window_seconds=window_seconds) for table in key_tables], 1)
     num_history_tokens = max((slot.base + slot.metadata.num_tokens for slot in history), default=0)
-    staging, key_starts = _stage_keys(current.num_tokens, history, num_history_tokens, captions.num_tokens, key_tables)
+    staging, key_starts = _stage_keys(
+        current,
+        history,
+        num_history_tokens,
+        captions.num_tokens,
+        key_tables,
+        reuse_control_kv=reuse_control_kv,
+    )
     key_lengths = torch.cat([table.length for table in key_tables])
     key_view = torch.cat([table.view_id for table in key_tables])
     key_is_und = torch.cat([table.is_und for table in key_tables])
     own_view = (query_runs.view_id[:, None] == key_view[None, :]) | key_is_und[None, :]
-    plan_spec = (("same_view", allowed & own_view), ("cross_view", allowed & ~own_view))
+
+    is_control = query_runs.role == ROLE_CONTROL
+    if reuse_control_kv:
+        current_keys = allowed[:, : query_runs.num_runs]
+        if bool(current_keys[is_control][:, ~is_control].any()):
+            raise RuntimeError(
+                "Cosmos3 causal maskless control queries read non-control keys of their own chunk; "
+                "their K/V cannot be reused across the chunk's forwards."
+            )
+        queried = ~is_control
+        skipped = query_runs.length * is_control
+        query_starts = query_runs.start - (torch.cumsum(skipped, 0) - skipped)
+    else:
+        queried = torch.ones_like(is_control)
+        query_starts = query_runs.start
+    num_query_tokens = int(query_runs.length[queried].sum())
+    if num_query_tokens == 0:
+        raise ValueError("The forward has no query tokens.")
+    admitted = allowed & queried[:, None]
+    plan_spec = (("same_view", admitted & own_view), ("cross_view", admitted & ~own_view))
 
     # Every query attends itself through its own view, so the first pass seeds every row.
-    if not bool(plan_spec[0][1].any(dim=1).all()):
+    if not bool(plan_spec[0][1][queried].any(dim=1).all()):
         raise RuntimeError("Cosmos3 causal maskless same-view pass must cover every GEN query run.")
 
     passes: list[MasklessPass] = []
@@ -499,20 +556,23 @@ def build_causal_maskless_plan(
                 name,
                 segments,
                 query_runs=query_runs,
+                query_starts=query_starts,
                 key_starts=key_starts,
                 key_lengths=key_lengths,
-                num_gen_tokens=current.num_tokens,
+                num_query_tokens=num_query_tokens,
                 device=device,
             )
         )
-    if not torch.equal(coverage, allowed.to(torch.int64)):
+    if not torch.equal(coverage, admitted.to(torch.int64)):
         raise RuntimeError("Cosmos3 causal maskless plan does not cover the replay predicate exactly once.")
-    if passes[0].q_index.numel() != current.num_tokens:
-        raise RuntimeError("Cosmos3 causal maskless first pass must cover every GEN row.")
+    if passes[0].q_index.numel() != num_query_tokens:
+        raise RuntimeError("Cosmos3 causal maskless first pass must cover every query row.")
     return CausalMasklessPlan(
         num_gen_tokens=current.num_tokens,
         num_history_tokens=num_history_tokens,
         num_und_tokens=captions.num_tokens,
+        num_query_tokens=num_query_tokens,
+        reuse_control_kv=reuse_control_kv,
         passes=tuple(passes),
         staging=staging,
         query_runs=query_runs,

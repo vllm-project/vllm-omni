@@ -10,6 +10,11 @@ the current chunk, the KV ring of committed chunks and the per-camera caption
 documents -- executed as log-sum-exp-merged maskless passes planned on the host
 (:mod:`.causal_plan`). Clean refresh forwards additionally write their K/V into
 the paged pool slots the pipeline allocated for the chunk.
+
+Control tokens never read their chunk's targets and carry no time embedding,
+so their per-layer K/V is the same in every forward of a chunk: the first
+forward can collect it, and later forwards run the target items only, reading
+the controls' keys from that cache.
 """
 
 from __future__ import annotations
@@ -55,8 +60,20 @@ class CausalMasklessRuntime:
 class Cosmos3NanoSimAutoTransformerOutput:
     #: Velocity (or clean) predictions of the target items, in item order, each ``[1, C, V*T, H, W]``.
     targets: list[torch.Tensor]
-    #: Current-chunk K/V per layer (post-norm, post-RoPE K; raw V) when collected for the dense oracle.
+    #: K/V of the forward's tokens per layer (post-norm, post-RoPE K; raw V) when collected for the dense oracle.
     current_kv: list[tuple[torch.Tensor, torch.Tensor]]
+    #: Control K/V per layer, ``[controls, H_kv, D]`` in packing order, when collected for reuse.
+    control_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+
+
+def item_token_ranges(items: Sequence[StreamItem], *, controls: bool) -> list[tuple[int, int]]:
+    """``(start, length)`` of the control (or non-control) items in the packed chunk."""
+    ranges, start = [], 0
+    for item in items:
+        if item.is_control == controls:
+            ranges.append((start, item.num_tokens))
+        start += item.num_tokens
+    return ranges
 
 
 class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
@@ -72,6 +89,8 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
         und_v: torch.Tensor,
         hist_k: torch.Tensor,
         hist_v: torch.Tensor,
+        control_k: torch.Tensor,
+        control_v: torch.Tensor,
         runtime: CausalMasklessRuntime,
         write_slots: torch.Tensor | None = None,
         key_pool: torch.Tensor | None = None,
@@ -83,6 +102,8 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
             raise ValueError("Cosmos3-Nano-Sim-Auto caption K/V must be matching [1, U, H_kv, D] tensors.")
         if hist_k.shape != hist_v.shape or hist_k.ndim != 3:
             raise ValueError("Cosmos3-Nano-Sim-Auto history K/V must be matching [tokens, H_kv, D] tensors.")
+        if control_k.shape != control_v.shape or control_k.ndim != 3:
+            raise ValueError("Cosmos3-Nano-Sim-Auto control K/V must be matching [tokens, H_kv, D] tensors.")
         batch, seq_len, _ = hidden_states.shape
         q = self.to_q(hidden_states).view(batch, seq_len, self.num_heads_local, self.head_dim)
         k = self.to_k(hidden_states).view(batch, seq_len, self.num_kv_heads_local, self.head_dim)
@@ -101,10 +122,11 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
                 raise ValueError(f"write_slots has {write_slots.numel()} entries for {seq_len} current tokens.")
             key_pool.index_copy_(0, write_slots, k[0].to(key_pool.dtype))
             value_pool.index_copy_(0, write_slots, v[0].to(value_pool.dtype))
+        # Stream order follows causal_plan: CURRENT, HISTORY, UND, CONTROL.
         out = maskless_attention_streams(
             q,
-            [k[0], hist_k.to(k.dtype), und_k[0].to(k.dtype)],
-            [v[0], hist_v.to(v.dtype), und_v[0].to(v.dtype)],
+            [k[0], hist_k.to(k.dtype), und_k[0].to(k.dtype), control_k.to(k.dtype)],
+            [v[0], hist_v.to(v.dtype), und_v[0].to(v.dtype), control_v.to(v.dtype)],
             runtime.plan,
             runtime.num_passes,
             runtime.kernel,
@@ -419,14 +441,22 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
         kv_pools: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         collect_kv: bool = False,
         rig_view_ids: torch.Tensor | None = None,
+        control_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        collect_control_kv: bool = False,
     ) -> Cosmos3NanoSimAutoTransformerOutput:
         """Denoise (``timestep`` set) or clean-refresh (``timestep`` None) one chunk.
 
         ``und_kv`` holds the per-layer compact caption K/V ``[1, U, H_kv, D]``;
         ``history_kv`` the per-layer ring keys ``[tokens, H_kv, D]`` (flat pool
         views or the dense ring), or ``None`` for chunk 0. ``write_slots`` with
-        ``kv_pools`` publishes the refresh K/V into the paged pool.
-        ``rig_view_ids`` are the request cameras' physical rig rows (``[V]``).
+        ``kv_pools`` publishes the refresh K/V of the forward's tokens into the
+        paged pool. ``rig_view_ids`` are the request cameras' physical rig rows
+        (``[V]``).
+
+        ``collect_control_kv`` returns the controls' per-layer K/V. Passing it
+        back as ``control_kv`` in a later forward of the same chunk runs the
+        non-control items only (control latents are ignored) against a
+        ``reuse_control_kv`` plan; ``write_slots`` then covers those items.
         """
         if self._inductor_cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
@@ -440,15 +470,33 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
             raise ValueError(f"Expected {self.num_hidden_layers} KV pools, got {len(kv_pools)}.")
         if timestep is not None and timestep.numel() != 1:
             raise ValueError(f"timestep must hold one value, got {tuple(timestep.shape)}.")
+        if len(items) != len(latents):
+            raise ValueError(f"{len(items)} items but {len(latents)} latent tensors.")
+        control_ranges = item_token_ranges(items, controls=True)
+        num_controls = sum(length for _, length in control_ranges)
+        if collect_control_kv and not num_controls:
+            raise ValueError("collect_control_kv needs a chunk with control items.")
+        if control_kv is not None:
+            if collect_control_kv:
+                raise ValueError("A forward either collects control K/V or reuses it, not both.")
+            if len(control_kv) != self.num_hidden_layers:
+                raise ValueError(f"Expected {self.num_hidden_layers} control KV layers, got {len(control_kv)}.")
+            if any(key.shape[0] != num_controls or value.shape[0] != num_controls for key, value in control_kv):
+                raise ValueError(f"Cached control K/V must hold the chunk's {num_controls} control tokens.")
+            # Targets-only forward: control items are neither embedded nor recomputed.
+            kept = [index for index, item in enumerate(items) if not item.is_control]
+            items, latents = [items[index] for index in kept], [latents[index] for index in kept]
 
         hidden = self.embed_items(items, latents, timestep=timestep, rig_view_ids=rig_view_ids)
         freqs_cos, freqs_sin = self.chunk_rope(items, text_extent=text_extent, device=hidden.device, dtype=hidden.dtype)
-        empty_history = und_kv[0][0].new_empty(0, self.num_kv_heads_local, self.head_dim)
+        empty_kv = und_kv[0][0].new_empty(0, self.num_kv_heads_local, self.head_dim)
         current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        collected: list[tuple[torch.Tensor, torch.Tensor]] | None = [] if collect_control_kv else None
         with self._offload_context("generator"):
             for layer_idx, layer in enumerate(self.gen_layers):
                 und_k, und_v = und_kv[layer_idx]
-                hist_k, hist_v = history_kv[layer_idx] if history_kv is not None else (empty_history, empty_history)
+                hist_k, hist_v = history_kv[layer_idx] if history_kv is not None else (empty_kv, empty_kv)
+                control_k, control_v = control_kv[layer_idx] if control_kv is not None else (empty_kv, empty_kv)
                 key_pool, value_pool = kv_pools[layer_idx] if kv_pools is not None else (None, None)
                 hidden, k, v = layer(
                     hidden,
@@ -458,6 +506,8 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
                     und_v=und_v,
                     hist_k=hist_k,
                     hist_v=hist_v,
+                    control_k=control_k,
+                    control_v=control_v,
                     runtime=runtime,
                     write_slots=write_slots,
                     key_pool=key_pool,
@@ -465,6 +515,13 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
                 )
                 if collect_kv:
                     current_kv.append((k, v))
+                if collected is not None:
+                    collected.append(
+                        (
+                            torch.cat([k[0, start : start + length] for start, length in control_ranges]),
+                            torch.cat([v[0, start : start + length] for start, length in control_ranges]),
+                        )
+                    )
             hidden = self.norm_moe_gen(hidden)
             outputs = []
             for item, latent, part in zip(
@@ -474,11 +531,12 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
                     continue
                 projected = (self.lidar_proj_out if item.is_lidar else self.proj_out)(part)
                 outputs.append(unpatchify_sensor(projected, tuple(latent.shape[1:]), self._item_patch(item)))
-        return Cosmos3NanoSimAutoTransformerOutput(targets=outputs, current_kv=current_kv)
+        return Cosmos3NanoSimAutoTransformerOutput(targets=outputs, current_kv=current_kv, control_kv=collected)
 
 
 __all__ = [
     "CausalMasklessRuntime",
+    "item_token_ranges",
     "Cosmos3NanoSimAutoGenDecoderLayer",
     "Cosmos3NanoSimAutoJointAttention",
     "Cosmos3NanoSimAutoTransformer",

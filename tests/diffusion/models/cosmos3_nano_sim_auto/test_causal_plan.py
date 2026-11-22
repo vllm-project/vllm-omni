@@ -24,7 +24,9 @@ import torch
 from vllm_omni.diffusion.models.cosmos3 import multiview_maskless_attention as m
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_attention import maskless_attention_streams
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_plan import META_K_START, META_KEY_STREAM, META_Q_START
+from vllm_omni.diffusion.models.cosmos3_nano_sim_auto import causal_plan
 from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.causal_plan import (
+    STREAM_CONTROL,
     STREAM_CURRENT,
     STREAM_HISTORY,
     STREAM_STAGED,
@@ -105,6 +107,7 @@ def scenario(
     num_views: int = 2,
     lidar_condition: bool = False,
     device: str = "cpu",
+    reuse_control_kv: bool = False,
 ) -> Scenario:
     schedule = build_chunk_schedule(
         rgb_latents=7,
@@ -135,7 +138,12 @@ def scenario(
     current, _ = chunk_token_metadata(items(chunk_index), step=chunk_index, pass_kind=pass_kind)
     docs = captions(num_views)
     plan = build_causal_maskless_plan(
-        current=current, history=slots, captions=caption_metadata(docs), window_seconds=WINDOW, device=device
+        current=current,
+        history=slots,
+        captions=caption_metadata(docs),
+        window_seconds=WINDOW,
+        device=device,
+        reuse_control_kv=reuse_control_kv,
     )
     return Scenario(plan, current, slots, docs)
 
@@ -243,7 +251,7 @@ def test_plan_matches_token_level_oracle(chunk_index: int, pass_kind: str, joint
     assert planned.shape == expected.shape
     assert torch.equal(planned, expected), (planned ^ expected).nonzero()
     # The varlen calls the executor runs cover exactly the same pairs, once each.
-    assert torch.equal(_token_pair_counts(scn.plan), expected.to(torch.int64))
+    assert torch.equal(_token_pair_counts(scn, scn.plan), expected.to(torch.int64))
     # Every GEN row is seeded by the first pass and attends at least itself; at most one merge follows.
     assert [attention_pass.name for attention_pass in scn.plan.passes] in (["same_view"], ["same_view", "cross_view"])
     assert int(scn.plan.passes[0].meta[META_Q_START]) == 0
@@ -251,17 +259,29 @@ def test_plan_matches_token_level_oracle(chunk_index: int, pass_kind: str, joint
     assert bool(planned.diagonal()[: scn.plan.num_gen_tokens].all())
 
 
-def _token_pair_counts(plan: CausalMasklessPlan) -> torch.Tensor:
-    """Expand every varlen segment through the staging rows into ``[GEN, current + history + und]`` counts."""
-    offsets = {
-        STREAM_CURRENT: 0,
-        STREAM_HISTORY: plan.num_gen_tokens,
-        STREAM_UND: plan.num_gen_tokens + plan.num_history_tokens,
+def _rows(scn: Scenario, *, controls: bool) -> torch.Tensor:
+    return torch.nonzero(scn.current.is_control == controls).flatten()
+
+
+def _token_pair_counts(scn: Scenario, plan: CausalMasklessPlan) -> torch.Tensor:
+    """Expand every varlen segment through the staging rows into ``[queries, current + history + und]`` counts."""
+    gen = plan.num_gen_tokens
+    offsets = {STREAM_HISTORY: gen, STREAM_UND: gen + plan.num_history_tokens}
+    # Chunk rows each stream's tokens stand for: a targets-only forward computes the non-control rows.
+    chunk_rows = {
+        STREAM_CURRENT: _rows(scn, controls=False) if plan.reuse_control_kv else torch.arange(gen),
+        STREAM_CONTROL: _rows(scn, controls=True),
     }
     column = torch.cat(
-        [torch.arange(start, start + length) + offsets[stream] for stream, start, length in plan.staging.tolist()]
+        [
+            chunk_rows[stream][start : start + length]
+            if stream in chunk_rows
+            else torch.arange(start, start + length) + offsets[stream]
+            for stream, start, length in plan.staging.tolist()
+        ]
     )
-    counts = torch.zeros(plan.num_gen_tokens, offsets[STREAM_UND] + plan.num_und_tokens, dtype=torch.int64)
+    assert plan.num_query_tokens == chunk_rows[STREAM_CURRENT].numel()
+    counts = torch.zeros(plan.num_query_tokens, offsets[STREAM_UND] + plan.num_und_tokens, dtype=torch.int64)
     for attention_pass in plan.passes:
         assert int(attention_pass.meta[META_KEY_STREAM]) == STREAM_STAGED
         for field, index in ((META_Q_START, attention_pass.q_index), (META_K_START, attention_pass.k_index)):
@@ -393,6 +413,8 @@ def _random_streams(scn: Scenario, *, heads: int = 2, kv_heads: int = 1, dim: in
                 torch.randn(length, kv_heads, dim, generator=generator),
             )
         )
+    # STREAM_CONTROL: empty unless a targets-only forward reads cached control K/V.
+    streams.append((torch.empty(0, kv_heads, dim), torch.empty(0, kv_heads, dim)))
     return q, streams
 
 
@@ -455,7 +477,7 @@ def test_history_remap_moves_only_staged_slots_to_their_pages() -> None:
         length = slot.metadata.num_tokens
         pool_k[base : base + length] = streams[1][0][slot.base : slot.base + length]
         pool_v[base : base + length] = streams[1][1][slot.base : slot.base + length]
-    physical = [streams[0], (pool_k, pool_v), streams[2]]
+    physical = [streams[0], (pool_k, pool_v), *streams[2:]]
     torch.testing.assert_close(_run(remapped, q, physical), _run(scn.plan, q, streams), rtol=0, atol=0)
     with pytest.raises(ValueError, match="without a physical page"):
         scn.plan.with_history_offsets([100], UNIT)
@@ -466,7 +488,7 @@ def test_streams_op_rejects_staging_outside_its_stream() -> None:
     q, streams = _random_streams(scn)
     short_history = (streams[1][0][:UNIT], streams[1][1][:UNIT])
     with pytest.raises(ValueError, match="exceeds key stream 1"):
-        _run(scn.plan, q, [streams[0], short_history, streams[2]])
+        _run(scn.plan, q, [streams[0], short_history, *streams[2:]])
 
 
 def test_chunk_one_stages_one_ring_slot_and_reads_it_in_both_passes() -> None:
@@ -485,6 +507,99 @@ def test_chunk_one_stages_one_ring_slot_and_reads_it_in_both_passes() -> None:
         assert k_runs & set(history_columns)
         # Captions are same-view keys: the cross-view pass never reads them.
         assert bool(k_runs & set(und_columns)) == (attention_pass.name == "same_view")
+
+
+@pytest.mark.parametrize("pass_kind", ["noisy", "clean"])
+@pytest.mark.parametrize(("chunk_index", "joint"), [(0, True), (1, True), (2, False), (3, True)])
+def test_reuse_plan_queries_targets_and_reads_controls_from_the_cache(
+    chunk_index: int, joint: bool, pass_kind: str
+) -> None:
+    full = scenario(chunk_index, pass_kind=pass_kind, joint=joint)
+    reuse = scenario(chunk_index, pass_kind=pass_kind, joint=joint, reuse_control_kv=True)
+    targets = _rows(full, controls=False)
+    assert torch.equal(_token_pair_counts(reuse, reuse.plan), _token_oracle(full)[targets].to(torch.int64))
+    # Same staged key layout as the full plan: only the chunk ranges change source.
+    chunk = (STREAM_CURRENT, STREAM_CONTROL)
+    assert (
+        sum(length for stream, _, length in reuse.plan.staging.tolist() if stream in chunk) == full.plan.num_gen_tokens
+    )
+    assert [row for row in reuse.plan.staging.tolist() if row[0] not in chunk] == full.plan.staging.tolist()[1:]
+    assert all(int(attention_pass.meta[META_Q_START]) == 0 for attention_pass in reuse.plan.passes[:1])
+
+
+@pytest.mark.parametrize(("chunk_index", "joint"), [(1, True), (3, True), (3, False)])
+def test_reuse_op_reproduces_the_full_op_on_target_rows(chunk_index: int, joint: bool) -> None:
+    full = scenario(chunk_index, joint=joint)
+    reuse = scenario(chunk_index, joint=joint, reuse_control_kv=True)
+    controls, targets = _rows(full, controls=True), _rows(full, controls=False)
+    q, streams = _random_streams(full)
+    keys, values = streams[0]
+    cached = [(keys[targets], values[targets]), streams[1], streams[2], (keys[controls], values[controls])]
+    expected = _run(full.plan, q, streams)[0, targets]
+    # Identical staged keys and segments: the target rows match bit for bit.
+    torch.testing.assert_close(_run(reuse.plan, q[:, targets], cached)[0], expected, rtol=0, atol=0)
+
+
+def test_cached_control_kv_reproduces_a_multi_layer_forward() -> None:
+    full = scenario(3)  # joint: the controls are two non-contiguous item ranges
+    reuse = scenario(3, reuse_control_kv=True)
+    controls, targets = _rows(full, controls=True), _rows(full, controls=False)
+    generator = torch.Generator().manual_seed(3)
+    width, heads, kv_heads, dim, layers = 6, 2, 1, 4, 3
+    weights = [
+        [torch.randn(width, n, generator=generator, dtype=torch.float64) / 3 for n in (8, 4, 4)]
+        + [torch.randn(heads * dim, width, generator=generator, dtype=torch.float64) / 3]
+        for _ in range(layers)
+    ]
+    ring = [
+        _random_streams(full, heads=heads, kv_heads=kv_heads, dim=dim, seed=layer)[1][1:3] for layer in range(layers)
+    ]
+    ring = [[(k.double(), v.double()) for k, v in pair] for pair in ring]
+
+    def forward(hidden: torch.Tensor, plan: CausalMasklessPlan, control_kv=None):
+        tokens = hidden.shape[1]
+        empty = hidden.new_empty(0, kv_heads, dim)
+        collected = []
+        for (w_q, w_k, w_v, w_o), (history, und), cache in zip(weights, ring, control_kv or [(empty, empty)] * layers):
+            q = (hidden @ w_q).view(1, tokens, heads, dim)
+            k, v = (hidden[0] @ w_k).view(tokens, kv_heads, dim), (hidden[0] @ w_v).view(tokens, kv_heads, dim)
+            attended = maskless_attention_streams(
+                q,
+                [k, history[0], und[0], cache[0]],
+                [v, history[1], und[1], cache[1]],
+                plan.flatten(),
+                len(plan.passes),
+                "torch",
+            )
+            hidden = hidden + attended.reshape(1, tokens, -1) @ w_o
+            if control_kv is None:
+                collected.append((k[controls], v[controls]))
+        return hidden, collected
+
+    first = torch.randn(1, full.plan.num_gen_tokens, width, generator=generator, dtype=torch.float64)
+    later = first.clone()
+    later[0, targets] = torch.randn(targets.numel(), width, generator=generator, dtype=torch.float64)
+    _, cache = forward(first, full.plan)
+    expected, recomputed = forward(later, full.plan)
+    # Control K/V does not depend on the chunk's targets at any layer.
+    for (k_cached, v_cached), (k_new, v_new) in zip(cache, recomputed, strict=True):
+        assert torch.equal(k_cached, k_new) and torch.equal(v_cached, v_new)
+    actual, _ = forward(later[:, targets], reuse.plan, control_kv=cache)
+    torch.testing.assert_close(actual[0], expected[0, targets], rtol=1e-12, atol=1e-12)
+
+
+def test_reuse_plan_rejects_controls_that_read_their_chunks_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    exact = causal_plan.pair_allowed
+
+    def leaky(q, k, *, window_seconds):
+        allowed = exact(q, k, window_seconds=window_seconds)
+        if k is q:  # the current-chunk key table
+            allowed |= (q.role == ROLE_CONTROL)[:, None] & (k.role != ROLE_CONTROL)[None, :]
+        return allowed
+
+    monkeypatch.setattr(causal_plan, "pair_allowed", leaky)
+    with pytest.raises(RuntimeError, match="cannot be reused"):
+        scenario(2, reuse_control_kv=True)
 
 
 @pytest.mark.gpu
