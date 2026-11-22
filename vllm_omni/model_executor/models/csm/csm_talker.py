@@ -34,6 +34,7 @@ from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaModel
 from vllm.model_executor.models.utils import AutoWeightsLoader, make_layers, maybe_prefix
 
 from vllm_omni.model_executor.models.csm.csm_depth_decoder import CsmDepthDecoder, draw_frame_uniforms
+from vllm_omni.model_executor.models.csm.csm_depth_graph import CsmDepthDecoderGraphs, depth_graph_buckets
 from vllm_omni.model_executor.models.csm.csm_mimi import rename_codec_weights
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
@@ -104,6 +105,8 @@ class CsmTalkerForConditionalGeneration(nn.Module):
     # The repository also ships the same weights in the original format (model.safetensors, ckpt.pt).
     allow_patterns_overrides = ["transformers-*.safetensors"]
     fall_back_to_pt_during_load = False
+    # forward returns the backbone's hidden states; make_omni_output adds the frame outputs afterwards.
+    mrv2_forward_returns_tensor = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -150,6 +153,9 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         self.logits_vocab_size = self.codebook_vocab_size
         sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self.mtp_sampling_params = {**_DEFAULT_DEPTH_SAMPLING, **(sampling if isinstance(sampling, Mapping) else {})}
+        # The runner cannot graph talker_mtp for a model that takes request ids, so the frame step has its own.
+        self._depth_graph_buckets = depth_graph_buckets(vllm_config)
+        self._depth_graphs: CsmDepthDecoderGraphs | None = None
 
         stop_logits = torch.full((self.logits_vocab_size,), float("-inf"))
         stop_logits[self.stop_token_id] = 0.0
@@ -382,7 +388,8 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         uniforms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Complete the frames started by ``first_codes`` with the depth decoder."""
-        return self.depth_decoder.generate_frame(
+        decoder = self.depth_decoder if self._depth_graphs is None else self._depth_graphs
+        return decoder.generate_frame(
             backbone_hidden,
             first_codes,
             do_sample=do_sample,
@@ -394,4 +401,26 @@ class CsmTalkerForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load a transformers-format CSM checkpoint, whichever Mimi layout it and transformers use."""
-        return AutoWeightsLoader(self).load_weights(rename_codec_weights(weights, self.codec_model))
+        loaded = AutoWeightsLoader(self).load_weights(rename_codec_weights(weights, self.codec_model))
+        self._capture_depth_graphs()
+        return loaded
+
+    def _capture_depth_graphs(self) -> None:
+        """Record the frame step on CUDA, unless the stage runs eagerly."""
+        if not self._depth_graph_buckets or self.lm_head.weight.device.type != "cuda":
+            return
+        graphs = self._new_depth_graphs(self._depth_graph_buckets)
+        graphs.capture()
+        self._depth_graphs = graphs
+
+    def _new_depth_graphs(self, buckets: list[int]) -> CsmDepthDecoderGraphs:
+        """Graphs for the deploy's depth sampling, the setting talker_mtp runs unless a caller overrides it."""
+        sampling = self.mtp_sampling_params
+        return CsmDepthDecoderGraphs(
+            self.depth_decoder,
+            buckets=buckets,
+            do_sample=bool(sampling["do_sample"]),
+            temperature=float(sampling["temperature"]),
+            top_k=int(sampling["top_k"]),
+            top_p=float(sampling["top_p"]),
+        )

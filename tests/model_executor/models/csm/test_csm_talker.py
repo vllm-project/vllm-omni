@@ -287,6 +287,42 @@ def test_talker_mtp_computes_a_stop_token_row_on_a_valid_code(
     assert torch.equal(codes[1], alone[0])
 
 
+def test_no_depth_graphs_are_recorded_without_a_gpu(
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]],
+) -> None:
+    talker, _ = loaded
+    assert talker._depth_graphs is None
+
+
+@pytest.mark.parametrize("depth_sampling", [None, {"do_sample": False}], ids=["deploy-default", "greedy"])
+def test_talker_mtp_runs_the_frame_step_the_graphs_record(
+    reference: CsmForConditionalGeneration, monkeypatch: pytest.MonkeyPatch, mocker, depth_sampling: dict | None
+) -> None:
+    """Off CUDA nothing is captured, but the frame still takes the padded buffers a replay would use."""
+    talker = _build_talker(reference.config, monkeypatch, subtalker_sampling_params=depth_sampling)
+    talker.load_weights(reference.state_dict().items())
+    hidden_size = talker.config.hidden_size
+    generator = torch.Generator().manual_seed(5)
+    hidden = torch.randn((3, hidden_size), generator=generator)
+    first = torch.randint(0, talker.codebook_vocab_size, (3, 1), generator=generator)
+    zeros = torch.zeros((3, hidden_size))
+
+    def frames() -> tuple[torch.Tensor, torch.Tensor]:
+        generators = [torch.Generator().manual_seed(seed) for seed in (11, 12, 13)]
+        with torch.no_grad():
+            return talker.talker_mtp(first, zeros, hidden, zeros, generators=generators)
+
+    expected_embeds, expected_codes = frames()
+    talker._depth_graphs = talker._new_depth_graphs([1, 2, 4])
+    spy = mocker.spy(talker.depth_decoder, "generate_frame")
+    embeds, codes = frames()
+
+    # Three rows ran padded to the bucket of four, with the sampling values talker_mtp resolved.
+    assert spy.call_count == 1 and spy.call_args.args[1].shape[0] == 4
+    assert torch.equal(codes, expected_codes)
+    torch.testing.assert_close(embeds, expected_embeds, rtol=0, atol=1e-5)
+
+
 def test_codec_loads_from_the_flat_names_of_the_checkpoint(
     reference: CsmForConditionalGeneration, monkeypatch: pytest.MonkeyPatch
 ) -> None:

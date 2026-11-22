@@ -192,6 +192,7 @@ def test_declared_capabilities(talker: CsmTalkerForConditionalGeneration) -> Non
     assert talker.has_talker_mtp and talker.has_preprocess and talker.have_multimodal_outputs
     assert talker.mtp_accepts_req_infos and talker.mtp_accepts_per_row_generators
     assert talker.logitsprocs_need_output_token_ids
+    assert talker.mrv2_forward_returns_tensor is True
     assert talker.stop_token_id == talker.config.codebook_pad_token_id == 2050
     assert talker.logits_vocab_size == talker.config.vocab_size == 2051
     assert talker.mtp_output_key == ("codes", "audio")

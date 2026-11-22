@@ -88,6 +88,9 @@ def test_deploy_config_matches_the_design_decisions(deploy) -> None:
     assert talker.max_model_len == CsmConfig().max_position_embeddings
     assert talker.default_sampling_params == {"temperature": 0.9, "top_k": 50, "max_tokens": 125}
     assert talker.subtalker_sampling_params == {"do_sample": True, "temperature": 0.9, "top_k": 50, "top_p": 1.0}
+    # The talker replays CUDA graphs: backbone decode steps, and the frame step the model captures itself.
+    assert talker.enforce_eager is False and talker.compilation_config == {"cudagraph_mode": "FULL_DECODE_ONLY"}
+    assert codec.enforce_eager is True
     # A waiting request keeps its codec slot, so the codec stage needs one per running talker request.
     assert codec.max_num_seqs >= talker.max_num_seqs
     # The longest request is 32 codes for every position the talker can generate.

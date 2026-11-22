@@ -22,7 +22,11 @@ stages:
     max_num_seqs: 8
     gpu_memory_utilization: 0.3
     max_model_len: 2048
-    enforce_eager: true
+    # CUDA graphs for the backbone's decode steps and for the depth decoder's frame step.
+    # The backbone has no piecewise graphs, so prompts run eagerly.
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mode: FULL_DECODE_ONLY
     # Every generated token is a first-codebook id whose frame is not in the
     # token stream, so a prefix hit could not restore the frames behind it.
     enable_prefix_caching: false
