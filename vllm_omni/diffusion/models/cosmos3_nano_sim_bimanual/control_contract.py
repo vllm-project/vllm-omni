@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict conditioning contract for Cosmos3-Nano-Sim-Transfer artifacts."""
 
 from __future__ import annotations

@@ -110,11 +110,6 @@ class _TransferSessionFingerprint:
     sampler_id: str
     inference_id: str
 
-    def text_length(self, branch: str) -> int:
-        """Return the real text K/V length recorded for ``branch``."""
-
-        return dict(self.real_text_kv_lengths)[branch]
-
 
 def _prompt_value(prompt_data: Any, key: str) -> Any:
     if not isinstance(prompt_data, Mapping):
@@ -309,36 +304,28 @@ def _trim_transfer_history(
     tokens_per_frame: int,
     window_frames: int,
     sink_frames: int,
-    dense_cache: CosmosSimDenseAttentionCache | None = None,
+    dense_cache: CosmosSimDenseAttentionCache,
 ) -> None:
-    """Select paired sinks and recent past before the next control forward.
+    """Select paired sinks and recent past in joint storage before the next control forward.
 
     W includes S sink frames and the current temporal frame. A past frame
     occupies two entries (control, generated latent). The current control is
     appended afterwards, so denoising and clean commit additionally see C_t.
+    Sinks stay in place and the recent tail shifts down behind them.
     Positions in the retained K/V remain absolute; eviction never renumbers RoPE.
     """
     sink_tokens = 2 * sink_frames * tokens_per_frame
     recent_tokens = 2 * (window_frames - sink_frames - 1) * tokens_per_frame
+    end = dense_cache.text_length + sink_tokens + recent_tokens
     for layer_idx, (key, value) in enumerate(history):
         if key.shape[1] <= sink_tokens + recent_tokens:
             continue
-
-        def select(tensor: torch.Tensor) -> torch.Tensor:
-            prefix = tensor[:, :sink_tokens]
-            return torch.cat((prefix, tensor[:, -recent_tokens:]), dim=1) if recent_tokens else prefix.clone()
-
-        if dense_cache is None:
-            history[layer_idx] = (select(key), select(value))
-        else:
-            end = dense_cache.text_length + sink_tokens + recent_tokens
-            for buffer, source in zip(dense_cache.kv[layer_idx], (key, value)):
-                if recent_tokens:
-                    # The source tail can overlap its destination; preserve it before shifting.
-                    buffer[:, end - recent_tokens : end].copy_(source[:, -recent_tokens:].clone())
-            history[layer_idx] = tuple(buffer[:, dense_cache.text_length : end] for buffer in dense_cache.kv[layer_idx])
-    if dense_cache is not None:
-        dense_cache.history_length = history[0][0].shape[1]
+        for buffer, source in zip(dense_cache.kv[layer_idx], (key, value)):
+            if recent_tokens:
+                # The source tail can overlap its destination; preserve it before shifting.
+                buffer[:, end - recent_tokens : end].copy_(source[:, -recent_tokens:].clone())
+        history[layer_idx] = tuple(buffer[:, dense_cache.text_length : end] for buffer in dense_cache.kv[layer_idx])
+    dense_cache.history_length = history[0][0].shape[1]
 
 
 def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfig):
@@ -786,11 +773,14 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     # -- Dense history ----------------------------------------------------
 
     def _prepare_dense_attention(self, state, text_kv, real_text_kv_len, geometry, target_frame):
-        """Reserve joint storage for text plus the retained control/generated frame pairs."""
+        """Reserve joint storage for text plus the retained control/generated frame pairs.
+
+        Transfer history lives only in this storage, which serves one session.
+        """
 
         state.dense_attention = None
         if self._SESSION_CAPACITY != 1:
-            return
+            raise RuntimeError("Cosmos3-Nano-Sim-Transfer joint K/V storage supports exactly one session.")
         frames = target_frame
         if self.manifest.chunk_size == 1:
             frames = min(frames, state.fingerprint.window_frames)
@@ -804,22 +794,6 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         cache.activate(state, text_kv, real_text_kv_len, capacity, state.dense_kv_by_branch.get(self._MAIN_BRANCH))
         self._dense_attention_cache = cache
         state.dense_attention = cache
-
-    def _append_dense_kv(
-        self,
-        state: Cosmos3NanoSimBimanualSessionState,
-        current_kv: list[tuple[torch.Tensor, torch.Tensor]],
-        geometry: Cosmos3NanoSimBimanualGeometry,
-    ) -> None:
-        """Append without per-entry eviction; ``_run_chunk`` trims complete pairs before C_t."""
-
-        # Keep C_t for all denoise steps and the clean commit.
-        history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
-        if history is None:
-            state.dense_kv_by_branch[self._MAIN_BRANCH] = [(k.detach(), v.detach()) for k, v in current_kv]
-        else:
-            for idx, ((old_k, old_v), (new_k, new_v)) in enumerate(zip(history, current_kv, strict=True)):
-                history[idx] = (torch.cat((old_k, new_k), dim=1), torch.cat((old_v, new_v), dim=1))
 
     def _run_chunk(
         self,

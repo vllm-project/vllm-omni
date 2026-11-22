@@ -388,7 +388,12 @@ class Cosmos3NanoSimBimanualManifest:
 
     @classmethod
     def from_od_config(cls, od_config: Any) -> Cosmos3NanoSimBimanualManifest:
-        """Load the sole schema-v1 artifact source; deployments never synthesize it."""
+        """Load the sole schema-v1 artifact source; deployments never synthesize it.
+
+        Deployment ``kv_cache_inference_size``/``attention_sink_size`` replace the
+        checkpoint history policy. Action artifacts store the recent-past count;
+        Transfer keeps the reference total, which its requests may override.
+        """
 
         _validate_deploy_layout(od_config)
         artifact = _exported_artifact_source(od_config)
@@ -406,22 +411,27 @@ class Cosmos3NanoSimBimanualManifest:
                 f"missing={missing}, unknown={unknown}."
             )
         manifest = cls(**_parse_artifact(artifact))
-        if isinstance(manifest.conditioning, Cosmos3NanoSimBimanualControlVideoConditioning):
-            # Transfer resolves its temporal-frame window on each request.
-            return manifest
+        transfer = isinstance(manifest.conditioning, Cosmos3NanoSimBimanualControlVideoConditioning)
         cache_size = deploy_option(od_config, "kv_cache_inference_size")
         sinks = deploy_option(od_config, "attention_sink_size")
         if cache_size is None:
             if sinks is not None:
                 raise ValueError("attention_sink_size override requires kv_cache_inference_size")
             return manifest
-        if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 2:
-            raise ValueError("kv_cache_inference_size must be an integer >= 2")
+        # Transfer may retain only the current frame; action windows need one recent past frame.
+        minimum_cache_size = 1 if transfer else 2
+        if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < minimum_cache_size:
+            raise ValueError(f"kv_cache_inference_size must be an integer >= {minimum_cache_size}")
         sinks = 0 if sinks is None else sinks
         if isinstance(sinks, bool) or not isinstance(sinks, int):
             raise ValueError("attention_sink_size must be an integer")
         # The effective manifest digest also separates session/cache identities.
-        window_frames = _recent_past_frames(cache_size, sinks, "attention_sink_size")
+        if transfer:
+            if not 0 <= sinks < cache_size:
+                raise ValueError("attention_sink_size must be non-negative and smaller than kv_cache_inference_size")
+            window_frames = cache_size
+        else:
+            window_frames = _recent_past_frames(cache_size, sinks, "attention_sink_size")
         return replace(manifest, window_frames=window_frames, sink_frames=sinks)
 
     def require_exported_artifact(self) -> None:

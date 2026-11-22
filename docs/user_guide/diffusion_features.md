@@ -209,6 +209,7 @@ The following tables show which models support each feature:
 | **Kandinsky 6 TI2VA**        | ✅* (uncalibrated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (decode) | ✅ (FP8) | ✅ (1 request) |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |     ✅     |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **Cosmos3-Nano-Transfer-Auto**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ❓ | ❌ | ❓ | ❓ | ❌ | ❓ | ❌ |
+| **Cosmos3-Nano-Sim-Transfer**       |     ❌     |     ❌      | ❌ | ❌ | ❓ | ❌ | ❓ | ❓ | ❌ | ❓ | ❌ |
 | **LingBot-Video**            |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
@@ -221,6 +222,10 @@ The following tables show which models support each feature:
 > Cosmos3-Nano-Transfer-Auto runs CFGP and strict Ulysses CP on GB200; HSDP and TP are configuration-only;
 > see the [Cosmos3-Nano-Transfer-Auto recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md).
 > HSDP and TP are alternative memory modes and cannot be combined.
+>
+> Cosmos3-Nano-Sim-Transfer is qualified on one GB200 with the default dense deployment. It rejects
+> SP, PP, and VAE-patch parallelism at load time, and its distilled inference requires guidance 1.0;
+> see the [Cosmos3-Nano-Sim-Transfer recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Sim-Transfer-GB200.md).
 >
 > 5\. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
 > recurrence carries state across frames, so a rank cannot denoise a slice of

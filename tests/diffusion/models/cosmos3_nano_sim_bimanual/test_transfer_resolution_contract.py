@@ -28,6 +28,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualSessionState,
 )
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+from vllm_omni.model_extras import get_extra_body_params
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -272,8 +274,7 @@ def test_chunk4_full_history_contract() -> None:
 
 
 @pytest.mark.parametrize("window,sink", [(None, 0), (1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
-@pytest.mark.parametrize("joint", [False, True])
-def test_rollout_history_matches_reference_visibility(window: int | None, sink: int, joint: bool) -> None:
+def test_rollout_history_matches_reference_visibility(window: int | None, sink: int) -> None:
     p = pipeline()
     p.transformer = SimpleNamespace(latent_channel_size=48)
     state = Cosmos3NanoSimBimanualSessionState(session_id="test")
@@ -286,10 +287,9 @@ def test_rollout_history_matches_reference_visibility(window: int | None, sink: 
     )
     window = request.window_frames
     conditioning = _TransferConditioning(request, torch.zeros(1, 48, total, 2, 2))
-    if joint:
-        state.fingerprint = SimpleNamespace(window_frames=window)
-        text = [(torch.zeros(1, 1, 1), torch.zeros(1, 1, 1))]
-        p._prepare_dense_attention(state, text, 1, geometry, total)
+    state.fingerprint = SimpleNamespace(window_frames=window)
+    text = [(torch.zeros(1, 1, 1), torch.zeros(1, 1, 1))]
+    p._prepare_dense_attention(state, text, 1, geometry, total)
     reads = []
 
     def visible() -> list[int]:
@@ -299,13 +299,10 @@ def test_rollout_history_matches_reference_visibility(window: int | None, sink: 
     def commit(label: int) -> None:
         kv = torch.tensor([[[float(label)]]])
         cache = state.dense_attention
-        if cache is None:
-            p._append_dense_kv(state, [(kv, kv)], geometry)
-        else:
-            offset = cache.text_length + cache.history_length
-            for buffer in cache.kv[0]:
-                buffer[:, offset : offset + 1].copy_(kv)
-            state.dense_kv_by_branch["main"] = cache.commit(1)
+        offset = cache.text_length + cache.history_length
+        for buffer in cache.kv[0]:
+            buffer[:, offset : offset + 1].copy_(kv)
+        state.dense_kv_by_branch["main"] = cache.commit(1)
 
     def transformer_forward(_state, latent, _timestep, *, frame_start, condition_vision, commit_current, **_kwargs):
         reads.append(("control" if condition_vision else "denoise", frame_start, visible()))
@@ -382,8 +379,26 @@ def test_transfer_joint_storage_requires_single_session() -> None:
     p = pipeline()
     p._SESSION_CAPACITY = 2
     state = Cosmos3NanoSimBimanualSessionState(session_id="test")
-    p._prepare_dense_attention(state, [], 1, None, 1)
+    with pytest.raises(RuntimeError, match="exactly one session"):
+        p._prepare_dense_attention(state, [], 1, None, 1)
     assert state.dense_attention is None
+
+
+def test_online_declared_fields_reach_admission_and_geometry() -> None:
+    sp = SimpleNamespace(height=None, width=None, num_frames=121, extra_args=None)
+    body = {
+        "depth": {"control_path": "control.mp4"},
+        "resolution": "480",
+        "aspect_ratio": "16,9",
+        "kv_cache_inference_size": 30,
+        "attention_sink_size": 3,
+    }
+    apply_declared_extra_args(sp, get_extra_body_params("Cosmos3NanoSimTransferPipeline"), body)
+    assert sp.extra_args == body
+    request = pipeline()._validate_conditioning_request(sp, None, prompt_data=None)
+    assert (request.hint, request.window_frames, request.sink_frames) == ("depth", 30, 3)
+    geometry = resolve_cosmos3_nano_sim_transfer_geometry(sp, {}, Cosmos3NanoSimBimanualResolutionPolicy())
+    assert (geometry.height, geometry.width) == (480, 832)
 
 
 def test_emphasis_and_explicit_geometry() -> None:

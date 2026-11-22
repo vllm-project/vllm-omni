@@ -45,25 +45,53 @@ def test_override_preserves_checkpoint_and_separates_sessions(cache_size, sinks)
     assert options.tf_model_config["cosmos3_nano_sim_bimanual"]["window_frames"] == baseline.window_frames
 
 
-def test_transfer_keeps_request_window_semantics():
-    control = {
-        "mode": "control_video",
-        "hints": ["edge", "blur", "depth", "seg"],
-        "transfer_control_attention_mode": "causal_control_with_rgb_history",
-        "share_vision_temporal_positions": True,
-        "system_prompt_id": "cosmos3_transfer_v1",
-        "emphasize_control_in_prompt": True,
-        "no_eviction": True,
-    }
-    options = config(
-        dict(conditioning=control, chunk_size=1, window_frames=51, sink_frames=1),
-        kv_cache_inference_size=30,
-        attention_sink_size=3,
-    )
-    effective = Cosmos3NanoSimBimanualManifest.from_od_config(options)
+TRANSFER_CONTROL = {
+    "mode": "control_video",
+    "hints": ["edge", "blur", "depth", "seg"],
+    "transfer_control_attention_mode": "causal_control_with_rgb_history",
+    "share_vision_temporal_positions": True,
+    "system_prompt_id": "cosmos3_transfer_v1",
+    "emphasize_control_in_prompt": True,
+    "no_eviction": True,
+}
+
+
+def transfer_config(**overrides):
+    return config(dict(conditioning=TRANSFER_CONTROL, chunk_size=1, window_frames=51, sink_frames=1), **overrides)
+
+
+def test_transfer_keeps_checkpoint_total_window():
+    effective = Cosmos3NanoSimBimanualManifest.from_od_config(transfer_config())
     assert (effective.window_frames, effective.sink_frames) == (51, 1)
     assert effective.conditioning_tokens_per_frame == 0
-    assert effective.require_control_video_conditioning().model_dump(mode="json") == control
+    assert effective.require_control_video_conditioning().model_dump(mode="json") == TRANSFER_CONTROL
+
+
+@pytest.mark.parametrize(("cache_size", "sinks", "expected"), [(30, 3, (30, 3)), (30, None, (30, 0)), (1, 0, (1, 0))])
+def test_transfer_deploy_override_replaces_checkpoint_total_window(cache_size, sinks, expected):
+    baseline = Cosmos3NanoSimBimanualManifest.from_od_config(transfer_config())
+    overrides = {"kv_cache_inference_size": cache_size}
+    if sinks is not None:
+        overrides["attention_sink_size"] = sinks
+    effective = Cosmos3NanoSimBimanualManifest.from_od_config(transfer_config(**overrides))
+    # Transfer keeps the reference total; requests resolve sinks and recent frames from it.
+    assert (effective.window_frames, effective.sink_frames) == expected
+    assert effective.digest != baseline.digest
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attention_sink_size": 3},
+        {"kv_cache_inference_size": 0},
+        {"kv_cache_inference_size": True},
+        {"kv_cache_inference_size": 30, "attention_sink_size": 30},
+        {"kv_cache_inference_size": 30, "attention_sink_size": -1},
+    ],
+)
+def test_transfer_invalid_deploy_override_rejected(overrides):
+    with pytest.raises(ValueError):
+        Cosmos3NanoSimBimanualManifest.from_od_config(transfer_config(**overrides))
 
 
 @pytest.mark.parametrize(("cache_size", "sinks"), [(16, 0), (30, 3), (64, 8), (128, 32)])

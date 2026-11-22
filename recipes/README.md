@@ -122,7 +122,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`TaoLiveAIGC/TaoMate-H3.md`](./TaoLiveAIGC/TaoMate-H3.md) | Realtime streaming presenter: MiniMax-H3 + TaoMate LoRA on the AR-Diffusion runtime | 2x H200-class FP8 (USP2) or 4x BF16 (USP4) |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
 | [`cosmos3/Cosmos3-Nano-Sim-Bimanual.md`](./cosmos3/Cosmos3-Nano-Sim-Bimanual.md) | Action- and camera-conditioned video generation with offline and typed tick requests | 1x CUDA GPU |
-| [`cosmos3/Cosmos3-Nano-Sim-Transfer.md`](./cosmos3/Cosmos3-Nano-Sim-Transfer.md) | Offline control-video-conditioned generation (edge, blur, depth, segmentation) | 1x CUDA GPU |
+| [`cosmos3/Cosmos3-Nano-Sim-Transfer-GB200.md`](./cosmos3/Cosmos3-Nano-Sim-Transfer-GB200.md) | Offline control-video-conditioned generation (edge, blur, depth, segmentation) | 1x GB200 |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |
 | [`cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md`](./cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md) | Up-to-11-camera AV video generation (T2V / I2V / WSM transfer / view completion), optional joint numeric LiDAR | 1x / 2x (CFG) GB200 186GB, strict Ulysses CP; TP/HSDP configuration-only |

@@ -20,6 +20,18 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def reference_trim(history, *, tokens_per_frame, window_frames, sink_frames):
+    """Independently select paired sinks and recent past from detached K/V."""
+    sink_tokens = 2 * sink_frames * tokens_per_frame
+    recent_tokens = 2 * (window_frames - sink_frames - 1) * tokens_per_frame
+    for layer_idx, pair in enumerate(history):
+        length = pair[0].shape[1]
+        if length > sink_tokens + recent_tokens:
+            history[layer_idx] = tuple(
+                torch.cat((tensor[:, :sink_tokens], tensor[:, length - recent_tokens :]), dim=1) for tensor in pair
+            )
+
+
 @pytest.mark.parametrize(
     "chunk,window,sinks", [(1, 1, 0), (1, 3, 0), (1, 3, 2), (1, 4, 1), (1, 30, 3), (2, 30, 0), (4, 30, 0)]
 )
@@ -36,7 +48,7 @@ def test_joint_storage_matches_attention_and_clean_history(chunk, window, sinks)
     for frame in range(0, 12, chunk):
         if chunk == 1 and original is not None:
             settings = dict(tokens_per_frame=BLOCK, window_frames=window, sink_frames=sinks)
-            _trim_transfer_history(original, **settings)
+            reference_trim(original, **settings)
             _trim_transfer_history(staged, dense_cache=cache, **settings)
             expected_frames = [i for i in range(frame) if i < sinks or i >= frame - (window - sinks - 1)]
             assert cache.history_length == 2 * len(expected_frames) * BLOCK
