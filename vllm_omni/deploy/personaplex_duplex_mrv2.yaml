@@ -1,10 +1,4 @@
-# Historical mixed-runner profile; unavailable with vLLM 0.34 / V2-only execution.
-# The V2 suffix describes Code2Wav, not complete PersonaPlex support.
-# Configuration resolution rejects the retained V1 Talker pin.
-# Stage 0 (Talker) required Model Runner V1 for lockstep resumable append,
-# post_sample_talker_mtp device depformer scheduling, and pacing.
-# Stage 1 (Code2Wav) runs on MRv2 with shared Mimi decode, TF32 GEMMs,
-# and streaming chunk synthesis.
+# CUDA Model Runner V2 profile for PersonaPlex full-duplex serving.
 base_config: personaplex.yaml
 
 session_mode: duplex
@@ -12,8 +6,8 @@ model_runner: v2
 
 stages:
   - stage_id: 0
-    # Stage 0 Talker stays on V1 for lockstep post-sample depformer execution
-    model_runner: v1
+    # Stage 0 uses its model-owned duplex runtime through MRv2 post_sample.
+    model_runner: v2
     async_scheduling: false
     # hf_overrides replaces personaplex.yaml's rather than merging into it, so
     # restate the RoPE table that covers the max_model_len inherited from it.

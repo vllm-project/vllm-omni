@@ -156,6 +156,10 @@ Content-Type: application/json
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 | `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
 
+For Step-Audio2, `max_new_tokens` overrides the first (Thinker) stage's token
+budget. Omitting it preserves deployment defaults; later stages keep their
+configured budgets. This is a token limit, not an audio-duration limit.
+
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
 #### Voice Clone Parameters (Base task)
@@ -1069,6 +1073,10 @@ OmniVoice processes voice-cloning audio after decoding. It removes middle gaps o
 OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
 key, and value tensors are evaluated in BF16 even when the stage is configured with `dtype: float32`; the attention output is converted back to the model's
 hidden-state dtype before the output projection. Consequently, a float32 stage configuration does not imply FP32 attention arithmetic.
+When the selected diffusion attention backend cannot run packed variable-length attention, as with the cuDNN default on sm_12x Blackwell
+GPUs, OmniVoice runs vLLM's FlashAttention 2 varlen kernel when the device supports it and otherwise uses SDPA with a block mask.
+On those GPUs the FlashAttention 2 kernels are compiled from PTX at first use, which adds about 16 seconds to the first server start on an
+RTX 5070; the CUDA compute cache keeps them for later starts.
 
 OmniVoice splits long input into smaller text chunks and joins the decoded audio. You can change the split behavior for one request through `extra_params`:
 

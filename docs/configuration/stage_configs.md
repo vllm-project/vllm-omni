@@ -324,16 +324,22 @@ model or deployment on a platform.
 
 Profiles that still resolve to V1 are unavailable with this version. These
 include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
-PersonaPlex's Talker, VibeVoice, YuE2, and the LFM3-Omni profiles. Selecting
+PersonaPlex's Talker, VibeVoice, and the LFM3-Omni profiles. Selecting
 `v2` manually does not establish support for those paths.
-YuE2's audio synthesis still depends on V1 model sampling hooks; its two
-offline audio export tests are not applicable to the V2 runtime.
 The complete PersonaPlex workflow is also unavailable: its Talker still
 requires V1, although its Code2Wav stage has V2 components.
 The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
 hardware validation remains pending. Retained V1 profiles identify unavailable
 workflows and preserve explicit configuration errors. They do not provide a V1
 fallback.
+
+YuE2's `yue2.yaml` uses the shared V2 AR runner with a model-owned sampler and
+model-state lifecycle hooks. The sampler preserves phase-specific sampling and
+paired CFG; the hooks release AR slots while NAR/VAE jobs complete and deliver audio by
+request ID. Automatic ABC transitions reset the same request's phase state.
+The profile requires one GPU, synchronous scheduling, and disabled prefix
+caching and external KV transfer. See the [YuE2 recipe](gh-file:recipes/m-a-p/YuE2-3B.md).
+
 Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
 are unavailable. Their retired serving E2E tests covered speech generation,
 voice cloning, streaming, concurrency and request validation across those
