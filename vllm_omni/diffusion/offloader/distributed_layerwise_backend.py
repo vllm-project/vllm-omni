@@ -21,7 +21,8 @@ from __future__ import annotations
 import threading
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from functools import partial
 from itertools import chain
 from typing import Any
@@ -33,6 +34,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
+    FusedTensorBinding,
     HostWeightPlan,
 )
 from vllm_omni.host_weight_runtime import HostWeightLease
@@ -133,6 +135,56 @@ def _forget_active_hwr_registration(
 # ones stay resident for lower latency.
 
 
+def _get_cached_tensor(file_cache: dict[str, Any], file_path: str, checkpoint_key: str) -> torch.Tensor:
+    """Return one checkpoint tensor, opening each safetensors file once."""
+    from safetensors import safe_open
+
+    handle = file_cache.get(file_path)
+    if handle is None:
+        handle = safe_open(file_path, framework="pt", device="cpu")
+        file_cache[file_path] = handle
+    return handle.get_tensor(checkpoint_key)
+
+
+def _binding_target(pipeline: nn.Module, runtime_name: str) -> torch.Tensor:
+    """Resolve a plan runtime name to its live parameter or buffer."""
+    parent_path, _, leaf_name = runtime_name.rpartition(".")
+    parent = pipeline.get_submodule(parent_path)
+    target = parent._parameters.get(leaf_name)
+    if target is None:
+        target = parent._buffers.get(leaf_name)
+    if target is None:
+        raise RuntimeError(f"Host-weight plan target tensor {runtime_name!r} no longer exists")
+    return target
+
+
+@dataclass(frozen=True)
+class _FusedMmapSource:
+    """Checkpoint slices fused into one runtime tensor during bounded staging.
+
+    ``slices`` are file-backed checkpoint views, so retaining them costs no
+    anonymous host memory. ``layout`` is a meta tensor describing the fused
+    runtime shape and stride, which sizing and copy checks use without
+    materializing the fused tensor outside a staging slot.
+    """
+
+    slices: tuple[torch.Tensor, ...]
+    fuse: Callable[[Sequence[torch.Tensor]], torch.Tensor]
+    layout: torch.Tensor
+
+    @classmethod
+    def build(
+        cls,
+        slices: tuple[torch.Tensor, ...],
+        fuse: Callable[[Sequence[torch.Tensor]], torch.Tensor],
+    ) -> _FusedMmapSource:
+        meta_slices = tuple(torch.empty(tuple(s.shape), dtype=s.dtype, device="meta") for s in slices)
+        return cls(slices=slices, fuse=fuse, layout=fuse(meta_slices))
+
+    def runtime_layout(self) -> torch.Tensor:
+        return self.layout
+
+
 class DistributedLayerwiseOffloadHook(ModelHook):
     """Hook for distributed layerwise offloading with fixed double-buffer.
 
@@ -159,6 +211,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
         rank_local_mmap: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
+        fused_sources: dict[int, Any] | None = None,
         materialization_probe_tensor: torch.Tensor | None = None,
         chunk_size_bytes: int = 64 * 1024 * 1024,
     ):
@@ -181,6 +234,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.rank_local_mmap = rank_local_mmap
         self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
+        # Runtime tensors fused from several checkpoint slices during staging;
+        # keyed by the id of the placeholder parameter the loader produced.
+        self.fused_sources = fused_sources or {}
 
         self._materialization_probe = materialization_probe_tensor
 
@@ -283,6 +339,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 self.next_block_parameters,
                 self.next_block_buffers,
                 self.tensor_transforms,
+                self.fused_sources,
             )
         elif self.dp_size > 1:
             self.cpu_shards, self.metadata, self.manifest = self._pack_chunk_shards(
@@ -345,24 +402,58 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         params: dict[str, nn.Parameter],
         bufs: dict[str, torch.Tensor],
         tensor_transforms: dict[int, Any] | None = None,
+        fused_sources: dict[int, Any] | None = None,
     ) -> tuple[dict[torch.dtype, list[dict[str, Any]]], dict[torch.dtype, list[dict[str, Any]]]]:
         """Retain file-backed tensors and describe their runtime layout.
 
         The returned sources preserve safetensors mmap storage.  Runtime-layout
         adapters are applied only while packing a bounded staging slot, so no
-        full-model anonymous CPU copy is retained by a worker.
+        full-model anonymous CPU copy is retained by a worker.  A fused runtime
+        tensor records its checkpoint slices plus the fusion callable, so the
+        same bounded staging slot materializes the runtime layout on demand.
         """
         cpu_sources: dict[torch.dtype, list[dict[str, Any]]] = {}
         metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
         offsets: dict[torch.dtype, int] = {}
         for name, target in chain(params.items(), bufs.items()):
+            dtype = target.dtype
+            offset = offsets.get(dtype, 0)
+            fused = (fused_sources or {}).get(id(target))
+            if fused is not None:
+                runtime_source = fused.runtime_layout()
+                stride = runtime_source.stride()
+                storage_numel = (
+                    0
+                    if runtime_source.numel() == 0
+                    else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(runtime_source.shape, stride))
+                )
+                cpu_sources.setdefault(dtype, []).append(
+                    {
+                        "name": name,
+                        "tensor": None,
+                        "transform": None,
+                        "fuse": fused.fuse,
+                        "slices": fused.slices,
+                    }
+                )
+                metadata.setdefault(dtype, []).append(
+                    {
+                        "name": name,
+                        "offset": offset,
+                        "numel": storage_numel,
+                        "shape": runtime_source.shape,
+                        "stride": stride,
+                    }
+                )
+                offsets[dtype] = offset + storage_numel
+                continue
+
             source = target.to_local() if hasattr(target, "to_local") else target
             if source.device.type != "cpu":
                 raise ValueError(
                     f"Rank-local mmap storage requires CPU checkpoint views, but {name!r} is on {source.device}."
                 )
 
-            dtype = source.dtype
             offset = offsets.get(dtype, 0)
             transform = (tensor_transforms or {}).get(id(target))
             runtime_source = transform(source) if callable(transform) else source
@@ -542,10 +633,17 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         meta: dict[str, Any],
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        source = source_info["tensor"]
-        transform = source_info["transform"]
-        if callable(transform):
-            source = transform(source)
+        fuse = source_info.get("fuse")
+        if callable(fuse):
+            # Fused runtime tensors have no single checkpoint entry; build the
+            # runtime layout for this block only, inside the bounded staging
+            # path, and never retain it beyond the copy that consumes it.
+            source = fuse(tuple(source_info["slices"]))
+        else:
+            source = source_info["tensor"]
+            transform = source_info["transform"]
+            if callable(transform):
+                source = transform(source)
         if source.dtype != dtype or source.shape != meta["shape"] or source.stride() != meta["stride"]:
             raise ValueError(
                 "mmap weight transform changed tensor layout for "
@@ -881,6 +979,7 @@ def apply_distributed_block_hook(
     shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
     rank_local_mmap: bool = False,
     tensor_transforms: dict[int, Any] | None = None,
+    fused_sources: dict[int, Any] | None = None,
     materialization_probe_tensor: torch.Tensor | None = None,
     chunk_size_bytes: int = 64 * 1024 * 1024,
 ) -> DistributedLayerwiseOffloadHook:
@@ -898,6 +997,7 @@ def apply_distributed_block_hook(
         shared_buffers=shared_buffers,
         rank_local_mmap=rank_local_mmap,
         tensor_transforms=tensor_transforms,
+        fused_sources=fused_sources,
         materialization_probe_tensor=materialization_probe_tensor,
         chunk_size_bytes=chunk_size_bytes,
     )
@@ -1166,6 +1266,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._host_weight_lease: HostWeightLease | None = None
         self._host_registration: HostRegistration | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
+        self._mmap_fused_by_tensor_id: dict[int, _FusedMmapSource] = {}
         self._poisoned_reason: str | None = None
 
     def load_resident_layers(self) -> None:
@@ -1197,6 +1298,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for sources in cpu_sources.values():
                 for source in sources:
                     tensor = source["tensor"]
+                    if tensor is None:
+                        # Fused tensors are assembled per staging slot, so they
+                        # have no persistent host view to register.
+                        continue
                     if id(tensor) not in seen:
                         seen.add(id(tensor))
                         tensors.append(tensor)
@@ -1318,33 +1423,33 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     def _load_weights_via_mmap(
         self,
         pipeline: nn.Module,
-        dits: tuple[ResolvedComponent, ...],
+        components: tuple[ResolvedComponent, ...],
         plan: HostWeightPlan,
     ) -> None:
-        """Load DiT checkpoint tensors as file-backed safetensors views.
+        """Load planned checkpoint tensors as file-backed safetensors views.
 
-        When the transformer is created on meta device, this method
-        replaces meta params with mmap views of the checkpoint files.
-        The views point to OS page cache shared across ranks. AllGather mode
-        copies only the rank's 1/dp_size shard to a persistent private buffer;
-        rank-local mode retains the views and packs one block at a time into
-        bounded staging storage.
+        Every component in ``components`` is converted to the meta device and
+        then realized from the loader's prevalidated plan: params become mmap
+        views, and fused runtime tensors keep their checkpoint slices so the
+        bounded staging path can assemble them on demand. The views point to OS
+        page cache shared across ranks. AllGather mode copies only the rank's
+        1/dp_size shard to a persistent private buffer; rank-local mode retains
+        the views and packs one block at a time into bounded staging storage.
 
-        Non-DiT modules (VAE, encoders) are NOT affected — they were
-        created on CPU with real weights via from_pretrained.
+        Components outside the plan (VAEs, non-streamed encoders) are NOT
+        affected — they were created with real weights by the ordinary loader.
         """
-        from safetensors import safe_open
 
         logger.info(
-            "Loading DiT weights via mmap (meta -> shared page cache): %d tensors",
+            "Loading planned component weights via mmap (meta -> shared page cache): %d tensors",
             len(plan.bindings),
         )
 
-        # --- Convert DiT modules to meta device ---
-        # The transformer was created normally (with random weights and
-        # correct non-persistent buffers from __init__).  We convert it
-        # to meta device to release the random weights (they're useless),
-        # then load real weights via mmap.
+        # --- Convert planned components to meta device ---
+        # Each component was created normally (with random weights and correct
+        # non-persistent buffers from __init__).  We convert it to meta device
+        # to release the random weights (they're useless), then load real
+        # weights via mmap.
         #
         # Non-persistent buffers (e.g. RoPE inv_freq, timestep freqs) are
         # NOT in the checkpoint — they are computed from formulas in
@@ -1357,16 +1462,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # rediscover a checkpoint layout.
 
         #
-        # Important: when DiT modules are nested (e.g. transformer contains
-        # transformer.language_model), to_empty("meta") on the parent
-        # converts the child's buffers too.  So we must save ALL buffers
-        # from ALL DiT modules BEFORE any to_empty call.
+        # Important: when components are nested (e.g. transformer contains
+        # transformer.language_model), to_empty("meta") on the parent converts
+        # the child's buffers too.  So we must save ALL buffers from ALL planned
+        # components BEFORE any to_empty call.
         saved_buffers: dict[int, dict[str, torch.Tensor]] = {}
-        for dit_module in (component.module for component in dits):
+        for component in components:
+            module = component.module
             bufs: dict[str, torch.Tensor] = {}
-            for name, buf in dit_module.named_buffers():
+            for name, buf in module.named_buffers():
                 # Check if this buffer is non-persistent on its OWNING module
-                owner = dit_module
+                owner = module
                 parts = name.split(".")
                 for part in parts[:-1]:
                     owner = getattr(owner, part)
@@ -1376,30 +1482,31 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 # before to_empty, but be safe)
                 if is_non_persistent:
                     bufs[name] = buf.detach().clone()
-            saved_buffers[id(dit_module)] = bufs
+            saved_buffers[id(module)] = bufs
 
-        # Now convert all DiT modules to meta (after saving all buffers).
-        # Skip modules that are already meta (happens when a parent DiT
-        # module contains a child DiT module — to_empty on the parent
-        # already converted the child).
-        for dit_module in (component.module for component in dits):
-            if any(p.is_meta for p in dit_module.parameters()):
+        # Now convert all planned components to meta (after saving all buffers).
+        # Skip modules that are already meta (happens when a parent component
+        # contains a nested one — to_empty on the parent already converted it).
+        for component in components:
+            module = component.module
+            if any(p.is_meta for p in module.parameters()):
                 logger.info(
                     "%s already on meta device (skipping to_empty, %d buffers saved)",
-                    dit_module.__class__.__name__,
-                    len(saved_buffers.get(id(dit_module), {})),
+                    module.__class__.__name__,
+                    len(saved_buffers.get(id(module), {})),
                 )
                 continue
-            dit_module.to_empty(device="meta")
+            module.to_empty(device="meta")
             logger.info(
                 "Converted %s to meta device (%d non-persistent buffers saved)",
-                dit_module.__class__.__name__,
-                len(saved_buffers.get(id(dit_module), {})),
+                module.__class__.__name__,
+                len(saved_buffers.get(id(module), {})),
             )
 
         # Cache open file handles
         file_cache: dict[str, Any] = {}
         loaded_names: set[str] = set()
+        fused_by_name: dict[str, _FusedMmapSource] = {}
 
         # Realize the loader's exact runtime-name bindings.  In particular,
         # do not reconstruct names from DLO block discovery: storage planning
@@ -1418,15 +1525,25 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             if target is None:
                 raise RuntimeError(f"Host-weight plan target tensor {runtime_name!r} no longer exists")
 
-            if binding.file_path not in file_cache:
-                file_cache[binding.file_path] = safe_open(
-                    binding.file_path,
-                    framework="pt",
-                    device="cpu",
-                )
-            tensor = file_cache[binding.file_path].get_tensor(binding.checkpoint_key)
             if is_parameter:
-                replacement = torch.nn.Parameter(tensor, requires_grad=target.requires_grad)
+                requires_grad = target.requires_grad
+            if isinstance(binding, FusedTensorBinding):
+                # A fused runtime tensor has no single checkpoint entry, so it
+                # cannot be realized as an mmap view. Keep a value-less
+                # placeholder with the validated runtime shape; bounded staging
+                # fuses the checkpoint slices when the block is prefetched.
+                if binding.fuse is None:
+                    raise RuntimeError(f"Fused host-weight binding {runtime_name!r} has no fusion callable")
+                slices = tuple(
+                    _get_cached_tensor(file_cache, file_path, checkpoint_key)
+                    for checkpoint_key, file_path in zip(binding.checkpoint_keys, binding.file_paths, strict=True)
+                )
+                fused_by_name[runtime_name] = _FusedMmapSource.build(slices=slices, fuse=binding.fuse)
+                tensor = torch.empty(tuple(target.shape), dtype=target.dtype, device="cpu")
+            else:
+                tensor = _get_cached_tensor(file_cache, binding.file_path, binding.checkpoint_key)
+            if is_parameter:
+                replacement = torch.nn.Parameter(tensor, requires_grad=requires_grad)
                 parent._parameters[leaf_name] = replacement
             else:
                 replacement = tensor
@@ -1443,7 +1560,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # assigning checkpoint tensors. The mmap path bypasses that loader, so
         # preserve the same lifecycle for transforms such as Cosmos3's fp32
         # timestep embedder.
-        for dit_name, dit_module in ((component.path, component.module) for component in dits):
+        for component in components:
+            dit_name, dit_module = component.path, component.module
             # Restore non-persistent buffers before post-load hooks and strict
             # validation. They are constructor-derived and intentionally have
             # no checkpoint binding.
@@ -1473,7 +1591,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # submodule), so associate deferred bounded transforms with the final
         # runtime tensor objects rather than the initial mmap replacements.
         self._mmap_transforms_by_tensor_id.clear()
+        self._mmap_fused_by_tensor_id.clear()
         for runtime_name, binding in plan.bindings.items():
+            if isinstance(binding, FusedTensorBinding):
+                self._mmap_fused_by_tensor_id[id(_binding_target(pipeline, runtime_name))] = fused_by_name[runtime_name]
+                continue
             if binding.transform is None:
                 continue
             parent_path, _, leaf_name = runtime_name.rpartition(".")
@@ -1488,7 +1610,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._mmap_transforms_by_tensor_id[id(target)] = binding.transform
 
         remaining_meta: list[str] = []
-        for dit_name, dit_module in ((component.path, component.module) for component in dits):
+        for dit_name, dit_module in ((component.path, component.module) for component in components):
             remaining_meta.extend(
                 f"{dit_name}.{name}" for name, tensor in dit_module.named_parameters() if tensor.is_meta
             )
@@ -1500,7 +1622,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if remaining_meta:
             raise RuntimeError(
                 "The prevalidated host-weight plan left "
-                f"{len(remaining_meta)} DiT tensors on the meta device "
+                f"{len(remaining_meta)} component tensors on the meta device "
                 f"(first 5: {remaining_meta[:5]})."
             )
 
@@ -1574,6 +1696,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         This selects the transport only.  The plan's checkpoint transforms are
         required by every transport, because the loader skipped ordinary
         loading for every planned tensor.
+
+        This composes the loader-side rank-local preflight (TP=1, non-quantized,
+        HSDP-free, single-rank transfer) that ``_using_rank_local_mmap`` already
+        encodes with the resolver-side ``backing`` declaration. A component that
+        resolved to a non-mmapped backing is ineligible even when the loader
+        produced a plan.
         """
         return component.selected and self._using_rank_local_mmap and component.backing is BackingKind.CHECKPOINT_MMAP
 
@@ -1621,6 +1749,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
                     tensor_transforms=self._mmap_transforms_by_tensor_id,
+                    fused_sources=self._mmap_fused_by_tensor_id if use_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
                     chunk_size_bytes=self.config.chunk_size_bytes,
                 )
@@ -1830,7 +1959,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             elif host_weight_plan.backing_kind == "checkpoint_mmap":
                 self._load_weights_via_mmap(
                     pipeline,
-                    resolved.dits,
+                    tuple(resolved.dits)
+                    + tuple(component for component in resolved.encoders if self._component_mmap_eligible(component)),
                     host_weight_plan,
                 )
             else:
@@ -1989,6 +2119,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self._host_registration is not None:
             raise HostRegistrationCleanupError("cannot close HWR mappings while host registration is still active")
         self._mmap_transforms_by_tensor_id.clear()
+        self._mmap_fused_by_tensor_id.clear()
         if hasattr(self, "_mmap_file_cache"):
             self._mmap_file_cache.clear()
             del self._mmap_file_cache

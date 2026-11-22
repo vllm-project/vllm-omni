@@ -101,6 +101,16 @@ parallel / quantization constraints, and any disk-streaming backing a resolver
 cannot serve fails closed to `PINNED` with a `fallback_reason` before a backend
 touches the mmap path.
 
+The loader's host-weight plan expresses one runtime tensor per binding as either
+a single checkpoint entry (`TensorBinding`, optionally with a rank-local layout
+transform) or several entries fused while a bounded staging slot is packed
+(`FusedTensorBinding`, an ordered `checkpoint_keys`/`file_paths` pair plus a
+`fuse` callable). A component that fuses weights in its own loader — for
+example `q/k/v` into `qkv_proj` — declares those source suffixes through the
+direct-mmap adapter, so plan preflight can prove the fused runtime shape from
+tensor metadata alone and staging fuses exactly what the ordinary loader would
+have produced.
+
 An undeclared DiT submodule joins the plan only when it is large enough that
 keeping it resident would defeat streaming; its block container is then found
 by scanning well-known attribute names, which warns once per submodule class.
