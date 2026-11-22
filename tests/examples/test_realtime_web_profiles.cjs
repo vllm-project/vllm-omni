@@ -53,6 +53,21 @@ test('PersonaPlex caption grouping uses audio time and resets at a new response'
   assert.equal(profile.mapEvent({ type: 'response.output_audio_transcript.done', response_id: 'r2', transcript: 'Hello' }).text, 'Hello');
 });
 
+test('PersonaPlex final captions preserve raw streamed spaces and Unicode offsets', () => {
+  const profile = profiles['personaplex-native']();
+  profile.mapEvent({ type: 'response.created', response: { id: 'r1' } });
+  const prefix = ' Hello 🌍.';
+  const suffix = ' Again.';
+  profile.mapEvent({ type: 'response.output_audio_transcript.delta', response_id: 'r1', delta: prefix });
+  profile.mapEvent({ type: 'response.output_audio.delta', response_id: 'r1',
+    sample_rate_hz: 24000, delta: Buffer.alloc(2400 * 24 * 2).toString('base64') });
+  profile.mapEvent({ type: 'response.output_audio_transcript.delta', response_id: 'r1', delta: suffix });
+  const final = profile.mapEvent({ type: 'response.output_audio_transcript.done', response_id: 'r1',
+    transcript: prefix + suffix });
+  assert.equal(final.text, suffix);
+  assert.equal(final.transcriptId, 'r1:caption-2');
+});
+
 test('MiniCPM keeps native flags, reference voice, camera, acknowledgements and no commits', () => {
   const native = profiles['minicpm-native']();
   const url = new URL(native.url({ ...config, model: 'MiniCPM' }, 'https://localhost/ui/'));

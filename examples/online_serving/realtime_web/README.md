@@ -27,7 +27,7 @@ Start the PersonaPlex backend, then the shared WebUI in a second terminal:
 
 ```bash
 vllm serve nvidia/personaplex-7b-v1 --omni --port 8091 \
-    --deploy-config vllm_omni/deploy/personaplex.yaml
+    --deploy-config vllm_omni/deploy/personaplex_duplex_mrv2.yaml
 
 python -m examples.online_serving.realtime_web --profile personaplex-native \
     --ws-backend ws://127.0.0.1:8091 --port 7862

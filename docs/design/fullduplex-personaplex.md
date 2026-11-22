@@ -23,6 +23,14 @@ selected by `PipelineConfig.duplex_plugin`. The historical serving path was:
   -> response.output_audio.delta + response.output_audio_transcript.delta
 ```
 
+The data plane also projects Stage 0 cumulative text tokens into assistant
+transcript deltas while leaving the same output available for Stage 1 audio
+generation. SentencePiece word boundaries are preserved and EPAD/PAD frames
+are omitted; per-request text offsets are cleared when the stream or session
+closes. Realtime constructs the final transcript from those same deltas. The
+`personaplex-native` WebUI profile displays them as captions, with row breaks
+based on gaps in the output audio timeline rather than model turn boundaries.
+
 The pre-framework pair (engine runtime extension plus serving adapter) and
 the standalone `/api/chat` / `/v1/audio/duplex` server are gone; the plugin is
 the only integration surface, and this document describes it.

@@ -39,8 +39,8 @@ from vllm_omni.model_executor.models.personaplex.duplex.plugin import (
     PersonaPlexSessionState,
 )
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -361,6 +361,8 @@ def test_runtime_config_update_treats_a_blank_voice_as_a_clear() -> None:
         with pytest.raises(DuplexRuntimeConfigError, match="voice") as excinfo:
             plugin.runtime_config_for_update(config, current)
         assert excinfo.value.code == "voice_update_unsupported"
+
+
 def test_caption_tokenizer_preserves_spaces_and_cleans_up_only_the_owning_session(tmp_path) -> None:
     import sentencepiece
 
@@ -395,6 +397,13 @@ def test_caption_tokenizer_preserves_spaces_and_cleans_up_only_the_owning_sessio
     assert project(first_id, ids)[0]["text"] == " Hello world!"
     plane.close_stream(first_id)
     assert project(first_id, ids)[0]["text"] == " Hello world!"
+
+    # Corrupt IDs must not crash caption projection or replay earlier text.
+    invalid_id = duplex_resource_request_id(DuplexFence("invalid"), "stage0")
+    malformed = [-1, tokenizer.get_piece_size(), *ids]
+    assert project(invalid_id, malformed)[0]["text"] == " Hello world!"
+    assert project(invalid_id, malformed) == []
+    assert project(invalid_id, [*malformed, ids[-1]])[0]["text"] == "!"
 
 
 def test_data_plane_context_is_the_framework_default() -> None:

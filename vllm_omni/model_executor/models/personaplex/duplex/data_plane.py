@@ -11,7 +11,7 @@ from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext, EncodeAudio
 from vllm_omni.model_executor.common.duplex.data_plane import CumulativeAudioTextDataPlane
 from vllm_omni.model_executor.common.request_outputs import unwrap_request_output
 from vllm_omni.model_executor.models.personaplex.duplex.config import SAMPLE_RATE
-from vllm_omni.model_executor.models.personaplex.duplex.policy import NON_TEXT_TOKEN_IDS
+from vllm_omni.model_executor.models.personaplex.duplex.policy import ZERO_TEXT_TOKEN
 
 
 class PersonaPlexDataPlaneSession(CumulativeAudioTextDataPlane):
@@ -35,7 +35,7 @@ class PersonaPlexDataPlaneSession(CumulativeAudioTextDataPlane):
         # Match the native PersonaPlex text stream, preserving word boundaries
         # between individual tokens and omitting EPAD/PAD frames.
         self._text_pieces = tuple(
-            "" if token_id in NON_TEXT_TOKEN_IDS else tokenizer.id_to_piece(token_id).replace("▁", " ")
+            "" if token_id in (0, ZERO_TEXT_TOKEN) else tokenizer.id_to_piece(token_id).replace("▁", " ")
             for token_id in range(tokenizer.get_piece_size())
         )
 
@@ -48,7 +48,9 @@ class PersonaPlexDataPlaneSession(CumulativeAudioTextDataPlane):
         if self._text_pieces is None or not isinstance(request_id, str) or not token_ids:
             return None
         offset = self._text_offsets.get(request_id, 0)
-        text = "".join(self._text_pieces[token_id] for token_id in token_ids[offset:])
+        text = "".join(
+            self._text_pieces[token_id] for token_id in token_ids[offset:] if 0 <= token_id < len(self._text_pieces)
+        )
         self._text_offsets[request_id] = len(token_ids)
         if not text:
             return None

@@ -46,8 +46,10 @@
           const raw = new ArrayBuffer(1920 * 4);
           const view = new DataView(raw);
           for (let i = 0; i < 1920; i += 1) view.setFloat32(i * 4, joined[offset + i] / 32768, true);
+          let binary = '';
+          for (const byte of new Uint8Array(raw)) binary += String.fromCharCode(byte);
           events.push({ type: 'input_audio_buffer.append',
-            audio: btoa(String.fromCharCode(...new Uint8Array(raw))), format: 'pcm_f32le', sample_rate_hz: 24000 });
+            audio: btoa(binary), format: 'pcm_f32le', sample_rate_hz: 24000 });
           offset += 1920;
         }
         pending = joined.slice(offset);
@@ -75,6 +77,9 @@
         if (action.role === 'assistant' && captionNumber) {
           // Only the caption key changes; audio keeps its original response ID.
           action.transcriptId = `${action.responseId}:caption-${captionNumber}`;
+          // Realtime builds the final transcript by concatenating the same
+          // projected deltas, without further SentencePiece normalization.
+          // Keep offsets in that raw stream; trimming happens only for display.
           if (action.kind === 'text-final') action.text = action.text.slice(captionStart);
         }
         return action;

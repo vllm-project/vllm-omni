@@ -203,7 +203,9 @@ def main(default_profile: str = "minicpm-native") -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
     parser.add_argument(
-        "--profile", choices=("minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn", "personaplex-native"), default=default_profile
+        "--profile",
+        choices=("minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn", "personaplex-native"),
+        default=default_profile,
     )
     parser.add_argument("--ws-backend", "--backend", dest="ws_backend")
     mode = parser.add_mutually_exclusive_group()
