@@ -80,6 +80,13 @@ overridden. Tensor parallelism is supported (reference
 parity target: TP4 on 4x GB200, equivalent to the reference's CP4); sequence, CFG, pipeline and
 VAE patch parallelism are rejected.
 
+The supplied YAML leaves `devices` unset, so the stage inherits `CUDA_VISIBLE_DEVICES`.
+Choose `--tensor-parallel-size 1`, `2`, or `4` in the offline runner and expose at least that
+many GPUs; no deployment copy or checkpoint reconversion is needed. The runner defaults to
+TP1. See the [launch settings](../../examples/offline_inference/cosmos3_nano_sim_auto/README.md)
+for examples. Smaller TP sizes increase memory required per GPU; memory fit and GPU inference
+parity remain unvalidated on the target hardware.
+
 ## Requests
 
 Requests follow the Cosmos3 multiview contract: `multiview.views[*]` with `camera_key`, `prompt`,

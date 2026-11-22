@@ -5,6 +5,7 @@ Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
+import json
 import warnings
 from pathlib import Path
 from unittest.mock import patch
@@ -692,6 +693,73 @@ class TestPipelineDiscovery:
         assert p.hf_architectures == ("SomeCollidingArch",)
 
 
+class TestModelIndexDiscovery:
+    """A shared HF model type must not hide a specific Diffusers pipeline."""
+
+    @pytest.mark.parametrize("load_hf_config", [True, False], ids=["hf-config", "raw-json"])
+    @pytest.mark.parametrize(
+        ("model_type", "model_index", "expected_model_type"),
+        [
+            ("cosmos3_omni", {"_class_name": "Cosmos3NanoSimAutoPipeline"}, "cosmos3_nano_sim_auto"),
+            ("cosmos3_omni", {"_class_name": "Cosmos3OmniDiffusersPipeline"}, "cosmos3_omni"),
+            ("cosmos3_omni", {"_class_name": "UnknownPipeline"}, "cosmos3_omni"),
+            ("cosmos3_omni", {"_class_name": None}, "cosmos3_omni"),
+            ("cosmos3_omni", {}, "cosmos3_omni"),
+            ("cosmos3_omni", None, "cosmos3_omni"),
+            ("step_audio_2", {"_class_name": "Cosmos3NanoSimAutoPipeline"}, "step_audio_2"),
+        ],
+    )
+    def test_model_index_complements_unregistered_root_type(
+        self, tmp_path, load_hf_config, model_type, model_index, expected_model_type
+    ):
+        # A matching directory name must not override explicit HF metadata.
+        model = tmp_path / "cosmos3_nano_sim_auto"
+        model.mkdir()
+        config_dict = {"model_type": model_type, "architectures": ["Cosmos3ForConditionalGeneration"]}
+        (model / "config.json").write_text(json.dumps(config_dict))
+        if model_index is not None:
+            (model / "model_index.json").write_text(json.dumps(model_index))
+        hf_config = PretrainedConfig(**config_dict) if load_hf_config else None
+
+        with patch.object(StageConfigFactory, "get_hf_config", return_value=hf_config):
+            assert StageConfigFactory.try_infer_model_type(str(model), False) == expected_model_type
+            pipeline = StageConfigFactory.get_pipeline_config(str(model), False)
+
+        assert pipeline is OMNI_PIPELINES.get(expected_model_type)
+
+    @pytest.mark.parametrize("load_hf_config", [True, False], ids=["hf-config", "raw-json"])
+    @pytest.mark.parametrize("tp_size", [1, 2, 4])
+    def test_sim_auto_discovery_loads_default_backend_and_honors_explicit_deploy(
+        self, tmp_path, load_hf_config, tp_size
+    ):
+        config_dict = {"model_type": "cosmos3_omni", "architectures": ["Cosmos3ForConditionalGeneration"]}
+        (tmp_path / "config.json").write_text(json.dumps(config_dict))
+        (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "Cosmos3NanoSimAutoPipeline"}))
+        hf_config = PretrainedConfig(**config_dict) if load_hf_config else None
+
+        with patch.object(StageConfigFactory, "get_hf_config", return_value=hf_config):
+            config = StageConfigFactory.create_from_model(
+                str(tmp_path),
+                trust_remote_code=False,
+                cli_overrides={"parallel_config": DiffusionParallelConfig(tensor_parallel_size=tp_size)},
+                deploy_config_path=None,
+            )
+            explicit_pipeline = StageConfigFactory.get_pipeline_config(
+                str(tmp_path), False, deploy_config_path=get_deploy_config_path("cosmos3_omni.yaml")
+            )
+
+        assert config is not None
+        assert config.pipeline_config is OMNI_PIPELINES["cosmos3_nano_sim_auto"]
+        stage = config.stage_by_id(0)
+        assert stage.parallel_config.tensor_parallel_size == tp_size
+        assert stage.parallel_config.world_size == stage.runtime_config.num_gpus == tp_size
+        assert stage.runtime_config.devices is None
+        diffusion_config = stage.diffusion_config
+        assert diffusion_config.model_class_name == "Cosmos3NanoSimAutoPipeline"
+        assert diffusion_config.engine_backend == "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+        assert explicit_pipeline is OMNI_PIPELINES["cosmos3_omni_deploy"]
+
+
 class TestCosmos3PolicyPipeline:
     """Cosmos3 policy serving resolves via deploy yaml selection (π0 precedent)."""
 
@@ -821,7 +889,13 @@ class TestCosmos3OmniDeployPipeline:
 
         StageConfigFactory.get_hf_config.cache_clear()
         StageConfigFactory.try_infer_model_type.cache_clear()
-        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+        with (
+            patch("vllm_omni.config.config_factory.get_config", return_value=fake_config),
+            patch(
+                "vllm_omni.config.config_factory.get_hf_file_to_dict",
+                return_value={"_class_name": "Cosmos3OmniDiffusersPipeline"},
+            ),
+        ):
             assert (
                 StageConfigFactory.get_pipeline_config(
                     model=model,
@@ -976,7 +1050,7 @@ class TestPipelineRegistration:
                     deploy_config_path=str(deploy_path),
                 )
 
-    def test_resolve_pipeline_matches_hf_architecture_fallback(self, clean_pipeline_registry):
+    def test_resolve_pipeline_matches_hf_architecture_fallback(self, clean_pipeline_registry, tmp_path):
         pipeline_key = "architecture_fallback_pipeline"
         pipe_cfg = PipelineConfig(
             model_type=pipeline_key,
@@ -992,14 +1066,14 @@ class TestPipelineRegistration:
         fake_config.architectures = ["ArchitectureFallbackForTest"]
         with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
             pipeline_cfg = StageConfigFactory.get_pipeline_config(
-                "fake/model",
+                str(tmp_path),
                 trust_remote_code=True,
                 deploy_config_path=None,
             )
 
         assert pipeline_cfg is pipe_cfg
 
-    def test_resolve_pipeline_architecture_fallback_respects_predicates(self, clean_pipeline_registry):
+    def test_resolve_pipeline_architecture_fallback_respects_predicates(self, clean_pipeline_registry, tmp_path):
         shared_arch = "SharedPredicateArchitectureForTest"
 
         def rejecting_predicate(_hf_config):
@@ -1036,7 +1110,7 @@ class TestPipelineRegistration:
         fake_config.architectures = [shared_arch]
         with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
             pipeline_cfg = StageConfigFactory.get_pipeline_config(
-                "fake/model",
+                str(tmp_path),
                 trust_remote_code=True,
                 deploy_config_path=None,
             )
@@ -1046,6 +1120,7 @@ class TestPipelineRegistration:
     def test_resolve_pipeline_architecture_fallback_rejects_non_matching_architecture(
         self,
         clean_pipeline_registry,
+        tmp_path,
     ):
         predicate_calls = []
 
@@ -1068,7 +1143,7 @@ class TestPipelineRegistration:
         fake_config.architectures = ["RequestedArchitectureForTest"]
         with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
             pipeline_cfg = StageConfigFactory.get_pipeline_config(
-                "fake/model",
+                str(tmp_path),
                 trust_remote_code=True,
                 deploy_config_path=None,
             )
@@ -1076,7 +1151,7 @@ class TestPipelineRegistration:
         assert pipeline_cfg is None
         assert predicate_calls == [fake_config]
 
-    def test_resolve_pipeline_architecture_fallback_resolves_callable_pipeline(self, clean_pipeline_registry):
+    def test_resolve_pipeline_architecture_fallback_resolves_callable_pipeline(self, clean_pipeline_registry, tmp_path):
         pipeline_key = "callable_architecture_fallback"
         resolved_cfg = PipelineConfig(
             model_type="callable_resolved_pipeline",
@@ -1098,7 +1173,7 @@ class TestPipelineRegistration:
         fake_config.architectures = ["CallableArchitectureForTest"]
         with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
             pipeline_cfg = StageConfigFactory.get_pipeline_config(
-                "fake/model",
+                str(tmp_path),
                 trust_remote_code=True,
                 deploy_config_path=None,
             )
@@ -1106,7 +1181,9 @@ class TestPipelineRegistration:
         assert pipeline_cfg is resolved_cfg
         assert seen_hf_configs == [fake_config]
 
-    def test_resolve_pipeline_returns_none_without_registry_or_architecture_match(self, clean_pipeline_registry):
+    def test_resolve_pipeline_returns_none_without_registry_or_architecture_match(
+        self, clean_pipeline_registry, tmp_path
+    ):
         class FakeConfig(PretrainedConfig):
             model_type = "unregistered_model_type"
 
@@ -1114,7 +1191,7 @@ class TestPipelineRegistration:
         fake_config.architectures = ["UnmatchedArchitectureForTest"]
         with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
             pipeline_cfg = StageConfigFactory.get_pipeline_config(
-                "fake/model",
+                str(tmp_path),
                 trust_remote_code=True,
                 deploy_config_path=None,
             )

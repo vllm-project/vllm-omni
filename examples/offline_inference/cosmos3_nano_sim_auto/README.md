@@ -25,6 +25,23 @@ for joint checkpoints, a numeric LiDAR HD-map control (plus an optional measured
        --output-dir outputs/sim_auto --tensor-parallel-size 4
    ```
 
+The default deployment inherits `CUDA_VISIBLE_DEVICES`; it does not pin the stage to GPU 0.
+Use the same YAML and exported checkpoint for these launch settings:
+
+| GPUs | `CUDA_VISIBLE_DEVICES` example | Runner option |
+| --- | --- | --- |
+| 1 | `0` | `--tensor-parallel-size 1` (default) |
+| 2 | `0,1` | `--tensor-parallel-size 2` |
+| 4 | `0,1,2,3` | `--tensor-parallel-size 4` |
+
+Set `CUDA_VISIBLE_DEVICES` before launching Python. For example, `CUDA_VISIBLE_DEVICES=2,5`
+with `--tensor-parallel-size 2` selects physical GPUs 2 and 5. At least as many GPUs must be
+visible as the requested TP size. A custom `--deploy-config` with an explicit `devices` field
+still restricts stage placement; omit that field to retain this behavior.
+
+Fewer GPUs require more memory per GPU for the sharded weights and KV cache. TP1/TP2 memory
+fit and GPU inference parity still need validation on the target hardware.
+
 Outputs per sample: `vision_view{NN}_{camera}.mp4`, `lidar.safetensors` (`frames` `[3,T,128,1800]`
 range/intensity/validity) when the request asks for LiDAR output, and `sample_outputs.json`.
 Add `--save-latents` to write `latents.pt` and record its path in `sample_outputs.json`.

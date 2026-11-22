@@ -265,9 +265,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True, help="Prepared request JSON or JSONL.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/cosmos3_nano_sim_auto"))
     parser.add_argument(
-        "--deploy-config", default=None, help="Deploy YAML (defaults to vllm_omni/deploy/cosmos3_nano_sim_auto.yaml)."
+        "--deploy-config",
+        default=str(Path(__file__).resolve().parents[3] / "vllm_omni/deploy/cosmos3_nano_sim_auto.yaml"),
+        help="Deploy YAML (defaults to vllm_omni/deploy/cosmos3_nano_sim_auto.yaml).",
     )
-    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs for tensor parallelism (default: 1). Select GPUs with CUDA_VISIBLE_DEVICES.",
+    )
     parser.add_argument(
         "--seed",
         type=int,

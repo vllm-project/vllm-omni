@@ -216,33 +216,39 @@ class StageConfigFactory:
             model=model,
             trust_remote_code=trust_remote_code,
         )
-        if hf_config is not None:
-            return hf_config.model_type
+        model_type = hf_config.model_type if hf_config is not None else None
+        if model_type in OMNI_PIPELINES:
+            return model_type
 
         config_source = _materialize_object_storage_configs(model)
 
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
-        try:
-            config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
-            if config_dict:
-                if "model_type" in config_dict:
-                    return config_dict["model_type"]
-                # VoxCPM2-style configs use singular ``architecture`` rather
-                # than HF's standard ``model_type`` / ``architectures``. Accept
-                # it as a fallback so the pipeline registry can still match.
-                if "architecture" in config_dict and isinstance(config_dict["architecture"], str):
-                    return config_dict["architecture"]
-        except Exception as e:
-            logger.debug(f"Failed to auto-detect model type for {model}: {e}")
+        if hf_config is None:
+            try:
+                config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
+                if config_dict:
+                    if "model_type" in config_dict:
+                        model_type = config_dict["model_type"]
+                    # VoxCPM2-style configs use singular ``architecture`` rather
+                    # than HF's standard ``model_type`` / ``architectures``. Accept
+                    # it as a fallback so the pipeline registry can still match.
+                    elif "architecture" in config_dict and isinstance(config_dict["architecture"], str):
+                        model_type = config_dict["architecture"]
+            except Exception as e:
+                logger.debug(f"Failed to auto-detect model type for {model}: {e}")
+            if model_type in OMNI_PIPELINES:
+                return model_type
 
         # Fallback for diffusers-style models: check model_index.json.
         # Some models (e.g. GLM-Image) have no root config.json but ship a
         # model_index.json with _class_name that maps to a pipeline key via
         # PipelineConfig.diffusers_class_name.
+        # Others (e.g. Cosmos3-Nano-Sim-Auto) have an unregistered shared HF
+        # model_type but identify their specific pipeline in model_index.json.
         try:
             model_index = get_hf_file_to_dict("model_index.json", config_source, revision=None)
-            if model_index and "_class_name" in model_index:
+            if model_index and isinstance(model_index.get("_class_name"), str):
                 class_name = model_index["_class_name"]
                 for obj in OMNI_PIPELINES.values():
                     # If we have a resolver, call it with the optional hf_config
@@ -260,6 +266,11 @@ class StageConfigFactory:
                         return pipeline_cfg.model_type
         except Exception as e:
             logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
+
+        # Preserve explicit HF metadata when no pipeline class matches. Model
+        # directory names must not override an unregistered root model_type.
+        if model_type is not None:
+            return model_type
 
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path
