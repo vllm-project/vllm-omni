@@ -395,4 +395,21 @@ The per-request `[StageRequestStats]` table is logged at `DEBUG` (for example `V
 
 Missing and zero are different. A field is `None` when its interval was not observed: a diffusion stage, `--log-stats` off, or an engine-core event that never arrived. A measured `0` stays `0`. In the `[StageRequestStats]` table a missing value prints as `None`, and, as for every other field, a row whose values are all zero or missing is hidden.
 
-For a streaming-input request, only the output that finishes the request carries the split. On an AR stage, vLLM's output processor finishes the request only after the input stream has ended; at each earlier segment stop it applies the next streaming update instead, which restarts the request stats, so the split covers the last input segment. The last segment's `QUEUED` event can arrive with the previous segment's final output, before that restart, so its `vllm_queued_ms` may be missing. A generation stage finishes on the first output that is not a segment stop and does not restart its stats between segments, so its split spans the whole request: `vllm_prefill_ms` is the first segment's, `vllm_decode_ms` runs from the first segment's first output to the last output, gaps between segments included, and `vllm_queued_ms` is missing when a later segment was queued after the first scheduling. The fields are not added to the `stage_metrics` snapshot returned to clients and benchmarks. The duplex per-response table leaves them out (`DUPLEX_STAGE_TABLE_EXCLUDE`): they describe one engine-core request, not a response turn.
+For a streaming-input request, only the output that finishes the request carries the split. On an AR stage, vLLM's output processor finishes the request only after the input stream has ended; at each earlier segment stop it applies the next streaming update instead, which restarts the request stats, so the split covers the last input segment. The last segment's `QUEUED` event can arrive with the previous segment's final output, before that restart, so its `vllm_queued_ms` may be missing. A generation stage finishes on the first output that is not a segment stop and does not restart its stats between segments, so its split spans the whole request: `vllm_prefill_ms` is the first segment's, `vllm_decode_ms` runs from the first segment's first output to the last output, gaps between segments included, and `vllm_queued_ms` is missing when a later segment was queued after the first scheduling. The duplex per-response table leaves them out (`DUPLEX_STAGE_TABLE_EXCLUDE`): they describe one engine-core request, not a response turn.
+
+When a client opts into `return_stage_metrics`, the bounded `stage_metrics`
+snapshot includes the phase split above together with stage generation,
+cross-stage receive, scheduler wait, pipeline, and orchestrator dispatch fields.
+`orchestrator_dispatch_wait_ms` is the sum of the time that output batches for
+the request-stage spent between the event-driven replica reader enqueue and the
+single serial dispatcher dequeue. `orchestrator_dispatch_wait_max_ms` is the
+largest such batch wait, and `orchestrator_dispatch_batches` is the number of
+batches in that sum. The fields are absent under the legacy polling loop rather
+than reported as measured zeros.
+
+With `--enable-orch-monitor`, the same opt-in snapshot also carries one bounded
+`orchestrator_snapshot`: current and run-high-water central dispatch depth plus
+current and run-high-water replica output-queue and inflight counts. It contains
+only configured stage/replica identities; request IDs and payload data are not
+used as keys or labels. Benchmark result compaction keeps these scalar/nested
+diagnostics but still drops per-token latency lists.

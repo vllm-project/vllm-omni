@@ -2575,10 +2575,55 @@ async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_
         assert warmup_salts == [None] * 4
 
 
-@pytest.mark.parametrize("snapshot", [None, {}, "not-a-dict"])
+@pytest.mark.parametrize("snapshot", [None, {}, "not-a-dict", {"0": {"vllm_itls_ms": [1.0, 2.0]}}])
 def test_compact_request_stage_metrics_drops_empty_snapshots(snapshot):
     """Empty chat-omni snapshots must not make every result persist request_stage_metrics."""
     assert patch._compact_request_stage_metrics(snapshot) is None
+
+
+def test_compact_request_stage_metrics_keeps_bounded_latency_diagnostics():
+    snapshot = {
+        "2": {
+            "num_tokens_out": 512,
+            "stage_gen_time_ms": 9000.0,
+            "rx_transfer_bytes": 2048,
+            "rx_decode_time_ms": 3.0,
+            "rx_in_flight_time_ms": 4.0,
+            "scheduler_queue_wait_ms": 5.0,
+            "vllm_queued_ms": 6.0,
+            "vllm_prefill_ms": 7.0,
+            "vllm_decode_ms": 8000.0,
+            "vllm_num_preemptions": 1,
+            "orchestrator_dispatch_wait_ms": 8.0,
+            "orchestrator_dispatch_wait_max_ms": 3.0,
+            "orchestrator_dispatch_batches": 4,
+            "pipeline_timings": {"queue_wait_ms": 9.0},
+            "orchestrator_snapshot": {"dispatch_queue_high_water": 2},
+            "vllm_itls_ms": [1.0, 2.0],
+        }
+    }
+
+    compacted = patch._compact_request_stage_metrics(snapshot)
+
+    assert compacted == {
+        "2": {
+            "num_tokens_out": 512,
+            "stage_gen_time_ms": 9000.0,
+            "rx_transfer_bytes": 2048,
+            "rx_decode_time_ms": 3.0,
+            "rx_in_flight_time_ms": 4.0,
+            "scheduler_queue_wait_ms": 5.0,
+            "vllm_queued_ms": 6.0,
+            "vllm_prefill_ms": 7.0,
+            "vllm_decode_ms": 8000.0,
+            "vllm_num_preemptions": 1,
+            "orchestrator_dispatch_wait_ms": 8.0,
+            "orchestrator_dispatch_wait_max_ms": 3.0,
+            "orchestrator_dispatch_batches": 4,
+            "pipeline_timings": {"queue_wait_ms": 9.0},
+            "orchestrator_snapshot": {"dispatch_queue_high_water": 2},
+        }
+    }
 
 
 # --------------------------------------------------------------------------- #

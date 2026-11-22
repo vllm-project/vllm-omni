@@ -1447,18 +1447,35 @@ _REQUEST_STAGE_METRIC_FIELDS = (
     "finish_reason",
     defs.AUDIO_FRAMES,
     f"{defs.AUDIO_DURATION}_s",
+    defs.STAGE_GEN_TIME_MS,
+    "rx_transfer_bytes",
+    "rx_decode_time_ms",
+    "rx_in_flight_time_ms",
+    defs.SCHEDULER_QUEUE_WAIT_MS,
+    defs.VLLM_QUEUED_MS,
+    defs.VLLM_PREFILL_MS,
+    defs.VLLM_DECODE_MS,
+    defs.VLLM_NUM_PREEMPTIONS,
+    defs.ORCHESTRATOR_DISPATCH_WAIT_MS,
+    defs.ORCHESTRATOR_DISPATCH_WAIT_MAX_MS,
+    defs.ORCHESTRATOR_DISPATCH_BATCHES,
+    "pipeline_timings",
+    defs.ORCHESTRATOR_SNAPSHOT,
 )
 
 
 def _compact_request_stage_metrics(snapshot: object) -> dict[str, dict] | None:
-    """Keep the stage fields used for workload checks; empty snapshots become None."""
+    """Keep bounded workload and latency diagnostics; empty snapshots become None."""
     if not isinstance(snapshot, dict) or not snapshot:
         return None
-    return {
-        stage: {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
-        for stage, metrics in snapshot.items()
-        if isinstance(metrics, dict)
-    }
+    compacted = {}
+    for stage, metrics in snapshot.items():
+        if not isinstance(metrics, dict):
+            continue
+        stage_metrics = {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
+        if stage_metrics:
+            compacted[stage] = stage_metrics
+    return compacted or None
 
 
 def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
