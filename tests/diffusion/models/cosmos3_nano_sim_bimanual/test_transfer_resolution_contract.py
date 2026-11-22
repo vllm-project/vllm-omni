@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Transfer request geometry, prompt, and sliding-history contracts."""
 
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -458,18 +456,6 @@ def test_seed_media_is_rejected_at_admission(extra, prompt_data) -> None:
     with pytest.raises(ARDiffusionRequestRejectedError, match="seed images"):
         pipeline()._validate_conditioning_request(params(**extra), None, prompt_data=prompt_data)
     assert pipeline()._initial_condition_latent(prompt_data, params(), None) is None
-
-
-def test_prompt_file_relative_to_record_and_cli_override(tmp_path: Path) -> None:
-    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_transfer import _load_prompt
-
-    caption = {"scene": "robot", "objects": ["arm", "cube"]}
-    (tmp_path / "caption.json").write_text(json.dumps(caption, indent=2))
-    record = {"prompt_path": "caption.json"}
-    assert _load_prompt(record, tmp_path) == json.dumps(caption)
-    override = tmp_path / "caption.txt"
-    override.write_text("A different scene.\n")
-    assert _load_prompt(record, tmp_path, override) == "A different scene."
 
 
 def test_transfer_input_fps_overrides_request_fps() -> None:

@@ -105,38 +105,57 @@ for artifact requirements and how to enable the policy.
 
 ## Offline inference
 
-`offline_bimanual` runs full rollouts from JSONL records with the default
-deployment above. Each record can provide:
+Load a reference image and a prepared JSON file containing `action` and
+`domain_id`. Use normalized unified action rows as described above. Run the
+example from the repository root with `imageio[ffmpeg]` installed for MP4 export.
 
-- `prompt` (or `ai_caption` or `text`);
-- a source `input_video`, `video`, `frames`, or `image`; its first frame is the
-  reference image;
-- `action` rows, with optional `action_space`, `domain_id`, or
-  `domain_name`/`embodiment`;
-- `fps` (or `conditioning_fps` or `frame_rate`; 15 by default) and
-  `num_frames` (one more than the number of action rows by default);
-- `npz_path` or `data_path`, naming an NPZ file that supplies fields the record
-  does not set. NPZ object arrays are rejected;
-- `action_path`, naming a prepared JSON sidecar with
-  `action_space: normalized_unified_v1`, the `action` rows, and either
-  `domain_id` or `domain_names`. Domain names are resolved through the
-  checkpoint manifest, and `vision_path` supplies the reference image.
+```python
+import json
+from pathlib import Path
 
-Relative paths are resolved against the JSONL directory.
+from diffusers.utils import export_to_video
+from PIL import Image
 
-```bash
-python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual \
-  --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
-  --jsonl /data/reference_samples.jsonl \
-  --sample-index 0 \
-  --seed 42 \
-  --output cosmos3_nano_sim_bimanual_sample_0.mp4
+from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+if __name__ == "__main__":
+    actions = json.loads(Path("/data/actions.json").read_text())
+    with Image.open("/data/reference.png") as image:
+        reference = image.convert("RGB")
+
+    fps = 15
+    params = OmniDiffusionSamplingParams(
+        num_frames=len(actions["action"]) + 1,
+        frame_rate=fps,
+        guidance_scale=1.0,
+        seed=42,
+        output_type="np",
+        extra_args={
+            "action": actions["action"],
+            "action_space": "normalized_unified_v1",
+            "domain_id": actions["domain_id"],
+            "session_id": "bimanual-rollout",
+            "reset": True,
+            "close_session": True,
+        },
+    )
+    omni = Omni(
+        model="/checkpoints/cosmos3-nano-sim-bimanual-diffusers",
+        model_class_name="Cosmos3NanoSimBimanualPipeline",
+        deploy_config="vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml",
+    )
+    try:
+        outputs = omni.generate(
+            {"prompt": "The robot moves a block.", "multi_modal_data": {"image": reference}},
+            params,
+        )
+    finally:
+        omni.close()
+    export_to_video(outputs[0].images[0], "cosmos3_nano_sim_bimanual.mp4", fps=fps)
 ```
 
-Each sample is sent as its own session with `reset=true` and
-`close_session=true`. Use `--all-samples --output-dir <dir>` to run every
-record, and `--output-type latent` to save the pre-VAE latent tensor as a `.pt`
-file. Omit `--height` and `--width` to use the reference-image canvas described
-above. The runner checks the decoded frame count, FPS, and any explicit
-dimensions, writes per-sample status to `sample_outputs.json` in the output
-directory, and exits non-zero if any sample fails.
+To process multiple samples, reuse the `Omni` instance and submit each sample
+with its own session ID. If your input is a reference video, extract its first
+frame for this example. Set `output_type="latent"` to return the pre-VAE latent
+tensor in `outputs[0].images[0]` and save it with `torch.save`.
