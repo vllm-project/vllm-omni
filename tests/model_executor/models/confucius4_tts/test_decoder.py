@@ -326,3 +326,31 @@ def test_load_weights_requires_talker_checkpoint(
 
     with pytest.raises(FileNotFoundError, match="t2s_model.safetensors"):
         decoder.load_weights([])
+
+
+def _built_decoder(max_positions: int | None) -> Confucius4TTSS2ADecoder:
+    config = Confucius4TTSConfig() if max_positions is None else Confucius4TTSConfig(s2a_max_positions=max_positions)
+    vllm_config = Mock()
+    vllm_config.model_config.model = "/model"
+    vllm_config.model_config.hf_config = config
+    return Confucius4TTSS2ADecoder(vllm_config=vllm_config)
+
+
+def test_lower_request_budget_keeps_the_checkpoint_table_shape() -> None:
+    # The budget is a request limit. Built through __init__ before any weights load,
+    # a lower budget must leave every S2A parameter and buffer shape unchanged,
+    # otherwise the shipped checkpoint no longer loads.
+    default = _built_decoder(None)
+    lowered = _built_decoder(2048)
+
+    assert lowered.config.s2a_max_positions == 2048
+    default_shapes = {name: tuple(t.shape) for name, t in default.s2a_model.state_dict().items()}
+    lowered_shapes = {name: tuple(t.shape) for name, t in lowered.s2a_model.state_dict().items()}
+    assert lowered_shapes == default_shapes
+    assert lowered.s2a_model.decoder.estimator.freqs_cis.shape[0] == 4096
+
+
+@pytest.mark.parametrize("budget", [0, -1, 4097])
+def test_request_budget_outside_the_checkpoint_table_is_rejected(budget: int) -> None:
+    with pytest.raises(ValueError, match="s2a_max_positions"):
+        _built_decoder(budget)

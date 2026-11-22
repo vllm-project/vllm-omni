@@ -11,8 +11,9 @@ SEMANTIC_BOS_TOKEN_ID = 8192
 SEMANTIC_EOS_TOKEN_ID = 8193
 OUTPUT_SAMPLE_RATE = 22050
 DEFAULT_MAX_REFERENCE_AUDIO_SECONDS = 30.0
-# Rotary positions of the S2A DiT: reference mel frames plus generated frames. The
-# released checkpoint stores a table of this size and was not trained past it.
+# Rotary positions of the S2A DiT (reference mel frames plus generated frames). The
+# released checkpoint stores a table of this size and was not trained past it, so it
+# is the fixed table length and the upper bound of ``s2a_max_positions``.
 S2A_MAX_POSITIONS = 4096
 
 

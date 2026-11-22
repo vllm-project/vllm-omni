@@ -24,7 +24,7 @@ from vllm_omni.model_executor.models.indextts2.preprocess_utils import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .configuration_confucius4_tts import Confucius4TTSConfig
+from .configuration_confucius4_tts import S2A_MAX_POSITIONS, Confucius4TTSConfig
 from .confucius4_tts_latent_recompute import Confucius4TTST2SRecompute
 from .flow.flow import MaskedDiffWithXvec, MaskedDiffWithXvecConfig
 
@@ -68,6 +68,12 @@ class Confucius4TTSS2ADecoder(nn.Module):
         self.requires_raw_input_tokens = True
 
         cfg = self.config
+        # The budget only limits requests; the rotary table keeps the checkpoint's
+        # size, so a lower budget cannot change a parameter shape before loading.
+        if not 1 <= cfg.s2a_max_positions <= S2A_MAX_POSITIONS:
+            raise ValueError(
+                f"Confucius4-TTS s2a_max_positions must be in [1, {S2A_MAX_POSITIONS}], got {cfg.s2a_max_positions}"
+            )
         s2a_config = MaskedDiffWithXvecConfig(
             input_size=cfg.s2a_input_size,
             output_size=cfg.s2a_output_size,
@@ -92,7 +98,7 @@ class Confucius4TTSS2ADecoder(nn.Module):
             estimator_style_dim=cfg.s2a_estimator_style_dim,
             estimator_mlp_ratio=cfg.s2a_estimator_mlp_ratio,
             estimator_dropout=cfg.s2a_estimator_dropout,
-            estimator_max_seq_len=cfg.s2a_max_positions,
+            estimator_max_seq_len=S2A_MAX_POSITIONS,
             estimator_long_skip_connection=(cfg.s2a_estimator_long_skip_connection),
             estimator_final_layer=cfg.s2a_estimator_final_layer,
             estimator_wavenet_hidden_dim=(cfg.s2a_estimator_wavenet_hidden_dim),
