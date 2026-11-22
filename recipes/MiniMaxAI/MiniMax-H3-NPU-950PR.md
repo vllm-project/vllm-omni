@@ -83,8 +83,12 @@ steady-state latency.
 > port allocation has been observed to make the first request fail with
 > `EI0006 Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose
 > NPUs sit in more than one interconnect domain, such as a two-domain
-> 950PR/950DT host. Leave the variable unset; the default port allocation
-> works on every topology.
+> 950PR/950DT host. Leave the variable unset; the default port allocation is
+> the workaround for that report.
+>
+> The default allocation on a split-domain host is **not verified here**: the
+> available eight-card 950PR host keeps all eight NPUs in one HCCS domain, so
+> the two-domain first request of issue #10645 was not reproduced.
 
 ### Recommended lossy configuration (Ascend 950PR / 950DT)
 
@@ -127,8 +131,12 @@ window; see below for more aggressive settings.
 > port allocation has been observed to make the first request fail with
 > `EI0006 Communication_Error_Get_Socket` on `HcclBroadcast` on hosts whose
 > NPUs sit in more than one interconnect domain, such as a two-domain
-> 950PR/950DT host. Leave the variable unset; the default port allocation
-> works on every topology.
+> 950PR/950DT host. Leave the variable unset; the default port allocation is
+> the workaround for that report.
+>
+> The default allocation on a split-domain host is **not verified here**: the
+> available eight-card 950PR host keeps all eight NPUs in one HCCS domain, so
+> the two-domain first request of issue #10645 was not reproduced.
 
 ### Ref2VA on a 950PR that reports ~86 GB HBM
 
