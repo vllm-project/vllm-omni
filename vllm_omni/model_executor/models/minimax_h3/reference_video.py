@@ -4,22 +4,39 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import functools
+import io
 import json
 import math
 import os
 import subprocess
+import threading
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import regex as re
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.errors import OmniClientError
 
+logger = init_logger(__name__)
+
 MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY = "minimax_h3_prepared_reference_videos"
+MINIMAX_H3_REFERENCE_DECODE_WORKERS_ENV = "VLLM_OMNI_H3_REFERENCE_DECODE_WORKERS"
+_DIRECT_DECODE_FFMPEG_RELEASES = frozenset({(4, 2), (4, 3), (4, 4), (5, 1), (6, 0), (6, 1), (7, 0)})
+_FFMPEG_LOG_LEVEL_TAG = re.compile(rb"\[(trace|debug|verbose|info|warning|error|fatal|panic)\] ")
+_FFMPEG_GRAPH_INPUT = re.compile(rb"w:\d+ h:\d+ pixfmt:")
 
 
 def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
+    if any(item.get("prepared_path") is None for item in items):
+        raise ValueError("directly decoded MiniMax H3 reference videos have no prepared video to describe")
     fields = (
         "original_path",
         "prepared_path",
@@ -160,6 +177,7 @@ def _probe_video(path: str) -> dict[str, Any]:
         "video_codec": str(stream.get("codec_name", "")).lower(),
         "audio_codecs": audio_codecs,
         "file_size": file_size,
+        "stream_count": len(streams),
     }
 
 
@@ -396,6 +414,209 @@ def _transcode_reference_video(
     return output
 
 
+def reference_frame_workers() -> int:
+    raw = os.environ.get(MINIMAX_H3_REFERENCE_DECODE_WORKERS_ENV, "").strip()
+    if not raw:
+        cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+        return min(4, max(1, cpus // 8))
+    with contextlib.suppress(ValueError):
+        if (workers := int(raw)) >= 0:
+            return workers
+    raise ValueError(f"{MINIMAX_H3_REFERENCE_DECODE_WORKERS_ENV} must be a non-negative integer, got {raw!r}")
+
+
+@functools.cache
+def direct_reference_decode_supported() -> bool:
+    try:
+        banner = subprocess.run(
+            ["ffmpeg", "-version"], check=True, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        banner = ""
+    match = re.match(r"ffmpeg version n?(\d+)\.(\d+)", banner)
+    if match and (int(match[1]), int(match[2])) in _DIRECT_DECODE_FFMPEG_RELEASES:
+        return True
+    logger.info("MiniMax H3 keeps prepared.mp4 reference videos for %s", match[0] if match else "this ffmpeg")
+    return False
+
+
+class _FrameProtocolError(RuntimeError): ...
+
+
+class ReferenceVideoFrames:
+    def __init__(
+        self,
+        source: str,
+        *,
+        width: int,
+        height: int,
+        frame_count: int,
+        start_time_seconds: float,
+        duration_seconds: float,
+        workers: int,
+        stream_count: int,
+    ) -> None:
+        self.source = source
+        self.frame_count = frame_count
+        self._options: dict[str, Any] = {
+            "width": width,
+            "height": height,
+            "frame_count": frame_count,
+            "start_time_seconds": start_time_seconds,
+            "duration_seconds": duration_seconds,
+            "stream_count": stream_count,
+        }
+        self._repeat_late_start = stream_count != 1
+        frame_limit = frame_count
+        if self._repeat_late_start:
+            micros = round(float(f"{duration_seconds:.6f}") * 1_000_000)
+            frame_limit = min(frame_count, -(-micros * int(MINIMAX_H3_FPS) // 1_000_000))
+        self.workers = max(1, min(workers, frame_limit))
+        self._frame_limit = frame_limit if self.workers > 1 else frame_count
+        self._frames: torch.Tensor | None = torch.empty((frame_count, height, width, 3), dtype=torch.uint8)
+        self._counts = [0] * self.workers
+        self._errors: list[BaseException | None] = [None] * self.workers
+        self._error_logs: list[deque[bytes]] = [deque(maxlen=32) for _ in range(self.workers)]
+        self._property_changed = False
+        self._processes: list[subprocess.Popen[bytes]] = []
+        self._threads: list[threading.Thread] = []
+        split = self.workers > 1
+        frames = self._frames.numpy()
+        try:
+            for worker in range(self.workers):
+                process = subprocess.Popen(
+                    self._command(worker),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE if split else None,
+                    bufsize=0,
+                )
+                self._processes.append(process)
+                self._start_thread(self._read, worker, process.stdout, frames)
+                if split:
+                    self._start_thread(self._watch_log, worker, process.stderr, process)
+        except BaseException:
+            self.cancel()
+            raise
+
+    def _start_thread(self, target: Callable[..., None], *args: object) -> None:
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        thread.start()
+        self._threads.append(thread)
+
+    def _command(self, worker: int) -> list[str]:
+        options = self._options
+        duration = f"{options['duration_seconds']:.6f}"
+        split = self.workers > 1
+        filters = [f"fps={MINIMAX_H3_FPS:g}"]
+        if split:
+            filters.append(f"trim=duration={duration}")
+            if self._repeat_late_start:
+                filters.append(f"fps={MINIMAX_H3_FPS:g}:start_time=0")
+            filters.append(f"select=eq(mod(n\\,{self.workers})\\,{worker})")
+        filters += [f"scale={options['width']}:{options['height']}:flags=lanczos", "setsar=1"]
+        command = ["ffmpeg", "-nostdin", "-loglevel", "level+verbose" if split else "error"]
+        if split:
+            command += ["-filter_threads", "1"]
+        command += ["-ss", f"{options['start_time_seconds']:.6f}", "-i", self.source]
+        command += ["-map", "0:v:0", "-an", "-vf", ",".join(filters)]
+        if not (split and self._repeat_late_start):
+            command += ["-t", duration]
+        command += ["-frames:v", str(len(range(worker, self._frame_limit, self.workers)))]
+        if split:
+            command += ["-vsync", "0"]
+        return [*command, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+
+    def _read(self, worker: int, pipe: io.RawIOBase, frames: np.ndarray) -> None:
+        count = 0
+        try:
+            with pipe:
+                with contextlib.suppress(AttributeError, OSError):
+                    fcntl.fcntl(pipe, fcntl.F_SETPIPE_SZ, 1 << 20)
+                for index in range(worker, self.frame_count, self.workers):
+                    view = memoryview(frames[index]).cast("B")
+                    filled = 0
+                    while filled < len(view) and (size := pipe.readinto(view[filled:])):
+                        filled += size
+                    if not filled:
+                        break
+                    if filled != len(view):
+                        raise _FrameProtocolError(f"ffmpeg sent a partial frame for {self.source}")
+                    count += 1
+                if pipe.read(1):
+                    raise _FrameProtocolError(f"ffmpeg sent extra frames for {self.source}")
+        except BaseException as exc:
+            self._errors[worker] = exc
+        finally:
+            self._counts[worker] = count
+
+    def _watch_log(self, worker: int, pipe: io.RawIOBase, process: subprocess.Popen[bytes]) -> None:
+        forward, graphs = False, 0
+        with io.BufferedReader(pipe) as lines:
+            for line in lines:
+                if tag := _FFMPEG_LOG_LEVEL_TAG.search(line):
+                    forward = tag[1] in (b"error", b"fatal", b"panic")
+                    line = line[: tag.start()] + line[tag.end() :]
+                graphs += bool(_FFMPEG_GRAPH_INPUT.search(line))
+                if graphs > 1 or b"Changing video frame properties on the fly" in line:
+                    self._property_changed = True
+                    process.kill()
+                elif forward:
+                    self._error_logs[worker].append(line)
+                    if worker == 0:
+                        with contextlib.suppress(OSError):
+                            os.write(2, line)
+
+    def cancel(self) -> None:
+        for process in self._processes:
+            process.kill()
+            process.wait()
+        for thread in self._threads:
+            thread.join()
+        for process in self._processes:
+            for pipe in filter(None, (process.stdout, process.stderr)):
+                pipe.close()
+        self._frames = None
+
+    def result(self) -> torch.Tensor:
+        try:
+            for thread in self._threads:
+                thread.join()
+            returncodes = [process.wait() for process in self._processes]
+        except BaseException:
+            self.cancel()
+            raise
+        frames, self._frames = self._frames, None
+        if frames is None:
+            raise RuntimeError("reference video frames were already consumed")
+        errors = [error for error in self._errors if error is not None]
+        total = sum(self._counts)
+        if self.workers > 1 and (
+            self._property_changed
+            or any(isinstance(error, _FrameProtocolError) for error in errors)
+            or (
+                not (errors or any(returncodes))
+                and self._counts != [len(range(worker, total, self.workers)) for worker in range(self.workers)]
+            )
+        ):
+            del frames
+            (logger.info if self._property_changed else logger.warning)(
+                "MiniMax H3 decodes reference video %s again in one ffmpeg process", self.source
+            )
+            return ReferenceVideoFrames(self.source, workers=1, **self._options).result()
+        for worker, (returncode, process) in enumerate(zip(returncodes, self._processes)):
+            if returncode:
+                stderr = b"".join(self._error_logs[worker]) or None
+                raise subprocess.CalledProcessError(returncode, process.args, stderr=stderr) from (
+                    self._errors[worker] or next(iter(errors), None)
+                )
+        if errors:
+            raise errors[0]
+        if not total:
+            raise OmniClientError(f"video has no frames: {self.source}")
+        return frames if total == self.frame_count else frames[:total].clone()
+
+
 def prepare_edit_video(
     value: Any,
     target_width: int,
@@ -442,6 +663,7 @@ def prepare_reference_videos(
     target_frame_count: int,
     workdir: str,
     start_time_seconds: Any = None,
+    frame_workers: int = 0,
 ) -> list[dict[str, Any]]:
     if isinstance(values, (str, os.PathLike)):
         values = [values]
@@ -455,6 +677,7 @@ def prepare_reference_videos(
         raise OmniClientError("start_time_seconds must contain one value per reference video")
 
     prepared: list[dict[str, Any]] = []
+    metas: list[dict[str, Any]] = []
     total_duration = 0.0
     for index, value in enumerate(values):
         item_start = start_times[index]
@@ -485,21 +708,11 @@ def prepare_reference_videos(
                 raise OmniClientError("reference videos must be at most 15 seconds in total")
         total_duration += duration
         width, height = _reference_video_shape(meta["width"], meta["height"])
-        item_workdir = Path(workdir) / f"video_{index}"
-        item_workdir.mkdir(parents=True)
-        prepared_path = _transcode_reference_video(
-            source,
-            target_width=width,
-            target_height=height,
-            target_frame_count=target_frame_count,
-            workdir=str(item_workdir),
-            start_time_seconds=start,
-            duration_seconds=duration,
-        )
+        metas.append(meta)
         prepared.append(
             {
                 "original_path": source,
-                "prepared_path": prepared_path,
+                "prepared_path": None,
                 "input_has_audio": bool(meta.get("audio_codecs")),
                 "width": width,
                 "height": height,
@@ -515,6 +728,39 @@ def prepare_reference_videos(
                 ),
             }
         )
+    decode_frames = frame_workers > 0 and target_frame_count > 0 and direct_reference_decode_supported()
+    try:
+        for index, (item, meta) in enumerate(zip(prepared, metas)):
+            source, width, height = item["original_path"], item["width"], item["height"]
+            start, duration = item["start_time_seconds"], item["duration_seconds"]
+            if decode_frames:
+                item["frames"] = ReferenceVideoFrames(
+                    source,
+                    width=width,
+                    height=height,
+                    frame_count=target_frame_count,
+                    start_time_seconds=start,
+                    duration_seconds=duration,
+                    workers=max(1, frame_workers // len(prepared)),
+                    stream_count=meta["stream_count"],
+                )
+            else:
+                item_workdir = Path(workdir) / f"video_{index}"
+                item_workdir.mkdir(parents=True)
+                item["prepared_path"] = _transcode_reference_video(
+                    source,
+                    target_width=width,
+                    target_height=height,
+                    target_frame_count=target_frame_count,
+                    workdir=str(item_workdir),
+                    start_time_seconds=start,
+                    duration_seconds=duration,
+                )
+    except BaseException:
+        for item in prepared:
+            if "frames" in item:
+                item["frames"].cancel()
+        raise
     return prepared
 
 
@@ -759,6 +1005,7 @@ __all__ = [
     "load_video_frames",
     "prepare_edit_video",
     "prepare_reference_videos",
+    "reference_frame_workers",
     "sample_reference_video_frames",
     "validate_reference_audio_files",
     "validate_reference_audio_waveforms",

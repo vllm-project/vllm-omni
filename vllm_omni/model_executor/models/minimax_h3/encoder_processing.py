@@ -45,6 +45,7 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     load_video_frames,
     prepare_edit_video,
     prepare_reference_videos,
+    reference_frame_workers,
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
@@ -765,6 +766,7 @@ def prepare_encoder_inputs(
                         target_frame_count=num_frames,
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
+                        frame_workers=reference_frame_workers(),
                     )
                 audio_pool = ThreadPoolExecutor(max_workers=1)
                 try:
@@ -783,10 +785,15 @@ def prepare_encoder_inputs(
                         for item in prepared_videos
                     ]
                     for item, audio_future in zip(prepared_videos, audio_futures):
-                        full_frames = load_video_frames(item["prepared_path"])
-                        encoded_video_inputs.append(_frames_to_tensor(full_frames))
+                        if "frames" in item:
+                            video = item["frames"].result()
+                            full_frames = video.numpy()
+                        else:
+                            full_frames = load_video_frames(item["prepared_path"])
+                            video = _frames_to_tensor(full_frames)
+                        encoded_video_inputs.append(video)
                         sampled = sample_reference_video_frames(
-                            item["prepared_path"],
+                            item["prepared_path"] or item["original_path"],
                             decoded_frames=full_frames,
                         )
                         video_timestamps.append(sampled["block_timestamps"])
@@ -811,6 +818,9 @@ def prepare_encoder_inputs(
                         else:
                             video_audio_inputs.append(None)
                 finally:
+                    for item in prepared_videos:
+                        if "frames" in item:
+                            item["frames"].cancel()
                     audio_pool.shutdown(wait=True, cancel_futures=True)
         audio_index = 0
         for video_index, item in enumerate(prepared_videos, start=1):
