@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Waveform ownership across graph replays and asynchronous output copies."""
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -81,6 +82,39 @@ def make_decoder(*, v2=True, channels=2, device="cpu", model_type="moss_tts_loca
     decoder._n_channels = channels
     decoder._stream_max_step_frames = 3
     return decoder
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("codec_version", [1, 2])
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_loading_codec_releases_encoder_and_preserves_decode(monkeypatch, mocker, codec_version, device_type):
+    from tests.model_executor.models.moss_tts.test_audio_tokenizer_v1_streaming import _make_codec
+    from tests.model_executor.models.moss_tts.test_codec_ring_headroom import tiny_codec
+    from vllm_omni.model_executor.models.moss_tts import modeling_moss_tts_codec as codec_module
+
+    codec = _make_codec() if codec_version == 1 else tiny_codec()
+    codes = torch.tensor([[[1, 2, 3]], [[3, 2, 1]]])
+    expected = codec.batch_decode([codes[:, 0]], num_quantizers=2).audio
+    encoder_ref = weakref.ref(codec.encoder)
+    expected_parameters = {f"_codec.{name}" for name, _ in codec.named_parameters() if not name.startswith("encoder.")}
+    decoder = make_decoder(streaming=False)
+    decoder.vllm_config.device_config = SimpleNamespace(device=mocker.Mock(spec=torch.device, type=device_type))
+    decoder.vllm_config.load_config = object()
+    decoder.vllm_config.model_config.enforce_eager = True
+    monkeypatch.setattr(codec_module, "load_codec", lambda *args, **kwargs: (codec.config, codec))
+    empty_cache = mocker.patch.object(codec_module.current_omni_platform, "empty_cache", create=True)
+
+    loaded = decoder.load_weights(iter(()))
+
+    if device_type == "cpu":
+        empty_cache.assert_not_called()
+    else:
+        empty_cache.assert_called_once_with()
+    assert encoder_ref() is None
+    assert loaded == expected_parameters
+    assert codec.encoder is None
+    actual = decoder._codec.batch_decode([codes[:, 0]], num_quantizers=2).audio
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.cpu
@@ -180,7 +214,6 @@ def test_replays_terminal_tails_and_slot_reuse_preserve_pending_waveforms(v2, ch
             assert sum(slab.is_cuda for _, slab in payload._groups) == 1
             result = OmniModelRunnerOutput(
                 req_ids=["tail", "empty", "live"],
-                req_id_to_index={"tail": 0, "empty": 1, "live": 2},
                 sampled_token_ids=[[], [], []],
             )
             pending.append(

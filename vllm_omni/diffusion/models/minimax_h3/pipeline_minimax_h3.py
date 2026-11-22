@@ -28,6 +28,7 @@ from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
     require_request_attention_schedule_fits,
+    resolve_request_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
@@ -77,6 +78,7 @@ from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_fram
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.utils import filter_active_lora_adapters
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -169,7 +171,7 @@ from .latent_upscaler import (
     resolve_minimax_h3_latent_upscaler,
 )
 from .lightvae import resolve_h3_lightvae_decoder_path
-from .lora import TurboSpec, load_minimax_h3_turbo_lora
+from .lora import TurboSpec, load_minimax_h3_native_adapter, load_minimax_h3_turbo_lora
 from .minimax_h3_blocks import (
     MiniMaxH3Attention,
     _attention_isolates_packed_requests,
@@ -177,7 +179,7 @@ from .minimax_h3_blocks import (
 from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
-    load_minimax_h3_native_lora,
+    load_minimax_h3_native_distilled_lora,
 )
 from .packed_sequence import (
     MINIMAX_H3_MAX_PAD_SEQ_LEN,
@@ -202,6 +204,7 @@ from .regenerate import (
 )
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
 from .time_request import (
+    MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS,
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
@@ -757,7 +760,7 @@ class MiniMaxH3Pipeline(
         # same client-supplied ID. Every real load replaces the classification.
         self._clear_adaln_caches()
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
-        self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._native_distilled_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
@@ -784,7 +787,7 @@ class MiniMaxH3Pipeline(
         # running platform: the native loader is checkpoint-format parsing with
         # no ``torch_npu`` dependency, so it needs no ``current_omni_platform``
         # dispatch and binds the same adapter on NPU, CUDA and CPU.
-        native_loaded = load_minimax_h3_native_lora(
+        native_loaded = load_minimax_h3_native_distilled_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
@@ -793,10 +796,16 @@ class MiniMaxH3Pipeline(
         )
         if native_loaded is not None:
             lora_model, peft_helper, sigma_schedule = native_loaded
-            self._native_lora_adapter_ids.add(lora_request.lora_int_id)
+            self._native_distilled_lora_adapter_ids.add(lora_request.lora_int_id)
             self._lora_sigma_schedules[lora_request.lora_int_id] = sigma_schedule
             return lora_model, peft_helper
-        return None
+        return load_minimax_h3_native_adapter(
+            transformer=self.transformer,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
 
     def _validate_diffusion_lora_binding(
         self,
@@ -812,7 +821,7 @@ class MiniMaxH3Pipeline(
                     f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
                 )
             return
-        if lora_model.id not in self._native_lora_adapter_ids:
+        if lora_model.id not in self._native_distilled_lora_adapter_ids:
             return
         missing = sorted(set(lora_model.loras) - bound_lora_names)
         if missing:
@@ -828,17 +837,24 @@ class MiniMaxH3Pipeline(
         constrains the task nor imposes its sampler contract.
         """
 
-        lora_request = sampling.lora_request
-        if lora_request is None or math.isclose(0.0, float(sampling.lora_scale)):
-            return None
-        return self._turbo_lora_specs.get(lora_request.lora_int_id)
+        adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        specs = [
+            self._turbo_lora_specs[request.lora_int_id]
+            for request, _ in adapters
+            if request.lora_int_id in self._turbo_lora_specs
+        ]
+        if len(specs) > 1:
+            raise OmniClientError("MiniMax-H3 supports at most one Turbo adapter in a composition")
+        if len(adapters) > 1 and any(
+            request.lora_int_id in self._native_distilled_lora_adapter_ids for request, _ in adapters
+        ):
+            raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
+        return specs[0] if specs else None
 
     def _has_active_native_lora(self, sampling: Any) -> bool:
-        lora_request = sampling.lora_request
-        return (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._native_lora_adapter_ids
+        return any(
+            request.lora_int_id in self._native_distilled_lora_adapter_ids
+            for request, _ in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
         )
 
     def _validate_native_sampling(self, sampling: Any, *, task: str) -> None:
@@ -846,7 +862,9 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
         # Derive the expected count from the adapter's own schedule so the
         # message can never disagree with the schedule the denoise loop runs.
-        schedule = self._lora_sigma_schedules.get(sampling.lora_request.lora_int_id)
+        requests = sampling.lora_request
+        request = requests[0] if isinstance(requests, (list, tuple)) else requests
+        schedule = self._lora_sigma_schedules.get(request.lora_int_id)
         expected_steps = MINIMAX_H3_NATIVE_INFERENCE_STEPS if schedule is None else schedule.num_inference_steps
         # Only request mode can take the count from the adapter schedule: step
         # mode admits the request in ``StepScheduler``, which reads
@@ -854,7 +872,7 @@ class MiniMaxH3Pipeline(
         # omission there rather than advertise a contract that would either fail
         # admission or disagree with the denoise loop.
         od_config = getattr(self, "od_config", None)
-        omission_allowed = not getattr(od_config, "step_execution", False)
+        omission_allowed = od_config is None or not od_config.step_execution
         or_omitted = " or omitted" if omission_allowed else ""
         sigma_steps = sampling.num_inference_steps
         if sigma_steps is None:
@@ -877,12 +895,9 @@ class MiniMaxH3Pipeline(
             )
 
     def _sigma_schedule_for_request(self, sampling: Any, task: str) -> DMD2SigmaSchedule | None:
-        lora_request = sampling.lora_request
-        if (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._lora_sigma_schedules
-        ):
+        adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        lora_request = adapters[0][0] if adapters else None
+        if lora_request is not None and lora_request.lora_int_id in self._lora_sigma_schedules:
             adapter_schedule = self._lora_sigma_schedules[lora_request.lora_int_id]
             checkpoint_schedule = self._base_schedule_for_task(task)
             if checkpoint_schedule is not None:
@@ -945,10 +960,11 @@ class MiniMaxH3Pipeline(
         self.parallel_config = od_config.parallel_config
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
-        # A request that omits attention_schedule and latent_refine inherits both defaults, a pair
-        # _prepare_encoder_conditioning_inputs rejects; fail here instead of on every such request.
-        service_schedule = getattr(od_config, "diffusion_attention_schedule", None)
-        additional_config = getattr(od_config, "additional_config", None) or {}
+        # A request that omits attention_schedule, attention_sigma_schedule and latent_refine inherits the
+        # default step ranges and the latent_refine default, a pair _prepare_encoder_conditioning_inputs
+        # rejects; fail here instead of on every such request.
+        service_schedule = od_config.diffusion_attention_schedule
+        additional_config = od_config.additional_config or {}
         if (
             service_schedule is not None
             and service_schedule.default
@@ -956,8 +972,9 @@ class MiniMaxH3Pipeline(
         ):
             raise ValueError(
                 "MiniMax H3 cannot combine default diffusion_attention_schedule ranges with a latent_refine "
-                "default in --additional-config: every request that omits attention_schedule and latent_refine "
-                "would be rejected. Remove the default ranges or the latent_refine default."
+                "default in --additional-config: every request that omits attention_schedule, "
+                "attention_sigma_schedule and latent_refine would be rejected. Remove the default ranges or the "
+                "latent_refine default."
             )
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
@@ -999,10 +1016,10 @@ class MiniMaxH3Pipeline(
             self._PROFILER_TARGETS.remove("_encode_local_media")
         modular = is_minimax_h3_modular(str(od_config.model), od_config.revision)
         self.partition = _minimax_h3_partition_for_task(
-            getattr(od_config, "task_type", None),
+            od_config.task_type,
             str(od_config.model),
         )
-        control_path = getattr(od_config, "controlnet_model_path", None)
+        control_path = od_config.controlnet_model_path
         if control_path:
             if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
                 raise ValueError("--controlnet-model-path must be a local original .safetensors file")
@@ -1013,12 +1030,12 @@ class MiniMaxH3Pipeline(
                 or int(self.parallel_config.ulysses_degree) != 1
                 or int(self.parallel_config.ring_degree) != 1
                 or int(self.parallel_config.allgather_degree) != 1
-                or getattr(self.parallel_config, "use_hsdp", False)
-                or getattr(od_config, "step_execution", False)
-                or getattr(od_config, "quantization_config", None)
+                or self.parallel_config.use_hsdp
+                or od_config.step_execution
+                or od_config.quantization_config
                 or resolve_offload(od_config).strategy is not OffloadStrategy.NONE
-                or getattr(od_config, "host_weight_runtime_mode", "disabled") != "disabled"
-                or getattr(od_config, "cache_backend", "none") not in (None, "none")
+                or od_config.host_weight_runtime_mode != "disabled"
+                or od_config.cache_backend not in (None, "none")
             )
             if unsupported:
                 raise ValueError(
@@ -1026,7 +1043,7 @@ class MiniMaxH3Pipeline(
                     "and no cache/offload/SP/HSDP; TP is supported"
                 )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
-        self._native_lora_adapter_ids: set[int] = set()
+        self._native_distilled_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
@@ -1255,7 +1272,7 @@ class MiniMaxH3Pipeline(
         _, rank, dit_world = _dit_rank_world()
         self._dit_rank = rank
         if self.load_text_encoder:
-            text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1))
+            text_encoder_tp_size = int(self.parallel_config.text_encoder_tp_size)
             if text_encoder_tp_size < 1:
                 raise ValueError(f"text_encoder_tp_size must be >= 1, got {text_encoder_tp_size}")
             if text_encoder_tp_size > dit_world:
@@ -1293,9 +1310,7 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and (
-            offload_streams_blocks(od_config)
-        )
+        legacy_manual_components = od_config.diffusion_offload_config is None and offload_streams_blocks(od_config)
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
@@ -1431,7 +1446,14 @@ class MiniMaxH3Pipeline(
             self._fasth3.validate_fully_applied(transformer_loaded)
         if self._regenerate is not None:
             self._regenerate.validate_fully_applied(transformer_loaded)
-        if self._fasth3_checkpoint is not None:
+        if self._fasth3_checkpoint is not None and "transformer." in loaded_prefixes:
+            # Only the streamed checkpoint is checked here. A DLO host-weight
+            # plan owns the ``transformer.`` source and installs the DiT
+            # without this method (the loader drops that source before calling
+            # us), after binding every DiT parameter, gates included, and
+            # restored final layouts were checked by the canonical load that
+            # produced them. Checking an empty stream would blame a complete
+            # checkpoint for all of its gates.
             parameter_names = set(dict(self.transformer.named_parameters()))
             required_gates = set()
             for i in range(self.transformer.arch.num_layers):
@@ -1519,8 +1541,10 @@ class MiniMaxH3Pipeline(
                 cache.clear()
 
     def _prepare_adaln_adapter(self, sampling: OmniDiffusionSamplingParams) -> None:
-        request = getattr(sampling, "lora_request", None)
-        identity = None if request is None else (request.lora_int_id, request.lora_path, float(sampling.lora_scale))
+        identity = tuple(
+            (request.lora_int_id, request.lora_path, scale)
+            for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        )
         if identity != getattr(self, "_adaln_adapter_identity", None):
             self._clear_adaln_caches()
             self._adaln_adapter_identity = identity
@@ -1547,7 +1571,7 @@ class MiniMaxH3Pipeline(
             return positions, len(positions) - 1
         sigma_schedule = self._sigma_schedule_for_request(sampling, task)
         if sigma_schedule is None:
-            return None, int(sampling.num_inference_steps or 50)
+            return None, int(sampling.num_inference_steps or MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS)
         # The schedule lists sigma boundaries; the denoise loop runs one step
         # per interval, and that count is what requests and Cache-DiT speak in.
         num_steps = sigma_schedule.num_inference_steps
@@ -1720,7 +1744,7 @@ class MiniMaxH3Pipeline(
         od_config = getattr(self, "od_config", None)
         if od_config is None:
             return False
-        if getattr(od_config, "diffusion_offload_config", None) is None:
+        if od_config.diffusion_offload_config is None:
             # The compatibility topology stages every component it can.
             return offload_streams_blocks(od_config)
         return component is getattr(self, "text_encoder", None) and should_offload_component(
@@ -2026,6 +2050,9 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        keep_steps: int | None = None,
+        base_text_embeddings: torch.Tensor | None = None,
+        base_text_tags: torch.Tensor | None = None,
         sampler: str = "euler",
         init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
         refine: MiniMaxH3LatentRefineSpec | None = None,
@@ -2042,6 +2069,7 @@ class MiniMaxH3Pipeline(
         position ``refine`` selects, and the returned schedules begin there.
         """
         sampler = resolve_sampler_name(sampler)
+        self._validate_sampler_cache(sampler)
         if sampler != "euler" and base_schedule is not None:
             raise ValueError(
                 f"MiniMax H3 {sampler} sampling with a fixed distilled sigma schedule has not been validated; "
@@ -2171,6 +2199,75 @@ class MiniMaxH3Pipeline(
             full_video[branch.update_mask] = initial_video
             initial_video = full_video
 
+        base_branch = None
+        base_cond_rows = None
+        if keep_steps is not None:
+            # CodeVideoModel-style early-only video conditioning: build the
+            # image-only packed layout used after the leading keep_steps steps.
+            # Every visual condition draws its own noise from the same seed
+            # (see condition_noise.py), so slicing the image-row prefix of the
+            # full anchor reproduces an image-only anchor bit for bit.
+            if task != "ref2va":
+                raise ValueError("keep_steps requires task ref2va")
+            if guide_blocks:
+                # Guide rows pack ahead of the reference rows, so the prefix
+                # slice below would not isolate the image rows.
+                raise ValueError("keep_steps does not support timeline guides")
+            if control_rows is not None:
+                # Control rows ride the branch's static kwargs and are indexed
+                # against the full layout; the switch path is unvalidated.
+                raise ValueError("keep_steps does not support control conditioning")
+            if base_text_embeddings is None or base_text_tags is None:
+                raise ValueError("keep_steps requires base text conditioning (image-only presentation)")
+            kinds = [str(block.get("kind")) for block in (ref_blocks or [])]
+            n_images = kinds.count("image")
+            if (
+                kinds != ["image"] * n_images + ["video"]
+                or not visual_condition_shapes
+                or len(visual_condition_shapes) != len(kinds)
+            ):
+                raise ValueError("keep_steps expects image reference(s) plus exactly one silent video reference")
+            image_shapes = [tuple(int(v) for v in shape) for shape in visual_condition_shapes[:n_images]]
+            shape_image_rows = sum(
+                int(shape[0]) * (int(shape[1]) // 2) * (int(shape[2]) // 2) for shape in image_shapes
+            )
+            if visual_anchor is None or int(visual_anchor.shape[0]) <= shape_image_rows:
+                raise ValueError("keep_steps found no video reference rows to drop")
+            base_ref_blocks = [
+                {"kind": "image", "latent_h": int(shape[1]), "latent_w": int(shape[2])} for shape in image_shapes
+            ]
+            base_packed = minimax_h3_packed_sequence_ref2va_blocks(
+                text_len=int(base_text_embeddings.shape[0]),
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+                ref_blocks=base_ref_blocks,
+                seq_len=None,
+                temporal_offset=temporal_offset,
+                media_time_origin=media_time_origin,
+            )
+            base_tags = base_packed["token_tags"].clone()
+            base_tags[base_packed["text_pos"]] = base_text_tags.cpu()
+            base_branch = MiniMaxH3DenoiseBranch(
+                packed=base_packed,
+                text_embeddings=base_text_embeddings,
+                token_tags=base_tags,
+                device=self.device,
+            )
+            if int(base_branch.update_mask.sum()) != int(branch.update_mask.sum()):
+                raise ValueError("base branch target row count differs from the full branch")
+            if int(base_branch.audio_pos.shape[0]) != int(branch.audio_pos.shape[0]):
+                raise ValueError("keep_steps branches must share the same audio row layout")
+            # The anchor prefix must cover exactly the base layout's condition
+            # rows; derive the count from the layout and cross-check it against
+            # the shape arithmetic so a future packing change fails loudly
+            # instead of slicing the wrong prefix.
+            base_image_rows = int((~base_branch.update_mask).sum())
+            if base_image_rows != shape_image_rows:
+                raise ValueError("keep_steps image row count disagrees with the packed layout; the packer changed")
+            base_cond_rows = visual_anchor[:base_image_rows].to(device=self.device, dtype=torch.float32)
+
         if locked_audio_rows is not None:
             expected = (2 * audio_t, 32)
             if tuple(locked_audio_rows.shape) != expected:
@@ -2259,6 +2356,9 @@ class MiniMaxH3Pipeline(
             "sigmas_audio": audio_sigmas,
             "video_edit": video_edit,
             "audio_edit": audio_edit,
+            "base_branch": base_branch,
+            "base_cond_rows": base_cond_rows,
+            "keep_steps": keep_steps,
         }
 
     def _unpack_denoised_rows(
@@ -2329,6 +2429,9 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        keep_steps: int | None = None,
+        base_text_embeddings: torch.Tensor | None = None,
+        base_text_tags: torch.Tensor | None = None,
         sampler: str = "euler",
         init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
         refine: MiniMaxH3LatentRefineSpec | None = None,
@@ -2372,6 +2475,9 @@ class MiniMaxH3Pipeline(
             audio_edit_clean_rows=audio_edit_clean_rows,
             audio_edit_mask_rows=audio_edit_mask_rows,
             audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
+            keep_steps=keep_steps,
+            base_text_embeddings=base_text_embeddings,
+            base_text_tags=base_text_tags,
             init_latents=init_latents,
             refine=refine,
             precomputed_initial_noise=(
@@ -2408,11 +2514,19 @@ class MiniMaxH3Pipeline(
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
+                    base=inputs.get("base_branch"),
+                    keep_steps=inputs.get("keep_steps"),
+                    base_cond_rows=inputs.get("base_cond_rows"),
                     update_progress=lambda step, video, audio: progress.update(),
                 )
 
+        # keep_steps: after the mid-loop switch the running rows live on the
+        # image-only base layout, so unpack against the branch that was
+        # active at loop exit (keep_steps < num_steps is enforced, so a
+        # present base branch always means the switch already happened).
+        final_branch = inputs.get("base_branch") if inputs.get("keep_steps") is not None else branch
         return self._unpack_denoised_rows(
-            branch,
+            final_branch,
             video_rows,
             audio_rows,
             latent_t=latent_t,
@@ -2574,7 +2688,8 @@ class MiniMaxH3Pipeline(
         Resolving here means an unserviceable size is rejected before the
         denoise loop rather than after it.
         """
-        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        od_config = getattr(self, "od_config", None)
+        additional = (od_config.additional_config if od_config is not None else None) or {}
         raw = extra["latent_upscale"] if "latent_upscale" in extra else additional.get("latent_upscale")
         try:
             spec = parse_minimax_h3_latent_upscale_request(raw)
@@ -2615,7 +2730,8 @@ class MiniMaxH3Pipeline(
         Read like ``latent_upscale``: ``extra_args['latent_refine']`` wins over
         an ``--additional-config`` default, and ``false`` opts back out.
         """
-        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        od_config = getattr(self, "od_config", None)
+        additional = (od_config.additional_config if od_config is not None else None) or {}
         raw = extra["latent_refine"] if "latent_refine" in extra else additional.get("latent_refine")
         try:
             return parse_minimax_h3_latent_refine_request(raw)
@@ -2640,7 +2756,8 @@ class MiniMaxH3Pipeline(
         Count the same rows as the packed layout without materializing its
         large position tensors before the first denoise pass.
         """
-        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        od_config = getattr(self, "od_config", None)
+        additional = (od_config.additional_config if od_config is not None else None) or {}
         limit = additional.get("latent_refine_max_tokens_per_rank", 65_536)
         if type(limit) is not int or limit < 0:
             raise OmniClientError("latent_refine_max_tokens_per_rank must be a non-negative integer")
@@ -2664,7 +2781,7 @@ class MiniMaxH3Pipeline(
                     used += block["latent_t"] * (block["latent_h"] // 2) * (block["latent_w"] // 2)
         padded = ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
         parallel = getattr(self, "parallel_config", None)
-        degree = int(getattr(parallel, "ulysses_degree", 1))
+        degree = int(parallel.ulysses_degree) if parallel is not None else 1
         per_rank = (padded + degree - 1) // degree
         if per_rank > limit:
             raise OmniClientError(
@@ -2943,6 +3060,111 @@ class MiniMaxH3Pipeline(
             shapes.append(self.video_vae.predict_video_latent_shape(frames))
         return tuple(shapes)
 
+    def _normalize_keep_steps(
+        self,
+        sampling: Any,
+        *,
+        num_steps: int,
+        base_schedule: Sequence[float] | None = None,
+        task: str | None = None,
+        condition_labels: Sequence[tuple[str, int]] | None = None,
+        timeline_guides: bool = False,
+        latent_hw: tuple[int, int] | None = None,
+        continuation: Any | None = None,
+    ) -> int | None:
+        """Validate and normalize ``keep_steps`` before the second encoder pass.
+
+        Shared by ``_prepare_local_conditioning`` (before the optional second
+        Qwen pass over the image-only presentation) and
+        ``_prepare_encoder_conditioning_inputs`` (the authoritative check), so
+        requests that can never switch do not pay for that pass. Covered here:
+        malformed ``keep_steps``, the degenerate ``== num_steps`` value, and
+        every restriction decidable from the request config alone (pinned
+        schedules -- including the fused FastH3 student, whose resolver branch
+        returns a pinned ladder -- task, long-video continuation, audio
+        labels, timeline guides, ``continue_from``, ``pad_seq_len``, step
+        execution, reference-KV offload, turbo/native LoRA, latent
+        refine/upscale, attention schedules). Still enforced
+        only in the authoritative check, because they need encoded
+        conditioning or runtime model state: audio-reference/guide tensors,
+        latent-mask editing, control rows, the AdaLN sidecar, and cache_dit
+        quality. Resolved latent continuations are covered up front as well:
+        ``_resolve_latent_continuation`` resolves exclusively from
+        ``extra["continue_from"]``, which the ``continue_from`` check rejects
+        before any continuation resolution runs. Rejection here happens after
+        media preparation
+        (``prepare_encoder_inputs`` already decoded the references) but before
+        any Qwen/VAE model encode. Returns the validated integer, or ``None``
+        when ``keep_steps`` is absent or equals the step count (degenerate:
+        the historical full-video path).
+
+        ``num_steps`` and ``base_schedule`` must come from
+        ``_resolve_sigma_positions``; both call sites resolve them that way,
+        so a pinned sigma schedule or a fused checkpoint cannot make the
+        early and authoritative checks disagree. Switch-specific restrictions
+        only apply after the degenerate ``== num_steps`` value is normalized
+        away, preserving the original semantics where such requests simply
+        run full-video.
+        """
+        keep_steps = (getattr(sampling, "extra_args", None) or {}).get("keep_steps")
+        if keep_steps is None:
+            return None
+        # 0 is rejected on purpose: the video reference would never condition
+        # a single step, yet the request still pays for its VAE encode, the
+        # full-presentation Qwen pass, and the full branch.
+        if type(keep_steps) is not int or not 1 <= keep_steps <= num_steps:
+            raise OmniClientError(f"MiniMax H3 keep_steps must be an integer in [1, {num_steps}]")
+        if keep_steps == num_steps:
+            # Degenerate request: keeping the video for every step is the
+            # historical behaviour, so drop the switch entirely.
+            logger.info("MiniMax H3 keep_steps equals the step count; using full-video conditioning")
+            return None
+        if base_schedule is not None:
+            # Distilled checkpoints (and the fused FastH3 student, whose
+            # resolver branch also returns a pinned schedule) pin the sigma
+            # ladder; the switch has not been validated against them.
+            raise OmniClientError(
+                "MiniMax H3 keep_steps does not support pinned distilled sigma schedules in this revision"
+            )
+        if task is not None and task != "ref2va":
+            raise OmniClientError("MiniMax H3 keep_steps requires task ref2va")
+        extra = getattr(sampling, "extra_args", None) or {}
+        if continuation is not None:
+            raise OmniClientError("MiniMax H3 keep_steps does not support continuation")
+        if condition_labels is not None and any(label[0] == "audio" for label in condition_labels):
+            raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
+        if timeline_guides:
+            raise OmniClientError("MiniMax H3 keep_steps does not support timeline guides")
+        if extra.get("continue_from") is not None:
+            # A continue_from prefix rides the layout as a frame-0 guide,
+            # which changes the reference geometry the switch relies on.
+            raise OmniClientError("MiniMax H3 keep_steps does not support continue_from")
+        if extra.get("pad_seq_len") is not None:
+            raise OmniClientError("MiniMax H3 keep_steps does not support pad_seq_len")
+        if bool(getattr(self.od_config, "step_execution", False)):
+            raise OmniClientError("MiniMax H3 keep_steps does not support step execution")
+        if getattr(self.od_config, "kv_offload_config", None):
+            # The Tier-2 reference KV state is sized per branch at loop
+            # start; the mid-loop switch changes the reference row count.
+            raise OmniClientError("MiniMax H3 keep_steps does not support reference-KV offload")
+        if self._active_turbo_spec(sampling) is not None or self._has_active_native_lora(sampling):
+            raise OmniClientError("MiniMax H3 keep_steps does not support turbo or native LoRA sampling")
+        if self._resolve_latent_refine(extra) is not None or (
+            latent_hw is not None
+            and self._resolve_latent_upscale(extra, latent_h=latent_hw[0], latent_w=latent_hw[1]) is not None
+        ):
+            # The hi-res route re-runs diffuse() over a second layout with
+            # the same prepared kwargs; the base branch is built for the
+            # first full schedule only.
+            raise OmniClientError("MiniMax H3 keep_steps does not support latent refine/upscale passes")
+        if require_request_attention_schedule_fits(
+            sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
+        ):
+            # The switch changes the packed layout mid-schedule; per-step
+            # attention profiles have not been validated across it.
+            raise OmniClientError("MiniMax H3 keep_steps does not support attention_schedule in this revision")
+        return keep_steps
+
     def _prepare_local_conditioning(
         self,
         raw_prompt: Any,
@@ -2961,6 +3183,7 @@ class MiniMaxH3Pipeline(
         prepared = text_conditioning = None
         initial_noise_params = None
         visual_noise_params = None
+        base_encode_needed = False
         error = None
         if rank == 0:
             try:
@@ -2999,13 +3222,41 @@ class MiniMaxH3Pipeline(
                     task=task,
                     prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
                 )
+                # CodeVideoModel keep_steps: validate and normalize before any
+                # encoder work, then encode the image-only presentation only
+                # when the mid-loop switch will actually happen. The resolver
+                # only runs for requests that carry keep_steps, so plain
+                # requests keep their original error ordering; when it runs,
+                # it is the same resolver the authoritative check uses, so
+                # pinned schedules cannot make the two disagree. Long-video
+                # continuation resolves before the normalize call so the
+                # helper can reject the combination with zero encoder passes.
                 continuation = None
                 if prompts is not None or (request_context is not None and task == "ref2va"):
                     continuation = resolve_continuation(
                         sampling.extra_args or {},
                         task=task,
-                        step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                        step_execution=bool(self.od_config.step_execution),
                     )
+                if (sampling.extra_args or {}).get("keep_steps") is None:
+                    keep_steps = None
+                else:
+                    early_base_schedule, early_num_steps = self._resolve_sigma_positions(task, sampling)
+                    keep_steps = self._normalize_keep_steps(
+                        sampling,
+                        num_steps=early_num_steps,
+                        base_schedule=early_base_schedule,
+                        task=task,
+                        condition_labels=prepared.condition_labels,
+                        timeline_guides=bool(getattr(prepared.media, "timeline_guides", None)),
+                        # MediaInput requires height/width, so this always
+                        # matches the authoritative side's canvas-derived
+                        # latent size (continue_from, which could rewrite
+                        # it, is rejected above before this point matters).
+                        latent_hw=(int(prepared.media.height) // 16, int(prepared.media.width) // 16),
+                        continuation=continuation,
+                    )
+                base_encode_needed = keep_steps is not None and bool(prepared.qwen_videos) and bool(prepared.images)
                 if prompts is not None:
                     if continuation is None or not self.load_text_encoder:
                         raise OmniClientError(
@@ -3052,10 +3303,10 @@ class MiniMaxH3Pipeline(
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
-        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params)]
+        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params, base_encode_needed)]
         if world_size > 1:
             dist.broadcast_object_list(header, src=0, group=group)
-        reuse_text, initial_noise_params, visual_noise_params = header[0]
+        reuse_text, initial_noise_params, visual_noise_params, base_encode_needed = header[0]
         executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
             if initial_noise_params is not None
@@ -3084,6 +3335,20 @@ class MiniMaxH3Pipeline(
                 )
             else:
                 hidden, tags = self.encode_prompt(prepared)
+            base_text = None
+            if base_encode_needed:
+                base_prepared = (
+                    replace(
+                        prepared,
+                        qwen_videos=[],
+                        video_timestamps=[],
+                        condition_labels=[label for label in prepared.condition_labels if label[0] != "video"],
+                    )
+                    if rank == 0
+                    else None
+                )
+                logger.info("MiniMax H3 encoding image-only presentation for keep_steps")
+                base_text = self.encode_prompt(base_prepared)
             window_text = None
             if prompts is not None:
                 window_text = [(hidden, tags)]
@@ -3106,7 +3371,10 @@ class MiniMaxH3Pipeline(
                     )
                 request_context["precomputed_visual_condition_noise"] = visual_noise.result()
             return MiniMaxH3EncoderConditioning.from_components(
-                MiniMaxH3TextConditioning(hidden, tags), media
+                MiniMaxH3TextConditioning(hidden, tags),
+                media,
+                base_hidden_states=base_text[0] if base_text is not None else None,
+                base_token_tags=base_text[1] if base_text is not None else None,
             ), window_text
         finally:
             if executor is not None:
@@ -3173,12 +3441,12 @@ class MiniMaxH3Pipeline(
         except ValueError as exc:
             raise OmniClientError(str(exc)) from exc
         if control is not None:
-            if not getattr(self.od_config, "controlnet_model_path", None):
+            if not self.od_config.controlnet_model_path:
                 raise OmniClientError("Control request requires --controlnet-model-path")
             if sampling.quality == "high" or extra.get(MINIMAX_H3_GENERIC_CACHE_KEY):
                 raise OmniClientError("H3 control does not support Cache-DiT quality profiles")
         continuation = resolve_continuation(
-            extra, task=conditioning.task, step_execution=bool(getattr(self.od_config, "step_execution", False))
+            extra, task=conditioning.task, step_execution=bool(self.od_config.step_execution)
         )
         validate_encoded_frame_limit(extra, conditioning.task, conditioning.num_frames)
         if continuation is not None and (
@@ -3202,6 +3470,10 @@ class MiniMaxH3Pipeline(
             return self._prepare_regenerate_inputs(conditioning, sampling)
         turbo_spec = self._active_turbo_spec(sampling)
         has_native_lora = self._has_active_native_lora(sampling)
+        if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec) and (
+            turbo_spec is not None or has_native_lora
+        ):
+            raise OmniClientError("FastH3 Omni supports ordinary LoRA adapters, not Turbo or distilled adapters")
         task = self._resolve_task(
             conditioning.task,
             turbo_spec=turbo_spec,
@@ -3220,7 +3492,7 @@ class MiniMaxH3Pipeline(
         if self._fasth3_checkpoint is not None:
             self._fasth3_checkpoint.check_request(
                 sampling,
-                step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                step_execution=bool(self.od_config.step_execution),
             )
         if self._fasth3 is not None:
             self._fasth3.check_request(
@@ -3244,6 +3516,26 @@ class MiniMaxH3Pipeline(
                 f"({expected_latent_t}, {expected_audio_t})"
             )
 
+        # keep_steps requests normalize before any continuation work: the
+        # switch check front-loads in _normalize_keep_steps (which rejects
+        # continue_from itself), so the resolver below never runs for a
+        # keep_steps request. Opt-in requests only, with the schedule
+        # resolved by the same resolver the authoritative block uses; the
+        # default path keeps its original ordering. conditioning is still
+        # the encoder's output here — continue_from, the one input that
+        # could rewrite its canvas, is rejected inside the helper before it
+        # is consumed.
+        early_keep_steps = None
+        if extra.get("keep_steps") is not None:
+            early_base_schedule, early_num_steps = self._resolve_sigma_positions(task, sampling)
+            early_keep_steps = self._normalize_keep_steps(
+                sampling,
+                num_steps=early_num_steps,
+                base_schedule=early_base_schedule,
+                task=task,
+                latent_hw=(conditioning.height // 16, conditioning.width // 16),
+                continuation=continuation,
+            )
         conditioning, latent_continuation = self._resolve_latent_continuation(
             extra, conditioning, inherit_canvas=continuation_inherits_source_canvas(conditioning.task, sampling)
         )
@@ -3368,19 +3660,56 @@ class MiniMaxH3Pipeline(
                 f"MiniMax H3 {sampler} sampling with a fixed distilled sigma schedule has not been validated; "
                 "use sampler='euler' for this schedule."
             )
+        # CodeVideoModel-style early-only video conditioning: the video
+        # reference conditions only the first ``keep_steps`` denoise steps;
+        # the request then continues from an image-only presentation.
+        # Normalization runs before the second encoder pass (see
+        # _normalize_keep_steps); every restriction decidable from the
+        # request config lives there, and keep_steps requests were normalized
+        # before the continuation resolver above — requests without
+        # keep_steps normalize to None there as well. The checks below need
+        # the encoded conditioning or runtime model state and stay
+        # authoritative here.
+        keep_steps = early_keep_steps
+        if keep_steps is not None:
+            if control_rows is not None:
+                raise OmniClientError("MiniMax H3 keep_steps does not support control conditioning")
+            if conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None:
+                raise OmniClientError("MiniMax H3 keep_steps cannot be combined with latent-mask editing")
+            if conditioning.audio_condition is not None or extra.get("audio_mode", "native") == "lock_source":
+                raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
+            if conditioning.guide_blocks:
+                # Guide rows pack ahead of the reference rows, so the
+                # image-row prefix slice that builds the base branch anchor
+                # would not isolate the image rows.
+                raise OmniClientError("MiniMax H3 keep_steps does not support timeline guides")
+            kinds = [str(block.get("kind")) for block in conditioning.ref_blocks]
+            if kinds != ["image"] * kinds.count("image") + ["video"]:
+                raise OmniClientError(
+                    "MiniMax H3 keep_steps expects image reference(s) plus exactly one silent video reference"
+                )
+            if conditioning.base_hidden_states is None or conditioning.base_token_tags is None:
+                raise OmniClientError(
+                    "MiniMax H3 keep_steps requires the encoder side to also return the image-only "
+                    "presentation (base_hidden_states/base_token_tags); with a local text encoder this "
+                    "is produced automatically, across a separate encoder stage see the TODO in "
+                    "stage_input_processors/minimax_h3.py"
+                )
         # num_steps is the length of the sequence this request denoises; FastH3 and pinned distilled
         # schedules can differ from num_inference_steps. A latent_refine pass has its own step count, which
-        # this check does not cover, so a schedule together with latent_refine is rejected below. Both
-        # execution modes reach this point before any denoise forward. Step mode runs it outside the forward
-        # context, so the request's own schedule is resolved against the service default; in request mode
-        # that is the schedule the runner bound.
-        attention_schedule = require_request_attention_schedule_fits(
-            sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
-        )
+        # this check does not cover, so step ranges together with latent_refine are rejected below; sigma
+        # windows do not depend on the step count. Both execution modes reach this point before any denoise
+        # forward. Step mode runs it outside the forward context, so the request's own schedule is resolved
+        # against the service default; in request mode that is the schedule the runner bound.
+        service = self.od_config.diffusion_attention_schedule
+        attention_schedule = require_request_attention_schedule_fits(sampling, service, num_steps)
+        sigma_schedule = resolve_request_attention_sigma_schedule(sampling, service)
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
         cache = getattr(transformer, "adaln_cache", None)
+        if keep_steps is not None and cache is not None and cache.sidecar is not None:
+            raise OmniClientError("MiniMax H3 keep_steps does not support the AdaLN sidecar cache")
         if cache is not None and cache.sidecar is not None:
             mode = task
             if task == "ref2va":
@@ -3401,14 +3730,20 @@ class MiniMaxH3Pipeline(
             num_inference_steps=num_steps,
             extra_args=extra,
         )
+        if sampler == "heun" and quality_plan.cache_dit is not None:
+            raise OmniClientError("Heun requires uncached model runs; set quality=lossless")
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
-        if attention_schedule and quality_plan.cache_dit is not None:
+        if keep_steps is not None and quality_plan.cache_dit is not None:
+            raise OmniClientError("MiniMax H3 keep_steps requires uncached denoising; set quality=lossless")
+        if (attention_schedule or sigma_schedule) and quality_plan.cache_dit is not None:
             # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
-            # that ran a different attention profile. Reject before its hooks are installed.
+            # that ran a different attention profile. Reject before its hooks are installed. An empty list
+            # of one kind keeps the service default of the other, so the message names both fields.
+            field = "attention_sigma_schedule" if sigma_schedule else "attention_schedule"
             raise InvalidAttentionScheduleError(
-                "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high); "
-                "send quality=lossless or attention_schedule=[]"
+                f"{field} cannot be combined with MiniMax H3 Cache-DiT (quality=high); send quality=lossless, "
+                "or attention_schedule=[] and attention_sigma_schedule=[]"
             )
         if attention_schedule and self._resolve_latent_refine(extra) is not None:
             # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step
@@ -3525,6 +3860,17 @@ class MiniMaxH3Pipeline(
             "video_shift": float(extra.get("flow_shift", self.default_video_shift)),
             "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
             "base_schedule": base_schedule,
+            "keep_steps": keep_steps,
+            "base_text_embeddings": (
+                conditioning.base_hidden_states.to(device=self.device, dtype=torch.bfloat16)
+                if keep_steps is not None and conditioning.base_hidden_states is not None
+                else None
+            ),
+            "base_text_tags": (
+                conditioning.base_token_tags.to(device=self.device, dtype=torch.long)
+                if keep_steps is not None and conditioning.base_token_tags is not None
+                else None
+            ),
             "num_outputs": num_outputs,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": (
@@ -3581,7 +3927,7 @@ class MiniMaxH3Pipeline(
                 "this server regenerates drafts only; send the draft as source_video with regenerate=true "
                 "(extra_params over HTTP)"
             )
-        if getattr(self.od_config, "step_execution", False):
+        if self.od_config.step_execution:
             raise OmniClientError("Open-H3-Regenerate does not support step execution")
         if resolve_continuation_request(extra) is not None:
             raise OmniClientError("Open-H3-Regenerate does not support continue_from")
@@ -3647,7 +3993,7 @@ class MiniMaxH3Pipeline(
         )
         if quality_plan.cache_dit is not None:
             raise OmniClientError("Open-H3-Regenerate requires uncached denoising; set quality=lossless")
-        cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
+        cache_backend = str(self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("none", "cache_dit"):
             raise OmniClientError(f"Open-H3-Regenerate does not support --cache-backend {cache_backend}")
         self._cache_dit_runtime.prepare(None)
@@ -3762,12 +4108,12 @@ class MiniMaxH3Pipeline(
         """Guides are validated against base weights and the full schedule only."""
         if cache_dit is not None:
             raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
-        cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
+        cache_backend = str(self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("none", "cache_dit"):
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
         if self._fasth3 is not None or self._fasth3_checkpoint is not None:
             raise OmniClientError("MiniMax H3 timeline guides require base H3 weights, not FastH3")
-        active_lora = sampling.lora_request is not None and not math.isclose(float(sampling.lora_scale), 0.0)
+        active_lora = bool(filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale))
         if turbo or native_lora or active_lora:
             raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
         if self._sigma_schedule_for_request(sampling, task) is not None:
@@ -3840,9 +4186,18 @@ class MiniMaxH3Pipeline(
 
     @staticmethod
     def _denoise_kwargs(context: dict[str, Any]) -> dict[str, Any]:
-        """Select the denoise-input arguments from a prepared request context."""
+        """Select the denoise-input arguments from a prepared request context.
+
+        The keep_steps family is optional by construction: the regenerate and
+        controlnet paths build contexts without it, and `_build_denoise_inputs`
+        reads a missing key the same as an explicit "no base branch", so those
+        keys are fetched leniently while the required whitelist stays strict.
+        """
         return {
             **{key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS},
+            "keep_steps": context.get("keep_steps"),
+            "base_text_embeddings": context.get("base_text_embeddings"),
+            "base_text_tags": context.get("base_text_tags"),
             "sampler": context.get("sampler", "euler"),
         }
 
@@ -4196,8 +4551,8 @@ class MiniMaxH3Pipeline(
     ) -> dict[str, Exception | None]:
         """Let each algorithm own all predictions for one complete sampler step.
 
-        Compatible requests share packed model evaluations. Failed groups do
-        not commit latents or history.
+        Compatible requests share packed model evaluations, including Heun's
+        correction sub-batch. Failed groups do not commit latents or history.
         A packed evaluation keeps one attention document per request; backends
         that ignore ``cu_seqlens`` fall back to one forward per request. Under a
         bound attention schedule, requests pack only when they carry the same
@@ -4214,6 +4569,7 @@ class MiniMaxH3Pipeline(
             groups.setdefault(state.extra[_STEP_SAMPLER], []).append(state)
         for name, group in groups.items():
             try:
+                self._validate_sampler_cache(name)
                 models = {}
                 pending = []
                 for request in group:
@@ -4230,6 +4586,7 @@ class MiniMaxH3Pipeline(
                         (request.extra.get(_STEP_VIDEO_EDIT), request.extra.get(_STEP_AUDIO_EDIT)),
                         model_rows=request.extra.get(_STEP_MODEL_ROWS),
                         attention_schedule=request.attention_schedule,
+                        attention_sigma_schedule=request.attention_sigma_schedule,
                     )
                     request.extra[_STEP_MODEL_ROWS] = adapter.model_rows
                     models[sample] = adapter
@@ -4250,6 +4607,14 @@ class MiniMaxH3Pipeline(
                 for request in group:
                     results[request.request_id] = exc
         return results
+
+    def _validate_sampler_cache(self, sampler: str) -> None:
+        # Heun's correction evaluates a proposal the cache never saw, so a cached
+        # residual from the previous prediction would corrupt it.
+        if sampler != "heun":
+            return
+        if self.od_config.cache_backend not in (None, "none") or self.is_cache_dit_enabled():
+            raise OmniClientError("Heun requires uncached model runs")
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Unpack the denoised rows and run the joint video/audio VAE decode."""

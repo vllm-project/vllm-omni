@@ -370,9 +370,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             info["aura_tts_partial"] = True
             info["aura_tts_close_only"] = True
         from vllm_omni.engine.duplex.plugin import PartialStageForward
-        from vllm_omni.model_executor.models.aura_omni.duplex.sentence_tts import (
-            SentenceTtsOutput,
-        )
+        from vllm_omni.engine.duplex.sentence_tts import SentenceTtsOutput
 
         request_id = str(getattr(plan.output, "request_id", ""))
         return PartialStageForward(

@@ -14,7 +14,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    InvalidAttentionScheduleError,
+    parse_attention_sigma_schedule,
+)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec, RequestScopedCacheDiTRuntime
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -33,6 +37,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
 _ResultT = TypeVar("_ResultT")
+
+
+def _pipeline_config(**overrides):
+    """Config defaults read by partially constructed H3 pipelines in this module."""
+    fields = dict(
+        additional_config={},
+        step_execution=False,
+        cache_backend="none",
+        controlnet_model_path=None,
+        diffusion_offload_config=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
 
 
 def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _ResultT:
@@ -407,7 +424,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.text_encoder = object()
@@ -461,7 +478,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     cache_spec = object()
@@ -1089,7 +1106,7 @@ def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_output
     decoder = object.__new__(MiniMaxH3DecoderPipeline)
     nn.Module.__init__(decoder)
     decoder.device = torch.device("cpu")
-    decoder.od_config = SimpleNamespace()
+    decoder.od_config = _pipeline_config()
     payload = {
         "video_latents": [torch.tensor([index]) for index in range(num_outputs)],
         "audio_latents": [torch.zeros(1) for _ in range(num_outputs)],
@@ -1256,7 +1273,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline._base_schedule_by_partition = schedules
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
@@ -1273,7 +1290,13 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     return pipeline
 
 
-def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None, quality="lossless"):
+def _t2va_batch(
+    num_inference_steps=None,
+    attention_schedule=None,
+    extra_args=None,
+    quality="lossless",
+    attention_sigma_schedule=None,
+):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -1287,6 +1310,7 @@ def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=No
         num_inference_steps=num_inference_steps,
         extra_args={"task": "t2va", "aspect_ratio": "16:9", **(extra_args or {})},
         attention_schedule=attention_schedule,
+        attention_sigma_schedule=attention_sigma_schedule,
     )
     return DiffusionRequestBatch(
         [
@@ -1417,7 +1441,8 @@ class _RecordingCacheDiTRuntime(RequestScopedCacheDiTRuntime):
         self.prepared.append(spec)
 
 
-def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch):
+@pytest.mark.parametrize("schedule_kind", ["step", "sigma-request", "sigma-default"])
+def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch, schedule_kind):
     """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
     _allow_cpu_empty_cache(monkeypatch)
     diffuse_calls: list[dict[str, Any]] = []
@@ -1427,19 +1452,62 @@ def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(mon
     pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
     runtime = _RecordingCacheDiTRuntime(pipeline)
     pipeline._cache_dit_runtime = runtime
-    schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
-
+    if schedule_kind == "step":
+        field = "attention_schedule"
+        schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
+    else:
+        field = "attention_sigma_schedule"
+        schedule = [{"low": 0.0, "high": 0.3, "profile": "sparse"}]
+        if schedule_kind == "sigma-default":
+            pipeline.od_config.diffusion_attention_schedule.sigma = parse_attention_sigma_schedule(schedule)
+    request_override = {} if schedule_kind == "sigma-default" else {field: schedule}
     with pytest.raises(InvalidAttentionScheduleError, match="Cache-DiT"):
-        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=schedule, quality="high"))
+        pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high", **request_override))
     assert runtime.prepared == []
     assert diffuse_calls == []
 
-    # Without a schedule, or with the request disabling it, Cache-DiT is prepared.
-    pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high"))
-    pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
+    # Both explicit and inherited windows must be disabled before installing
+    # request-scoped Cache-DiT. Unbound explicit configurations remain accepted.
+    if schedule_kind != "sigma-default":
+        pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high"))
+    pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high", **{field: []}))
+    count = 1 if schedule_kind == "sigma-default" else 2
     prepared_keys = [None if spec is None else spec.installation_key for spec in runtime.prepared]
-    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY] * 2
-    assert len(diffuse_calls) == 2
+    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY] * count
+    assert len(diffuse_calls) == count
+
+
+def test_cache_dit_rejection_names_both_schedule_fields(monkeypatch):
+    """An empty list of one kind keeps the service default of the other, so the Cache-DiT rejection
+    asks for both fields to be emptied, and a request that follows it runs with Cache-DiT."""
+    _allow_cpu_empty_cache(monkeypatch)
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    pipeline.od_config.diffusion_attention_schedule.sigma = parse_attention_sigma_schedule(
+        [{"low": 0.0, "high": 0.3, "profile": "sparse"}]
+    )
+    # quality=high resolves to the request-scoped Cache-DiT profile.
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    runtime = _RecordingCacheDiTRuntime(pipeline)
+    pipeline._cache_dit_runtime = runtime
+
+    with pytest.raises(InvalidAttentionScheduleError) as exc_info:
+        pipeline.forward(
+            _t2va_batch(
+                num_inference_steps=4, attention_schedule=[{"start": 0, "end": 2, "profile": "sparse"}], quality="high"
+            )
+        )
+    assert "attention_schedule=[] and attention_sigma_schedule=[]" in str(exc_info.value)
+    with pytest.raises(InvalidAttentionScheduleError, match="Cache-DiT"):
+        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
+
+    pipeline.forward(
+        _t2va_batch(num_inference_steps=4, attention_schedule=[], attention_sigma_schedule=[], quality="high")
+    )
+    prepared_keys = [None if spec is None else spec.installation_key for spec in runtime.prepared]
+    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY]
+    assert len(diffuse_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -1817,6 +1885,53 @@ def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
 
     class FakeAttention(torch.nn.Module):
         attn_backend = RainFusionAttentionBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        # One request: 5 valid rows padded to the 8-row alignment boundary.
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+
+
+def test_sage_packed_padding_publishes_valid_kv_length_instead_of_a_mask():
+    """SAGE_ATTN rejects attn_mask, so an unaligned H3 request must reach it as a K/V prefix.
+
+    Drives the real backend class through the packed path: before SAGE_ATTN
+    advertised supports_prefix_kv_slicing, every request whose packed length
+    was not 64-aligned failed with "does not support attn_mask".
+    """
+    from vllm_omni.diffusion.attention.backends.sage_attn import SageAttentionBackend
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = SageAttentionBackend
 
         def __init__(self):
             super().__init__()
@@ -2291,7 +2406,7 @@ def test_no_offload_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
     )
@@ -2312,7 +2427,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=True,
         enable_layerwise_offload=False,
     )
@@ -2338,7 +2453,7 @@ def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         diffusion_offload_config=None,
         enable_cpu_offload=False,
         enable_layerwise_offload=enable_layerwise,
@@ -2366,7 +2481,7 @@ def test_layerwise_encoder_selection_releases_text_encoder():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -2391,7 +2506,7 @@ def test_layerwise_dit_only_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -2413,7 +2528,7 @@ def test_dit_encoder_selection_keeps_vae_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -4120,7 +4235,7 @@ def _peer_rank_preencode_pipeline(monkeypatch):
     pipeline.audio_vae = FakeAudioVAE()
     pipeline.video_vae = PeerRankVideoVAE()
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = _pipeline_config()
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
     return pipeline
 

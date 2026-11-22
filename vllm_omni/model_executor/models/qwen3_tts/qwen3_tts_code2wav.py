@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -293,6 +294,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decoder_state_cache: dict[str, dict[str, Any]] = {}
         self._decoder_state_cache_warn_entries = 512
         self._streaming_codec: StreamingCode2Wav | None = None
+        # load_weights defers the first decoder graph setup to
+        # capture_auxiliary_graphs. A weight reload after that sets it up again
+        # at once.
+        self._pending_decoder_graph_setup: Callable[[], None] | None = None
+        self._decoder_warmup_done = False
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -413,9 +419,15 @@ class Qwen3TTSCode2Wav(nn.Module):
             return None
         return StagePostWarmupMemoryStats(*memory_stats)
 
+    def _drop_decoder_state(self, req_id: str) -> None:
+        state = self._decoder_state_cache.pop(req_id, None)
+        incremental = getattr(self.decoder, "_npu_incremental", None)
+        if incremental is not None and isinstance(state, dict) and "npu_slot" in state:
+            incremental.release(int(state["npu_slot"]))
+
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
-            self._decoder_state_cache.pop(req_id, None)
+            self._drop_decoder_state(req_id)
             self._rho_stats.on_request_finished(req_id)
         if self._streaming_codec is not None:
             self._streaming_codec.release(finished_req_ids)
@@ -632,7 +644,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 strict=False,
             ):
                 if req_id is not None and (finished or segment_finished):
-                    self._decoder_state_cache.pop(req_id, None)
+                    self._drop_decoder_state(req_id)
                     self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
                     if self._streaming_codec is not None:
                         self._streaming_codec.release([req_id])
@@ -762,7 +774,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             strict=False,
         ):
             if req_id is not None and (finished or segment_finished):
-                self._decoder_state_cache.pop(req_id, None)
+                self._drop_decoder_state(req_id)
                 self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
                 if self._streaming_codec is not None:
                     self._streaming_codec.release([req_id])
@@ -798,6 +810,95 @@ class Qwen3TTSCode2Wav(nn.Module):
                 "sr": sr,
             },
         )
+
+    def capture_auxiliary_graphs(self) -> None:
+        """Set up the decoder CUDA graphs that ``load_weights`` deferred.
+
+        The worker calls this once ``load_model`` has returned, before the stage
+        serves. vLLM's ``load_model`` limits the caching allocator to
+        ``max_split_size_mb:20``; graphs captured under it cannot reuse the
+        blocks an earlier capture freed in their shared pool, so each capture
+        grows the pool.
+        """
+        self._decoder_warmup_done = True
+        setup, self._pending_decoder_graph_setup = self._pending_decoder_graph_setup, None
+        if setup is not None:
+            setup()
+
+    def _setup_decoder_graphs(
+        self,
+        *,
+        device: torch.device,
+        decode_streaming: bool,
+        decode_cudnn_benchmark: bool,
+        codec_chunk_frames: int,
+        codec_left_context_frames: int,
+        initial_codec_chunk_frames: int,
+        codec_chunk_ramp: list[int] | None,
+        decode_cudagraph_batch_sizes: list[int] | None,
+        decode_cudagraph_capture_sizes: list[int] | None,
+    ) -> None:
+        """Capture the segmented decoder graphs, or build the streaming codec.
+
+        The arguments are the decoder settings ``load_weights`` parsed.
+        """
+        if (
+            not decode_streaming
+            and self.decoder_cudagraph_modes
+            and hasattr(self.decoder, "enable_cudagraph")
+            and device.type == "cuda"
+        ):
+            try:
+                # Autotune only during warmup/capture, then restore the process
+                # flags. The captured convolution algorithms remain in the
+                # graphs without changing later models' cuDNN policy.
+                autotune = (
+                    torch.backends.cudnn.flags(
+                        enabled=torch.backends.cudnn.enabled,
+                        benchmark=True,
+                        benchmark_limit=10,
+                        deterministic=torch.backends.cudnn.deterministic,
+                        allow_tf32=torch.backends.cudnn.allow_tf32,
+                    )
+                    if decode_cudnn_benchmark
+                    else nullcontext()
+                )
+                with autotune:
+                    self._maybe_enable_decoder_cudagraph(
+                        device=device,
+                        codec_chunk_frames=codec_chunk_frames,
+                        codec_left_context_frames=codec_left_context_frames,
+                        initial_codec_chunk_frames=initial_codec_chunk_frames,
+                        codec_chunk_ramp=codec_chunk_ramp,
+                        decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
+                        decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to enable CUDA Graph for Code2Wav decoder",
+                    exc_info=True,
+                )
+
+        if decode_streaming:
+            from .streaming_code2wav import StreamingCode2Wav
+
+            num_slots = self.vllm_config.scheduler_config.max_num_seqs
+            with torch.inference_mode():
+                self._streaming_codec = StreamingCode2Wav(
+                    self.decoder,
+                    num_slots=num_slots,
+                    decode_modes=self.decoder_cudagraph_modes,
+                    max_batch_size=self._decode_batch_max_size,
+                    batch_sizes=decode_cudagraph_batch_sizes or [1],
+                    frame_sizes=[1, initial_codec_chunk_frames, codec_chunk_frames, *(codec_chunk_ramp or [])],
+                    # enforce_eager disables both native and streaming graphs.
+                    capture=not getattr(self.vllm_config.model_config, "enforce_eager", False),
+                )
+            logger.info(
+                "Code2Wav streaming codec enabled: %d request slots; ICL mode=%s",
+                num_slots,
+                "streaming",
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # The primary weights iterator contains no Code2Wav parameters.
@@ -997,62 +1098,21 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
-        if (
-            not decode_streaming
-            and self.decoder_cudagraph_modes
-            and hasattr(self.decoder, "enable_cudagraph")
-            and device.type == "cuda"
-        ):
-            try:
-                # Autotune only during warmup/capture, then restore the process
-                # flags. The captured convolution algorithms remain in the
-                # graphs without changing later models' cuDNN policy.
-                autotune = (
-                    torch.backends.cudnn.flags(
-                        enabled=torch.backends.cudnn.enabled,
-                        benchmark=True,
-                        benchmark_limit=10,
-                        deterministic=torch.backends.cudnn.deterministic,
-                        allow_tf32=torch.backends.cudnn.allow_tf32,
-                    )
-                    if decode_cudnn_benchmark
-                    else nullcontext()
-                )
-                with autotune:
-                    self._maybe_enable_decoder_cudagraph(
-                        device=device,
-                        codec_chunk_frames=codec_chunk_frames,
-                        codec_left_context_frames=codec_left_context_frames,
-                        initial_codec_chunk_frames=initial_codec_chunk_frames,
-                        codec_chunk_ramp=codec_chunk_ramp,
-                        decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
-                        decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
-                    )
-            except Exception:
-                logger.warning(
-                    "Failed to enable CUDA Graph for Code2Wav decoder",
-                    exc_info=True,
-                )
-
-        if decode_streaming:
-            from .streaming_code2wav import StreamingCode2Wav
-
-            num_slots = self.vllm_config.scheduler_config.max_num_seqs
-            with torch.inference_mode():
-                self._streaming_codec = StreamingCode2Wav(
-                    self.decoder,
-                    num_slots=num_slots,
-                    decode_modes=self.decoder_cudagraph_modes,
-                    max_batch_size=self._decode_batch_max_size,
-                    batch_sizes=decode_cudagraph_batch_sizes or [1],
-                    frame_sizes=[1, initial_codec_chunk_frames, codec_chunk_frames, *(codec_chunk_ramp or [])],
-                    # enforce_eager disables both native and streaming graphs.
-                    capture=not getattr(self.vllm_config.model_config, "enforce_eager", False),
-                )
-            logger.info(
-                "Code2Wav streaming codec enabled: %d request slots; ICL mode=%s",
-                num_slots,
-                "streaming",
-            )
+        setup = functools.partial(
+            self._setup_decoder_graphs,
+            device=device,
+            decode_streaming=decode_streaming,
+            decode_cudnn_benchmark=decode_cudnn_benchmark,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            initial_codec_chunk_frames=initial_codec_chunk_frames,
+            codec_chunk_ramp=codec_chunk_ramp,
+            decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
+            decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+        )
+        if self._decoder_warmup_done:
+            setup()
+        else:
+            self._pending_decoder_graph_setup = setup
 
         return loaded

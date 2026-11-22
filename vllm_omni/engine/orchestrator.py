@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 import janus
+import numpy as np
 import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
@@ -37,6 +38,7 @@ from vllm.multimodal.cache.shm import ShmObjectStoreSenderCache
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -84,7 +86,7 @@ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_k
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageRequestMetrics, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import definitions as metric_defs
@@ -95,7 +97,7 @@ from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
-    from vllm_omni.engine import OmniEngineCoreOutput
+    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
     from vllm_omni.engine.stage_client import StagePoolClient
 
 logger = init_logger(__name__)
@@ -190,14 +192,24 @@ def build_engine_core_request_from_tokens(
     if arrival_time is None:
         arrival_time = _time.time()
 
-    prompt_token_ids = prompt["prompt_token_ids"]
+    prompt_token_ids = prompt.get("prompt_token_ids")
+    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+    # ``np.ndarray`` at runtime (TokenBuffer asserts itemsize == 4); coerce
+    # list prompts so /v1/run stage inputs round-trip through
+    # ``msgspec.convert`` symmetrically (a decoded plain list fails the
+    # ndarray field check).
+    if isinstance(prompt_token_ids, list):
+        prompt_token_ids = np.asarray(prompt_token_ids, dtype=np.int32)
 
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
         if model_config is not None:
-            remaining = model_config.max_model_len - len(prompt_token_ids)
+            remaining = model_config.max_model_len - length_from_prompt_token_ids_or_embeds(
+                prompt_token_ids, prompt_embeds
+            )
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
@@ -209,7 +221,6 @@ def build_engine_core_request_from_tokens(
     else:
         pooling_params = params.clone()
 
-    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
     wire_payload: dict[str, Any] | None = None
@@ -288,6 +299,43 @@ def _update_stale_request_metadata(
         request.additional_information.entries[RETURN_STAGE_PAYLOAD_KEY] = return_stage_payload_entry
 
 
+def stamp_stage_submit(req_state: OrchestratorRequestState, stage_id: int, *, refresh: bool) -> float:
+    """Record a stage's submit clocks.
+
+    ``stage_submit_ts`` stays wall time for published output messages. Generation
+    elapsed uses the paired ``stage_submit_perf`` so it is on the same monotonic
+    clock as diffusion ``scheduler_queue_wait_ms``. ``refresh`` starts a later
+    segment; the first submit keeps the clocks already recorded.
+    """
+    if refresh or stage_id not in req_state.stage_submit_ts:
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        req_state.stage_submit_perf[stage_id] = _time.perf_counter()
+    return req_state.stage_submit_ts[stage_id]
+
+
+def stamp_downstream_stage_submit(
+    req_state: OrchestratorRequestState,
+    stage_id: int,
+    pool: object,
+    *,
+    already_submitted: bool,
+    after_submit: bool,
+) -> None:
+    """Stamp a downstream stage around ``submit_initial`` / ``submit_update``.
+
+    Diffusion stamps before enqueue so scheduler admission stays in the stage
+    clock. LLM stamps after a successful submit so replica-selection wait is
+    not counted as generation.
+    """
+    is_diffusion = getattr(pool, "stage_type", None) == "diffusion"
+    if after_submit:
+        if not is_diffusion:
+            stamp_stage_submit(req_state, stage_id, refresh=True)
+        return
+    if is_diffusion:
+        stamp_stage_submit(req_state, stage_id, refresh=already_submitted)
+
+
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -308,8 +356,12 @@ class OrchestratorRequestState:
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
 
-    # Metrics: timestamp when request was submitted to each stage.
+    # Wall-clock time the request was submitted to each stage. Output messages
+    # publish this. Elapsed generation uses stage_submit_perf, not this value.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
+    # perf_counter() at the same instant as stage_submit_ts. Paired so a wall-clock
+    # step cannot disagree with the diffusion scheduler's monotonic queue wait.
+    stage_submit_perf: dict[int, float] = field(default_factory=dict)
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
@@ -319,9 +371,14 @@ class OrchestratorRequestState:
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
     # A session-owned request's lifetime belongs to a session (duplex), not to
-    # its own ``finished`` flag: no synthetic terminal, no client emission of
-    # stage-0 segment ends, no terminal re-forward, no cleanup on finish.
+    # its own ``finished`` flag: no synthetic terminal on the client queue, no
+    # client emission of stage-0 segment ends, no terminal re-forward, no
+    # cleanup on finish. A swallowed final-stage request-end is routed through
+    # intercept instead of ``output_async_queue``.
     session_owned: bool = False
+    # Final-stage processed output kept ``finished=True`` through intercept.
+    # Session raw-terminal fallback must not emit a second empty done.
+    routed_final_finished: bool = False
     # Duplex sentence TTS already submitted this output. Do not also run the
     # legacy full-text handoff for the same stage result.
     skip_legacy_stage_forward: bool = False
@@ -581,7 +638,7 @@ class OrchestratorBase:
             self._membership.install_membership_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=cleanup_member_requests,
-                replica_removed_callback=self._remove_stage_replica_metrics,
+                replica_removed_callback=self._handle_replica_removed,
                 replica_added_callback=self._publish_replica_post_warmup_memory,
             )
             membership_watcher = self._membership.start()
@@ -1180,6 +1237,7 @@ class OrchestratorBase:
             processed = [
                 output for output in processed if getattr(output, "request_id", None) not in reported_session_errors
             ]
+        self._stamp_poll_segment_finished(stage_id, raw_outputs, processed)
 
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             self._stat_logger.record(
@@ -1653,7 +1711,6 @@ class OrchestratorBase:
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
-        pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
             if req_state is None:
@@ -1672,17 +1729,40 @@ class OrchestratorBase:
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
-                stage_metrics = pool.build_stage_metrics(
-                    [output],
-                    submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
-                    request_timestamp=req_state.request_timestamp,
-                    replica_id=replica_id,
-                    sampling_params=req_state.sampling_params_list[stage_id],
-                )
-                if self.collect_stage_metrics:
-                    stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                stage_metrics = self._attach_finished_stage_metrics(stage_id, replica_id, output, req_state)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+            self._note_routed_stage_output(stage_id, output, req_state)
+
+    def _attach_finished_stage_metrics(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> StageRequestMetrics:
+        """Build finished-stage metrics and fold scheduler wait into queue wait.
+
+        The pool returns the measured wait. This method, which owns the request
+        timings, adds it before the per-stage copy. ``extract_queue_wait_s``
+        later reads that one key.
+        """
+        pool = self.stage_pools[stage_id]
+        stage_metrics = pool.build_stage_metrics(
+            [output],
+            submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+            submit_perf=req_state.stage_submit_perf.get(stage_id),
+            request_timestamp=req_state.request_timestamp,
+            replica_id=replica_id,
+            sampling_params=req_state.sampling_params_list[stage_id],
+        )
+        wait_ms = stage_metrics.scheduler_queue_wait_ms
+        if wait_ms is not None:
+            # A missing orchestrator hop still records the scheduler wait.
+            req_state.pipeline_timings["queue_wait_ms"] = req_state.pipeline_timings.get("queue_wait_ms", 0.0) + wait_ms
+        if self.collect_stage_metrics:
+            stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+        return stage_metrics
 
     async def _handle_stage_error(
         self,
@@ -1745,6 +1825,19 @@ class OrchestratorBase:
         engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
         if self._stat_logger is not None and engine_idx is not None:
             self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
+
+    async def _handle_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Membership detach: drop stats, then let the stage owner react.
+
+        The owner seam runs before ``MembershipController`` cleans up the requests
+        the removed address was routing, so a session-based owner can close its
+        sessions with a typed error instead of letting them time out.
+        """
+        self._remove_stage_replica_metrics(stage_id, replica_id)
+        await self._on_replica_removed(stage_id, replica_id)
+
+    async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Seam for stage owners after a replica detaches; the base does nothing."""
 
     def _sync_engines_waiting_counter(self) -> None:
         """Aggregate per-replica waiting into the counter shared with the
@@ -2114,6 +2207,25 @@ class OrchestratorBase:
             self._shared_requests.finish(cleanup_ids, aborted=abort or trace_error is not None)
         return abort_outputs
 
+    def _stamp_poll_segment_finished(
+        self, stage_id: int, raw_outputs: OmniEngineCoreOutputs, processed: list[RequestOutput]
+    ) -> None:
+        """Bind this poll's ``is_segment_finished`` onto processed outputs.
+
+        Duplex intercept must not read a leftover ``streaming.segments[stage].finished``
+        from an earlier sentence park. Turn-based requests do not need this.
+        """
+        del stage_id, raw_outputs, processed
+
+    def _note_routed_stage_output(
+        self,
+        stage_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Record that a processed output was routed; no-op outside duplex."""
+        del stage_id, output, req_state
+
     async def _apply_raw_terminal_stage_finish(
         self,
         stage_id: int,
@@ -2207,6 +2319,17 @@ class OrchestratorBase:
         )
         return True
 
+    async def _finish_session_owned_raw_terminal(
+        self,
+        stage_id: int,
+        replica_id: int,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        pool: StagePool,
+    ) -> None:
+        """Route a swallowed duplex request-end through intercept; no-op outside duplex."""
+        del stage_id, replica_id, request_id, req_state, pool
+
     async def _finish_raw_terminal_requests(
         self,
         stage_id: int,
@@ -2218,7 +2341,10 @@ class OrchestratorBase:
 
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
-            if req_state is None or req_state.session_owned:
+            if req_state is None:
+                continue
+            if req_state.session_owned:
+                await self._finish_session_owned_raw_terminal(stage_id, replica_id, request_id, req_state, pool)
                 continue
             if req_state.trace is not None:
                 req_state.trace.finish_stage(stage_id)
@@ -2521,10 +2647,33 @@ class OrchestratorBase:
             model_intermediate_buffer=model_intermediate_buffer,
         )
 
-    async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+    def _process_stage_inputs_in_worker(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> EngineCoreRequest:
+        """Process inputs under the shared lock; subclasses may prepare them first.
+
+        Called only from the joined CPU worker. Generic stages use the ordinary
+        processor; duplex specializes preparation before backend admission.
+        """
+        request = self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+        if validate_input_tokens is not None:
+            validate_input_tokens(
+                length_from_prompt_token_ids_or_embeds(
+                    request.prompt_token_ids, getattr(request, "prompt_embeds", None)
+                )
+            )
+        return request
+
+    async def _process_stage_inputs(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> Any:
+        """Join serialized CPU input processing on success, rejection or cancellation."""
+
         def process() -> Any:
             with self._prompt_processing_lock:
-                return self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+                return self._process_stage_inputs_in_worker(
+                    stage_id, validate_input_tokens=validate_input_tokens, **kwargs
+                )
 
         worker = asyncio.create_task(asyncio.to_thread(process))
         try:
@@ -2699,6 +2848,7 @@ class OrchestratorBase:
         resumable: bool = False,
         payload_sender_info: PayloadSenderInfo | None = None,
         replica_id: int | None = None,
+        validate_input_tokens: Callable[[int], None] | None = None,
     ) -> EngineCoreRequest:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2712,6 +2862,10 @@ class OrchestratorBase:
             )
             request.external_req_id = request.request_id
             request.payload_sender_info = payload_sender_info
+            if validate_input_tokens is not None:
+                validate_input_tokens(
+                    length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
+                )
             return request
 
         if replica_id is not None:
@@ -2726,6 +2880,7 @@ class OrchestratorBase:
             supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
         else:
             supported_tasks = ("generate",)
+        validation = {} if validate_input_tokens is None else {"validate_input_tokens": validate_input_tokens}
         request = await self._process_stage_inputs(
             next_stage_id,
             request_id=req_id,
@@ -2734,6 +2889,7 @@ class OrchestratorBase:
             supported_tasks=supported_tasks,
             arrival_time=_time.time(),
             resumable=resumable,
+            **validation,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
@@ -2927,6 +3083,16 @@ class OrchestratorBase:
                 request_id,
                 exc_info=True,
             )
+
+    def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
+        """Tell the diffusion stage how many per-sample KV caches to receive."""
+        params = _without_per_sample_kv_count(params)
+        n = getattr(req_state.sampling_params_list[src_stage_id], "n", 1) or 1
+        if n <= 1 or not self.stage_pools[src_stage_id].per_sample_kv:
+            return params
+        params = copy.copy(params)
+        params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
+        return params
 
     async def _forward_to_next_stage(
         self,
@@ -3134,7 +3300,7 @@ class OrchestratorBase:
                 already_submitted=already_submitted,
                 t_submit_start=_t_submit_start,
                 submit_kwargs=submit_kwargs,
-                params_override=self._diffusion_params_for_samples(
+                params_override=cast(Orchestrator, self)._diffusion_params_for_samples(
                     req_state, src_stage_id, self._maybe_clone_diffusion_params_for_cfg(req_id, params)
                 ),
                 pinned_replica_id=pinned_replica_id,
@@ -3252,8 +3418,7 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=final_pool._infer_audio_sample_rate(),
             )
-            submit_ts = _time.time()
-            req_state.stage_submit_ts[final_stage_id] = submit_ts
+            submit_ts = stamp_stage_submit(req_state, final_stage_id, refresh=True)
             logger.info(
                 "[Orchestrator] req=%s stage-%s produced no terminal inputs for stage-%s; "
                 "returning empty %s output from final stage-%s",
@@ -3338,6 +3503,13 @@ class OrchestratorBase:
 
                 if mark_submitting is not None:
                     mark_submitting()
+                stamp_downstream_stage_submit(
+                    req_state,
+                    next_logical,
+                    next_pool,
+                    already_submitted=already_submitted,
+                    after_submit=False,
+                )
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
                 else:
@@ -3349,6 +3521,13 @@ class OrchestratorBase:
                         expected_replica_id=scoped_replica_id,
                         **route_kwargs,
                     )
+                stamp_downstream_stage_submit(
+                    req_state,
+                    next_logical,
+                    next_pool,
+                    already_submitted=already_submitted,
+                    after_submit=True,
+                )
             self._on_stage_submitted(
                 next_logical,
                 req_id,
@@ -3368,7 +3547,6 @@ class OrchestratorBase:
             )
             return
 
-        req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
         self._emit_tx_edge(
             from_stage=src_stage_id,
@@ -3417,13 +3595,26 @@ class OrchestratorBase:
         if params_override is not None:
             initial_kwargs["params_override"] = params_override
         for request in requests:
+            stamp_downstream_stage_submit(
+                req_state,
+                receiver_stage_id,
+                to_pool,
+                already_submitted=already_submitted,
+                after_submit=False,
+            )
             if already_submitted:
                 replica_id = await to_pool.submit_update(req_id, req_state, request, **update_kwargs)
             else:
                 replica_id = await to_pool.submit_initial(req_id, req_state, request, **initial_kwargs)
+            stamp_downstream_stage_submit(
+                req_state,
+                receiver_stage_id,
+                to_pool,
+                already_submitted=already_submitted,
+                after_submit=True,
+            )
             self._on_stage_submitted(receiver_stage_id, req_id, replica_id, req_state)
 
-        req_state.stage_submit_ts[receiver_stage_id] = _time.time()
         self._emit_tx_edge(
             from_stage=source_stage_id,
             from_replica=source_replica_id if source_replica_id is not None else 0,
@@ -3463,6 +3654,13 @@ class OrchestratorBase:
                 sampling_params_list=sampling_params_list,
             )
         )
+
+    def _prewarm_downstream_resumable(
+        self, stage_id: int, entry_request: Any, req_state: OrchestratorRequestState
+    ) -> bool:
+        """Keep the entry request's streaming lifetime on downstream stages."""
+        del stage_id
+        return bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -3534,7 +3732,13 @@ class OrchestratorBase:
                     await self._fail_request_dead_stage(request_id, route_stage_id)
                     return False
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            stamp_downstream_stage_submit(
+                req_state,
+                next_stage_id,
+                next_pool,
+                already_submitted=False,
+                after_submit=False,
+            )
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
@@ -3602,7 +3806,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+                downstream_resumable = self._prewarm_downstream_resumable(next_stage_id, entry_request, req_state)
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
                 if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
@@ -3643,6 +3847,13 @@ class OrchestratorBase:
             # request is already cleaned up, so stop prewarming.
             if not submitted:
                 return False
+            stamp_downstream_stage_submit(
+                req_state,
+                next_stage_id,
+                next_pool,
+                already_submitted=False,
+                after_submit=True,
+            )
 
             # The guard swallows submit_initial's return value; the pool binding
             # it recorded carries the same replica.
@@ -3845,13 +4056,13 @@ class Orchestrator(OrchestratorBase):
                 self._interaction_queue.put_nowait(interaction)
             except asyncio.QueueFull:
                 # This is a request-scoped failure: terminate the overloaded
-                # stream rather than silently dropping camera commands.
+                # stream rather than silently dropping camera commands. No
+                # event_id: an event-scoped rejection would keep the stream.
                 await self.output_async_queue.put(
                     ErrorMessage(
                         error="Too many pending interactions",
                         fatal=False,
                         request_id=interaction.request_id,
-                        event_id=interaction.interaction.get("event_id"),
                         stage_id=0,
                     )
                 )
@@ -3969,16 +4180,6 @@ class Orchestrator(OrchestratorBase):
         max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
         return float("inf") if max_num_seqs is None else int(max_num_seqs)
 
-    def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
-        """Tell the diffusion stage how many per-sample KV caches to receive."""
-        params = _without_per_sample_kv_count(params)
-        n = getattr(req_state.sampling_params_list[src_stage_id], "n", 1) or 1
-        if n <= 1 or not self.stage_pools[src_stage_id].per_sample_kv:
-            return params
-        params = copy.copy(params)
-        params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
-        return params
-
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = msg.entry_stage_id
@@ -3992,10 +4193,14 @@ class Orchestrator(OrchestratorBase):
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
         sampling_params_list = [_without_per_sample_kv_count(params) for params in sampling_params_list]
 
+        # Before registration, only the submission message owns the artifact
+        # dirs; state-based failure cleanup cannot find them yet.
+        artifact_dirs = msg.request_artifact_dirs or []
         if msg.requested_replica_id is not None:
             try:
                 self.stage_pools[stage_id].reserve_requested_replica(request_id, msg.requested_replica_id)
             except OmniClientError as exc:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
@@ -4005,18 +4210,38 @@ class Orchestrator(OrchestratorBase):
                 )
                 return
         if await self._fail_if_cannot_submit(request_id, stage_id, is_run_request=msg.yield_stage_id is not None):
+            cleanup_request_artifact_dirs(artifact_dirs)
             return
 
         if getattr(prompt, "resumable", False):
+            for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+                vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
+                model_config = getattr(vllm_config, "model_config", None)
+                hf_config = getattr(model_config, "hf_config", None)
+                spec_config = getattr(vllm_config, "speculative_config", None)
+                if (
+                    getattr(hf_config, "model_type", None) == "qwen3_omni_moe"
+                    and spec_config is not None
+                    and spec_config.use_dflash()
+                ):
+                    cleanup_request_artifact_dirs(artifact_dirs)
+                    await self._fail_request_client_error(
+                        request_id,
+                        stage_id,
+                        f"streaming (resumable) input is not supported with Qwen3-Omni DFlash on stage "
+                        f"{active_stage_id}; disable DFlash for streaming input or use a non-resumable request",
+                    )
+                    return
             mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
             if mrv2_stage_id is not None:
                 # Streaming-input sessions replace downstream prompts through
                 # the V1 chunk adapter, which MRv2's native data plane lacks.
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
                     f"streaming (resumable) input is not supported: stage {mrv2_stage_id} runs on "
-                    "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
+                    "model_runner v2, which supports turn-based requests only; select a V2 duplex profile "
                     "for that stage",
                 )
                 return
@@ -4025,6 +4250,7 @@ class Orchestrator(OrchestratorBase):
         for later_stage_id in range(stage_id + 1, min(final_stage_id, len(sampling_params_list) - 1) + 1):
             later_n = getattr(sampling_params_list[later_stage_id], "n", 1) or 1
             if later_n > 1:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(
                     request_id,
                     stage_id,
@@ -4053,6 +4279,7 @@ class Orchestrator(OrchestratorBase):
             elif self.stage_pools[stage_id].will_watermark(entry_params):
                 reason = f"n > 1 is not supported with output watermarking on stage {stage_id}"
             if reason is not None:
+                cleanup_request_artifact_dirs(artifact_dirs)
                 await self._fail_request_client_error(request_id, stage_id, reason)
                 return
 
@@ -4138,7 +4365,7 @@ class Orchestrator(OrchestratorBase):
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
                     return
                 req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
-            req_state.stage_submit_ts[stage_id] = _time.time()
+            stamp_stage_submit(req_state, stage_id, refresh=True)
             if mark_submitting is not None:
                 mark_submitting()
             if not await self._dispatch_or_fail_request(
@@ -4185,7 +4412,7 @@ class Orchestrator(OrchestratorBase):
             req_state.sampling_params_list = [_without_per_sample_kv_count(p) for p in msg.sampling_params_list]
 
         req_state.streaming.enabled = True
-        req_state.stage_submit_ts[stage_id] = _time.time()
+        stamp_stage_submit(req_state, stage_id, refresh=True)
         if not await self._dispatch_or_fail_request(
             lambda: self.stage_pools[stage_id].submit_update(
                 request_id,
@@ -4236,7 +4463,7 @@ class Orchestrator(OrchestratorBase):
             ),
         )
         self.request_states[companion_id] = companion_state
-        companion_state.stage_submit_ts[0] = _time.time()
+        stamp_stage_submit(companion_state, 0, refresh=True)
 
         # A dead-stage failure is attributed to the parent request; its cleanup
         # also releases this companion.
