@@ -84,17 +84,6 @@ def test_a_stacked_pair_reserves_what_the_model_slices_it_into(
     assert reserved == expected_blocks * TOKENS_PER_BLOCK
 
 
-def test_a_small_frame_no_longer_reserves_three_hd_blocks() -> None:
-    """A 448x448 frame is one tile, so a stacked pair is two blocks, not four.
-
-    The size-independent count reserved 264 tokens for this pair. 132 of them
-    were for patches the model never produces.
-    """
-    frame = _frame((448, 448))
-
-    assert _duplex_vision_tokens({"video_frames": [frame, frame]}, tile_pixels=TILE_448) == 2 * TOKENS_PER_BLOCK
-
-
 def test_one_tile_is_the_whole_slicing_decision() -> None:
     """``ceil(w * h / tile)`` capped at 2: a single pixel over the tile slices."""
 

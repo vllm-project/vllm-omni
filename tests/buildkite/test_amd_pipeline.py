@@ -26,6 +26,7 @@ AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
+R2_01_EXPECTED_COUNT = 1456
 AMD_SOURCE_DEPENDENCIES = Path(".buildkite/common/ci_source_file_dependencies.yml")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
@@ -826,7 +827,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1454,
+        R2_01_EXPECTED_COUNT,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -2309,6 +2310,227 @@ def test_bagel_offline_weekly_executes_junit_guard_before_exit(
         timeout_status=timeout_status,
         expected_status=expected_status,
     )
+
+
+_QWEN_IMAGE_EDIT_ONLINE_1GPU_NODES = (
+    "tests/e2e/online_serving/test_qwen_image_edit.py::test_single_image_to_image_001[default]",
+    "tests/e2e/online_serving/test_qwen_image_edit.py::test_multi_images_to_image_001[default]",
+    "tests/e2e/online_serving/test_qwen_image_edit.py::test_different_sizes_001[default]",
+    "tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[cpu_offload]",
+    "tests/e2e/online_serving/test_qwen_image_edit_expansion.py::"
+    "test_qwen_image_edit_2511_single_image[single_card_001]",
+    "tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[cpu_offload]",
+    "tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[single_card_001]",
+    "tests/e2e/online_serving/test_qwen_image_layered.py::test_single_image_to_image_001[default]",
+    "tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[cpu_offload]",
+    "tests/e2e/online_serving/test_qwen_image_layered_expansion.py::"
+    "test_layered_output_image_count[layers_guard_001_layers2]",
+    "tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_empty_prompt[prompt_001]",
+)
+_QWEN_IMAGE_EDIT_ACCURACY_NODES = (
+    "tests/e2e/accuracy/test_qwen_image_edit.py::test_qwen_image_edit_single_matches_diffusers",
+    "tests/e2e/accuracy/test_qwen_image_edit.py::test_qwen_image_edit_2511_matches_diffusers_pixelwise",
+    "tests/e2e/accuracy/test_qwen_image_layered.py::test_qwen_image_layered_matches_diffusers",
+)
+_QWEN_IMAGE_EDIT_ONLINE_2GPU_NODES = (
+    *(
+        f"tests/e2e/online_serving/test_qwen_image_edit_expansion.py::"
+        f"test_qwen_image_edit_2511_single_image[parallel_{index:03d}]"
+        for index in range(1, 6)
+    ),
+    *(
+        f"tests/e2e/online_serving/test_qwen_image_edit_expansion.py::"
+        f"test_qwen_image_edit_2511_two_images[parallel_{index:03d}]"
+        for index in range(1, 6)
+    ),
+    "tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[sp_001]",
+    "tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[cfg_parallel_001]",
+    "tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[parallel_hsdp]",
+)
+_QWEN_IMAGE_MERGED_LORA_NODE = (
+    "tests/e2e/features/rlhf_test/test_qwen_image_merged_lora.py::"
+    "test_qwen_image_merged_lora_changes_and_restores_generation"
+)
+_QWEN_IMAGE_AUTOROUND_NODES = (
+    "tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py::test_qwen_image_autoround_w4a16_load",
+    "tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py::"
+    "test_qwen_image_autoround_w4a16_generate",
+)
+_QWEN_IMAGE_WEEKLY_JOBS = (
+    (
+        "Qwen-Image Edit and Layered online · 1-GPU",
+        "mi300_1",
+        "1",
+        "11",
+        "285m",
+        300,
+        "rocm-qwen-image-edit-layered-online-weekly",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "full_model",
+        "diffusion_qwen_image_edit_weekly",
+        _QWEN_IMAGE_EDIT_ONLINE_1GPU_NODES,
+    ),
+    (
+        "Qwen-Image Edit and Layered accuracy · 1-GPU",
+        "mi300_1",
+        "1",
+        "3",
+        "285m",
+        300,
+        "rocm-qwen-image-edit-layered-accuracy-weekly",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "full_model",
+        "diffusion_qwen_image_edit_weekly",
+        _QWEN_IMAGE_EDIT_ACCURACY_NODES,
+    ),
+    (
+        "Qwen-Image Edit and Layered online · 2-GPU",
+        "mi300_2",
+        "2",
+        "13",
+        "285m",
+        300,
+        "rocm-qwen-image-edit-layered-2gpu-weekly",
+        "slow and diffusion and rocm and MI325 and cards_2",
+        "full_model",
+        "diffusion_qwen_image_edit_weekly",
+        _QWEN_IMAGE_EDIT_ONLINE_2GPU_NODES,
+    ),
+    (
+        "Qwen-Image merged LoRA · 1-GPU",
+        "mi300_1",
+        "1",
+        "1",
+        "105m",
+        120,
+        "rocm-qwen-image-merged-lora-weekly",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "core_model",
+        "diffusion_qwen_image_function",
+        (_QWEN_IMAGE_MERGED_LORA_NODE,),
+    ),
+    (
+        "Qwen-Image AutoRound W4A16 · 1-GPU",
+        "mi300_1",
+        "1",
+        "2",
+        "285m",
+        300,
+        "rocm-qwen-image-autoround-weekly",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "full_model",
+        "diffusion_qwen_image_autoround_weekly",
+        _QWEN_IMAGE_AUTOROUND_NODES,
+    ),
+)
+
+
+def test_qwen_image_weekly_jobs_are_exact_blocking_owners() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
+    runner = ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh"
+    weekly_group = _find_group("Diffusion E2E Weekly", AMD_WEEKLY_PIPELINE)
+    labels = {job[0] for job in _QWEN_IMAGE_WEEKLY_JOBS}
+    assert len([step for step in weekly_group["steps"] if step["label"] in labels]) == len(labels)
+
+    for (
+        label,
+        agent_pool,
+        expected_gpus,
+        expected_tests,
+        run_timeout,
+        step_timeout,
+        artifact_name,
+        marker,
+        run_level,
+        dependency_key,
+        nodes,
+    ) in _QWEN_IMAGE_WEEKLY_JOBS:
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        assert step["grade"] == "Blocking"
+        assert step["agent_pool"] == agent_pool
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == step_timeout
+        assert step["source_file_dependencies"] == [dependency_key, runner]
+        assert step["env"]["VLLM_ROCM_USE_AITER"] == "0"
+        assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+        assert step["env"].get("ROCM_DIFFUSION_RUN_LEVEL", "full_model") == run_level
+        assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
+        assert "retry" not in step
+
+        command = next(command for command in step["commands"] if runner in command)
+        tokens = [token for token in split(command) if token.strip()]
+        runner_index = tokens.index(runner)
+        args = tokens[runner_index + 1 :]
+        assert args[:4] == [expected_gpus, expected_tests, run_timeout, artifact_name]
+        marker_index = args.index("-m")
+        assert args[marker_index + 1] == marker
+        assert tuple(args[4:marker_index]) == nodes
+
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+    dependency_paths = flatten_paths(dependencies["diffusion_qwen_image_edit_weekly"])
+    assert {
+        "vllm_omni/diffusion/models/qwen_image/",
+        "vllm_omni/config/",
+        "vllm_omni/diffusion/cache/",
+        "vllm_omni/diffusion/distributed/",
+        "vllm_omni/diffusion/offloader/",
+        "tests/e2e/online_serving/test_qwen_image_edit.py",
+        "tests/e2e/online_serving/test_qwen_image_edit_expansion.py",
+        "tests/e2e/online_serving/test_qwen_image_layered.py",
+        "tests/e2e/online_serving/test_qwen_image_layered_expansion.py",
+        "tests/e2e/accuracy/test_qwen_image_edit.py",
+        "tests/e2e/accuracy/test_qwen_image_layered.py",
+        "tests/assets/qwen_image_edit/",
+    } <= dependency_paths
+
+    autoround_dependency_paths = flatten_paths(dependencies["diffusion_qwen_image_autoround_weekly"])
+    assert {
+        "vllm_omni/diffusion/models/qwen_image/",
+        "vllm_omni/config/",
+        "vllm_omni/diffusion/offloader/",
+        "vllm_omni/diffusion/model_loader/",
+        "vllm_omni/engine/stage_init_utils.py",
+        "vllm_omni/quantization/",
+        "tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py",
+    } <= autoround_dependency_paths
+
+    online_mark = 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})'
+    parallel_mark = 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)'
+    hardware_mark = '@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)'
+    assert online_mark in Path("tests/e2e/online_serving/test_qwen_image_edit.py").read_text(encoding="utf-8")
+    assert online_mark in Path("tests/e2e/online_serving/test_qwen_image_layered.py").read_text(encoding="utf-8")
+    for source_path in (
+        "tests/e2e/online_serving/test_qwen_image_edit_expansion.py",
+        "tests/e2e/online_serving/test_qwen_image_layered_expansion.py",
+    ):
+        source = Path(source_path).read_text(encoding="utf-8")
+        assert online_mark in source
+        assert parallel_mark in source
+    assert Path("tests/e2e/accuracy/test_qwen_image_edit.py").read_text(encoding="utf-8").count(hardware_mark) == 2
+    assert hardware_mark in Path("tests/e2e/accuracy/test_qwen_image_layered.py").read_text(encoding="utf-8")
+    assert hardware_mark in Path("tests/e2e/features/rlhf_test/test_qwen_image_merged_lora.py").read_text(
+        encoding="utf-8"
+    )
+    autoround_source = Path("tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py").read_text(
+        encoding="utf-8"
+    )
+    assert autoround_source.count('@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"})') == len(
+        _QWEN_IMAGE_AUTOROUND_NODES
+    )
+    autoround_step = _find_step("Qwen-Image AutoRound W4A16 · 1-GPU", AMD_WEEKLY_PIPELINE)
+    assert autoround_step["commands"][0].startswith("export QWEN_IMAGE_AUTOROUND_ARTIFACT_DIR=")
 
 
 _COSMOS3_WEEKLY_NODES = (
@@ -5202,7 +5424,8 @@ _WORKER_ONE_CARD_NODES = (
 def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
-    The V2/shared one-card cases retain their exact IDs after V1 removal. R2-01 still collects 1454 model-executor nodes and does not run them.
+    The V2/shared cases retain their exact IDs after V1 removal and run in
+    the dedicated worker job.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5252,7 +5475,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1454" in r2_01_command
+    assert f"assert-pytest-collection.sh {R2_01_EXPECTED_COUNT}" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -5359,8 +5582,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
     """READY blocks on the remaining one-card copy cases.
 
     The marker selects both intermediate-buffer residency rows and the three
-    device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1454 model-executor nodes.
+    device-copy GPU tests. #9552's worker files stay on the other job.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5414,7 +5636,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1454" in r2_01_command
+    assert f"assert-pytest-collection.sh {R2_01_EXPECTED_COUNT}" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
@@ -6001,6 +6223,6 @@ def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 38
-    assert sum(step["grade"] == "Blocking" for step in steps) == 36
+    assert len(steps) == 43
+    assert sum(step["grade"] == "Blocking" for step in steps) == 41
     assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS
