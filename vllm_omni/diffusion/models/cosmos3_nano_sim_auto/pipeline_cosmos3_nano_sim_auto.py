@@ -28,11 +28,11 @@ from contextlib import contextmanager
 from typing import Any, ClassVar
 
 import torch
-
 from vllm.logger import init_logger
+
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.cosmos3.fixed_step_sde import fixed_step_sample, initial_noise
-from vllm_omni.diffusion.models.cosmos3.lidar import Cosmos3LidarDecoder, Cosmos3LidarEncoder
+from vllm_omni.diffusion.models.cosmos3.lidar_vae import Cosmos3LidarDecoder, Cosmos3LidarEncoder
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_attention import resolve_maskless_kernel
 from vllm_omni.diffusion.models.cosmos3.multiview_prompts import (
     COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT,
@@ -179,8 +179,12 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         self.lidar_grid: SensorGrid | None = None
         if self.manifest.lidar is not None:
             lidar_config = dict(self.manifest.lidar)
-            self.lidar_encoder = Cosmos3LidarEncoder.from_pretrained(od_config.model, lidar_config, self.device)
-            self.lidar_decoder = Cosmos3LidarDecoder.from_pretrained(od_config.model, lidar_config, self.device)
+            self.lidar_encoder = Cosmos3LidarEncoder.from_pretrained(
+                od_config.model, lidar_config, self.device, od_config=od_config
+            )
+            self.lidar_decoder = Cosmos3LidarDecoder.from_pretrained(
+                od_config.model, lidar_config, self.device, od_config=od_config
+            )
             network = lidar_config["network_config"]
             assert self.manifest.lidar_latent_patch_size_hw is not None
             self.lidar_grid = lidar_grid(

@@ -22,10 +22,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from vllm_omni.diffusion.models.cosmos3.lidar import validate_lidar_config
+from vllm_omni.diffusion.models.cosmos3.lidar_vae import validate_lidar_config
 from vllm_omni.diffusion.models.cosmos3.multiview_config import _validated_rig_view_embedding
 from vllm_omni.diffusion.models.cosmos3.multiview_packing import spatial_patch_hw
-from vllm_omni.diffusion.models.cosmos3.multiview_prompts import MADS_CAMERA_ATTRIBUTES
+from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
 
 COSMOS3_NANO_SIM_AUTO_SCHEMA_VERSION = 1
 COSMOS3_NANO_SIM_AUTO_ARTIFACT_KEY = "cosmos3_nano_sim_auto"
@@ -280,7 +280,7 @@ class Cosmos3NanoSimAutoManifest:
         if (
             not isinstance(cameras, list)
             or not cameras
-            or any(not isinstance(camera, str) or camera not in MADS_CAMERA_ATTRIBUTES for camera in cameras)
+            or any(not isinstance(camera, str) or camera not in COSMOS3_MADS_CAMERAS for camera in cameras)
             or len(set(cameras)) != len(cameras)
         ):
             raise ValueError("Cosmos3-Nano-Sim-Auto cameras must be unique MADS camera keys.")
