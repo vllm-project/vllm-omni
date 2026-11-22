@@ -13,10 +13,17 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
+import sys
 from pathlib import Path
 
+from vllm.benchmarks.serve import TaskType
+
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, DuplexSample, load_samples
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import (
+    DEFAULT_JUDGE_FRAME_MAX_SIDE,
+    evaluate_sample,
+    summarize_scores,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     DEFAULT_INSTRUCTIONS,
@@ -31,7 +38,11 @@ from vllm_omni.benchmarks.duplex_session_metrics import (
     merge_duplex_metrics_report,
     read_duplex_metrics_report,
 )
+from vllm_omni.benchmarks.metrics.metrics import build_stage_metrics_from_snapshots, print_stage_metrics
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
+
+_STAGE_PERCENTILE_METRICS = ["ttft", "tpot", "itl", "audio_ttfp", "audio_duration"]
+_STAGE_PERCENTILES = [99.0]
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -105,6 +116,14 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     generate.add_argument("--clock", choices=("media",), default="media")
     generate.add_argument("--concurrency", type=int, default=1)
     generate.add_argument("--overwrite", action="store_true")
+    generate.add_argument(
+        "--print-stage",
+        action="store_true",
+        help=(
+            "Print aggregated per-stage metrics from successful samples generated in this run "
+            "(mean, median and P99; fixed metric selection)."
+        ),
+    )
     evaluate = actions.add_parser("evaluate")
     _common(evaluate)
     evaluate.add_argument("--response-root", required=True)
@@ -114,6 +133,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     evaluate.add_argument("--judge-api-key", default="EMPTY")
     evaluate.add_argument("--judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
     evaluate.add_argument("--judge-fps", type=int, default=2)
+    evaluate.add_argument(
+        "--judge-frame-max-side",
+        type=int,
+        default=DEFAULT_JUDGE_FRAME_MAX_SIDE,
+        help="Scale judge frames down so the longer side is at most this many pixels (0 keeps source resolution).",
+    )
     evaluate.add_argument("--window-size", type=float, default=10.0)
     evaluate.add_argument("--allow-invalid-clock", action="store_true")
     evaluate.add_argument("--eval-workers", type=int, default=1)
@@ -177,37 +202,99 @@ def run(args: argparse.Namespace) -> int:
                         pace=args.pace,
                         clock=args.clock,
                         overwrite=args.overwrite,
+                        collect_stage_metrics=args.print_stage,
                         instructions=args.instructions or None,
                         turn_detection=args.turn_detection,
                     )
 
             return list(await asyncio.gather(*(generate_one(sample) for sample in samples)))
 
-        _write_duplex_metrics(args.response_root, asyncio.run(generate()))
+        results = asyncio.run(generate())
+        _write_duplex_metrics(args.response_root, results)
+        if args.print_stage:
+            skipped = sum(not result.generated for result in results)
+            if skipped:
+                print(
+                    f"Stage metrics are unavailable for {skipped} skipped sample(s); "
+                    "use --overwrite to regenerate them.",
+                    file=sys.stderr,
+                )
+            successful_results = [
+                result
+                for result in results
+                if result.generated and result.metadata.get("response_done") is True and not result.error
+            ]
+            failed = sum(result.generated for result in results) - len(successful_results)
+            if failed:
+                print(f"Excluded {failed} failed sample(s) from stage metrics.", file=sys.stderr)
+            snapshots = [
+                stage_metrics
+                for result in successful_results
+                for metric in result.request_metrics
+                if isinstance((stage_metrics := metric.get("stage_metrics")), dict)
+            ]
+            stages = build_stage_metrics_from_snapshots(snapshots)
+            if not stages and successful_results:
+                print("No stage metrics were returned for successful samples generated in this run.", file=sys.stderr)
+            for stage in stages:
+                print_stage_metrics(
+                    TaskType.GENERATION,
+                    _STAGE_PERCENTILE_METRICS,
+                    _STAGE_PERCENTILES,
+                    stage,
+                )
         return 0
 
     if args.eval_workers < 1:
         raise ValueError("--eval-workers must be at least 1")
+    if args.judge_frame_max_side < 0:
+        raise ValueError("--judge-frame-max-side must be 0 or positive")
+    frame_max_side = args.judge_frame_max_side or None
+    response_root = Path(args.response_root)
+    score_root = Path(args.score_root)
+
+    def needs_evaluation(sample: DuplexSample, score_path: Path) -> bool:
+        if args.overwrite or not score_path.exists():
+            return True
+        if sample.family == "rtd":
+            cached_cap = json.loads(score_path.read_text(encoding="utf-8")).get("judge_frame_max_side")
+            if cached_cap != frame_max_side:
+                raise ValueError(
+                    f"Cached RTD score {score_path} has judge_frame_max_side={cached_cap!r}, "
+                    f"but the requested setting is {frame_max_side!r} (None means source resolution). "
+                    "Rerun with --overwrite or use a fresh --score-root."
+                )
+        return False
+
+    # Check all selected cached scores before any worker can write a new one.
+    pending: list[tuple[DuplexSample, Path]] = []
+    for sample in samples:
+        score_path = score_root / sample.split / f"{sample.id}.json"
+        if needs_evaluation(sample, score_path):
+            pending.append((sample, score_path))
+    if not pending:
+        return 0
+
     judge = DuplexJudge(args.judge_base_url, args.judge_model, api_key=args.judge_api_key)
 
-    def evaluate_one(sample: DuplexSample) -> None:
-        response_path = Path(args.response_root) / sample.split / f"{sample.id}.json"
-        score_path = Path(args.score_root) / sample.split / f"{sample.id}.json"
-        if score_path.exists() and not args.overwrite:
+    def evaluate_one(work: tuple[DuplexSample, Path]) -> None:
+        sample, score_path = work
+        if not needs_evaluation(sample, score_path):
             return
         evaluate_sample(
             sample,
-            response_path,
+            response_root / sample.split / f"{sample.id}.json",
             score_path,
             judge,
             judge_fps=args.judge_fps,
             judge_video_mode=args.judge_video_mode,
+            judge_frame_max_side=frame_max_side,
             window_size=args.window_size,
             allow_invalid_clock=args.allow_invalid_clock,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.eval_workers) as executor:
-        list(executor.map(evaluate_one, samples))
+        list(executor.map(evaluate_one, pending))
     return 0
 
 

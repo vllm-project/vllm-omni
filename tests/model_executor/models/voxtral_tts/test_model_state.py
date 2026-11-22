@@ -136,7 +136,7 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
 
     def emit_mrv2_frames(req_ids, request_infos, values, scheduled_tokens):
         model.model.next_frames = [torch.full((1, 1, 4), value) for value in values]
-        model.make_omni_output_mrv2(
+        return model.make_omni_output_mrv2(
             torch.zeros((len(req_ids), 4)),
             input_batch=SimpleNamespace(
                 num_reqs=len(req_ids),
@@ -149,7 +149,7 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
             model_intermediate_buffer=request_infos,
         )
 
-    emit_mrv2_frames(["request-a"], [state.intermediate_buffer.buffers[0]], [101.0], [4])
+    first_output = emit_mrv2_frames(["request-a"], [state.intermediate_buffer.buffers[0]], [101.0], [4])
 
     def runner_output(req_ids):
         return ModelRunnerOutput(
@@ -162,7 +162,17 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
         )
 
     first_codes = state.intermediate_buffer.buffers[0]["codes"]
-    assert first_codes["audio_history"][0] is first_codes["audio"]
+    assert "audio" not in first_codes
+    torch.testing.assert_close(first_codes["audio_history"][0], torch.full((1, 1, 4), 101.0))
+    postprocess_update = model.tts_postprocess(
+        torch.zeros((1, 4)),
+        first_output.multimodal_outputs,
+        _omni_batch_row=0,
+    )
+    state.intermediate_buffer.update(0, postprocess_update)
+    first_codes = state.intermediate_buffer.buffers[0]["codes"]
+    torch.testing.assert_close(first_codes["audio"], torch.full((1, 1, 4), 101.0))
+    torch.testing.assert_close(first_codes["audio_history"][0], torch.full((1, 1, 4), 101.0))
 
     scheduler.update_from_output(first_prefill, runner_output(["request-a"]))
     preemption = scheduler.schedule()

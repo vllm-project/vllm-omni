@@ -148,6 +148,22 @@ adapter, not injected through unrelated scheduler state.
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
 
+## Model-owned request lifecycle
+
+Model states can implement `get_request_lifecycle(scheduler_output)` to return
+a `RequestLifecycleUpdate` before the runner admits new requests. Reset IDs
+clear both model-owned state and native slots before the same IDs enter a new
+phase. Release IDs free only native slots, leaving model-owned jobs alive.
+Real finished/aborted IDs still notify the model even after a slot was released.
+These worker transitions do not mutate the scheduler's completion metadata.
+
+`finalize_runner_output(output, idle=...)` runs on the AR worker thread after
+sampling and on no-forward steps, outside graph capture/profiling. It can
+publish work that outlives native slots. Ordinary model states preserve the
+original deferred output without synchronizing it. YuE2 uses these hooks for
+ABC phase replacement and request-keyed NAR/VAE completion, through the shared
+`OmniARModelRunner` and standard worker.
+
 ## Token-only output payloads
 
 An AR stage whose downstream decoder consumes sampled tokens rather than

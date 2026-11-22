@@ -139,6 +139,8 @@ class VoxtralTTSForConditionalGeneration(
             self._vllm_config = vllm_config
             tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
             self._audio_token_id = tokenizer.instruct.audio_encoder.special_ids.audio
+            # The next decode step embeds this frame, so keep it on device.
+            self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("codes", "audio")}
             speaker_id = config.audio_config.get("speaker_id", None)
             if speaker_id:
                 self.voice_to_embedding = {}
@@ -412,9 +414,45 @@ class VoxtralTTSForConditionalGeneration(
             return input_ids, input_embeds, feedback_state_update
         return input_ids, input_embeds, feedback_state_update
 
-    def tts_postprocess(
-        self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None
-    ) -> dict:
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, object]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, object]]]:
+        """Batched decode branch of ``tts_preprocess``: embed every row's last audio frame at once."""
+        if input_ids.numel() != len(req_infos):
+            raise ValueError(f"Expected one decode token per request, got {input_ids.numel()} for {len(req_infos)}")
+        self.post_process_idx = 0
+        frames: list[torch.Tensor] = []
+        rows: list[int] = []
+        for row, info in enumerate(req_infos):
+            codes = info.get("codes")
+            frame = codes.get("audio") if isinstance(codes, Mapping) else None
+            if isinstance(frame, torch.Tensor):
+                frames.append(frame.reshape(1, -1))
+                rows.append(row)
+        embeds = self.model.embed_input_ids(input_ids)
+        if len(rows) < len(req_infos):
+            # Like tts_preprocess, a row without a frame keeps its token embedding
+            # instead of failing the whole batch.
+            logger.warning_once("Voxtral TTS decode row without a previous audio frame; using its token embedding")
+        if not rows:
+            return input_ids, embeds, [{} for _ in req_infos]
+
+        audio_codes = torch.cat(frames).to(input_ids.device)  # (rows, num_codebooks)
+        audio_embeds = self.model.audio_tokenizer.encode_tokens([audio_codes.unsqueeze(-1)])[0]
+        audio_embeds = audio_embeds.reshape(len(rows), -1).to(embeds.dtype)
+        if len(rows) == len(req_infos):
+            is_audio = (input_ids == self._audio_token_id).unsqueeze(-1)
+            embeds = torch.where(is_audio, audio_embeds, embeds)
+        else:
+            index = torch.tensor(rows, device=input_ids.device)
+            is_audio = (input_ids[index] == self._audio_token_id).unsqueeze(-1)
+            embeds = embeds.index_copy(0, index, torch.where(is_audio, audio_embeds, embeds[index]))
+        return input_ids, embeds, [{} for _ in req_infos]
+
+    def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):
         update_dict = {}
         if isinstance(multimodal_outputs, Mapping):
             codes = multimodal_outputs.get("codes")
@@ -482,15 +520,15 @@ class VoxtralTTSForConditionalGeneration(
         *,
         keep_history_on_device: bool = False,
     ) -> None:
-        """Save each emitted acoustic frame in its request-local model state.
+        """Append emitted frames to request-local replay history.
 
-        The next decode step consumes this frame in tts_preprocess. Keeping it
-        in request-local state avoids a model-global cursor, which can associate
-        frames with the wrong request under batching. MRV2 may keep active
-        history on device and offload it when preempted; V1 keeps CPU history.
-        MRV2 device memory grows with generated frames across active requests.
-        request_sample_eligible excludes intermediate prompt chunks; the final
-        prompt chunk remains eligible for the first generated token.
+        tts_postprocess writes the current codes.audio feedback frame.
+        This helper stores only the history needed to replay accepted tokens
+        after preemption. MRV2 may keep that history on device and offload it
+        when preempted; V1 keeps CPU history. MRV2 device memory grows with
+        generated frames across active requests. request_sample_eligible
+        excludes intermediate prompt chunks; the final prompt chunk remains
+        eligible for the first generated token.
         """
         if not isinstance(multimodal_outputs, Mapping) or not isinstance(request_infos, (list, tuple)):
             return
@@ -537,18 +575,11 @@ class VoxtralTTSForConditionalGeneration(
             if isinstance(request_codes, dict):
                 # Own the frame so request state survives reuse of model-output buffers.
                 latest_frame = frame.detach().clone()
-                # MRV2 owns request state directly, so keep active replay
-                # frames with the request on device and offload them together
-                # only if scheduler preemption suspends that request. V1's
-                # runner serializes intermediate updates to CPU and keeps the
-                # historical behavior below.
+                # Keep active MRV2 history on device and offload it on preemption;
+                # V1 stores history on CPU. tts_postprocess writes codes.audio.
                 history_frame = (
                     latest_frame if keep_history_on_device else frame.detach().to(device="cpu", copy=True).contiguous()
                 )
-                # Generation output writes both views from this same frame:
-                # tts_preprocess may use `audio` as `audio_history[-1]` when
-                # positions align. Any update to one must update the other too.
-                request_codes["audio"] = latest_frame
                 history = request_codes.setdefault("audio_history", [])
                 if isinstance(history, list):
                     history.append(history_frame)

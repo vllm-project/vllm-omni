@@ -34,6 +34,7 @@ from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.utils import (
     coerce_param_message_types,
     filter_dataclass_kwargs,
+    parse_stage_overrides,
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 
@@ -463,7 +464,8 @@ class TestResolveOmniConfig:
         assert stage.diffusion_config.revision == "pinned-revision"
         assert stage.final_output_type == "video"
 
-    def test_generic_diffusion_stage_overrides_reach_typed_backend(self, mocker: MockerFixture):
+    @pytest.mark.parametrize("stage_id", ["0", "00"])
+    def test_generic_diffusion_stage_overrides_reach_typed_backend(self, mocker: MockerFixture, stage_id: str):
         from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
         mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
@@ -480,14 +482,16 @@ class TestResolveOmniConfig:
                 "tensor_parallel_size": 1,
                 "diffusion_streaming_output": True,
             },
-            stage_overrides={
-                "0": {
-                    "extras": {"ltx2_use_conv_vae": True},
-                    "tensor_parallel_size": 2,
-                    "devices": "2,3",
-                    "engine_backend": "custom.backend",
+            stage_overrides=parse_stage_overrides(
+                {
+                    stage_id: {
+                        "extras": {"ltx2_use_conv_vae": True},
+                        "tensor_parallel_size": 2,
+                        "devices": "2,3",
+                        "engine_backend": "custom.backend",
+                    },
                 },
-            },
+            ),
             strategy_config_path=None,
         )
         stage = resolved.stage_by_id(0)
