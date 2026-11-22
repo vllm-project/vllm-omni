@@ -134,7 +134,7 @@ def _mlp(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
 
 @functools.cache
 def tiled_attention_supported(device_index: int) -> bool:
-    """``cfm_attention`` TF32 dots need NVIDIA tensor cores (SM80+)."""
+    """Use tiled FP32/FP16 attention on NVIDIA tensor cores (SM80+)."""
     return torch.version.hip is None and torch.cuda.get_device_capability(device_index) >= (8, 0)
 
 
@@ -154,9 +154,10 @@ def _attention(
     if slots is None:
         # ``att_cache`` behind the current frames: left where it is when it
         # already sits there (the Whole-Euler arena's aliasing), else copied once.
-        cached = 0 if att_cache is None else int(att_cache.shape[2])
-        kv = kv[:, :, : frames + cached]
-        behind = kv[:, :, frames:]
+        # Both caches are split K/V ``(2, N, H, T, D)`` rows.
+        cached = 0 if att_cache is None else int(att_cache.shape[-2])
+        kv = kv[:, :, :, : frames + cached]
+        behind = kv[:, :, :, frames:]
         if cached and (att_cache.data_ptr() != behind.data_ptr() or att_cache.stride() != behind.stride()):
             behind.copy_(att_cache)
     q = qkv_head_layer_norm(
@@ -169,10 +170,12 @@ def _attention(
         rows=rows,
         positions=positions,
     )
-    head_dim = int(q.shape[-1])
-    keys, values = kv[..., :head_dim], kv[..., head_dim:]
+    keys, values = kv[0], kv[1]
     if rows is not None or (
-        kv.is_cuda and kv.dtype == q.dtype == torch.float32 and tiled_attention_supported(kv.get_device())
+        kv.is_cuda
+        and kv.dtype == q.dtype
+        and kv.dtype in (torch.float32, torch.float16)
+        and tiled_attention_supported(kv.get_device())
     ):
         from .cfm_attention import cfm_attention
 

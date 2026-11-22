@@ -102,14 +102,26 @@ async def test_downstream_stage_call_validates_configured_order(source, receiver
         engine_client.run_downstream_stage.assert_not_awaited()
 
 
-def test_stage_input_round_trips_sampling_params():
+@pytest.mark.parametrize("adapter_count", [0, 1, 2])
+def test_stage_input_round_trips_sampling_params(adapter_count):
     """Ensure a stage's sampling params (including complex types) survive encoding."""
+    adapters = [
+        LoRARequest(lora_name=f"adapter-{index}", lora_int_id=index + 1, lora_path=f"/adapter-{index}")
+        for index in range(adapter_count)
+    ]
+    if adapter_count == 1:
+        lora_request = adapters[0]
+        lora_scale = 0.7
+    else:
+        lora_request = adapters
+        lora_scale = [0.3, 0.8][:adapter_count]
     stage_input = msgspec.structs.replace(
         _next_stage_input(),
         sampling_params_list=[
             SamplingParams(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
             OmniDiffusionSamplingParams(
-                lora_request=LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/adapter"),
+                lora_request=lora_request,
+                lora_scale=lora_scale,
             ),
         ],
     )

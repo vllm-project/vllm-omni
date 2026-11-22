@@ -7,6 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
@@ -52,6 +53,7 @@ from vllm_omni.metrics.modality import (
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_extras import (
     build_text_to_image_prompt,
+    get_ar_max_tokens_builder,
     get_extra_body_params,
     get_extra_output_params,
     should_init_extra_args_for_non_diffusion_stages,
@@ -145,13 +147,14 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
     merge_llm_sampling_params,
+    resolve_diffusion_sampling_params,
     to_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     is_image_generation_stage,
     is_single_stage_diffusion,
-    parse_lora_request,
+    parse_lora_requests,
     resolve_diffusion_od_config,
 )
 from vllm_omni.errors import OmniClientError
@@ -525,6 +528,35 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             self._multistage_model_class_name = model_class_name
         return model_class_name
 
+    def _cap_ar_stage_max_tokens(
+        self,
+        engine: AsyncOmni,
+        sampling_params_list: list[Any],
+        ar_idx: int | None,
+        height: int | None,
+        width: int | None,
+        is_i2i: bool = False,
+    ) -> None:
+        """Cap a multistage request's AR-stage ``max_tokens`` at the model's grid budget.
+
+        Models whose AR stage emits a size-dependent token count (GLM-Image:
+        preview + target + 1, the count the reference implementation truncates
+        at) declare an ``ar_max_tokens_builder``. Calling it here matches the
+        reference's truncation budget, so generation stops at the grid's token
+        count instead of running to the deploy-YAML ceiling. A size-less
+        request is capped at the model's default grid budget — the builder
+        resolves the absent size itself. Models without a builder keep their
+        configured ceiling.
+        """
+        if ar_idx is None or ar_idx >= len(sampling_params_list):
+            return
+        builder = get_ar_max_tokens_builder(self._resolve_multistage_model_class_name(engine))
+        if builder is None:
+            return
+        sp = sampling_params_list[ar_idx]
+        if hasattr(sp, "max_tokens"):
+            sp.max_tokens = builder(height, width, is_i2i=is_i2i)
+
     def _normalize_diffusion_request_args(
         self,
         request: ChatCompletionRequest,
@@ -886,10 +918,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Store height/width for applying to diffusion stage sampling params later
                 _image_gen_height = height
                 _image_gen_width = width
+                _image_gen_is_i2i = is_img2img
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
                 _image_gen_height = None
                 _image_gen_width = None
+                _image_gen_is_i2i = False
         elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
             # Single-stage diffusion text output (img2text / text2text).
             # Build a diffusion-style prompt with modalities=["text"] so the
@@ -917,9 +951,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
             _image_gen_height = None
             _image_gen_width = None
+            _image_gen_is_i2i = False
         else:
             _image_gen_height = None
             _image_gen_width = None
+            _image_gen_is_i2i = False
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -948,15 +984,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         request.modalities,
                     )
 
+                # The AR stage index does not depend on the request size;
+                # only the extra_args write below does. Size-less multistage
+                # requests still cap their AR budget — the registered
+                # builder resolves the absent size to the model's default
+                # grid. Single-stage engines have no AR stage to cap.
+                # Multi-stage pipelines that mark no comprehension stage get
+                # None, which the AR cap treats as a no-op.
                 comprehension_idx = (
-                    self._get_comprehension_stage_index()
-                    if _image_gen_height is not None and _image_gen_width is not None
-                    else None
+                    None
+                    if is_single_stage_diffusion(self.engine_client)
+                    else self._find_comprehension_stage_index(self.engine_client.stage_configs)
                 )
                 self._apply_text_chat_ar_task_mode(sampling_params_list, request)
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
-                    if idx == comprehension_idx:
+                    has_image_size = _image_gen_height is not None and _image_gen_width is not None
+                    if idx == comprehension_idx and has_image_size:
                         extra_args = dict(getattr(sp, "extra_args", {}) or {})
                         extra_args["target_h"] = int(_image_gen_height)
                         extra_args["target_w"] = int(_image_gen_width)
@@ -980,6 +1024,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             self._get_diffusion_extra_body_params(),
                             extra_body,
                         )
+
+                # GLM-Image-style AR stages stop at the grid's exact token
+                # budget instead of running every request to the deploy-YAML
+                # max_tokens ceiling (see _cap_ar_stage_max_tokens).
+                self._cap_ar_stage_max_tokens(
+                    self.engine_client,
+                    sampling_params_list,
+                    comprehension_idx,
+                    _image_gen_height,
+                    _image_gen_width,
+                    is_i2i=_image_gen_is_i2i,
+                )
 
                 self._log_inputs(
                     request_id,
@@ -1059,7 +1115,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Keep OMNI compatibility args wired while delegating rendering
         # to the upstream async renderer pipeline.
-        default_template_kwargs = merge_kwargs(
+        resolved_template_kwargs = merge_kwargs(
             default_template_kwargs,
             dict(
                 tools=tool_dicts,
@@ -1070,17 +1126,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenize=isinstance(renderer.tokenizer, MistralTokenizer),
             ),
         )
-
         tok_params = request.build_tok_params(self.model_config)
         mm_config = self.model_config.multimodal_config
         chat_params = request.build_chat_params(
             default_template,
             default_template_content_format,
         ).with_defaults(
-            default_template_kwargs,
+            resolved_template_kwargs,
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
+        # HF templates such as MiMo-Audio's use output modalities to select
+        # model task tokens. Apply this server-owned value after request-level
+        # chat_template_kwargs so clients cannot select a task that disagrees
+        # with the public request. Mistral's renderer does not accept arbitrary
+        # template variables.
+        if not isinstance(renderer.tokenizer, MistralTokenizer):
+            chat_params = replace(
+                chat_params,
+                chat_template_kwargs={
+                    **chat_params.chat_template_kwargs,
+                    "vllm_omni_output_modalities": getattr(request, "modalities", None),
+                },
+            )
 
         deferred_multi_modal_data: dict[str, Any] | None = None
         if entry_stage_id == 0 and self._needs_multistage_multimodal_split():
@@ -1438,14 +1506,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _get_comprehension_stage_index(self) -> int:
-        for idx, stage in enumerate(self.engine_client.stage_configs):
+    @staticmethod
+    def _find_comprehension_stage_index(stage_configs: Sequence[Any]) -> int | None:
+        """Return the first ``is_comprehension`` stage index, or None if no stage is marked."""
+        for idx, stage in enumerate(stage_configs):
             is_comprehension = (
-                stage.get("is_comprehension", False) if isinstance(stage, Mapping) else stage.is_comprehension
+                stage.get("is_comprehension", False)
+                if isinstance(stage, Mapping)
+                else getattr(stage, "is_comprehension", False)
             )
             if is_comprehension:
                 return idx
-        raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
+        return None
+
+    def _get_comprehension_stage_index(self) -> int:
+        idx = self._find_comprehension_stage_index(self.engine_client.stage_configs)
+        if idx is None:
+            raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
+        return idx
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -1463,6 +1541,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
+        "n",
     }
 
     def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
@@ -1560,7 +1639,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             List of SamplingParams, one for each stage.
         """
         default_params_list = self.engine_client.default_sampling_params_list
-        comprehension_idx = self._get_comprehension_stage_index()
+        # Without a comprehension stage every stage keeps its YAML defaults.
+        comprehension_idx = self._find_comprehension_stage_index(self.engine_client.stage_configs)
 
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
@@ -3236,11 +3316,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         width = gen_params.width
         seed = gen_params.seed
         generator_device = gen_params.generator_device
-        num_outputs_per_prompt = gen_params.num_outputs_per_prompt
+        num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
         num_inference_steps = extra_body.get("num_inference_steps")
         quality = extra_body.get("quality")
         guidance_scale = extra_body.get("guidance_scale")
-        true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+        true_cfg_scale = extra_body.get("true_cfg_scale", extra_body.get("cfg_scale"))
         negative_prompt = extra_body.get("negative_prompt")
         num_frames = extra_body.get("num_frames")
         guidance_scale_2 = extra_body.get("guidance_scale_2")
@@ -3372,11 +3452,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data
 
-        comprehension_idx = None
-        for idx, stage in enumerate(stage_configs):
-            if getattr(stage, "is_comprehension", False):
-                comprehension_idx = idx
-                break
+        comprehension_idx = self._find_comprehension_stage_index(stage_configs)
 
         sampling_params_list = build_stage_sampling_params_list(
             stage_configs,
@@ -3392,6 +3468,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if stage_type == "llm" and ar_stop_token_ids is not None:
                 setattr(default_stage_params, "stop_token_ids", ar_stop_token_ids)
 
+            # A prompt-grid budget (below) is request-specific; the builder
+            # cap later in this iteration only applies when it did not fire.
+            ar_budget_applied = False
             if stage_type == "llm" and idx == 0 and ar_prompt_info is not None:
                 if should_init_extra_args_for_non_diffusion_stages(model_class_name):
                     extra_args = getattr(default_stage_params, "extra_args", None)
@@ -3411,6 +3490,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 ar_grid_budget = ar_grid_max_tokens(ar_width, ar_height)
                 if ar_grid_budget is not None and hasattr(default_stage_params, "max_tokens"):
                     default_stage_params.max_tokens = ar_grid_budget
+                    ar_budget_applied = True
+
+            # GLM-Image-style AR stages stop at the grid's exact token budget
+            # instead of running every request to the deploy-YAML max_tokens
+            # ceiling (see _cap_ar_stage_max_tokens). Skipped when the
+            # prompt-grid budget above already set one.
+            if not ar_budget_applied:
+                self._cap_ar_stage_max_tokens(
+                    engine,
+                    sampling_params_list,
+                    idx if stage_type == "llm" and idx == 0 else None,
+                    height,
+                    width,
+                    is_i2i=bool(reference_images),
+                )
 
             if (
                 comprehension_idx is not None
@@ -3452,13 +3546,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if lora_body and isinstance(lora_body, dict):
+                if lora_body and isinstance(lora_body, (dict, list)):
                     try:
-                        lora_req, lora_scale = parse_lora_request(lora_body)
-                        if lora_req is not None:
-                            default_stage_params.lora_request = lora_req
-                            if lora_scale is not None:
-                                default_stage_params.lora_scale = lora_scale
+                        lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                        if lora_reqs:
+                            default_stage_params.lora_request = lora_reqs
+                            default_stage_params.lora_scale = lora_scales
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
             elif stage_type == "llm" and idx > 0 and is_image_generation_stage(stage_cfg):
@@ -3502,7 +3595,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         seed = extra_body.get("seed")
         generator_device = extra_body.get("generator_device")
         negative_prompt = extra_body.get("negative_prompt")
-        num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
         lora_body = extra_body.get("lora")
 
         pil_images: list[Image.Image] = []
@@ -3513,19 +3605,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             except Exception as e:
                 logger.warning("Failed to decode reference image: %s", e)
 
-        gen_params = OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-            seed=seed,
-        )
+        stage_configs = getattr(engine, "stage_configs", None) or []
+        if len(stage_configs) > 1:
+            # Multi-stage requests merge explicit fields into each stage's own defaults.
+            gen_params = OmniDiffusionSamplingParams()
+        else:
+            gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine))
         self._set_if_supported(
             gen_params,
+            height=height,
+            width=width,
+            seed=seed,
+            num_outputs_per_prompt=extra_body.get("num_outputs_per_prompt"),
             generator_device=generator_device,
             quality=extra_body.get("quality"),
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
-            true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
+            true_cfg_scale=extra_body.get("true_cfg_scale", extra_body.get("cfg_scale")),
             num_frames=extra_body.get("num_frames"),
             guidance_scale_2=extra_body.get("guidance_scale_2"),
             layers=extra_body.get("layers"),
@@ -3534,13 +3630,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             sigmas=extra_body.get("sigmas"),
         )
 
-        if lora_body and isinstance(lora_body, dict):
+        if lora_body and isinstance(lora_body, (dict, list)):
             try:
-                lora_req, lora_scale = parse_lora_request(lora_body)
-                if lora_req is not None:
-                    gen_params.lora_request = lora_req
-                    if lora_scale is not None:
-                        gen_params.lora_scale = lora_scale
+                lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                if lora_reqs:
+                    gen_params.lora_request = lora_reqs
+                    gen_params.lora_scale = lora_scales
             except Exception as e:  # pragma: no cover - safeguard
                 logger.warning("Failed to parse LoRA request: %s", e)
 
@@ -3865,7 +3960,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if seed is None:
                 seed = getattr(request, "seed", None)
             negative_prompt = extra_body.get("negative_prompt")
-            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
@@ -3910,42 +4004,60 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
             if negative_prompt is not None:
                 gen_prompt["negative_prompt"] = negative_prompt
-            gen_params = OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_outputs_per_prompt=num_outputs_per_prompt,
-                seed=seed,
+            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
+            stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
+            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
+            sampling_params_list = build_stage_sampling_params_list(
+                stage_configs,
+                default_sampling_params_list,
+                diffusion_params=OmniDiffusionSamplingParams(),
             )
+            if not sampling_params_list:
+                sampling_params_list = [resolve_diffusion_sampling_params(default_sampling_params_list)]
+            for gen_params in sampling_params_list:
+                if not isinstance(gen_params, OmniDiffusionSamplingParams):
+                    continue
+                self._set_if_supported(
+                    gen_params,
+                    height=height,
+                    width=width,
+                    num_outputs_per_prompt=extra_body.get("num_outputs_per_prompt"),
+                    seed=seed,
+                )
 
-            # Only override defaults when the user explicitly provides values
-            if num_inference_steps is not None:
-                gen_params.num_inference_steps = num_inference_steps
-            if quality is not None:
-                gen_params.quality = quality
-            if guidance_scale is not None:
-                gen_params.guidance_scale = guidance_scale
-            if true_cfg_scale is not None:
-                gen_params.true_cfg_scale = true_cfg_scale
-            apply_normalized_diffusion_request_extra_args(gen_params, normalized_extra_args)
-            if num_frames is not None:
-                gen_params.num_frames = num_frames
-            if guidance_scale_2 is not None:
-                gen_params.guidance_scale_2 = guidance_scale_2
-            if layers is not None:
-                gen_params.layers = layers
-            if resolution is not None:
-                gen_params.resolution = resolution
+                # Only override defaults when the user explicitly provides values
+                if num_inference_steps is not None:
+                    gen_params.num_inference_steps = num_inference_steps
+                if quality is not None:
+                    gen_params.quality = quality
+                if guidance_scale is not None:
+                    gen_params.guidance_scale = guidance_scale
+                if true_cfg_scale is not None:
+                    gen_params.true_cfg_scale = true_cfg_scale
+                apply_normalized_diffusion_request_extra_args(gen_params, normalized_extra_args)
+                if num_frames is not None:
+                    gen_params.num_frames = num_frames
+                if guidance_scale_2 is not None:
+                    gen_params.guidance_scale_2 = guidance_scale_2
+                if layers is not None:
+                    gen_params.layers = layers
+                if resolution is not None:
+                    gen_params.resolution = resolution
 
-            # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
-                try:
-                    lora_req, lora_scale = parse_lora_request(lora_body)
-                    if lora_req is not None:
-                        gen_params.lora_request = lora_req
-                        if lora_scale is not None:
-                            gen_params.lora_scale = lora_scale
-                except Exception as exc:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", exc)
+                # Parse per-request LoRA.
+                if lora_body and isinstance(lora_body, (dict, list)):
+                    try:
+                        lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                        if lora_reqs:
+                            gen_params.lora_request = lora_reqs
+                            gen_params.lora_scale = lora_scales
+                    except Exception as exc:  # pragma: no cover - safeguard
+                        logger.warning("Failed to parse LoRA request: %s", exc)
+
+                if reference_videos:
+                    gen_params.extra_args["video_path"] = reference_videos[0]
+                if reference_audios:
+                    gen_params.extra_args["audio_path"] = reference_audios[0]
 
             # Route text modality for single-stage diffusion (img2text / text2text)
             requested_modalities = extra_body.get("modalities") or []
@@ -3975,33 +4087,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             "and send multiple images in the user message content.",
                             status_code=400,
                         )
-
-            if reference_videos:
-                gen_params.extra_args["video_path"] = reference_videos[0]
-            if reference_audios:
-                gen_params.extra_args["audio_path"] = reference_audios[0]
-
-            # Generate image or audio via AsyncOmni
-            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
-            stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
-            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
-            sampling_params_list = build_stage_sampling_params_list(
-                stage_configs,
-                default_sampling_params_list,
-                diffusion_params=gen_params,
-                replace_diffusion_params=True,
-            )
-            for index, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
-                if get_stage_type(stage_config) != "diffusion" or index >= len(default_sampling_params_list):
-                    continue
-                default_extra_args = getattr(default_sampling_params_list[index], "extra_args", None)
-                if default_extra_args:
-                    sampling_params.extra_args = {
-                        **default_extra_args,
-                        **(getattr(sampling_params, "extra_args", None) or {}),
-                    }
-            if not sampling_params_list:
-                sampling_params_list = [gen_params]
 
             result = None
             async for output in diffusion_engine.generate(

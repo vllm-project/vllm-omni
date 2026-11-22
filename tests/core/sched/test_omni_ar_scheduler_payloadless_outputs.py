@@ -61,7 +61,6 @@ def _step(
 
     model_runner_output = OmniModelRunnerOutput(
         req_ids=[request.request_id],
-        req_id_to_index={request.request_id: 0},
         sampled_token_ids=[[]] if token is None else [[token]],
         multimodal_outputs=[mm_output],
         num_nans_in_logits=None if fast_decode else {request.request_id: nan_count},

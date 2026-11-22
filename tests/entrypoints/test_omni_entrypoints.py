@@ -6,12 +6,16 @@ from __future__ import annotations
 import asyncio
 import gc
 import queue
-from collections.abc import Callable
+import threading
+from collections.abc import AsyncGenerator, Callable
+from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import janus
 import pytest
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -20,8 +24,8 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import StageConfig, StageType
-from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
@@ -268,6 +272,51 @@ def test_disabled_stage_metrics_preserve_speech_completion_without_full_merge(mo
     assert "inter_output_latencies_ms" not in output.metrics["stage_metrics"]["0"]
     assert merge.call_count == 2
     assert all(call.kwargs == {"collect_stage_metrics": False} for call in merge.call_args_list)
+
+
+def test_process_single_result_accepts_scalar_pooling_output(mocker):
+    base = _make_base()
+    base.collect_stage_metrics = False
+    base._enable_ar_profiler = False
+    base.engine.get_stage_metadata.return_value = StageRuntimeInfo(
+        stage_type="llm",
+        final_output=True,
+        final_output_type="latent",
+        model_stage="pooler",
+    )
+    base.prom_metrics = mocker.Mock()
+    base.mod_metrics = mocker.Mock()
+    base._publish_request_gauges = mocker.Mock()
+    mocker.patch("vllm_omni.entrypoints.omni_base.observe_modality_at_finalize")
+
+    metrics = mocker.Mock()
+    metrics.stage_events = {}
+    metrics.stage_first_ts = [None]
+    metrics.stage_last_ts = [None]
+    metrics.e2e_done = set()
+    pooling_output = SimpleNamespace(data=object())
+    result = SimpleNamespace(
+        request_id="req-pooling",
+        stage_id=0,
+        replica_id=0,
+        stage_submit_ts=1.0,
+        metrics=None,
+        engine_outputs=SimpleNamespace(
+            request_id="req-pooling",
+            outputs=pooling_output,
+            finished=True,
+            final_output_type="latent",
+            stage_durations={},
+            peak_memory_mb=0.0,
+        ),
+    )
+
+    output = base._process_single_result(result, 0, metrics, {}, 0.0, 0)
+
+    base.prom_metrics.request_succeeded.assert_called_once()
+    assert base.prom_metrics.request_succeeded.call_args.kwargs["finished_reason"] == "stop"
+    assert output is not None
+    assert output.outputs == [pooling_output]
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
@@ -1727,4 +1776,373 @@ def test_omni_generate_dead_orchestrator_closes_engine(monkeypatch: pytest.Monke
         assert engine.aborted == [[engine.submitted[0]["request_id"]]]
         assert not app.request_states
     finally:
+        app.shutdown()
+
+
+# ───────── AsyncOmni.shutdown() fails in-flight requests ─────────
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_ends_in_flight_streams(monkeypatch: pytest.MonkeyPatch):
+    """A shutdown after partial output must terminate every active stream."""
+    engine = FakeAsyncOmniEngine(
+        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
+            make_output_msg(
+                msg["request_id"],
+                0,
+                payload="partial",
+                output_finished=False,
+            )
+        )
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    streaming = {request_id: asyncio.Event() for request_id in ("req-1", "req-2")}
+
+    async def drain(request_id: str) -> None:
+        async for _ in app.generate(prompt="hello", request_id=request_id):
+            streaming[request_id].set()
+
+    streams = [asyncio.create_task(drain(request_id)) for request_id in streaming]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in streaming.values())),
+            timeout=5,
+        )
+
+        app.shutdown()
+        results = await asyncio.wait_for(
+            asyncio.gather(*streams, return_exceptions=True),
+            timeout=5,
+        )
+        assert all(isinstance(result, OmniEngineDeadError) for result in results)
+        assert engine.shutdown_called
+        assert app.request_states == {}
+    finally:
+        app.shutdown()
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, return_exceptions=True)
+
+
+async def _consume_async(gen) -> None:
+    """Drain an async generator so the test only observes the exception."""
+    async for _ in gen:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_async_omni_shutdown_rejects_request_racing_the_snapshot(monkeypatch: pytest.MonkeyPatch):
+    loop = asyncio.get_running_loop()
+    serving_thread = threading.current_thread()
+    first_streaming = asyncio.Event()
+    snapshot_taken = asyncio.Event()
+    late_submitted = threading.Event()
+    snapshot_threads: list[threading.Thread] = []
+
+    def on_add_request(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        if msg["request_id"] == "req-late":
+            late_submitted.set()
+        else:
+            engine.output_q.put_nowait(make_output_msg("req-first", 0, payload="partial", output_finished=False))
+
+    engine = FakeAsyncOmniEngine(on_add_request=on_add_request)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+
+    class RequestStates(dict[str, ClientRequestState]):
+        armed = True
+
+        def values(self):
+            snapshot = self.copy().values()
+            if not self.armed:
+                return snapshot
+            self.armed = False
+            snapshot_threads.append(threading.current_thread())
+            # Schedule the late request as soon as the first snapshot is taken.
+            # A worker-thread snapshot can overlap that request's registration.
+            if threading.current_thread() is serving_thread:
+                snapshot_taken.set()
+            else:
+                loop.call_soon_threadsafe(snapshot_taken.set)
+                assert late_submitted.wait(timeout=5)
+            return snapshot
+
+    async def drain_first() -> None:
+        async for _ in app.generate(prompt="hello", request_id="req-first"):
+            first_streaming.set()
+
+    async def drain_late() -> None:
+        await snapshot_taken.wait()
+        await _consume_async(app.generate(prompt="hello", request_id="req-late"))
+
+    streams = [asyncio.create_task(drain_first()), asyncio.create_task(drain_late())]
+    try:
+        await asyncio.wait_for(first_streaming.wait(), timeout=5)
+        pump = app.final_output_task
+        assert pump is not None and not pump.done()
+        app.request_states = RequestStates(app.request_states)
+
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=6)
+        result = await asyncio.wait_for(asyncio.gather(*streams, return_exceptions=True), timeout=2)
+        assert all(isinstance(exc, OmniEngineDeadError) and "shutting down" in str(exc) for exc in result), result
+        assert snapshot_threads == [serving_thread]
+        assert not late_submitted.is_set()
+        assert not app.request_states
+        assert engine.shutdown_called
+        assert app.final_output_task is None and pump.cancelled()
+    finally:
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paused", [True, False], ids=["paused", "sleeping"])
+async def test_async_omni_shutdown_releases_admission_waiters(monkeypatch: pytest.MonkeyPatch, paused: bool):
+    engine = FakeAsyncOmniEngine()
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    app._paused = paused
+    if not paused:
+        app._sleeping_tags.add("kv_cache")
+
+    parked = asyncio.Event()
+    original_wait = app._pause_cond.wait
+
+    async def observe_wait() -> bool:
+        parked.set()
+        return await original_wait()
+
+    monkeypatch.setattr(app._pause_cond, "wait", observe_wait)
+    waiting = asyncio.create_task(_consume_async(app.generate(prompt="hello", request_id="req-parked")))
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=5)
+        assert not app.request_states
+        assert app.final_output_task is None
+
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=5)
+
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(waiting, timeout=1)
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(_consume_async(app.generate(prompt="hello", request_id="req-later")), timeout=1)
+        assert not engine.submitted
+        assert not app.request_states
+        assert app.final_output_task is None
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_input_pump", [True, False], ids=["waiting-for-input", "before-pump-start"])
+async def test_async_omni_shutdown_releases_first_streaming_input(
+    monkeypatch: pytest.MonkeyPatch, start_input_pump: bool
+):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META[:1])
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    input_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    input_closed = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    allow_input = asyncio.Event()
+
+    async def inputs() -> AsyncGenerator[StreamingInput, None]:
+        input_started.set()
+        try:
+            await allow_input.wait()
+            yield StreamingInput(prompt={"prompt_token_ids": [1]})
+        finally:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            input_closed.set()
+
+    if start_input_pump:
+        # An abort ACK may arrive while the input iterator is releasing its resources.
+        abort = engine.abort_async
+
+        async def acknowledge_abort(request_ids, timeout=None):
+            await cleanup_started.wait()
+            return await abort(request_ids, timeout)
+
+        monkeypatch.setattr(engine, "abort_async", acknowledge_abort)
+
+    original_add_streaming = app._add_streaming_input_request
+    pumps: list[asyncio.Task] = []
+
+    async def capture_input_pump(**kwargs) -> asyncio.Task:
+        pump = await original_add_streaming(**kwargs)
+        pumps.append(pump)
+        if not start_input_pump:
+            # The pump is queued on this loop and has yet to execute its try/finally.
+            app.shutdown()
+        return pump
+
+    monkeypatch.setattr(app, "_add_streaming_input_request", capture_input_pump)
+    waiting = asyncio.create_task(_consume_async(app.generate(prompt=inputs(), request_id="req-input")))
+    try:
+        if start_input_pump:
+            await asyncio.wait_for(input_started.wait(), timeout=5)
+            assert app.request_states["req-input"].input_stream_task is pumps[0]
+            await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=5)
+
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(waiting, timeout=1)
+        allow_cleanup.set()
+        assert len(pumps) == 1
+        await asyncio.wait_for(asyncio.gather(*pumps, return_exceptions=True), timeout=1)
+        assert input_started.is_set() is start_input_pump
+        assert input_closed.is_set() is start_input_pump
+        assert not allow_input.is_set()
+        assert not engine.submitted
+        assert not app.request_states
+        assert app.final_output_task is None
+    finally:
+        allow_cleanup.set()
+        waiting.cancel()
+        await asyncio.gather(waiting, *pumps, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_omni_executor_shutdown_delivers_terminal_errors_before_engine_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = FakeAsyncOmniEngine(
+        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
+            make_output_msg(msg["request_id"], 0, payload="partial", output_finished=False)
+        )
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    streaming = {request_id: asyncio.Event() for request_id in ("req-1", "req-2")}
+
+    async def drain(request_id: str) -> None:
+        async for _ in app.generate(prompt="hello", request_id=request_id):
+            streaming[request_id].set()
+
+    loop = asyncio.get_running_loop()
+    real_schedule = loop.call_soon_threadsafe
+    frontend_scheduled = asyncio.Event()
+    engine_started = asyncio.Event()
+    release_frontend = asyncio.Event()
+    pending_frontend: list[asyncio.Task] = []
+    fatal_enqueued: set[str] = set()
+    fatal_at_teardown: list[set[str]] = []
+    worker: threading.Thread | None = None
+    frontend_intercepted = False
+
+    async def delay_frontend(callback, args, context) -> None:
+        frontend_scheduled.set()
+        await release_frontend.wait()
+        loop.call_soon(callback, *args, context=context)
+
+    def schedule(callback, *args, context=None):
+        nonlocal frontend_intercepted
+        if threading.current_thread() is worker and not frontend_intercepted:
+            frontend_intercepted = True
+
+            def defer() -> None:
+                pending_frontend.append(loop.create_task(delay_frontend(callback, args, context)))
+
+            return real_schedule(defer)
+        return real_schedule(callback, *args, context=context)
+
+    def observe_queue(queue) -> None:
+        put = queue.put_nowait
+
+        def record(message) -> None:
+            if isinstance(message, ErrorMessage) and message.fatal:
+                assert asyncio.get_running_loop() is loop
+                assert message.request_id is not None
+                fatal_enqueued.add(message.request_id)
+            put(message)
+
+        monkeypatch.setattr(queue, "put_nowait", record)
+
+    engine_shutdown = engine.shutdown
+
+    def teardown() -> None:
+        fatal_at_teardown.append(fatal_enqueued.copy())
+        real_schedule(engine_started.set)
+        engine_shutdown()
+
+    def launcher_shutdown() -> None:
+        nonlocal worker
+        worker = threading.current_thread()
+        app.shutdown()
+
+    streams = [asyncio.create_task(drain(request_id)) for request_id in streaming]
+    shutdown = None
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in streaming.values())), timeout=5)
+        for state in app.request_states.values():
+            observe_queue(state.queue)
+        monkeypatch.setattr(loop, "call_soon_threadsafe", schedule)
+        monkeypatch.setattr(engine, "shutdown", teardown)
+
+        shutdown = loop.run_in_executor(None, launcher_shutdown)
+        await asyncio.wait_for(frontend_scheduled.wait(), timeout=5)
+        # Give the executor time to reach teardown while the frontend callback
+        # is held. An implementation that waits for the callback cannot enter.
+        with suppress(TimeoutError):
+            await asyncio.wait_for(engine_started.wait(), timeout=0.25)
+        release_frontend.set()
+
+        await asyncio.wait_for(shutdown, timeout=5)
+        results = await asyncio.wait_for(asyncio.gather(*streams, return_exceptions=True), timeout=5)
+        assert all(isinstance(result, OmniEngineDeadError) for result in results)
+        assert fatal_at_teardown == [set(streaming)]
+        assert not app.request_states
+    finally:
+        release_frontend.set()
+        if shutdown is not None:
+            await asyncio.wait_for(asyncio.gather(shutdown, return_exceptions=True), timeout=5)
+        for stream in streams:
+            stream.cancel()
+        await asyncio.gather(*streams, *pending_frontend, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_executor_shutdown_with_full_downstream_stage_queue(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine()
+    stage_engine = object.__new__(AsyncOmniEngine)
+    requests = janus.Queue(maxsize=1)
+    stage_engine.request_queue = requests
+    monkeypatch.setattr(engine, "add_next_stage_input_async", stage_engine.add_next_stage_input_async, raising=False)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    stage_input = NextStageInputMessage(
+        request_id="original",
+        source_stage_id=0,
+        receiver_stage_id=1,
+        requests=[],
+        submit_kwargs=None,
+        stage_output=None,
+        prompt="hello",
+        sampling_params_list=[],
+    )
+    requests.sync_q.put_nowait(stage_input)
+    # Bound the test even if a synchronous put blocks the entire serving loop.
+    watchdog = threading.Timer(5, requests.close)
+    watchdog.start()
+    stage = asyncio.create_task(app.run_downstream_stage(stage_input, request_id="downstream"))
+    try:
+        await asyncio.sleep(0)
+        assert app.request_states and not stage.done()
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown), timeout=2)
+        assert engine.shutdown_called
+        assert requests.sync_q.get_nowait() is stage_input
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(stage, timeout=2)
+        assert not app.request_states
+    finally:
+        watchdog.cancel()
+        await requests.aclose()
+        await asyncio.gather(stage, return_exceptions=True)
         app.shutdown()

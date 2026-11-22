@@ -53,6 +53,13 @@ def _assert_request_metrics(metrics: object, *, expected_count: int) -> None:
         assert isinstance(request["response_id"], str)
         assert request["ttft_ms"] is not None and request["ttft_ms"] >= 0
         assert request["ttfp_ms"] >= 0
+        # TTFT/TTFP are anchored on the server's accepted native append, which
+        # the engine announces on response.created and every audio delta; the
+        # client only falls back to its own receive clock without it.
+        assert request["source"] == "server_request_start_and_client_receive", request
+        origin = request["measurement_origin"]
+        assert origin["ttft"].startswith("accepted native-append start"), origin
+        assert origin["ttfp"].startswith("accepted native-append start"), origin
         assert request["rtf"] is not None and request["rtf"] >= 0
         assert request["audio_generation_ms"] >= 0
         assert request["audio_duration_ms"] > 0
@@ -781,7 +788,7 @@ def test_duplex_single_session_still_image_input(omni_server, tmp_path: Path) ->
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) -> None:
     result = asyncio.run(

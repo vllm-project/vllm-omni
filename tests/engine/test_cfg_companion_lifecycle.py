@@ -20,10 +20,17 @@ from types import SimpleNamespace
 import pytest
 from vllm.sampling_params import SamplingParams
 
+from tests.engine.test_orchestrator import (
+    FakeStageClient,
+    _build_request_output,
+    _build_stage_pools,
+    _processed_request,
+)
 from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
-from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage
+from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage, StageSubmissionMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -82,8 +89,11 @@ class _FakePool:
 
     def __init__(self, stage_type: str = "diffusion") -> None:
         self.stage_type = stage_type
+        self.final_output = False
+        self.stage_vllm_config = None
         self.stage_client = SimpleNamespace(requires_multimodal_data=False, custom_process_input_func=None)
         self.aborted: list[list[str]] = []
+        self.submitted: list[str] = []
 
     def live_replica_ids(self) -> list[int]:
         # Single always-live replica: these tests cover CFG bundling, not
@@ -92,6 +102,10 @@ class _FakePool:
 
     async def abort_requests(self, request_ids):
         self.aborted.append(list(request_ids))
+
+    async def submit_initial(self, request_id, *_args, **_kwargs):
+        self.submitted.append(request_id)
+        return 0
 
     def release_bindings(self, request_ids):
         pass
@@ -123,6 +137,43 @@ def _req_state(final_stage_id: int = 1) -> OrchestratorRequestState:
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(final_stage_id + 1)],
         prompt={"prompt": "x"},
     )
+
+
+@pytest.mark.asyncio
+async def test_parent_output_before_companion_message_is_not_forwarded(mocker):
+    """A queued CFG companion must block its parent even when the parent
+    finishes before the companion message is handled."""
+    pools = _build_stage_pools([[FakeStageClient()], [FakeStageClient(stage_type="diffusion", final_output=True)]])
+    orch = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    params = SamplingParams(max_tokens=1)
+    await orch._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="p",
+            prompt=_processed_request("p", params),
+            original_prompt={"prompt": "x"},
+            output_prompt_text=None,
+            sampling_params_list=[params, OmniDiffusionSamplingParams()],
+            final_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+            cfg_companion_ids={"neg": "p__neg"},
+        )
+    )
+    state = orch.request_states["p"]
+    assert len(pools[0].stage_client.add_request_calls) == 1
+
+    forward = mocker.patch.object(orch, "_forward_to_next_stage", new=mocker.AsyncMock())
+    output = _build_request_output("p")
+    await orch._route_output(0, 0, output, state, None)
+
+    forward.assert_not_awaited()
 
 
 @pytest.mark.asyncio

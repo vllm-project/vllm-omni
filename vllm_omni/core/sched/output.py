@@ -135,7 +135,13 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
+    # Scheduler-confirmed history for terminal speculative full-payload sends.
+    finished_req_output_token_ids: dict[str, list[int]] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
+    # Aborted, errored, and ignored requests whose pending full payloads
+    # must be dropped instead of flushed. Empty unless the scheduler recorded
+    # one of those terminal statuses.
+    discarded_req_ids: set[str] = field(default_factory=set)

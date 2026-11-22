@@ -17,7 +17,7 @@ import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import anyio
 import msgspec
@@ -226,7 +226,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # side. Park here until the full wake instead of erroring (#8678).
         streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
-            await self._pause_cond.wait_for(lambda: not self._paused and not getattr(self, "_sleeping_tags", None))
+            await self._pause_cond.wait_for(self._generation_admission_ready)
             if not streaming_input:
                 self._admitting = getattr(self, "_admitting", 0) + 1
         admitting = not streaming_input
@@ -337,6 +337,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
+                    priority=priority,
                     first_chunk_submitted=first_chunk_submitted,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
@@ -353,6 +354,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         arrival_time=wall_start_ts,
                         lora_request=lora_request,
                         trace_headers=trace_headers,
+                        priority=priority,
                         entry_stage_id=entry_stage_id,
                         **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                     ),
@@ -413,14 +415,30 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
+            self._cancel_input_pump(input_stream_task)
             if admitting:
                 await self._release_generate_admission()
             reservations = getattr(self, "_interaction_reservations", {})
             for key in [key for key in reservations if key[0] == request_id]:
                 reservations.pop(key, None)
+            finished_state = self.request_states.get(request_id)
+            if finished_state is not None:
+                with anyio.CancelScope(shield=True):
+                    await self._drain_interaction_error_tasks(finished_state)
             self._log_summary_and_cleanup(request_id)
+
+    def _generation_admission_ready(self) -> bool:
+        self._check_frontend_admission()
+        return not self._paused and not getattr(self, "_sleeping_tags", None)
+
+    def _on_frontend_shutdown(self) -> None:
+        loop = self._output_loop
+        if loop is not None and loop.is_running():
+            loop.create_task(self._notify_generation_waiters())
+
+    async def _notify_generation_waiters(self) -> None:
+        async with self._pause_cond:
+            self._pause_cond.notify_all()
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""
@@ -480,9 +498,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 async with self._pause_cond:
                     # Same full-wake condition as generate()'s gate: streaming
                     # ADDs must not race a partially-asleep engine either (#8678).
-                    await self._pause_cond.wait_for(
-                        lambda: not self._paused and not getattr(self, "_sleeping_tags", None)
-                    )
+                    await self._pause_cond.wait_for(self._generation_admission_ready)
                     self._admitting = getattr(self, "_admitting", 0) + 1
             try:
                 await submit_factory()
@@ -537,6 +553,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         arrival_time: float,
         lora_request: Any = None,
         trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
         first_chunk_submitted: asyncio.Future[None] | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
@@ -620,6 +637,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
                                 trace_headers=trace_headers,
+                                priority=priority,
                                 resumable=True,
                                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
@@ -683,6 +701,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
                                     trace_headers=trace_headers,
+                                    priority=priority,
                                     resumable=False,
                                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
@@ -704,6 +723,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         input_stream_task = asyncio.create_task(handle_inputs())
         req_state.input_stream_task = input_stream_task
+        req_state.first_chunk_submitted = first_chunk_submitted
         return input_stream_task
 
     @staticmethod
@@ -772,8 +792,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Track one stage call; abort it if the caller is cancelled and always drop its state."""
         request_id = f"{self._get_unique_request_id(external_request_id)}-{stage_id}"
         req_state = ClientRequestState(request_id, external_request_id=external_request_id)
-        self.request_states[request_id] = req_state
         self._final_output_handler()
+        self.request_states[request_id] = req_state
         try:
             yield req_state
         except asyncio.CancelledError:
@@ -984,17 +1004,36 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reservations.pop(reservation_key, None)
         await self._engine_core_rpc("track_streaming_interaction", stage_ids=[0], args=(internal_id, event_id, False))
 
+    async def _release_rejected_interaction(self, request_id: str, event_id: str) -> None:
+        # The engine clears a playback reservation only when the interaction
+        # reaches it, so one rejected before delivery would block a paced
+        # stream for good. Releasing an untracked event is a no-op.
+        self._interaction_reservations_map().pop((request_id, event_id), None)
+        try:
+            await self._engine_core_rpc(
+                "track_streaming_interaction", stage_ids=[0], args=(request_id, event_id, False)
+            )
+        except Exception:
+            logger.debug("Failed to release rejected interaction %s for req %s", event_id, request_id, exc_info=True)
+
     async def submit_interaction_async(
         self,
         request_id: str,
         *,
         interaction: OmniInteractionPrompt,
         track_playback: bool = False,
+        on_error: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> float | None:
         """Apply a midway interaction to an active streaming diffusion request.
 
         ``request_id`` is the external id created by the server-side session,
         matching the value passed to :meth:`generate`.
+
+        Submission only queues the interaction. If the engine rejects it later,
+        the request keeps generating and ``on_error`` is awaited with
+        ``(event_id, message)``. One callback serves all of the request's
+        interactions; the latest one passed applies. Without a callback the
+        rejection is logged.
         """
         event = interaction.get("event")
         prompt = event.get("prompt") if isinstance(event, dict) else None
@@ -1005,6 +1044,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             raise ValueError("transition_chunks must be >= 0")
 
         internal_id = self._resolve_interaction_request(request_id)
+        if on_error is not None:
+            self.request_states[internal_id].interaction_error_handler = on_error
         event_id = interaction.get("event_id", "")
         reservations = self._interaction_reservations_map()
         reservation_key = (internal_id, event_id)
@@ -1316,14 +1357,23 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         return all(self._coerce_stage_bool(result) for result in results)
 
     async def release_kv_cache_memory(
-        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+        self,
+        reset_connector: bool = True,
+        *,
+        stage_ids: list[int] | None = None,
+        timeout: float = CACHE_RESET_TIMEOUT_S,
     ) -> None:
         """Discard AR-stage KV memory after a completed generation pause.
 
         EngineCore checks that the scheduler is paused and all executor
         memory is resident. Diffusion stages have no KV cache to release.
         Restore KV memory with ``wake_up(tags=["kv_cache"])`` before resuming.
+
+        ``reset_connector`` is accepted for upstream ``EngineClient``
+        compatibility; omni stages own their connector teardown inside the
+        stage-side release RPC.
         """
+        _ = reset_connector
         ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
         if not ar_stage_ids:
             return
@@ -1338,9 +1388,17 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self._hold_admission_until_resume = True
 
     async def sleep(
-        self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
+        self,
+        stage_ids: list[int] | None = None,
+        level: int = 2,
+        mode: PauseMode = "abort",
+        reset_connector: bool = True,
     ) -> list[OmniACK]:
         """Put stages to sleep.
+
+        ``reset_connector`` is accepted for upstream ``EngineClient``
+        compatibility; omni stages own their connector teardown inside the
+        stage-side sleep RPC.
 
         AR/LLM stages use EngineCore.sleep (pause scheduler, wait idle, then
         offload/discard memory) — matching vLLM AsyncLLM.sleep.
@@ -1587,6 +1645,18 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         if stage_ids is not None:
             return bool(self._sleeping_tags_for_stages(stage_ids))
         return bool(getattr(self, "_sleeping_tags", None))
+
+    async def checkpoint_prepare(self, mode: PauseMode = "wait") -> NoReturn:
+        """Reject process checkpointing without draining or modifying stages."""
+        raise NotImplementedError("AsyncOmni does not support process checkpointing.")
+
+    async def checkpoint_restore(self) -> NoReturn:
+        """Keep the checkpoint interface concrete for newer vLLM EngineClient."""
+        raise NotImplementedError("AsyncOmni does not support process checkpointing.")
+
+    async def checkpoint_state(self) -> NoReturn:
+        """Do not report a checkpoint lifecycle state that Omni does not own."""
+        raise NotImplementedError("AsyncOmni does not support process checkpointing.")
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into all stages.

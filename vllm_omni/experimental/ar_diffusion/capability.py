@@ -11,8 +11,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext
-    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
+    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVState
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 
@@ -241,15 +240,26 @@ class SupportsARDiffusionWarmup(Protocol):
 
 
 @runtime_checkable
-class SupportsARDiffusionCellPipeline(Protocol):
-    """Cell Self-Forcing (S=1 layer PP) / Latest-KV (vertical slice) pipeline. Mutually exclusive with tick KV."""
+class SupportsARDiffusionNoisyKV(Protocol):
+    """Noisy KV declaration and bind. Independent of how a request is advanced.
 
-    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec: ...
+    Mirrors :class:`SupportsARDiffusionPipeline`: the pipeline declares the
+    pool, and the runner initializes it, binds it for one mainline request
+    invocation, and releases it. Cell planning and ``run_cell_pipeline`` are
+    not part of this contract. Presence of the pool does not select an
+    execution algorithm.
+    """
 
-    def bind_ar_diffusion_cell_context(
-        self,
-        ctx: ARDiffusionCellContext,
-    ) -> AbstractContextManager[None]: ...
+    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
+        """Return immutable Noisy KV geometry for this worker."""
+        ...
+
+    def bind_ar_diffusion_noisy_kv(self, state: NoisyKVState) -> AbstractContextManager[None]:
+        """Bind runner-owned Noisy KV for one ``execute_model`` / batch invocation.
+
+        The pipeline must not retain ``state`` after the context exits.
+        """
+        ...
 
 
 def supports_chunk_step_grouping(pipeline: object) -> bool:

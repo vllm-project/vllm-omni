@@ -87,8 +87,8 @@ every submitted stage. The endpoint's terminal output is retained until then,
 so delayed upstream usage and stop reasons arrive before completion.
 Cleanup retains the existing per-replica batched, best-effort resource release.
 Abort acknowledgement does not certify physical release of transport buffers.
-Changing a route does not strengthen a backend's release guarantees. Legacy V1
-full-payload and native KV transfer retain their existing cleanup paths; NIXL
+Changing a route does not strengthen a backend's release guarantees.
+Full-payload and native KV transfer retain their existing cleanup paths; NIXL
 ownership changes are reviewed separately.
 
 This first implementation supports static routes for turn-based requests.

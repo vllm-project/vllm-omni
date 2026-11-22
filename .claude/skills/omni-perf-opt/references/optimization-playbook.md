@@ -147,8 +147,7 @@ regression test `test_decode_replays_encoder_graph_in_capture_autocast`).
   is high but GPUs idle.
 - Connectors: `SharedMemoryConnector` on a single node; Mooncake, NIXL,
   Mori, and Yuanrong connectors for cross-device or cross-node transport
-  (`distributed/omni_connectors/factory.py`). `--shm-threshold-bytes`
-  (default 65536) sets the shared-memory threshold.
+  (`distributed/omni_connectors/factory.py`).
 - Payload size: hand only the hidden layers and keys the next stage reads;
   oversized payloads show up as connector `tx_time_ms` and orchestrator
   saturation.

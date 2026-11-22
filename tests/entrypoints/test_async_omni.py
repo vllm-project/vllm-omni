@@ -95,6 +95,8 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._stage_meta_list = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     omni.request_states = {}
     omni._final_output_handler = lambda: None
+    omni._check_frontend_admission = lambda: None
+    omni._frontend_shutting_down = False
     omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
     omni._compute_final_stage_id = lambda output_modalities: 0
     omni._compute_final_output_stage_ids = lambda output_modalities: [0]
@@ -561,6 +563,66 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("priority", [None, 0, -7, 7], ids=["default", "zero", "negative", "positive"])
+@pytest.mark.parametrize("input_kind", ["ordinary", "stream", "empty_stream"])
+def test_generate_forwards_priority(mocker, input_kind, priority):
+    """Preserve request priority on every stage-0 ADD path."""
+
+    async def run():
+        add_request = mocker.AsyncMock()
+        omni = get_async_omni_instance(fake_add_request=add_request)
+        omni.engine.add_streaming_update_async = mocker.AsyncMock()
+        omni.engine.model_config = object()
+        mocker.patch(
+            "vllm_omni.entrypoints.async_omni.extract_prompt_components",
+            return_value=(None, None, None),
+        )
+
+        async def input_stream():
+            if input_kind == "stream":
+                yield StreamingInput(prompt={"prompt_token_ids": [1, 2]})
+                yield StreamingInput(prompt={"prompt_token_ids": [3, 4]})
+
+        async def process_results(request_id, *args):
+            state = omni.request_states[request_id]
+            if state.input_stream_task is not None:
+                await state.input_stream_task
+            assert state.queue.empty(), "unexpected streaming input failure"
+            async for output in fake_process_results(request_id, *args):
+                yield output
+
+        omni._process_orchestrator_results = process_results
+        prompt = {"prompt_token_ids": [1, 2]} if input_kind == "ordinary" else input_stream()
+        priority_kwargs = {} if priority is None else {"priority": priority}
+        outputs = [
+            output
+            async for output in omni.generate(
+                prompt=prompt,
+                request_id="priority-test",
+                sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.DELTA)],
+                output_modalities=["text"],
+                **priority_kwargs,
+            )
+        ]
+
+        assert len(outputs) == 1
+        add_request.assert_awaited_once()
+        submitted = add_request.await_args.kwargs
+        if input_kind == "stream":
+            assert submitted["resumable"] is True
+            assert submitted["prompt"] == {"prompt_token_ids": [1, 2]}
+            assert omni.engine.add_streaming_update_async.await_count == 2
+        elif input_kind == "empty_stream":
+            assert submitted["resumable"] is False
+            assert submitted["prompt"] == {"prompt_token_ids": [0]}
+            omni.engine.add_streaming_update_async.assert_not_awaited()
+        assert omni.request_states == {}
+        assert submitted.get("priority", 0) == (0 if priority is None else priority)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5.0))
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("has_chunk", [False, True])
 @pytest.mark.parametrize("input_fails", [False, True])
 def test_streaming_input_terminal_submit_failure_reaches_generate(mocker, has_chunk, input_fails):
@@ -643,7 +705,13 @@ def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1.0)
+            # Harness bound only - it guards against a wedged cleanup, while the
+            # semantic bound is the monkeypatched ABORT_TIMEOUT_S=0.05 asserted
+            # via seen_timeouts below. CI scheduling stalls (CPU throttling, GC
+            # pauses) can delay the cleanup chain for ~1s before the inner bound
+            # arms (issue #10165), so keep generous headroom here instead of
+            # matching the inner bound's magnitude.
+            await asyncio.wait_for(task, timeout=5.0)
         assert seen_timeouts
         assert seen_timeouts[-1] == 0.05
         assert omni.request_states == {}
@@ -1016,7 +1084,7 @@ _DIFFUSION_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 _OMNI_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -1044,7 +1112,7 @@ async def test_diffusion_generate_request_id(async_omni_runner_function):
         assert output.request_id != ""
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

@@ -86,9 +86,19 @@ def model_output_dir(parent_dir: Path, model: str) -> Path:
     return path
 
 
-def write_json_artifact(path: Path, value: Any) -> None:
-    """Write a UTF-8 accuracy artifact, rejecting non-finite JSON numbers."""
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+def write_json_artifact(
+    path: Path,
+    value: Any,
+    *,
+    ensure_ascii: bool = True,
+    allow_nan: bool = False,
+) -> None:
+    """Write a UTF-8 accuracy artifact, rejecting non-finite JSON numbers by default."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, ensure_ascii=ensure_ascii, allow_nan=allow_nan) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _omni_acc_bench_core():
@@ -317,6 +327,11 @@ def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) 
     return errs
 
 
+def validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
+    """Public accuracy-gate helper for DFX and other cross-package callers."""
+    return _validate_daily_omni(result, min_accuracy=min_accuracy)
+
+
 def _validate_videomme(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
     errs: list[str] = []
     acc = result.get("videomme_accuracy")
@@ -406,6 +421,65 @@ def _validate_seed_tts(
         )
     )
     return errs
+
+
+def dataset_accuracy_errors(
+    result: dict[str, object],
+    dataset: str,
+    expected: int,
+    baseline: Mapping[str, float],
+    *,
+    enforce_thresholds: bool = True,
+) -> list[str]:
+    """Check dataset scoring coverage independently of the model and concurrency."""
+    failures = ["timed_out_requests", "cancelled_after_timeout_requests"]
+    if dataset == "daily-omni":
+        counts = ["daily_omni_evaluated_ok"]
+        scores = ["daily_omni_accuracy"]
+        failures += ["daily_omni_request_failed", "daily_omni_no_gold"]
+    elif dataset == "seed-tts":
+        counts = ["seed_tts_content_evaluated"]
+        scores = ["seed_tts_content_error_mean"]
+        failures += ["seed_tts_request_failed", "seed_tts_no_pcm", "seed_tts_asr_failed", "seed_tts_empty_audio"]
+        if baseline.get("min_seed_tts_mean_sim") is not None:
+            counts.append("seed_tts_sim_evaluated")
+            scores.append("seed_tts_sim_mean")
+            failures += ["seed_tts_sim_failed", "seed_tts_sim_skipped_no_ref"]
+    else:
+        raise ValueError(f"No dataset accuracy contract for {dataset}")
+    errors = [f"{key}={result.get(key)!r}, expected {expected}" for key in counts if result.get(key) != expected]
+    errors += [f"{key}={result[key]}; workload coverage is incomplete" for key in failures if result.get(key, 0)]
+    for key in scores:
+        value = result.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            errors.append(f"{key} must be a finite score: {value!r}")
+    limits = baseline if enforce_thresholds else {}
+    if dataset == "daily-omni":
+        errors += _validate_daily_omni(result, min_accuracy=limits.get("min_daily_omni_accuracy"))
+    else:
+        errors += _validate_seed_tts(
+            result,
+            max_mean_wer=limits.get("max_seed_tts_mean_wer"),
+            min_mean_sim=limits.get("min_seed_tts_mean_sim"),
+            min_mean_utmos=None,
+        )
+    return errors
+
+
+def validate_seed_tts(
+    result: dict[str, Any],
+    *,
+    max_mean_wer: float | None,
+    min_mean_sim: float | None,
+    min_mean_utmos: float | None,
+) -> list[str]:
+    """Public accuracy-gate helper for DFX and other cross-package callers."""
+    return _validate_seed_tts(
+        result,
+        max_mean_wer=max_mean_wer,
+        min_mean_sim=min_mean_sim,
+        min_mean_utmos=min_mean_utmos,
+    )
 
 
 def _seed_tts_floor_errors(
@@ -555,6 +629,91 @@ def _acc_result_filename(model: str, suite: str, when: datetime | None = None) -
     """
     when = datetime.now() if when is None else when
     return f"result_acc_{_acc_model_name(model)}_{suite}_{when.strftime('%Y%m%d')}_{when.strftime('%H%M%S')}.json"
+
+
+_OMNIINTERACT_DATASET = "omniinteract"
+_OMNIINTERACT_AGGREGATE_SUITE = "omniinteract_aggregate"
+_OMNIINTERACT_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/omniinteract/results")
+_DUPLEX_EVAL_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/omni_duplex_eval/results")
+_OMNIINTERACT_ALL_GLOBAL_METRICS = (
+    "IA_QTF1",
+    "Precision",
+    "Recall",
+    "Global_TP",
+    "Global_FP",
+    "Global_FN",
+)
+
+
+def dfx_accuracy_result_dir(default: Path | str, *, fallback_to_benchmark_dir: bool = False) -> Path:
+    """Resolve the ``result_acc_*.json`` directory.
+
+    Prefer ``ACC_BENCH_RESULT_DIR``. When ``fallback_to_benchmark_dir`` is set
+    (OmniInteract), reuse ``BENCHMARK_DIR`` if present. Otherwise use ``default``.
+    """
+    explicit = os.environ.get("ACC_BENCH_RESULT_DIR")
+    if explicit:
+        return Path(explicit)
+    if fallback_to_benchmark_dir:
+        fallback = os.environ.get("BENCHMARK_DIR")
+        if fallback:
+            return Path(fallback)
+    return Path(default)
+
+
+def omniinteract_accuracy_result_dir() -> Path:
+    """Directory for OmniInteract ``result_acc_*.json`` files."""
+    return dfx_accuracy_result_dir(_OMNIINTERACT_DEFAULT_ACC_DIR, fallback_to_benchmark_dir=True)
+
+
+def flatten_omniinteract_accuracy_metrics(accuracy: Mapping[str, object]) -> dict[str, object]:
+    """Copy judge output and lift All Global scores onto ``accuracy``."""
+    payload = dict(accuracy)
+    summary = accuracy.get("summary")
+    if isinstance(summary, Mapping):
+        for key in _OMNIINTERACT_ALL_GLOBAL_METRICS:
+            if key in summary and key not in payload:
+                payload[key] = summary[key]
+    return payload
+
+
+def write_dfx_accuracy_result(
+    path: Path,
+    *,
+    test_name: str,
+    name: str | None,
+    model_id: str,
+    dataset: str,
+    dataset_path: str,
+    date: str,
+    hardware: str,
+    baseline: Mapping[str, object],
+    branch: str,
+    num_prompts: int,
+    max_concurrency: int | None,
+    benchmark_exit_code: int,
+    generation: Mapping[str, object],
+    accuracy: Mapping[str, object],
+) -> Path:
+    """Write the shared DFX accuracy envelope."""
+    record = {
+        "test_name": test_name,
+        "name": name,
+        "model_id": model_id,
+        "dataset": dataset,
+        "dataset_path": dataset_path,
+        "date": date,
+        "Hardware": hardware,
+        "baseline": {key: value for key, value in baseline.items() if value is not None},
+        "branch": branch,
+        "num_prompts": num_prompts,
+        "max_concurrency": max_concurrency,
+        "benchmark_exit_code": benchmark_exit_code,
+        "generation": dict(generation),
+        "accuracy": dict(accuracy),
+    }
+    write_json_artifact(path, record, ensure_ascii=False, allow_nan=True)
+    return path
 
 
 def _build_common_args(
@@ -1047,6 +1206,11 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
 
 
 DEFAULT_DEVICE_PROFILE = "default"
+# Torch's NPU name does not contain the CI profile key ``A3``. Atlas A3 runners
+# report ``Ascend910`` / ``Ascend910_93xx``; Atlas A2 reports ``Ascend910B*``
+# and must not inherit the A3 accuracy row. #10054.
+_DEVICE_NAME_PROFILE_ALIASES: tuple[tuple[str, str], ...] = (("Ascend910", "A3"),)
+_DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST: tuple[tuple[str, str], ...] = (("Ascend910", "Ascend910B"),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1057,31 +1221,75 @@ class SimilarityThresholds:
     psnr: float
 
 
+def _current_device_identity() -> tuple[str | None, str | None]:
+    """Return the current device marketing name and architecture, best effort."""
+    try:
+        from vllm_omni.platforms import current_omni_platform
+    except Exception:
+        logging.getLogger(__name__).debug("Could not import the current Omni platform", exc_info=True)
+        return None, None
+
+    device_name: str | None = None
+    device_architecture: str | None = None
+    try:
+        value = current_omni_platform.get_device_name()
+        if value:
+            device_name = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device marketing name", exc_info=True)
+
+    try:
+        device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+        properties = device_module.get_device_properties(0)
+        value = getattr(properties, "gcnArchName", None)
+        if value:
+            device_architecture = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device architecture", exc_info=True)
+
+    return device_name, device_architecture
+
+
 def resolve_device_profile(
     device_name: str | None = None,
     *,
+    device_architecture: str | None = None,
     profiles: Mapping[str, Any],
 ) -> str:
-    """Map a device marketing name to a key in *profiles*.
+    """Map a device marketing name or architecture to a key in *profiles*.
 
-    When *device_name* is omitted, uses ``current_omni_platform.get_device_name()``.
-    Non-``default`` keys are matched as substrings; unmatched devices use ``default``.
+    When both identifiers are omitted, queries the current platform. Non-
+    ``default`` profile keys are matched as substrings of either identifier
+    first so a later explicit row (for example ``Ascend910B``) wins over an
+    alias. Otherwise a name such as ``Ascend910`` / ``Ascend910_93xx`` is
+    rewritten to its CI alias (``A3``) when that key is present;
+    ``Ascend910B*`` (Atlas A2) is excluded from that alias. Unmatched devices
+    use ``default``. Callers with an already captured device record should pass
+    both values so profile selection uses the same evidence as the saved
+    artifacts.
     """
-    if device_name is None:
-        try:
-            from vllm_omni.platforms import current_omni_platform
+    if device_name is None and device_architecture is None:
+        device_name, device_architecture = _current_device_identity()
 
-            device_name = current_omni_platform.get_device_name()
-        except Exception:
-            return DEFAULT_DEVICE_PROFILE
-
-    if not device_name:
+    identifiers = tuple(value for value in (device_name, device_architecture) if value)
+    if not identifiers:
         return DEFAULT_DEVICE_PROFILE
 
     for profile in profiles:
         if profile == DEFAULT_DEVICE_PROFILE:
             continue
-        if profile in device_name:
+        if any(profile in identifier for identifier in identifiers):
+            return profile
+
+    for identifier in identifiers:
+        for needle, profile in _DEVICE_NAME_PROFILE_ALIASES:
+            if profile not in profiles or needle not in identifier:
+                continue
+            if any(
+                blocked_needle == needle and blocked in identifier
+                for blocked_needle, blocked in _DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST
+            ):
+                continue
             return profile
     return DEFAULT_DEVICE_PROFILE
 
@@ -1091,11 +1299,16 @@ def resolve_similarity_thresholds(
     device_profile: str | None = None,
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
 ) -> SimilarityThresholds:
     """Pick SSIM/PSNR thresholds from *table* for the current (or given) device profile."""
     if DEFAULT_DEVICE_PROFILE not in table:
         raise ValueError("threshold table must include a 'default' entry")
-    profile = device_profile or resolve_device_profile(device_name, profiles=table)
+    profile = device_profile or resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=table,
+    )
     return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
 
 
@@ -1103,20 +1316,25 @@ def resolve_device_threshold(
     thresholds: float | int | Mapping[str, float],
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
     label: str = "threshold",
 ) -> tuple[str, float]:
-    """Resolve a scalar or per-GPU threshold for the current CUDA device.
+    """Resolve a scalar or per-device threshold for the current accelerator.
 
     Returns ``(profile_key, threshold)``. A bare number uses profile ``default``.
-    A mapping matches keys as substrings of the device name via
-    ``resolve_device_profile`` (for example ``{"H100": 0.3, "B200": 0.36}``).
-    Prefer an explicit ``default`` entry when unmatched GPUs should fall back;
+    A mapping matches keys as substrings of the device name or architecture via
+    ``resolve_device_profile`` (for example ``{"H100": 0.3, "gfx942": 0.36}``).
+    Prefer an explicit ``default`` entry when unmatched devices should fall back;
     otherwise unmatched devices raise.
     """
     if isinstance(thresholds, float | int):
         return DEFAULT_DEVICE_PROFILE, float(thresholds)
 
-    profile = resolve_device_profile(device_name, profiles=thresholds)
+    profile = resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=thresholds,
+    )
     if profile in thresholds:
         return profile, float(thresholds[profile])
     if DEFAULT_DEVICE_PROFILE in thresholds:
@@ -1651,6 +1869,41 @@ def assert_images_pixel_close(
         f"p99<={p99_threshold:.6e})"
     )
     return dict(metrics)
+
+
+def assert_video_pixel_close(
+    *,
+    model_name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    mean_threshold: float,
+    p99_threshold: float,
+    frame_psnr_threshold: float,
+) -> None:
+    """Assert frame-first ``[frames, ...]`` videos in ``[0, 1]`` match within pixel tolerances.
+
+    ``mean_abs_diff`` and ``p99_abs_diff`` bound global and tail drift like
+    ``assert_images_pixel_close``; ``worst_frame_psnr`` (dB) keeps one bad
+    frame from hiding in the clip-wide averages.
+    """
+    assert actual.shape == expected.shape, f"{model_name} video shapes differ: {actual.shape} vs {expected.shape}"
+    diff = (actual.float() - expected.float()).abs()
+    mean_abs_diff = diff.mean().item()
+    p99_abs_diff = float(np.quantile(diff.numpy(), 0.99))
+    frame_mse = diff.pow(2).flatten(1).mean(dim=1)
+    worst_frame_psnr = (-10 * torch.log10(frame_mse.max().clamp_min(1e-12))).item()
+    print(
+        f"{model_name} video metrics: mean_abs_diff={mean_abs_diff:.6e} (<={mean_threshold:.6e}), "
+        f"p99_abs_diff={p99_abs_diff:.6e} (<={p99_threshold:.6e}), "
+        f"worst_frame_psnr={worst_frame_psnr:.2f} dB (>={frame_psnr_threshold:.2f}), "
+        f"max_abs_diff={diff.max().item():.6e}"
+    )
+    assert (
+        mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold and worst_frame_psnr >= frame_psnr_threshold
+    ), (
+        f"Video diff exceeded threshold for {model_name}: mean_abs_diff={mean_abs_diff:.6e}, "
+        f"p99_abs_diff={p99_abs_diff:.6e}, worst_frame_psnr={worst_frame_psnr:.2f} dB"
+    )
 
 
 def compute_image_ssim_psnr(

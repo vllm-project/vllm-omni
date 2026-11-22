@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
+from transformers import Qwen3OmniMoeConfig
+from vllm.config import SpeculativeConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
 
@@ -52,7 +54,6 @@ from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 configured_orchestrator_factory = orchestrator_factory
@@ -593,13 +594,6 @@ async def test_reordered_route_starts_at_admitted_nonzero_entry(mocker, async_ch
     assert not clients[0].add_request_calls
     assert bool(clients[1].add_request_calls) is (async_chunk and final_stage_id == 1)
 
-    runner = object.__new__(GPUARModelRunner)
-    runner.vllm_config = orch.stage_pools[2].stage_vllm_config
-    runner.vllm_config.model_config.stage_id = 2
-    runner.vllm_config.model_config.engine_output_type = "latent"
-    runner.model_intermediate_buffer = {"r": info}
-    runner._downstream_payload_cache = {}
-    assert runner._resolve_pooler_payload_req_ids(["r"]) == ("latent", ["r"] if final_stage_id == 1 else [])
     await orch._cleanup_request_ids(["r"], abort=True)
 
 
@@ -617,6 +611,75 @@ async def test_closing_request_does_not_consume_its_abort_snapshot(mocker):
     assert filtered is not raw
     assert [output.request_id for output in filtered.outputs] == ["healthy"]
     assert [output.request_id for output in raw.outputs] == ["r", "healthy"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [{"entry_stage_id": 1}, {"final_stage_id": 1, "final_output_stage_ids": [1]}, {"final_output_stage_ids": [0]}, {}],
+    ids=["inactive-entry", "inactive-endpoint", "missing-endpoint-output", "duplicate-id"],
+)
+async def test_rejected_route_releases_unregistered_artifacts(tmp_path, overrides):
+    orch, state, clients = _direct_orchestrator()
+    if overrides:
+        orch.request_states.clear()
+    artifacts = tmp_path / "unregistered"
+    artifacts.mkdir()
+    await orch._handle_add_request(_submission(request_artifact_dirs=[str(artifacts)], **overrides))
+    error = orch.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert not artifacts.exists()
+    assert all(not client.add_request_calls for client in clients)
+    if not overrides:
+        assert orch.request_states["r"] is state
+
+
+@pytest.mark.asyncio
+async def test_reordered_route_rejects_sampling_on_a_downstream_stage():
+    orch, _, clients = _direct_orchestrator(((0, 2), (2, 1)))
+    orch.request_states.clear()
+    params = [SamplingParams(max_tokens=1) for _ in clients]
+    params[1] = SamplingParams(n=2, max_tokens=1)
+    await orch._handle_add_request(
+        _submission(entry_stage_id=2, final_stage_id=1, final_output_stage_ids=[1], sampling_params_list=params)
+    )
+    error = orch.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert "n > 1 is supported only on the entry stage 2; stage 1 has n=2" in error.error
+    assert not orch.request_states
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_stage", [1, 2])
+async def test_reordered_route_rejects_resumable_dflash_on_active_stages(spec_stage):
+    orch, _, clients = _direct_orchestrator(((0, 2), (2, 1)))
+    orch.request_states.clear()
+    config = orch.stage_pools[spec_stage].stage_vllm_config
+    config.model_config.hf_config = Qwen3OmniMoeConfig()
+    config.speculative_config = object.__new__(SpeculativeConfig)
+    config.speculative_config.method = "dflash"
+    await orch._handle_add_request(
+        _submission(
+            entry_stage_id=2,
+            final_stage_id=1,
+            final_output_stage_ids=[1],
+            prompt=FakePromptRequest(request_id="r", prompt_token_ids=[1], resumable=True),
+        )
+    )
+    error = orch.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert f"Qwen3-Omni DFlash on stage {spec_stage}" in error.error
+    assert not orch.request_states
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.parametrize("entry, expected", [(0, False), (2, True)])
+def test_per_sample_kv_follows_the_configured_successor(entry, expected):
+    orch, _, clients = _direct_orchestrator(((0, 2), (2, 1)))
+    clients[1].stage_type = "diffusion"
+    orch.stage_pools[entry].stage_vllm_config.model_config.omni_kv_config = {"per_sample_kv": True}
+    assert orch._feeds_per_sample_kv_stage(entry, 1) is expected
 
 
 @pytest.mark.asyncio

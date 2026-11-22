@@ -43,6 +43,7 @@ def make_metadata(request_id: str = "req-0") -> DiffusionKVMetadata:
 def make_runner(mode: DiffusionKVCacheMode) -> DiffusionModelRunner:
     runner = object.__new__(DiffusionModelRunner)
     runner.od_config = SimpleNamespace(
+        kv_transfer_config=None,
         diffusion_kv_mode=mode,
         parallel_config=SimpleNamespace(cfg_parallel_size=1),
     )
