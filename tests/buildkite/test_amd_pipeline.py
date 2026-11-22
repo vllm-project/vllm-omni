@@ -2967,6 +2967,9 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "count": 5,
             "artifact_name": "rocm-glm-tts-weekly",
             "dependency": "tts_glm_weekly",
+            "env": {
+                "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "artifacts/rocm-glm-tts-weekly",
+            },
             "files": (
                 "tests/e2e/offline_inference/test_glm_tts_expansion.py",
                 "tests/e2e/online_serving/test_glm_tts_expansion.py",
@@ -3146,6 +3149,19 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     assert indextts_source.count('"transcript_escalation_model": "large-v3"') == 1
     assert "SAMPLE_RATE = 22050" in indextts_source
     assert '"expected_sample_rate": SAMPLE_RATE' in indextts_source
+
+    glm_offline_source = Path("tests/e2e/offline_inference/test_glm_tts_expansion.py").read_text(encoding="utf-8")
+    assert 'TRANSCRIPT_LANGUAGE = "zh"' in glm_offline_source
+    assert 'TRANSCRIPT_ESCALATION_MODEL = "large-v3"' in glm_offline_source
+    assert "language=TRANSCRIPT_LANGUAGE" in glm_offline_source
+    assert glm_offline_source.count('"transcript_language": TRANSCRIPT_LANGUAGE') == 1
+    assert glm_offline_source.count('"transcript_escalation_model": TRANSCRIPT_ESCALATION_MODEL') == 1
+
+    glm_online_source = Path("tests/e2e/online_serving/test_glm_tts_expansion.py").read_text(encoding="utf-8")
+    assert 'TRANSCRIPT_LANGUAGE = "zh"' in glm_online_source
+    assert 'TRANSCRIPT_ESCALATION_MODEL = "large-v3"' in glm_online_source
+    assert glm_online_source.count('"transcript_language": TRANSCRIPT_LANGUAGE') == 2
+    assert glm_online_source.count('"transcript_escalation_model": TRANSCRIPT_ESCALATION_MODEL') == 2
 
     cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
     assert 'id="sync"' in cosy_source

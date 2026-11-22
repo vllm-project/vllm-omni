@@ -1787,6 +1787,7 @@ steps:
           OMP_NUM_THREADS: "1"
           MKL_NUM_THREADS: "1"
           NUMEXPR_NUM_THREADS: "1"
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: artifacts/rocm-glm-tts-weekly
         artifact_paths:
           - artifacts/rocm-glm-tts-weekly/**/*
         commands:
