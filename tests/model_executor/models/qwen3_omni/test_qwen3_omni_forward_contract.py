@@ -283,7 +283,7 @@ def test_make_omni_output_accepts_capture_tuple():
 
 @pytest.mark.parametrize("consumed", [False, True])
 def test_aux_hidden_states_keep_drafter_order_outside_speech_snapshot(consumed):
-    from vllm_omni.worker.gpu_ar_model_runner import _clone_cuda_tensor_payload
+    from vllm_omni.model_executor.output_snapshot import pack_output_snapshot
 
     model = _make_combined(is_staged_run=True)
     model.set_aux_hidden_state_layers((4, 6, 2))
@@ -313,7 +313,9 @@ def test_aux_hidden_states_keep_drafter_order_outside_speech_snapshot(consumed):
     assert set(captured["hidden_states"]["layers"]) == {0, 2, 4, 6}
     assert prepared["hidden_states"]["last"] is captured["hidden_states"]["last"]
     assert all(prepared["hidden_states"]["layers"][index] is layers[index] for index in (0, 6))
-    snapshot = _clone_cuda_tensor_payload(prepared, [])
+    packed = pack_output_snapshot(prepared, {}, max_buckets=4)
+    assert packed is not None
+    snapshot = packed.copy_to_cpu(lambda tensor: tensor.clone())
     assert set(snapshot["hidden_states"]["layers"]) == {0, 6}
     for index in (0, 6):
         torch.testing.assert_close(snapshot["hidden_states"]["layers"][index], layers[index])

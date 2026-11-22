@@ -141,6 +141,7 @@ _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
 )
 _PRINT_STAGE = False
 _DUPLEX_METRIC_AGGREGATION = "session"
+_DUPLEX_BACKEND_UNAVAILABLE_CODES = frozenset({"server_vad_unavailable", "semantic_vad_unavailable"})
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -1162,8 +1163,11 @@ class MixRequestFuncOutput(RequestFuncOutput):
     tts_output_pcm_bytes: bytes | None = None
     #: Per-turn 24 kHz mono PCM for grouped Realtime Seed-TTS WER.
     tts_turn_pcm_bytes: list[bytes] | None = None
-    #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
+    #: Per-stage snapshot merged across SSE chunks.
     stage_metrics: dict[str, dict] | None = None
+    #: Final duplex snapshots keyed by response key, then stage_id. A response
+    #: key may include its request index when response IDs are session-scoped.
+    stage_metrics_by_response: dict[str, dict[str, dict[str, object]]] | None = None
     #: Diffusion pipeline profiler timings from response ``stage_durations``
     #: (e.g. diffuse / text_encoder.forward / vae.decode), when present.
     stage_durations: dict[str, float] | None = None
@@ -1174,6 +1178,8 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Retries before the reported attempt. Diagnostic only: excluded from the
     #: measured latency, but a run that needed them is not silently clean.
     duplex_retries: int = 0
+    #: A rejected duplex backend configuration cannot recover by sending more prompts.
+    duplex_fatal_error_code: str | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -3261,6 +3267,8 @@ async def _async_request_omniinteract(
     *,
     pbar: tqdm | None,
 ) -> MixRequestFuncOutput:
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
     case = getattr(request_func_input, "omniinteract_case", None)
     options = getattr(request_func_input, "omniinteract_options", None)
     output = MixRequestFuncOutput()
@@ -3318,14 +3326,29 @@ async def _async_request_omniinteract(
                     case_result.session_id,
                 )
         output.duplex_request_metrics = case_result.duplex_request_metrics
+        output.stage_metrics_by_response = {
+            response_id: snapshots
+            for metric in case_result.duplex_request_metrics
+            if isinstance((response_id := metric.get("response_id")), str)
+            and isinstance((snapshots := metric.get("stage_metrics")), dict)
+        }
         output.duplex_session_metrics = session_metrics
         output.success = case_result.success
         output.error = case_result.error
+        if case_result.error_code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+            output.duplex_fatal_error_code = case_result.error_code
+        if output.error:
+            logger.error("OmniInteract Realtime request failed: %s", output.error)
         setattr(output, "omniinteract_case", case)
         setattr(output, "omniinteract_case_result", case_result)
-    except Exception:
+    except Exception as exc:
         output.success = False
-        output.error = traceback.format_exc()
+        if isinstance(exc, DuplexProtocolError):
+            if exc.code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+                output.duplex_fatal_error_code = exc.code
+            output.error = f"{exc.code}: {exc}"
+        else:
+            output.error = traceback.format_exc()
         logger.error("OmniInteract Realtime request failed: %s", output.error)
         if case is not None:
             case_result = OmniInteractCaseResult(
@@ -3333,6 +3356,7 @@ async def _async_request_omniinteract(
                 video=str(case.video_path),
                 output_dir="",
                 error=output.error,
+                error_code=exc.code if isinstance(exc, DuplexProtocolError) else None,
             )
             setattr(output, "omniinteract_case", case)
             setattr(output, "omniinteract_case_result", case_result)
@@ -3343,7 +3367,7 @@ async def _async_request_omniinteract(
 
 async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | None) -> MixRequestFuncOutput:
     from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import generate_sample
-    from vllm_omni.clients.duplex import metric_mean
+    from vllm_omni.clients.duplex import DuplexProtocolError, metric_mean
 
     output = MixRequestFuncOutput()
     output.prompt_len = request.prompt_len
@@ -3433,6 +3457,11 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         output.audio_rtf = metric_mean(result.session_metrics.get("rtf")) or 0.0
         output.duplex_request_metrics = result.request_metrics
         output.duplex_session_metrics = result.session_metrics
+        output.stage_metrics_by_response = {
+            str(metric["response_id"]): snapshots
+            for metric in result.request_metrics
+            if metric.get("response_id") is not None and isinstance((snapshots := metric.get("stage_metrics")), dict)
+        }
         _apply_stage0_token_timings(
             output,
             [row.get("stage0_tokens") for row in result.request_metrics],
@@ -3443,9 +3472,16 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         # indistinguishable from one that never ran. A completed sample keeps
         # its advisory timeouts (a stalled close or ack) in metadata only.
         output.error = (result.error or (_duplex_stall_reason(result) or "")) if not output.success else ""
+        if output.error:
+            logger.error("Omni-DuplexEval sample %s failed: %s", sample.sample.id, output.error)
         # Readiness/warmups run the identical session but retain no judge files.
         if request.request_id is not None:
             setattr(output, "duplex_eval_result", result)
+    except DuplexProtocolError as exc:
+        if exc.code in _DUPLEX_BACKEND_UNAVAILABLE_CODES:
+            output.duplex_fatal_error_code = exc.code
+        output.error = f"{exc.code}: {exc}"
+        logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
     except Exception:
         output.error = traceback.format_exc()
         logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
@@ -3688,6 +3724,7 @@ async def async_request_openai_realtime_duplex(
     turn_timings: list[dict[str, object]] = []
     turn_pcm_bytes: list[bytes] = []
     turn_transcripts: list[str] = []
+    output.stage_metrics_by_response = {}
     measurement_origin = {
         "ttft": "first silence append client send to first non-empty text delta",
         "ttfp": "first silence append client send to first audio packet",
@@ -3757,6 +3794,9 @@ async def async_request_openai_realtime_duplex(
                 if not isinstance(request_metrics, dict):
                     raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
                 turn_timings.append(timing)
+                if isinstance((snapshots := timing.get("stage_metrics")), dict):
+                    # Response IDs are scoped to each per-utterance session.
+                    output.stage_metrics_by_response[f"{request_index}:{response_id}"] = snapshots
                 metric = {
                     "session_id": session_id,
                     "request_index": request_index,
@@ -3917,6 +3957,14 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # and drops unknown fields; multimodal processor caches are not keyed by it.
 CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "daily-omni"})
 
+_ISOLATE_PREFIX_CACHE = False
+
+
+def set_isolate_prefix_cache(enabled: bool) -> None:
+    global _ISOLATE_PREFIX_CACHE
+    _ISOLATE_PREFIX_CACHE = enabled
+
+
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
@@ -4075,6 +4123,15 @@ async def benchmark(
     except KeyError:
         raise ValueError(f"Unknown backend: {endpoint_type}") from None
 
+    if _ISOLATE_PREFIX_CACHE:
+        if endpoint_type not in CACHE_SALT_BACKENDS:
+            raise ValueError("--omni-isolate-prefix-cache requires a chat/completions backend")
+        if (extra_body or {}).get("cache_salt") is not None or any(
+            (request.request_overrides or {}).get("cache_salt") is not None for request in input_requests
+        ):
+            raise ValueError("--omni-isolate-prefix-cache cannot be combined with an explicit cache_salt")
+    measurement_salt = uuid.uuid4().hex if _ISOLATE_PREFIX_CACHE else None
+
     # Reuses connections across requests to reduce TLS handshake overhead.
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
     session = _build_benchmark_session(max_concurrency, ssl_setting)
@@ -4120,8 +4177,21 @@ async def benchmark(
     test_input = bind_realtime_video(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
+
+        async def ready_request_func(
+            request_func_input: RequestFuncInput, session: aiohttp.ClientSession
+        ) -> RequestFuncOutput:
+            output = await request_func(request_func_input=request_func_input, session=session)
+            if getattr(output, "duplex_fatal_error_code", None):
+                await session.close()
+                raise ValueError(
+                    f"Duplex readiness probe rejected the server configuration; "
+                    f"measured requests were not sent: {output.error}"
+                )
+            return output
+
         test_output = await wait_for_endpoint(
-            request_func,
+            ready_request_func,
             _salted_copy(test_input, warmup_scope and f"{warmup_scope}-ready"),
             session,
             timeout_seconds=ready_check_timeout_sec,
@@ -4154,6 +4224,9 @@ async def benchmark(
             request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
         warmup_outputs = await asyncio.gather(*warmup_tasks)
+        if _ISOLATE_PREFIX_CACHE and not all(output.success for output in warmup_outputs):
+            await session.close()
+            raise ValueError("Warmup requests failed; refusing to measure an unprepared workload")
         # Warmup dumps must not bleed into the timed run that follows.
         await _await_pending_audio_saves()
 
@@ -4161,18 +4234,25 @@ async def benchmark(
             warmup_pbar.close()
         print("Warmup run completed.")
 
-    if endpoint_type == "realtime-video" and any(not output.success for output in warmup_outputs):
+    failed_warmups = [output for output in warmup_outputs if not output.success]
+    if failed_warmups:
         await session.close()
-        return await asyncio.to_thread(
-            finalize_realtime_video,
-            input_requests,
-            [],
-            warmup_outputs,
-            duration=0.0,
-            endpoint=api_url,
-            model=model_id,
-            selected_percentile_metrics=selected_percentile_metrics,
-            selected_percentiles=selected_percentiles,
+        if endpoint_type == "realtime-video":
+            return await asyncio.to_thread(
+                finalize_realtime_video,
+                input_requests,
+                [],
+                warmup_outputs,
+                duration=0.0,
+                endpoint=api_url,
+                model=model_id,
+                selected_percentile_metrics=selected_percentile_metrics,
+                selected_percentiles=selected_percentiles,
+            )
+        first_error = next((output.error for output in failed_warmups if output.error), "No request error recorded")
+        raise ValueError(
+            f"{len(failed_warmups)}/{len(warmup_outputs)} warmup requests failed; "
+            f"measured requests were not sent: {first_error}"
         )
 
     print("Starting main benchmark run...")
@@ -4281,6 +4361,8 @@ async def benchmark(
             request.request_id,
         )
         per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
+        if measurement_salt is not None:
+            per_request_extra_body = {**(per_request_extra_body or {}), "cache_salt": measurement_salt}
         req_model_id, req_model_name = model_id, model_name
         if lora_iter is not None:
             req_lora_module = next(lora_iter)
@@ -4546,6 +4628,10 @@ async def benchmark(
         if (accuracy := duplex_eval_summary.get("accuracy")) is not None:
             print("\nOmni-DuplexEval accuracy:")
             print(json.dumps(accuracy, indent=2))
+
+    from vllm_omni.benchmarks.validation import request_coverage
+
+    result.update(request_coverage(outputs))
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

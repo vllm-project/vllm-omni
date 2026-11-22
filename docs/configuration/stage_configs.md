@@ -310,19 +310,65 @@ exclusively.
 
 ### Stage-level runner selection
 
-`model_runner: v1` or `v2` at the deploy level sets the default runner.
-A `model_runner` on an individual stage overrides that default, allowing
-one stage to migrate or roll back independently. This does not change
-`PipelineConfig` topology, input adapters, or the connector payload contract.
-An omitted stage override preserves the deploy-level selection.
+With vLLM 0.34, `model_runner: v2` is the default and the only supported
+model runner. An individual stage can select `v2` explicitly. Configuration
+resolution still applies platform overrides before stage selection; any
+resolved `v1` stage raises an error. There is no V1 fallback. Runner selection
+does not change `PipelineConfig` topology or the connector payload contract.
+
+The default Qwen3-TTS and Qwen3-Omni profiles select V2 on CUDA, ROCm, NPU and
+XPU. MiniCPM-o 4.5 selects V2 through its CUDA, ROCm and NPU platform overlays,
+while Moss-TTS-local selects V2 on CUDA. The CUDA-tuned `*_mrv2.yaml` overlays
+are not NPU profiles. A V2 worker implementation alone does not qualify every
+model or deployment on a platform.
+
+Profiles that still resolve to V1 are unavailable with this version. These
+include Qwen3-TTS's and Qwen3-Omni's MUSA overrides, Fish-Omni's DAC stage,
+PersonaPlex's Talker, VibeVoice, and the LFM3-Omni profiles. Selecting
+`v2` manually does not establish support for those paths.
+The complete PersonaPlex workflow is also unavailable: its Talker still
+requires V1, although its Code2Wav stage has V2 components.
+The Qwen3-TTS and Qwen3-Omni XPU profiles select V2; final-release XPU
+hardware validation remains pending. Retained V1 profiles identify unavailable
+workflows and preserve explicit configuration errors. They do not provide a V1
+fallback.
+
+YuE2's `yue2.yaml` uses the shared V2 AR runner with a model-owned sampler and
+model-state lifecycle hooks. The sampler preserves phase-specific sampling and
+paired CFG; the hooks release AR slots while NAR/VAE jobs complete and deliver audio by
+request ID. Automatic ABC transitions reset the same request's phase state.
+The profile requires one GPU, synchronous scheduling, and disabled prefix
+caching and external KV transfer. See the [YuE2 recipe](gh-file:recipes/m-a-p/YuE2-3B.md).
+
+Drama 3 / Fish-Omni serving and both LFM3-Omni speech and text-only profiles
+are unavailable. Their retired serving E2E tests covered speech generation,
+voice cloning, streaming, concurrency and request validation across those
+workflows. Retained Fish AR and LFM3-Omni component tests are not complete V2
+serving replacements; LFM3-Audio uses a different checkpoint and profile.
+Drama jobs are removed from CUDA Weekly and AMD CI. The Merge matrix also
+excludes VibeVoice. These exclusions do not count as passing V2 model tests.
+
+Retiring V1 dispatch also reduces the following Weekly CI coverage:
+
+| Retired selection | Retained V2 CI selection | Remaining coverage limit |
+| --- | --- | --- |
+| Audex offline TTS, S2T and TTA on CUDA L4 and AMD MI325 | H100 selects Audex offline S2S and online TTA/TTS. | No effective V2 CI owner is established for the three offline files. Their L4/MI325 markers exclude them from the H100 aggregate. |
+| CUDA L4 Higgs V2/V3, IndexTTS2, and Ming/GLM online serving | AMD MI325 selects the corresponding offline/online files. H100 selects only the dedicated Higgs V3 full-response case. | These selections do not replace the retired L4 scenarios. |
+| CUDA L4 CosyVoice3 offline inference | AMD MI325 selects the same offline expansion file. H100 selects CosyVoice3 online expansion. | Online coverage and another hardware backend do not replace L4 offline coverage. |
+
+The existing Ming and GLM **offline L4** cases already use the default V2
+runner and remain selected. These are CI source selections, not new passing
+results or qualification of every model/platform combination. Retained test
+source or another backend's CI lane does not establish support for a retired
+workflow.
 
 MRv2 native downstream receivers accept turn-based requests. A pipeline that
-sets `supports_duplex_mrv2` also accepts duplex sessions on those stages.
-Qwen3-Omni and MiniCPM-o 4.5 set that flag. Resumable streaming input uses the
-V1 prompt-replacement path unless the pipeline implements the MRv2 equivalent.
-Selecting a runner does not add session capabilities the pipeline lacks.
-Platform fallbacks and stage overrides are validated after configuration
-resolution.
+sets `supports_duplex_mrv2` also accepts duplex sessions on those stages;
+Qwen3-Omni and MiniCPM-o 4.5 set that flag. Resumable streaming input without
+a model-owned V2 implementation is unsupported. Pipeline parallelism and
+prefill context parallelism greater than one remain unsupported by the Omni
+V2 runner. These are source-defined limits, not a claim that model or hardware
+validation has passed.
 
 ### Stage fields
 
@@ -404,7 +450,7 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Merged with pipeline `sampling_constraints`; scalar constraints win, while required `stop_token_ids` are appended and deduplicated. |
 | `engine_extras` | dict | optional | `{}` | Catch-all for engine fields not listed above; deep-merged across overlays and forwarded to the stage engine. |
 
-**Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. A top-level `--tensor-parallel-size` is broadcast to every stage, so it can make a single-GPU stage violate this contract ([issue #5003](gh-issue:5003)); fix that case with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set TP only on the multi-GPU stage.
+**Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. Use `--stage-overrides` or the stage's deploy entry to set `tensor_parallel_size` and `devices` together per stage.
 
 ### Connector schema
 
@@ -453,6 +499,22 @@ platform-specific value in a user overlay, use the same platform block.
 | `--deploy-config PATH` | Load a deploy YAML. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
+
+`--stage-overrides` logs a warning and ignores deploy-only fields such
+as `session_mode` and `connectors`. Set those fields in the deploy YAML.
+
+Stage-owned flags such as `--gpu-memory-utilization`, `--kv-cache-memory-bytes`,
+`--max-model-len`, and `--tensor-parallel-size` reject a flat value that would override
+multiple stages in `vllm serve --omni`. Use `--stage-overrides` or a
+deploy YAML to specify the value for each intended stage. A numeric
+`--stage-id` scopes these flags to the selected stage. Flat flags with a
+single eligible recipient and pipeline-wide flags such as `--dtype`
+continue to work.
+
+A nested `parallel_config` in `--stage-overrides` takes precedence for that
+stage. For example, `'{"1":{"parallel_config":{"tensor_parallel_size":1}}}'`
+sets stage 1's tensor parallel size and lets a flat `--tensor-parallel-size`
+apply to stage 0 in a two-stage pipeline.
 
 ### Stage-Based CLI Paradigm
 
@@ -511,7 +573,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 From highest to lowest:
 
 1. Per-stage overrides (`--stage-overrides` JSON)
-2. Explicit global CLI flags (`--gpu-memory-utilization 0.85`, etc.)
+2. Explicit CLI flags for the pipeline or a single eligible stage
 3. Platform section (`platforms.npu.stages`, etc.) on top of the base `stages:`
 4. Overlay YAML (via `base_config:`) on top of the base YAML
 5. Parser defaults
@@ -573,13 +635,12 @@ stages:
     gpu_memory_utilization: 0.5     # smaller GPU
 ```
 
-Launched with both an explicit global flag and a per-stage override:
+Launch with stage-specific overrides:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config my_overrides.yaml \
-    --max-model-len 16384 \
-    --stage-overrides '{"0": {"max_num_seqs": 8}}'
+    --stage-overrides '{"0": {"max_num_seqs": 8, "max_model_len": 16384}, "1": {"max_model_len": 16384}}'
 ```
 
 Within the stage-based CLI paradigm, equivalent configuration parameters can inherently be passed directly
@@ -599,10 +660,10 @@ Effective config per stage after the merge:
 | ------- | ------- | ------------- | -------- |
 | 0 | `gpu_memory_utilization` | `0.9` | base YAML (overlay didn't touch stage 0) |
 | 0 | `max_num_seqs` | `8` | per-stage CLI (`--stage-overrides`) — wins over base `32` |
-| 0 | `max_model_len` | `16384` | global CLI |
+| 0 | `max_model_len` | `16384` | per-stage CLI |
 | 1 | `gpu_memory_utilization` | `0.5` | overlay YAML — wins over base `0.7` |
 | 1 | `max_num_seqs` | `16` | base YAML (overlay didn't touch this field) |
-| 1 | `max_model_len` | `16384` | global CLI |
+| 1 | `max_model_len` | `16384` | per-stage CLI |
 | 2 | (all defaults) | — | base YAML (no overrides apply) |
 
 Therefore, as a core part of vLLM-Omni, a model's pipeline and deployment configurations have several main functions:
@@ -637,51 +698,31 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. MRV2 remains
-experimental for this model; its scheduler and delivery paths are still being
-qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on XPU,
-ROCm and MUSA. On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav
-retains `PIECEWISE`. If opting out to V1 on NPU, set both `model_runner: v1`
-and stage 0 to `PIECEWISE` in the NPU platform section of the copied
-configuration. The NPU Talker rejects
-V1 with full decode graphs before loading weights; use `PIECEWISE`, `NONE` or
-eager execution for V1. Select one of these
-deployment profiles:
+Qwen3-TTS selects Model Runner V2 by default on CUDA, ROCm, NPU and XPU. With
+vLLM 0.34.0, V2 is the only supported model runner; the MUSA override that
+selects V1 is rejected. MRV2 remains experimental for this model.
+ROCm keeps Code2Wav eager because its decoder convolutions are not safe inside
+the outer graph capture.
+On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav retains
+`PIECEWISE`. These settings do not establish hardware qualification.
+Select one of these deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 on CUDA/NPU; V1 on XPU/ROCm/MUSA | B1 | Shipped default; experimental |
+| `qwen3_tts.yaml` | V2 on CUDA/ROCm/NPU/XPU; MUSA V1 override unsupported | B1 | Shipped default; experimental |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
 | `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
-| `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
+| `qwen3_tts_high_concurrency.yaml` | V2 (default) | Existing defaults | Original high-concurrency tuning |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
 The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
-`qwen3_tts.yaml` instead: their resolved settings were identical on CUDA,
-XPU, ROCm and MUSA. On NPU, the former profile selected V1 with `PIECEWISE`
-Talker graphs, while the default selects V2 with `FULL_AND_PIECEWISE`.
-To retain that NPU V1 behavior, use a custom overlay:
-
-```yaml
-# qwen3_tts_npu_v1.yaml; replace base_config with your installed file's path.
-base_config: /absolute/path/to/vllm_omni/deploy/qwen3_tts.yaml
-platforms:
-  npu:
-    model_runner: v1
-    stages:
-      - stage_id: 0
-        compilation_config:
-          cudagraph_mode: PIECEWISE
-```
-
-Relative `base_config` paths resolve from the overlay's directory.
+`qwen3_tts.yaml` instead; it selects V2 on CUDA, ROCm, NPU and XPU.
 
 ```bash
-# Use the overlay above to retain V1 on NPU.
+# Use the bundled V2 profile.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config /path/to/qwen3_tts_npu_v1.yaml
+  --deploy-config vllm_omni/deploy/qwen3_tts.yaml
 ```
 
 The V2 profiles bound Talker prefill to 512 tokens per step and select the
@@ -689,8 +730,9 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections retain V1 on XPU, ROCm and MUSA;
-this change does not qualify MRV2 on those backends or enable other model families.
+releasing request state. The platform section that retains V1 on MUSA is
+unsupported. XPU selects V2, but final-release XPU hardware qualification
+remains pending.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
 transport path; the warning does not establish support for that combination.
@@ -916,3 +958,18 @@ stereo; benchmark raw PCM with `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 `VLLM_OMNI_BENCH_AUDIO_CHANNELS=2`. See the
 [MOSS recipe](gh-file:recipes/OpenMOSS/MOSS-TTS.md#local-15-unified-deployment-and-slot-attention)
 for the execution path and configuration overrides.
+
+## MiniMax-Music3 with Model Runner V2
+
+`minimax_music3.yaml` and `minimax_music3_2gpu.yaml` inherit the vLLM 0.34 MRV2
+default for both stages. The serving validation for these profiles used CUDA. The MRV2 model state passes the batch rows, counts and per-request
+arguments to the talker for CFG pairing, frame feedback and seeded sampling.
+Stage 0 uses `async_scheduling: false` so the two members of a CFG pair
+are sampled in the same engine step.
+
+Each window reaches stage 1 as its codes, 200 frames x 8 codebooks =
+1600 prompt tokens. A song's last window
+can be one frame longer: 201 frames, 1608 tokens. A window is never split, so
+in your own config keep stage 1's `max_num_batched_tokens` at least
+`max_num_seqs` x 1608 on MRV2. With less, a few requests take every step and
+the other streams wait.

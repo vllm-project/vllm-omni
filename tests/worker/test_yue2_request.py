@@ -132,7 +132,56 @@ def test_speech_truncation_includes_either_phase(abc_truncated, semantic_truncat
     assert metadata["audio_truncated"] == (abc_truncated or semantic_truncated)
 
 
-@pytest.mark.parametrize("cot,cfg_scale", [("full", 1), ("full", 1.5), ("off", 1.5)])
+@pytest.mark.parametrize(
+    "overrides,expected_fragments",
+    [
+        pytest.param({"instructions": None}, ("instructions",), id="instructions_missing"),
+        pytest.param({"instructions": "   "}, ("instructions",), id="instructions_blank"),
+        pytest.param({"input": "   "}, ("input",), id="lyrics_blank"),
+        pytest.param({"voice": "alloy"}, ("voice",), id="voice_rejected"),
+        pytest.param({"speed": 1.5}, ("speed",), id="speed_rejected"),
+        pytest.param(
+            {"extra_params": {"temperature": 0.3}},
+            ("temperature",),
+            id="temperature_rejected",
+        ),
+        pytest.param(
+            {"max_new_tokens": Yue2Adapter.max_new_tokens_min - 1},
+            ("max_new_tokens",),
+            id="frame_budget_below_minimum",
+        ),
+        pytest.param(
+            {"max_new_tokens": Yue2Adapter.max_new_tokens_max + 1},
+            ("max_new_tokens",),
+            id="frame_budget_above_maximum",
+        ),
+        pytest.param(
+            {"extra_params": {"abc": "X:1\nK:C\nC"}},
+            ("abc", "cot"),
+            id="abc_without_cot",
+        ),
+    ],
+)
+def test_yue2_adapter_validation_rejects_invalid_requests(overrides, expected_fragments):
+    body = {
+        "input": "lyrics",
+        "instructions": "style",
+        "max_new_tokens": 250,
+    }
+    for key, value in overrides.items():
+        if value is None:
+            body.pop(key)
+        else:
+            body[key] = value
+
+    adapter = Yue2Adapter(SpeechServingContext(server=None))
+    error = adapter.validate(OpenAICreateSpeechRequest(**body))
+
+    assert error is not None
+    assert all(fragment in error for fragment in expected_fragments)
+
+
+@pytest.mark.parametrize("cot,cfg_scale", [("melody", 1), ("full", 1), ("full", 1.5), ("off", 1.5)])
 @pytest.mark.asyncio
 async def test_http_song_sampling_isolated_from_defaults(mocker, cot, cfg_scale):
     engine = mocker.Mock(
@@ -246,9 +295,8 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     from importlib import import_module
     from pathlib import Path
 
-    import yaml
-
     from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+    from vllm_omni.config.stage_config import PipelineConfig, load_deploy_config, merge_pipeline_deploy
     from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 
@@ -256,17 +304,17 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     assert [key for key in _OMNI_MODELS if key.startswith("Yue2")] == ["Yue2ForCausalLM"]
     assert _OMNI_MODELS["Yue2ForCausalLM"] == ("yue2", "runtime", "Yue2ForCausalLM")
     pipeline = OMNI_PIPELINES["yue2"]
+    assert isinstance(pipeline, PipelineConfig)
     assert pipeline.default_deploy_config_name == "yue2.yaml"
     module, name = pipeline.stages[0].scheduler_cls.rsplit(".", 1)
     assert getattr(import_module(module), name) is Yue2Scheduler
-    deploy = yaml.safe_load((Path(__file__).parents[2] / "vllm_omni/deploy/yue2.yaml").read_text())
-    assert deploy["pipeline"] == "yue2"
-    assert deploy["model_runner"] == "v1"
-    module, name = deploy["stages"][0]["worker_cls"].rsplit(".", 1)
-    worker = getattr(import_module(module), name)
-    from vllm_omni.model_executor.models.yue2.runtime import Yue2ModelRunner
-
-    assert worker.model_runner_cls is Yue2ModelRunner
+    deploy_root = Path(__file__).parents[2] / "vllm_omni/deploy"
+    deploy = load_deploy_config(deploy_root / "yue2.yaml")
+    assert deploy.pipeline == "yue2"
+    assert deploy.model_runner == "v2"
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    assert stages[0].yaml_engine_args.get("worker_cls", "auto") == "auto"
     family, module, name = _OMNI_MODELS["Yue2ForCausalLM"]
     assert getattr(import_module(f"vllm_omni.model_executor.models.{family}.{module}"), name) is Yue2ForCausalLM
     assert detect_tts_model_type("yue2", "Yue2ForCausalLM") == "yue2"

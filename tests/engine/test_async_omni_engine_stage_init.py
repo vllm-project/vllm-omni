@@ -215,7 +215,9 @@ def test_build_vllm_config_forwards_text_watermark_config(
     )
     forwarded: list[dict[str, object] | None] = []
 
-    with pytest.raises(_StopAfterEngineArgsError):
+    expected_error = _StopAfterEngineArgsError if use_v2_model_runner else ValueError
+    expected_match = None if use_v2_model_runner else "Model Runner V1 is not supported"
+    with pytest.raises(expected_error, match=expected_match):
         # start to build the vLLM config and ensure the Omni watermark config is properly parsed
         build_vllm_config(
             stage,
@@ -224,7 +226,7 @@ def test_build_vllm_config_forwards_text_watermark_config(
             watermark_config=WatermarkConfig({"text": {"key": 1234, "algorithm": "gumbel"}}),
         )
 
-    assert forwarded == [expected]
+    assert forwarded == ([expected] if use_v2_model_runner else [])
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
@@ -407,7 +409,11 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.stage_configs = [types.SimpleNamespace()]
+    engine.stage_configs = [
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="text_encoder", owns_tokenizer=True)
+        )
+    ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
@@ -446,7 +452,11 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.stage_configs = [types.SimpleNamespace()]
+    engine.stage_configs = [
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="text_encoder", owns_tokenizer=True)
+        )
+    ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
