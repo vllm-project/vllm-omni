@@ -124,11 +124,21 @@
         "enable-diffusion-pipeline-profiler": true,
         "deploy-config": "../vllm_omni/deploy/bagel.yaml",
         "no-async-chunk": true,
-        "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
-        "gpu-memory-utilization": 0.45,
-        "max-model-len": 8192,
-        "max-num-batched-tokens": 9216
+        "stage-overrides": {
+          "0": {
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.45,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 9216
+          },
+          "1": {
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.45,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 9216
+          }
+        }
       }
     },
     "benchmark_params": [
@@ -175,11 +185,21 @@
         "enable-diffusion-pipeline-profiler": true,
         "deploy-config": "../vllm_omni/deploy/bagel.yaml",
         "no-async-chunk": true,
-        "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
-        "gpu-memory-utilization": 0.45,
-        "max-model-len": 8192,
-        "max-num-batched-tokens": 9216
+        "stage-overrides": {
+          "0": {
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.45,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 9216
+          },
+          "1": {
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.45,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 9216
+          }
+        }
       }
     },
     "benchmark_params": [

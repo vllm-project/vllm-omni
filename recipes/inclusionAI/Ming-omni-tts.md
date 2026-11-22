@@ -16,7 +16,6 @@
 - [Huggingface: inclusionAI/Ming-omni-tts-0.5B](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B)
 - Upstream repository [inclusionAI/Ming-omni-tts](https://github.com/inclusionAI/Ming-omni-tts)
 
-
 ## Hardware Support
 
 This recipe documents a validated ROCm configuration and a CUDA configuration for the dense 0.5B and the MoE 16.8B two-stage TTS pipeline deployment.
@@ -150,7 +149,7 @@ docker run --rm \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
     --omni \
     --port 8091 \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 #### Verification
@@ -203,5 +202,8 @@ The run used the official ROCm image built from `docker/Dockerfile.rocm`.
 - The reference clips above are a subset of the upstream [`inclusionAI/Ming-omni-tts/tree/main/data/wavs`](https://github.com/inclusionAI/Ming-omni-tts/tree/main/data/wavs) cookbook fixtures.
 - To clone from local audio instead of a URL, pass a `file://` URI (launch the server with `--allowed-local-media-path <dir>`), or base64-encode the clip into a `data:` URL written to a payload file and send it with `curl -d @payload.json`. Putting the base64 directly on the `curl` command line overflows the OS argument limit (`bash: /usr/bin/curl: Argument list too long`).
 - The tested environment uses `--enforce-eager`.
+- CFM CUDA Graphs follow Stage 0's configuration: `enforce_eager: true` or `compilation_config.cudagraph_mode: NONE` disables their compilation and capture.
+- Both stages of `ming_tts.yaml` and `ming_tts_moe.yaml` run on Model Runner V2 (native data plane); vLLM 0.34+ does not support Model Runner V1. MRV2 is currently qualified on CUDA; ROCm, NPU, XPU and MUSA are not yet qualified on MRV2 (the ROCm notes above were validated on older vLLM 0.22/0.27 releases).
+- Stage 0 does not support chunked prefill. Keep its `max_num_batched_tokens` at least `max_model_len`, as the bundled profiles do. A preempted Stage-0 request fails with a truncation error instead of being recomputed, because its decode state is not in the token stream.
 - Non-streaming responses return WAV bytes; streaming responses return PCM.
 - Output is mono 44.1 kHz audio.

@@ -46,7 +46,7 @@ def test_x_to_text_model_family(monkeypatch: pytest.MonkeyPatch, config: dict[st
 def test_bagel_x_to_text_prompt_builder() -> None:
     prompt, stop_token_ids = build_x_to_text_prompt("bagel", "unused", "Describe it.", has_image=True)
     assert prompt == {
-        "prompt": "<|im_start|>user\n<|image_pad|>\nDescribe it.<|im_end|>\n<|im_start|>assistant\n",
+        "prompt": "<|image_pad|><|im_start|>Describe it.<|im_end|><|im_start|>",
         "modalities": ["text"],
     }
     assert stop_token_ids is None
@@ -301,6 +301,21 @@ def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.Monkey
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("model_class_name", "preserves"),
+    [
+        ("Cosmos3OmniDiffusersPipeline", True),
+        ("Cosmos3OmniPipeline", True),
+        # Sim-Bimanual uses the requested output geometry as given.
+        ("Cosmos3NanoSimBimanualPipeline", False),
+    ],
+)
+def test_cosmos3_reference_image_size_policy(model_class_name: str, preserves: bool) -> None:
+    assert should_preserve_reference_image_size(model_class_name, model="nvidia/Cosmos3-Nano") is preserves
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
 def test_minimax_h3_preserves_reference_image_size(model_class_name: str) -> None:
     assert should_preserve_reference_image_size(
@@ -458,6 +473,15 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
         is False
     )
     assert should_init_extra_args_for_non_diffusion_stages("UnknownPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_flux3_extra_registry_declares_contract() -> None:
+    assert get_extra_body_params("Flux3Pipeline") == frozenset({"flow_shift"})
+    assert get_extra_output_params("Flux3Pipeline") == frozenset()
+    assert should_preserve_reference_image_size("Flux3Pipeline", model="org/flux3") is True
+    assert should_init_extra_args_for_non_diffusion_stages("Flux3Pipeline") is False
 
 
 @pytest.mark.core_model

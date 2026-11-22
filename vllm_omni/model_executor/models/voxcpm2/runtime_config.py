@@ -41,6 +41,7 @@ class _VoxCPM2RuntimeConfig:
     enable_profiling: bool = False
     enable_nvtx_profile: bool = False
     enable_loc_dit_layer_nvtx: bool = False
+    enable_torch_compile: bool = True
     enable_loc_dit_fused_qkv: bool = True
     enable_loc_dit_fused_mlp: bool = True
     enable_loc_dit_zero_dt_cache: bool = True
@@ -62,7 +63,7 @@ class _VoxCPM2RuntimeConfig:
     deterministic_cfm_noise: bool = False
     deterministic_cfm_seed: int = 20260601
     audio_emit_every: int = 1
-    vae_decode_every: int = 3
+    vae_decode_every: int = 2
     enable_delayed_audio_copy: bool = False
     delayed_audio_copy_use_events: bool = False
     coalesce_audio_d2h: bool = True
@@ -78,7 +79,12 @@ class _VoxCPM2RuntimeConfig:
         model_config = vllm_config.model_config
         values: dict[str, Any] = {}
         if getattr(model_config, "use_v2_model_runner", False):
-            values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
+            from vllm_omni.platforms import current_omni_platform
+
+            # Incremental VAE decoding is a per-patch unified-graph feature and
+            # only exists on CUDA. Other platforms keep the v1 audio profile.
+            if current_omni_platform.is_cuda():
+                values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
         raw = getattr(model_config, "voxcpm2_runtime_config", None)
         if raw is None:
             raw = getattr(getattr(model_config, "hf_config", None), "voxcpm2_runtime_config", None)
@@ -163,8 +169,16 @@ class _VoxCPM2RuntimeConfig:
                 return max(1, value)
             return value
         if isinstance(default, float):
-            if key == "cfg_value" and not math.isfinite(float(value)):
-                raise ValueError("VoxCPM2 cfg_value must be finite.")
+            if key == "cfg_value":
+                # a yaml boolean parses as a Python bool, which float()
+                # silently accepts (true -> 1.0 = CFG effectively off);
+                # reject it before the coercion.
+                if isinstance(value, bool):
+                    raise ValueError(
+                        f"voxcpm2_runtime_config.cfg_value={value!r} must be a positive finite float, not a boolean"
+                    )
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"voxcpm2_runtime_config.cfg_value={value!r} must be finite.")
             if key == "cfg_cutoff_ratio":
                 return min(1.0, max(0.0, float(value)))
             return float(value)

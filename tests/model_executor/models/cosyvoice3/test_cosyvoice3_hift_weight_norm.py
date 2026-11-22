@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU regressions for folding frozen HiFT generator weight normalization."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -26,11 +28,20 @@ def fixed_seed():
         yield
 
 
+def _select_weight_norm_api(api, monkeypatch):
+    if api == "legacy":
+        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
+    return api
+
+
 @pytest.fixture(params=["parametrized", "legacy"])
 def weight_norm_api(request, monkeypatch):
-    if request.param == "legacy":
-        monkeypatch.setattr(hifigan, "weight_norm", nn.utils.weight_norm)
-    return request.param
+    return _select_weight_norm_api(request.param, monkeypatch)
+
+
+@pytest.fixture
+def checkpoint_weight_norm_api(request, monkeypatch):
+    return _select_weight_norm_api(request.param, monkeypatch)
 
 
 def _has_weight_norm(module):
@@ -127,26 +138,27 @@ def test_hift_fold_preserves_audio_and_leaves_f0_unchanged(weight_norm_api, caus
 
 
 @pytest.mark.parametrize(
-    "weight_norm_api,legacy_checkpoint",
+    "checkpoint_weight_norm_api,legacy_checkpoint",
     [("parametrized", False), ("parametrized", True), ("legacy", True)],
-    indirect=["weight_norm_api"],
+    indirect=["checkpoint_weight_norm_api"],
 )
-def test_load_weights_folds_loaded_not_initial_weights(tmp_path, weight_norm_api, legacy_checkpoint):
+def test_load_weights_folds_loaded_not_initial_weights(tmp_path, checkpoint_weight_norm_api, legacy_checkpoint):
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
     # Exercise the real loader with a small vocoder and synthetic checkpoints.
     # __new__ skips CosyVoice3Code2Wav.__init__ (which would build the DiT and
-    # flow decoder); load_weights only touches .flow_model and .hift.
+    # flow decoder); weight-norm tests leave optional DiT compilation disabled.
     model = CosyVoice3Code2Wav.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
+    model.config = SimpleNamespace(cosyvoice3_compile_dit=False)
     model.flow_model = nn.Linear(2, 2)
     # Start in training mode to check the loader's transition to eval.
     model.hift = _make_hift().train()
     assert model.hift.training
     conv = model.hift.conv_pre
-    assert hasattr(conv, "weight_g") == (weight_norm_api == "legacy")
+    assert hasattr(conv, "weight_g") == (checkpoint_weight_norm_api == "legacy")
     state = {name: value.clone() for name, value in model.hift.state_dict().items()}
-    gain = "weight_g" if weight_norm_api == "legacy" else "parametrizations.weight.original0"
+    gain = "weight_g" if checkpoint_weight_norm_api == "legacy" else "parametrizations.weight.original0"
     state[f"conv_pre.{gain}"].mul_(2)
     expected_weight = conv.weight.detach().clone() * 2
     assert not torch.equal(conv.weight, expected_weight)

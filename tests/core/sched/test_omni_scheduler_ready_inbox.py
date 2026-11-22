@@ -26,6 +26,7 @@ def test_ready_inbox_coalesces_live_events_and_drops_cancelled(mocker):
         _async_chunk=True, update_request_metadata=mocker.Mock(), process_pending_chunks=mocker.Mock()
     )
     scheduler.input_coordinator = coordinator
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler._init_omni_connector_output_inbox()
     scheduler.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"r"}))
     scheduler.enqueue_omni_connector_output(
@@ -56,7 +57,11 @@ def test_native_input_gate_parks_and_restores_kv_holders(policy, async_chunk):
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.waiting = create_request_queue(policy)
     scheduler.kv_holding_waiting = create_request_queue(policy)
+    # Upstream _enqueue_waiting_request reads self.connector (None unless a KV
+    # connector is configured); __new__ bypasses the __init__ that sets it.
+    scheduler.connector = None
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.running = []
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = OmniSchedulingCoordinator(
@@ -113,6 +118,7 @@ def test_native_input_gate_preserves_upstream_blocked_waits(async_chunk, status)
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.running = []
     request = Request("blocked", [1, 2, 3], SamplingParams(max_tokens=1), pooling_params=None)
     request.status = status

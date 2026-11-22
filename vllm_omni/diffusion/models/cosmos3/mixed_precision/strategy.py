@@ -39,6 +39,8 @@ def _has_spec(method: object | None, spec: QuantSpec) -> bool:
 class Cosmos3PrecisionStrategy:
     """Quantization-format boundary behind the shared precision schedule."""
 
+    format_name: str
+
     def accepts(self, method: object | None) -> bool:
         """Return whether this strategy owns a native linear method."""
         raise NotImplementedError
@@ -98,6 +100,8 @@ class Cosmos3PrecisionStrategy:
 class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     """Use native ModelOpt W8A8 or reference dense W8A16."""
 
+    format_name = "fp8"
+
     def accepts(self, method: object | None) -> bool:
         return _has_spec(method, _FP8_W8A8_SPEC)
 
@@ -109,8 +113,11 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     ) -> None:
         if hasattr(layer, "pre_quant_scale"):
             raise ValueError(f"{module_name} uses unsupported SmoothQuant pre_quant_scale")
+        # Merged layers (e.g. gate/up) hold one tensorwise scale per logical
+        # shard until the native transform requantizes them to a single scale.
         weight_scale = getattr(layer, "weight_scale", None)
-        if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != 1:
+        num_shards = len(getattr(layer, "logical_widths", None) or [None])
+        if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != num_shards:
             raise ValueError(f"{module_name} requires serialized tensorwise FP8 weights")
         fp8_kernel = getattr(method, "kernel", None)
         from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
@@ -159,6 +166,8 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
 
 class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
     """Use native ModelOpt W4A4 or reference dense W4A16."""
+
+    format_name = "nvfp4"
 
     def accepts(self, method: object | None) -> bool:
         return _has_spec(method, _NVFP4_W4A4_SPEC)

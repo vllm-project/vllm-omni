@@ -9,17 +9,48 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.omni_duplex_eval.validation import assert_accuracy_result, load_accuracy_config
+from tests.e2e.accuracy.omni_duplex_eval.validation import (
+    assert_accuracy_result,
+    load_accuracy_config,
+    select_duplex_eval_baseline,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _CONFIG_PATH = Path(__file__).with_name("omni_duplex_eval_ci_config.json")
+_TEST_ROOT = Path(__file__).resolve().parents[3]
+_MINICPMO_DFX = _TEST_ROOT / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json"
+_QWEN3_DFX = _TEST_ROOT / "dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json"
+
+
+def _soundtrack_accuracy_guard_params() -> dict:
+    accuracy = json.loads(_CONFIG_PATH.read_text())
+    ids = [str(sample_id) for values in accuracy["sample_ids_per_split"].values() for sample_id in values]
+    return {
+        "dataset_name": "omni-duplex-eval",
+        "dataset_path": accuracy["dataset"],
+        "duplex_eval_evaluate": True,
+        "duplex_eval_ids": ids,
+        "num_prompts": [len(ids)],
+        "duplex_eval_mix": accuracy["mix"],
+        "duplex_eval_split": "all",
+        "duplex_eval_accuracy_config": str(_CONFIG_PATH),
+        "max_concurrency": [8],
+    }
+
+
+def _minicpmo_accuracy_guard_dfx_config() -> dict:
+    dfx = json.loads(_MINICPMO_DFX.read_text())[0]
+    dfx["benchmark_params"][0].update(_soundtrack_accuracy_guard_params())
+    return dfx
 
 
 @pytest.fixture
 def config():
-    return json.loads(_CONFIG_PATH.read_text())
+    raw = json.loads(_CONFIG_PATH.read_text())
+    selected = select_duplex_eval_baseline(raw, "H100")
+    return {**raw, "baseline": selected} if selected else raw
 
 
 @pytest.fixture
@@ -57,10 +88,11 @@ def result(tmp_path, config):
         errors=[],
         score_root=str(score_root),
     )
-    return {
+    payload = {
         "date": "20261020-065052",
         "completed": expected,
         "failed": 0,
+        "duplex_metric_aggregation": "response",
         "duplex_session_metrics": [
             {
                 "client_ttft_ms": {"count": 1, "mean": 3.0},
@@ -75,6 +107,22 @@ def result(tmp_path, config):
             "accuracy": summary,
         },
     }
+    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+        payload[f"num_{metric}_samples"] = expected
+        suffix = "" if metric == "audio_rtf" else "_ms"
+        for percentile in (50, 95):
+            payload[f"p{percentile}_{metric}{suffix}"] = 1.0
+    for metric in (
+        "duplex_client_rtf",
+        "duplex_client_ttfp_ms",
+        "duplex_client_ttft_ms",
+        "duplex_busy_rtf",
+        "duplex_stall_ratio",
+    ):
+        payload[f"num_{metric}_samples"] = expected
+        for stat in ("mean", "median", "p99"):
+            payload[f"{stat}_{metric}"] = 0.1
+    return payload
 
 
 def test_complete_scores_pass(result, config):
@@ -210,12 +258,39 @@ def test_zero_threshold_is_rejected(result, config):
         assert_accuracy_result(result, config)
 
 
+_CALIBRATED_FLOORS = {
+    "min_rtd_mean_content_score": 1.8,
+    "min_rtd_mean_temporal_score": 1.4,
+    "min_pr_mean_all_success": 0.28,
+}
+
+
+def test_select_duplex_eval_baseline_nested_contract():
+    nested = {
+        "baseline": {
+            "H100": dict(_CALIBRATED_FLOORS),
+            "B200": dict(_CALIBRATED_FLOORS),
+            "A3": dict(_CALIBRATED_FLOORS),
+            "MI325": {},
+        }
+    }
+    assert select_duplex_eval_baseline(nested, "H100") == _CALIBRATED_FLOORS
+    assert select_duplex_eval_baseline(nested, "MI325") == {}
+    assert select_duplex_eval_baseline(nested, "MI300") == {}
+    with pytest.raises(ValueError, match="requires a runtime hardware label"):
+        select_duplex_eval_baseline(nested, "")
+    with pytest.raises(ValueError, match="requires a runtime hardware label"):
+        select_duplex_eval_baseline(nested, None)
+    mixed = {"baseline": {"H100": dict(_CALIBRATED_FLOORS), "min_rtd_mean_content_score": 1.8}}
+    with pytest.raises(ValueError, match="mixes hardware maps and flat metrics"):
+        select_duplex_eval_baseline(mixed, "H100")
+    assert select_duplex_eval_baseline({"baseline": dict(_CALIBRATED_FLOORS)}, "MI325") == _CALIBRATED_FLOORS
+
+
 def test_dfx_invokes_full_accuracy_contract(result):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
-    test_root = Path(__file__).resolve().parents[3]
-    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
-    params = dfx["benchmark_params"][0]
+    params = _soundtrack_accuracy_guard_params()
     result["Hardware"] = "H100"
     assert_result(result, params, 66)
     result["omni_duplex_eval"]["accuracy"]["pr"]["mean_all_success"] = 0
@@ -227,24 +302,30 @@ def test_dfx_invokes_full_accuracy_contract(result):
 def test_dfx_accuracy_requires_batch_audio(result, audio_sessions):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
-    test_root = Path(__file__).resolve().parents[3]
-    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    params = _soundtrack_accuracy_guard_params()
     result["Hardware"] = "H100"
     for session in result["duplex_session_metrics"][audio_sessions:]:
         session["client_ttfp_ms"] = {"count": 0, "mean": None}
     if audio_sessions:
-        assert_result(result, dfx["benchmark_params"][0], 66)
+        assert_result(result, params, 66)
     else:
         with pytest.raises(AssertionError, match="no measured client audio"):
-            assert_result(result, dfx["benchmark_params"][0], 66)
+            assert_result(result, params, 66)
 
 
-def test_nightly_workload_matches_ci_config():
-    test_root = Path(__file__).resolve().parents[3]
-    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
-    params = dfx["benchmark_params"][0]
-    assert params["duplex_eval_mix"] == "soundtrack"
+def test_soundtrack_accuracy_config_accepts_matching_guard_params():
+    params = _soundtrack_accuracy_guard_params()
     assert load_accuracy_config(str(_CONFIG_PATH), params)["mix"] == "soundtrack"
+
+
+def test_minicpmo_nightly_records_pr_correction_without_accuracy_config():
+    minicpm = json.loads(_MINICPMO_DFX.read_text())[0]["benchmark_params"][0]
+    qwen3 = json.loads(_QWEN3_DFX.read_text())[0]["benchmark_params"][0]
+    assert "duplex_eval_accuracy_config" not in minicpm
+    assert minicpm["duplex_eval_split"] == "PR_correction"
+    assert minicpm["duplex_eval_mix"] == qwen3["duplex_eval_mix"] == "question"
+    assert minicpm["duplex_eval_ids"] == qwen3["duplex_eval_ids"]
+    assert minicpm["num_prompts"] == [120]
 
 
 @pytest.mark.parametrize(
@@ -258,9 +339,7 @@ def test_nightly_workload_matches_ci_config():
     ],
 )
 def test_wrong_workload_is_rejected(field, value):
-    test_root = Path(__file__).resolve().parents[3]
-    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
-    params = dfx["benchmark_params"][0]
+    params = _soundtrack_accuracy_guard_params()
     if value is None:
         del params[field]
     else:
@@ -298,19 +377,26 @@ def test_empty_score_directory(tmp_path):
     ],
 )
 @pytest.mark.parametrize("accuracy_dir_override", [False, True])
-@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3"])
+@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3", "MI300"])
 @pytest.mark.parametrize("benchmark_params_name", [None, "rtd-pr-c8"])
 def test_dfx_writes_both_artifacts_before_quality_gate(
-    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override, resource_label, benchmark_params_name
+    tmp_path,
+    monkeypatch,
+    result,
+    config,
+    failure,
+    accuracy_dir_override,
+    resource_label,
+    benchmark_params_name,
+    pytestconfig,
 ):
     from tests.dfx import conftest as dfx
     from tests.dfx.perf.scripts import run_benchmark as runner
     from vllm_omni.platforms import current_omni_platform
 
-    test_root = Path(__file__).resolve().parents[3]
-    dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
-    dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
-    enforce_score_floors = resource_label in dfx_config["benchmark_params"][0]["duplex_eval_score_floor_hardware"]
+    dfx_config = _minicpmo_accuracy_guard_dfx_config()
+    selected_baseline = select_duplex_eval_baseline(json.loads(_CONFIG_PATH.read_text()), resource_label)
+    enforce_score_floors = bool(selected_baseline)
     if benchmark_params_name is not None:
         dfx_config["benchmark_params"][0]["name"] = benchmark_params_name
     result["model_id"] = "/models/MiniCPM-o-4_5"
@@ -377,9 +463,9 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     if expect_failure:
         message = "benchmark exited with unexpected code" if returncode else ""
         with pytest.raises(AssertionError, match=message):
-            runner.test_performance_benchmark(ServerEndpoint(), case)
+            runner.test_performance_benchmark(ServerEndpoint(), case, pytestconfig=pytestconfig)
     else:
-        runner.test_performance_benchmark(ServerEndpoint(), case)
+        runner.test_performance_benchmark(ServerEndpoint(), case, pytestconfig=pytestconfig)
 
     assert len(commands) == 1
     accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))
@@ -401,7 +487,7 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     assert saved["num_prompts"] == dfx_config["benchmark_params"][0]["num_prompts"][0] == 66
     assert saved["branch"] == "test-branch"
     assert saved["max_concurrency"] == 8
-    assert saved["baseline"] == (config["baseline"] if enforce_score_floors else {})
+    assert saved["baseline"] == selected_baseline
     assert saved["benchmark_exit_code"] == returncode
     if failure == "cli":
         assert saved["accuracy"]["status"] == "failed"
@@ -414,44 +500,94 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
         }
 
 
-@pytest.mark.parametrize("returncode", [0, 1, -6])
-def test_qwen3_eval_keeps_existing_writer_behavior(tmp_path, monkeypatch, returncode):
+@pytest.mark.parametrize("evaluate", [False, True])
+def test_qwen3_record_only_accuracy_publication(tmp_path, monkeypatch, evaluate):
     from tests.dfx import conftest as dfx
 
-    test_root = Path(__file__).resolve().parents[3]
-    config = json.loads((test_root / "dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[0]
+    config = json.loads(_QWEN3_DFX.read_text())[0]
     params = config["benchmark_params"][0]
     assert params["duplex_eval_evaluate"] is True
     assert "duplex_eval_accuracy_config" not in params
-    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    perf_dir = tmp_path / "perf-results"
+    perf_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
     accuracy_dir = tmp_path / "accuracy"
     monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
+    monkeypatch.setenv("BUILDKITE_BRANCH", "test-branch")
+    accuracy = {
+        "status": "completed",
+        "total": params["num_prompts"][0],
+        "evaluated": params["num_prompts"][0],
+        "failed": 0,
+        "skipped": 0,
+        "pr": {"samples": params["num_prompts"][0], "mean_all_success": 0.75},
+    }
+    summary = {"published": params["num_prompts"][0], "artifact_errors": []}
+    if evaluate:
+        summary["accuracy"] = accuracy
+    payload = {
+        "model_id": config["server_params"]["model"],
+        "date": "20261119-104553",
+        "completed": params["num_prompts"][0],
+        "failed": 0,
+        "duration": 732.204,
+        "mean_ttft_ms": 130.5,
+        "mean_audio_rtf": 0.8,
+        "duplex_session_metrics": [{"client_ttft_ms": {"count": 1, "mean": 130.5}}],
+        "omni_duplex_eval": summary,
+    }
+    commands = []
 
     class BenchmarkProcess:
         def __init__(self, command, **kwargs):
+            commands.append(command)
             self.stdout = io.StringIO("")
             self.stderr = io.StringIO("")
             path = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
-            path.write_text(json.dumps({"completed": params["num_prompts"][0]}))
+            path.write_text(json.dumps(payload))
 
         def wait(self):
-            return returncode
+            return 0
 
     monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    args = [
+        "--model",
+        config["server_params"]["model"],
+        "--dataset-path",
+        params["dataset_path"],
+        "--max-concurrency",
+        str(params["max_concurrency"][0]),
+    ]
+    if evaluate:
+        args.append("--duplex-eval-evaluate")
     saved = dfx.run_benchmark(
-        [
-            "--model",
-            config["server_params"]["model"],
-            "--dataset-path",
-            params["dataset_path"],
-            "--duplex-eval-evaluate",
-        ],
+        args,
         test_name=config["test_name"],
         flow=params["max_concurrency"][0],
         dataset_name=params["dataset_name"],
         num_prompt=params["num_prompts"][0],
         resource_label="H100",
+        num_warmups=params["num_warmups"],
+        benchmark_params_name=params["name"],
     )
-    assert saved["completed"] == params["num_prompts"][0]
-    assert len(list(tmp_path.glob("result_*.json"))) == 1
-    assert not accuracy_dir.exists()
+    expected = {
+        **payload,
+        "baseline": {},
+        "Hardware": "H100",
+        "branch": "test-branch",
+        "test_name": config["test_name"],
+        "name": params["name"],
+    }
+    perf_paths = list(perf_dir.glob("result_*.json"))
+    assert len(commands) == len(perf_paths) == 1
+    assert saved == json.loads(perf_paths[0].read_text()) == expected
+    assert not list(perf_dir.glob("result_acc_*.json"))
+    if not evaluate:
+        assert not accuracy_dir.exists()
+        return
+    accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))
+    assert len(accuracy_paths) == 1
+    published = json.loads(accuracy_paths[0].read_text())
+    assert published["accuracy"] == accuracy
+    assert published["baseline"] == {}

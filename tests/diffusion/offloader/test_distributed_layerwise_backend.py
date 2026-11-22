@@ -19,7 +19,6 @@ from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
 from tests.diffusion.offloader.helpers import (
     DummyStream,
-    _DummyBlock,
     _PlainEncoder,
     _SingleBlockModel,
     _StagedEncoder,
@@ -34,11 +33,6 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.diffusion.offloader import plan_resolver
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
-from vllm_omni.diffusion.offloader.block_discovery import (
-    get_blocks_attr_names,
-    get_blocks_from_dit,
-    set_blocks_attr_names,
-)
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -79,6 +73,36 @@ def _make_values(start: float) -> torch.Tensor:
     return torch.arange(start, start + 4, dtype=torch.float32)
 
 
+def _install_flat_shards(hook: DistributedLayerwiseOffloadHook, source_block: nn.Module) -> None:
+    """Replace chunk-packed shards with the legacy flat-shard layout."""
+    params = dict(source_block.named_parameters())
+    bufs = dict(source_block.named_buffers())
+    hook.cpu_shards, hook.metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+        params,
+        bufs,
+        hook.dp_size,
+        hook.rank,
+        hook.pin_memory,
+        hook.tensor_transforms,
+    )
+    hook.manifest = None
+    hook._ag_output_sizes = {dtype: sum(meta["numel"] for meta in metas) for dtype, metas in hook.metadata.items()}
+    hook._cached_repoint = tuple(
+        (
+            hook.next_block_parameters[m["name"]]
+            if m["name"] in hook.next_block_parameters
+            else hook.next_block_buffers[m["name"]],
+            dtype,
+            m["offset"],
+            m["numel"],
+            m["shape"],
+            m["stride"],
+        )
+        for dtype, metas in hook.metadata.items()
+        for m in metas
+    )
+
+
 class TestDistributedLayerwiseOffloadHook:
     def test_buffer_only_block_reports_offloaded_state(self, patched_offload_runtime):
         current_block = nn.Module()
@@ -99,7 +123,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook.offload_layer()
         assert not hook.is_materialized
 
-    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch):
+    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch, patched_offload_runtime):
         current_block = nn.Linear(2, 2)
         next_block = nn.Linear(2, 2)
         expected = {name: tensor.detach().clone() for name, tensor in next_block.state_dict().items()}
@@ -436,10 +460,12 @@ class TestDistributedLayerwiseOffloadHook:
                 atol=0,
             )
 
+    @pytest.mark.parametrize("chunked", [True, False], ids=["manifest", "flat"])
     def test_allgather_reconstructs_online_mxfp8_weight_and_scale(
         self,
         patched_offload_runtime,
         monkeypatch,
+        chunked,
     ):
         """DLO must reconstruct finalized online-MXFP8 tensors byte-for-byte.
 
@@ -490,21 +516,49 @@ class TestDistributedLayerwiseOffloadHook:
 
         rank0_hook = make_hook(rank0_block, 0)
         rank1_hook = make_hook(rank1_block, 1)
+        rank0_flat_source = OnlineMxfp8Block()
+        rank1_flat_source = OnlineMxfp8Block()
         rank0_hook.initialize_hook(current_block)
         rank1_hook.initialize_hook(OnlineMxfp8Block())
+        if chunked:
+            # dp_size > 1 normally takes the chunk-manifest path.
+            assert rank0_hook.manifest is not None
+        else:
+            _install_flat_shards(rank0_hook, rank0_flat_source)
+            _install_flat_shards(rank1_hook, rank1_flat_source)
+            assert rank0_hook.manifest is None
         rank0_hook.gpu_shard_buffers = [
             {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
         ]
 
+        source_dtypes = []
+        original_all_gather = dist_backend_module._all_gather_shard
+
+        def recording_all_gather(output, input_tensor, group):
+            # Record the dtype before the helper applies its uint8 byte view,
+            # so the fake can route to the correct rank-1 shard even when a
+            # block later carries a real uint8 dtype group.
+            source_dtypes.append(input_tensor.dtype)
+            original_all_gather(output, input_tensor, group)
+
+        monkeypatch.setattr(dist_backend_module, "_all_gather_shard", recording_all_gather)
+        collective_dtypes = []
+
         def fake_allgather(output, local_shard, *, group):
             del group
-            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
-            shard_size = local_shard.numel()
-            output[:shard_size].copy_(local_shard)
-            output[shard_size : 2 * shard_size].copy_(remote_shard)
+            collective_dtypes.append(local_shard.dtype)
+            local_bytes = local_shard.view(torch.uint8)
+            remote_bytes = rank1_hook.cpu_shards[source_dtypes.pop(0)].view(torch.uint8)
+            shard_size = local_bytes.numel()
+            output_bytes = output.view(torch.uint8)
+            output_bytes[:shard_size].copy_(local_bytes)
+            output_bytes[shard_size : 2 * shard_size].copy_(remote_bytes)
 
         monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
         rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert torch.uint8 in collective_dtypes
+        assert torch.float8_e8m0fnu not in collective_dtypes
 
         for name, tensor in rank0_block.named_parameters():
             assert tensor.stride() == expected_strides[name]
@@ -769,6 +823,63 @@ class TestDistributedLayerwiseOffloadHook:
         )
         assert next_block.weight.stride() == (1, 2)
         assert torch.equal(source, torch.arange(4, dtype=torch.float32).view(2, 2))
+
+    def test_rank_local_mmap_accepts_shape_changing_transform(self, patched_offload_runtime):
+        """A rank-local layout may be smaller than its checkpoint tensor.
+
+        MAGI-2 declares an EP-head slice as its mmap transform, so the runtime
+        shape is a strict subset of the checkpoint shape. The non-mmap path
+        (``_shard_and_pin``) already accepts that; rank-local staging must too,
+        because it sizes and packs from the transformed layout.
+        """
+        current_block = nn.Module()
+        next_block = nn.Module()
+        next_block.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).view(8, 1))
+
+        def take_first_quarter(tensor):
+            return tensor[:2]
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            rank_local_mmap=True,
+            tensor_transforms={id(next_block.weight): take_first_quarter},
+        )
+        hook.initialize_hook(current_block)
+
+        assert hook.metadata[torch.float32][0]["shape"] == torch.Size([2, 1])
+        assert hook.metadata[torch.float32][0]["numel"] == 2
+
+        hook.cpu_staging_buffers = [
+            {torch.float32: torch.empty(2)},
+            {torch.float32: torch.empty(2)},
+        ]
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert torch.equal(next_block.weight.flatten(), torch.tensor([0.0, 1.0]))
+
+    def test_rank_local_mmap_rejects_dtype_changing_transform(self, patched_offload_runtime):
+        """Sources are bucketed and staged by dtype, so a dtype change stays invalid."""
+        current_block = nn.Module()
+        next_block = nn.Module()
+        next_block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            rank_local_mmap=True,
+            tensor_transforms={id(next_block.weight): lambda tensor: tensor.to(torch.float16)},
+        )
+        with pytest.raises(ValueError, match="mmap weight transform changed tensor dtype"):
+            hook.initialize_hook(current_block)
 
     def test_rank_local_mmap_staging_is_bounded_by_largest_block(self, patched_offload_runtime):
         hooks = []
@@ -1254,29 +1365,6 @@ def test_failed_unregistration_retains_lease_after_backend_is_dropped(
     retained_lease.close()
 
 
-class _MultiBlockModel(nn.Module):
-    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
-
-    def __init__(self, num_transformer: int = 2, num_single: int = 2):
-        super().__init__()
-        self.transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(num_transformer)])
-        self.single_transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(num_single)])
-
-
-class _EmptyBlocksModel(nn.Module):
-    _layerwise_offload_blocks_attrs = ["blocks"]
-
-    def __init__(self):
-        super().__init__()
-        self.blocks = nn.ModuleList([])
-
-
-class _NoAttrsModel(nn.Module):
-    def __init__(self, num_blocks: int = 2):
-        super().__init__()
-        self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
-
-
 class _MmapPostLoadModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["blocks"]
 
@@ -1576,51 +1664,6 @@ class TestMmapWeightLoading:
         assert not backend.enabled
         assert not backend._blocks
         assert not backend._all_hook_groups
-
-
-class TestGetBlocksFromDit:
-    def test_get_blocks_from_dit_single_block_attr(self):
-        model = _SingleBlockModel(num_blocks=3)
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert attr_names == ["blocks"]
-        assert len(blocks) == 3
-        assert all(isinstance(b, _DummyBlock) for b in blocks)
-
-    def test_get_blocks_from_dit_multi_block_attrs(self):
-        model = _MultiBlockModel(num_transformer=2, num_single=3)
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert set(attr_names) == {"transformer_blocks", "single_transformer_blocks"}
-        assert len(blocks) == 5
-
-    def test_get_blocks_from_dit_empty_blocks(self):
-        model = _EmptyBlocksModel()
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert attr_names == []
-        assert blocks == []
-
-    def test_get_blocks_from_dit_no_attrs_defined(self):
-        model = _NoAttrsModel(num_blocks=3)
-        attr_names, blocks = get_blocks_from_dit(model)
-        assert attr_names == []
-        assert blocks == []
-
-
-class TestGetBlocksAttrNames:
-    def test_get_blocks_attr_names_new_format(self):
-        model = _MultiBlockModel()
-        attrs = get_blocks_attr_names(model)
-        assert attrs == ["transformer_blocks", "single_transformer_blocks"]
-
-    def test_get_blocks_attr_names_no_attrs(self):
-        model = _NoAttrsModel()
-        attrs = get_blocks_attr_names(model)
-        assert attrs == []
-
-    def test_set_blocks_attr_names(self):
-        model = _NoAttrsModel()
-        set_blocks_attr_names(model, ["new_blocks"])
-        assert hasattr(model.__class__, "_layerwise_offload_blocks_attrs")
-        assert model.__class__._layerwise_offload_blocks_attrs == ["new_blocks"]
 
 
 class TestCrossGroupSharedBuffer:
@@ -2948,7 +2991,9 @@ class TestDistributedComponentSelection:
             assert registry is None or registry.get_hook("distributed_layerwise_offload") is None
             torch.testing.assert_close(block.weight, expected)
 
-    def test_multirank_enable_failure_cleanup_skips_restore_collective(self, monkeypatch, mocker):
+    def test_multirank_enable_failure_cleanup_skips_restore_collective(
+        self, monkeypatch, mocker, patched_offload_runtime
+    ):
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,

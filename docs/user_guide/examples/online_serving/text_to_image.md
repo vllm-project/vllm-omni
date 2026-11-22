@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_image>.
 
-
 This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
 
 ## Start Server
@@ -12,6 +11,7 @@ This example demonstrates how to deploy Qwen-Image model for online image genera
 ```bash
 vllm serve Qwen/Qwen-Image --omni --port 8091
 ```
+
 !!! note
     If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
 
@@ -112,7 +112,10 @@ python openai_chat_client.py --prompt "A beautiful landscape painting" --output 
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.34 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 ```bash
 python gradio_demo.py
@@ -166,7 +169,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
 
 LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
@@ -216,7 +219,7 @@ Wrap generation parameters inside `extra_body` in the request JSON:
     ```
 
     For details on how generation parameters are handled across different clients, see the
-    [Chat Completions API guide](../../../../serving/chat_completions_api.md).
+    [Chat Completions API guide](../../../serving/chat_completions_api.md).
 
 ### Multimodal Input (Text + Structured Content)
 
@@ -237,8 +240,8 @@ Wrap generation parameters inside `extra_body` in the request JSON:
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
 JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
-[Chat Completions API guide](../../../../serving/chat_completions_api.md)).
-When using the dedicated [`/v1/images/generations`](../../../../serving/image_generation_api.md)
+[Chat Completions API guide](../../../serving/chat_completions_api.md)).
+When using the dedicated [`/v1/images/generations`](../../../serving/image_generation_api.md)
 endpoint, pass the supported generation controls as top-level JSON fields
 directly. For image dimensions and count, use `size` and `n` rather than
 `height`, `width`, or `num_outputs_per_prompt`.
