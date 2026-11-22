@@ -86,11 +86,9 @@ token for the rank's head group, so the frame unit is the same as on one GPU. Ul
 weight copy per GPU and replaces TP's per-layer all-reduces with all-to-alls.
 
 The supplied YAML leaves `devices` unset, so the stage inherits `CUDA_VISIBLE_DEVICES`.
-Choose `--tensor-parallel-size` and/or `--ulysses-degree` in the offline runner and expose at least
-TP x Ulysses GPUs; no deployment copy or checkpoint reconversion is needed. The runner defaults to
-TP1. See the [launch settings](../../examples/offline_inference/cosmos3_nano_sim_auto/README.md)
-for examples. Smaller TP sizes increase memory required per GPU; memory fit and GPU inference
-parity remain unvalidated on the target hardware.
+Pass `tensor_parallel_size` and `ulysses_degree` to `Omni` and expose at least TP x Ulysses GPUs.
+Smaller TP sizes increase memory required per GPU. Memory fit and GPU inference parity remain
+unvalidated on the target hardware.
 
 ## Requests
 
@@ -98,18 +96,118 @@ Requests follow the Cosmos3 multiview contract: `multiview.views[*]` with `camer
 `control_path` (WSM) and optional `vision_path` (first frame), top-level `wsm: {}`, `num_frames`
 (`4k+1`), `fps`, `resolution`; joint requests add `lidar.control_path` (`.safetensors`,
 `frames` `[3,T,128,1800]`), optional `lidar.condition_path` with `num_conditional_sweeps: 1`, and
-`return_output: true`. Prepare them from the reference JSONL with
-`cosmos3.scripts.prepare_multiview_lidar --rolling --num-views 7 --num-frames 297 --fps 30 --seed 0`;
-the first caption span is held for the horizon, controls are cut to its source window so the
-server's last-frame padding matches the reference, student-ignored sampling fields are dropped,
-and every request gets the same seed (the reference applies `--seed` unchanged to every sample of
-an input file).
+`return_output: true`. The rolling preparation command below holds the first caption span for
+the horizon, cuts controls to its source window so last-frame padding matches the reference,
+and drops sampling fields the student ignores. Use the same seed for each request unless the
+input supplies one.
 
 Guidance must be 1.0 and `num_inference_steps` either unset or the student's step count. Joint
 inference requires `fps` equal to the artifact's clock (30). Camera subsets of the exported rig are
 accepted in request order.
 
-See the [offline runner](../../examples/offline_inference/cosmos3_nano_sim_auto/README.md).
+## Offline rollout and latent parity
+
+In the imaginaire4 checkout, prepare the RGB input with the command below. For joint inputs, use
+`wsm_lidar_transfer_i2v.jsonl` and a separate output directory.
+
+```bash
+PYTHONPATH="$PWD/packages/cosmos3:$PWD" python -m cosmos3.scripts.prepare_multiview_lidar \
+  packages/cosmos3/inputs/omni_multiview/wsm_transfer_i2v.jsonl \
+  --output /data/sim_auto_rgb --rolling --num-views 7 --num-frames 297 --fps 30 --seed 0
+```
+
+Save this snippet locally as `sim_auto_rollout.py`. It uses the offline `Omni` API and writes a
+numbered directory per input row. Use a fresh output directory for each run.
+
+```python
+import json
+import os
+import sys
+from pathlib import Path
+
+import torch
+from diffusers.utils import export_to_video
+
+from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
+
+
+def main():
+    model, manifest_path, output_path = sys.argv[1:]
+    manifest = Path(manifest_path).resolve()
+    contents = manifest.read_text()
+    lines = contents.splitlines() if manifest.suffix.lower() == ".jsonl" else [contents]
+    requests = [json.loads(line) for line in lines if line.strip()]
+    if not requests:
+        raise ValueError(f"No prepared requests in {manifest}")
+    output_dir = Path(output_path)
+    output_dir.mkdir(parents=True)
+    save_latents = os.environ.get("SAVE_LATENTS") == "1"
+    omni = Omni(
+        model=model,
+        tensor_parallel_size=int(os.environ.get("TP", "1")),
+        ulysses_degree=int(os.environ.get("ULYSSES", "1")),
+    )
+    try:
+        for index, request in enumerate(requests):
+            request = {**request.get("extra_params", {}), **request}
+            fields = ("multiview", "wsm", "lidar", "resolution", "aspect_ratio")
+            extra = {key: request[key] for key in fields if key in request}
+            for item in [*extra["multiview"]["views"], extra.get("lidar") or {}]:
+                for key in ("control_path", "vision_path", "condition_path", "control", "vision"):
+                    path = item.get(key)
+                    if isinstance(path, str) and "://" not in path:
+                        item[key] = str((manifest.parent / Path(path).expanduser()).resolve())
+            extra.update(session_id=f"offline-{index}", reset=True, close_session=True, return_latents=save_latents)
+            params = OmniDiffusionSamplingParams(
+                seed=int(request.get("seed", 0)),
+                num_frames=request.get("num_frames", 1),
+                fps=request.get("fps"),
+                extra_args=extra,
+            )
+            [result] = omni.generate({"prompt": request.get("prompt", ""), "modalities": ["video"]}, params)
+            [video] = result.images  # [1, cameras * frames_per_view, height, width, 3] in [0, 1]
+            payload = result.multimodal_output
+            metadata = payload["metadata"]
+            views = metadata["multiview"]
+            frames_per_view = views["frames_per_view"]
+            sample = output_dir / f"{index:04d}"
+            sample.mkdir()
+            for view, camera in enumerate(views["cameras"]):
+                start = view * frames_per_view
+                path = sample / f"vision_view{view:02d}_{Path(camera).name}.mp4"
+                export_to_video(list(video[0, start : start + frames_per_view]), str(path), fps=views["fps"])
+            if lidar_output_requested(extra):
+                data, _ = serialize_lidar_output(payload["lidar"], metadata["lidar"])
+                (sample / "lidar.safetensors").write_bytes(data)
+            if save_latents:
+                torch.save([result.latents], sample / "latents.pt")
+            summary = {"name": request.get("name"), "seed": params.seed, "metadata": metadata}
+            (sample / "sample_outputs.json").write_text(json.dumps(summary, indent=2) + "\n")
+    finally:
+        omni.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run with explicit GPU visibility. For Ulysses 4, replace `TP=4` with `ULYSSES=4`. For
+TP2 × Ulysses 2, set `TP=2 ULYSSES=2`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 TP=4 SAVE_LATENTS=1 python sim_auto_rollout.py \
+  /exports/cosmos3-nano-sim-auto /data/sim_auto_rgb/requests.jsonl outputs/sim_auto
+```
+
+Camera files follow the request order. When requested, `lidar.safetensors` stores the decoded
+`frames` tensor in `[3,T,128,1800]` order (range, intensity, validity). `SAVE_LATENTS=1` also
+writes the reference format, a one-element list containing `vision_latent` (`[1,C,V*T,h,w]`,
+camera-major) and, for joint requests, `lidar_latent` (`[1,C_l,S,h_l,w_l]`). Both keep their
+sampling dtype and observed condition prefix. Compare like-for-like RGB or joint runs with the
+same checkpoint, ordered cameras, inputs, horizon, and seed. Load either runner's latent file
+with `torch.load(path, map_location="cpu", weights_only=True)[0]`.
 
 ## Validation status
 
@@ -122,7 +220,7 @@ See the [offline runner](../../examples/offline_inference/cosmos3_nano_sim_auto/
 | Fixed-step SDE sampler seed arithmetic | validated (CPU tests) |
 | Exporter manifest contract (incl. `rig_view_embedding`) | CPU tests; actual checkpoint export/load pending |
 | Ulysses (2, 4): padded token shards, packed Q/K/V exchange, head-group control/ring/pool K/V vs one rank | validated (CPU Gloo tests) |
-| Transformer / pipeline on GPU, latent parity vs `--save-latents` goldens, TP4, Ulysses | not tested |
+| Transformer / pipeline on GPU, latent parity against the reference, TP4, Ulysses | not tested |
 | Tick sessions over the videos API | not implemented (phase 2) |
 
 The Sim-Auto tests do not require generated JSON reference fixtures. Reference comparisons

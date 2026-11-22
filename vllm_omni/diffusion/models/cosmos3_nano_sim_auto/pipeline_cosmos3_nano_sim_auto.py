@@ -121,7 +121,7 @@ def get_cosmos3_nano_sim_auto_post_process_func(od_config: OmniDiffusionConfig):
     def post_process(output: dict[str, Any], output_type: str = "np", sampling_params=None):
         processed = process_video(output, output_type=output_type, sampling_params=sampling_params)
         if (latents := output.get("payload", {}).get("latents")) is not None:
-            processed["payload"]["latents"] = latents
+            processed["payload"]["trajectory"] = {"latents": latents}
         return processed
 
     return post_process

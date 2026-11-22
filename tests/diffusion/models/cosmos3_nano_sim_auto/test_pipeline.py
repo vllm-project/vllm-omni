@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.cosmos3_nano_sim_auto import pipeline_cosmos3_nano_sim_auto as pipeline
 from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.geometry import SensorGrid, build_chunk_schedule
 from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.layout import build_chunk_items
@@ -14,6 +15,9 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.state_cosmos3_nano_sim_aut
     Cosmos3NanoSimAutoSessionState,
     DenseReplayRing,
 )
+from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -97,8 +101,8 @@ def test_dense_refresh_reads_previous_chunk_until_all_layers_finish() -> None:
 
 
 @pytest.mark.parametrize("joint", [False, True])
-def test_latents_are_opt_in_and_survive_postprocessing(monkeypatch, joint: bool) -> None:
-    rgb = torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 2, 2)
+def test_latents_are_opt_in_and_reach_offline_output(monkeypatch, joint: bool) -> None:
+    rgb = torch.arange(16, dtype=torch.bfloat16).reshape(1, 2, 2, 2, 2)
     lidar = rgb + 100 if joint else None
     state = Cosmos3NanoSimAutoSessionState(
         session_id="test",
@@ -111,18 +115,37 @@ def test_latents_are_opt_in_and_survive_postprocessing(monkeypatch, joint: bool)
         manifest=SimpleNamespace(frames_per_chunk=3, checkpoint_id="test"),
         _decode_latents=lambda value: torch.zeros(1, 3, value.shape[2], 2, 2),
     )
-    args = (host, state, {} if joint else None, [], "480", "16,9")
-    payload, metadata = pipeline.Cosmos3NanoSimAutoPipeline._build_payload(*args)
-    assert "latents" not in payload
-    payload, metadata = pipeline.Cosmos3NanoSimAutoPipeline._build_payload(*args, return_latents=True)
     # Generic multiview processing returns video/LiDAR only; the Sim-Auto wrapper retains latents.
     monkeypatch.setattr(
         pipeline,
         "get_cosmos3_multiview_post_process_func",
         lambda config: lambda output, **kwargs: {"payload": {"video": output["payload"]["video"]}},
     )
+    request = OmniDiffusionRequest(
+        prompt="Driving.",
+        sampling_params=OmniDiffusionSamplingParams(seed=0),
+        request_id="sim-auto-latents",
+    )
     process = pipeline.get_cosmos3_nano_sim_auto_post_process_func(None)
-    latents = process({"payload": payload, "metadata": metadata})["payload"]["latents"]
+
+    def format_rollout(return_latents: bool):
+        payload, metadata = pipeline.Cosmos3NanoSimAutoPipeline._build_payload(
+            host, state, {} if joint else None, [], "480", "16,9", return_latents=return_latents
+        )
+        output = DiffusionOutput(output={"payload": payload, "metadata": metadata})
+        processed = process(output.output)
+        [result] = format_diffusion_outputs(
+            request=request,
+            od_config=SimpleNamespace(model_class_name="Cosmos3NanoSimAutoPipeline"),
+            diffusion_output=output,
+            output_data=processed,
+            postprocess_output=normalize_diffusion_postprocess_output(processed),
+        )
+        assert result.final_output_type == "video" and len(result.images) == 1
+        return result.latents
+
+    assert format_rollout(False) is None
+    latents = format_rollout(True)
     torch.testing.assert_close(latents["vision_latent"], rgb, rtol=0, atol=0)
     assert latents["vision_latent"].device.type == "cpu"
     if joint:
