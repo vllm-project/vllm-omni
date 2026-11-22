@@ -376,16 +376,26 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
             view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
             if guardrails_enabled:
                 view = check_video_safety(view)
+            if output_type == "np":
+                # Denormalize through the processor but skip its float32
+                # intermediate, stack and merge copies: one fused cast+permute
+                # writes [F, C, H, W] straight into the [F, H, W, C] output.
+                view = video_processor.postprocess_video(view, output_type="pt")[0]
+                if processed_video is None:
+                    output_shape = (1, video.shape[2], *view.shape[2:], view.shape[1])
+                    processed_video = np.empty(output_shape, dtype=np.float32)
+                torch.from_numpy(processed_video[0, frame_start : frame_start + frames_per_view]).copy_(
+                    view.permute(0, 2, 3, 1)
+                )
+                del view
+                continue
             processed_view = video_processor.postprocess_video(view, output_type=output_type)
             if processed_video is None:
                 if output_type == "pil":
                     processed_video = [[]]
                 else:
                     output_shape = (1, video.shape[2], *processed_view.shape[2:])
-                    if output_type == "np":
-                        processed_video = np.empty(output_shape, dtype=processed_view.dtype)
-                    else:
-                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
+                    processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
             if output_type == "pil":
                 processed_video[0].extend(processed_view[0])
             else:
