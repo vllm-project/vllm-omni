@@ -29,7 +29,7 @@ from .multiview_maskless_plan import (
     META_GEN_TOKENS,
     META_IDENTITY_K,
     META_IDENTITY_Q,
-    META_KEYS_FROM_UND,
+    META_KEY_STREAM,
     META_MAX_SEQLEN_K,
     META_MAX_SEQLEN_Q,
     TENSORS_PER_PASS,
@@ -200,18 +200,25 @@ def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, t
 
 def _maskless_attention_impl(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_und: torch.Tensor,
-    v_und: torch.Tensor,
+    key_streams: list[torch.Tensor],
+    value_streams: list[torch.Tensor],
     plan: list[torch.Tensor],
     num_passes: int,
     kernel_name: str,
 ) -> torch.Tensor:
+    """Run the planned passes over ``q[0]`` and merge them.
+
+    ``key_streams[i]``/``value_streams[i]`` are packed ``[tokens, H_kv, D]``
+    tensors; each pass's ``META_KEY_STREAM`` selects the stream it gathers keys
+    from. The bidirectional multiview op passes ``[GEN, UND]``; causal variants
+    append further streams such as retained KV history.
+    """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("Maskless multiview attention requires B == 1.")
     if num_passes <= 0 or len(plan) != num_passes * TENSORS_PER_PASS:
         raise ValueError(f"Maskless plan carries {len(plan)} tensors for {num_passes} passes.")
+    if not key_streams or len(key_streams) != len(value_streams):
+        raise ValueError("Maskless attention needs matching non-empty key and value stream lists.")
     first_meta = plan[TENSORS_PER_PASS - 1]
     planned_tokens = int(first_meta[META_GEN_TOKENS])
     if q.shape[1] != planned_tokens or plan[0].numel() != planned_tokens:
@@ -219,13 +226,15 @@ def _maskless_attention_impl(
             "Cosmos3 maskless packed GEN length does not match the request plan: "
             f"attention={q.shape[1]}, plan={planned_tokens}."
         )
-    if k.shape != v.shape or k_und.shape != v_und.shape or k.shape[:2] != q.shape[:2]:
-        raise ValueError("Maskless Q/K/V geometry mismatch.")
-    if k_und.shape[0] != 1 or k_und.shape[2:] != k.shape[2:] or q.shape[-1] != k.shape[-1]:
-        raise ValueError("Maskless GEN/UND head geometry mismatch.")
-    if q.shape[2] % k.shape[2]:
-        raise ValueError("Maskless attention requires an integral GQA ratio.")
     heads, head_dim = q.shape[2], q.shape[3]
+    kv_heads = key_streams[0].shape[1] if key_streams[0].ndim == 3 else -1
+    for stream_keys, stream_values in zip(key_streams, value_streams, strict=True):
+        if stream_keys.ndim != 3 or stream_keys.shape != stream_values.shape:
+            raise ValueError("Maskless key/value streams must be matching [tokens, H_kv, D] tensors.")
+        if stream_keys.shape[1] != kv_heads or stream_keys.shape[2] != head_dim:
+            raise ValueError("Maskless key streams must share the query head size and one KV head count.")
+    if kv_heads <= 0 or heads % kv_heads:
+        raise ValueError("Maskless attention requires an integral GQA ratio.")
     kernel = get_pass_kernel(kernel_name)
     merge = _merge_step_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
@@ -241,12 +250,14 @@ def _maskless_attention_impl(
             ]
             meta_values = meta.tolist()
             max_seqlen_q, max_seqlen_k = int(meta_values[META_MAX_SEQLEN_Q]), int(meta_values[META_MAX_SEQLEN_K])
-            keys_from_und = bool(meta_values[META_KEYS_FROM_UND])
+            stream = int(meta_values[META_KEY_STREAM])
+            if not 0 <= stream < len(key_streams):
+                raise ValueError(f"Maskless pass addresses key stream {stream}, but {len(key_streams)} were given.")
             identity_q, identity_k = bool(meta_values[META_IDENTITY_Q]), bool(meta_values[META_IDENTITY_K])
             # Actual heads here are already partitioned by TP and Ulysses.
             validate_indexing([max_seqlen_q], heads, head_dim)
-            validate_indexing([max_seqlen_k], k.shape[2], head_dim)
-            keys, values = (k_und[0], v_und[0]) if keys_from_und else (k[0], v[0])
+            validate_indexing([max_seqlen_k], kv_heads, head_dim)
+            keys, values = key_streams[stream], value_streams[stream]
             queries = q[0] if identity_q else q[0].index_select(0, q_index)
             if not identity_k:
                 keys, values = keys.index_select(0, k_index), values.index_select(0, k_index)
@@ -315,14 +326,40 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_maskless_attention"):
         num_passes: int,
         kernel: str,
     ) -> torch.Tensor:
-        return _maskless_attention_impl(q, k, v, k_und, v_und, plan, num_passes, kernel)
+        if q.ndim != 4 or q.shape[0] != 1:
+            raise ValueError("Maskless multiview attention requires B == 1.")
+        if k.shape != v.shape or k_und.shape != v_und.shape or k.shape[:2] != q.shape[:2]:
+            raise ValueError("Maskless Q/K/V geometry mismatch.")
+        if k_und.shape[0] != 1 or k_und.shape[2:] != k.shape[2:] or q.shape[-1] != k.shape[-1]:
+            raise ValueError("Maskless GEN/UND head geometry mismatch.")
+        return _maskless_attention_impl(q, [k[0], k_und[0]], [v[0], v_und[0]], plan, num_passes, kernel)
 
     @_cosmos3_maskless_attention_op.register_fake
     def _(q, k, v, k_und, v_und, plan, num_passes, kernel):
         return torch.empty_like(q)
 
 
+if not hasattr(torch.ops.vllm_omni, "cosmos3_maskless_attention_streams"):
+
+    @torch.library.custom_op("vllm_omni::cosmos3_maskless_attention_streams", mutates_args=())
+    def _cosmos3_maskless_attention_streams_op(
+        q: torch.Tensor,
+        key_streams: list[torch.Tensor],
+        value_streams: list[torch.Tensor],
+        plan: list[torch.Tensor],
+        num_passes: int,
+        kernel: str,
+    ) -> torch.Tensor:
+        """Generalized executor: ``META_KEY_STREAM`` selects among packed ``[tokens, H_kv, D]`` streams."""
+        return _maskless_attention_impl(q, list(key_streams), list(value_streams), plan, num_passes, kernel)
+
+    @_cosmos3_maskless_attention_streams_op.register_fake
+    def _(q, key_streams, value_streams, plan, num_passes, kernel):
+        return torch.empty_like(q)
+
+
 _cosmos3_maskless_attention_op = torch.ops.vllm_omni.cosmos3_maskless_attention
+maskless_attention_streams = torch.ops.vllm_omni.cosmos3_maskless_attention_streams
 
 
 @dataclass(frozen=True, eq=False)

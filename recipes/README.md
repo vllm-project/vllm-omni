@@ -77,6 +77,7 @@ recipes/
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
+| [`cosmos3/Cosmos3-Nano-Sim-Auto.md`](./cosmos3/Cosmos3-Nano-Sim-Auto.md) | Causal rolling multiview RGB WSM transfer and joint RGB + LiDAR rollouts | 4x GB200 (TP4), reference parity pending |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |
 | [`cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md`](./cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md) | Up-to-11-camera AV video generation (T2V / I2V / WSM transfer / view completion), optional joint numeric LiDAR | 1x / 2x (CFG) GB200 186GB, strict Ulysses CP; TP/HSDP configuration-only |

@@ -141,6 +141,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multiview_reference_inputs=True,
         final_output_type="video",
     ),
+    "Cosmos3NanoSimAutoPipeline": DiffusionModelMetadata(
+        supports_multiview_reference_inputs=True,
+        final_output_type="video",
+    ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaWmPipeline": DiffusionModelMetadata(

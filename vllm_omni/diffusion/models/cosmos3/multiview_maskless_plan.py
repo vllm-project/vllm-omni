@@ -45,8 +45,12 @@ from .multiview_flex_attention import (
 TENSORS_PER_PASS = 5
 #: ``meta`` is a CPU int64 vector so the attention op reads host integers
 #: without a device synchronization and Dynamo never guards on prompt lengths.
-META_MAX_SEQLEN_Q, META_MAX_SEQLEN_K, META_KEYS_FROM_UND, META_IDENTITY_Q, META_IDENTITY_K, META_GEN_TOKENS = range(6)
+META_MAX_SEQLEN_Q, META_MAX_SEQLEN_K, META_KEY_STREAM, META_IDENTITY_Q, META_IDENTITY_K, META_GEN_TOKENS = range(6)
 META_SIZE = 6
+#: ``META_KEY_STREAM`` indexes the executor's key-stream list. The bidirectional
+#: multiview plan passes ``[GEN, UND]``, so stream 1 is "keys from UND"; causal
+#: variants add further streams (for example retained KV history).
+META_KEYS_FROM_UND = META_KEY_STREAM
 _INT32_LIMIT = 2**31
 
 Segment = tuple[tuple[int, ...], tuple[int, ...]]
