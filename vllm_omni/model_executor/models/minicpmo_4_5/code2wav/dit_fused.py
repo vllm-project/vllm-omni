@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .ops import qkv_head_layer_norm, residual_layer_norm
+from ..ops import qkv_head_layer_norm, residual_layer_norm
 
 # adaLN chunk order of ``DiTBlock.adaLN_modulation``.
 _SHIFT_MSA, _SCALE_MSA, _GATE_MSA, _SHIFT_MLP, _SCALE_MLP, _GATE_MLP, _SHIFT_CONV, _SCALE_CONV, _GATE_CONV = range(9)
@@ -134,7 +134,7 @@ def _mlp(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
 
 @functools.cache
 def tiled_attention_supported(device_index: int) -> bool:
-    """``cfm_attention`` TF32 dots need NVIDIA tensor cores (SM80+)."""
+    """Use tiled FP32/FP16 attention on NVIDIA tensor cores (SM80+)."""
     return torch.version.hip is None and torch.cuda.get_device_capability(device_index) >= (8, 0)
 
 
@@ -172,7 +172,10 @@ def _attention(
     )
     keys, values = kv[0], kv[1]
     if rows is not None or (
-        kv.is_cuda and kv.dtype == q.dtype == torch.float32 and tiled_attention_supported(kv.get_device())
+        kv.is_cuda
+        and kv.dtype == q.dtype
+        and kv.dtype in (torch.float32, torch.float16)
+        and tiled_attention_supported(kv.get_device())
     ):
         from .cfm_attention import cfm_attention
 

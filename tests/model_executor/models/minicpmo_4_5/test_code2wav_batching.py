@@ -13,18 +13,18 @@ import pytest
 import torch
 import torch.nn as nn
 
-import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav as token2wav_module
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
+    AttSlotPool,
+    WholeEulerExecutionArena,
+    _pack_att_cache,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2Wav,
     PromptFeatures,
     _token2wav_sdpa_context,
     plan_token2wav_encode_slices,
     relpos_encode_token_budget,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
-    AttSlotPool,
-    WholeEulerExecutionArena,
-    _pack_att_cache,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -1017,13 +1017,19 @@ def test_ragged_diffusion_batches_eight_rows_and_preserves_exact_results():
 
 def test_npu_patch_preserves_ragged_estimator_contract():
     script = r"""
+import sys
+
 import torch
+
+# Model import and NPU patching must work without loading vocoder assets.
+core_module = "vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav"
+sys.modules[core_module] = None
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
     _FakeToken2Wav,
     _enable_fake_ragged_kernel,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 import vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav as npu_patch
 
 
@@ -1033,6 +1039,7 @@ class _FailGraphRunner:
 
 
 npu_patch.apply_minicpmo_4_5_code2wav_patch()
+del sys.modules[core_module]
 adapter = BatchedToken2Wav(_FakeToken2Wav())
 _enable_fake_ragged_kernel(adapter)
 prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
@@ -1069,7 +1076,7 @@ def test_decode_cfm_enters_platform_sdpa_context(monkeypatch):
         entered.append("exit")
 
     monkeypatch.setattr(
-        batched_token2wav_module,
+        token2wav_module,
         "_token2wav_sdpa_context",
         lambda _device: recording_context(),
     )
@@ -1592,8 +1599,9 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     assert token2wav.flow.decoder.estimator.attention_cache_dtypes[-2:] == [torch.float32, torch.float32]
 
 
-def test_bfloat16_estimator_attention_cache_materializes_each_timestep():
-    adapter = BatchedToken2Wav(_FakeToken2Wav(), bfloat16_attention_cache=True)
+@pytest.mark.parametrize("options,dtype", [({}, torch.float32), ({"bfloat16_attention_cache": True}, torch.bfloat16)])
+def test_estimator_attention_cache_materializes_each_timestep(options, dtype):
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), **options)
 
     _, estimator_cnn, estimator_att = adapter._decode_cfm(
         torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
@@ -1604,24 +1612,7 @@ def test_bfloat16_estimator_attention_cache_materializes_each_timestep():
     )
 
     assert estimator_cnn.dtype == torch.float32
-    assert estimator_att.dtype == torch.bfloat16
-    # ``(n_t, depth, 2, rows, heads, frames, head_dim)`` on the split layout.
-    assert estimator_att.shape[:4] == (2, 1, 2, 4)
-
-
-def test_float32_estimator_attention_cache_materializes_each_timestep():
-    adapter = BatchedToken2Wav(_FakeToken2Wav())
-
-    _, estimator_cnn, estimator_att = adapter._decode_cfm(
-        torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
-        torch.ones((2, 1)),
-        torch.zeros((2, 1, 2)),
-        cnn_cache=None,
-        att_cache=None,
-    )
-
-    assert estimator_cnn.dtype == torch.float32
-    assert estimator_att.dtype == torch.float32
+    assert estimator_att.dtype == dtype
     # ``(n_t, depth, 2, rows, heads, frames, head_dim)`` on the split layout.
     assert estimator_att.shape[:4] == (2, 1, 2, 4)
 
@@ -1814,15 +1805,8 @@ def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, mon
     second_model, _ = _model(runtime_prompt_cache_size=0)
     reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
 
-    def runtime_ref_info(request_id: str):
-        info = _info(request_id, 0, [10, 11])
-        info["codes"]["ref"] = reference
-        info["meta"]["ref_audio_sr"] = 16000
-        info["meta"].pop("prompt_cache_id")
-        return info
-
-    _forward(first_model, [runtime_ref_info("voice-a")], request_ids=["internal-a"])
-    _forward(second_model, [runtime_ref_info("voice-b")], request_ids=["internal-b"])
+    _forward(first_model, [_runtime_ref_info("voice-a", reference)], request_ids=["internal-a"])
+    _forward(second_model, [_runtime_ref_info("voice-b", reference)], request_ids=["internal-b"])
 
     first_key = first_model._request_prompt_keys["internal-a"]
     second_key = second_model._request_prompt_keys["internal-b"]
@@ -2224,7 +2208,7 @@ def _padded_decode_adapter(bucket_frames: int) -> tuple[BatchedToken2Wav, int, i
 def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disable_during_setup, grouped):
     adapter, _, _ = _padded_decode_adapter(bucket_frames=16)
     adapter.flow.decoder.rand_noise = torch.randn(1, 1, 400)
-    prompt = batched_token2wav_module.PromptFeatures(
+    prompt = token2wav_module.PromptFeatures(
         cache_key=("voice", "voice.wav"),
         # The fake encoder consumes one of the three appended lookahead tokens.
         speech_tokens=torch.full((1, 298), 5, dtype=torch.long),
@@ -2609,7 +2593,7 @@ def test_decode_replays_encoder_graph_in_capture_autocast(monkeypatch, ragged, a
 
 @pytest.mark.parametrize("graph_hit", [True, False])
 def test_cfm_padding_mask_is_deferred_until_graph_fallback(monkeypatch, graph_hit):
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import _build_capture_mask
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import _build_capture_mask
 
     adapter = BatchedToken2Wav(_FakeToken2Wav())
     adapter._cfm_graph_bucket_frames = 4

@@ -337,6 +337,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
+                    priority=priority,
                     first_chunk_submitted=first_chunk_submitted,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
@@ -353,6 +354,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         arrival_time=wall_start_ts,
                         lora_request=lora_request,
                         trace_headers=trace_headers,
+                        priority=priority,
                         entry_stage_id=entry_stage_id,
                         **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                     ),
@@ -551,6 +553,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         arrival_time: float,
         lora_request: Any = None,
         trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
         first_chunk_submitted: asyncio.Future[None] | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
@@ -634,6 +637,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
                                 trace_headers=trace_headers,
+                                priority=priority,
                                 resumable=True,
                                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
@@ -697,6 +701,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
                                     trace_headers=trace_headers,
+                                    priority=priority,
                                     resumable=False,
                                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
