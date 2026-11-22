@@ -95,7 +95,7 @@ class StageRequestStats:
     orchestrator_dispatch_wait_max_ms: float | None = None
     orchestrator_dispatch_batches: int | None = None
     # Bounded queue/inflight diagnostics captured when this stage finishes.
-    orchestrator_snapshot: dict[str, Any] | None = None
+    orchestrator_snapshot: dict[str, object] | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -283,9 +283,7 @@ def _apply_merged_stage_stats(template: StageRequestStats, merged: dict[str, obj
     pipeline_timings = merged.get("pipeline_timings")
     stats.pipeline_timings = dict(pipeline_timings) if isinstance(pipeline_timings, dict) else None
     orchestrator_snapshot = merged.get(defs.ORCHESTRATOR_SNAPSHOT)
-    stats.orchestrator_snapshot = (
-        copy.deepcopy(orchestrator_snapshot) if isinstance(orchestrator_snapshot, dict) else None
-    )
+    stats.orchestrator_snapshot = dict(orchestrator_snapshot) if isinstance(orchestrator_snapshot, dict) else None
     return stats
 
 
@@ -708,7 +706,7 @@ class OrchestratorAggregator:
             if evt.orchestrator_dispatch_batches is not None:
                 current[defs.ORCHESTRATOR_DISPATCH_BATCHES] = int(evt.orchestrator_dispatch_batches)
             if evt.orchestrator_snapshot is not None:
-                current[defs.ORCHESTRATOR_SNAPSHOT] = copy.deepcopy(evt.orchestrator_snapshot)
+                current[defs.ORCHESTRATOR_SNAPSHOT] = dict(evt.orchestrator_snapshot)
             return current
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
@@ -800,7 +798,7 @@ class OrchestratorAggregator:
                 evt.orchestrator_dispatch_batches
             )
         if evt.orchestrator_snapshot is not None:
-            current[defs.ORCHESTRATOR_SNAPSHOT] = copy.deepcopy(evt.orchestrator_snapshot)
+            current[defs.ORCHESTRATOR_SNAPSHOT] = dict(evt.orchestrator_snapshot)
 
         output_count = int(current.get(defs.OUTPUT_UNIT_COUNT, 0))
         remaining_ms = max(

@@ -58,6 +58,7 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
+from vllm_omni.engine.orchestrator_monitor import OrchestratorMonitorBase
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -1607,8 +1608,14 @@ async def test_async_chunk_raw_terminal_without_processed_output_finishes_reques
         assert output_msg.engine_outputs.finished is True
         assert output_msg.engine_outputs.outputs[0].multimodal_output["audio"].numel() == 0
         assert output_msg.metrics is not None
-        assert output_msg.metrics.orchestrator_dispatch_batches == 1
-        assert output_msg.metrics.orchestrator_dispatch_wait_ms >= 0.0
+        if orchestrator_fixture.orchestrator._event_driven_orch:
+            assert output_msg.metrics.orchestrator_dispatch_batches == 1
+            assert output_msg.metrics.orchestrator_dispatch_wait_ms >= 0.0
+            assert output_msg.metrics.orchestrator_dispatch_wait_max_ms >= 0.0
+        else:
+            assert output_msg.metrics.orchestrator_dispatch_batches is None
+            assert output_msg.metrics.orchestrator_dispatch_wait_ms is None
+            assert output_msg.metrics.orchestrator_dispatch_wait_max_ms is None
         await _wait_for(lambda: request.request_id not in orchestrator_fixture.orchestrator.request_states)
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -3149,7 +3156,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
 
 @pytest.mark.asyncio
-async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
+async def test_resumable_segment_boundary_builds_stage_metrics(mocker: MockerFixture) -> None:
     built_metrics = SimpleNamespace(pipeline_timings={}, scheduler_queue_wait_ms=None)
 
     class RecordingPool:
@@ -3172,7 +3179,9 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-stream": req_state}
     orchestrator.stage_pools = [pool]
-    orchestrator._orch_monitor = SimpleNamespace(snapshot=lambda: {"dispatch_queue_high_water": 4})
+    monitor = mocker.Mock(spec=OrchestratorMonitorBase)
+    monitor.snapshot.return_value = {"dispatch_queue_high_water": 4}
+    orchestrator._orch_monitor = monitor
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -3190,6 +3199,7 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     assert built_metrics.orchestrator_dispatch_wait_max_ms == pytest.approx(2.5)
     assert built_metrics.orchestrator_dispatch_batches == 1
     assert built_metrics.orchestrator_snapshot == {"dispatch_queue_high_water": 4}
+    monitor.snapshot.assert_called_once_with()
     assert req_state.dispatch_wait_total_ms == {}
     assert req_state.dispatch_wait_max_ms == {}
     assert req_state.dispatch_batches == {}

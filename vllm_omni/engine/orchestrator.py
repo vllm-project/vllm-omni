@@ -1104,7 +1104,7 @@ class OrchestratorBase:
     def _record_dispatch_residence(
         self,
         stage_id: int,
-        outputs: list[Any],
+        outputs: list[object],
         wait_ms: float,
         raw_terminal_request_ids: set[str] | None = None,
     ) -> None:
