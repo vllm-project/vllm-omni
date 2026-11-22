@@ -1549,6 +1549,10 @@ source_file_dependencies:
 
   diffusion_qwen_image_edit_weekly:
     - *qwen_image
+    - vllm_omni/config/
+    - vllm_omni/diffusion/cache/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/offloader/
     - tests/e2e/online_serving/test_qwen_image_edit.py
     - tests/e2e/online_serving/test_qwen_image_edit_expansion.py
     - tests/e2e/online_serving/test_qwen_image_layered.py
@@ -1563,6 +1567,8 @@ source_file_dependencies:
 
   diffusion_qwen_image_autoround_weekly:
     - *qwen_image
+    - vllm_omni/config/
+    - vllm_omni/diffusion/offloader/
     - vllm_omni/diffusion/data.py
     - vllm_omni/diffusion/model_loader/
     - vllm_omni/diffusion/worker/

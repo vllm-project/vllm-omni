@@ -2481,6 +2481,10 @@ def test_qwen_image_weekly_jobs_are_exact_blocking_owners() -> None:
     dependency_paths = flatten_paths(dependencies["diffusion_qwen_image_edit_weekly"])
     assert {
         "vllm_omni/diffusion/models/qwen_image/",
+        "vllm_omni/config/",
+        "vllm_omni/diffusion/cache/",
+        "vllm_omni/diffusion/distributed/",
+        "vllm_omni/diffusion/offloader/",
         "tests/e2e/online_serving/test_qwen_image_edit.py",
         "tests/e2e/online_serving/test_qwen_image_edit_expansion.py",
         "tests/e2e/online_serving/test_qwen_image_layered.py",
@@ -2493,6 +2497,8 @@ def test_qwen_image_weekly_jobs_are_exact_blocking_owners() -> None:
     autoround_dependency_paths = flatten_paths(dependencies["diffusion_qwen_image_autoround_weekly"])
     assert {
         "vllm_omni/diffusion/models/qwen_image/",
+        "vllm_omni/config/",
+        "vllm_omni/diffusion/offloader/",
         "vllm_omni/diffusion/model_loader/",
         "vllm_omni/engine/stage_init_utils.py",
         "vllm_omni/quantization/",
