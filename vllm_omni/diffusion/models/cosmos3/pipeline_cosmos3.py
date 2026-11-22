@@ -706,8 +706,8 @@ def _cosmos3_media_output(
     """Use shared transport only for plain video with NumPy presentation.
 
     Guardrails and auxiliary outputs retain the existing model postprocessor.
-    Sampling output_type historically did not change Cosmos3 presentation, so
-    non-NumPy requests also stay on that path rather than changing their API.
+    Explicit tensor, PIL, and latent requests retain model postprocessing
+    so shared transport does not change their presentation.
     """
     from .guardrails import is_guardrails_enabled
 

@@ -188,3 +188,40 @@ def test_runner_bfloat16_video_conversion(runner) -> None:
     frames = runner._video_frames(torch.full((1, 3, 5, 32, 32), -1, dtype=torch.bfloat16))
     assert len(frames) == 5 and frames[0].shape == (32, 32, 3)
     assert np.count_nonzero(frames) == 0
+
+
+def test_frustum_pose_source_camera_request(runner):
+    poses = np.repeat(np.eye(4)[None], 5, axis=0)
+    params = {"frame_rate": 30, "num_frames": 5, "extra_args": {}}
+    runner._resolve_request_frustum({"pose_source": "camera_batch"}, params, None, "unused", poses)
+    assert params["extra_args"]["frustum_geometry"] == {"c2w": poses.tolist(), "fps": 30}
+    with pytest.raises(ValueError, match="must not be overridden"):
+        runner._resolve_request_frustum({"pose_source": "camera_batch", "fps": 30}, params, None, "unused", poses)
+
+
+def test_frustum_pose_source_bundled_statistics(runner, tmp_path):
+    import hashlib
+    import math
+
+    stats = json.dumps({"global": {"q01": [-1.0] * 59, "q99": [1.0] * 59}}).encode()
+    (tmp_path / "stats.json").write_bytes(stats)
+    source = {"artifact_path": "stats.json", "sha256": hashlib.sha256(stats).hexdigest()}
+    schema = SimpleNamespace(schema_version=5, normalizer={"source": source})
+    artifact = SimpleNamespace(require_action_schema=lambda: schema, resolve_domain_name=lambda name: 15)
+    action = torch.zeros(4, 59)
+    action[:, 3] = action[:, 7] = torch.asinh(torch.tensor(1.0)) / math.asinh(1)
+    params = {
+        "frame_rate": 30,
+        "num_frames": 5,
+        "extra_args": {"action": action, "action_space": "normalized_unified_v1", "domain_name": "agibotworld"},
+    }
+    runner._resolve_request_frustum(
+        {"pose_source": "agibot_unified_v1_chunk16", "fps": 30}, params, artifact, str(tmp_path)
+    )
+    np.testing.assert_allclose(params["extra_args"]["frustum_geometry"]["c2w"], np.repeat(np.eye(4)[None], 5, axis=0))
+    assert params["extra_args"]["action"] is action
+    (tmp_path / "stats.json").write_bytes(stats + b" ")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        runner._resolve_request_frustum(
+            {"pose_source": "agibot_unified_v1_chunk16", "fps": 30}, params, artifact, str(tmp_path)
+        )

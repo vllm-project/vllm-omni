@@ -70,6 +70,56 @@ class ARDiffusionKVState:
         except KeyError as exc:
             raise KeyError(f"Unknown AR-Diffusion KV branch {kv_branch!r}; expected {self.kv_branch_names}") from exc
 
+    def gather_history_into(
+        self, kv_branch: str, positions: list[int], destination: list[tuple[torch.Tensor, torch.Tensor]], offset: int
+    ) -> None:
+        """Read exact committed token positions, excluding partial-page neighbors.
+
+        This explicit-selection path requires an un-compacted resident archive.
+        It changes neither allocation nor the request's committed position.
+        """
+        adapter = self.adapter(kv_branch)
+        if (
+            adapter.compacted_tokens
+            or positions != sorted(set(positions))
+            or any(type(p) is not int or p < 0 or p >= adapter.num_computed_tokens for p in positions)
+        ):
+            raise ValueError("Selected history requires ordered unique resident past token positions")
+        if len(destination) != self.num_layers or offset < 0:
+            raise ValueError("Invalid selected-history destination")
+        if not positions:
+            return
+        table = self.kv_cache.block_table(adapter)
+        if any(table[p // self.kv_cache.block_size] == self.kv_cache.null_block_id for p in positions):
+            raise ValueError("Selected history contains evicted tokens")
+        slots = compute_slot_mapping(table, positions, self.kv_cache.block_size).to(destination[0][0].device)
+        for layer, pair in enumerate(destination):
+            for pool, buffer in zip((self.kv_cache._k_pools[layer], self.kv_cache._v_pools[layer]), pair):
+                if offset + len(positions) > buffer.shape[1]:
+                    raise ValueError("Selected history exceeds staging capacity")
+                torch.index_select(pool, 0, slots, out=buffer[0, offset : offset + len(positions)])
+
+    def append_history(self, kv_branch: str, current: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        """Publish clean K/V produced by attention outside the paged kernel."""
+        adapter = self.adapter(kv_branch)
+        if self._paged_pending[kv_branch] is not None:
+            raise RuntimeError("Cannot append while a paged forward is pending")
+        size = self.kv_cache.spec.chunk_size
+        if len(current) != self.num_layers or not current or current[0][0].shape[1] % size:
+            raise ValueError("Archive commits must contain complete frames for every layer")
+        count = current[0][0].shape[1]
+        for pair in current:
+            if any(t.shape != current[0][0].shape for t in pair):
+                raise ValueError("Archive commit K/V shapes differ")
+        for begin in range(0, count, size):
+            self.kv_cache.allocate_chunk(adapter)
+            slots = self.kv_cache.chunk_write_slots(adapter).to(current[0][0].device)
+            for layer, pair in enumerate(current):
+                for pool, source in zip((self.kv_cache._k_pools[layer], self.kv_cache._v_pools[layer]), pair):
+                    pool.index_copy_(0, slots, source[0, begin : begin + size])
+            self.kv_cache.commit_chunk(adapter)
+            self._committed[kv_branch] += size
+
     def get_kv_caches(
         self,
         kv_branch: str,

@@ -97,7 +97,6 @@ def test_transformer_resolves_global_and_subcomponent_quant_configs(
     expected_gen: str | None,
 ) -> None:
     """Resolve pipeline-level defaults and Cosmos3 subcomponent overrides."""
-    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
     from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
@@ -122,7 +121,7 @@ def test_transformer_resolves_global_and_subcomponent_quant_configs(
             received.append(("gen_layers", quant_config))
 
     monkeypatch.setattr(Cosmos3VFMTransformer, "_language_model_cls", _StubLanguageModel)
-    monkeypatch.setattr(transformer_cosmos3, "Cosmos3GenDecoderLayer", _StubGenDecoderLayer)
+    monkeypatch.setattr(Cosmos3VFMTransformer, "_gen_layer_cls", _StubGenDecoderLayer)
 
     if config_kind == "flat":
         top_level_config = configs["transformer"]
