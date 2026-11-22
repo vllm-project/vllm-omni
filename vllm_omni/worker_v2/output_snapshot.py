@@ -6,10 +6,23 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
+
+
+@dataclass(frozen=True)
+class RequestOutputSnapshot:
+    """Already partitioned, CPU-owned payloads in the current request order.
+
+    Model finalizers may return this after D2H completes to avoid recursively
+    cloning and partitioning data whose request ownership is already known.
+    """
+
+    inter_stage: list[dict[str, Any] | None]
+    client: list[dict[str, Any] | None] | None = None
 
 
 class PackedOutputSnapshot(dict):

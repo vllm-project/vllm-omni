@@ -28,26 +28,51 @@ Deliberate differences from the reference, all inference-only:
 """
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-__all__ = ["AuKTransformer", "dit_state_dict", "sample_latents"]
+__all__ = ["AuKStepContext", "AuKTransformer", "build_time_grid", "dit_state_dict", "sample_latents"]
 
 
-def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """The single attention call site, so the backend can be swapped in one place.
 
-    ``q``/``k``/``v`` are ``[B, H, N, D]``. ``mask`` is a boolean key-padding
-    mask ``[B, K]`` in which ``True`` marks a valid key; it is broadcast to
-    ``[B, H, Q, K]`` only when given.
+    ``q``/``k``/``v`` are ``[B, H, N, D]``. ``bias`` is an additive key-padding
+    bias ``[B, 1, 1, K]`` (see :func:`_key_padding_bias`) or ``None``. Passing
+    it unexpanded lets SDPA broadcast it inside a fused kernel (cuDNN on
+    Hopper) instead of materializing a ``[B, H, Q, K]`` mask per layer.
     """
-    attn_mask = None
-    if mask is not None:
-        attn_mask = mask[:, None, None, :].expand(q.shape[0], q.shape[1], q.shape[-2], k.shape[-2])
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+    if bias is None or not q.is_cuda:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=bias, dropout_p=0.0, is_causal=False)
+    # With a bias, SDPA's default choice here is the memory-efficient kernel,
+    # about 3x slower than cuDNN's at these lengths on Hopper.
+    with sdpa_kernel(_MASKED_SDPA_PRIORITY, set_priority=True):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=bias, dropout_p=0.0, is_causal=False)
+
+
+_MASKED_SDPA_PRIORITY = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
+
+def _key_padding_bias(mask: torch.Tensor | None, dtype: torch.dtype) -> torch.Tensor | None:
+    """Additive attention bias ``[B, 1, 1, K]`` from a boolean key mask ``[B, K]``.
+
+    Valid keys add 0 and padded keys add ``-inf``, which is exactly what SDPA
+    does with a boolean mask internally.
+    """
+    if mask is None:
+        return None
+    bias = torch.zeros(mask.shape, dtype=dtype, device=mask.device).masked_fill(~mask, float("-inf"))
+    return bias[:, None, None, :]
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -57,12 +82,24 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
-def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Apply rotary frequencies ``[1, 1, N, D]`` to ``x`` ``[B, H, N, D]`` in fp32."""
+def _apply_rope_cos_sin(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate ``x`` ``[B, H, N, D]`` in fp32 with precomputed ``cos``/``sin`` of the frequencies."""
     out_dtype = x.dtype
     x32 = x.float()
-    out = x32 * freqs.cos() + _rotate_half(x32) * freqs.sin()
+    out = x32 * cos + _rotate_half(x32) * sin
     return out.to(out_dtype)
+
+
+def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Apply rotary frequencies ``[1, 1, N, D]`` to ``x`` ``[B, H, N, D]`` in fp32."""
+    return _apply_rope_cos_sin(x, freqs.cos(), freqs.sin())
+
+
+RopeCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def _rope_cos_sin(freqs: torch.Tensor) -> RopeCache:
+    return freqs.cos(), freqs.sin()
 
 
 class Rotary(nn.Module):
@@ -86,14 +123,17 @@ class Rotary(nn.Module):
         exponents = torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim
         return 1.0 / (self.base**exponents)
 
-    def forward(self, seq_len: int) -> torch.Tensor:
-        """Return frequencies ``[1, 1, seq_len, dim]`` for positions ``0..seq_len-1``."""
+    def forward(self, seq_len: int, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Return rotary frequencies, compressing positions across padding."""
         inv_freq = self.inv_freq
         if inv_freq.dtype != torch.float32:
             inv_freq = self._frequencies(inv_freq.device)
-        pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
-        freqs = torch.outer(pos, inv_freq)
-        return torch.stack((freqs, freqs), dim=-1).flatten(-2)[None, None]
+        if mask is None:
+            pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)[None]
+        else:
+            pos = (mask.to(torch.int32).cumsum(dim=1) - 1).clamp_min(0).to(torch.float32)
+        freqs = pos.unsqueeze(-1) * inv_freq
+        return torch.stack((freqs, freqs), dim=-1).flatten(-2).unsqueeze(1)
 
 
 class TimeEmbedding(nn.Module):
@@ -227,30 +267,48 @@ class Attention(nn.Module):
         packed: torch.Tensor,
         q_norm: nn.Module,
         k_norm: nn.Module,
-        rope: torch.Tensor | None,
+        rope: RopeCache | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split a packed QKV projection into heads, RMSNorm Q/K, then rotate."""
+        """Split a packed QKV projection into heads, RMSNorm Q/K, then rotate.
+
+        ``rope`` is the ``(cos, sin)`` pair of the rotary frequencies.
+        """
         q, k, v = (t.view(t.shape[0], -1, self.heads, self.dim_head).transpose(1, 2) for t in packed.chunk(3, dim=-1))
         q = q_norm(q)
         k = k_norm(k)
         if rope is not None:
-            q = _apply_rope(q, rope)
-            k = _apply_rope(k, rope)
+            q = _apply_rope_cos_sin(q, *rope)
+            k = _apply_rope_cos_sin(k, *rope)
         return q, k, v
 
-    def _project(self, x: torch.Tensor, rope: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _project(self, x: torch.Tensor, rope: RopeCache | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._qkv(self.to_qkv(x), self.q_norm, self.k_norm, rope)
 
     def forward(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None, rope: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        rope: RopeCache | None = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``bias`` is the precomputed key-padding bias for ``mask``; built here when absent."""
         q, k, v = self._project(x, rope)
-        attn_mask = mask if self.attn_mask_enabled else None
-        out = self._merge_heads(_sdpa(q, k, v, attn_mask).to(q.dtype))
+        if bias is None and self.attn_mask_enabled:
+            bias = _key_padding_bias(mask, q.dtype)
+        out = self._merge_heads(_sdpa(q, k, v, bias).to(q.dtype))
         out = self.to_out[0](out)
         if mask is not None:
             out = out.masked_fill(~mask.unsqueeze(-1), 0.0)
         return out
+
+
+def joint_key_mask(mask: torch.Tensor | None, c_mask: torch.Tensor | None, text_len: int) -> torch.Tensor | None:
+    """Key mask of joint attention over ``[audio | text]``; ``None`` when the audio has no mask."""
+    if mask is None:
+        return None
+    if c_mask is not None:
+        return torch.cat([mask, c_mask], dim=1)
+    return F.pad(mask, (0, text_len), value=True)
 
 
 class JointAttention(Attention):
@@ -264,7 +322,7 @@ class JointAttention(Attention):
         self.c_k_norm = nn.RMSNorm(dim_head, elementwise_affine=True)
         self.to_out_c = nn.Linear(inner_dim, context_dim)
 
-    def _project_context(self, c: torch.Tensor, c_rope: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
+    def _project_context(self, c: torch.Tensor, c_rope: RopeCache | None) -> tuple[torch.Tensor, ...]:
         return self._qkv(self.to_qkv_c(c), self.c_q_norm, self.c_k_norm, c_rope)
 
     def forward(  # type: ignore[override]  # joint attention takes the context stream too
@@ -272,10 +330,12 @@ class JointAttention(Attention):
         x: torch.Tensor,
         c: torch.Tensor,
         mask: torch.Tensor | None = None,
-        rope: torch.Tensor | None = None,
-        c_rope: torch.Tensor | None = None,
+        rope: RopeCache | None = None,
+        c_rope: RopeCache | None = None,
         c_mask: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``bias`` is the precomputed :func:`joint_key_mask` bias; built here when absent."""
         audio_len = x.shape[1]
         q, k, v = self._project(x, rope)
         c_q, c_k, c_v = self._project_context(c, c_rope)
@@ -284,14 +344,10 @@ class JointAttention(Attention):
         k = torch.cat([k, c_k], dim=2)
         v = torch.cat([v, c_v], dim=2)
 
-        joint_mask = None
-        if self.attn_mask_enabled and mask is not None:
-            if c_mask is not None:
-                joint_mask = torch.cat([mask, c_mask], dim=1)
-            else:
-                joint_mask = F.pad(mask, (0, c.shape[1]), value=True)
+        if bias is None and self.attn_mask_enabled:
+            bias = _key_padding_bias(joint_key_mask(mask, c_mask, c.shape[1]), q.dtype)
 
-        out = self._merge_heads(_sdpa(q, k, v, joint_mask).to(q.dtype))
+        out = self._merge_heads(_sdpa(q, k, v, bias).to(q.dtype))
         x_out = self.to_out[0](out[:, :audio_len])
         c_out = self.to_out_c(out[:, audio_len:])
 
@@ -323,14 +379,15 @@ class DoubleBlock(nn.Module):
         c: torch.Tensor,
         t: torch.Tensor,
         mask: torch.Tensor | None,
-        rope: torch.Tensor,
-        c_rope: torch.Tensor,
+        rope: RopeCache,
+        c_rope: RopeCache,
         c_mask: torch.Tensor | None,
+        bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         norm_c, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.attn_norm_c(c, t)
         norm_x, x_gate_msa, x_shift_mlp, x_scale_mlp, x_gate_mlp = self.attn_norm_x(x, t)
 
-        x_attn, c_attn = self.attn(x=norm_x, c=norm_c, mask=mask, rope=rope, c_rope=c_rope, c_mask=c_mask)
+        x_attn, c_attn = self.attn(x=norm_x, c=norm_c, mask=mask, rope=rope, c_rope=c_rope, c_mask=c_mask, bias=bias)
 
         c = c + c_gate_msa[:, None] * c_attn
         norm_c = self.ff_norm_c(c) * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
@@ -352,15 +409,25 @@ class SingleBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, mask: torch.Tensor | None, rope: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        mask: torch.Tensor | None,
+        rope: RopeCache,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
-        x = x + gate_msa[:, None] * self.attn(x=norm, mask=mask, rope=rope)
+        x = x + gate_msa[:, None] * self.attn(x=norm, mask=mask, rope=rope, bias=bias)
         norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         return x + gate_mlp[:, None] * self.ff(norm)
 
 
 class AuKTransformer(nn.Module):
     """Flow-matching velocity predictor for AuK audio latents.
+
+    The forward pass is :meth:`prepare` (per request) followed by
+    :meth:`step` (per timestep); an Euler loop calls the two separately.
 
     Args:
         dim: Model width.
@@ -375,6 +442,9 @@ class AuKTransformer(nn.Module):
             attention runs unmasked, though padded outputs are still zeroed,
             which is what the reference does with the flag off.
     """
+
+    # Regional torch.compile targets (see vllm_omni.diffusion.compile).
+    _repeated_blocks = ["DoubleBlock", "SingleBlock"]
 
     def __init__(
         self,
@@ -392,6 +462,7 @@ class AuKTransformer(nn.Module):
         super().__init__()
         self.dim = dim
         self.latent_dim = latent_dim
+        self.attn_mask_enabled = attn_mask_enabled
         self.text_cond: torch.Tensor | None = None
         self.text_uncond: torch.Tensor | None = None
 
@@ -430,40 +501,134 @@ class AuKTransformer(nn.Module):
         self.text_cond = None
         self.text_uncond = None
 
-    def _embed_audio(
-        self,
-        x: torch.Tensor,
-        ref: torch.Tensor | None,
-        drop_audio_cond: bool,
-        mask: torch.Tensor | None,
-        ref_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
-        """Embed the target latents, prepending the reference prompt when present.
+    def _embed_prompt(self, ref: torch.Tensor, ref_mask: torch.Tensor | None, drop: bool) -> torch.Tensor:
+        """Embed the reference prompt, zeroed for the audio-dropped CFG branch."""
+        if drop:
+            ref = torch.zeros_like(ref)
+        return self.audio_embed(ref, mask=ref_mask)
 
-        Returns the ``[ref | target]`` sequence, its padding mask and the
-        reference length, which the caller uses to slice the target back out.
+    def prepare(
+        self,
+        text: torch.Tensor,
+        *,
+        target_len: int,
+        mask: torch.Tensor | None = None,
+        c_mask: torch.Tensor | None = None,
+        ref: torch.Tensor | None = None,
+        ref_mask: torch.Tensor | None = None,
+        drop_audio_cond: bool = False,
+        drop_text: bool = False,
+        cfg_infer: bool = False,
+        cache: bool = False,
+    ) -> "AuKStepContext":
+        """Everything a denoise step needs that does not depend on ``x`` or the time.
+
+        An Euler loop over fixed conditioning calls this once and then
+        :meth:`step` per timestep, so the text projection, the reference
+        prompt embedding, the padding masks and biases and the rotary tables
+        are not recomputed on every step. Arguments are those of
+        :meth:`forward`; ``target_len`` is the target frame count ``n``.
         """
+        batch = text.shape[0]
+        if c_mask is None:
+            # Padding rows are all-zero in the text encoder's output.
+            c_mask = text.abs().sum(-1) > 0
         if ref is not None and ref.shape[1] == 0:
             ref = None
 
-        target = self.audio_embed(x, mask=mask)
-        if ref is None:
-            return target, mask, 0
+        if cfg_infer:
+            if cache and self.text_cond is not None:
+                c_cond, c_uncond = self.text_cond, self.text_uncond
+            else:
+                c_cond = self.project_text(text)
+                # The uncond branch drops the text, which is exactly a zeroed projection.
+                c_uncond = torch.zeros_like(c_cond)
+                if cache:
+                    self.text_cond, self.text_uncond = c_cond, c_uncond
+            c = torch.cat((c_cond, c_uncond), dim=0)
+            prompt = None
+            if ref is not None:
+                prompt = torch.cat(
+                    (self._embed_prompt(ref, ref_mask, False), self._embed_prompt(ref, ref_mask, True)), dim=0
+                )
+        else:
+            c = self.project_text(text)
+            if drop_text:
+                c = torch.zeros_like(c)
+            prompt = None if ref is None else self._embed_prompt(ref, ref_mask, drop_audio_cond)
 
-        if drop_audio_cond:
-            ref = torch.zeros_like(ref)
-        prompt = self.audio_embed(ref, mask=ref_mask)
-        audio = torch.cat([prompt, target], dim=1)
-        prompt_len = prompt.shape[1]
-
-        audio_mask = None
-        if mask is not None or ref_mask is not None:
+        audio_mask = mask
+        if ref is not None and (mask is not None or ref_mask is not None):
             if mask is None:
-                mask = x.new_ones(x.shape[:2], dtype=torch.bool)
+                mask = torch.ones((batch, target_len), dtype=torch.bool, device=ref.device)
             if ref_mask is None:
-                ref_mask = ref.new_ones(ref.shape[:2], dtype=torch.bool)
+                ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=ref.device)
             audio_mask = torch.cat([ref_mask, mask], dim=1)
-        return audio, audio_mask, prompt_len
+
+        branches = 2 if cfg_infer else 1
+        if branches == 2:
+            c_mask = torch.cat((c_mask, c_mask), dim=0)
+            if audio_mask is not None:
+                audio_mask = torch.cat((audio_mask, audio_mask), dim=0)
+
+        prompt_len = 0 if prompt is None else prompt.shape[1]
+        text_len = c.shape[1]
+        audio_len = prompt_len + target_len
+        single_mask = None if audio_mask is None else torch.cat([c_mask, audio_mask], dim=1)
+        joint_bias = single_bias = None
+        if self.attn_mask_enabled:
+            joint_bias = _key_padding_bias(joint_key_mask(audio_mask, c_mask, text_len), c.dtype)
+            single_bias = _key_padding_bias(single_mask, c.dtype)
+
+        return AuKStepContext(
+            c=c,
+            prompt=prompt,
+            target_mask=mask,
+            c_mask=c_mask,
+            audio_mask=audio_mask,
+            single_mask=single_mask,
+            joint_bias=joint_bias,
+            single_bias=single_bias,
+            rope_audio=_rope_cos_sin(self.rotary_embed(audio_len, audio_mask)),
+            rope_text=_rope_cos_sin(self.rotary_embed(text_len, c_mask)),
+            rope_single=_rope_cos_sin(self.rotary_embed(text_len + audio_len, single_mask)),
+            branches=branches,
+        )
+
+    def step(self, x: torch.Tensor, time: torch.Tensor, ctx: "AuKStepContext") -> torch.Tensor:
+        """Predict the velocity of ``x`` at ``time`` under a :meth:`prepare` context.
+
+        The target embedding does not depend on the CFG branch, so it is
+        computed once and shared by both branches.
+        """
+        if time.ndim == 0:
+            time = time.repeat(x.shape[0])
+        t = self.time_embed(time)
+        target = self.audio_embed(x, mask=ctx.target_mask)
+        if ctx.branches == 2:
+            t = torch.cat((t, t), dim=0)
+            target = torch.cat((target, target), dim=0)
+        audio = target if ctx.prompt is None else torch.cat([ctx.prompt, target], dim=1)
+        c = ctx.c
+
+        for block in self.transformer_blocks:
+            c, audio = block(
+                audio,
+                c,
+                t,
+                mask=ctx.audio_mask,
+                rope=ctx.rope_audio,
+                c_rope=ctx.rope_text,
+                c_mask=ctx.c_mask,
+                bias=ctx.joint_bias,
+            )
+
+        h = torch.cat([c, audio], dim=1)
+        for block in self.single_transformer_blocks:
+            h = block(h, t, mask=ctx.single_mask, rope=ctx.rope_single, bias=ctx.single_bias)
+
+        h = h[:, h.shape[1] - x.shape[1] :]
+        return self.proj_out(self.norm_out(h, t))
 
     def forward(
         self,
@@ -505,57 +670,89 @@ class AuKTransformer(nn.Module):
             Velocity ``[B, n, latent_dim]``, or ``[2B, n, latent_dim]`` under
             ``cfg_infer``.
         """
-        batch = x.shape[0]
-        if time.ndim == 0:
-            time = time.repeat(batch)
-        t = self.time_embed(time)
+        ctx = self.prepare(
+            text,
+            target_len=x.shape[1],
+            mask=mask,
+            c_mask=c_mask,
+            ref=ref,
+            ref_mask=ref_mask,
+            drop_audio_cond=drop_audio_cond,
+            drop_text=drop_text,
+            cfg_infer=cfg_infer,
+            cache=cache and cfg_infer,
+        )
+        return self.step(x, time, ctx)
 
-        if c_mask is None:
-            # Padding rows are all-zero in the text encoder's output.
-            c_mask = text.abs().sum(-1) > 0
 
-        if cfg_infer:
-            if cache and self.text_cond is not None:
-                c_cond, c_uncond = self.text_cond, self.text_uncond
-            else:
-                c_cond = self.project_text(text)
-                # The uncond branch drops the text, which is exactly a zeroed projection.
-                c_uncond = torch.zeros_like(c_cond)
-                if cache:
-                    self.text_cond, self.text_uncond = c_cond, c_uncond
-            x_cond, mask_cond, prompt_len = self._embed_audio(x, ref, False, mask, ref_mask)
-            x_uncond, mask_uncond, _ = self._embed_audio(x, ref, True, mask, ref_mask)
+@dataclass
+class AuKStepContext:
+    """Per-request state of the denoise step, built by :meth:`AuKTransformer.prepare`.
 
-            x = torch.cat((x_cond, x_uncond), dim=0)
-            c = torch.cat((c_cond, c_uncond), dim=0)
-            t = torch.cat((t, t), dim=0)
-            c_mask = torch.cat((c_mask, c_mask), dim=0)
-            audio_mask = None
-            if mask_cond is not None and mask_uncond is not None:
-                audio_mask = torch.cat((mask_cond, mask_uncond), dim=0)
-        else:
-            c = self.project_text(text)
-            if drop_text:
-                c = torch.zeros_like(c)
-            x, audio_mask, prompt_len = self._embed_audio(x, ref, drop_audio_cond, mask, ref_mask)
+    Batch rows are ``branches`` copies of the request (cond first under CFG).
+    ``target_mask`` covers the target frames only and has the request's batch
+    size; the other masks cover their full sequences and every branch.
+    """
 
-        seq_len = x.shape[1]
-        text_len = c.shape[1]
-        rope_audio = self.rotary_embed(seq_len)
-        rope_text = self.rotary_embed(text_len)
+    c: torch.Tensor
+    prompt: torch.Tensor | None
+    target_mask: torch.Tensor | None
+    c_mask: torch.Tensor | None
+    audio_mask: torch.Tensor | None
+    single_mask: torch.Tensor | None
+    joint_bias: torch.Tensor | None
+    single_bias: torch.Tensor | None
+    rope_audio: RopeCache
+    rope_text: RopeCache
+    rope_single: RopeCache
+    branches: int
 
-        for block in self.transformer_blocks:
-            c, x = block(x, c, t, mask=audio_mask, rope=rope_audio, c_rope=rope_text, c_mask=c_mask)
+    def tensors(self) -> list[torch.Tensor | None]:
+        """Every tensor field in a fixed order, rope pairs flattened."""
+        return [
+            self.c,
+            self.prompt,
+            self.target_mask,
+            self.c_mask,
+            self.audio_mask,
+            self.single_mask,
+            self.joint_bias,
+            self.single_bias,
+            *self.rope_audio,
+            *self.rope_text,
+            *self.rope_single,
+        ]
 
-        x = torch.cat([c, x], dim=1)
-        rope = self.rotary_embed(text_len + seq_len)
-        single_mask = None if audio_mask is None else torch.cat([c_mask, audio_mask], dim=1)
+    def copy_(self, other: "AuKStepContext") -> None:
+        """Overwrite these tensors in place with ``other``'s, for CUDA graph static inputs."""
+        if other.branches != self.branches:
+            raise ValueError(f"AuK step context mismatch: {other.branches} vs {self.branches} branches")
+        for dst, src in zip(self.tensors(), other.tensors(), strict=True):
+            if (dst is None) != (src is None):
+                raise ValueError("AuK step context mismatch: a mask is present in only one context")
+            if dst is not None:
+                dst.copy_(src)
 
-        for block in self.single_transformer_blocks:
-            x = block(x, t, mask=single_mask, rope=rope)
+    def clone(self) -> "AuKStepContext":
+        """A copy whose tensors own fresh storage."""
 
-        x = x[:, text_len + prompt_len :]
-        return self.proj_out(self.norm_out(x, t))
+        def _clone(value: torch.Tensor | None) -> torch.Tensor | None:
+            return None if value is None else value.clone()
+
+        return AuKStepContext(
+            c=self.c.clone(),
+            prompt=_clone(self.prompt),
+            target_mask=_clone(self.target_mask),
+            c_mask=_clone(self.c_mask),
+            audio_mask=_clone(self.audio_mask),
+            single_mask=_clone(self.single_mask),
+            joint_bias=_clone(self.joint_bias),
+            single_bias=_clone(self.single_bias),
+            rope_audio=(self.rope_audio[0].clone(), self.rope_audio[1].clone()),
+            rope_text=(self.rope_text[0].clone(), self.rope_text[1].clone()),
+            rope_single=(self.rope_single[0].clone(), self.rope_single[1].clone()),
+            branches=self.branches,
+        )
 
 
 def dit_state_dict(
@@ -569,6 +766,31 @@ def dit_state_dict(
     """
     items = checkpoint.items() if isinstance(checkpoint, Mapping) else checkpoint
     return {name[len(prefix) :]: tensor for name, tensor in items if name.startswith(prefix)}
+
+
+def build_time_grid(
+    *,
+    nfe: int,
+    sway_sampling_coef: float | None,
+    t_grid: list[float] | None,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Build and validate the Euler schedule before a graph replay."""
+    if t_grid is not None:
+        timesteps = torch.tensor(t_grid, device="cpu", dtype=torch.float32)
+    else:
+        timesteps = torch.linspace(0, 1, nfe + 1, device="cpu", dtype=torch.float32)
+        if sway_sampling_coef is not None:
+            timesteps = timesteps + sway_sampling_coef * (torch.cos(math.pi / 2 * timesteps) - 1 + timesteps)
+    if (
+        timesteps.ndim != 1
+        or timesteps.numel() < 2
+        or not bool(torch.isfinite(timesteps).all() & torch.all(timesteps[1:] > timesteps[:-1]))
+    ):
+        raise ValueError(
+            f"AuK sampling needs a strictly increasing time grid with at least two points; got {timesteps.tolist()}"
+        )
+    return timesteps.to(device)
 
 
 @torch.no_grad()
@@ -589,6 +811,7 @@ def sample_latents(
     latent_dim: int | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
+    sampler: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Integrate the flow from noise to audio latents with explicit Euler steps.
 
@@ -640,36 +863,72 @@ def sample_latents(
             .unsqueeze(0)
         )
 
-    if t_grid is not None:
-        t = torch.tensor(t_grid, device=device, dtype=torch.float32)
-    else:
-        t = torch.linspace(0, 1, nfe + 1, device=device, dtype=torch.float32)
-        if sway_sampling_coef is not None:
-            t = t + sway_sampling_coef * (torch.cos(math.pi / 2 * t) - 1 + t)
-
-    guided = cfg_strength >= 1e-5
-    if t.numel() < 2 or not bool(torch.all(t[1:] > t[:-1])):
-        raise ValueError(
-            f"AuK sampling needs a strictly increasing time grid with at least two points; got {t.tolist()}"
-        )
-    try:
-        for i in range(t.shape[0] - 1):
-            if guided:
-                pred = dit(
-                    x,
-                    text,
-                    t[i],
+    t = build_time_grid(
+        nfe=nfe,
+        sway_sampling_coef=sway_sampling_coef,
+        t_grid=t_grid,
+        device=device,
+    )
+    if sampler is not None:
+        try:
+            for i in range(t.shape[0] - 1):
+                velocity = sampler(
+                    x=x,
+                    text=text,
                     c_mask=c_mask,
                     ref=ref,
                     ref_mask=ref_mask,
-                    cfg_infer=True,
-                    cache=True,
+                    timestep=t[i],
+                    cfg_strength=cfg_strength,
+                    new_request=i == 0,
                 )
-                v_cond, v_uncond = pred.chunk(2, dim=0)
+                x = x + (t[i + 1] - t[i]) * velocity
+        finally:
+            dit.clear_cache()
+        return x
+    return _sample_latents(
+        dit,
+        initial_latents=x,
+        text=text,
+        c_mask=c_mask,
+        ref=ref,
+        ref_mask=ref_mask,
+        timesteps=t,
+        cfg_strength=cfg_strength,
+    )
+
+
+def _sample_latents(
+    dit: AuKTransformer,
+    *,
+    initial_latents: torch.Tensor,
+    text: torch.Tensor,
+    c_mask: torch.Tensor | None,
+    ref: torch.Tensor,
+    ref_mask: torch.Tensor | None,
+    timesteps: torch.Tensor,
+    cfg_strength: float,
+) -> torch.Tensor:
+    """Euler integration shared by eager sampling and CUDA graph capture."""
+    x = initial_latents
+    guided = cfg_strength >= 1e-5
+    try:
+        # The conditioning is fixed across the loop: prepare it once.
+        ctx = dit.prepare(
+            text,
+            target_len=x.shape[1],
+            c_mask=c_mask,
+            ref=ref,
+            ref_mask=ref_mask,
+            cfg_infer=guided,
+            cache=guided,
+        )
+        for i in range(timesteps.shape[0] - 1):
+            v = dit.step(x, timesteps[i], ctx)
+            if guided:
+                v_cond, v_uncond = v.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength
-            else:
-                v = dit(x, text, t[i], c_mask=c_mask, ref=ref, ref_mask=ref_mask)
-            x = x + (t[i + 1] - t[i]) * v
+            x = x + (timesteps[i + 1] - timesteps[i]) * v
     finally:
         # The cached text projections belong to this request only; a failed
         # step must not leak them into the next one.

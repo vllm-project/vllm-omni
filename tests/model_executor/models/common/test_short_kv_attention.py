@@ -16,7 +16,7 @@ pytestmark = [
 @pytest.mark.parametrize("heads,kv_heads,dim", [(16, 8, 128), (8, 8, 64)])
 @pytest.mark.parametrize("positions", [[0, 1], [2], [8], [15]])
 def test_short_attention_causal_gqa_and_graph(batch, heads, kv_heads, dim, positions):
-    from vllm_omni.model_executor.models.qwen3_tts.short_kv_attention import short_kv_attention
+    from vllm_omni.model_executor.models.common.short_kv_attention import short_kv_attention
 
     with torch.inference_mode():
         torch.manual_seed(42)

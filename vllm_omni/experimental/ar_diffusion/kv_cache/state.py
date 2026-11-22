@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-facing session state backed by paged AR-Diffusion KV storage."""
 
 from __future__ import annotations
@@ -104,10 +105,11 @@ class ARDiffusionKVState:
         """
         cs = self.kv_cache.spec.chunk_size
         if frame_causal and (
-            not commit_current or seq_len <= 0 or cs != self.kv_cache.block_size or extra_visible_tokens != cs
+            not commit_current or seq_len <= 0 or cs % self.kv_cache.block_size != 0 or extra_visible_tokens != cs
         ):
             raise ValueError(
-                "Frame-causal clean refresh requires committing frame-sized blocks and exactly one extra visible frame"
+                "Frame-causal clean refresh requires committing block-aligned frames "
+                "and exactly one extra visible frame"
             )
         if int(seq_len) % cs != 0:
             raise AssertionError(
@@ -168,11 +170,16 @@ class ARDiffusionKVState:
                     # all old history. Sequential allocation preserves the
                     # manager's sink/window eviction and partial-chunk rules.
                     table = self.kv_cache.allocate_chunk(ctx.adapter)
-                    destination = table[ctx.adapter.num_computed_tokens // ctx.block_size]
-                    source = ctx.current_video_block_ids[frame]
-                    for layer in range(self.num_layers):
-                        self.kv_cache.key_cache(layer)[destination].copy_(self.kv_cache.key_cache(layer)[source])
-                        self.kv_cache.value_cache(layer)[destination].copy_(self.kv_cache.value_cache(layer)[source])
+                    blocks_per_frame = self.kv_cache.spec.chunk_size // ctx.block_size
+                    start = ctx.adapter.num_computed_tokens // ctx.block_size
+                    for block in range(blocks_per_frame):
+                        destination = table[start + block]
+                        source = ctx.current_video_block_ids[frame * blocks_per_frame + block]
+                        for layer in range(self.num_layers):
+                            self.kv_cache.key_cache(layer)[destination].copy_(self.kv_cache.key_cache(layer)[source])
+                            self.kv_cache.value_cache(layer)[destination].copy_(
+                                self.kv_cache.value_cache(layer)[source]
+                            )
                 self.kv_cache.commit_chunk(ctx.adapter)
             self._committed[kv_branch] += ctx.seq_len
             _log.debug(

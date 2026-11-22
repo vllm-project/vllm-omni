@@ -678,6 +678,8 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
             spatial_merge_size=self.get_hf_config().vision_config.spatial_merge_size,
             target_sr=feature_extractor.sampling_rate,
             target_channels=1,
+            # Retain PyAV for long-audio latency after vLLM 0.30 changed the default.
+            audio_resample_method="pyav",
             expected_hidden_size=self._get_expected_hidden_size(),
         )
 

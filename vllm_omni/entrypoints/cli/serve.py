@@ -561,6 +561,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--hsdp-weight-load-strategy",
+            choices=["full", "pre_sharded"],
+            default=None,
+            help=(
+                "HSDP checkpoint loading strategy: 'full' loads then shards; "
+                "'pre_sharded' shards meta parameters first and reads rank-local HF safetensors slices."
+            ),
+        )
+        omni_config_group.add_argument(
             "--lora-path",
             type=str,
             nargs="+",
@@ -791,7 +800,10 @@ class OmniServeCommand(CLISubcommand):
             type=_json_object,
             default=None,
             help=(
-                "JSON object configuring video output preparation, for example '{\"enable_device_postprocess\": true}'."
+                "JSON object configuring video output transport: enable_device_postprocess enables GPU preparation; "
+                "enable_registered_shm enables experimental CUDA-registered SHM for supported video outputs. "
+                "enable_borrowed_frames enables borrowed RGB frames in MP4 response encoding. "
+                "All default to false."
             ),
         )
         omni_config_group.add_argument(

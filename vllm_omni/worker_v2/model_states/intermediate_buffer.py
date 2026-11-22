@@ -79,6 +79,22 @@ class OmniIntermediateBuffer:
         if ai is not None:
             info.update(_resolve_additional_information(ai))
 
+        # Orchestrator stage bridges (e.g. MiniCPM-o's llm2tts) hand the
+        # request's runner payload over directly, like the V1 runner's
+        # ``_update_intermediate_buffer``: nested sections merge key by key.
+        mib = getattr(new_req_data, "model_intermediate_buffer", None)
+        if isinstance(mib, dict) and mib:
+            for key, value in mib.items():
+                if isinstance(value, dict):
+                    section = info.get(key)
+                    if not isinstance(section, dict):
+                        section = {}
+                        info[key] = section
+                    for qualifier, item in value.items():
+                        self._store_value(section, qualifier, item, set())
+                else:
+                    self._store_value(info, key, value, set())
+
         if new_req_data.mm_features:
             info["mm_features"] = new_req_data.mm_features
 

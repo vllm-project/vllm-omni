@@ -594,6 +594,40 @@ def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
     torch.testing.assert_close(frames[:3], ref_code[-3:])
 
 
+@pytest.mark.parametrize("tensor_frames", [False, True])
+def test_async_chunks_preserve_codebook_order_with_reference_and_short_tail(tensor_frames):
+    tm = _tm(left_context=3, initial_chunk_frames=1)
+    rid = "r-codebook-order"
+    quantizers = 16
+    reference = [[1500 + f * quantizers + q for q in range(quantizers)] for f in range(5)]
+    tm.request_payload[rid] = torch.tensor(reference, dtype=torch.long)
+    generated = [[1 + f * quantizers + q for q in range(quantizers)] for f in range(30)]
+
+    for start, end, finished in [(0, 1, False), (1, 26, False), (26, 30, True)]:
+        rows = generated[:end]
+        if tensor_frames:
+            # Non-contiguous int32 rows exercise conversion independently of
+            # the native producer's contiguous CPU-long representation.
+            storage = torch.tensor(rows, dtype=torch.int32).repeat_interleave(2, dim=1)
+            tm.code_prompt_token_ids[rid] = list(storage[:, ::2].unbind())
+        else:
+            tm.code_prompt_token_ids[rid] = rows
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output=None if finished else {},
+            request=_req(rid, finished=finished),
+            is_finished=finished,
+        )
+        assert payload is not None
+        expected = (reference[-3:] if start == 0 else []) + generated[start:end]
+        codes = payload.codes.audio
+        assert codes.dtype == torch.long and codes.device.type == "cpu" and codes.is_contiguous()
+        torch.testing.assert_close(codes.reshape(quantizers, -1).T, torch.tensor(expected))
+        assert payload.meta.left_context_size == (3 if start == 0 else 0)
+        assert payload.meta.finished.item() == finished
+        tm.put_req_chunk[rid] += 1
+
+
 def test_ref_code_context_can_be_buffered_before_first_emit():
     tm = _tm()
     rid = "r-ref-buffered"

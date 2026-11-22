@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig, extract_diffusion_stage_config_kwargs
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
+from vllm_omni.config.stage_config import build_stage_runtime_overrides
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -945,3 +946,33 @@ def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
     assert launched["model"] == "generic-diffusion"
     assert launched["stage_id"] == 0
     assert runtime.stage_pools[0].clients == [client]
+
+
+def test_default_stage_config_preserves_pre_sharded_hsdp_weight_load() -> None:
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"hsdp_weight_load_strategy": "pre_sharded"})[0]
+
+    assert stage_cfg["engine_args"]["hsdp_weight_load_strategy"] == "pre_sharded"
+
+
+@pytest.mark.parametrize("prefix", ["", "stage_0_"])
+def test_pre_sharded_hsdp_weight_load_survives_stage_overrides(prefix: str) -> None:
+    overrides = build_stage_runtime_overrides(0, {f"{prefix}hsdp_weight_load_strategy": "pre_sharded"})
+
+    assert overrides["hsdp_weight_load_strategy"] == "pre_sharded"
+
+
+@pytest.mark.parametrize("strategy", ["full", "pre_sharded"])
+def test_typed_default_stage_preserves_hsdp_weight_load_strategy(strategy: str) -> None:
+    config = StageConfigFactory.create_typed_default_diffusion(
+        "generic-diffusion", {"hsdp_weight_load_strategy": strategy}
+    )
+
+    assert config.stage_configs[0].diffusion_config.hsdp_weight_load_strategy == strategy
+
+
+@pytest.mark.parametrize("strategy", ["memory_limited", "invalid"])
+def test_removed_hsdp_loading_strategies_are_rejected(strategy):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    with pytest.raises(ValueError, match="hsdp_weight_load_strategy"):
+        OmniDiffusionConfig(hsdp_weight_load_strategy=strategy)

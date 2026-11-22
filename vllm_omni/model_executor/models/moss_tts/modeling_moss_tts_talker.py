@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
 )
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     MossTTSRealtimeLocalTransformer,
+    _normalize_generators,
 )
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import (
     MossTTSLocalDepthTransformer,
@@ -1355,6 +1356,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._stacked_audio_emb_w: torch.Tensor | None = None
         self.mtp_hidden_size = hidden_size
         self.talker_mtp_graph_safe = not current_omni_platform.is_npu()
+        self.talker_mtp_accepts_per_row_generators = True
         self.talker_mtp_output_key = ("audio_codes", "current")
         # ``make_omni_output`` keeps code rows fixed-shape and performs all
         # state updates eagerly, so the runner can safely pack/snapshot them
@@ -1621,9 +1623,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         generator: torch.Generator | None = None,
+        generators: list[torch.Generator | None] | None = None,
         **_: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = int(input_embeds.shape[0])
+        # One generator per row, or the extra rows would silently sample from
+        # the global RNG. Validate before the n_vq-step depth loop so a wrong
+        # generator count fails on entry.
+        generators = _normalize_generators(generators, bsz)
         input_embeds_out = input_embeds.reshape(bsz, -1)
         last_talker_hidden = last_talker_hidden.reshape(bsz, -1).to(
             device=input_embeds.device,
@@ -1652,6 +1659,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             repetition_penalty=1.0,
             history_per_codebook=None,
             generator=generator,
+            generators=generators,
         )
         new_codes = new_codes.to(device=input_embeds.device, dtype=torch.long)
         emit_mask = active_mask & should_continue_t.reshape(bsz, 1)

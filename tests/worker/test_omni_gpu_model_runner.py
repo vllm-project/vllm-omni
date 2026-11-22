@@ -607,6 +607,39 @@ def test_update_additional_information_deserializes_new_request_payload():
     )
 
 
+@pytest.mark.parametrize("replace_payload", [False, True])
+def test_resumed_streaming_payload_converts_to_typed_model_input(replace_payload):
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.data_entry_keys import to_struct
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = replace_payload
+    payload = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"req_id": ["r1"], "stream_finished": torch.tensor(False)},
+    }
+    new_req = OmniNewRequestData(
+        req_id="r1",
+        prompt_token_ids=[1, 2],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+        model_intermediate_buffer=payload,
+    )
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
+    # CosyVoice and other typed-payload consumers perform this conversion
+    # after the runner adds its resume metadata.
+    result = to_struct(runner.model_intermediate_buffer["r1"])
+    assert result.meta.resumable is True
+    assert result.meta.num_processed_tokens == 0
+    assert result.meta.req_id == ["r1"]
+    torch.testing.assert_close(result.codes.audio, payload["codes"]["audio"])
+
+
 def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
     from vllm_omni.engine.serialization import serialize_additional_information
 
@@ -1222,3 +1255,30 @@ def test_decode_batch_without_mtp_rejects_incomplete_outputs(monkeypatch, invali
     with pytest.raises(ValueError, match="decode preprocessing"):
         runner._preprocess(scheduled, 2)
     assert torch.equal(runner.inputs_embeds.gpu, before)
+
+
+@pytest.mark.parametrize("supports_boundaries", [False, True])
+def test_multimodal_embeddings_receive_opt_in_host_request_boundaries(supports_boundaries):
+    runner = object.__new__(OmniGPUModelRunner)
+    received = {}
+
+    def embed(ids, **kwargs):
+        received.update(kwargs)
+        return ids
+
+    runner.model = SimpleNamespace(supports_embed_input_ids_query_start_loc=supports_boundaries, embed_input_ids=embed)
+    runner.input_batch = SimpleNamespace(num_reqs=3)
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 6, 7, 11, 999]))
+    runner.input_ids = SimpleNamespace(gpu=torch.arange(16))
+    mm = [torch.ones(2, 4), torch.ones(1, 4)]
+    mask = torch.tensor([True] * 4 + [False] * 3 + [True] * 3 + [False])
+
+    result = runner._embed_multimodal_input_ids(11, mm, mask)
+
+    torch.testing.assert_close(result, torch.arange(11))
+    assert received["multimodal_embeddings"] is mm
+    assert received["is_multimodal"] is mask
+    if supports_boundaries:
+        assert received["query_start_loc"] == [0, 6, 7, 11]
+    else:
+        assert "query_start_loc" not in received

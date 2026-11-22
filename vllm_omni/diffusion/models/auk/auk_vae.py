@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import math
 import warnings
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -31,6 +32,8 @@ from torch import nn
 from torch.nn.utils import remove_weight_norm as _fold_weight_norm
 from torch.nn.utils import weight_norm as _apply_weight_norm
 from vllm.logger import init_logger
+
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta as _SharedSnakeBeta
 
 logger = init_logger(__name__)
 
@@ -195,27 +198,50 @@ class Encoder(nn.Module):
         return self.generator(x)
 
 
-class SnakeBeta(nn.Module):
-    """``x + sin^2(alpha * x) / beta`` with per-channel learned alpha and beta (log-scale in AuK)."""
+class SnakeBeta(_SharedSnakeBeta):
+    """x + sin^2(alpha * x) / beta with per-channel learned alpha and beta (log-scale in AuK).
+
+    Built on the shared speech-decoder activation for its precomputed
+    exp(alpha) and 1 / (exp(beta) + eps) buffers, which are materialised once
+    instead of on every call. The forward always uses the eager formula in
+    the reference's operation order, so it reproduces the reference bit for
+    bit; the shared class's fused Triton kernel is not used, because inside
+    the compiled decode buckets Inductor fuses the formula itself and on the
+    remaining eager paths (the reference-audio encode and clips longer than
+    the largest bucket) the kernel measured slower than eager.
+    """
 
     def __init__(self, channels: int, alpha_logscale: bool = False) -> None:
-        super().__init__()
-        self.alpha_logscale = alpha_logscale
-        init = torch.zeros(channels) if alpha_logscale else torch.ones(channels)
-        self.alpha = nn.Parameter(init.clone())
-        self.beta = nn.Parameter(init.clone())
-        self.eps = 1e-9
+        super().__init__(channels, alpha_logscale=alpha_logscale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
-        beta = self.beta.unsqueeze(0).unsqueeze(-1)
-        if self.alpha_logscale:
-            alpha = torch.exp(alpha)
-            beta = torch.exp(beta)
-        return x + (1.0 / (beta + self.eps)) * torch.sin(x * alpha).pow(2)
+        return self._eager_forward(x)
 
 
-class LowPass(nn.Module):
+class _CachedFilter:
+    """Mixin for the FIR modules: expand the shared taps per channel once, not per call.
+
+    filter.expand(channels, -1, -1) is a stride-0 view, and the convolution
+    then copies it to a contiguous weight on every call. Caching the contiguous
+    copy per channel count removes one launch per activation; the taps are the
+    same, so the output is unchanged.
+    """
+
+    filter: torch.Tensor
+    cache_filters: bool = True
+    _expanded: torch.Tensor | None = None
+
+    def _taps(self, channels: int, x: torch.Tensor) -> torch.Tensor:
+        if not self.cache_filters:
+            return self.filter.expand(channels, -1, -1)
+        cached = self._expanded
+        if cached is None or cached.shape[0] != channels or cached.device != x.device:
+            cached = self.filter.expand(channels, -1, -1).contiguous()
+            self._expanded = cached
+        return cached
+
+
+class LowPass(_CachedFilter, nn.Module):
     """Fixed FIR low-pass with replicate padding, applied per channel."""
 
     def __init__(
@@ -241,10 +267,10 @@ class LowPass(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         channels = x.size(1)
         x = F.pad(x, (self.pad_left, self.pad_right), mode="replicate")
-        return F.conv1d(x, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels)
+        return F.conv1d(x, self._taps(channels, x), stride=self.stride, groups=channels)
 
 
-class Upsample(nn.Module):
+class Upsample(_CachedFilter, nn.Module):
     """Band-limited interpolation by ``ratio``. Always non-causal, matching how AuK builds it."""
 
     def __init__(self, ratio: int = 2, kernel_size: int = 12) -> None:
@@ -258,7 +284,7 @@ class Upsample(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         channels = x.size(1)
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = self.ratio * F.conv_transpose1d(x, self.filter.expand(channels, -1, -1), stride=self.ratio, groups=channels)
+        x = self.ratio * F.conv_transpose1d(x, self._taps(channels, x), stride=self.ratio, groups=channels)
         return x[..., self.pad_left : -self.pad_right]
 
 
@@ -327,6 +353,51 @@ class AmpBlock(nn.Module):
         for conv1, conv2, act1, act2 in zip(self.convs1, self.convs2, acts1, acts2, strict=True):
             x = conv2(act2(conv1(act1(x)))) + x
         return x
+
+
+def _conv_context(conv: Conv) -> tuple[Fraction, Fraction]:
+    """(left, right) input samples a causal or same-padded convolution reaches."""
+    if conv.causal:
+        return Fraction(conv.left_padding), Fraction(0)
+    reach = Fraction(conv.dilation[0] * (conv.kernel_size[0] - 1), 2)
+    return reach, reach
+
+
+def _transpose_context(up: ConvTranspose) -> tuple[Fraction, Fraction]:
+    """(left, right) input frames a transposed convolution reaches, in its input's units."""
+    if up.causal:
+        return Fraction(1), Fraction(0)
+    reach = Fraction(up.kernel_size[0], 2 * up.stride[0])
+    return reach, reach
+
+
+def _activation_context(act: AliasFreeActivation) -> tuple[Fraction, Fraction]:
+    """(left, right) samples an alias-free activation reaches, in its input's units.
+
+    The upsampler's taps reach half a kernel each side, and the low-pass
+    behind the activation runs at the oversampled rate, so its padding
+    counts at ``1 / ratio``.
+    """
+    upsample, lowpass = act.upsample, act.downsample.lowpass
+    reach = Fraction(upsample.filter.shape[-1], 2 * upsample.ratio)
+    left = reach + Fraction(lowpass.pad_left, upsample.ratio)
+    right = reach + Fraction(lowpass.pad_right, upsample.ratio)
+    return left, right
+
+
+def _block_context(block: AmpBlock) -> tuple[Fraction, Fraction]:
+    """(left, right) samples one AMP block reaches: its convolutions and activations run in series."""
+    left = Fraction(0)
+    right = Fraction(0)
+    for conv in list(block.convs1) + list(block.convs2):
+        conv_left, conv_right = _conv_context(conv)
+        left += conv_left
+        right += conv_right
+    for act in block.activations:
+        act_left, act_right = _activation_context(act)
+        left += act_left
+        right += act_right
+    return left, right
 
 
 class AuKVAE(nn.Module):
@@ -458,6 +529,26 @@ class AuKVAE(nn.Module):
                 folded += 1
         self._norm_folded = True
         logger.debug("Folded weight norm on %d AuK VAE convolutions", folded)
+        # The activations' exp(alpha) / 1/(exp(beta)+eps) caches depend only on
+        # the loaded parameters; materialise them here so no decode call, and
+        # in particular no CUDA graph capture, computes them lazily.
+        for module in self.modules():
+            if isinstance(module, SnakeBeta):
+                module.precompute_exp_cache()
+
+    def set_decode_fast_paths(self, *, cached_filters: bool) -> None:
+        """Toggle the FIR modules' per-channel filter caching.
+
+        On by default. The switch exists so the cache's cost can be measured
+        against the plain expand-per-call path. Flip it before any CUDA graph
+        is captured: it reallocates the cached taps, and a captured graph
+        keeps reading the old buffers.
+        """
+
+        for module in self.modules():
+            if isinstance(module, _CachedFilter):
+                module.cache_filters = cached_filters
+                module._expanded = None
 
     def encode(
         self, wav: torch.Tensor, *, sample: bool = False, generator: torch.Generator | None = None
@@ -479,6 +570,36 @@ class AuKVAE(nn.Module):
                 latents = mean
             latents = latents.transpose(1, 2).float()
             return (latents - self.global_mean.float()) / torch.sqrt(self.global_log_std.float())
+
+    def decode_context_frames(self) -> tuple[int, int]:
+        """Latent frames of (left, right) context a decoded frame can depend on.
+
+        Summed layer by layer from the modules' own padding and kernel
+        geometry, so it is an upper bound that holds for any weights: a
+        window decoded on its own reproduces the full decode exactly except
+        within these many frames of a window edge that is not a true clip
+        edge. The decoder is causal apart from ``conv_pre`` and the
+        band-limited upsamplers, so the right context is a few frames while
+        the left one is dominated by the dilated convolutions of the first
+        (lowest-rate) stage.
+        """
+        left, right = _conv_context(self.conv_pre)
+        rate = Fraction(1)  # samples per latent frame at the current depth
+        for i in range(self.num_upsamples):
+            for up in self.ups[i]:
+                up_left, up_right = _transpose_context(up)
+                left += up_left / rate
+                right += up_right / rate
+                rate *= up.stride[0]
+            first = i * self.num_kernels
+            blocks = [_block_context(self.resblocks[first + j]) for j in range(self.num_kernels)]
+            left += max(block_left for block_left, _ in blocks) / rate
+            right += max(block_right for _, block_right in blocks) / rate
+        act_left, act_right = _activation_context(self.activation_post)
+        post_left, post_right = _conv_context(self.conv_post)
+        left += (act_left + post_left) / rate
+        right += (act_right + post_right) / rate
+        return math.ceil(left), math.ceil(right)
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode normalized ``[B, Np, latent_dim]`` latents into a ``[B, Np * hop_size]`` waveform in [-1, 1]."""

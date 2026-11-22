@@ -192,9 +192,10 @@ def test_voxcpm2_scheduler_policy_stays_model_local():
     assert "def _should_defer_waiting_admission(self) -> bool:" in common_source
 
     assert "class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler)" in voxcpm2_scheduler_source
+    assert "import vllm_omni.platforms as omni_platform" in voxcpm2_scheduler_source
     assert "from .runtime_config import _VoxCPM2RuntimeConfig" in voxcpm2_scheduler_source
     assert "_VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)" in voxcpm2_scheduler_source
-    assert "unified_decode_graph_available(use_cuda_graph=current_omni_platform.is_cuda())" in voxcpm2_scheduler_source
+    assert "use_cuda_graph=omni_platform.current_omni_platform.is_cuda()" in voxcpm2_scheduler_source
     assert "_should_defer_waiting_for_unified_decode_graph" in voxcpm2_scheduler_source
     assert "def schedule(" not in voxcpm2_scheduler_source
     assert "create_request_queue" not in voxcpm2_scheduler_source

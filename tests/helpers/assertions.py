@@ -367,6 +367,25 @@ def assert_video_first_frame_matches(
     )
 
 
+def assert_video_first_frames_differ(
+    video: bytes,
+    reference: bytes,
+    *,
+    min_mean_absolute_error: float,
+) -> None:
+    """Compare decoded pixels, ignoring differences in MP4 encoding metadata."""
+    with av.open(BytesIO(video)) as container:
+        actual = next(container.decode(video=0)).to_ndarray(format="rgb24")
+    with av.open(BytesIO(reference)) as container:
+        expected = next(container.decode(video=0)).to_ndarray(format="rgb24")
+
+    assert actual.shape == expected.shape
+    mean_absolute_error = float(np.abs(actual.astype(np.float32) - expected).mean() / 255.0)
+    assert mean_absolute_error > min_mean_absolute_error, (
+        f"Expected first-frame MAE > {min_mean_absolute_error}, got {mean_absolute_error:.6f}."
+    )
+
+
 def assert_audio_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],

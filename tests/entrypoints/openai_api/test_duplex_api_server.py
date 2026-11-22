@@ -14,10 +14,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
 from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.stage_config import DeployConfig, DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
@@ -436,6 +438,58 @@ def test_realtime_opted_out_of_duplex_falls_through_to_the_turn_based_route(quer
                 websocket.receive_text()
 
     assert handler.queries == []
+
+
+@pytest.fixture
+def qwen3_realtime_stages():
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+
+    return VllmOmniConfig.from_pipeline_config(
+        QWEN3_OMNI_PIPELINE, user_deploy_config=DeployConfig(async_chunk=True)
+    ).stage_configs
+
+
+def test_qwen3_realtime_recognizes_typed_stages(qwen3_realtime_stages) -> None:
+    from vllm_omni.entrypoints.duplex.openai import supports_qwen3_omni_realtime
+
+    assert supports_qwen3_omni_realtime(qwen3_realtime_stages)
+
+
+@pytest.mark.parametrize("topology", ["missing-stage", "duplicate-stage", "other-architecture"])
+def test_qwen3_realtime_rejects_other_topologies(qwen3_realtime_stages, topology: str) -> None:
+    from vllm_omni.entrypoints.duplex.openai import supports_qwen3_omni_realtime
+
+    stages = list(qwen3_realtime_stages)
+    if topology == "missing-stage":
+        stages.pop()
+    elif topology == "duplicate-stage":
+        stages[-1] = stages[0]
+    else:
+        stages[0].model_config.model_arch = "Qwen2_5OmniForConditionalGeneration"
+
+    assert not supports_qwen3_omni_realtime(stages)
+
+
+def test_qwen3_turn_deployment_uses_conformant_realtime(qwen3_realtime_stages, mocker) -> None:
+    app = _duplex_app(None)
+    app.state.stage_configs = qwen3_realtime_stages
+    app.state.args = Namespace()
+    app.state.openai_serving_models = _FakeModels(
+        base_model_paths=[BaseModelPath(name="qwen3-omni", model_path="qwen3-omni")]
+    )
+    app.state.engine_client = mocker.Mock(
+        get_tokenizer=mocker.AsyncMock(return_value=mocker.Mock(chat_template="{{ messages }}"))
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime?model=qwen3-omni") as websocket:
+            assert websocket.receive_json()["type"] == "session.created"
+            assert websocket.receive_json()["type"] == "conversation.created"
+            websocket.send_json({"type": "unknown_event"})
+            error = websocket.receive_json()
+            assert error["type"] == "error"
+            assert error["error"]["type"] == "invalid_request_error"
+            assert error["error"]["code"] == "invalid_event"
 
 
 # --------------------------------------------------------------------------- #
