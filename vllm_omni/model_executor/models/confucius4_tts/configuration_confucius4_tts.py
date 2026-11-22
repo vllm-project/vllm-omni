@@ -11,6 +11,9 @@ SEMANTIC_BOS_TOKEN_ID = 8192
 SEMANTIC_EOS_TOKEN_ID = 8193
 OUTPUT_SAMPLE_RATE = 22050
 DEFAULT_MAX_REFERENCE_AUDIO_SECONDS = 30.0
+# Rotary positions of the S2A DiT: reference mel frames plus generated frames. The
+# released checkpoint stores a table of this size and was not trained past it.
+S2A_MAX_POSITIONS = 4096
 
 
 class Confucius4TTSConfig(PretrainedConfig):
@@ -38,6 +41,7 @@ class Confucius4TTSConfig(PretrainedConfig):
         mel_length_ratio: float = 1.72,
         output_sample_rate: int = OUTPUT_SAMPLE_RATE,
         max_reference_audio_seconds: float = DEFAULT_MAX_REFERENCE_AUDIO_SECONDS,
+        s2a_max_positions: int = S2A_MAX_POSITIONS,
         s2a_input_size: int = 512,
         s2a_output_size: int = 80,
         s2a_spk_embed_dim: int = 192,
@@ -100,6 +104,7 @@ class Confucius4TTSConfig(PretrainedConfig):
         self.mel_length_ratio = mel_length_ratio
         self.output_sample_rate = output_sample_rate
         self.max_reference_audio_seconds = max_reference_audio_seconds
+        self.s2a_max_positions = s2a_max_positions
         self.s2a_input_size = s2a_input_size
         self.s2a_output_size = s2a_output_size
         self.s2a_spk_embed_dim = s2a_spk_embed_dim

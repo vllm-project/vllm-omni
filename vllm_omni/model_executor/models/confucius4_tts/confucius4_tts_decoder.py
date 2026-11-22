@@ -92,6 +92,7 @@ class Confucius4TTSS2ADecoder(nn.Module):
             estimator_style_dim=cfg.s2a_estimator_style_dim,
             estimator_mlp_ratio=cfg.s2a_estimator_mlp_ratio,
             estimator_dropout=cfg.s2a_estimator_dropout,
+            estimator_max_seq_len=cfg.s2a_max_positions,
             estimator_long_skip_connection=(cfg.s2a_estimator_long_skip_connection),
             estimator_final_layer=cfg.s2a_estimator_final_layer,
             estimator_wavenet_hidden_dim=(cfg.s2a_estimator_wavenet_hidden_dim),
@@ -240,6 +241,37 @@ class Confucius4TTSS2ADecoder(nn.Module):
         )
         return torch.random.fork_rng(devices=devices)
 
+    def _fit_reference_to_positions(self, ref_mel: torch.Tensor, target_length: int) -> torch.Tensor | None:
+        """Keep reference plus target frames inside the S2A rotary table.
+
+        The DiT sees ``[reference mel | target frames]`` and only has
+        ``s2a_max_positions`` rotary positions. A reference of up to 30 s (about
+        2600 frames) next to a long target overflows it, and the resulting shape
+        error in a worker kills the whole stage. Trim the reference prompt to its
+        most recent frames, the ones adjacent to the target, so every position
+        stays in the range the checkpoint was trained on.
+
+        Args:
+            ref_mel: Reference mel prompt, shape (1, T_ref, n_mels).
+            target_length: Number of generated mel frames.
+
+        Returns:
+            The reference, trimmed if needed, or ``None`` when the target alone
+            does not fit (unreachable with the 1518-token budget).
+        """
+        budget = self.config.s2a_max_positions - target_length
+        if budget < 1:
+            return None
+        if ref_mel.shape[1] > budget:
+            logger.info(
+                "Confucius4-TTS trims the reference prompt from %d to %d mel frames to fit %d S2A positions",
+                ref_mel.shape[1],
+                budget,
+                self.config.s2a_max_positions,
+            )
+            ref_mel = ref_mel[:, -budget:, :]
+        return ref_mel
+
     @torch.no_grad()
     def forward(
         self,
@@ -303,6 +335,15 @@ class Confucius4TTSS2ADecoder(nn.Module):
                 device=device,
                 dtype=torch.long,
             )
+            ref_mel = self._fit_reference_to_positions(ref_mel, target_length)
+            if ref_mel is None:
+                logger.error(
+                    "Confucius4-TTS target of %d mel frames exceeds the %d S2A positions; returning empty audio",
+                    target_length,
+                    self.config.s2a_max_positions,
+                )
+                waveforms.append(torch.zeros(0, dtype=torch.float32))
+                continue
             with self._seed_context(device, seed):
                 if seed is not None:
                     torch.manual_seed(seed)

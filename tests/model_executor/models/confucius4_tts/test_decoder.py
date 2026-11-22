@@ -210,6 +210,70 @@ def test_forward_returns_empty_audio_for_an_empty_semantic_sequence_only(
     assert decoder.s2a_model.call["target_feat_len"].tolist() == [3]
 
 
+def _forward_with(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    num_codes: int,
+    ref_frames: int,
+    max_positions: int | None = None,
+):
+    decoder = _decoder()
+    if max_positions is not None:
+        decoder.config.s2a_max_positions = max_positions
+    decoder.model_path = "/model"
+    decoder._resolved_vocoder_source = None
+    decoder.s2a_model = _FakeS2A()
+    decoder.t2s_recompute = _FakeRecompute()
+    monkeypatch.setattr(decoder_module, "_resolve_bigvgan_source", lambda *_args: "/bigvgan")
+    monkeypatch.setattr(decoder_module, "_load_bigvgan", lambda *_args: _FakeBigVGAN())
+    ref_mel = torch.arange(ref_frames, dtype=torch.float32).reshape(1, ref_frames, 1).expand(1, ref_frames, 80)
+    info = {
+        **_conditioning(),
+        "semantic_codes": torch.zeros(num_codes, dtype=torch.long),
+        "ref_mel": ref_mel.contiguous(),
+    }
+    output = decoder.forward(torch.tensor([0]), model_intermediate_buffer=[info])
+    return decoder, output
+
+
+def test_reference_is_trimmed_to_fit_the_s2a_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A 30 s reference (~2585 frames) next to the full 1518-token budget (2610 frames)
+    # overflows the 4096-row rotary table; that crashed the stage in a worker.
+    decoder, output = _forward_with(monkeypatch, num_codes=1518, ref_frames=2585)
+
+    prompt = decoder.s2a_model.call["prompt_feat"]
+    target = decoder.s2a_model.call["target_feat_len"].item()
+    assert target == 2610
+    assert prompt.shape[1] == 4096 - 2610
+    assert prompt.shape[1] + target <= decoder.config.s2a_max_positions
+    # The frames adjacent to the target are kept.
+    assert prompt[0, -1, 0].item() == 2584
+    assert prompt[0, 0, 0].item() == 2585 - (4096 - 2610)
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 8
+
+
+@pytest.mark.parametrize(
+    ("ref_frames", "expected_prompt"),
+    [
+        (100, 100),  # well inside the table
+        (4096 - 1720, 4096 - 1720),  # exactly full: 1000 codes -> 1720 frames
+        (4096 - 1720 + 1, 4096 - 1720),  # one frame over is trimmed by one
+    ],
+)
+def test_reference_trim_boundary(monkeypatch: pytest.MonkeyPatch, ref_frames: int, expected_prompt: int) -> None:
+    decoder, _ = _forward_with(monkeypatch, num_codes=1000, ref_frames=ref_frames)
+
+    assert decoder.s2a_model.call["target_feat_len"].item() == 1720
+    assert decoder.s2a_model.call["prompt_feat"].shape[1] == expected_prompt
+
+
+def test_target_that_cannot_fit_returns_empty_audio_for_that_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    decoder, output = _forward_with(monkeypatch, num_codes=10, ref_frames=5, max_positions=10)
+
+    assert decoder.s2a_model.call is None
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+
+
 def test_load_weights_uses_safe_tensor_only_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -42,7 +42,7 @@ def test_voice_clone_english(omni_server, online_client) -> None:
     """Generate a non-streaming WAV from text and one reference clip."""
     request_config = {
         "model": omni_server.model,
-        "input": "Hello, this is a Confucius4 text to speech test.",
+        "input": "The quick brown fox jumps over the lazy dog.",
         "stream": False,
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
@@ -67,6 +67,8 @@ def test_request_finished_on_prefill_returns_audio(omni_server, online_client) -
         "extra_params": {"lang": "en"},
         "max_new_tokens": 1,
         "sample_rate": 22050,
+        # One semantic token has no words to transcribe.
+        "transcript_expected_text": "",
         # Without the conditioning on the prefill step this waits for the
         # 600 s stage-input deadline instead of returning.
         "timeout": 60.0,

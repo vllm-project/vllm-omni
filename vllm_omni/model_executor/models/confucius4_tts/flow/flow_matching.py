@@ -44,6 +44,7 @@ class ConditionalCFM(nn.Module):
         wavenet_dilation_rate: WaveNet final layer dilation base
         wavenet_num_layers: Number of WaveNet final layer blocks
         wavenet_dropout: WaveNet final layer dropout
+        max_seq_len: Rotary positions available to the estimator (prompt + target frames)
     """
 
     def __init__(
@@ -64,6 +65,7 @@ class ConditionalCFM(nn.Module):
         wavenet_dilation_rate: int = 1,
         wavenet_num_layers: int = 8,
         wavenet_dropout: float = 0.0,
+        max_seq_len: int = 4096,
     ):
         super().__init__()
 
@@ -86,6 +88,7 @@ class ConditionalCFM(nn.Module):
             wavenet_dilation_rate=wavenet_dilation_rate,
             wavenet_num_layers=wavenet_num_layers,
             wavenet_dropout=wavenet_dropout,
+            max_seq_len=max_seq_len,
         )
 
     @torch.no_grad()
@@ -153,7 +156,8 @@ class ConditionalCFM(nn.Module):
                 dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
                 dphi_dt = (1.0 + cfg_rate) * dphi_dt - cfg_rate * cfg_dphi_dt
             else:
-                dphi_dt = self.estimator(x, mask, mu, t, spks, prompt_x)
+                # The estimator embeds a per-sample timestep of shape (B,).
+                dphi_dt = self.estimator(x, mask, mu, t.expand(batch_size), spks, prompt_x)
 
             x = x + dt * dphi_dt
             t = t + dt

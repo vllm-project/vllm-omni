@@ -52,6 +52,7 @@ class MaskedDiffWithXvecConfig:
         estimator_style_dim: Speaker style embedding width
         estimator_mlp_ratio: DiT feed-forward expansion ratio
         estimator_dropout: DiT dropout
+        estimator_max_seq_len: Rotary positions available to the DiT (prompt + target frames)
         estimator_long_skip_connection: Enable U-Net-style skip connections
         estimator_final_layer: Final layer type ("wavenet" or "mlp")
         estimator_wavenet_hidden_dim: WaveNet final layer hidden width
@@ -88,6 +89,7 @@ class MaskedDiffWithXvecConfig:
     estimator_style_dim: int = 192
     estimator_mlp_ratio: float = 4.0
     estimator_dropout: float = 0.0
+    estimator_max_seq_len: int = 4096
     estimator_long_skip_connection: bool = True
     estimator_final_layer: str = "wavenet"
     estimator_wavenet_hidden_dim: int = 512
@@ -145,6 +147,7 @@ class MaskedDiffWithXvec(nn.Module):
             wavenet_dilation_rate=config.estimator_wavenet_dilation_rate,
             wavenet_num_layers=config.estimator_wavenet_num_layers,
             wavenet_dropout=config.estimator_wavenet_dropout,
+            max_seq_len=config.estimator_max_seq_len,
         )
 
         self.input_embedding = SemanticTokenEmbedding(
