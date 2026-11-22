@@ -54,7 +54,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
-    MiniCPMO45DataPlaneContext,
     MiniCPMO45DataPlaneSession,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
@@ -905,29 +904,6 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             return MiniCPMO45DuplexWindowConfig.from_mapping(provided)
         except ValueError as exc:
             raise MiniCPMO45ClientRuntimeConfigError(str(exc), code="invalid_sliding_window_config") from exc
-
-    def data_plane_context(
-        self,
-        *,
-        epoch: int,
-        turn_id: int,
-        active_response_turn_id: int | None,
-        active_response_id: str | None,
-        auto_responds: bool,
-        response_format: str,
-        speed: float | None,
-        modalities: tuple[str, ...],
-    ) -> MiniCPMO45DataPlaneContext:
-        return MiniCPMO45DataPlaneContext(
-            epoch=epoch,
-            turn_id=turn_id,
-            active_response_turn_id=active_response_turn_id,
-            active_response_id=active_response_id,
-            auto_responds=auto_responds,
-            response_format=response_format,
-            speed=speed,
-            modalities=modalities,
-        )
 
 
 __all__ = [

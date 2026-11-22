@@ -50,7 +50,9 @@ def test_commit_flushes_only_an_actual_residual_after_incremental_audio(tail_sam
         )
         assert buffer.append(tail.payload(), chunk_period_ms=1_000) is None
         assert buffer.pending_byte_count == tail_samples * 4
-    committed = buffer.commit(chunk_period_ms=1_000)
+    reservation = buffer.prepare_commit(operation_id="commit", chunk_period_ms=1_000)
+    reservation.commit()
+    committed = reservation.payload
 
     assert emitted is not None
     assert not buffer.has_pending()
@@ -60,7 +62,9 @@ def test_commit_flushes_only_an_actual_residual_after_incremental_audio(tail_sam
         assert _b64_audio(committed) == bytes(16_000 * 4)
     else:
         assert committed is None
-    assert buffer.commit(chunk_period_ms=1_000) is None
+    empty = buffer.prepare_commit(operation_id="empty-commit", chunk_period_ms=1_000)
+    empty.commit()
+    assert empty.payload is None
 
 
 def test_append_emits_one_model_unit_when_multiple_units_are_buffered():
@@ -125,19 +129,22 @@ def test_commit_without_speech_does_not_synthesize_terminal_audio():
     buffer = MiniCPMO45PcmAppendBuffer()
     buffer.append(pcm_payload(8_000, speech=False), chunk_period_ms=1_000)
 
-    committed = buffer.commit(chunk_period_ms=1_000)
+    reservation = buffer.prepare_commit(operation_id="silent-commit", chunk_period_ms=1_000)
+    reservation.commit()
 
-    assert committed is None
+    assert reservation.payload is None
 
 
 def test_commit_resets_cumulative_turn_accounting():
     buffer = MiniCPMO45PcmAppendBuffer()
     buffer.append(pcm_payload(16_000), chunk_period_ms=1_000)
-    buffer.commit(chunk_period_ms=1_000)
+    reservation = buffer.prepare_commit(operation_id="commit", chunk_period_ms=1_000)
+    reservation.commit()
 
-    empty = buffer.commit(chunk_period_ms=1_000)
+    empty = buffer.prepare_commit(operation_id="empty-commit", chunk_period_ms=1_000)
+    empty.commit()
 
-    assert empty is None
+    assert empty.payload is None
 
 
 def test_pcm_append_reservation_rollback_restores_emitted_audio():
@@ -406,7 +413,9 @@ def test_vision_only_append_emits_without_audio_and_survives_rollback():
     assert retried["video_frames"] == ["base", "stack"]
     assert retried["audio"] == ""
     assert not buffer.has_pending()
-    assert buffer.commit(chunk_period_ms=1000) is None
+    empty = buffer.prepare_commit(operation_id="vision-commit", chunk_period_ms=1000)
+    empty.commit()
+    assert empty.payload is None
 
 
 def test_video_only_bypasses_partial_microphone_audio_and_restores_on_rollback():

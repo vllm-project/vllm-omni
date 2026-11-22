@@ -45,6 +45,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 from vllm_omni.model_executor.models.minicpmo_4_5.config import (
     parse_bool_flag as _bool_flag,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.config import stage_connector_extra
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
@@ -1327,13 +1328,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # deployment sets ``talker_codec_fused_prelude: false`` to force the
         # eager chain, and the runtime latch still covers kernel failures.
         self._codec_fused_prelude = _bool_flag(
-            self._extra_config().get("talker_codec_fused_prelude", True),
+            stage_connector_extra(self.vllm_config).get("talker_codec_fused_prelude", True),
             "talker_codec_fused_prelude",
         )
         # Same contract for the fused top-k/top-p tail of the stochastic
         # codec-sampling chain; default true, runtime latch covers failures.
         self._codec_fused_tail = _bool_flag(
-            self._extra_config().get("talker_codec_fused_tail", True),
+            stage_connector_extra(self.vllm_config).get("talker_codec_fused_tail", True),
             "talker_codec_fused_tail",
         )
 
@@ -3326,23 +3327,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             generator.manual_seed(_codec_int_param(request_state, "codec_seed", self._codec_seed))
             self._request_generators[request_id] = generator
         return generator
-
-    def _extra_config(self) -> dict[str, Any]:
-        """Stage-connector ``extra``: the per-stage knobs a deploy YAML can set.
-
-        The talker has no incoming connector edge, so ``get_stage_connector_spec``
-        takes the producer fallback and hands it the extra of its outgoing
-        ``1->2`` edge. If a deploy ever gives stage 1 an explicit
-        ``input_connectors`` entry, the dict comes from that edge instead and
-        ``talker_codec_fused_prelude`` silently reverts to the default.
-        """
-        model_config = getattr(self.vllm_config, "model_config", None)
-        connector = getattr(model_config, "stage_connector_config", None)
-        if isinstance(connector, Mapping):
-            extra = connector.get("extra", connector)
-        else:
-            extra = getattr(connector, "extra", None)
-        return dict(extra) if isinstance(extra, Mapping) else {}
 
     def _codec_sample_setup(
         self,

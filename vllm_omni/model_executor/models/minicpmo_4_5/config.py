@@ -14,6 +14,21 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def stage_connector_extra(vllm_config: object) -> dict[str, Any]:
+    """Read per-stage knobs from the selected connector's mapping or config.
+
+    A stage without an incoming edge uses its outgoing connector's extra;
+    an explicit input connector takes precedence (resolved by the engine).
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    connector = getattr(model_config, "stage_connector_config", None)
+    if isinstance(connector, Mapping):
+        extra = connector.get("extra", connector)
+    else:
+        extra = getattr(connector, "extra", None)
+    return dict(extra) if isinstance(extra, Mapping) else {}
+
+
 def parse_bool_flag(value: Any, key: str) -> bool:
     """Parse a stage-config boolean strictly, so a typo fails at startup.
 

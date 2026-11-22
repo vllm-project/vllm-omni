@@ -40,6 +40,7 @@ from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
+    MiniCPMO45OmniLLMForConditionalGeneration,
     MiniCPMO45OmniLLMMultiModalProcessor,
     MiniCPMO45OmniLLMProcessingInfo,
     MiniCPMOConfig,
@@ -141,13 +142,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("image"):
-            return "(<image>./</image>)"
-        if modality.startswith("video"):
-            return "(<video>./</video>)"
-        if modality.startswith("audio"):
-            return "(<audio>./</audio>)"
-        raise ValueError("Only image, video or audio modality is supported")
+        return MiniCPMO45OmniLLMForConditionalGeneration.get_placeholder_str(modality, i)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -752,14 +747,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """Keyword arguments of ``_stage_prefill_embeddings_only`` for one append, frames aside."""
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _optional_int
 
-        window, reanchor = duplex.get("stage0_window"), duplex.get("stage0_reanchor")
+        window = duplex.get("stage0_window")
         return {
             "epoch": _optional_int(duplex.get("epoch")),
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
-            "final": bool(duplex.get("final")),
             "stage0_window": window if isinstance(window, dict) else None,
-            "stage0_reanchor": reanchor if isinstance(reanchor, dict) else None,
         }
 
     def _duplex_data_plane_helper(self):

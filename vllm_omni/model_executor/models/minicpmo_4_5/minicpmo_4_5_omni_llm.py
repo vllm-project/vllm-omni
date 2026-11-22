@@ -17,7 +17,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import itertools
 import math
 import os
@@ -52,26 +51,10 @@ from transformers.image_utils import (
 )
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.whisper.modeling_whisper import ACT2FN
-
-from vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph import make_encoder_graph
-
-try:
-    from transformers.models.whisper.modeling_whisper import WHISPER_ATTENTION_CLASSES
-except ImportError:
-    from transformers.models.whisper.modeling_whisper import (
-        WhisperAttention,
-    )
-
-    WHISPER_ATTENTION_CLASSES = {
-        "eager": WhisperAttention,
-        "sdpa": WhisperAttention,  # fallback to eager
-    }
-from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.models.whisper.modeling_whisper import WhisperConfig, WhisperEncoder
+from transformers.models.whisper.modeling_whisper import ACT2FN, WhisperAttention, WhisperConfig, WhisperEncoder
 from transformers.utils import (
     TensorType,
     add_start_docstrings,
@@ -129,6 +112,8 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph import make_encoder_graph
 
 
 # vllm.transformers_utils.tokenizer no longer exists in upstream vLLM;
@@ -2067,16 +2052,12 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+        self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             dropout=config.attention_dropout,
             config=config,
             layer_idx=layer_idx,
-        )
-        attention_parameters = inspect.signature(self.self_attn.forward).parameters
-        self._past_key_values_kwarg = (
-            "past_key_values" if "past_key_values" in attention_parameters else "past_key_value"
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -2115,18 +2096,13 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        attention_kwargs = {
-            "hidden_states": hidden_states,
-            "attention_mask": attention_mask,
-            "layer_head_mask": layer_head_mask,
-            "output_attentions": output_attentions,
-            self._past_key_values_kwarg: past_key_values,
-        }
-        attn_out = self.self_attn(**attention_kwargs)
-        hidden_states = attn_out[0]
-        attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        if len(attn_out) > 2:
-            past_key_values = attn_out[2]
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+            past_key_values=past_key_values,
+        )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 

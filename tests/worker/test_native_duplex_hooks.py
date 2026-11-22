@@ -802,9 +802,7 @@ def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffe
         # Keep the tiny fake processor's initial chunk unpadded to model carry.
         runtime._pad_first_audio_chunk_if_needed = lambda *args: None
         assert runtime._stage_prefill_embeddings_only(state, np.zeros(2, dtype=np.float32), seq=0)["success"] is False
-    first = runtime._stage_prefill_embeddings_only(
-        state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1, final=buffered
-    )
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1)
     assert first["input_token_ids"] == [1, 11, 2, 1, 11]
     assert state.window_units == []
     assert state.pending_window_unit.token_ids == first["input_token_ids"]
@@ -1747,7 +1745,6 @@ def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit(
         state,
         np.arange(8, dtype=np.float32),
         seq=1,
-        final=True,
     )
 
     assert result["success"] is True
@@ -1831,7 +1828,6 @@ def test_minicpmo_stage0_final_does_not_promote_first_chunk_alignment_tail_to_un
         state,
         np.zeros(8, dtype=np.float32),
         seq=3,
-        final=True,
     )
 
     assert first["input_token_ids"].count(1) == 1

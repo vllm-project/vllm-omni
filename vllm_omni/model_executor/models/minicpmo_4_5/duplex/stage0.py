@@ -399,9 +399,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
-        final: bool = False,
         stage0_window: dict[str, object] | None = None,
-        stage0_reanchor: dict[str, object] | None = None,
     ) -> _PrefillSteps:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 

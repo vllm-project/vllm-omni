@@ -35,7 +35,7 @@ from .code2wav.token2wav import (
     state_shape_signature,
 )
 from .code2wav.watchdog import Code2WavWatchdog
-from .config import read_bool_flag, resolve_token2wav_trt_config
+from .config import read_bool_flag, resolve_token2wav_trt_config, stage_connector_extra
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -405,7 +405,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
         from vllm_omni.platforms import current_omni_platform
 
-        extra = self._extra_config()
+        extra = stage_connector_extra(self.vllm_config)
         # Resolved on every platform so an invalid value fails at startup
         # instead of inside the first forward/prefetch (_stage_matmul_policy).
         self._tf32_mode = _tf32_mode(extra)
@@ -605,15 +605,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         logger.info("Default prompt normalized onto the %.2fs window: %s", self._ref_max_seconds, path)
         self._default_prompt_normalized = (str(path), cache_id)
         return self._default_prompt_normalized
-
-    def _extra_config(self) -> dict[str, Any]:
-        model_config = getattr(self.vllm_config, "model_config", None)
-        connector = getattr(model_config, "stage_connector_config", None)
-        if isinstance(connector, Mapping):
-            extra = connector.get("extra", connector)
-        else:
-            extra = getattr(connector, "extra", None)
-        return dict(extra) if isinstance(extra, Mapping) else {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -1836,7 +1827,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
         from vllm_omni.platforms import current_omni_platform
 
-        extra = self._extra_config()
+        extra = stage_connector_extra(self.vllm_config)
         # Hub repo ids only need to become local directories once the vocoder
         # assets are actually read; unit tests construct this model with fake
         # paths and must not trigger a hub download (#5442).
@@ -2015,7 +2006,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         allocator it warmed instead of
         raising the reserved footprint the way a weight-load-time sweep does.
         """
-        if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
+        if stage_connector_extra(self.vllm_config).get("cfm_graph_precapture_after_load") is not None:
             logger.warning_once(
                 "MiniCPM-o Code2Wav: cfm_graph_precapture_after_load is ignored; "
                 "the startup sweep is controlled by cfm_graph_precapture_at_init"
@@ -2031,7 +2022,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runners without a warmup forward (Model Runner V2, Ascend) paid for the
         capture on their first real request. Only an explicit ``false`` opts out.
         """
-        return read_bool_flag(self._extra_config(), "cfm_graph_precapture_at_init", True)
+        return read_bool_flag(stage_connector_extra(self.vllm_config), "cfm_graph_precapture_at_init", True)
 
     def _precapture_before_serve(self) -> None:
         """Run the precapture sweep once, under the context ``forward`` uses.

@@ -538,22 +538,6 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         }
         return self.append(payload, chunk_period_ms=chunk_period_ms, flush=True)
 
-    def commit(self, *, chunk_period_ms: int) -> dict[str, object] | None:
-        """Commit the real residual PCM and reset per-client-input state.
-
-        Complete model units are emitted by :meth:`append` as soon as they are
-        available.  A commit at that exact boundary therefore has no payload;
-        synthesizing another unit would add a model decision that does not
-        exist in the official continuous streaming loop.
-        """
-        self._reservation_seq += 1
-        reservation = self.prepare_commit(
-            operation_id=f"immediate-commit-{self._reservation_seq}",
-            chunk_period_ms=chunk_period_ms,
-        )
-        reservation.commit()
-        return reservation.payload
-
 
 __all__ = [
     "MiniCPMO45PcmAppendReservation",

@@ -293,7 +293,7 @@ def test_extra_config_reaches_the_switch_from_the_connector_dict():
             )
         )
     )
-    extra = tts_mod.MiniCPMO45OmniTTSForConditionalGeneration._extra_config(holder)
+    extra = tts_mod.stage_connector_extra(holder.vllm_config)
     assert extra["talker_codec_fused_prelude"] == "false"
     assert tts_mod._bool_flag(extra["talker_codec_fused_prelude"], "talker_codec_fused_prelude") is False
 

@@ -132,15 +132,6 @@ class Code2WavSolveStats:
         self._window_start = None
         self._last_ts = None
 
-    def summary(self) -> dict[str, object]:
-        """Return the window in a form tests can assert on."""
-        return {
-            "solves": self._solves,
-            "pending": self._pending,
-            "frames": {(k, f): n for (k, f), n in self._frames.items()},
-            "batches": {(k, b): n for (k, b), n in self._batches.items()},
-        }
-
     @staticmethod
     def _hist(pairs: list[tuple[int, int]]) -> str:
         head = ",".join(f"{value}:{count}" for value, count in pairs[:_TOP_BUCKETS])
