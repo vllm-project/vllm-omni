@@ -2787,7 +2787,6 @@ def test_pre_sharded_groups_apply_model_remap(tmp_path):
     assert groups[0].checkpoint_entries["transformer.weight"] == ("renamed", str(checkpoint))
 
 
-
 def test_pre_sharded_groups_require_block_load_opt_in(tmp_path):
     """A DiT whose block-local loading is unverified is rejected before any checkpoint read."""
     from vllm_omni.diffusion.model_loader.checkpoint_load_proxy import _plan_checkpoint_groups
@@ -2814,6 +2813,7 @@ def test_cosmos3_transformers_opt_in_to_pre_sharded_block_load():
 
     assert Cosmos3VFMTransformer._hsdp_pre_sharded_block_load is True
     assert Cosmos3EdgeVFMTransformer._hsdp_pre_sharded_block_load is True
+
 
 def test_pre_sharded_groups_assign_nested_blocks_before_parent_and_root(tmp_path):
     from vllm_omni.diffusion.model_loader.checkpoint_load_proxy import _plan_checkpoint_groups
@@ -2911,7 +2911,6 @@ def test_pre_sharded_proxies_reject_a_key_duplicated_in_planned_files(tmp_path, 
 
     with pytest.raises(ValueError, match="must be stored once"):
         _read_planned_proxy(tmp_path, mocker, entries)
-
 
 
 def _write_index_with_packed_sidecar(directory: Path) -> None:
