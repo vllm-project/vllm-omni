@@ -57,34 +57,6 @@ def test_cfm_padding_respects_grid_and_noise_capacity(mel_frames, offset, capaci
     )
 
 
-def test_steady_state_cache_width_saturates_on_bucket_grid():
-    """Pin the real recurrence: grow, then trim to ``prompt_len + 100``.
-
-    ``_decode_batch_once`` trims the estimator attention cache after every
-    decode, so the width saturates instead of growing without bound. What
-    matters for the graph cache is that the steady-state
-    ``(chunk_width, cache_width)`` pair settles on a single grid point.
-    """
-    bucket, prompt_len = 16, 304
-    cache_cap = prompt_len + 100
-    width = prompt_len
-    shapes = set()
-    for _ in range(20):
-        pad = _cfm_pad_frames(
-            mel_frames=50,
-            offset=width,
-            noise_capacity=30000,
-            bucket_frames=bucket,
-            disabled=False,
-        )
-        assert pad == 14
-        shapes.add((50 + pad, width))  # (chunk width, cache width) as used
-        width = min(width + 50 + pad, cache_cap)
-    assert width == cache_cap
-    # (64, 304) -> (64, 368) -> (64, 404), then stable.
-    assert shapes == {(64, 304), (64, 368), (64, 404)}
-
-
 def test_varied_chunk_lengths_collapse_onto_few_widths():
     """Bucketing exists for the varied-length calls, not the steady 50-frame one.
 

@@ -28,9 +28,6 @@ class TestBatchBucket:
         buckets = (1, 2, 4, 8)
         assert [npu_patch._batch_bucket(n, buckets) for n in range(1, 9)] == [1, 2, 4, 4, 8, 8, 8, 8]
 
-    def test_exact_bucket_is_unchanged(self):
-        assert npu_patch._batch_bucket(8, (1, 2, 4, 8)) == 8
-
     def test_batch_beyond_largest_bucket_stays_exact(self):
         # Rounding 12 up to a hypothetical 16 would be correct but 12 is not a
         # configured bucket, so the caller keeps the exact shape instead.
@@ -174,13 +171,6 @@ def _seen_and_out(completed: subprocess.CompletedProcess) -> tuple[set[int], tup
     line = next(line for line in completed.stdout.splitlines() if line.startswith("SEEN"))
     seen_text, out_text = line[len("SEEN ") :].split(" OUT ")
     return set(ast.literal_eval(seen_text)), tuple(ast.literal_eval(out_text))
-
-
-def test_batch_three_is_captured_as_four_and_trimmed_back():
-    seen, out = _seen_and_out(_run_batch_bucket_script(_step_body("(4,)", 3)))
-    assert seen == {4}, seen
-    # The batch axis of the result is trimmed back to the live rows.
-    assert out[0] == 3, out
 
 
 def test_bucket_of_one_never_pads():

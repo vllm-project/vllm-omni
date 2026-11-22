@@ -24,172 +24,30 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+    MiniCPMO45Stage0DuplexRuntime,
+    _MiniCPMO45Stage0SessionState,
+    _MiniCPMO45WindowUnit,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+    DUPLEX_WINDOW_BLOCK_SIZE,
+    MiniCPMO45DuplexSchedulerHelper,
+    MiniCPMO45DuplexWindowManager,
+    MiniCPMO45DuplexWorkerHelper,
+    assert_uniform_position_shift,
+    duplex_window_geometry,
+    rotate_cached_keys,
+    rotate_keys,
+    validate_duplex_window_install,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+    PositionReanchor,
+    plan_position_reanchor,
+)
+
 repo_root = pathlib.Path(__file__).resolve().parent
 while repo_root.name and not (repo_root / "vllm_omni").is_dir():
     repo_root = repo_root.parent
-
-try:
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
-        MiniCPMO45Stage0DuplexRuntime,
-        _MiniCPMO45Stage0SessionState,
-        _MiniCPMO45WindowUnit,
-    )
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
-        DUPLEX_WINDOW_BLOCK_SIZE,
-        MiniCPMO45DuplexSchedulerHelper,
-        MiniCPMO45DuplexWindowManager,
-        MiniCPMO45DuplexWorkerHelper,
-        assert_uniform_position_shift,
-        duplex_window_geometry,
-        rotate_cached_keys,
-        rotate_keys,
-        validate_duplex_window_install,
-    )
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
-        PositionReanchor,
-        plan_position_reanchor,
-    )
-except (ImportError, ModuleNotFoundError):
-    import importlib.util
-    import sys
-    import types
-
-    def _make_pkg(name: str) -> types.ModuleType:
-        if name in sys.modules:
-            return sys.modules[name]
-        m = types.ModuleType(name)
-        m.__path__ = []  # type: ignore[attr-defined]
-        sys.modules[name] = m
-        return m
-
-    vllm = _make_pkg("vllm")
-    vllm.__version__ = "0.7.0"  # type: ignore[attr-defined]
-    vllm.__version_tuple__ = (0, 7, 0)  # type: ignore[attr-defined]
-    v1 = _make_pkg("vllm.v1")
-    spec_reg = _make_pkg("vllm.v1.kv_cache_spec_registry")
-    spec_reg.register_kv_cache_spec = lambda *a, **k: (lambda cls: cls)  # type: ignore[attr-defined]
-    kv_if = _make_pkg("vllm.v1.kv_cache_interface")
-
-    class MockSpec:
-        pass
-
-    kv_if.KVCacheSpec = MockSpec  # type: ignore[attr-defined]
-    kv_if.SlidingWindowSpec = MockSpec  # type: ignore[attr-defined]
-
-    vo = _make_pkg("vllm_omni")
-    vo_exp = _make_pkg("vllm_omni.experimental")
-    vo_ad = _make_pkg("vllm_omni.experimental.ar_diffusion")
-    vo_kc = _make_pkg("vllm_omni.experimental.ar_diffusion.kv_cache")
-    vo_pg = _make_pkg("vllm_omni.experimental.ar_diffusion.kv_cache.paged")
-
-    class MockChunkSpec:
-        pass
-
-    class MockChunkManager:
-        def __init__(self, *a, **k):
-            self.enable_caching = False
-            self.req_to_blocks = {}
-            self.block_size = 16
-            self._null_block = -1
-
-        def compact_block_table(self, request_id: str, sink_blocks: int | None = None) -> int:
-            blocks = self.req_to_blocks.get(request_id, [])
-            start = 0 if sink_blocks is None else int(sink_blocks)
-            end = start
-            while end < len(blocks) and blocks[end] == self._null_block:
-                end += 1
-            if end == start:
-                return 0
-            del blocks[start:end]
-            return (end - start) * self.block_size
-
-        def compact_request_blocks(self, request_id: str, *, sink_blocks: int, num_blocks: int) -> int:
-            blocks = self.req_to_blocks.get(request_id)
-            if blocks is None or num_blocks <= 0:
-                return 0
-            start = int(sink_blocks)
-            end = start + int(num_blocks)
-            if start < 0 or end > len(blocks) or any(b == self._null_block for b in blocks[start:end]):
-                return 0
-            for i in range(start, end):
-                blocks[i] = self._null_block
-            return self.compact_block_table(request_id, sink_blocks=start)
-
-        def reanchor_block_table(self, request_id: str, plan: Any) -> int:
-            gap_blocks = plan.delta // self.block_size
-            return self.compact_request_blocks(
-                request_id,
-                sink_blocks=plan.sink_blocks,
-                num_blocks=gap_blocks,
-            )
-
-    vo_pg.ChunkWindowSpec = MockChunkSpec  # type: ignore[attr-defined]
-    vo_pg.ChunkWindowManager = MockChunkManager  # type: ignore[attr-defined]
-
-    def compute_slot_mapping(block_ids, positions, block_size):
-        p = positions.to(dtype=torch.long)
-        t = torch.tensor(block_ids, dtype=torch.long, device=p.device)
-        return t[torch.div(p, block_size, rounding_mode="floor")] * block_size + (p % block_size)
-
-    vo_pg.compute_slot_mapping = compute_slot_mapping  # type: ignore[attr-defined]
-
-    _make_pkg("vllm_omni.model_executor")
-    _make_pkg("vllm_omni.model_executor.models")
-    _make_pkg("vllm_omni.model_executor.models.minicpmo_4_5")
-    _make_pkg("vllm_omni.model_executor.models.minicpmo_4_5.duplex")
-
-    repo_root = pathlib.Path(__file__).resolve().parent
-    while repo_root.name and not (repo_root / "vllm_omni").is_dir():
-        repo_root = repo_root.parent
-
-    def _load_module(name: str, rel_path: str) -> types.ModuleType:
-        spec = importlib.util.spec_from_file_location(name, repo_root / rel_path)
-        assert spec is not None and spec.loader is not None
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
-    _wp = _load_module(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan",
-        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/window_plan.py",
-    )
-    _wk = _load_module(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv",
-        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/window_kv.py",
-    )
-
-    _wp = _load_module(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan",
-        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/window_plan.py",
-    )
-    _wk = _load_module(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv",
-        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/window_kv.py",
-    )
-    _policy = _load_module(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy",
-        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/policy.py",
-    )
-    _stage0 = _load_module(
-        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0",
-        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/stage0.py",
-    )
-
-    DUPLEX_WINDOW_BLOCK_SIZE = _wk.DUPLEX_WINDOW_BLOCK_SIZE
-    MiniCPMO45DuplexSchedulerHelper = _wk.MiniCPMO45DuplexSchedulerHelper
-    MiniCPMO45DuplexWindowManager = _wk.MiniCPMO45DuplexWindowManager
-    MiniCPMO45DuplexWorkerHelper = _wk.MiniCPMO45DuplexWorkerHelper
-    assert_uniform_position_shift = _wk.assert_uniform_position_shift
-    duplex_window_geometry = _wk.duplex_window_geometry
-    rotate_cached_keys = _wk.rotate_cached_keys
-    rotate_keys = _wk.rotate_keys
-    validate_duplex_window_install = _wk.validate_duplex_window_install
-    PositionReanchor = _wp.PositionReanchor
-    plan_position_reanchor = _wp.plan_position_reanchor
-    MiniCPMO45Stage0DuplexRuntime = _stage0.MiniCPMO45Stage0DuplexRuntime
-    _MiniCPMO45Stage0SessionState = _stage0._MiniCPMO45Stage0SessionState
-    _MiniCPMO45WindowUnit = _stage0._MiniCPMO45WindowUnit
 
 
 def _extract_prepare_stage0_window():

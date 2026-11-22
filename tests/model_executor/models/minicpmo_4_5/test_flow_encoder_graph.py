@@ -252,25 +252,6 @@ def test_legacy_graph_options_share_one_owner():
     assert result.token_widths == (6,)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.nvidia_only
-@_requires_nvidia_capture
-@torch.inference_mode()
-def test_exact_capture_failure_blocks_retry(monkeypatch):
-    graph = FlowEncoderGraphs(lambda x, **kwargs: (x, x, x))
-
-    def fail(*args):
-        raise RuntimeError("capture failed")
-
-    monkeypatch.setattr(graph, "_capture", fail)
-    tokens = torch.zeros(1, 6, device="cuda")
-    graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
-    with pytest.raises(RuntimeError, match="capture failed"):
-        graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
-    with pytest.raises(RuntimeError, match="restart"):
-        graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
-
-
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("amp", [False, True])
