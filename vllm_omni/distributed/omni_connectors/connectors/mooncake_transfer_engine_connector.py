@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 import queue
@@ -169,7 +169,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         # --- Role ---
         # "sender": bind ZMQ listener, accept put() calls.
-        # "receiver": skip ZMQ bind, only accept get() calls.
+        # "receiver": only get(), unless a middle stage also has an outgoing
+        # edge. That edge supplies a separate listener endpoint for put().
         # The orchestration layer (get_connectors_config_for_stage /
         # kv_transfer_manager) is responsible for injecting the correct role.
         role = str(config.get("role", "sender")).lower()
@@ -177,7 +178,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             raise ValueError(
                 f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender' or 'receiver'."
             )
-        self.can_put = role == "sender"
+        self.can_put = role == "sender" or isinstance(config.get("outgoing"), dict)
 
         self.engine_id = str(uuid.uuid4())
 
