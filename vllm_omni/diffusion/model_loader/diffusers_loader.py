@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 import huggingface_hub
 import torch
@@ -30,6 +30,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_skip_softmax_calibration
+from vllm_omni.diffusion.attention.layer import validate_attention_schedule_candidates
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import (
@@ -66,6 +68,11 @@ from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
+    from vllm_omni.distributed.weight_sharing.backend import ImportedWeights
+    from vllm_omni.distributed.weight_sharing.contracts import WeightSharingBackend
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -284,12 +291,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
     def _prepare_weights(
         self,
-        model_name_or_path: Path | str,
+        model_name_or_path: str,
         subfolder: str | None,
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-    ) -> tuple[Path | str, list[str], bool]:
+    ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
@@ -372,7 +379,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if len(hf_weights_files) == 0:
             raise RuntimeError(f"Cannot find any model weights with `{model_name_or_path}`")
 
-        return hf_folder, hf_weights_files, use_safetensors
+        return str(hf_folder), hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
         self,
@@ -387,22 +394,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-        quant_config = self._get_source_quant_config(source)
         use_multithread = (
             use_safetensors
             and source.weight_name_patterns is None
-            and getattr(self.od_config, "enable_multithread_weight_load", False)
+            and self.od_config.enable_multithread_weight_load
             and self.load_config.safetensors_load_strategy != "torchao"
         )
-        use_torchao = (
-            not use_safetensors
-            and quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "torchao"
-            and getattr(quant_config, "is_checkpoint_torchao_serialized", False)
-        )
         if use_multithread:
-            num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
+            num_threads = self.od_config.num_weight_load_threads
             # Keep deterministic shard order before passing to vLLM helper.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = multi_thread_safetensors_weights_iterator(
@@ -410,7 +409,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 self.load_config.use_tqdm_on_load,
                 max_workers=num_threads,
             )
-        elif use_torchao:
+        elif not use_safetensors:
+            # PyTorch pickles (.bin/.pt/.pth); torchao-serialized checkpoints take this path too.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = pt_weights_iterator(
                 sorted_hf_weights_files,
@@ -534,6 +534,28 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             offloaded,
         )
 
+    @staticmethod
+    def _finalize_online_quant_weights_to_cpu(model: nn.Module) -> None:
+        """Bound deferred quantization after the weight consumer has returned."""
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            finalize_layerwise_processing,
+            get_layerwise_info,
+        )
+
+        # A consumer may buffer the iterator before assigning weights. Do not
+        # finalize at generator exhaustion: the last buffered tensors may not
+        # have reached their layers yet.
+        for module in model.modules():
+            if not getattr(getattr(module, "quant_method", None), "uses_meta_device", False):
+                continue
+            if get_layerwise_info(module).can_load():
+                # Padded linears cannot finish during checkpoint consumption.
+                # Finalizing the whole model would accumulate them on device.
+                finalize_layerwise_processing(module, model_config=None)
+            # Also catch the final layer if the consumer processed it after
+            # the streaming generator's last offload_completed() call.
+            module.to("cpu")
+
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
             cast(
@@ -568,16 +590,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
     def _maybe_fuse_distilled_lora(self, model: nn.Module) -> None:
         """Fuse distilled LoRA weights into the model before sharding or quantization."""
-        if self.od_config is None:
-            return
-        lora_backend = getattr(self.od_config, "lora_backend", None)
+        lora_backend = self.od_config.lora_backend
         if lora_backend != LoRABackend.DISTILL and lora_backend != "distill":
             return
 
         if getattr(model, "lora_is_fused", False):
             return
 
-        lora_path = getattr(self.od_config, "lora_path", None)
+        lora_path = self.od_config.lora_path
         if not lora_path:
             return
 
@@ -585,8 +605,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             lora_path = lora_path[0]
 
         if hasattr(model, "load_lora_weights"):
-            lora_scale = getattr(self.od_config, "lora_scale", 1.0)
-            if lora_scale > 1.0:
+            lora_scale = self.od_config.lora_scale
+            if any(scale > 1.0 for scale in (lora_scale if isinstance(lora_scale, list) else [lora_scale])):
                 logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
             logger.info("Fusing distilled LoRA weights from %s into %s", lora_path, model.__class__.__name__)
             model.load_lora_weights(lora_path)
@@ -705,8 +725,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         load_format: str | None = "default",
         custom_pipeline_name: str | type[nn.Module] | None = None,
         device: torch.device | None = None,
+        weight_sharing_backend: "WeightSharingBackend | None" = None,
     ) -> nn.Module:
-        """Load a model with the given configurations."""
+        """Load a model, using the runner-owned backend when weight sharing is enabled.
+
+        The caller retains the backend and session identity across load failures;
+        a failed shared load must not be replayed with a replacement backend.
+        The runner validates the load format before requesting shared loading.
+        """
         self.host_weight_plan = None
         self._hwr_state = None
         self._last_load_request = {
@@ -738,6 +764,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
+
+        shared_group = self._get_shared_weight_group()
+        if shared_group is not None:
+            if weight_sharing_backend is None:
+                raise ValueError("shared-backbone loading requires a runner-owned weight-sharing backend")
+            return self._load_model_with_shared_backbone(
+                shared_group, custom_pipeline_name, target_device, weight_sharing_backend
+            )
+
         with set_default_torch_dtype(self.od_config.dtype):
             if self.parallel_config.use_hsdp:
                 model = self._load_model_with_hsdp(
@@ -761,10 +796,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
                 dit_distributed_offload = distributed_offload and resolved_offload.offloads(DIT_COMPONENT)
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
-                tensor_parallel_size = int(getattr(self.parallel_config, "tensor_parallel_size", 1))
-                use_hsdp = bool(getattr(self.parallel_config, "use_hsdp", False))
-                data_parallel_size = int(getattr(self.parallel_config, "data_parallel_size", 1))
-                sequence_parallel_size = int(getattr(self.parallel_config, "sequence_parallel_size", 1))
+                tensor_parallel_size = int(self.parallel_config.tensor_parallel_size)
+                use_hsdp = bool(self.parallel_config.use_hsdp)
+                data_parallel_size = int(self.parallel_config.data_parallel_size)
+                sequence_parallel_size = int(self.parallel_config.sequence_parallel_size)
                 dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
                 modules = ModuleDiscovery.discover(model)
                 plan = get_offload_plan(model)
@@ -820,7 +855,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     except _HWRCommitError:
                         from vllm_omni.host_weight_runtime import RuntimeMode
 
-                        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                        mode = RuntimeMode(self.od_config.host_weight_runtime_mode)
                         if mode is not RuntimeMode.PREFERRED:
                             raise
                         logger.warning(
@@ -834,15 +869,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
                 if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
-                    lora_backend = getattr(self.od_config, "lora_backend", None)
+                    lora_backend = self.od_config.lora_backend
                     has_distilled_lora = lora_backend in (LoRABackend.DISTILL, "distill") and bool(
-                        getattr(self.od_config, "lora_path", None)
+                        self.od_config.lora_path
                     )
                     plan_result = build_checkpoint_mmap_plan(
                         model,
                         dit_modules=tuple(zip(modules.dit_names, modules.dits)),
                         sources=weight_sources,
-                        model_path=str(getattr(self.od_config, "model", "")) or None,
+                        model_path=str(self.od_config.model) or None,
                         tensor_parallel_size=tensor_parallel_size,
                         use_hsdp=use_hsdp,
                         online_quantization=any(self._has_online_quant(dit) for dit in modules.dits),
@@ -924,7 +959,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     carrier.close()
                 from vllm_omni.host_weight_runtime import RuntimeMode
 
-                mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                mode = RuntimeMode(self.od_config.host_weight_runtime_mode)
                 if mode is RuntimeMode.PREFERRED:
                     logger.warning(
                         "HWR warm finalization failed; discarding the model and retrying a fresh canonical load",
@@ -933,6 +968,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     del model
                     return self.load_fresh_canonical_model()
             raise
+        self._validate_attention_schedule_candidates(model)
         self._log_w4a8_fallback_load_summaries(model)
         self._attach_offload_startup_state(model)
         return model
@@ -1053,19 +1089,40 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         return tuple(sorted(unsupported))
 
     def _apply_skip_softmax_calibration(self, model: nn.Module) -> None:
-        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
-            apply_skip_softmax_calibration,
-        )
+        cfg = self.od_config.diffusion_attention_config
+        # A schedule profile can be the only spec carrying calibration, so discovery has to
+        # look past the baseline config or that candidate would stay dense at runtime.
+        schedule = self.od_config.diffusion_attention_schedule
+        apply_skip_softmax_calibration(cfg, model, schedule=schedule)
 
-        cfg = getattr(self.od_config, "diffusion_attention_config", None)
-        apply_skip_softmax_calibration(cfg, model)
+    def _validate_attention_schedule_candidates(self, model: nn.Module) -> None:
+        """Reject an incompatible prepared candidate before the model is served.
 
-    def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
+        The traversal resolves the same per-candidate calibration dict that stamping uses. It does
+        not read stamped impl state. Without a schedule it walks nothing.
+        """
+        if self.od_config.diffusion_attention_schedule is None:
+            return
+        validated = validate_attention_schedule_candidates(model, self.od_config)
+        logger.debug("Attention schedule: %d prepared candidate(s) passed startup checks.", validated)
+
+    def _process_weights_after_loading(
+        self,
+        model: nn.Module,
+        target_device: torch.device,
+        *,
+        preprocessed_module_names: frozenset[str] = frozenset(),
+    ) -> None:
         """Process weights after loading for quantization methods.
 
         This handles vLLM's quantization methods that need to process weights
         after loading (e.g., FP8 online quantization from BF16/FP16 weights).
+        Shared modules must pass the preprocessed-weight capability check before
+        import; they initialize local kernels without transforming shared tensors.
         """
+        if preprocessed_module_names:
+            from vllm.model_executor.utils import weights_already_processed
+
         # Newer upstream vLLM online-quant methods (uses_meta_device=True) create
         # weights on the ``meta`` device and materialize them just-in-time as each
         # layer's weights finish loading (via the layerwise online-process loader).
@@ -1090,9 +1147,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             # have none, so passing None is safe here.
             finalize_layerwise_processing(model, model_config=None)
 
-        for _, module in model.named_modules():
+        for module_name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
+                continue
+
+            if module_name in preprocessed_module_names:
+                with weights_already_processed():
+                    quant_method.process_weights_after_loading(module)
                 continue
 
             # Layers finished during loading would only be staged onto the target
@@ -1147,14 +1209,32 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         stream_online_quant_to_cpu: bool = False,
         sources: Sequence["ComponentSource"] | None = None,
         planned_weights: Iterable[str] = (),
+        weight_name_filter: Callable[[str], bool] | None = None,
+        disallow_weights: Iterable[str] = (),
     ) -> None:
         weights_to_load = self._get_expected_parameter_names(model)
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
+        if weight_name_filter is not None:
+            weights = ((name, tensor) for name, tensor in weights if not weight_name_filter(name))
         if stream_online_quant_to_cpu:
             weights = self._stream_online_quant_weights_to_cpu(model, weights)
         loaded_weights = model.load_weights(weights)
-        if loaded_weights is not None:
-            loaded_weights = set(loaded_weights).union(planned_weights)
+        if stream_online_quant_to_cpu:
+            self._finalize_online_quant_weights_to_cpu(model)
+        if loaded_weights is None:
+            if disallow_weights:
+                raise ValueError(
+                    "shared-backbone loading requires load-weight tracking, but model.load_weights returned None"
+                )
+        else:
+            loaded_weights = set(loaded_weights)
+            overlap = loaded_weights.intersection(disallow_weights)
+            if overlap:
+                raise ValueError(
+                    "a checkpoint key wrote into a shared weight and may have corrupted "
+                    f"the AR provider's storage: {sorted(overlap)}"
+                )
+            loaded_weights = loaded_weights.union(planned_weights)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
@@ -1246,6 +1326,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         target_device: torch.device,
         custom_pipeline_name: str | type[nn.Module] | None = None,
         is_hsdp: bool = False,
+        backbone_meta: bool = False,
     ) -> nn.Module:
         """Initialize the model from a specified load format."""
         if load_format == "custom_pipeline":
@@ -1277,12 +1358,150 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             device_ctx = contextlib.nullcontext() if hsdp_defer_to_cpu else target_device
             with device_ctx:
                 if load_format == "default":
-                    model = initialize_model(self.od_config)
+                    model_init_kwargs = {"backbone_meta": True} if backbone_meta else None
+                    model = initialize_model(self.od_config, model_init_kwargs=model_init_kwargs)
                 elif load_format == "diffusers":
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")
         prepare_model_for_weight_reload(model, self.od_config, target_device)
+        return model
+
+    def _get_shared_weight_group(self) -> Any | None:
+        """Return the startup layer's shared-group config, if one is attached."""
+        return getattr(self.od_config, "weight_sharing", None)
+
+    def _load_model_with_shared_backbone(
+        self,
+        shared_group: Any,
+        custom_pipeline_name: str | type[nn.Module] | None,
+        target_device: torch.device,
+        backend: "WeightSharingBackend",
+    ) -> nn.Module:
+        """Build a consumer pipeline with a meta backbone and bind the provider.
+
+        This is the step-2 consumer branch: construct the shared backbone on
+        ``meta`` (private components stay on the target device), import the AR
+        final weights through CUDA IPC, bind the views, then load only the
+        stage-private weights from disk.  It intentionally bypasses the
+        ordinary (whole-backbone) load path to avoid a second backbone peak.
+        """
+        if getattr(shared_group, "role", None) != "consumer":
+            raise ValueError("diffusion weight sharing requires role='consumer'")
+        if self.quant_config is not None:
+            raise ValueError("shared-backbone loading does not support quantization in v1")
+        if self.parallel_config.use_hsdp:
+            raise ValueError("shared-backbone loading does not support HSDP in v1")
+        if self.od_config.lora_application == "merged":
+            # Merged adapters copy adapted values into the base parameter in
+            # place, which would write into provider-backed IPC views.
+            raise ValueError("shared-backbone loading does not support merged LoRA adapters")
+        resolved_offload = resolve_offload(self.od_config)
+        if resolved_offload.strategy is not OffloadStrategy.NONE and resolved_offload.offloads(DIT_COMPONENT):
+            raise ValueError("shared-backbone loading does not support DiT offload; imported weights must remain bound")
+
+        from vllm_omni.platforms import current_omni_platform
+
+        device_index = current_omni_platform.current_device()
+        expected_device = current_omni_platform.get_torch_device(device_index)
+        if target_device.type not in ("cpu", "meta") and (
+            target_device.type != expected_device.type or target_device.index not in (None, device_index)
+        ):
+            raise ValueError(
+                f"Weight-sharing target device {target_device} does not match current device {expected_device}"
+            )
+
+        with set_default_torch_dtype(self.od_config.dtype):
+            model = self._init_from_load_format(
+                "default",
+                target_device,
+                custom_pipeline_name,
+                is_hsdp=False,
+                backbone_meta=True,
+            )
+
+        get_adapter = getattr(model, "get_weight_sharing_adapter", None)
+        if not callable(get_adapter):
+            raise ValueError(f"consumer model {type(model).__name__} has no get_weight_sharing_adapter hook")
+        adapter: WeightSharingAdapter = get_adapter()
+
+        payload = getattr(shared_group, "payload", None)
+        if payload is None:
+            raise ValueError("consumer weight sharing requires the provider's claimed payload")
+        # Reject unsupported finalization before creating any IPC mappings.
+        shared = adapter.shared_param_full_names(model)
+        shared_module_names = frozenset(name.rsplit(".", 1)[0] for name in shared)
+        shared_set = set(shared)
+        for full_name, _param in model.named_parameters():
+            if full_name.rsplit(".", 1)[0] in shared_module_names and full_name not in shared_set:
+                raise ValueError(f"shared-backbone module owns a non-shared param: {full_name}")
+        for full_name, _buffer in model.named_buffers():
+            owner_name = full_name.rsplit(".", 1)[0]
+            if owner_name not in shared_module_names:
+                continue
+            owner = model.get_submodule(owner_name) if owner_name else model
+            if full_name.rsplit(".", 1)[1] not in owner._non_persistent_buffers_set:
+                raise ValueError(f"shared-backbone module owns a persistent buffer: {full_name}")
+        for name, module in model.named_modules():
+            if name not in shared_module_names:
+                continue
+            method = getattr(module, "quant_method", None)
+            if method is not None and (
+                not isinstance(method, QuantizeMethodBase)
+                or not getattr(method, "supports_pre_processed_weights", False)
+            ):
+                raise ValueError(f"{name}: {type(method).__name__} does not support preprocessed shared weights")
+
+        # The runner already owns the backend; keep the successful pipeline's
+        # lifecycle handles here too for normal teardown.
+        model._weight_share_backend = backend
+        model._weight_share_import = None
+        imported: ImportedWeights | None
+        try:
+            imported = adapter.open_backbone_import(
+                backend, model, payload=payload, group=shared_group, device_index=device_index
+            )
+            model._weight_share_import = imported
+
+            params_by_name = dict(model.named_parameters())
+            # Local kernel initialization must preserve the imported bindings.
+            shared_data_ptrs = {name: params_by_name[name].data_ptr() for name in shared}
+
+            # Mark shared params as planned and drop checkpoint keys that feed
+            # them. disallow_weights is a backstop that fails loudly if the
+            # predicate misses a key that would write into the provider storage.
+            self.load_weights(
+                model,
+                planned_weights=shared,
+                weight_name_filter=adapter.is_shared_checkpoint_name,
+                disallow_weights=shared,
+            )
+            self._process_weights_after_loading(model, target_device, preprocessed_module_names=shared_module_names)
+
+            params_by_name = dict(model.named_parameters())
+            for name in shared:
+                param = params_by_name.get(name)
+                if param is None:
+                    raise ValueError(f"shared backbone weight disappeared after import: {name}")
+                if param.data_ptr() != shared_data_ptrs[name]:
+                    raise ValueError(f"shared backbone weight was repacked after import: {name}")
+            meta_left = [name for name in shared if params_by_name[name].device.type == "meta"]
+            if meta_left:
+                raise ValueError(f"shared backbone parameters remain on meta after attach: {meta_left[:16]}")
+        except Exception:
+            imported = model._weight_share_import
+            if imported is not None:
+                try:
+                    result = backend.close_import(imported)
+                except Exception:
+                    backend.mark_failed(imported)
+                else:
+                    if result.status != "CLOSED":
+                        backend.mark_failed(imported)
+            raise
+
+        model = model.eval()
+        self._attach_offload_startup_state(model)
         return model
 
     def _load_model_with_pre_sharded_hsdp(
@@ -1325,7 +1544,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             targets,
         )
 
-        thread_count = int(getattr(self.od_config, "num_weight_load_threads", 4))
+        thread_count = int(self.od_config.num_weight_load_threads)
         if _is_distributed_rank_zero():
             directory_label = "directory" if len(checkpoint_states) == 1 else "directories"
             logger.info(
@@ -1591,8 +1810,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             model,
             dit_modules=tuple(zip(outer_dit_names, outer_dits)),
             sources=sources,
-            model_path=str(getattr(self.od_config, "model", "")) or None,
-            tensor_parallel_size=int(getattr(self.parallel_config, "tensor_parallel_size", 1)),
+            model_path=str(self.od_config.model) or None,
+            tensor_parallel_size=int(self.parallel_config.tensor_parallel_size),
             online_quantization=False,
         )
         if plan_result.plan is None:
@@ -1759,7 +1978,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # mapping (QKV fusion, etc.).
         if load_format == "diffusers":
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
-        strategy = getattr(self.od_config, "hsdp_weight_load_strategy", "full")
+        strategy = self.od_config.hsdp_weight_load_strategy
         if strategy == "pre_sharded":
             if load_format != "default":
                 raise ValueError(
@@ -1767,7 +1986,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 )
             if self.quant_config is not None:
                 raise ValueError(f"hsdp_weight_load_strategy={strategy!r} does not support quantization yet")
-            if getattr(self.od_config, "lora_path", None):
+            if self.od_config.lora_path:
                 raise ValueError(f"hsdp_weight_load_strategy={strategy!r} does not support LoRA yet")
         elif strategy != "full":
             raise ValueError(f"Unknown hsdp_weight_load_strategy: {strategy!r}")
@@ -1805,7 +2024,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             has_online_quant = self._has_online_quant(model) or (
                 self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
             )
-            enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
+            enable_broadcast = bool(self.od_config.enable_broadcast_weight_load) and world_size > 1
 
             if enable_broadcast and has_online_quant:
                 logger.info(
@@ -1822,8 +2041,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
                 if (
                     rank != 0
-                    and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
-                    and getattr(self.od_config, "lora_path", None)
+                    and self.od_config.lora_backend in (LoRABackend.DISTILL, "distill")
+                    and self.od_config.lora_path
                     and hasattr(model, "load_lora_weights")
                 ):
                     setattr(model, "lora_is_fused", True)

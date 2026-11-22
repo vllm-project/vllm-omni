@@ -30,6 +30,7 @@ from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
 from vllm_omni.core.sched.output import OmniRequestPrewarm
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -47,6 +48,7 @@ def _prefetch_model(
     ref_prefetch: bool | None = None,
     prefetch_setup: bool | None = None,
     max_waiters: int = 1,
+    allow_tf32: bool | None = None,
 ) -> tuple[MiniCPMO45Code2Wav, _FakeToken2Wav]:
     """Code2Wav over the fake Token2wav; ``token2wav.cold_setups`` records the
     prompt key of every setup built on a setup-cache miss."""
@@ -57,6 +59,8 @@ def _prefetch_model(
         extra["token2wav_ref_prefetch"] = ref_prefetch
     if prefetch_setup is not None:
         extra["token2wav_ref_prefetch_setup"] = prefetch_setup
+    if allow_tf32 is not None:
+        extra["token2wav_allow_tf32"] = allow_tf32
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav, setup_cache_size=setup_cache_size)
     _enable_fake_ragged_kernel(backend)
@@ -739,8 +743,10 @@ def test_bad_prefetch_payload_is_skipped_without_raising(payload, warns, mocker)
 def test_prefetch_phases_run_under_the_stage_matmul_policy(allow_tf32, monkeypatch):
     # The prefetch runs chunk 0's preparation calls outside forward, so it must
     # apply the same TF32 policy as forward and restore the caller's afterwards.
-    model, _ = _prefetch_model(prefetch_setup=True)
-    model.vllm_config.model_config.stage_connector_config["extra"]["token2wav_allow_tf32"] = allow_tf32
+    # The mode is resolved once at construction and every call site reuses it.
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    model, _ = _prefetch_model(prefetch_setup=True, allow_tf32=allow_tf32)
+    assert model._tf32_mode == ("tf32" if allow_tf32 else "off")
     seen: list[tuple[str, bool]] = []
     for name in ("prepare_prompt", "setup_batch"):
         original = getattr(model.backend, name)
@@ -799,3 +805,98 @@ def test_configured_waiter_limit_still_defers_above_limit_and_while_busy():
 def test_prefetch_waiter_limit_must_be_positive():
     with pytest.raises(ValueError, match="max_waiters"):
         _prefetch_model(max_waiters=0)
+
+
+def test_placeholder_dedup_and_pins(mocker):
+    model, _ = _prefetch_model(capacity=2)
+    model._ref_cpu_prefetch_workers = 4
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
+    model.on_requests_added([_prewarm("a"), _prewarm("a"), _prewarm("b")])
+    assert submit.call_count == 2
+    assert model._prefetch_pins["a"] == model._prefetch_pins["b"]
+    entry = next(iter(model._runtime_prompts.values()))
+    assert entry.pins == {"a", "b"} and Path(entry.path).exists()
+    model._runtime_prompt_cache_size = 0
+    model._drop_prefetch("a")
+    assert entry.pins == {"b"} and Path(entry.path).exists()
+    model._drop_prefetch("b")
+    assert not model._runtime_prompts and not Path(entry.path).exists()
+
+
+def test_prefetch_failure_releases_pin():
+    model, _ = _prefetch_model(capacity=0)
+    model._ref_cpu_prefetch_workers = 4
+
+    def fail(*args):
+        raise RuntimeError("injected")
+
+    model.backend.prefetch_prompt_cpu = fail
+    model.on_requests_added([_prewarm("a")])
+    assert not model._prefetch_queue and not model._prefetch_pins and not model._runtime_prompts
+
+
+def test_cpu_prefetch_is_bounded_by_placeholder_queue(mocker):
+    model, _ = _prefetch_model(capacity=32)
+    model._ref_cpu_prefetch_workers = 4
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
+    model.on_requests_added([_prewarm(str(i)) for i in range(40)])
+    assert submit.call_count == 32 and len(model._prefetch_queue) == 32
+    model._runtime_prompt_cache_size = 0
+    for i in range(40):
+        model._drop_prefetch(str(i))
+    assert not model._runtime_prompts
+
+
+@pytest.mark.parametrize("capacity", [0, 1, 4])
+def test_cpu_prefetch_respects_pin_budget_before_materializing(capacity, mocker):
+    model, _ = _prefetch_model(capacity=capacity)
+    model._ref_cpu_prefetch_workers = 1
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
+    materialize = mocker.spy(model, "_materialize_runtime_prompt")
+    prewarms = [_prewarm(str(i), torch.tensor([0.0, (i + 1) / 64])) for i in range(32)]
+    model.on_requests_added(prewarms)
+    limit = max(1, capacity)
+    assert materialize.call_count == submit.call_count == limit
+    assert len(model._prefetch_pins) == len(model._runtime_prompts) == limit
+    assert len(model._prefetch_queue) == 32
+    # A skipped request still prepares its reference at chunk 0.
+    baseline, _ = _prefetch_model(ref_prefetch=False)
+    info = _chunk0(prewarms[-1].payload["ref_audio"])
+    actual = _forward(model, [info], request_ids=["31"])
+    expected = _forward(baseline, [info], request_ids=["31"])
+    torch.testing.assert_close(
+        actual.multimodal_outputs["model_outputs"][0], expected.multimodal_outputs["model_outputs"][0]
+    )
+    model.on_requests_finished([str(i) for i in range(32)])
+    assert not model._prefetch_pins and not model._prefetch_queue
+
+
+@pytest.mark.parametrize("capacity", [0, 4])
+def test_cpu_prefetch_rejected_submission_releases_pin(capacity, mocker):
+    model, _ = _prefetch_model(capacity=capacity)
+    model._ref_cpu_prefetch_workers = 1
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=False)
+    model.on_requests_added([_prewarm(str(i), torch.tensor([0.0, (i + 1) / 64])) for i in range(32)])
+    assert submit.call_count == 32
+    assert not model._prefetch_pins and not model._prefetch_queue
+    assert len(model._runtime_prompts) <= capacity
+    assert all(not entry.pins for entry in model._runtime_prompts.values())
+    baseline, _ = _prefetch_model(ref_prefetch=False)
+    actual = _forward(model, [_chunk0(_REF_A)], request_ids=["0"])
+    expected = _forward(baseline, [_chunk0(_REF_A)], request_ids=["0"])
+    torch.testing.assert_close(
+        actual.multimodal_outputs["model_outputs"][0], expected.multimodal_outputs["model_outputs"][0]
+    )
+
+
+def test_idle_phase_reuses_cpu_prefetch_pin_at_capacity(mocker):
+    model, token2wav = _prefetch_model(capacity=1)
+    model._ref_cpu_prefetch_workers = 1
+    mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
+    model.on_requests_added([_prewarm("a")])
+    assert len(model._prefetch_pins) == 1
+    assert model.run_idle_prefetch() is True
+    assert _cold(token2wav) == (1, 0)
+    assert len(model._prefetch_pins) == 1
+    model.on_requests_finished(["a"])
+    _assert_no_prefetch_state(model)

@@ -45,6 +45,7 @@ def methods():
         "_request_kv_spec",
         "ar_diffusion_request_spec",
         "_validate_bound_kv_geometry",
+        "_ensure_text_kv",
     }
     body = [node for node in cls.body if getattr(node, "name", "") in selected]
     body += [node for node in tree.body if getattr(node, "name", "") == "_admission_int"]
@@ -113,6 +114,7 @@ def test_full_history_reaches_dense_paged_and_batched_paths():
         pipe._append_dense_kv(state, [(value, value)], geometry)
     assert state.dense_kv_by_branch["main"][0][0].flatten().tolist() == list(range(226))
     pipe._ar_diffusion_kv_state = None
+    state.dense_attention = None
     pipe._transformer_forward(
         state,
         torch.zeros(1, 1, 2, 1, 1),
@@ -130,6 +132,21 @@ def test_full_history_reaches_dense_paged_and_batched_paths():
         frame_causal=True,
     )
     assert pipe.transformer.call_args.kwargs["history_window"] == (0, None)
+
+
+def test_dense_text_kv_is_not_capped_by_manifest_cache_length():
+    pipe = methods()()
+    pipe._MAIN_BRANCH = "main"
+    pipe._ar_diffusion_kv_state = None
+    cached = [(torch.ones(1, 513, 1), torch.ones(1, 513, 1))]
+    pipe.transformer = Mock()
+    pipe.transformer.encode_und_kv.return_value = (cached, 513)
+    state = SimpleNamespace(text_kv_by_branch={})
+
+    actual = pipe._ensure_text_kv(state, torch.ones(1, 513), torch.ones(1, 513))
+
+    assert actual is cached
+    assert state.text_kv_by_branch["main"] is cached
 
 
 def test_full_rollout_uses_checkpoint_chunk_without_history_limit():

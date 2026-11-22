@@ -209,6 +209,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     clean_commit_mode: str = "batched"
     overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
+    _request_session_id: str | None = None
     _vae_decode_stream: torch.cuda.Stream | None = None
     _streaming_decoder: WanStreamingDecoder | None = None
 
@@ -617,7 +618,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             cached = [(entry["k"], entry["v"]) for entry in pooled]
         else:
             raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
-            if real_len > self.manifest.text_cache_max_len:
+            if paged_state is not None and real_len > self.manifest.text_cache_max_len:
                 raise ValueError(
                     "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
                     f"{real_len} > {self.manifest.text_cache_max_len}."
@@ -1021,7 +1022,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         typed_tick: ARDiffusionTickRequest | None,
         stage_durations: dict[str, float],
     ) -> DiffusionOutput:
-        from vllm_omni.diffusion.models.cosmos3.guardrails import is_guardrails_enabled
+        from vllm_omni.diffusion.utils.guardrail_utils import is_guardrails_enabled
 
         metadata = {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(typed_tick).to_dict()} if typed_tick else {}
         # The legacy Cosmos3 postprocessor owns video guardrails. Keep that
@@ -1099,10 +1100,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             # survives for a corrected retry or an explicit reset.
             raise
         except Exception:
-            extra = req.sampling_params.extra_args or {}
-            session_id = str(extra.get("session_id") or self._bound_session_id or "default")
-            self._drop_session(session_id)
+            # Use the normalized ID: typed ticks carry it inside
+            # extra_args["ar_diffusion_tick"], not at the top level.
+            if self._request_session_id is not None:
+                self._drop_session(self._request_session_id)
             raise
+        finally:
+            self._request_session_id = None
 
     def _forward_impl(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # ---- Admission (pure) ------------------------------------------------
@@ -1149,6 +1153,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3-Nano-Sim-Bimanual request session "
                 f"{session_id!r} does not match bound session {self._bound_session_id!r}."
             )
+        self._request_session_id = session_id
 
         reset = controls.reset
         close_session = controls.close_session
@@ -1239,7 +1244,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             use_system_prompt=False,
         )
         real_text_kv_len = int(text_mask[0].sum().item())
-        if real_text_kv_len > self.manifest.text_cache_max_len:
+        if self._ar_diffusion_kv_state is not None and real_text_kv_len > self.manifest.text_cache_max_len:
             raise ARDiffusionRequestRejectedError(
                 "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
                 f"{real_text_kv_len} > {self.manifest.text_cache_max_len}."

@@ -2,7 +2,8 @@ name: CodeQL Advanced
 
 on:
   pull_request:
-    branches: [main]
+    # Base branch filter. release/v* covers release/vX.Y.Z and release/vX.Y.ZrcN.
+    branches: [main, "release/v*"]
   # Full scan of the default branch. Cron is UTC; 18:00 UTC is 02:00 Asia/Shanghai.
   schedule:
     - cron: "0 18 * * *"

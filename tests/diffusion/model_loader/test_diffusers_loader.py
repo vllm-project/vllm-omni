@@ -20,7 +20,7 @@ from vllm.config.load import LoadConfig
 
 import vllm_omni.diffusion.model_loader.diffusers_loader as loader_module
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import AttentionConfig, DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
@@ -124,8 +124,28 @@ class _HWRPipeline(nn.Module):
         return loaded
 
 
+def _loader_config(**overrides) -> SimpleNamespace:
+    """Loader fields read directly; model and multithreading keep the doubles' previous load path."""
+    fields = dict(
+        model="",
+        enable_multithread_weight_load=False,
+        num_weight_load_threads=4,
+        enable_broadcast_weight_load=False,
+        hsdp_weight_load_strategy="full",
+        host_weight_runtime_mode="disabled",
+        lora_backend=LoRABackend.PEFT,
+        lora_path=None,
+        lora_scale=1.0,
+        lora_application="runtime",
+        diffusion_attention_config=AttentionConfig(),
+        diffusion_attention_schedule=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> SimpleNamespace:
-    return SimpleNamespace(
+    return _loader_config(
         model=str(model),
         dtype=torch.bfloat16,
         host_weight_runtime_mode=mode,
@@ -135,6 +155,7 @@ def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> Si
         lora_path=None,
         quantization_config=None,
         diffusion_attention_config=None,
+        diffusion_attention_schedule=None,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
             data_parallel_size=1,
@@ -152,7 +173,7 @@ def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> Si
 
 
 def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoader:
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
@@ -170,15 +191,17 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
-def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
-    torchao_config = SimpleNamespace(
-        get_name=lambda: "torchao",
-        is_checkpoint_torchao_serialized=True,
-    )
+@pytest.mark.parametrize(
+    ("torchao_serialized", "suffix"),
+    [(True, ".bin"), (False, ".pth")],  # torchao checkpoints, and plain state dicts such as Video Depth Anything's
+)
+def test_pytorch_checkpoints_use_pytorch_iterator(mocker, torchao_serialized, suffix):
     loader = _make_loader_with_weights([])
-    loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
+    if torchao_serialized:
+        torchao_config = SimpleNamespace(get_name=lambda: "torchao", is_checkpoint_torchao_serialized=True)
+        loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
     loader.load_config.pt_load_map_location = "cpu"
-    files = ["/weights/model-10.bin", "/weights/model-2.bin"]
+    files = [f"/weights/model-10{suffix}", f"/weights/model-2{suffix}"]
     mocker.patch.object(loader, "_prepare_weights", return_value=("/weights", files, False))
     pt_iterator = mocker.patch.object(
         loader_module,
@@ -197,7 +220,7 @@ def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
     weights = list(loader._get_weights_iterator(source))
 
     pt_iterator.assert_called_once_with(
-        ["/weights/model-2.bin", "/weights/model-10.bin"],
+        [f"/weights/model-2{suffix}", f"/weights/model-10{suffix}"],
         loader.load_config.use_tqdm_on_load,
         "cpu",
     )
@@ -264,7 +287,7 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
 
 
 def test_maybe_fuse_distilled_lora_skips_when_lora_path_unset():
-    cfg = SimpleNamespace(
+    cfg = _loader_config(
         lora_backend="distill",
         lora_path=None,
         lora_scale=1.0,
@@ -283,11 +306,16 @@ def test_maybe_fuse_distilled_lora_skips_when_lora_path_unset():
     assert getattr(model, "lora_is_fused", False) is False
 
 
-def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
-    cfg = SimpleNamespace(
+@pytest.mark.parametrize(
+    ("lora_scale", "should_warn"),
+    [(1.0, False), ([1.0, 1.5], True)],
+)
+def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot(lora_scale, should_warn, mocker):
+    warning = mocker.patch.object(loader_module.logger, "warning")
+    cfg = _loader_config(
         lora_backend=LoRABackend.DISTILL,
         lora_path="/path/to/lora.safetensors",
-        lora_scale=1.0,
+        lora_scale=lora_scale,
         dtype=torch.bfloat16,
         quantization_config=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -302,6 +330,10 @@ def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
 
     model.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
     assert getattr(model, "lora_is_fused", False) is True
+    if should_warn:
+        warning.assert_called_once_with("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
+    else:
+        warning.assert_not_called()
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
@@ -640,7 +672,7 @@ def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypa
         },
         checkpoint,
     )
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         enable_multithread_weight_load=True,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
@@ -665,6 +697,113 @@ def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypa
         "transformer.audio_proj_in.weight",
         "transformer.transformer_blocks.0.audio_ff.weight",
     ]
+
+
+def test_safetensors_directory_source_selects_model_file_from_package_root(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Exact allow patterns keep root package components isolated."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    selected_file = tmp_path / "model.safetensors"
+    sibling_file = tmp_path / "ae.safetensors"
+    selected_file.write_bytes(b"")
+    sibling_file.write_bytes(b"")
+
+    od_config = _loader_config(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=[selected_file.name, "*.safetensors"],
+    )
+    weight = torch.zeros(1)
+    safetensors_iterator = MagicMock(return_value=iter([("weight", weight)]))
+    hub_download = MagicMock()
+    monkeypatch.setattr(loader_mod, "safetensors_weights_iterator", safetensors_iterator)
+    monkeypatch.setattr(loader_mod, "download_weights_from_hf", hub_download)
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", weight)]
+
+    safetensors_iterator.assert_called_once_with(
+        [str(selected_file)],
+        loader.load_config.use_tqdm_on_load,
+        loader.load_config.safetensors_load_strategy,
+    )
+    hub_download.assert_not_called()
+
+
+def test_remote_source_without_index_skips_empty_index_download(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """A remote exact-file source must not request an empty index filename."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"")
+    od_config = _loader_config(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="org/model",
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=[checkpoint.name],
+    )
+    weight = torch.zeros(1)
+    index_resolver = MagicMock()
+    hub_download = MagicMock(return_value=str(tmp_path))
+    safetensors_iterator = MagicMock(return_value=iter([("weight", weight)]))
+    monkeypatch.setattr(loader_mod, "maybe_download_from_modelscope", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(loader, "_resolve_weight_index", index_resolver)
+    monkeypatch.setattr(loader_mod, "download_weights_from_hf", hub_download)
+    monkeypatch.setattr(loader_mod, "safetensors_weights_iterator", safetensors_iterator)
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", weight)]
+    hub_download.assert_called_once()
+    index_resolver.assert_not_called()
+
+
+def test_safetensors_directory_source_uses_its_single_checkpoint(tmp_path, mocker):
+    """A component directory with one checkpoint loads that checkpoint."""
+    component_dir = tmp_path / "dit"
+    component_dir.mkdir()
+    checkpoint = component_dir / "component.safetensors"
+    checkpoint.write_bytes(b"")
+
+    od_config = _loader_config(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(component_dir),
+        subfolder="",
+        revision=None,
+        fall_back_to_pt=True,
+    )
+    safetensors_iterator = mocker.patch(
+        "vllm_omni.diffusion.model_loader.diffusers_loader.safetensors_weights_iterator",
+        return_value=iter([("weight", torch.zeros(1))]),
+    )
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", torch.zeros(1))]
+
+    safetensors_iterator.assert_called_once_with(
+        [str(checkpoint)],
+        loader.load_config.use_tqdm_on_load,
+        loader.load_config.safetensors_load_strategy,
+    )
 
 
 def test_stream_online_quant_weights_offloads_layers_after_processing():
@@ -714,6 +853,82 @@ def test_stream_online_quant_weights_offloads_layers_after_processing():
     assert events == ["first", "second"]
 
 
+def test_online_quant_finalizes_padded_layers_without_accumulating(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    resident: set[nn.Module] = set()
+    finalized: set[nn.Module] = set()
+
+    class _OnlineQuantMethod:
+        uses_meta_device = True
+
+    class _PaddedLayer(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 3, bias=False)
+            self.quant_method = _OnlineQuantMethod()
+            info = layerwise.get_layerwise_info(self)
+            info.load_numel_total = self.weight.numel()
+            info.load_numel = 4  # The checkpoint omits two padding elements.
+
+        def to(self, device):
+            assert device == "cpu"
+            assert self in finalized
+            resident.remove(self)
+            return super().to(device)
+
+    model = nn.Sequential(_PaddedLayer(), _PaddedLayer(), _PaddedLayer())
+
+    def finalize(module, model_config):
+        assert model_config is None
+        assert not resident, "previous deferred layer must be offloaded before the next"
+        resident.add(module)
+        finalized.add(module)
+        layerwise.get_layerwise_info(module).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    DiffusersPipelineLoader._finalize_online_quant_weights_to_cpu(model)
+    assert finalized == set(model)
+    assert not resident
+
+
+def test_online_quant_finalization_waits_for_buffered_weight_consumer(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    class _BufferedModel(nn.Module):
+        consumed = False
+
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(2, 2, bias=False)
+            self.layer.quant_method = SimpleNamespace(uses_meta_device=True)
+            layerwise.get_layerwise_info(self.layer).load_numel_total = 6
+
+        def load_weights(self, weights):
+            buffered = list(weights)
+            assert not self.consumed
+            assert len(buffered) == 1
+            self.layer.weight.data.copy_(buffered[0][1])
+            layerwise.get_layerwise_info(self.layer).load_numel = 4
+            self.consumed = True
+            return None
+
+    model = _BufferedModel()
+    loader = _make_loader_with_weights(["weight"])
+    finalized = []
+
+    def finalize(layer, model_config):
+        assert layer is model.layer and model_config is None
+        assert model.consumed, "iterator exhaustion does not mean the consumer finished"
+        finalized.append(layer)
+        layerwise.get_layerwise_info(layer).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    loader.load_weights(model, stream_online_quant_to_cpu=True)
+    assert finalized == [model.layer]
+
+
 def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
     from unittest.mock import Mock
 
@@ -757,7 +972,7 @@ class _ConfigAwareModel(nn.Module):
 def test_initialize_model_sets_current_diffusion_config_during_model_construction(monkeypatch):
     import vllm_omni.diffusion.registry as registry_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         model_class_name="DummyPipeline",
         parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=1, sequence_parallel_size=1),
         vae_use_slicing=False,
@@ -791,10 +1006,13 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         weight_transfer_config=None,
     )
 
@@ -819,10 +1037,13 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
 def test_dlo_transfers_loader_plan_and_skips_ordinary_weight_loading(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
@@ -859,10 +1080,13 @@ def test_compact_rank_local_layer_offload_skips_dlo_mmap_planning(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.config import materialize_legacy_offload_flags
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         diffusion_offload_config={"mode": "layer", "components": ["dit"]},
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -901,7 +1125,7 @@ def _compact_layer_offload_config(
     components: list[str],
     layer_options: dict[str, dict[str, str]],
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    return _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
@@ -910,6 +1134,7 @@ def _compact_layer_offload_config(
             sequence_parallel_size=1,
         ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         diffusion_offload_config={
             "mode": "layer",
             "components": components,
@@ -1005,10 +1230,13 @@ def test_rank_local_encoder_quantization_does_not_mark_dit_mmap_plan_online(monk
 def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
@@ -1066,10 +1294,13 @@ def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
 def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
@@ -1095,10 +1326,13 @@ def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
 
 
 def test_dlo_mmap_plan_with_distilled_lora_falls_back_to_ordinary_loader(monkeypatch):
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
+        ),
         quantization_config=None,
+        diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         lora_backend=LoRABackend.DISTILL,
@@ -1294,6 +1528,18 @@ def test_dlo_allgather_allows_unquantized_host_fallback():
     assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
 
 
+def test_dlo_allgather_rejects_configurable_online_fp8_blocks():
+    from vllm_omni.quantization.fp8_config import OnlineBlockFp8LinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(OnlineBlockFp8LinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == (
+        "OnlineBlockFp8LinearMethod",
+    )
+
+
 def test_dlo_load_model_keeps_host_fallback_on_cpu_through_post_load_sweep(monkeypatch, mocker):
     """Through load_model(): DLO + online quant must build the model inside
     load_unquantizable_fallback_on_cpu(), and the over-wide fallback weight
@@ -1393,7 +1639,7 @@ def test_hsdp_enters_host_fallback_context_only_when_offloading_after_quant(mock
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
     from vllm_omni.quantization import int8_config
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1492,7 +1738,7 @@ def test_hsdp_processes_quantized_weights_before_sharding(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1545,7 +1791,7 @@ def test_hsdp_fuses_distilled_lora_before_sharding(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1598,7 +1844,7 @@ def test_hsdp_fuses_multi_file_distilled_lora_wan22(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1655,7 +1901,7 @@ def test_hsdp_fuses_multi_file_distilled_lora_wan22(mocker):
 
 
 def test_load_model_fuses_distilled_lora_non_hsdp(mocker):
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
@@ -1665,6 +1911,7 @@ def test_load_model_fuses_distilled_lora_non_hsdp(mocker):
         ),
         enable_cpu_offload=False,
         quantization_config=None,
+        diffusion_attention_schedule=None,
         lora_backend="distill",
         lora_path="/path/to/lora.safetensors",
         lora_scale=1.0,
@@ -1730,7 +1977,7 @@ def test_hsdp_broadcast_weight_load_rank0(mocker):
     mocker.patch("torch.distributed.get_world_size", return_value=4)
     mocker.patch("torch.distributed.get_rank", return_value=0)
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1792,7 +2039,7 @@ def test_hsdp_broadcast_weight_load_rank_nonzero(mocker):
     mocker.patch("torch.distributed.get_world_size", return_value=4)
     mocker.patch("torch.distributed.get_rank", return_value=1)
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -1864,7 +2111,7 @@ def test_broadcast_model_weights_invokes_dist_broadcast(mocker):
     model.register_buffer("buf", torch.tensor([1.0, 2.0]))
     model.register_buffer("int_buf", torch.tensor([1, 2, 3], dtype=torch.long))
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -1901,7 +2148,7 @@ def test_broadcast_model_weights_receiver_copies_data(mocker):
     model.register_buffer("buf", torch.zeros(2))
     model.register_buffer("int_buf", torch.zeros(3, dtype=torch.long))
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -1935,7 +2182,7 @@ def test_broadcast_model_weights_mixed_cpu_and_accelerator_devices(mocker):
     model.vae = nn.Linear(4, 4).to(dev)
     model.text_encoder = nn.Linear(4, 4).to(dev)
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -1964,7 +2211,7 @@ def test_broadcast_model_weights_mixed_devices_receiver(mocker):
     model.transformer = nn.Linear(2, 2)  # CPU
     model.vae = nn.Linear(2, 2).to(dev)  # Accelerator
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=True),
         enable_broadcast_weight_load=True,
@@ -1992,7 +2239,7 @@ def test_hsdp_broadcast_weight_load_falls_back_when_online_quantization_enabled(
     mock_quant_config = SimpleNamespace(
         is_checkpoint_quantized=False,
     )
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
@@ -2065,7 +2312,7 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
                 return {"transformer.weight", "transformer.bias"}
 
         mock_quant_config = SimpleNamespace(is_checkpoint_quantized=False)
-        od_config = SimpleNamespace(
+        od_config = _loader_config(
             dtype=torch.float32,
             parallel_config=SimpleNamespace(
                 use_hsdp=True,
@@ -2103,6 +2350,8 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
         if model.load_called:
             with open(os.path.join(temp_dir, f"rank_{rank}_success.flag"), "w") as f:
                 f.write("ok")
+        # Keep successful ranks alive until every peer has finished initialization/loading.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
@@ -2132,7 +2381,7 @@ def test_hsdp_broadcast_weight_load_online_quant_multiprocess():
 
 
 def test_pre_sharded_hsdp_rejects_quantization_before_loading():
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         hsdp_weight_load_strategy="pre_sharded",
         lora_path=None,
@@ -2152,7 +2401,7 @@ def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    od_config = SimpleNamespace(
+    od_config = _loader_config(
         dtype=torch.float32,
         hsdp_weight_load_strategy="pre_sharded",
         lora_path=None,

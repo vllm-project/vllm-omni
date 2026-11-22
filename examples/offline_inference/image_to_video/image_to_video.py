@@ -262,6 +262,18 @@ def parse_args() -> argparse.Namespace:
         help="Disable torch.compile and force eager execution.",
     )
     parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Total timeout for orchestrator startup in seconds (default: 600s).",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300s).",
+    )
+    parser.add_argument(
         "--audio-sample-rate",
         type=int,
         default=24000,
@@ -601,6 +613,8 @@ def main():
         enable_distributed_layerwise_offload=args.enable_distributed_layerwise_offload,
         dlo_use_allgather=args.dlo_use_allgather,
         dlo_resident_layers=args.dlo_resident_layers,
+        init_timeout=args.init_timeout,
+        stage_init_timeout=args.stage_init_timeout,
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config

@@ -41,6 +41,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
     ARDiffusionKVConfig,
     contiguous_kv_gather_enabled,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
@@ -172,6 +173,27 @@ def ar_diffusion_scratch_blocks_override() -> int:
     return value
 
 
+def _superpage_private_pages(
+    config: ARDiffusionKVConfig,
+    block_size: int,
+    max_scratch_tokens_per_branch: int,
+    segmented: ARDiffusionSegmentedKVSpec | None,
+) -> int:
+    if not config.superpage_tokens:
+        return 0
+    if segmented is not None or config.reuse_history_staging or contiguous_kv_gather_enabled():
+        raise ValueError(
+            "superpage_tokens is incompatible with segmented KV, reuse_history_staging or contiguous gather"
+        )
+    if max_scratch_tokens_per_branch:
+        raise ValueError("superpage_tokens does not support action/state KV tokens")
+    if block_size != config.superpage_tokens:
+        raise ValueError("superpage manager pages must match the configured superpage size")
+    # The sink starts at zero and has one boundary. Recent history has two.
+    boundaries = int(config.sink_chunks > 0) + 2
+    return -(-(boundaries * (block_size - 1)) // block_size)
+
+
 def estimate_ar_diffusion_kv_cache_memory(
     config: ARDiffusionKVConfig,
     spec: ARDiffusionKVCacheSpec,
@@ -196,7 +218,7 @@ def estimate_ar_diffusion_kv_cache_memory(
         )
 
     if block_size is None:
-        block_size = spec.segmented.block_size if spec.segmented else spec.tokens_per_frame
+        block_size = config.superpage_tokens or (spec.segmented.block_size if spec.segmented else spec.tokens_per_frame)
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
     blocks_per_frame = -(-spec.tokens_per_frame // block_size)
@@ -273,8 +295,12 @@ def estimate_ar_diffusion_kv_cache_memory(
     )
     cross_attention_reserved_bytes = session_capacity * cross_attention_bytes_per_session
     model_owned_state_reserved_bytes = session_capacity * spec.model_owned_state_bytes_per_session
+    superpage_reserved_bytes = page_size_bytes * _superpage_private_pages(
+        config, block_size, spec.max_scratch_tokens_per_branch, spec.segmented
+    )
     required_bytes = (
         scratch_reserved_bytes
+        + superpage_reserved_bytes
         + managed_num_blocks * page_size_bytes
         + cross_attention_reserved_bytes
         + model_owned_state_reserved_bytes
@@ -341,7 +367,7 @@ class HistoryStagingState:
     signature: tuple[Any, ...] | None = None
 
 
-class ARDiffusionKVCache:
+class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
     """Own the paged KV pool and KV-branch-local storage for one model.
 
     Build once per loaded model (dimensions known); then per request:
@@ -371,6 +397,7 @@ class ARDiffusionKVCache:
         model_owned_state_bytes_per_session: int = 0,
         segmented: ARDiffusionSegmentedKVSpec | None = None,
         agree_staging_allocation: Callable[[bool], bool] | None = None,
+        visibility_block_size: int | None = None,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -443,6 +470,22 @@ class ARDiffusionKVCache:
             str,
             dict[str, dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]]],
         ] = {}
+
+        self.superpage_size = config.superpage_tokens
+        self.visibility_block_size = visibility_block_size or block_size
+        self.superpage_private_pages = 0
+        # Last page plan and block-table metadata, reused while the window is unchanged.
+        self.superpage_plan: tuple | None = None
+        self.superpage_metadata: tuple | None = None
+        if self.superpage_size:
+            if block_size % self.visibility_block_size:
+                raise ValueError("superpage manager pages must be a multiple of the baseline visibility unit")
+            self.superpage_private_pages = _superpage_private_pages(
+                config, block_size, max_scratch_tokens_per_branch, segmented
+            )
+        self.superpage_reserved_bytes = (
+            2 * num_layers * self.superpage_private_pages * block_size * num_kv_heads * head_size * dtype.itemsize
+        )
 
         self.spec = ChunkWindowSpec(
             block_size=block_size,
@@ -543,6 +586,7 @@ class ARDiffusionKVCache:
         self_attn_budget_bytes = (
             self.memory_budget_bytes
             - self.scratch_reserved_bytes
+            - self.superpage_reserved_bytes
             - self.history_staging_reserved_bytes
             - self.cross_attention_reserved_bytes
             - self.model_owned_state_reserved_bytes
@@ -574,7 +618,17 @@ class ARDiffusionKVCache:
         self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
         self.managed_num_blocks = num_blocks
         self.num_blocks = num_blocks
-        self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks
+        self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks + self.superpage_private_pages
+        _log.info(
+            "AR-Diffusion KV capacity: manager_tokens=%d allocatable_tokens=%d page_tokens=%d "
+            "private_bytes=%d scratch_bytes=%d session_capacity=%d",
+            num_blocks * block_size,
+            (num_blocks - 1) * block_size,
+            block_size,
+            self.superpage_reserved_bytes,
+            self.scratch_reserved_bytes,
+            effective_capacity,
+        )
         self.null_block_id = self.manager.block_pool.null_block.block_id
 
         # Allocate the per-layer paged K/V pools on the given device.
@@ -884,7 +938,18 @@ class ARDiffusionKVCache:
         _log.debug("AR-Diffusion begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
         return adapter
 
-    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+    def finish_request(self, owner: ARDiffusionRequestAdapter) -> None:
+        """Finish a call without releasing the session branch's history.
+
+        Window/segment commit already applies the history policy. This backend
+        has no additional per-call allocation to retire; the adapter remains
+        installed until explicit history release, reset or close.
+        """
+        self._require_current_adapter(owner)
+
+    def release_history(self, owner: ARDiffusionRequestAdapter) -> None:
+        """Release one branch/segment allocation after computation stops."""
+        adapter = owner
         self._require_current_adapter(adapter)
         _log.debug(
             "AR-Diffusion end_request: req=%s chunks=%d free=%d",
@@ -894,6 +959,10 @@ class ARDiffusionKVCache:
         )
         self.manager.free(adapter)
         self._adapters.pop(adapter.request_id, None)
+
+    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+        """Compatibility entry point for releasing an owner's entire history."""
+        self.release_history(adapter)
 
     # -- per-chunk operations ------------------------------------------------
 

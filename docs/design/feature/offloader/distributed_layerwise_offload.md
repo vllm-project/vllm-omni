@@ -117,6 +117,18 @@ block's shard is copied to a device buffer and reconstructed with
 `all_gather_into_tensor` on a communication stream while the current block is
 executing.
 
+Weights are packed into chunk-major rank shards. `dlo_chunk_size_mb` (default
+64 MiB) bounds each collective, allowing the next chunk's host-to-device copy
+to overlap the current chunk's AllGather on separate streams. Two chunk-input
+buffers are reused only after their prior collective completes. The shared
+full-block buffers retain the existing compute-readiness and prefetch ordering.
+Chunk packing applies only when the effective weight-sharding group has more
+than one rank; rank-local mmap retains its bounded staging path.
+
+Packing preserves each parameter and buffer's physical layout, including
+strides. Loader-provided transforms may change strides but must preserve dtype
+and shape; invalid transforms raise before the source weights are released.
+
 ```text
 Compute:    [Block N]             [Block N+1]          [Block N+2]
 H2D:                      [shard N+1]           [shard N+2]

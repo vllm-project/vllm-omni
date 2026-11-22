@@ -12,13 +12,12 @@ import ast
 import hashlib
 import json
 import math
-import sys
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -118,18 +117,6 @@ def pipeline_methods() -> type:
     return namespace["Pipeline"]
 
 
-@pytest.fixture(autouse=True)
-def guardrail_gate(monkeypatch):
-    # Execute the real gate without importing GPU guardrail implementations.
-    path = SOURCE.parent / "cosmos3/guardrails.py"
-    tree = ast.parse(path.read_text())
-    body = [node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "__future__"]
-    body += [node for node in tree.body if getattr(node, "name", None) == "is_guardrails_enabled"]
-    module = ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
-    exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), str(path), "exec"), module.__dict__)
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-
-
 def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
     from test_action_schema import manifest
 
@@ -138,6 +125,7 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
     pipe._states = {}
     pipe._bound_session_id = None
     pipe._ar_diffusion_kv_state = None
+    pipe._request_session_id = None
     pipe._distilled_num_steps = 4
     pipe.default_domain_id = 15
     pipe.default_fps = 30
@@ -225,6 +213,16 @@ def test_latent_output_keeps_existing_path() -> None:
     pipe._decode_latents.assert_not_called()
 
 
+def test_dense_rollout_is_not_capped_by_manifest_cache_length() -> None:
+    pipe, state = fake_pipeline()
+    token_ids = torch.arange(513).unsqueeze(0)
+    pipe._tokenize_prompt.return_value = (token_ids, torch.ones_like(token_ids))
+
+    pipe.forward(request(5, output_type="latent"))
+
+    assert state.fingerprint.real_text_kv_lengths == (("main", 513),)
+
+
 @pytest.mark.parametrize("frames", [5, 17, 21, 61])
 @pytest.mark.parametrize("prefix", [True, False])
 def test_batched_clean_commit_preserves_terminal_frame_and_action_slices(frames, prefix):
@@ -292,6 +290,28 @@ def test_failed_decoder_releases_session() -> None:
     pipe._decode_live_latents.side_effect = RuntimeError("decoder failure")
     with pytest.raises(RuntimeError, match="decoder failure"):
         pipe.forward(request())
+    assert pipe._states == {}
+
+
+def test_failed_typed_tick_releases_its_session() -> None:
+    pipe, state = fake_pipeline()
+    pipe._bound_session_id = "robot"
+    pipe._ar_diffusion_kv_state = SimpleNamespace(kv_cache=SimpleNamespace(spec=SimpleNamespace(window_chunks=16)))
+    pipe._validate_bound_kv_geometry = Mock()
+    pipe._decode_live_latents.side_effect = RuntimeError("decoder failure")
+    tick = ARDiffusionTickRequest(
+        session_id="robot",
+        request_id="tick-0",
+        chunk_index=0,
+        controls=(build_cosmos3_nano_sim_bimanual_action_control(torch.zeros(8, 59)),),
+    )
+    req = request()
+    req.sampling_params.extra_args = tick.to_extra_args()
+    with pytest.raises(RuntimeError, match="decoder failure"):
+        pipe.forward(req)
+    # KV commit and frame position advanced before decode failed.
+    assert state.next_frame_idx == 3
+    pipe._drop_session.assert_called_once_with("robot")
     assert pipe._states == {}
 
 
