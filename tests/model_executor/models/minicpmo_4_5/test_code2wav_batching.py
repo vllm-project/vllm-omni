@@ -1599,8 +1599,9 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     assert token2wav.flow.decoder.estimator.attention_cache_dtypes[-2:] == [torch.float32, torch.float32]
 
 
-def test_bfloat16_estimator_attention_cache_materializes_each_timestep():
-    adapter = BatchedToken2Wav(_FakeToken2Wav(), bfloat16_attention_cache=True)
+@pytest.mark.parametrize("options,dtype", [({}, torch.float32), ({"bfloat16_attention_cache": True}, torch.bfloat16)])
+def test_estimator_attention_cache_materializes_each_timestep(options, dtype):
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), **options)
 
     _, estimator_cnn, estimator_att = adapter._decode_cfm(
         torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
@@ -1611,24 +1612,7 @@ def test_bfloat16_estimator_attention_cache_materializes_each_timestep():
     )
 
     assert estimator_cnn.dtype == torch.float32
-    assert estimator_att.dtype == torch.bfloat16
-    # ``(n_t, depth, 2, rows, heads, frames, head_dim)`` on the split layout.
-    assert estimator_att.shape[:4] == (2, 1, 2, 4)
-
-
-def test_float32_estimator_attention_cache_materializes_each_timestep():
-    adapter = BatchedToken2Wav(_FakeToken2Wav())
-
-    _, estimator_cnn, estimator_att = adapter._decode_cfm(
-        torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
-        torch.ones((2, 1)),
-        torch.zeros((2, 1, 2)),
-        cnn_cache=None,
-        att_cache=None,
-    )
-
-    assert estimator_cnn.dtype == torch.float32
-    assert estimator_att.dtype == torch.float32
+    assert estimator_att.dtype == dtype
     # ``(n_t, depth, 2, rows, heads, frames, head_dim)`` on the split layout.
     assert estimator_att.shape[:4] == (2, 1, 2, 4)
 
@@ -1821,15 +1805,8 @@ def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, mon
     second_model, _ = _model(runtime_prompt_cache_size=0)
     reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
 
-    def runtime_ref_info(request_id: str):
-        info = _info(request_id, 0, [10, 11])
-        info["codes"]["ref"] = reference
-        info["meta"]["ref_audio_sr"] = 16000
-        info["meta"].pop("prompt_cache_id")
-        return info
-
-    _forward(first_model, [runtime_ref_info("voice-a")], request_ids=["internal-a"])
-    _forward(second_model, [runtime_ref_info("voice-b")], request_ids=["internal-b"])
+    _forward(first_model, [_runtime_ref_info("voice-a", reference)], request_ids=["internal-a"])
+    _forward(second_model, [_runtime_ref_info("voice-b", reference)], request_ids=["internal-b"])
 
     first_key = first_model._request_prompt_keys["internal-a"]
     second_key = second_model._request_prompt_keys["internal-b"]

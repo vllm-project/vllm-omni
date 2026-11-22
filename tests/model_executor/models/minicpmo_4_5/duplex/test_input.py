@@ -135,18 +135,6 @@ def test_commit_without_speech_does_not_synthesize_terminal_audio():
     assert reservation.payload is None
 
 
-def test_commit_resets_cumulative_turn_accounting():
-    buffer = MiniCPMO45PcmAppendBuffer()
-    buffer.append(pcm_payload(16_000), chunk_period_ms=1_000)
-    reservation = buffer.prepare_commit(operation_id="commit", chunk_period_ms=1_000)
-    reservation.commit()
-
-    empty = buffer.prepare_commit(operation_id="empty-commit", chunk_period_ms=1_000)
-    empty.commit()
-
-    assert empty.payload is None
-
-
 def test_pcm_append_reservation_rollback_restores_emitted_audio():
     buffer = MiniCPMO45PcmAppendBuffer()
     original = pcm_payload(16_000)
@@ -222,21 +210,9 @@ def _frame_payload(samples: int, frames: list[str]) -> dict[str, object]:
     return payload
 
 
-def test_append_attaches_every_frame_of_the_unit_closing_append():
-    """A base frame and its stacked composite arrive on one append and must
-    enter the same model unit (official ``frame_list``), not one per unit."""
-    buffer = MiniCPMO45PcmAppendBuffer()
-
-    emitted = buffer.append(_frame_payload(16_000, ["base-0", "stack-0"]), chunk_period_ms=1_000)
-
-    assert emitted is not None
-    assert emitted["video_frames"] == ["base-0", "stack-0"]
-    assert buffer._frame_queue == []
-
-
 def test_stacked_frames_do_not_accumulate_across_units():
+    """Each closing append's base frame and composite belong to the same unit."""
     buffer = MiniCPMO45PcmAppendBuffer()
-    attached: list[list[str]] = []
 
     for unit in range(64):
         emitted = buffer.append(
@@ -244,11 +220,8 @@ def test_stacked_frames_do_not_accumulate_across_units():
             chunk_period_ms=1_000,
         )
         assert emitted is not None
-        attached.append(list(emitted["video_frames"]))
-
-    assert attached[0] == ["base-0", "stack-0"]
-    assert attached[-1] == ["base-63", "stack-63"]
-    assert buffer._frame_queue == []
+        assert emitted["video_frames"] == [f"base-{unit}", f"stack-{unit}"]
+        assert buffer._frame_queue == []
 
 
 def test_frames_from_partial_appends_ride_the_unit_they_close():

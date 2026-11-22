@@ -2298,19 +2298,7 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(
     bucketed._flush()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
-        BatchedToken2Wav,
-    )
-
-    mock_stepper = Mock()
-    mock_stepper.step.side_effect = lambda x, mu, t, spks, cond, cnn_cache, att_cache: (
-        x,
-        torch.zeros(2, x.shape[0], 4, 2, device=x.device),
-        torch.zeros(2, x.shape[0], 2, x.shape[2], 4, device=x.device),
-    )
-
+def _whole_euler_token2wav():
     class _MockDecoder(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -2334,9 +2322,25 @@ def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
             self.source_cache_len = 2
             self.speech_window = torch.hamming_window(4, periodic=False)
 
+    return _MockToken2Wav()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+        BatchedToken2Wav,
+    )
+
+    mock_stepper = Mock()
+    mock_stepper.step.side_effect = lambda x, mu, t, spks, cond, cnn_cache, att_cache: (
+        x,
+        torch.zeros(2, x.shape[0], 4, 2, device=x.device),
+        torch.zeros(2, x.shape[0], 2, x.shape[2], 4, device=x.device),
+    )
+
     # Both TRT stepper and enable_cfm_graph (with enable_whole_euler=True) configured
     adapter = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         trt_stepper=mock_stepper,
         cfm_graph_config={"enabled": True, "enable_whole_euler": True, "bucket_frames": 16},
     )
@@ -2365,38 +2369,15 @@ def test_whole_euler_disabled_via_serving_config() -> None:
         BatchedToken2Wav,
     )
 
-    class _MockDecoder(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.estimator = _WholeEulerDiT().eval().cuda()
-            self.inference_cfg_rate = 0.7
-            self.register_buffer("rand_noise", torch.zeros(1, 4, 100, device="cuda"), persistent=False)
-
-    class _MockFlow(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.decoder = _MockDecoder()
-            self.spk_embed_affine_layer = nn.Identity()
-
-    class _MockToken2Wav:
-        def __init__(self) -> None:
-            self.flow = _MockFlow()
-            self.hift = nn.Module()
-            self.float16 = False
-            self.n_timesteps = 10
-            self.mel_cache_len = 1
-            self.source_cache_len = 2
-            self.speech_window = torch.hamming_window(4, periodic=False)
-
     adapter_disabled = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         cfm_graph_config={"enabled": True, "enable_whole_euler": False},
     )
     assert adapter_disabled._whole_euler_graph_wrapper is None
     assert adapter_disabled._cfm_graph_wrapper is not None
 
     adapter_enabled = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         cfm_graph_config={"enabled": True, "enable_whole_euler": True},
     )
     assert adapter_enabled._whole_euler_graph_wrapper is not None
@@ -2404,7 +2385,7 @@ def test_whole_euler_disabled_via_serving_config() -> None:
 
     # Unconfigured, the capture width is the steady chunk's mel width.
     adapter_derived = BatchedToken2Wav(
-        _MockToken2Wav(),
+        _whole_euler_token2wav(),
         connector_config={"codec_chunk_frames": 25, "codec_left_context_frames": 3},
         cfm_graph_config={"enabled": True, "enable_whole_euler": True},
     )
@@ -2586,39 +2567,6 @@ def test_whole_euler_mixed_histories_match_independent_streams(
             assert out_att[row].shape[-2] == offset + length
             torch.testing.assert_close(out_att[row], expected_att, rtol=1e-4, atol=1e-5)
     wrapper._flush()
-
-
-def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest.MonkeyPatch) -> None:
-    device = SimpleNamespace(type="npu")
-    wrapper = SimpleNamespace(
-        enabled=True,
-        npu_mixed_history=False,
-        device=device,
-        _stats={"calls": 0},
-        max_graph_batch=8,
-        _plan_groups=lambda batch: [(0, batch)],
-        row_offsets=False,
-        ragged_body=object(),
-        query_widths=(8,),
-    )
-    monkeypatch.setattr(
-        wrapper_module, "_graph_api", lambda _: SimpleNamespace(is_current_stream_capturing=lambda: False)
-    )
-    prepare = Mock(side_effect=AssertionError("mixed NPU histories must not enter the arena"))
-    monkeypatch.setattr(wrapper_module, "_pad_query_for_capture", prepare)
-    result = WholeEulerCFMGraphWrapper.replay(
-        wrapper,
-        x=SimpleNamespace(device=device, shape=(2, 4, 8)),
-        mu_cfg=torch.zeros(4, 4, 8),
-        speakers_cfg=torch.zeros(4, 4),
-        cond_cfg=torch.zeros(4, 4, 8),
-        cnn_cache=None,
-        att_cache=[torch.zeros(1, 1, 2, 1, 1, length, 2) for length in [4, 8]],
-        valid_lengths=[8, 8],
-        attn_mask=torch.ones(4, 8, 16, dtype=torch.bool),
-    )
-    assert result is None
-    prepare.assert_not_called()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")

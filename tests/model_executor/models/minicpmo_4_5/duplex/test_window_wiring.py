@@ -10,7 +10,6 @@ Covers:
    - Request 1: normal decode (untouched)
    - Request 2: triggers window trim with delta=32
 4. Scheduler-side watermark detection and reanchor plan attachment without full re-prefill.
-5. Barge-in / abort safety ensuring zero leaked blocks.
 """
 
 from __future__ import annotations
@@ -83,35 +82,6 @@ def _forward_rope(x_raw: torch.Tensor, pos: int, inv_freq: torch.Tensor) -> torc
     sin = torch.sin(angle).to(dtype=x_raw.dtype).unsqueeze(0).unsqueeze(1)
     x1, x2 = x_raw[..., :half], x_raw[..., half:]
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-
-def test_worker_block_table_compaction():
-    """Verify that shifting block table entries on the worker is exact and zero-copy."""
-    # Simulate a request with 7 physical blocks: [B0, B1, Gap0, Gap1, B2, B3, B4]
-    sink_blocks = 2
-    gap_blocks = 2
-    num_blocks = 7
-    initial_blocks = [101, 102, 201, 202, 301, 302, 303]
-
-    table_np = np.zeros((4, 32), dtype=np.int32)
-    num_blocks_per_row = np.zeros(4, dtype=np.int32)
-
-    row_idx = 1
-    table_np[row_idx, :num_blocks] = initial_blocks
-    num_blocks_per_row[row_idx] = num_blocks
-
-    # Worker-side compaction helper
-    total = int(num_blocks_per_row[row_idx])
-    assert total == 7
-    table_np[row_idx, sink_blocks : total - gap_blocks] = table_np[row_idx, sink_blocks + gap_blocks : total]
-    table_np[row_idx, total - gap_blocks : total] = 0
-    num_blocks_per_row[row_idx] -= gap_blocks
-
-    assert num_blocks_per_row[row_idx] == 5
-    compacted = list(table_np[row_idx, :5])
-    assert compacted == [101, 102, 301, 302, 303]
-    # Zeroed out tail
-    assert list(table_np[row_idx, 5:7]) == [0, 0]
 
 
 def test_rotate_cached_keys_attention_equivalence():
@@ -304,43 +274,6 @@ def test_scheduler_reanchor_planning_and_no_full_reprefill():
     assert target - BLOCK_SIZE < retained <= target
     # Total retained equals sink_end + retained tail
     assert (8090 + 12) - plan.delta == plan.sink_end + ((8090 + 12) - plan.moved_from)
-
-
-def test_barge_in_abort_safety():
-    """Verify that aborting a request during/after reanchor does not leak blocks."""
-    # Simulate a mini block allocator
-    free_blocks = set(range(100))
-    allocated = {}
-
-    def alloc(req_id, count):
-        blocks = [free_blocks.pop() for _ in range(count)]
-        allocated[req_id] = blocks
-        return blocks
-
-    def free_blocks_range(req_id, start, end):
-        blocks = allocated[req_id]
-        freed = blocks[start:end]
-        for b in freed:
-            free_blocks.add(b)
-        allocated[req_id] = blocks[:start] + blocks[end:]
-
-    def abort_request(req_id):
-        blocks = allocated.pop(req_id, [])
-        for b in blocks:
-            free_blocks.add(b)
-
-    # Req A allocates 8 blocks
-    alloc("req-a", 8)
-    assert len(free_blocks) == 92
-
-    # Trim: free gap blocks [2:4] (2 blocks)
-    free_blocks_range("req-a", 2, 4)
-    assert len(free_blocks) == 94
-    assert len(allocated["req-a"]) == 6
-
-    # User barges in -> abort!
-    abort_request("req-a")
-    assert len(free_blocks) == 100  # ALL blocks successfully returned, zero leak!
 
 
 def test_scheduler_worker_end_to_end_state_agreement():
@@ -808,65 +741,6 @@ def test_assert_uniform_position_shift():
     # 5. Invalid rank
     with pytest.raises(ValueError, match="expected a \\(rows, tokens\\) position tensor"):
         assert_uniform_position_shift(pos_1d.unsqueeze(0).unsqueeze(0), moved_from=32)
-
-
-def test_session_mode_location_on_model_config():
-    """Verify session_mode is read from vllm_config.model_config, not vllm_config."""
-    # Production layout: session_mode is in model_config
-    valid_cfg = SimpleNamespace(
-        model_config=SimpleNamespace(model_stage="llm", session_mode="duplex", max_model_len=40960),
-        cache_config=SimpleNamespace(block_size=16),
-    )
-    assert getattr(getattr(valid_cfg, "model_config", None), "session_mode", None) == "duplex"
-
-    # Buggy layout: session_mode on vllm_config directly was never populated in vllm-omni
-    buggy_cfg = SimpleNamespace(
-        session_mode="duplex",
-        model_config=SimpleNamespace(model_stage="llm", max_model_len=40960),
-        cache_config=SimpleNamespace(block_size=16),
-    )
-    assert getattr(getattr(buggy_cfg, "model_config", None), "session_mode", None) != "duplex"
-
-
-def test_scheduler_replace_streaming_prompt_bypasses_reanchor():
-    """Verify that when replace_streaming_prompt is True, re-anchoring is bypassed."""
-    reanchor_called = []
-
-    class MockScheduler:
-        def _release_replaced_streaming_prompt_cache(self, session):
-            session.released = True
-
-        def _replace_streaming_session(self, session, update):
-            session.replaced = True
-
-        def _maybe_reanchor_minicpmo45_stage0_window(self, session, update):
-            reanchor_called.append(True)
-
-        def _update_request_as_session(self, session, update):
-            stage_id = 0
-            update_infos = [{"meta": {"replace_streaming_prompt": True}}]
-
-            replace_streaming_prompt = any(
-                isinstance(info, dict)
-                and isinstance(info.get("meta"), dict)
-                and info["meta"].get("replace_streaming_prompt") is True
-                for info in update_infos
-            )
-            if replace_streaming_prompt:
-                self._release_replaced_streaming_prompt_cache(session)
-                self._replace_streaming_session(session, update)
-                return
-
-            if stage_id == 0:
-                self._maybe_reanchor_minicpmo45_stage0_window(session, update)
-
-    sched = MockScheduler()
-    session = SimpleNamespace(released=False, replaced=False)
-    sched._update_request_as_session(session, None)
-
-    assert session.released is True
-    assert session.replaced is True
-    assert len(reanchor_called) == 0, "Re-anchoring must not be called when replacing streaming prompt!"
 
 
 def test_reanchor_ordinary_append_fallback_rebuild_sequence():
