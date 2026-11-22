@@ -305,7 +305,6 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     # Keep output helpers and --help usable without initializing the inference runtime.
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
 
@@ -316,9 +315,10 @@ def main() -> None:
         model_class_name="Cosmos3NanoSimAutoPipeline",
         deploy_config=args.deploy_config,
         enforce_eager=True,
-        parallel_config=DiffusionParallelConfig(
-            tensor_parallel_size=args.tensor_parallel_size, ulysses_degree=args.ulysses_degree
-        ),
+        # Flat, not a nested parallel_config: with a deploy YAML the nested form is an
+        # orchestrator-only key that never reaches the stage, which then runs on one GPU.
+        tensor_parallel_size=args.tensor_parallel_size,
+        ulysses_degree=args.ulysses_degree,
     )
     for index, request in enumerate(requests):
         # imaginaire4 applies --seed unchanged to every sample of an input file.
