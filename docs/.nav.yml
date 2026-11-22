@@ -3,6 +3,7 @@ nav:
 - User Guide:
   - Getting Started:
     - getting_started/quickstart.md
+    - Consumer Devices (8 GiB and below): getting_started/consumer_devices.md
     - getting_started/installation/*
   - Serving:
     - API Server:
