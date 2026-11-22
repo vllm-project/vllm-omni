@@ -1049,3 +1049,92 @@ def test_native_lora_delta_matches_between_cpu_and_cuda(tmp_path):
         torch.testing.assert_close(cuda_delta.cpu(), cpu_delta, msg=f"delta mismatch for {module_name}")
         checked += 1
     assert checked == _EXPECTED_NATIVE_SLICE_PAIRS
+
+
+def _native_hook_pipeline(lora_application: str = "runtime"):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline.od_config = SimpleNamespace(
+        step_execution=False,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        lora_application=lora_application,
+    )
+    pipeline._turbo_lora_specs = {}
+    pipeline._native_lora_specs = {}
+    return pipeline
+
+
+@pytest.mark.cpu
+def test_native_lora_composition_rejected_on_cold_load(monkeypatch, tmp_path):
+    """A cold FlashGen + PEFT stack registers only its composed ID; the guard must still fire."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_native(path)
+    native = _request(path)
+    peft = LoRARequest(lora_name="peft", lora_int_id=8, lora_path=str(tmp_path / "peft"))
+    composed_id = 999
+
+    class _Manager:
+        def list_adapters(self):
+            return [composed_id]
+
+    manager = _Manager()
+    pipeline = _native_hook_pipeline()
+    pipeline._bind_diffusion_lora_manager(manager)
+    # _register_composed_adapter loads each source transiently, without registering it.
+    assert pipeline._load_diffusion_lora_adapter(lora_request=native, lora_path=path, dtype=torch.float32)
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", lambda **_: None)
+    pipeline.transformer = torch.nn.Module()
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_adapter", lambda **_: None)
+    pipeline._load_diffusion_lora_adapter(lora_request=peft, lora_path=peft.lora_path, dtype=torch.float32)
+
+    sampling = SimpleNamespace(lora_request=[native, peft], lora_scale=[1.0, 1.0])
+    with pytest.raises(OmniClientError, match="cannot be composed"):
+        pipeline._active_turbo_spec(sampling)
+
+    # Reloading the ID as an ordinary adapter clears the classification.
+    pipeline._load_diffusion_lora_adapter(lora_request=native, lora_path=path, dtype=torch.float32)
+    assert pipeline._active_turbo_spec(sampling) is None
+
+
+@pytest.mark.cpu
+def test_native_lora_rejects_merged_application(tmp_path):
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_native(path)
+    pipeline = _native_hook_pipeline("merged")
+
+    with pytest.raises(ValueError, match="--lora-application runtime"):
+        pipeline._load_diffusion_lora_adapter(lora_request=_request(path), lora_path=path, dtype=torch.float32)
+    assert pipeline._native_lora_specs == {}
+
+
+@pytest.mark.cpu
+def test_native_v2_fl2va_loads_on_combined_and_rejects_ref2va(tmp_path):
+    spec = lora_module.NativeDistilledLoRASpec(
+        DMD2SigmaSchedule.from_positions([1, 0.7, 0.4, 0.15, 0]), task="fl2va", rank=_TINY_RANK, qkv_rank=_TINY_RANK
+    )
+    path = tmp_path / "published-fl2va.safetensors"
+    _write_tiny_native(path, metadata=_v2_metadata("fl2va"), spec=spec)
+    loaded = load_minimax_h3_native_distilled_lora(
+        partition="combined", lora_request=_request(path), lora_path=path, dtype=torch.float32
+    )
+    assert loaded is not None
+    parsed = loaded[2]
+    assert parsed.task == "fl2va"
+
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "combined"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+    pipeline._turbo_lora_specs = {}
+    with pytest.raises(OmniClientError, match="active adapter requires task='fl2va', got task='ref2va'"):
+        pipeline._resolve_task("ref2va", {}, turbo_spec=None, native_spec=parsed)
