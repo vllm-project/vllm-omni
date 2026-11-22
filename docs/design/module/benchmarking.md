@@ -63,6 +63,13 @@ existing behavior.
 Request failures are logged with their cause, and the DFX assertion includes
 the completed count and the first recorded request error.
 
+For opted-in multi-stage serving diagnostics, DFX result JSON preserves one
+compact stage snapshot per measured request. The snapshot keeps generation,
+engine phase, scheduler, transfer, pipeline, and event-driven dispatch timing;
+when the server orchestrator monitor is enabled it also keeps bounded queue and
+inflight current/high-water values. Per-token latency arrays remain excluded so
+result size is bounded by the configured request and stage counts.
+
 DFX's opt-in `--require-baseline` validates metrics with the same 10% regression
 tolerance as `--assert-baseline`, but fails when the measured hardware has no
 matching baseline. Existing `--assert-baseline` callers retain their warning and

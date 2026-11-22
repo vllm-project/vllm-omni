@@ -422,6 +422,12 @@ Each 1-second window records:
 
 On shutdown the server also logs a short summary (`loop_active_pct`, per-replica queue averages/maxima).
 
+If a request also sets `return_stage_metrics=true`, each finished-stage snapshot
+includes a bounded `orchestrator_snapshot` with current and run-high-water
+dispatch depth plus per-replica output-queue and inflight values. This makes the
+same signals available in serving benchmark result JSON without parsing the
+shutdown file.
+
 `loop_idle` and `loop_active` count loop iterations, so their absolute scale is
 tied to which orchestration loop is running. Under the legacy poll loop
 (`VLLM_OMNI_EVENT_DRIVEN_ORCH=0`) an idle orchestrator records roughly one

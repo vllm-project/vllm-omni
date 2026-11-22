@@ -88,6 +88,14 @@ class StageRequestStats:
     # Diffusion scheduler admission wait for this stage, in milliseconds.
     # None means the output did not carry scheduler_queue_wait_ms.
     scheduler_queue_wait_ms: float | None = None
+    # Residence in the event-driven orchestrator's central dispatch queue.
+    # Values are per finished stage segment; the snapshot merge sums totals
+    # and batch counts while retaining the largest single-batch wait.
+    orchestrator_dispatch_wait_ms: float | None = None
+    orchestrator_dispatch_wait_max_ms: float | None = None
+    orchestrator_dispatch_batches: int | None = None
+    # Bounded queue/inflight diagnostics captured when this stage finishes.
+    orchestrator_snapshot: dict[str, Any] | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -151,6 +159,7 @@ STAGE_EXCLUDE = {
     "finish_reason",
     "pipeline_timings",
     "scheduler_queue_wait_ms",
+    "orchestrator_snapshot",
 }
 # Duplex logs one StageRequestStats table per response. Chunk submits refresh
 # ``request_timestamp``, so serving_time_to_first_output_ms is often a clamped
@@ -218,6 +227,9 @@ def _apply_merged_stage_stats(template: StageRequestStats, merged: dict[str, obj
     stats.num_tokens_in = _as_int(merged.get(defs.NUM_TOKENS_IN))
     stats.num_tokens_out = _as_int(merged.get(defs.NUM_TOKENS_OUT))
     stats.stage_gen_time_ms = _as_float(merged.get(defs.STAGE_GEN_TIME_MS))
+    stats.rx_transfer_bytes = _as_int(merged.get("rx_transfer_bytes"))
+    stats.rx_decode_time_ms = _as_float(merged.get("rx_decode_time_ms"))
+    stats.rx_in_flight_time_ms = _as_float(merged.get("rx_in_flight_time_ms"))
     stats.postprocess_time_ms = _as_float(merged.get(defs.POSTPROCESS_TIME_MS))
     stats.audio_generated_frames = _as_int(merged.get(defs.AUDIO_FRAMES))
     stats.audio_sample_rate = _as_int(merged.get(defs.AUDIO_SAMPLE_RATE))
@@ -239,6 +251,41 @@ def _apply_merged_stage_stats(template: StageRequestStats, merged: dict[str, obj
     stats.vllm_tpot_ms = _as_float(merged.get(defs.VLLM_TPOT_MS))
     stats.vllm_itls_ms = _as_float_list(merged.get(defs.VLLM_ITLS_MS))
     stats.vllm_itl_ms = _as_float(merged.get(defs.VLLM_ITL_MS))
+    for field in (defs.VLLM_QUEUED_MS, defs.VLLM_PREFILL_MS, defs.VLLM_DECODE_MS):
+        value = merged.get(field)
+        setattr(stats, field, float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None)
+    preemptions = merged.get(defs.VLLM_NUM_PREEMPTIONS)
+    stats.vllm_num_preemptions = (
+        int(preemptions) if isinstance(preemptions, int | float) and not isinstance(preemptions, bool) else None
+    )
+    scheduler_wait = merged.get(defs.SCHEDULER_QUEUE_WAIT_MS)
+    stats.scheduler_queue_wait_ms = (
+        float(scheduler_wait)
+        if isinstance(scheduler_wait, int | float) and not isinstance(scheduler_wait, bool)
+        else None
+    )
+    dispatch_wait = merged.get(defs.ORCHESTRATOR_DISPATCH_WAIT_MS)
+    stats.orchestrator_dispatch_wait_ms = (
+        float(dispatch_wait) if isinstance(dispatch_wait, int | float) and not isinstance(dispatch_wait, bool) else None
+    )
+    dispatch_wait_max = merged.get(defs.ORCHESTRATOR_DISPATCH_WAIT_MAX_MS)
+    stats.orchestrator_dispatch_wait_max_ms = (
+        float(dispatch_wait_max)
+        if isinstance(dispatch_wait_max, int | float) and not isinstance(dispatch_wait_max, bool)
+        else None
+    )
+    dispatch_batches = merged.get(defs.ORCHESTRATOR_DISPATCH_BATCHES)
+    stats.orchestrator_dispatch_batches = (
+        int(dispatch_batches)
+        if isinstance(dispatch_batches, int | float) and not isinstance(dispatch_batches, bool)
+        else None
+    )
+    pipeline_timings = merged.get("pipeline_timings")
+    stats.pipeline_timings = dict(pipeline_timings) if isinstance(pipeline_timings, dict) else None
+    orchestrator_snapshot = merged.get(defs.ORCHESTRATOR_SNAPSHOT)
+    stats.orchestrator_snapshot = (
+        copy.deepcopy(orchestrator_snapshot) if isinstance(orchestrator_snapshot, dict) else None
+    )
     return stats
 
 
@@ -622,6 +669,9 @@ class OrchestratorAggregator:
             current.update(
                 {
                     defs.STAGE_GEN_TIME_MS: float(evt.stage_gen_time_ms),
+                    "rx_transfer_bytes": int(evt.rx_transfer_bytes),
+                    "rx_decode_time_ms": float(evt.rx_decode_time_ms),
+                    "rx_in_flight_time_ms": float(evt.rx_in_flight_time_ms),
                     defs.POSTPROCESS_TIME_MS: float(evt.postprocess_time_ms),
                     defs.AUDIO_FRAMES: int(evt.audio_generated_frames),
                     defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
@@ -641,6 +691,24 @@ class OrchestratorAggregator:
                     defs.VLLM_ITLS_MS: list(evt.vllm_itls_ms or []),
                 }
             )
+            if evt.pipeline_timings:
+                current["pipeline_timings"] = dict(evt.pipeline_timings)
+            if evt.scheduler_queue_wait_ms is not None:
+                current[defs.SCHEDULER_QUEUE_WAIT_MS] = float(evt.scheduler_queue_wait_ms)
+            for field in (defs.VLLM_QUEUED_MS, defs.VLLM_PREFILL_MS, defs.VLLM_DECODE_MS):
+                value = getattr(evt, field)
+                if value is not None:
+                    current[field] = float(value)
+            if evt.vllm_num_preemptions is not None:
+                current[defs.VLLM_NUM_PREEMPTIONS] = int(evt.vllm_num_preemptions)
+            if evt.orchestrator_dispatch_wait_ms is not None:
+                current[defs.ORCHESTRATOR_DISPATCH_WAIT_MS] = float(evt.orchestrator_dispatch_wait_ms)
+            if evt.orchestrator_dispatch_wait_max_ms is not None:
+                current[defs.ORCHESTRATOR_DISPATCH_WAIT_MAX_MS] = float(evt.orchestrator_dispatch_wait_max_ms)
+            if evt.orchestrator_dispatch_batches is not None:
+                current[defs.ORCHESTRATOR_DISPATCH_BATCHES] = int(evt.orchestrator_dispatch_batches)
+            if evt.orchestrator_snapshot is not None:
+                current[defs.ORCHESTRATOR_SNAPSHOT] = copy.deepcopy(evt.orchestrator_snapshot)
             return current
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
@@ -650,6 +718,11 @@ class OrchestratorAggregator:
         if not collect_stage_metrics:
             return current
         current[defs.STAGE_GEN_TIME_MS] = float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) + float(evt.stage_gen_time_ms)
+        current["rx_transfer_bytes"] = int(current.get("rx_transfer_bytes", 0)) + int(evt.rx_transfer_bytes)
+        current["rx_decode_time_ms"] = float(current.get("rx_decode_time_ms", 0.0)) + float(evt.rx_decode_time_ms)
+        current["rx_in_flight_time_ms"] = float(current.get("rx_in_flight_time_ms", 0.0)) + float(
+            evt.rx_in_flight_time_ms
+        )
         current[defs.POSTPROCESS_TIME_MS] = float(current.get(defs.POSTPROCESS_TIME_MS, 0.0)) + float(
             evt.postprocess_time_ms
         )
@@ -698,6 +771,36 @@ class OrchestratorAggregator:
         vllm_itls.extend(list(evt.vllm_itls_ms or []))
         current[defs.VLLM_ITLS_MS] = vllm_itls
         current[defs.VLLM_ITL_MS] = sum(vllm_itls) / float(len(vllm_itls)) if vllm_itls else 0.0
+
+        if evt.pipeline_timings:
+            current["pipeline_timings"] = dict(evt.pipeline_timings)
+        if evt.scheduler_queue_wait_ms is not None:
+            current[defs.SCHEDULER_QUEUE_WAIT_MS] = float(current.get(defs.SCHEDULER_QUEUE_WAIT_MS, 0.0)) + float(
+                evt.scheduler_queue_wait_ms
+            )
+        for field in (defs.VLLM_QUEUED_MS, defs.VLLM_PREFILL_MS, defs.VLLM_DECODE_MS):
+            value = getattr(evt, field)
+            if value is not None:
+                current[field] = float(current.get(field, 0.0)) + float(value)
+        if evt.vllm_num_preemptions is not None:
+            current[defs.VLLM_NUM_PREEMPTIONS] = int(current.get(defs.VLLM_NUM_PREEMPTIONS, 0)) + int(
+                evt.vllm_num_preemptions
+            )
+        if evt.orchestrator_dispatch_wait_ms is not None:
+            current[defs.ORCHESTRATOR_DISPATCH_WAIT_MS] = float(
+                current.get(defs.ORCHESTRATOR_DISPATCH_WAIT_MS, 0.0)
+            ) + float(evt.orchestrator_dispatch_wait_ms)
+        if evt.orchestrator_dispatch_wait_max_ms is not None:
+            current[defs.ORCHESTRATOR_DISPATCH_WAIT_MAX_MS] = max(
+                float(current.get(defs.ORCHESTRATOR_DISPATCH_WAIT_MAX_MS, 0.0)),
+                float(evt.orchestrator_dispatch_wait_max_ms),
+            )
+        if evt.orchestrator_dispatch_batches is not None:
+            current[defs.ORCHESTRATOR_DISPATCH_BATCHES] = int(current.get(defs.ORCHESTRATOR_DISPATCH_BATCHES, 0)) + int(
+                evt.orchestrator_dispatch_batches
+            )
+        if evt.orchestrator_snapshot is not None:
+            current[defs.ORCHESTRATOR_SNAPSHOT] = copy.deepcopy(evt.orchestrator_snapshot)
 
         output_count = int(current.get(defs.OUTPUT_UNIT_COUNT, 0))
         remaining_ms = max(
@@ -832,7 +935,7 @@ class OrchestratorAggregator:
             return
         bucket = self.diffusion_metrics[req_id]
         for key, value in diffusion_metrics.items():
-            if value is None:
+            if isinstance(value, bool) or not isinstance(value, int | float):
                 continue
             if key in self._MS_TO_S:
                 bucket[self._MS_TO_S[key]] += float(value) / 1000.0

@@ -1606,6 +1606,9 @@ async def test_async_chunk_raw_terminal_without_processed_output_finishes_reques
         assert output_msg.finished is True
         assert output_msg.engine_outputs.finished is True
         assert output_msg.engine_outputs.outputs[0].multimodal_output["audio"].numel() == 0
+        assert output_msg.metrics is not None
+        assert output_msg.metrics.orchestrator_dispatch_batches == 1
+        assert output_msg.metrics.orchestrator_dispatch_wait_ms >= 0.0
         await _wait_for(lambda: request.request_id not in orchestrator_fixture.orchestrator.request_states)
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -3169,6 +3172,7 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-stream": req_state}
     orchestrator.stage_pools = [pool]
+    orchestrator._orch_monitor = SimpleNamespace(snapshot=lambda: {"dispatch_queue_high_water": 4})
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -3176,11 +3180,19 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
 
     orchestrator._route_output = record_route
     output = SimpleNamespace(request_id="req-stream", error=None, finished=False)
+    orchestrator._record_dispatch_residence(0, [output, output], 2.5)
 
     await orchestrator._handle_processed_outputs(0, 0, [output])
 
     assert pool.calls == [[output]]
     assert routed == [built_metrics]
+    assert built_metrics.orchestrator_dispatch_wait_ms == pytest.approx(2.5)
+    assert built_metrics.orchestrator_dispatch_wait_max_ms == pytest.approx(2.5)
+    assert built_metrics.orchestrator_dispatch_batches == 1
+    assert built_metrics.orchestrator_snapshot == {"dispatch_queue_high_water": 4}
+    assert req_state.dispatch_wait_total_ms == {}
+    assert req_state.dispatch_wait_max_ms == {}
+    assert req_state.dispatch_batches == {}
 
 
 @pytest.mark.asyncio

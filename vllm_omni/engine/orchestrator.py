@@ -82,7 +82,12 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
+from vllm_omni.engine.orchestrator_monitor import (
+    _NULL_ORCH_MONITOR,
+    OrchestratorMonitorBase,
+    create_orch_monitor,
+    replica_key,
+)
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
@@ -370,6 +375,11 @@ class OrchestratorRequestState:
 
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
+    # Event-driven central-dispatch residence accumulated until a stage
+    # segment finishes and consumes the values into StageRequestStats.
+    dispatch_wait_total_ms: dict[int, float] = field(default_factory=dict)
+    dispatch_wait_max_ms: dict[int, float] = field(default_factory=dict)
+    dispatch_batches: dict[int, int] = field(default_factory=dict)
     # A session-owned request's lifetime belongs to a session (duplex), not to
     # its own ``finished`` flag: no synthetic terminal on the client queue, no
     # client emission of stage-0 segment ends, no terminal re-forward, no
@@ -468,6 +478,7 @@ class OrchestratorBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    _orch_monitor: OrchestratorMonitorBase = _NULL_ORCH_MONITOR
     collect_stage_metrics: bool = True
     tracer: Tracer | None = None
 
@@ -1090,6 +1101,30 @@ class OrchestratorBase:
                 samples[key] = pool.replica_monitor_sample(replica_id)
         return samples
 
+    def _record_dispatch_residence(
+        self,
+        stage_id: int,
+        outputs: list[Any],
+        wait_ms: float,
+        raw_terminal_request_ids: set[str] | None = None,
+    ) -> None:
+        """Attribute one ready-queue residence sample to each request in a batch."""
+        request_ids = {str(request_id) for request_id in (raw_terminal_request_ids or ())}
+        for output in outputs:
+            request_id = getattr(output, "request_id", None)
+            if request_id is None:
+                continue
+            request_ids.add(str(request_id))
+
+        wait_ms = max(float(wait_ms), 0.0)
+        for request_id in request_ids:
+            req_state = self.request_states.get(request_id)
+            if req_state is None:
+                continue
+            req_state.dispatch_wait_total_ms[stage_id] = req_state.dispatch_wait_total_ms.get(stage_id, 0.0) + wait_ms
+            req_state.dispatch_wait_max_ms[stage_id] = max(req_state.dispatch_wait_max_ms.get(stage_id, 0.0), wait_ms)
+            req_state.dispatch_batches[stage_id] = req_state.dispatch_batches.get(stage_id, 0) + 1
+
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
@@ -1439,7 +1474,7 @@ class OrchestratorBase:
         task churn) is removed. Diffusion stages keep their nowait-poll contract
         via a per-pool poller task feeding the same queue.
         """
-        ready_q: asyncio.Queue[tuple[str, int, int, Any]] = asyncio.Queue()
+        ready_q: asyncio.Queue[tuple[float, str, int, int, Any]] = asyncio.Queue()
         readers: dict[tuple[int, int], tuple[asyncio.Task, Any]] = {}
         pollers: dict[int, asyncio.Task] = {}
         reaped: list[asyncio.Task] = []
@@ -1458,12 +1493,12 @@ class OrchestratorBase:
                     if raw_outputs is None:
                         await asyncio.sleep(0.001)
                         continue
-                    await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
+                    await ready_q.put((_time.perf_counter(), "llm", stage_id, replica_id, raw_outputs))
                     self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
-                await ready_q.put(("error", stage_id, replica_id, e))
+                await ready_q.put((_time.perf_counter(), "error", stage_id, replica_id, e))
 
         async def _diffusion_poller(stage_id: int, pool: StagePool) -> None:
             try:
@@ -1473,18 +1508,18 @@ class OrchestratorBase:
                         try:
                             output = pool.poll_diffusion_output(replica_id)
                         except EngineDeadError as e:
-                            await ready_q.put(("error", stage_id, replica_id, e))
+                            await ready_q.put((_time.perf_counter(), "error", stage_id, replica_id, e))
                             continue
                         if output is None:
                             continue
-                        await ready_q.put(("diffusion", stage_id, replica_id, output))
+                        await ready_q.put((_time.perf_counter(), "diffusion", stage_id, replica_id, output))
                         self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
                         got = True
                     await asyncio.sleep(0 if got else 0.001)
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
-                await ready_q.put(("error", stage_id, -1, e))
+                await ready_q.put((_time.perf_counter(), "error", stage_id, -1, e))
 
         def _reconcile_readers() -> None:
             """Track available replicas: spawn/reap LLM readers and diffusion pollers.
@@ -1618,8 +1653,9 @@ class OrchestratorBase:
                     if not done:
                         self._orch_monitor.note_loop(idle=True)
                     continue
-                kind, stage_id, replica_id, payload = pending_get.result()
+                enqueued_at, kind, stage_id, replica_id, payload = pending_get.result()
                 pending_get = None
+                dispatch_wait_ms = max((_time.perf_counter() - enqueued_at) * 1000.0, 0.0)
                 # Record the queue after dequeue so the gauge reflects work
                 # still waiting for dispatch rather than producer-side depth.
                 self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
@@ -1683,6 +1719,12 @@ class OrchestratorBase:
                     )
                     raise
 
+                self._record_dispatch_residence(
+                    stage_id,
+                    processed,
+                    dispatch_wait_ms,
+                    raw_terminal_request_ids,
+                )
                 await self._handle_processed_outputs(stage_id, replica_id, processed)
                 await self._finish_raw_terminal_requests(stage_id, replica_id, raw_terminal_request_ids)
                 # Mirrors the legacy loop, which sets idle=False only after a
@@ -1762,6 +1804,12 @@ class OrchestratorBase:
             req_state.pipeline_timings["queue_wait_ms"] = req_state.pipeline_timings.get("queue_wait_ms", 0.0) + wait_ms
         if self.collect_stage_metrics:
             stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+            stage_metrics.orchestrator_snapshot = self._orch_monitor.snapshot()
+        dispatch_batches = req_state.dispatch_batches.pop(stage_id, None)
+        if dispatch_batches is not None:
+            stage_metrics.orchestrator_dispatch_wait_ms = req_state.dispatch_wait_total_ms.pop(stage_id, 0.0)
+            stage_metrics.orchestrator_dispatch_wait_max_ms = req_state.dispatch_wait_max_ms.pop(stage_id, 0.0)
+            stage_metrics.orchestrator_dispatch_batches = dispatch_batches
         return stage_metrics
 
     async def _handle_stage_error(
@@ -2396,13 +2444,19 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=pool._infer_audio_sample_rate(),
             )
+            stage_metrics = self._attach_finished_stage_metrics(
+                stage_id,
+                replica_id,
+                terminal_output,
+                req_state,
+            )
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=request_id,
                     stage_id=stage_id,
                     replica_id=replica_id,
                     engine_outputs=terminal_output,
-                    metrics=None,
+                    metrics=stage_metrics,
                     finished=True,
                     stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
                 )
