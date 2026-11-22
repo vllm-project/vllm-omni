@@ -62,10 +62,7 @@ def test_asset_downloads_use_hf_cache_and_http_cache(tmp_path: Path, monkeypatch
 
 
 @pytest.mark.parametrize("kind", ["legacy", "cookbook"])
-@pytest.mark.parametrize("use_overrides", [False, True])
-def test_runner_batch_status_and_camera_poses(
-    tmp_path: Path, monkeypatch, runner, kind: str, use_overrides: bool
-) -> None:
+def test_runner_batch_status_and_camera_poses(tmp_path: Path, monkeypatch, runner, kind: str) -> None:
     imageio = pytest.importorskip("imageio.v2")
     pytest.importorskip("imageio_ffmpeg")
     artifact = manifest(kind)
@@ -124,8 +121,6 @@ def test_runner_batch_status_and_camera_poses(
             str(output_dir),
         ],
     )
-    if use_overrides:
-        sys.argv.extend(["--deploy-config", str(ROOT / "vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml")])
     calls = []
     engines = []
 
@@ -166,8 +161,8 @@ def test_runner_batch_status_and_camera_poses(
         assert Path(status["output"]).parent == output_dir
         assert params.extra_args["reset"] and params.extra_args["close_session"]
         assert params.guidance_scale == 1 and params.num_inference_steps is None
-        assert status["window_frames"] == (226 if use_overrides else artifact.window_frames)
-        assert status["num_steps_by_frame"] == ([4, 2] if use_overrides else [4])
+        assert status["window_frames"] == artifact.window_frames
+        assert status["num_steps"] == len(artifact.t_list)
         assert params.seed == params.generator.initial_seed()
         assert status["action_contract_sha256"] == artifact.action_contract_sha256
     assert [params.seed for _, params in calls] == [7, 13, 99]

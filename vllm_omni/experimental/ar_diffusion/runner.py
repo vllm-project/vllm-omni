@@ -214,7 +214,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         ):
             self._validate_dynamic_capacity(capability, budget)
             self._dynamic_capacity_validated = True
-        self.ar_diffusion_kv_config = config
+        # Keep deployment overrides separate from this resolved allocation;
+        # otherwise its window becomes an override for every later request.
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
         self.kv_cache = ARDiffusionKVCache(

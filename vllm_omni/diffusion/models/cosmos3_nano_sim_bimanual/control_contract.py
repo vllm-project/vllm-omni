@@ -3,14 +3,15 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, field_validator, model_validator
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import (
     Cosmos3NanoSimBimanualActionSchema,
     canonical_sha256,
 )
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.unified_action_contract import UnifiedActionConditioning
 
 TRANSFER_HINTS = ("edge", "blur", "depth", "seg")
 TRANSFER_SYSTEM_PROMPT_ID = "cosmos3_transfer_v1"
@@ -63,10 +64,11 @@ class Cosmos3NanoSimBimanualControlVideoConditioning(BaseModel):
         return canonical_sha256(self.model_dump(mode="json"))
 
 
-Cosmos3NanoSimBimanualConditioning = Annotated[
-    Cosmos3NanoSimBimanualActionConditioning | Cosmos3NanoSimBimanualControlVideoConditioning,
-    Field(discriminator="mode"),
-]
+Cosmos3NanoSimBimanualConditioning = (
+    Cosmos3NanoSimBimanualActionConditioning
+    | UnifiedActionConditioning
+    | Cosmos3NanoSimBimanualControlVideoConditioning
+)
 _CONDITIONING_ADAPTER = TypeAdapter(Cosmos3NanoSimBimanualConditioning)
 
 

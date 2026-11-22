@@ -57,7 +57,7 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
         tokens_per_frame: int,
         action_tokens_per_frame: int,
         null_action_frame_indexes: tuple[int, ...] = (),
-        clean_history_window: tuple[int, int] | None = None,
+        clean_history_window: tuple[int, int | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] != 1:
             raise ValueError(
@@ -109,14 +109,14 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
             # remain batched, while each attention sees its sequential prefix.
             sink_frames, window_frames = clean_history_window
             sink_tokens = sink_frames * tokens_per_frame
-            tail_tokens = window_frames * tokens_per_frame
+            tail_tokens = window_frames * tokens_per_frame if window_frames is not None else None
             history_k, history_v = dense_history if dense_history is not None else (k[:, :0], v[:, :0])
             outputs = []
             for frame in range(num_frames):
                 start, end = frame * tokens_per_frame, (frame + 1) * tokens_per_frame
                 key = torch.cat([history_k, k[:, :start]], dim=1)
                 value = torch.cat([history_v, v[:, :start]], dim=1)
-                if key.shape[1] > sink_tokens + tail_tokens:
+                if tail_tokens is not None and key.shape[1] > sink_tokens + tail_tokens:
                     key = torch.cat([key[:, :sink_tokens], key[:, -tail_tokens:]], dim=1)
                     value = torch.cat([value[:, :sink_tokens], value[:, -tail_tokens:]], dim=1)
                 outputs.append(
@@ -366,7 +366,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         condition_vision: bool = False,
         null_action_frame_indexes: tuple[int, ...] = (),
         frame_causal: bool = False,
-        history_window: tuple[int, int] | None = None,
+        history_window: tuple[int, int | None] | None = None,
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         """Denoise or clean-commit one current chunk.
 
@@ -439,7 +439,14 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                 "Cosmos3-Nano-Sim-Bimanual actions must have shape "
                 f"{expected_action_shape}, got {tuple(action_latents.shape)}"
             )
-        action_hidden = self.action_proj_in(action_latents, action_domain_ids)
+        if action_domain_ids.ndim == 2:
+            if action_domain_ids.shape != action_latents.shape[:2]:
+                raise ValueError("Per-token domain IDs must match [batch, action tokens]")
+            action_hidden = self.action_proj_in(
+                action_latents.reshape(-1, self.action_dim), action_domain_ids.reshape(-1)
+            ).reshape(1, num_frames * action_count, self.hidden_size)
+        else:
+            action_hidden = self.action_proj_in(action_latents, action_domain_ids)
         action_hidden = action_hidden + self.action_modality_embed.to(action_hidden.dtype)
         action_hidden = action_hidden.view(1, num_frames, action_count, self.hidden_size)
         hidden = interleave_action_vision_tokens(action_hidden, vision_tokens)

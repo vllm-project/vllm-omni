@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract impor
     Cosmos3NanoSimBimanualControlVideoConditioning,
     parse_cosmos3_nano_sim_bimanual_conditioning,
 )
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.unified_action_contract import UnifiedActionConditioning
 
 COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION = 1
 COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS = frozenset(
@@ -181,7 +182,9 @@ def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": _strict_int(artifact["schema_version"], "schema_version"),
         "chunk_size": _strict_int(artifact["chunk_size"], "chunk_size"),
-        "window_frames": _strict_int(artifact["window_frames"], "window_frames"),
+        "window_frames": None
+        if artifact["window_frames"] is None
+        else _strict_int(artifact["window_frames"], "window_frames"),
         "sink_frames": _strict_int(artifact["sink_frames"], "sink_frames", positive=False),
         "text_cache_max_len": _strict_int(artifact["text_cache_max_len"], "text_cache_max_len"),
         "latent_patch_size": _strict_int(artifact["latent_patch_size"], "latent_patch_size"),
@@ -215,7 +218,7 @@ class Cosmos3NanoSimBimanualManifest:
 
     schema_version: int = COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION
     chunk_size: int = 4
-    window_frames: int = 96
+    window_frames: int | None = 96
     sink_frames: int = 0
     text_cache_max_len: int = 512
     latent_patch_size: int = 2
@@ -243,7 +246,6 @@ class Cosmos3NanoSimBimanualManifest:
             )
         positive = {
             "chunk_size": self.chunk_size,
-            "window_frames": self.window_frames,
             "text_cache_max_len": self.text_cache_max_len,
             "latent_patch_size": self.latent_patch_size,
             "vae_spatial_compression_factor": self.vae_spatial_compression_factor,
@@ -251,6 +253,11 @@ class Cosmos3NanoSimBimanualManifest:
             "temporal_modality_margin": self.temporal_modality_margin,
             "num_train_timesteps": self.num_train_timesteps,
         }
+        if self.window_frames is None:
+            if self.sink_frames:
+                raise ValueError("Full history requires zero sinks")
+        else:
+            positive["window_frames"] = self.window_frames
         for name, value in positive.items():
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"Cosmos3-Nano-Sim-Bimanual manifest {name} must be a positive integer, got {value!r}")
@@ -299,15 +306,22 @@ class Cosmos3NanoSimBimanualManifest:
         if self.checkpoint_hash != "unknown" and set(self.checkpoint_hash) == {"0"}:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoint_hash cannot be the all-zero template value")
         if self.conditioning is not None and not isinstance(
-            self.conditioning, Cosmos3NanoSimBimanualActionConditioning | Cosmos3NanoSimBimanualControlVideoConditioning
+            self.conditioning,
+            Cosmos3NanoSimBimanualActionConditioning
+            | UnifiedActionConditioning
+            | Cosmos3NanoSimBimanualControlVideoConditioning,
         ):
             raise ValueError("Cosmos3-Nano-Sim-Bimanual schema v1 requires a recognized conditioning payload")
 
     @property
-    def action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | None:
-        return self.conditioning if isinstance(self.conditioning, Cosmos3NanoSimBimanualActionConditioning) else None
+    def action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | UnifiedActionConditioning | None:
+        return (
+            self.conditioning
+            if isinstance(self.conditioning, (Cosmos3NanoSimBimanualActionConditioning, UnifiedActionConditioning))
+            else None
+        )
 
-    def require_action_schema(self) -> Cosmos3NanoSimBimanualActionSchema:
+    def require_action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | UnifiedActionConditioning:
         schema = self.action_schema
         if schema is None:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual action conditioning is unavailable.")

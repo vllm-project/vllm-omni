@@ -32,13 +32,14 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_action_values
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import (
+    domains_for_frames,
+    prepare_action_values,
+    prepare_domain_ids,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualResolutionPolicy,
     resolve_cosmos3_nano_sim_bimanual_geometry,
-)
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.inference_config import (
-    Cosmos3NanoSimBimanualInferenceConfig,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
@@ -75,6 +76,8 @@ def pipeline_methods() -> type:
         "resolve_cosmos3_nano_sim_bimanual_geometry": resolve_cosmos3_nano_sim_bimanual_geometry,
         "parse_cosmos3_nano_sim_bimanual_tick": parse_cosmos3_nano_sim_bimanual_tick,
         "prepare_action_values": prepare_action_values,
+        "prepare_domain_ids": prepare_domain_ids,
+        "domains_for_frames": domains_for_frames,
         "DiffusionMediaOutput": DiffusionMediaOutput,
         "VideoMediaOutput": VideoMediaOutput,
         "VideoTensorSpec": VideoTensorSpec,
@@ -131,7 +134,6 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
 
     pipe = pipeline_methods()()
     pipe.manifest = manifest()
-    pipe.inference_config = Cosmos3NanoSimBimanualInferenceConfig.from_od_config(SimpleNamespace(), pipe.manifest)
     pipe._states = {}
     pipe._bound_session_id = None
     pipe._ar_diffusion_kv_state = None

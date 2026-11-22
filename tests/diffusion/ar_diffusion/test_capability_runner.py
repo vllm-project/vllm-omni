@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -198,6 +199,15 @@ def make_runner(
     runner._stepwise_chunk_started = {}
     runner._preallocate_kv_cache(available_bytes=available_bytes)
     return runner
+
+
+def test_allocation_does_not_pin_later_request_window():
+    pipeline = CapablePipeline(tiny_spec())
+    runner = make_runner(pipeline)
+    assert runner.ar_diffusion_kv_config.window_chunks is None
+    larger = replace(pipeline.spec, window_frames=226)
+    effective, config = runner._effective_spec(pipeline, larger)
+    assert effective.window_frames == config.window_chunks == 226
 
 
 def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
