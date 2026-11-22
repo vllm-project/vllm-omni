@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
@@ -105,6 +106,8 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_stage_max_tokens",
         "duplex_stage0_max_tokens",
         "duplex_scheduler_token_id",
+        "duplex_listen_prob_scale",
+        "duplex_listen_top_k",
         "duplex_vision_tile_pixels",
         "duplex_first_append_context_tokens",
         "ref_audio_data",
@@ -250,6 +253,41 @@ def _duplex_force_listen_count(extra_body: object) -> int:
         return 0
 
 
+def _duplex_listen_knobs(extra_body: object) -> tuple[float, int | None]:
+    """``listen_prob_scale`` / ``listen_top_k`` from the session's ``extra_body``.
+
+    The released ``streaming_generate`` takes both per call; serving keeps
+    them constant per session, and the neutral defaults (``1.0`` / ``None``)
+    leave the listen decision exactly as it stands. Invalid values fail at
+    session creation instead of silently neutralizing the request.
+    """
+    if not isinstance(extra_body, dict):
+        return 1.0, None
+    scale_raw = extra_body.get("listen_prob_scale")
+    scale = 1.0
+    if scale_raw is not None:
+        if isinstance(scale_raw, bool) or not isinstance(scale_raw, (int, float)):
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "listen_prob_scale must be a number", code="invalid_listen_prob_scale"
+            )
+        scale = float(scale_raw)
+        if not math.isfinite(scale) or scale <= 0:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "listen_prob_scale must be a finite positive number", code="invalid_listen_prob_scale"
+            )
+    top_k_raw = extra_body.get("listen_top_k")
+    top_k = None
+    if top_k_raw is not None:
+        if isinstance(top_k_raw, bool) or not isinstance(top_k_raw, int):
+            raise MiniCPMO45ClientRuntimeConfigError("listen_top_k must be an integer", code="invalid_listen_top_k")
+        if top_k_raw <= 0:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "listen_top_k must be greater than zero", code="invalid_listen_top_k"
+            )
+        top_k = int(top_k_raw)
+    return scale, top_k
+
+
 def build_duplex_data_plane_prompt(
     *,
     request_id: str,
@@ -305,6 +343,21 @@ def build_duplex_data_plane_prompt(
         and payload.get("force_listen") is not True
     ):
         payload = {**payload, "force_listen": True}
+    raw_listen_scale = runtime_config.get("duplex_listen_prob_scale")
+    try:
+        listen_scale = 1.0 if raw_listen_scale is None else float(raw_listen_scale)
+    except (TypeError, ValueError):
+        listen_scale = 1.0
+    raw_listen_top_k = runtime_config.get("duplex_listen_top_k")
+    try:
+        listen_top_k = max(0, int(raw_listen_top_k)) if raw_listen_top_k is not None else 0
+    except (TypeError, ValueError):
+        listen_top_k = 0
+    if isinstance(payload, dict) and (listen_scale != 1.0 or listen_top_k > 0):
+        # The released decoder's listen knobs, carried on the payload like
+        # force_listen. A session that did not ask for them samples exactly
+        # as before: neutral values never touch the payload.
+        payload = {**payload, "listen_prob_scale": listen_scale, "listen_top_k": listen_top_k}
     return build_duplex_append_prompt(
         request_id=request_id,
         fence=fence,
@@ -791,6 +844,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             runtime_config["initial_user_text"] = initial_user_text
         tokenizer = await self._tokenizer_for(model_config)
         _apply_default_scheduler_policy(runtime_config, config=config, tokenizer=tokenizer, model_config=model_config)
+        listen_scale, listen_top_k = _duplex_listen_knobs(extra_body)
+        runtime_config["duplex_listen_prob_scale"] = listen_scale
+        # 0 spells "absent" so the prompt builder's tolerant read maps it back
+        # to the disabled knob.
+        runtime_config["duplex_listen_top_k"] = listen_top_k if listen_top_k is not None else 0
 
         ref_audio = config.ref_audio
         extra_ref_audio = extra_body.get("ref_audio")
@@ -869,6 +927,21 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             runtime_config.get("instructions"),
             message="instructions cannot be changed after the session is created",
             code="instructions_update_unsupported",
+            error_cls=MiniCPMO45ClientRuntimeConfigError,
+        )
+        listen_scale, listen_top_k = _duplex_listen_knobs(extra_body)
+        reject_changed_runtime_value(
+            listen_scale,
+            runtime_config.get("duplex_listen_prob_scale"),
+            message="listen decision knobs cannot be changed after the session is created",
+            code="listen_knobs_update_unsupported",
+            error_cls=MiniCPMO45ClientRuntimeConfigError,
+        )
+        reject_changed_runtime_value(
+            listen_top_k if listen_top_k is not None else 0,
+            runtime_config.get("duplex_listen_top_k"),
+            message="listen decision knobs cannot be changed after the session is created",
+            code="listen_knobs_update_unsupported",
             error_cls=MiniCPMO45ClientRuntimeConfigError,
         )
         stage_max_tokens = runtime_config.get("duplex_stage_max_tokens")
