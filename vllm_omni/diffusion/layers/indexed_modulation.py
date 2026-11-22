@@ -317,15 +317,6 @@ def indexed_gate_rms_norm_scale_shift(
             input_dtype
         )
         return residual_out, modulated_out
-    if residual.device.type == "npu":
-        try:
-            from mindiesd.layers._custom_ops import eagle_indexed_gate_norm_modulate
-        except ImportError:
-            pass
-        else:
-            return eagle_indexed_gate_norm_modulate(
-                residual, gate, branch, shift, scale, indices, weight=weight, norm_type=0, eps=eps
-            )
     residual_out = torch.empty_like(residual)
     modulated_out = torch.empty_like(residual)
     rows, hidden_size = residual.shape

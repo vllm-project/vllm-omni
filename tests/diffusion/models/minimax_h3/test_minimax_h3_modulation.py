@@ -74,8 +74,6 @@ def test_launch_row_chunks_is_npu_only(device_type, expected_grids_and_offsets):
     [
         ("rms", True, 3),
         ("rms", False, 3),
-        ("gate_norm", True, 3),
-        ("gate_norm", False, 3),
         ("gate", True, 3),
         ("gate", False, 3),
         ("gate", True, 0),
@@ -87,33 +85,23 @@ def test_mindiesd_modulation_dispatch(monkeypatch, mocker, kind, available, rows
     x = mocker.Mock(is_cpu=False, device=mocker.Mock(type="npu"), shape=(rows, 128))
     gate, branch, weight, shift, scale, indices = (mocker.Mock() for _ in range(6))
     output = mocker.Mock()
-    allocate = mocker.patch.object(modulation.torch, "empty_like", side_effect=[output, mocker.sentinel.modulated])
+    allocate = mocker.patch.object(modulation.torch, "empty_like", return_value=output)
     launch = mocker.patch.object(modulation, "_launch_row_chunks")
     mocker.patch.object(modulation, "triton", mocker.Mock(next_power_of_2=lambda width: 128))
     eps = 1e-5
     args: tuple[object, ...]
     sd_args: tuple[object, ...]
-    sd_kwargs = {}
     if kind == "rms":
         call = rms_norm_indexed_scale_shift
         args = sd_args = (x, weight, shift, scale, indices, eps)
         module, symbol = "mindiesd", "rms_norm_indexed_scale_shift"
         sd_result = mocker.sentinel.normalized
-        fallback_result = output
-    elif kind == "gate_norm":
-        call = indexed_gate_rms_norm_scale_shift
-        args = (x, gate, branch, weight, shift, scale, indices, eps)
-        sd_args = (x, gate, branch, shift, scale, indices)
-        sd_kwargs = dict(weight=weight, norm_type=0, eps=eps)
-        module, symbol = "mindiesd.layers._custom_ops", "eagle_indexed_gate_norm_modulate"
-        sd_result = (mocker.sentinel.residual, mocker.sentinel.modulated)
-        fallback_result = (output, mocker.sentinel.modulated)
     else:
         call = indexed_gate
         args = (x, gate, branch, indices)
         sd_args = (output, *args)
         module, symbol = "mindiesd.layers.index_modulation", "indexed_gate"
-        sd_result = fallback_result = output
+        sd_result = output
     op = mocker.Mock(return_value=sd_result)
     interface = ModuleType(module)
     if available:
@@ -123,7 +111,7 @@ def test_mindiesd_modulation_dispatch(monkeypatch, mocker, kind, available, rows
     actual = call(*args)
 
     if available and rows:
-        op.assert_called_once_with(*sd_args, **sd_kwargs)
+        op.assert_called_once_with(*sd_args)
         launch.assert_not_called()
         assert actual == sd_result
         if kind == "gate":
@@ -132,12 +120,34 @@ def test_mindiesd_modulation_dispatch(monkeypatch, mocker, kind, available, rows
             allocate.assert_not_called()
     else:
         op.assert_not_called()
-        assert actual == fallback_result
-        assert allocate.call_count == (2 if kind == "gate_norm" else 1)
+        assert actual == output
+        allocate.assert_called_once_with(x)
         if rows:
             launch.assert_called_once()
         else:
             launch.assert_not_called()
+
+
+@pytest.mark.cpu
+def test_npu_fused_modulation_uses_omni_triton_with_eagle_installed(monkeypatch, mocker):
+    from vllm_omni.diffusion.layers import indexed_modulation as modulation
+
+    interface = ModuleType("mindiesd.layers._custom_ops")
+    eagle = mocker.Mock()
+    interface.eagle_indexed_gate_norm_modulate = eagle
+    monkeypatch.setitem(sys.modules, interface.__name__, interface)
+
+    residual = mocker.Mock(is_cpu=False, device=mocker.Mock(type="npu"), shape=(3, 128))
+    gate, branch, weight, shift, scale, indices = (mocker.Mock() for _ in range(6))
+    outputs = (mocker.sentinel.residual, mocker.sentinel.modulated)
+    mocker.patch.object(modulation.torch, "empty_like", side_effect=outputs)
+    launch = mocker.patch.object(modulation, "_launch_row_chunks")
+    mocker.patch.object(modulation, "triton", mocker.Mock(next_power_of_2=lambda width: 128))
+
+    assert indexed_gate_rms_norm_scale_shift(residual, gate, branch, weight, shift, scale, indices, 1e-5) == outputs
+    eagle.assert_not_called()
+    launch.assert_called_once()
+    assert launch.call_args.args[:5] == (modulation._indexed_gate_rms_norm_scale_shift_kernel, 3, "npu", *outputs)
 
 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
@@ -182,7 +192,7 @@ def test_modulation_wrappers_match_reference_above_grid_limit(device):
 
     updated_residual = residual.float() + indexed_gate_float * branch_float
     expected_residual = updated_residual.to(dtype)
-    normalized_residual = updated_residual
+    normalized_residual = expected_residual.float()
     normalized_residual = normalized_residual * torch.rsqrt(normalized_residual.pow(2).mean(-1, keepdim=True) + eps)
     normalized_residual = normalized_residual * weight.float()
     expected_modulated = (normalized_residual * (1.0 + indexed_scale_float) + indexed_shift_float).to(dtype)
@@ -265,6 +275,31 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
     )
 
     assert torch.equal(modulated_out, expected)
+
+
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("hidden_size", [3072, 5376])
+def test_npu_fused_modulation_preserves_bf16_residual_boundary(hidden_size):
+    device = current_omni_platform.get_torch_device()
+    residual = torch.ones(2, hidden_size, device=device, dtype=torch.bfloat16)
+    gate = torch.ones_like(residual[:1])
+    branch = torch.zeros_like(residual)
+    branch[:, 0] = 2**-8
+    weight = torch.ones_like(residual[0])
+    shift = -gate
+    scale = torch.zeros_like(gate)
+    indices = torch.zeros(residual.shape[0], device=device, dtype=torch.int64)
+
+    residual_out, modulated_out = indexed_gate_rms_norm_scale_shift(
+        residual, gate, branch, weight, shift, scale, indices, 1e-6
+    )
+
+    # The first-column update is a BF16 halfway value and rounds back to one.
+    # Subtracting one after RMSNorm exposes any use of the unrounded update.
+    assert torch.equal(residual_out, residual)
+    torch.testing.assert_close(modulated_out, torch.zeros_like(modulated_out), atol=1e-5, rtol=0)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
