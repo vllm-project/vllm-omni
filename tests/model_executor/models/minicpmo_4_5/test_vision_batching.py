@@ -211,7 +211,8 @@ def test_resampler_matches_torch_cross_attention(device, dtype, kv_dim, padded, 
     actual = model(features, tgt_sizes)
     projection.assert_called_once()
     # PyTorch multiplies by the reciprocal scale; MiniCPM keeps division.
-    atol = {torch.float32: 1e-6, torch.float16: 2e-3, torch.bfloat16: 2e-2}[dtype]
+    # CPU backends can differ by ~1.2e-6 in FP32 (AMD CI #16669).
+    atol = {torch.float32: 2e-6, torch.float16: 2e-3, torch.bfloat16: 2e-2}[dtype]
     torch.testing.assert_close(actual, reference(features, tgt_sizes), atol=atol, rtol=atol)
 
     # Padded patches must not contribute even when their values change.
