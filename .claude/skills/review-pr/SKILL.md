@@ -209,6 +209,9 @@ imports, tests, builds, hooks, or repo-configurable tooling from an untrusted
 head on the reviewer host.
 
 - Treat CI as status evidence; inspect only the first overlapping failure.
+- See the [worked PR handoff](../../../docs/contributing/ci/pr_merge_loop.md#worked-pr-handoff)
+  for an example of tracing a review finding and carrying its evidence to the
+  maintainer when the head moves.
 - For docs-only changes, use diff hygiene, links/build checks, and bounded live
   contract verification instead of dependency setup or pytest.
 - For hardware-dependent paths, run available static/CPU checks and name the
