@@ -27,6 +27,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     HostWeightPlanResult,
     TensorBinding,
+    _add_safetensors_source,
     build_checkpoint_binding_plan,
 )
 from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
@@ -2581,3 +2582,14 @@ def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpo
     else:
         assert result.plan is None
         assert "no checkpoint binding" in result.fallback_reason
+
+
+def test_host_weight_plan_reads_index_in_bracketed_folder(tmp_path):
+    folder = tmp_path / "H3[beta]"
+    folder.mkdir()
+    save_file({"w": torch.zeros(1)}, folder / "model-00001.safetensors")
+    save_file({"w": torch.ones(1)}, folder / "stray.safetensors")
+    (folder / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w": "model-00001.safetensors"}}))
+    bindings: dict[str, tuple[str, str]] = {}
+    _add_safetensors_source(str(folder), "", None, bindings)
+    assert bindings == {"w": ("w", str(folder / "model-00001.safetensors"))}

@@ -128,7 +128,9 @@ def _add_safetensors_source(
     indexed_keys = 0
     # Match the ordinary loader: explicit weight patterns bypass shard indices.
     index_files = (
-        sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors.index.json"))) if allow_patterns is None else []
+        sorted(glob.glob(os.path.join(glob.escape(checkpoint_dir), "*.safetensors.index.json")))
+        if allow_patterns is None
+        else []
     )
     if index_files:
         for index_file in index_files:
