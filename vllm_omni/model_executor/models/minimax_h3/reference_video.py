@@ -273,14 +273,18 @@ def _probe_audio(path: str) -> dict[str, Any]:
     }
 
 
-def validate_reference_audio_files(values: Any) -> None:
+def probe_reference_audio(path: str) -> dict[str, Any]:
+    return _probe_audio(path)
+
+
+def validate_reference_audio_files(values: Any, *, probe: Callable[[str], dict[str, Any]] | None = None) -> None:
     """Validate path-backed standalone audio references against the H3 spec."""
     total_duration = 0.0
     for index, value in enumerate(_audio_items(values)):
         if not isinstance(value, (str, os.PathLike)):
             continue
         source = str(value)
-        meta = _probe_audio(source)
+        meta = (probe or _probe_audio)(source)
         file_size = int(meta["file_size"])
         if file_size > MINIMAX_H3_MAX_AUDIO_BYTES:
             raise OmniClientError(f"reference audio {index} exceeds the 15 MiB size limit")
@@ -1005,6 +1009,7 @@ __all__ = [
     "load_video_frames",
     "prepare_edit_video",
     "prepare_reference_videos",
+    "probe_reference_audio",
     "reference_frame_workers",
     "sample_reference_video_frames",
     "validate_reference_audio_files",

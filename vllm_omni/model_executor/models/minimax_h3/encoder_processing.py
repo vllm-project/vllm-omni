@@ -8,8 +8,9 @@ import math
 import os
 import subprocess
 import tempfile
+from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -45,6 +46,7 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     load_video_frames,
     prepare_edit_video,
     prepare_reference_videos,
+    probe_reference_audio,
     reference_frame_workers,
     sample_reference_video_frames,
     validate_reference_audio_files,
@@ -80,14 +82,17 @@ def _audio_items(value: Any) -> list[Any]:
     return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
-def _load_audio(value: Any) -> tuple[torch.Tensor, int]:
+_AudioLoader = Callable[[str], tuple[torch.Tensor, int]]
+
+
+def _load_audio(value: Any, *, load_file: _AudioLoader | None = None) -> tuple[torch.Tensor, int]:
     if isinstance(value, (list, tuple)) and not (len(value) == 2 and isinstance(value[1], (int, np.integer))):
-        audios = _load_audios(value)
+        audios = _load_audios(value, load_file=load_file)
         if len(audios) != 1:
             raise OmniClientError(f"MiniMax H3 expected one audio, got {len(audios)}")
         return audios[0]
     if isinstance(value, (str, os.PathLike)):
-        return load_audio_file(str(value))
+        return (load_file or load_audio_file)(str(value))
     if isinstance(value, (list, tuple)) and len(value) == 2:
         waveform, sample_rate = value
         return torch.as_tensor(waveform).float(), int(sample_rate)
@@ -99,12 +104,48 @@ def _load_audio(value: Any) -> tuple[torch.Tensor, int]:
     raise OmniClientError("MiniMax H3 audio input must be a path, (waveform, sample_rate), or a waveform mapping")
 
 
-def _load_audios(value: Any) -> list[tuple[torch.Tensor, int]]:
+def _load_audios(value: Any, *, load_file: _AudioLoader | None = None) -> list[tuple[torch.Tensor, int]]:
     if isinstance(value, (list, tuple)) and not (len(value) == 2 and isinstance(value[1], (int, np.integer))):
         if not value:
             raise OmniClientError("MiniMax H3 audio input must not be empty")
-        return [_load_audio(item) for item in value]
-    return [_load_audio(value)]
+        return [_load_audio(item, load_file=load_file) for item in value]
+    return [_load_audio(value, load_file=load_file)]
+
+
+_AudioFetch = tuple[dict[str, Any], Future[tuple[torch.Tensor, int]] | None]
+
+
+class _ReferenceAudioPrefetch:
+    def __init__(self) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=3)
+        self._probes: defaultdict[str, deque[Future[_AudioFetch]]] = defaultdict(deque)
+        self._loads: defaultdict[str, deque[Future[_AudioFetch]]] = defaultdict(deque)
+
+    def start(self, values: Sequence[Any]) -> None:
+        for path in (str(value) for value in values if isinstance(value, (str, os.PathLike))):
+            fetch = self._pool.submit(self._fetch, path)
+            self._probes[path].append(fetch)
+            self._loads[path].append(fetch)
+
+    def _fetch(self, path: str) -> _AudioFetch:
+        meta = probe_reference_audio(path)
+        try:
+            validate_reference_audio_files(path, probe=lambda _: meta)
+        except OmniClientError:
+            return meta, None
+        return meta, self._pool.submit(load_audio_file, path)
+
+    def probe(self, path: str) -> dict[str, Any]:
+        fetches = self._probes.get(path)
+        return fetches.popleft().result()[0] if fetches else probe_reference_audio(path)
+
+    def load(self, path: str) -> tuple[torch.Tensor, int]:
+        fetches = self._loads.get(path)
+        audio = fetches.popleft().result()[1] if fetches else None
+        return audio.result() if audio else load_audio_file(path)
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _as_int_list(value: Any, *, name: str) -> list[int]:
@@ -297,6 +338,7 @@ def _prepare_encoder_images(
     height: int,
     width: int,
     guided: bool = False,
+    parallel: bool = False,
 ) -> list[Any]:
     if not images:
         return []
@@ -304,6 +346,10 @@ def _prepare_encoder_images(
         # Guided references are kept within the output area: they ride through
         # every denoising step next to the guide anchors.
         max_area = width * height if guided else None
+        if parallel and len(images) > 1:
+            sizes = [resolve_minimax_h3_reference_image_shape(image, max_area=max_area) for image in images]
+            with ThreadPoolExecutor(max_workers=min(8, len(images))) as pool:
+                return list(pool.map(lambda image, size: image.resize(size, Image.Resampling.LANCZOS), images, sizes))
         return [
             image.resize(
                 resolve_minimax_h3_reference_image_shape(image, max_area=max_area),
@@ -582,6 +628,23 @@ def prepare_encoder_inputs(
     prepared_reference_videos: list[dict[str, Any]] | None = None,
 ) -> PreparedEncoderInputs:
     """Decode references once and prepare the shared text/codec presentation."""
+    audio_prefetch = _ReferenceAudioPrefetch()
+    try:
+        return _prepare_encoder_inputs(
+            prompt, sampling, task, prepared_reference_videos, reference_frame_workers(), audio_prefetch
+        )
+    finally:
+        audio_prefetch.close()
+
+
+def _prepare_encoder_inputs(
+    prompt: Any,
+    sampling: Any,
+    task: str | None,
+    prepared_reference_videos: list[dict[str, Any]] | None,
+    frame_workers: int,
+    audio_prefetch: _ReferenceAudioPrefetch,
+) -> PreparedEncoderInputs:
     if isinstance(prompt, str):
         prompt = {"prompt": prompt}
     if not isinstance(prompt, dict):
@@ -626,6 +689,8 @@ def prepare_encoder_inputs(
         )
         if not raw_images and not videos and not latent_continuation:
             raise OmniClientError("ref2va requires an image or video condition")
+        if frame_workers > 0 and not lock_audio:
+            audio_prefetch.start(audio_values)
     else:
         raise OmniClientError(f"unsupported MiniMax H3 task {task!r}")
 
@@ -742,6 +807,7 @@ def prepare_encoder_inputs(
         height=height,
         width=width,
         guided=bool(timeline_guides),
+        parallel=frame_workers > 0,
     )
     keyframe_indices = _resolve_fl2va_keyframe_indices(extra_args, len(images)) if task == "fl2va" else []
     video_timestamps: list[list[float]] = []
@@ -766,7 +832,7 @@ def prepare_encoder_inputs(
                         target_frame_count=num_frames,
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
-                        frame_workers=reference_frame_workers(),
+                        frame_workers=frame_workers,
                     )
                 audio_pool = ThreadPoolExecutor(max_workers=1)
                 try:
@@ -889,8 +955,8 @@ def prepare_encoder_inputs(
         audio_edit = (waveform, int(sample_rate))
 
     if raw_audio is not None and not lock_audio:
-        validate_reference_audio_files(raw_audio)
-    standalone_audios = _load_audios(raw_audio) if raw_audio is not None else []
+        validate_reference_audio_files(raw_audio, probe=audio_prefetch.probe)
+    standalone_audios = _load_audios(raw_audio, load_file=audio_prefetch.load) if raw_audio is not None else []
     if lock_audio:
         waveform, rate = standalone_audios[0]
         if rate <= 0 or waveform.ndim not in (1, 2) or waveform.numel() == 0 or not torch.isfinite(waveform).all():

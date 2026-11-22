@@ -462,8 +462,10 @@ def reference_mp3(tmp_path_factory, encoders) -> dict[str, str]:
     if "libmp3lame" not in encoders:
         pytest.skip("ffmpeg with libmp3lame is required")
     root = tmp_path_factory.mktemp("minimax_h3_reference_audio")
-    paths = {"valid": str(root / "valid.mp3")}
-    _ffmpeg(*SINE, "-t", 3, "-c:a", "libmp3lame", paths["valid"])
+    paths = {name: str(root / f"{name}.mp3") for name in ("valid", "too_short", "corrupt")}
+    for name, seconds in (("valid", 3), ("too_short", 1)):
+        _ffmpeg(*SINE, "-t", seconds, "-c:a", "libmp3lame", paths[name])
+    (root / "corrupt.mp3").write_bytes(b"not audio\n" * 64)
     return paths
 
 
@@ -523,20 +525,49 @@ def _spy(monkeypatch, owner, name) -> list:
 def test_encoder_inputs_are_identical_to_the_legacy_path(
     monkeypatch, sources, reference_mp3, legacy_decoder, videos, video_labels
 ):
-    legacy_loads = _spy(monkeypatch, processing, "load_video_frames")
+    spies = {
+        "legacy_loads": _spy(monkeypatch, processing, "load_video_frames"),
+        "prefetches": _spy(monkeypatch, processing._ReferenceAudioPrefetch, "start"),
+        "resizes": _spy(monkeypatch, processing, "_prepare_encoder_images"),
+    }
     digests = {}
     for raw in ("0", "1", "3", "8", None):
         if raw is None:
             monkeypatch.delenv(ENV, raising=False)
         else:
             monkeypatch.setenv(ENV, raw)
-        legacy_loads.clear()
+        for calls in spies.values():
+            calls.clear()
         digests[raw] = _digest(_prepare([sources[video] for video in videos], reference_mp3["valid"], start=0.37))
-        assert len(legacy_loads) == (len(videos) if raw == "0" else 0), raw
+        assert len(spies["legacy_loads"]) == (len(videos) if raw == "0" else 0), raw
+        assert [args[1] for args, _ in spies["prefetches"]] == ([] if raw == "0" else [[reference_mp3["valid"]]]), raw
+        assert [kwargs["parallel"] for _, kwargs in spies["resizes"]] == [raw != "0"], raw
         assert _ffmpeg_children() == []
     assert digests["0"]["video_audios"][0] is not None
     assert digests["0"]["condition_labels"] == [("image", 1), ("image", 2), *video_labels, ("audio", 2)]
     assert all(digest == digests["0"] for digest in digests.values())
+
+
+@pytest.mark.parametrize("workers", ["0", "8"])
+@pytest.mark.parametrize(
+    ("videos", "audios", "options", "error", "match", "work"),
+    [
+        (["s30_audio"], ["valid"], {"audio_mode": "lock_source"}, None, None, (0, 1)),
+        (["s25_short"], ["too_short"], {"images": False}, OmniClientError, r"audio 0 duration .*got 1\.0", (1, 0)),
+        ([], ["valid"] * 4, {}, OmniClientError, "at most 3 standalone audio references", (0, 0)),
+        ([], ["corrupt"], {}, subprocess.CalledProcessError, "ffprobe", (1, 0)),
+    ],
+    ids=["lock_source", "invalid", "rejected", "corrupt"],
+)
+def test_reference_audio_is_probed_and_decoded_only_where_the_serial_path_does(
+    monkeypatch, sources, reference_mp3, workers, videos, audios, options, error, match, work
+):
+    monkeypatch.setenv(ENV, workers)
+    probes, loads = _spy(monkeypatch, reference_video, "_probe_audio"), _spy(monkeypatch, processing, "load_audio_file")
+    with pytest.raises(error, match=match) if error else contextlib.nullcontext():
+        _prepare([sources[video] for video in videos], [reference_mp3[audio] for audio in audios], **options)
+    assert (len(probes), len(loads)) == work
+    assert _ffmpeg_children() == []
 
 
 def test_unconsumed_frame_jobs_are_cancelled_on_error(monkeypatch, sources, reference_mp3, frame_jobs):
