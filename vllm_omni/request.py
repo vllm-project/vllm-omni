@@ -107,6 +107,7 @@ class OmniRequest(Request):
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=request.resumable,
             session_id=request.session_id,
+            kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,

@@ -262,6 +262,7 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
         "audio": 1,
     }[modality]
     mm_data_items.__getitem__ = MagicMock(side_effect=lambda modality: [f"{modality}-0"])
+    mm_data_items.values = MagicMock(return_value=[])
 
     inputs = MagicMock()
     inputs.mm_data_items = mm_data_items
@@ -275,6 +276,7 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     cache = MagicMock()
     # Video miss, audio hit under pair-aware keys — expansion must force audio.
     cache.is_cached.side_effect = lambda keys: [False] if keys[0].startswith("v") else [True]
+    inputs.cache = cache
 
     captured = {}
 
@@ -309,6 +311,8 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     fake_self._get_mm_fields_config = MagicMock(return_value={})
     fake_self._get_mm_prompt_updates = MagicMock(return_value={"video": [[object()]], "audio": [[object()]]})
     fake_self._merge_mm_kwargs = capture_merge
+    fake_self._postprocess_prompt = lambda prompt: prompt
+    inputs.prompt = [0, 1, 2]
 
     with patch(
         "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.MultiModalKwargsItems.from_hf_inputs",
@@ -549,24 +553,6 @@ def test_qwen2_5_prompt_updates_validate_mask_against_request_video_count():
         )
 
 
-def test_qwen2_5_mm_only_dummy_counts_subtract_only_videos_using_audio():
-    captured_counts = {}
-    fake_self = SimpleNamespace(
-        dummy_inputs=SimpleNamespace(get_dummy_text=lambda counts: captured_counts.update(counts) or "dummy"),
-        _apply_hf_processor_text_mm=lambda **_kwargs: ([], {}, False),
-    )
-    mm_items = SimpleNamespace(get_all_counts=lambda: {"video": 2, "audio": 1})
-
-    Qwen2_5OmniThinkerMultiModalProcessor._apply_hf_processor_mm_only(
-        fake_self,
-        mm_items,
-        {"use_audio_in_video": [True, False]},
-        {},
-    )
-
-    assert captured_counts == {"video": 2, "audio": 0}
-
-
 def test_get_video_use_audio_in_video_falls_back_to_prompt_updates_for_cache_hits():
     fake_self = _fake_processor()
     update_with_audio = SimpleNamespace(content=SimpleNamespace(full=[VIDEO_TOKEN_ID, AUDIO_TOKEN_ID]))
@@ -661,7 +647,12 @@ def test_qwen3_processor_inherits_vllm_omni_per_video_helpers():
         Qwen3OmniMoeThinkerMultiModalProcessor,
         Qwen2_5OmniThinkerMultiModalProcessor,
     )
-    assert Qwen3OmniMoeThinkerMultiModalProcessor._get_hf_mm_data is UpstreamQwen3Processor._get_hf_mm_data
+    # Keep Qwen3's native HF preprocessing while inheriting Omni pair handling.
+    assert Qwen3OmniMoeThinkerMultiModalProcessor._get_hf_mm_inputs is UpstreamQwen3Processor._get_hf_mm_inputs
+    assert (
+        Qwen3OmniMoeThinkerMultiModalProcessor._get_audio_in_video_pairs
+        is Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_pairs
+    )
     mro = Qwen3OmniMoeThinkerMultiModalProcessor.__mro__
     assert mro.index(Qwen2_5OmniThinkerMultiModalProcessor) < mro.index(UpstreamQwen3Processor)
 

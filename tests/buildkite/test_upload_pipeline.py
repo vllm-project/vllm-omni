@@ -172,7 +172,11 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     env_names = {item["name"] for item in container["env"]}
     assert "VLLM_CI_HF_TOKEN" in env_names
     assert "HF_TOKEN" not in env_names
-    assert step["commands"] == [CUDA_HF_TOKEN_EXPORT, "pytest -sv tests/example"]
+    assert step["commands"] == [
+        CUDA_HF_TOKEN_EXPORT,
+        "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+        "pytest -sv tests/example",
+    ]
 
 
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
@@ -239,6 +243,10 @@ def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
         assert "VLLM_CI_HF_TOKEN" in env_names
         assert "HF_TOKEN" not in env_names
         assert step["commands"][0] == CUDA_HF_TOKEN_EXPORT
+        assert step["commands"][1:] == [
+            "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+            "pytest -sv tests/example",
+        ]
 
 
 def _gpu_limit(step: dict) -> int:

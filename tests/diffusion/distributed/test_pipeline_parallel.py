@@ -19,6 +19,7 @@ from vllm.utils.network_utils import get_file_store_init_method
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
+from tests.helpers.distributed import collective_context, start_collective_workers
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -37,6 +38,25 @@ _L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)
 
 DeviceKind = Literal["cpu", "cuda"]
 _UNIT_MARKS = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _restore_collective_platforms():
+    """CPU baselines run in the parent process; retain its original platforms."""
+    import vllm.platforms
+
+    from vllm_omni.diffusion.distributed import comm, group_coordinator, parallel_state
+
+    original_platform = vllm.platforms.current_platform
+    original_omni_platforms = {
+        module: module.current_omni_platform for module in (comm, group_coordinator, parallel_state)
+    }
+    try:
+        yield
+    finally:
+        vllm.platforms.current_platform = original_platform
+        for module, platform in original_omni_platforms.items():
+            module.current_omni_platform = platform
 
 
 def _cleanup_distributed() -> None:
@@ -409,6 +429,10 @@ def init_dist(
     device = _worker_device(local_rank, device_kind)
     if device_kind == "cuda":
         current_omni_platform.set_device(device)
+    else:
+        from tests.helpers.distributed import configure_cpu_collective_worker
+
+        configure_cpu_collective_worker()
     backend = "gloo" if device_kind == "cpu" else None
     init_distributed_environment(
         world_size=world_size,
@@ -500,13 +524,14 @@ def isend_irecv_worker(
 
 
 def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) -> None:
-    mp_context = torch.multiprocessing.get_context("spawn")
+    mp_context = collective_context(device_kind)
     manager = mp_context.Manager()
     q = manager.Queue()
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         isend_irecv_worker,
         args=(pp_size, init_method, device_kind, q),
         nprocs=pp_size,
+        device_kind=device_kind,
     )
     results = {label: tensor for label, tensor in [q.get(), q.get()]}
     torch.testing.assert_close(
@@ -656,15 +681,16 @@ def _run_predict_noise(
 
     baseline_out = compute_single_gpu_baseline(test_config, dtype, do_true_cfg, device_kind)
 
-    mp_context = torch.multiprocessing.get_context("spawn")
+    mp_context = collective_context(device_kind)
     manager = mp_context.Manager()
     pp_q = manager.Queue()
 
     world_size = pp_size * cfg_size
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         predict_noise_worker,
         args=(world_size, init_method, pp_size, cfg_size, do_true_cfg, dtype, test_config, device_kind, pp_q),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
     pp_out = pp_q.get()
@@ -900,15 +926,16 @@ def _run_scheduler_step(
 
     baseline = compute_scheduler_step_baseline(test_config, do_true_cfg, device_kind)
 
-    mp_context = torch.multiprocessing.get_context("spawn")
+    mp_context = collective_context(device_kind)
     manager = mp_context.Manager()
     q = manager.Queue()
 
     world_size = pp_size * cfg_size
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         scheduler_step_worker,
         args=(world_size, init_method, pp_size, cfg_size, do_true_cfg, test_config, device_kind, q),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
     result = q.get()

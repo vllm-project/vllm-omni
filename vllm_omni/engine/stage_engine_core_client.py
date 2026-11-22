@@ -34,6 +34,7 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
+    from vllm.renderers import BaseRenderer
     from vllm.v1.engine import EngineCoreOutput
 
     from vllm_omni.inputs.data import OmniTokensPrompt
@@ -90,6 +91,7 @@ class StageEngineCoreClientBase(StageClientBase):
         coordinator: Any = None,
         client_count: int = 1,
         client_index: int = 0,
+        renderer: BaseRenderer | None = None,
     ) -> StageEngineCoreClient | DPLBStageEngineCoreClient:
         """Create the appropriate stage async client for the DP mode."""
         parallel_config = vllm_config.parallel_config
@@ -103,6 +105,7 @@ class StageEngineCoreClientBase(StageClientBase):
             coordinator=coordinator,
             client_count=client_count,
             client_index=client_index,
+            renderer=renderer,
         )
 
         if parallel_config.data_parallel_size > 1 and not parallel_config.data_parallel_external_lb:
@@ -118,6 +121,7 @@ class StageEngineCoreClientBase(StageClientBase):
         client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        renderer: BaseRenderer | None = None,
         *,
         metadata: StageMetadata | None = None,
         engine_manager: Any = None,
@@ -183,13 +187,16 @@ class StageEngineCoreClientBase(StageClientBase):
         )
 
         try:
-            super().__init__(
+            # Concrete clients place AsyncMPClient next in the cooperative MRO;
+            # the mixin's declared base exposes only object.__init__ to mypy.
+            super().__init__(  # type: ignore[call-arg]
                 vllm_config,
                 executor_class,
                 log_stats=log_stats,
                 client_addresses=client_addresses,
                 client_count=client_count,
                 client_index=client_index,
+                renderer=renderer,
             )
             if engine_manager is not None:
                 self.resources.engine_manager = engine_manager

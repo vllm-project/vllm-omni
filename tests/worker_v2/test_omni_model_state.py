@@ -4,13 +4,17 @@
 graph/eager paths with per-request seed independence, async snapshot ownership."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _make_safe_get_rope
@@ -18,8 +22,19 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _m
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_prepare_attn_forwards_release_model_specific_metadata():
+    state = object.__new__(OmniModelState)
+    metadata = object()
+    output = object()
+    batch = SimpleNamespace()
+    with patch.object(DefaultModelState, "prepare_attn", return_value=output) as prepare:
+        assert state.prepare_attn(batch, None, (), None, [], None, model_specific_attn_metadata=metadata) is output
+    assert prepare.call_args.kwargs["model_specific_attn_metadata"] is metadata
+
+
 class _DummyInputBatch:
     is_prefilling_np: np.ndarray
+    req_ids: list[str]
 
     input_ids: SimpleNamespace
     query_start_loc: torch.Tensor
@@ -218,6 +233,61 @@ def test_static_decode_embeddings_refresh_from_input_ids():
     original = torch.tensor([[1.0, 2.0]])
     assert OmniModelState._preprocess_result_needs_writeback(original, original) is False
     assert OmniModelState._preprocess_result_needs_writeback(original, original.view_as(original)) is True
+
+
+def test_moss_local_decode_runs_depth_predictor_and_routes_eos(mocker):
+    """Exercise MRV2 dispatch through the real Local hook, output and logits."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.states import RequestState
+
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import MossTTSLocalDepthTransformer
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSLocalTalkerForGeneration,
+    )
+
+    model = MossTTSLocalTalkerForGeneration.__new__(MossTTSLocalTalkerForGeneration)
+    torch.nn.Module.__init__(model)
+    model.model = torch.nn.Module()
+    model.model.embed_tokens = torch.nn.Embedding(8, 4, _weight=torch.zeros(8, 4))
+    model.hidden_size = 4
+    model.n_vq = 2
+    model.audio_pad_token_id = 8
+    model.audio_assistant_slot_token_id = 2
+    model.im_end_token_id = 3
+    model.text_vocab_size = 8
+    model.talker_mtp_output_key = ("audio_codes", "current")
+    model.talker_mtp_graph_safe = False
+    model.gpu_resident_buffer_keys = set()
+    model.audio_lm_heads = model.audio_embeddings = model.local_text_lm_head = None
+    model._audio_embed = lambda codes: codes[:, :1].expand(-1, 4).float()
+    frame = mocker.Mock(return_value=(torch.tensor([True, False]), torch.tensor([[1, 2], [3, 4]])))
+    model.local_transformer = mocker.Mock(spec=MossTTSLocalDepthTransformer, generate_frame=frame)
+
+    state = _make_state(max_num_reqs=2, has_preprocess=True, have_multimodal_outputs=True)
+    state.model = model
+    for idx in range(2):
+        state.intermediate_buffer.buffers[idx] = {
+            "req_id": f"r{idx}",
+            "audio_state": {"is_stopping": False},
+            "hidden_states": {"last": torch.full((4,), float(idx + 1))},
+        }
+    batch = _DummyInputBatch([1, 0], num_computed_tokens_cpu=[1, 1])
+    inputs = {"input_ids": torch.tensor([2, 2]), "inputs_embeds": torch.zeros(2, 4)}
+    request_state = mocker.Mock(spec=RequestState, prompt_len=np.array([1, 1]), num_computed_tokens=None)
+    state.run_preprocess(batch, inputs, request_state)
+
+    frame.assert_called_once()
+    torch.testing.assert_close(frame.call_args.args[0], torch.tensor([[2.0] * 4, [1.0] * 4]))
+    assert frame.call_args.kwargs["temperature"] == 1.7
+    assert frame.call_args.kwargs["top_k"] == 25
+    assert frame.call_args.kwargs["top_p"] == 0.8
+    torch.testing.assert_close(inputs["inputs_embeds"], torch.tensor([[1.0] * 4, [0.0] * 4]))
+    _, payload = state.postprocess_model_output(torch.zeros(2, 4), batch, request_state)
+    assert [codes.tolist() for codes in payload["codes"]["audio"]] == [[[1, 2]], [[8, 8]]]
+    assert model.compute_logits(torch.zeros(2, 4)).argmax(-1).tolist() == [2, 3]
+    # An explicit local seed must reach the request-owned MRV2 generator.
+    params = SamplingParams(extra_args={"tts_local_seed": 17}, seed=99)
+    assert state._get_mtp_generator("seeded", params, torch.device("cpu")).initial_seed() == 17
 
 
 @pytest.mark.parametrize("owned", [False, True])
@@ -642,6 +712,58 @@ def test_publish_sampled_embeddings_is_opt_in() -> None:
     assert state.publish_sampled_embeddings(SimpleNamespace(num_reqs=1), torch.tensor([[1]])) is None
 
 
+def test_split_settled_rows_matches_per_row_check():
+    batch = _DummyInputBatch(np.array([3, 0, 2, 1, 4]))
+    batch.req_ids = ["c", "a", "x", "b", "e"]
+    batch.num_scheduled_tokens = [1, 1, 1, 4, 1]
+    batch.query_start_loc_np = [0, 1, 2, 3, 7]
+    req_indices = batch.idx_mapping_np.tolist()
+    # Slot 2 still names a finished request, slot 1 schedules a prefill
+    # chunk, slot 4 is not settled and slot 7 is not scheduled.
+    settled = {3: "c", 0: "a", 2: "old", 1: "b", 7: "z"}
+    split = OmniModelState._split_settled_rows(batch, req_indices, settled)
+    assert split is not None
+    settled_rows, remaining = split
+    assert settled_rows == [(0, 3, 0, "c"), (1, 0, 1, "a")]
+    assert remaining == [(2, 2), (3, 1), (4, 4)]
+    assert OmniModelState._split_settled_rows(batch, req_indices, {2: "old"}) is None
+
+
+def test_settled_row_split_preserves_mixed_batch_and_pending_replay(monkeypatch):
+    """Exercise run_preprocess, including the scalar fallback during replay."""
+
+    def prepare():
+        state = _make_eager_state()
+        _fill_buffers(state, "prefill", "decode")
+        state._eager_fastpath = True
+        state._eager_settled = {1: "decode"}
+        state._eager_ready = {1: "decode"}
+        state._eager_embeds[1].fill_(7)
+        state.model.eager_settled_text_step = lambda: torch.ones(_EAGER_DIM)
+        state.model.eager_decode_settled = lambda info: False
+        state.model.preprocess = lambda input_ids, input_embeds, **info: (input_ids, input_embeds, {})
+        batch = _EagerBatch([3, 1])
+        batch.req_ids = ["prefill", "decode"]
+        inputs = {"input_ids": torch.zeros(4, dtype=torch.long), "inputs_embeds": torch.zeros(4, _EAGER_DIM)}
+        return state, batch, inputs
+
+    vector, batch, inputs = prepare()
+    vector.run_preprocess(batch, inputs)
+    reference, ref_batch, ref_inputs = prepare()
+    monkeypatch.setattr(reference, "_split_settled_rows", lambda *args: None)
+    reference.run_preprocess(ref_batch, ref_inputs)
+    torch.testing.assert_close(inputs["inputs_embeds"], ref_inputs["inputs_embeds"], rtol=0, atol=0)
+    assert vector._eager_rows[1] == reference._eager_rows[1]
+    assert inputs["inputs_embeds"][3].tolist() == [8.0] * _EAGER_DIM
+
+    replay, replay_batch, replay_inputs = prepare()
+    replay._eager_state._restore_audio["prefill"] = [torch.ones(1)]
+    assert replay._eager_state.has_pending_replay()
+    monkeypatch.setattr(replay, "_split_settled_rows", MagicMock(side_effect=AssertionError("replay must skip split")))
+    replay.run_preprocess(replay_batch, replay_inputs)
+    torch.testing.assert_close(replay_inputs["inputs_embeds"], ref_inputs["inputs_embeds"], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("prefilling", [False, True])
 def test_identity_preprocess_skips_only_decode_rows(prefilling):
     state = _make_state(has_preprocess=True)
@@ -661,3 +783,32 @@ def test_identity_preprocess_skips_only_decode_rows(prefilling):
     state.run_preprocess(batch, {"input_ids": torch.tensor([1]), "inputs_embeds": embeds})
     assert seen == (["r1"] if prefilling else [])
     assert torch.equal(embeds, torch.ones(1, 4))
+
+
+def test_mm_embeddings_exclude_zero_length_graph_padding_rows():
+    state = object.__new__(OmniModelState)
+    state.supports_mm_inputs = True
+    state.mm_pruner = None
+    state.prompt_embeds_state = None
+    state.encoder_runner = MagicMock(spec=EncoderRunner, inputs_embeds=torch.zeros(8, 2))
+    state.execute_mm_encoder = lambda _: None
+    state.gather_mm_embeddings = lambda _: ([torch.ones(1, 2)], torch.ones(5, dtype=torch.bool))
+
+    def embed(input_ids, *, query_start_loc, multimodal_embeddings, is_multimodal):
+        assert query_start_loc == [0, 2, 5]
+        return input_ids[:, None].expand(-1, 2).float()
+
+    state.model = MagicMock(supports_embed_input_ids_query_start_loc=True, embed_input_ids=embed)
+    buffers = InputBuffers(4, 8, torch.device("cpu"))
+    batch = replace(
+        InputBatch.make_dummy(2, 5, buffers),
+        num_reqs=2,
+        num_reqs_after_padding=4,
+        num_tokens=5,
+        num_tokens_after_padding=8,
+        input_ids=torch.arange(8),
+        query_start_loc_np=np.array([0, 2, 5, 5, 5], dtype=np.int32),
+    )
+    result = state.prepare_inputs_embeds({}, batch, MagicMock(spec=RequestState))
+    torch.testing.assert_close(result[:5], torch.arange(5).float()[:, None].expand(-1, 2))
+    assert result.shape == (8, 2)

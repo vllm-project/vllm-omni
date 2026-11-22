@@ -79,30 +79,15 @@ def get_text_token_prompts(
     """Return ``(text_prompt, token_prompt)`` for the given multimodal data."""
     dummy_inputs = processor.dummy_inputs
     tokenizer: TokenizerLike = processor.info.get_tokenizer()
-    model_config = processor.info.ctx.model_config
 
     parsed_data = processor.info.parse_mm_data(mm_data)
     mm_counts = {k: len(vs) for k, vs in parsed_data.items()}
 
-    inputs = dummy_inputs.get_dummy_processor_inputs(
-        model_config.max_model_len,
-        mm_counts,
-        mm_options={},
+    text_prompt = dummy_inputs.get_dummy_text(mm_counts)
+    token_prompt = tokenizer.encode(
+        text_prompt,
+        **processor.info.get_default_tok_params().get_encode_kwargs(),
     )
-
-    text_prompt: str | None
-    token_prompt: list[int]
-    if isinstance(inputs.prompt, list):
-        text_prompt = None
-        token_prompt = inputs.prompt
-    elif isinstance(inputs.prompt, str):
-        text_prompt = inputs.prompt
-        token_prompt = tokenizer.encode(
-            text_prompt,
-            **processor.info.get_default_tok_params().get_encode_kwargs(),
-        )
-    else:
-        raise TypeError(type(inputs.prompt))
 
     return text_prompt, token_prompt
 
@@ -199,8 +184,8 @@ def _test_processing_correctness(
         modality: _to_dummy_options(modality, count) for modality, count in limit_mm_per_prompt_ints.items()
     }
 
-    baseline_processor = factories.build_processor(ctx, cache=None)
-    cached_processor = factories.build_processor(ctx, cache=cache)
+    baseline_processor = factories.build_processor(ctx)
+    cached_processor = factories.build_processor(ctx)
 
     rng = np.random.RandomState(0)
 
@@ -238,6 +223,7 @@ def _test_processing_correctness(
             baseline_processor,
             cached_processor,
             batch_idx,
+            cache,
         )
 
 
@@ -247,6 +233,7 @@ def _test_processing_correctness_one(
     baseline_processor: BaseMultiModalProcessor,
     cached_processor: BaseMultiModalProcessor,
     batch_idx: int,
+    cache: MultiModalProcessorOnlyCache,
 ):
     model_type = model_config.hf_config.model_type
 
@@ -258,12 +245,14 @@ def _test_processing_correctness_one(
         token_prompt,
         mm_items=mm_items,
         hf_processor_mm_kwargs={},
+        cache=None,
     )
 
     cached_tokenized_result = cached_processor(
         token_prompt,
         mm_items=mm_items,
         hf_processor_mm_kwargs={},
+        cache=cache,
     )
 
     _assert_inputs_equal(
@@ -278,11 +267,13 @@ def _test_processing_correctness_one(
             text_prompt,
             mm_items=mm_items,
             hf_processor_mm_kwargs={},
+            cache=None,
         )
         cached_text_result = cached_processor(
             text_prompt,
             mm_items=mm_items,
             hf_processor_mm_kwargs={},
+            cache=cache,
         )
 
         _assert_inputs_equal(

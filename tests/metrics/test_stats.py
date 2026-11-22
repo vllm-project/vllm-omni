@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import pytest
@@ -155,3 +158,39 @@ def test_build_and_log_summary_multiple_requests() -> None:
     r2_stage_entry = next(e for e in summary["stage_table"] if e["request_id"] == "r2")
     assert len(r1_stage_entry["stages"]) == 2
     assert len(r2_stage_entry["stages"]) == 1
+
+
+def test_log_timing_summary_skips_tables_unless_debug(monkeypatch) -> None:
+    from vllm_omni.metrics import stats
+
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    agg.stage_first_ts[0] = 0.0
+    agg.stage_last_ts[0] = 0.02
+    agg.on_stage_metrics(
+        0,
+        "r1",
+        StageRequestStats(
+            batch_id=1,
+            batch_size=1,
+            num_tokens_in=3,
+            num_tokens_out=3,
+            stage_gen_time_ms=20.0,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(),
+        ),
+    )
+    agg.on_finalize_request(0, "r1", req_start_ts=0.0)
+    tables, lines = [], []
+
+    def record_table(*args, **kwargs):
+        tables.append(args)
+        return ""
+
+    monkeypatch.setattr(stats, "_format_table", record_table)
+    monkeypatch.setattr(stats.logger, "info", lambda msg, *args: lines.append(msg % args))
+    monkeypatch.setattr(stats.logger, "isEnabledFor", lambda level: False)
+    agg.log_timing_summary()
+    assert not tables
+    assert len(lines) == 1 and lines[0].startswith("[OmniTiming] req=r1 total=")

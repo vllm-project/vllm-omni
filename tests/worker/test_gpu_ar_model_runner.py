@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker import gpu_input_batch
@@ -25,7 +27,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker import sparse_audio
+from vllm_omni.worker import gpu_ar_model_runner, sparse_audio
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
@@ -614,8 +616,10 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
     assert output.multimodal_outputs is None
 
 
-def test_process_additional_information_uses_snapshot_request_order(monkeypatch):
+@pytest.mark.parametrize("include_hidden", [True, False])
+def test_process_additional_information_uses_snapshot_request_order(monkeypatch, include_hidden):
     runner = _make_async_output_runner()
+    runner._pooler_payload_include_hidden_flag = include_hidden
     seen = []
 
     class PostprocessModel:
@@ -958,6 +962,11 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
 
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_snapshot_scheduler_output_for_async_omni_output",
+        lambda *args: pytest.fail("inline output must not snapshot scheduler metadata"),
+    )
     output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
 
     # Non-async-chunk now ships the full payload to the next stage, so
@@ -1946,3 +1955,164 @@ def test_prepare_hook_keeps_legacy_signature_and_orders_opt_in_metadata(accepts_
         assert seen["discard"] == [True, False]
     else:
         assert set(seen) == {"req_ids"}
+
+
+@pytest.fixture
+def token_only_builder(monkeypatch):
+    runner = _make_async_output_runner()
+    runner._pooler_payload_include_hidden_flag = False
+    runner.supports_mm_inputs = True
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
+    scheduler = SchedulerOutput.make_empty()
+    scheduler.total_num_scheduled_tokens = 2
+    scheduler.num_scheduled_tokens = {"r1": 1, "r2": 1}
+    kwargs = dict(
+        scheduler_output=scheduler,
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs=None,
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[11], [22]],
+        logprobs_lists=object(),
+        prompt_logprobs_dict={"r1": object()},
+        num_nans_in_logits={"r1": 0},
+        kv_connector_output=object(),
+        ec_connector_output=object(),
+        cudagraph_stats=object(),
+        kv_extracted_req_ids=["r2"],
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    return runner, kwargs
+
+
+@pytest.mark.parametrize("empty_mm", [None, {}])
+def test_token_only_output_preserves_sampling_and_connector_metadata(token_only_builder, mocker, empty_mm):
+    runner, kwargs = token_only_builder
+    kwargs["multimodal_outputs"] = empty_mm
+    payload_builder = mocker.spy(runner, "_build_omni_pooler_payload")
+    output = runner._build_omni_model_runner_output_from_snapshot(**kwargs)
+
+    assert output.req_ids == ["r1", "r2"]
+    assert output.req_id_to_index == {"r1": 0, "r2": 1}
+    assert output.sampled_token_ids == [[11], [22]]
+    assert output.inter_stage_outputs is None
+    assert output.multimodal_outputs is None
+    assert output.pooler_output is None
+    assert output.logprobs is kwargs["logprobs_lists"]
+    for name in (
+        "prompt_logprobs_dict",
+        "num_nans_in_logits",
+        "kv_connector_output",
+        "ec_connector_output",
+        "cudagraph_stats",
+        "kv_extracted_req_ids",
+    ):
+        assert getattr(output, name) is kwargs[name]
+    payload_builder.assert_not_called()
+
+
+def test_token_only_output_keeps_prefix_cache_merge(token_only_builder, mocker):
+    runner, kwargs = token_only_builder
+    runner.omni_prefix_cache = object()
+    cached = {"codes.audio": {"r1": torch.tensor([31]), "r2": torch.tensor([32])}}
+    merge = mocker.patch.object(
+        runner, "_prepare_prefix_cache_pooler_payload_sources", return_value=(None, None, cached)
+    )
+    output = runner._build_omni_model_runner_output_from_snapshot(**kwargs)
+
+    merge.assert_called_once()
+    assert output.inter_stage_outputs[0]["codes.audio"].tolist() == [31]
+    assert output.inter_stage_outputs[1]["codes.audio"].tolist() == [32]
+
+
+@pytest.mark.parametrize("snapshot", [True, False], ids=["background", "inline"])
+def test_query_metadata_lifetime_matches_materialization_mode(snapshot):
+    runner = object.__new__(GPUARModelRunner)
+    runner.query_start_loc = object.__new__(CpuGpuBuffer)
+    runner.query_start_loc.cpu = torch.tensor([0, 2, 3], dtype=torch.int32)
+    offsets = runner._get_query_start_loc_cpu(snapshot=snapshot)
+    runner.query_start_loc.cpu[1] = 9
+
+    if snapshot:
+        assert offsets.tolist() == [0, 2, 3]
+    else:
+        assert offsets is runner.query_start_loc.cpu
+        assert offsets.tolist() == [0, 9, 3]
+
+
+def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
+    """Delay the real builder until offsets, batch IDs and counts are reused."""
+
+    runner = _make_async_output_runner()
+    runner.use_async_scheduling = True
+    runner.speculative_config = None
+    runner.model.use_async_omni_output = True
+    runner.broadcast_pp_output = False
+    runner.kv_connector_output = None
+    runner.device = torch.device("cpu")
+    runner.async_output_copy_stream = None
+    runner.input_batch = mocker.Mock(
+        spec=InputBatch, req_ids=["r1", "r2"], req_id_to_index={"r1": 0, "r2": 1}, vocab_size=10
+    )
+    runner.query_start_loc = object.__new__(CpuGpuBuffer)
+    runner.query_start_loc.cpu = torch.tensor([0, 1, 3], dtype=torch.int32)
+    runner._omni_num_scheduled_tokens_np = np.array([1, 2], dtype=np.int32)
+    scheduler = SchedulerOutput.make_empty()
+    scheduler.num_scheduled_tokens = {"r1": 1, "r2": 2}
+    scheduler.total_num_scheduled_tokens = 3
+    hidden = torch.tensor([[1.0], [2.0], [3.0]])
+    runner.execute_model_state = ExecuteModelState(
+        scheduler, None, None, None, hidden, None, None, None, None, None, {}, None
+    )
+    sampler = SamplerOutput(sampled_token_ids=torch.tensor([[7], [8]]), logprobs_tensors=None)
+    mocker.patch.object(runner, "_sample", return_value=sampler)
+    mocker.patch.object(runner, "_update_states_after_model_execute")
+    # Match upstream bookkeeping's ownership contract: these are already copies.
+    mocker.patch.object(
+        runner,
+        "_bookkeeping_sync",
+        return_value=(
+            {},
+            None,
+            None,
+            [],
+            {},
+            runner.input_batch.req_ids.copy(),
+            runner.input_batch.req_id_to_index.copy(),
+            [],
+        ),
+    )
+    mocker.patch.object(runner, "_run_post_sample_talker_mtp", return_value={})
+    mocker.patch.object(runner, "eplb_step")
+    mocker.patch.object(runner, "get_omni_connector_output", return_value=None)
+    monkeypatch.setattr(gpu_ar_model_runner, "get_pp_group", lambda: mocker.Mock(world_size=1))
+    mocker.patch.object(runner, "_resolve_pooler_payload_req_ids", side_effect=lambda ids: ("audio", ids))
+    # Device copying is covered separately; this test isolates metadata lifetime.
+    mocker.patch.object(
+        runner,
+        "_snapshot_omni_output_tensors_for_async_output",
+        return_value=gpu_ar_model_runner._OmniOutputTensorSnapshot(
+            hidden_states=hidden, staged_hidden_states_cpu=None, multimodal_outputs={}
+        ),
+    )
+    async_output = mocker.Mock(
+        spec=OmniAsyncGPUModelRunnerOutput,
+        sampled_token_ids_cpu=sampler.sampled_token_ids,
+        async_copy_ready_event=object(),
+    )
+    constructor = mocker.patch.object(gpu_ar_model_runner, "OmniAsyncGPUModelRunnerOutput", return_value=async_output)
+
+    assert runner.sample_tokens(None) is async_output
+    runner.query_start_loc.cpu.fill_(99)
+    runner._omni_num_scheduled_tokens_np.fill(99)
+    scheduler.num_scheduled_tokens.clear()
+    runner.input_batch.req_ids[:] = ["next-step"]
+    runner.input_batch.req_id_to_index.clear()
+    output = constructor.call_args.kwargs["model_runner_output_builder"]()
+
+    assert output.req_ids == ["r1", "r2"]
+    assert output.req_id_to_index == {"r1": 0, "r2": 1}
+    torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
+    torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])

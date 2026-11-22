@@ -769,4 +769,11 @@ class CosyVoice3Code2Wav(nn.Module):
         if f0_folded == 0:
             logger.warning("HiFT F0 predictor had no weight-norm layers to fold; check config drift")
         self.hift.eval()
+        if device.type == "cuda" and cosyvoice3_packed_streaming_enabled():
+            if os.getenv("COSYVOICE3_CACHED_ISTFT", "0") == "1":
+                self.hift.enable_cached_istft()
+                logger.info("CosyVoice3 streaming HiFT: cached ISTFT enabled")
+            if os.getenv("COSYVOICE3_HIFT_GRAPH", "0") == "1":
+                self.hift.enable_decode_graphs()
+                logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")

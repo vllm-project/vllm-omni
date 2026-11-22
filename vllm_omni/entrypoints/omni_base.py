@@ -441,7 +441,7 @@ class OmniBase(PDDisaggregationMixin):
             if self.log_stats:
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
-                req_state.metrics.build_and_log_summary()
+                req_state.metrics.log_timing_summary()
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",

@@ -5,8 +5,9 @@
 
 Sessions live inside the engine (``DuplexSessionRunner`` on the orchestrator
 loop). The API layer only opens/closes/resumes/touches sessions through
-correlated RPC and pushes ``DuplexCommand`` objects one-way; every session
-output travels back as a ``DuplexSessionEventMessage``.
+correlated RPC and pushes ``DuplexCommand`` objects one-way. Open binds a
+bounded in-process output buffer; closure notifications and errors without
+a live session travel back as ``DuplexSessionEventMessage``.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from vllm_omni.engine.messages import EngineQueueMessage
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.commands import DuplexCommand
     from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
     from vllm_omni.engine.duplex.events import DuplexEvent
 
 
@@ -44,6 +46,8 @@ class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     session_id: str
     #: Already normalized by ``DuplexOmni``; the queue is in-process, so the object crosses as is.
     session_config: DuplexSessionConfig
+    #: In-process, bounded output shared with the single consumer; no media in the engine-wide queue.
+    output_buffer: DuplexOutputBuffer
 
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):

@@ -40,6 +40,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
 
@@ -72,7 +73,8 @@ def _replace_streaming_session(session: Request) -> None:
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
-    sched.skipped_waiting = set()
+    sched.kv_holding_waiting = set()
+    sched.deferred_waiting = set()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     update = StreamingUpdate(
         mm_features=None,
@@ -103,6 +105,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    bind_omits_transfer_helpers(sched)
     return sched
 
 

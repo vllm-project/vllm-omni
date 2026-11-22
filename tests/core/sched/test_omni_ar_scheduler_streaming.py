@@ -23,9 +23,11 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
 
@@ -41,7 +43,8 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
-    sched.skipped_waiting = set()
+    sched.kv_holding_waiting = set()
+    sched.deferred_waiting = set()
     sched._free_request_blocks = MagicMock()
     sched.encoder_cache_manager = MagicMock()
     sched._inflight_prefills = set()
@@ -175,6 +178,7 @@ def _run_resumable_segment_stop(
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    bind_omits_transfer_helpers(sched)
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
@@ -285,7 +289,12 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
-def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
+@pytest.mark.parametrize("processor", [None, talker2code2wav_async_chunk], ids=["no_opt_in", "cosyvoice3"])
+@pytest.mark.parametrize("new_token_ids", [[], [42]], ids=["no_tokens", "sampled_token"])
+@pytest.mark.parametrize("omit_chunk_transfer", [False, True], ids=["downstream", "stage0_final"])
+def test_running_decode_step_without_inter_stage_payload_does_not_raise(
+    processor, new_token_ids, omit_chunk_transfer, mocker
+) -> None:
     """A decode step that neither stops nor carries an inter-stage payload.
 
     ``finished`` is only assigned when the request stops, yet the async-chunk
@@ -294,14 +303,16 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     """
     session = _make_request()
     session.status = RequestStatus.RUNNING
+    session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
-    sched = MagicMock()
+    sched = mocker.MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
-    sched._update_request_with_output.return_value = ([42], False)
+    sched._update_request_with_output.return_value = (new_token_ids, False)
     sched._process_kv_transfer_trigger.return_value = False
-    sched.chunk_transfer_adapter = MagicMock()
+    sched.chunk_transfer_adapter = mocker.MagicMock()
+    sched.chunk_transfer_adapter.custom_process_next_stage_input_func = processor
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
     sched.transfer_triggered_requests = set()
@@ -312,14 +323,15 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    bind_omits_transfer_helpers(sched)
 
-    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output = mocker.MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
-    model_runner_output = MagicMock(spec=ModelRunnerOutput)
-    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output = mocker.MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [new_token_ids]
     model_runner_output.logprobs = None
     model_runner_output.prompt_logprobs_dict = {}
     model_runner_output.pooler_output = None
@@ -332,8 +344,16 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
 
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
-    # Nothing to hand downstream: no payload, no segment boundary, not finished.
-    sched.chunk_transfer_adapter.save_async.assert_not_called()
+    if omit_chunk_transfer or processor is None or not new_token_ids:
+        sched.chunk_transfer_adapter.save_async.assert_not_called()
+    else:
+        sched.chunk_transfer_adapter.save_async.assert_called_once_with(
+            None,
+            session,
+            False,
+            new_token_ids=[42],
+            confirmed_num_computed_tokens=None,
+        )
 
 
 def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:
@@ -400,6 +420,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    bind_omits_transfer_helpers(sched)
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
@@ -1165,7 +1186,8 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode="duplex"))
     sched.running = []
     sched.waiting = queue()
-    sched.skipped_waiting = queue(session)
+    sched.kv_holding_waiting = queue(session)
+    sched.deferred_waiting = set()
     sched.num_waiting_for_streaming_input = 1
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=True,
@@ -1177,7 +1199,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
 
     assert session.status == RequestStatus.WAITING
     assert session in sched.waiting.requests
-    assert session not in sched.skipped_waiting.requests
+    assert session not in sched.kv_holding_waiting.requests
     assert sched.num_waiting_for_streaming_input == 0
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
 
@@ -1204,7 +1226,8 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
         receives_chunks=receives_chunks,
         segment_finished_requests={session.request_id},
     )
-    sched.skipped_waiting = MagicMock()
+    sched.kv_holding_waiting = MagicMock()
+    sched.deferred_waiting = set()
     sched._enqueue_waiting_request = MagicMock()
 
     sched._resume_downstream_chunk_receiver(session)
@@ -1212,7 +1235,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
     assert sched.num_waiting_for_streaming_input == 1
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
-    sched.skipped_waiting.remove_requests.assert_not_called()
+    sched.kv_holding_waiting.remove_requests.assert_not_called()
     sched._enqueue_waiting_request.assert_not_called()
 
 
@@ -1268,7 +1291,8 @@ def _park_session(sched: OmniARScheduler, session: Request) -> None:
     session.num_computed_tokens = 6
     session.num_output_placeholders = 0
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-    sched.skipped_waiting.add_request(session)
+    sched.kv_holding_waiting.add_request(session)
+    sched.deferred_waiting.add(session)
     sched.num_waiting_for_streaming_input = 1
 
 
@@ -1291,7 +1315,7 @@ def test_stage0_streaming_update_that_overflows_max_model_len_finishes_the_sessi
     assert session.status == RequestStatus.FINISHED_ERROR
     assert session.request_id not in sched.requests
     assert len(sched.waiting) == 0
-    assert len(sched.skipped_waiting) == 0
+    assert len(sched.kv_holding_waiting) == 0
     assert sched.num_waiting_for_streaming_input == 0
     sched._free_request_blocks.assert_called_once_with(session)
     assert sched.finished_req_ids == {session.request_id}
@@ -1399,7 +1423,8 @@ def _make_admission_scheduler(*, max_model_len: int) -> OmniARScheduler:
     sched.max_model_len = max_model_len
     sched.policy = SchedulingPolicy.FCFS
     sched.waiting = create_request_queue(sched.policy)
-    sched.skipped_waiting = create_request_queue(sched.policy)
+    sched.kv_holding_waiting = create_request_queue(sched.policy)
+    sched.deferred_waiting = set()
     sched.running = []
     sched.requests = {}
     sched._free_request = MagicMock()  # needs a KV manager; not what this covers
@@ -1428,7 +1453,7 @@ def test_queued_streaming_update_that_overflows_does_not_return_to_admission() -
 
     assert finished is True
     assert len(sched.waiting) == 0
-    assert len(sched.skipped_waiting) == 0
+    assert len(sched.kv_holding_waiting) == 0
     assert session.status == RequestStatus.FINISHED_ERROR
     assert session.resumable is False
     assert "context_length_exceeded: " in sched._streaming_context_overflow[session.request_id][1]
@@ -1447,7 +1472,8 @@ def test_queued_streaming_update_that_fits_still_resumes_the_session() -> None:
     finished = sched._handle_stopped_request(session)
 
     assert finished is False
-    assert len(sched.waiting) == 1
+    assert list(sched.kv_holding_waiting) == [session]
+    assert session not in sched.deferred_waiting
     assert session.status == RequestStatus.WAITING
     assert not getattr(sched, "_streaming_context_overflow", {})
     sched._free_request.assert_not_called()
@@ -1469,7 +1495,7 @@ def test_queued_stop_with_a_recorded_overflow_still_leaves_admission() -> None:
 
     assert finished is True
     assert len(sched.waiting) == 0
-    assert len(sched.skipped_waiting) == 0
+    assert len(sched.kv_holding_waiting) == 0
     assert session.status == RequestStatus.FINISHED_ERROR
     assert session.resumable is False
     sched._free_request.assert_not_called()
@@ -1492,7 +1518,7 @@ def test_parked_stop_with_a_recorded_overflow_keeps_the_streaming_counter_balanc
     finished = sched._handle_stopped_request(session)
 
     assert finished is True
-    assert len(sched.skipped_waiting) == 0
+    assert len(sched.kv_holding_waiting) == 0
     assert sched.num_waiting_for_streaming_input == 0
     assert session.status == RequestStatus.FINISHED_ERROR
     sched._free_request.assert_not_called()
@@ -1525,6 +1551,7 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
     sched.running = []
     sched._native_data_plane = native
     sched.use_v2_model_runner = native
+    sched.max_num_active_reqs = 8
     sched.max_num_running_reqs = 8
     sched.input_coordinator = (
         SimpleNamespace(_async_chunk=True, _waiting_for_chunk_running=[parked], restore_queues=lambda _w, _r: None)
@@ -1551,7 +1578,7 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
     observed_limits: list[int] = []
 
     def fake_schedule(self, _throttle_prefills=False):
-        observed_limits.append(self.max_num_running_reqs)
+        observed_limits.append(self.max_num_active_reqs)
         return SimpleNamespace(scheduled_new_reqs=[])
 
     monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
@@ -1559,4 +1586,4 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
     sched.schedule()
 
     assert observed_limits == [7 if native else 8]
-    assert sched.max_num_running_reqs == 8
+    assert sched.max_num_active_reqs == 8

@@ -55,7 +55,7 @@ from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_POLICY_PIPELINE,
 )
 from vllm_omni.model_executor.models.cosmos3_nano_sim_bimanual.pipeline import COSMOS3_NANO_SIM_BIMANUAL_PIPELINE
-from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
+from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
@@ -152,7 +152,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # key (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_omni.yaml).
     "cosmos3_omni_deploy": COSMOS3_OMNI_DEPLOY_PIPELINE,
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
-    "cosyvoice3": COSYVOICE3_PIPELINE,
+    "cosyvoice3": resolve_cosyvoice3_pipeline,
     "covo_audio": COVO_AUDIO_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,

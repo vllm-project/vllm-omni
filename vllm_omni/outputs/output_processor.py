@@ -46,6 +46,8 @@ def _modality_to_type_string(modality: OutputModality) -> str:
             return "image"
         if OutputModality.LATENT in modality:
             return "latent"
+        if OutputModality.TOKEN_IDS in modality:
+            return "token_ids"
     except TypeError:
         # Flag identity mismatch (e.g. after module reload in tests).
         name = getattr(modality, "name", "") or ""
@@ -56,6 +58,8 @@ def _modality_to_type_string(modality: OutputModality) -> str:
             return "image"
         if "latent" in lowered:
             return "latent"
+        if "token_ids" in lowered:
+            return "token_ids"
     return "text"
 
 
@@ -410,7 +414,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats: Whether to log statistics
             stream_interval: Stream interval for output generation
             engine_core_output_type: Optional output type string (e.g.,
-                "image", "audio", "latent"). Converted to OutputModality
+                "image", "audio", "latent", "token_ids"). Converted to OutputModality
                 internally. Kept for backward compatibility with
                 stage_init_utils.
             output_modality: Type-safe output modality flag. Used to tag

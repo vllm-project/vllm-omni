@@ -61,7 +61,10 @@ def test_single_request_graph_wrapper_cpu_falls_back_to_eager(cfg_strength: floa
 
     # The conditioning is prepared once per request and reused by every step.
     assert prepare_spy.call_count == 1
-    assert prepare_spy.call_args.args[-1] is (cfg_strength >= 1e-5)
+    # _prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps)
+    assert prepare_spy.call_args.args[6] is (cfg_strength >= 1e-5)
+    # The time grid reaches prepare, so the adaLN modulations are computed once.
+    assert prepare_spy.call_args.args[7].numel() == 2
     assert step_spy.call_count == 2
     capture_spy.assert_not_called()
     assert not wrapper._cache
@@ -84,7 +87,8 @@ def test_graph_inputs_use_bounded_length_buckets() -> None:
     assert padded[4].shape == (1, 100, 4)
     assert padded[5].shape == (1, 100)
     assert [mask.sum().item() for mask in (padded[1], padded[3], padded[5])] == [65, 65, 51]
-    assert wrapper._key(padded[0], padded[2], padded[4], False) == (96, 96, 100, False)
+    assert wrapper._key(padded[0], padded[2], padded[4], False) == (96, 96, 100, False, 0)
+    assert wrapper._key(padded[0], padded[2], padded[4], False, 32) == (96, 96, 100, False, 32)
     assert wrapper.max_graphs == 32
 
 
@@ -153,18 +157,21 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
             inputs["ref"],
             inputs["ref_mask"],
         )
-        key = wrapper._key(bucketed[0], bucketed[2], bucketed[4], cfg_strength >= 1e-5)
+        # sample_latents passes the grid, so the key carries its step count (two steps here).
+        key = wrapper._key(bucketed[0], bucketed[2], bucketed[4], cfg_strength >= 1e-5, 2)
         assert key in wrapper._cache
 
         # The static context was refreshed for this request's conditioning.
         entry = wrapper._cache[key]
-        fresh = wrapper._prepare(*bucketed, cfg_strength >= 1e-5)
+        grid = torch.tensor([0.0, 0.4], device="cuda")
+        fresh = wrapper._prepare(*bucketed, cfg_strength >= 1e-5, grid)
         for static, want in zip(entry.static_ctx.tensors(), fresh.tensors(), strict=True):
             if want is None:
                 assert static is None
             else:
                 torch.testing.assert_close(static, want)
         torch.testing.assert_close(entry.static_timestep, torch.tensor(0.4, device="cuda"))
+        assert int(entry.static_step) == 1
 
     assert len(wrapper._cache) == 1
 

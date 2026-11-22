@@ -20,14 +20,20 @@ enable_chunked_prefill: false
 
 stages:
   # Stage 0: Qwen2.5-Omni thinker as a frozen text encoder.
-  # Prefill only — one sampled token, discarded downstream. eager because the
-  # fused-hidden forward walks the decoder layers itself and so bypasses the
-  # compiled graph.
+  # Prefill only: one sampled token, discarded downstream. The fused-hidden
+  # forward walks the decoder layers itself, so torch.compile has nothing to
+  # hook (mode 0); the whole prefill is instead captured as FULL CUDA graphs
+  # padded to the sizes below, which removes most of its launch overhead
+  # (about 20 ms per request on H200). Longer prompts run eager.
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
     gpu_memory_utilization: 0.45
-    enforce_eager: true
+    enforce_eager: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [64, 128, 192, 256, 384, 512]
     max_num_batched_tokens: 32768
     # AuK takes text plus at most one clip; no image or video tower is built.
     limit_mm_per_prompt: {audio: 1}

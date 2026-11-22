@@ -3,6 +3,7 @@
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
 from dataclasses import dataclass
+from enum import Flag
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -79,6 +80,26 @@ def _make_state(output_kind: RequestOutputKind):
 
 def test_output_modality_name_uses_string_value():
     assert str(OutputModalityNames.AUDIO) == "audio"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("TOKEN_IDS", "token_ids"),
+        ("TEXT|TOKEN_IDS", "token_ids"),
+        ("LATENT|TOKEN_IDS", "latent"),
+        ("IMAGE|TOKEN_IDS", "image"),
+        ("AUDIO|TOKEN_IDS", "audio"),
+    ],
+)
+def test_modality_type_string_handles_reloaded_token_id_enum(name, expected):
+    # A separate Flag class reproduces enum identity changes after module reload.
+    ReloadedOutputModality = Flag("ReloadedOutputModality", ["TEXT", "IMAGE", "AUDIO", "LATENT", "TOKEN_IDS"])
+    value = ReloadedOutputModality(0)
+    for member in name.split("|"):
+        value |= ReloadedOutputModality[member]
+
+    assert output_processor._modality_to_type_string(value) == expected
 
 
 def test_init_empty_dict():
@@ -572,6 +593,92 @@ _NO_DETOK_STATE_KWARGS = {
 
 def _make_no_detok_state(output_kind: RequestOutputKind):
     return OmniRequestState(**_NO_DETOK_STATE_KWARGS, output_kind=output_kind)
+
+
+def test_token_id_delta_retains_ids_and_latents_until_final_consolidation(mocker):
+    state = _make_state(RequestOutputKind.DELTA)
+    state.detokenizer = mocker.MagicMock(
+        output_token_ids=[10],
+        get_next_output_text=mocker.MagicMock(return_value=""),
+        num_output_tokens=mocker.MagicMock(return_value=1),
+    )
+    first_ids = torch.tensor([[1, 2]], dtype=torch.long)
+    last_ids = torch.tensor([[3, 4]], dtype=torch.long)
+    first_latent = torch.tensor([[0.1, 0.2, 0.3]])
+    last_latent = torch.tensor([[0.4, 0.5, 0.6]])
+    state.add_multimodal_tensor({"model_outputs": first_ids, "latent": first_latent}, mm_type="token_ids")
+
+    first = state.make_request_output([10], None, None, None)
+
+    assert first is not None and not isinstance(first, PoolingRequestOutput)
+    first_completion = first.outputs[0]
+    assert set(state.mm_accumulated) == {"token_ids", "latent"}
+    torch.testing.assert_close(first_completion.multimodal_output["token_ids"], first_ids)
+    torch.testing.assert_close(first_completion.multimodal_output["latent"], first_latent)
+    assert first_completion.cumulative_token_ids == [10]
+
+    state.detokenizer.output_token_ids.append(11)
+    state.add_multimodal_tensor({"model_outputs": last_ids, "latent": last_latent}, mm_type="token_ids")
+    final = state.make_request_output([11], None, FinishReason.STOP, None)
+
+    assert final is not None and not isinstance(final, PoolingRequestOutput)
+    completion = final.outputs[0]
+    assert set(state.mm_accumulated) == {"token_ids", "latent"}
+    torch.testing.assert_close(completion.multimodal_output["token_ids"], torch.cat([first_ids, last_ids], dim=0))
+    torch.testing.assert_close(completion.multimodal_output["latent"], torch.cat([first_latent, last_latent], dim=0))
+    # Completion tokens remain on their own cumulative path, independent of
+    # tensor payload IDs; the earlier completion keeps its original snapshot.
+    assert completion.cumulative_token_ids == [10, 11]
+    assert first_completion.cumulative_token_ids == [10]
+
+
+@pytest.mark.parametrize(
+    ("engine_output_type", "expected_key", "expected_values"),
+    [
+        (None, "text", [[0, 1, 2], [3, 4, 5]]),
+        ("text", "text", [[0, 1, 2], [3, 4, 5]]),
+        ("image", "image", [[0, 1, 2], [3, 4, 5]]),
+        ("latent", "latent", [[0, 1, 2], [3, 4, 5]]),
+        ("token_ids", "token_ids", [[0, 1, 2], [3, 4, 5]]),
+        ("audio", "audio", [[0, 1, 2, 3, 4, 5]]),
+        ("text+image", "image", [[0, 1, 2], [3, 4, 5]]),
+        ("text,latent", "latent", [[0, 1, 2], [3, 4, 5]]),
+        ("text+audio", "audio", [[0, 1, 2, 3, 4, 5]]),
+        ("text+token_ids", "token_ids", [[0, 1, 2], [3, 4, 5]]),
+        ("latent,token_ids", "latent", [[0, 1, 2], [3, 4, 5]]),
+        ("image+token_ids", "image", [[0, 1, 2], [3, 4, 5]]),
+        ("audio+token_ids", "audio", [[0, 1, 2, 3, 4, 5]]),
+    ],
+)
+def test_engine_output_type_controls_payload_key_and_concatenation(engine_output_type, expected_key, expected_values):
+    """Canonical config values retain output naming and tensor merge behavior."""
+    processor = MultimodalOutputProcessor(
+        tokenizer=None,
+        log_stats=False,
+        engine_core_output_type=engine_output_type,
+    )
+    state = _make_no_detok_state(RequestOutputKind.FINAL_ONLY)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+
+    first = OmniEngineCoreOutput(
+        request_id=state.request_id,
+        new_token_ids=[10],
+        multimodal_output={"model_outputs": torch.tensor([[0, 1, 2]])},
+    )
+    assert not processor.process_outputs([first]).request_outputs
+
+    last = OmniEngineCoreOutput(
+        request_id=state.request_id,
+        new_token_ids=[11],
+        finish_reason=FinishReason.STOP,
+        multimodal_output={"model_outputs": torch.tensor([[3, 4, 5]])},
+    )
+    result = processor.process_outputs([last])
+    assert len(result.request_outputs) == 1
+    payload = result.request_outputs[0].outputs[0].multimodal_output
+    assert set(payload) == {expected_key}
+    torch.testing.assert_close(payload[expected_key], torch.tensor(expected_values))
 
 
 def test_no_detokenizer_completion_output():

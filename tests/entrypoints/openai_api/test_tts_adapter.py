@@ -691,6 +691,45 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer.to.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "variant,graphs_env,prepares",
+    [("local", None, False), ("local", "1", True), ("local", "0", False), ("realtime", "1", False)],
+)
+def test_moss_warmup_prepares_the_reference_encoder(variant, graphs_env, prepares, mocker, monkeypatch):
+    if graphs_env is None:
+        monkeypatch.delenv("VLLM_OMNI_MOSS_REF_GRAPHS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_MOSS_REF_GRAPHS", graphs_env)
+    adapter = _moss_adapter_with_stage_configs([], mocker)
+    adapter._moss_variant = variant
+    encoder = mocker.Mock()
+    mocker.patch.object(adapter, "_get_moss_ref_encoder", return_value=encoder)
+    asyncio.run(adapter.warmup())
+    assert encoder.prepare.called is prepares
+
+
+def test_moss_warmup_failure_does_not_stop_startup(mocker, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_GRAPHS", "1")
+    adapter = _moss_adapter_with_stage_configs([], mocker)
+    encoder = mocker.Mock()
+    encoder.prepare.side_effect = RuntimeError("capture failed")
+    mocker.patch.object(adapter, "_get_moss_ref_encoder", return_value=encoder)
+    asyncio.run(adapter.warmup())
+    encoder.prepare.assert_called_once_with()
+
+
+def test_moss_shared_encoder_startup_failure_stops_api_startup(mocker, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_GRAPHS", "1")
+    from vllm_omni.model_executor.models.moss_tts.shared_reference_encoder import SharedReferenceEncoderStartupError
+
+    adapter = _moss_adapter_with_stage_configs([], mocker)
+    encoder = mocker.Mock()
+    encoder.prepare.side_effect = SharedReferenceEncoderStartupError("still compiling")
+    mocker.patch.object(adapter, "_get_moss_ref_encoder", return_value=encoder)
+    with pytest.raises(SharedReferenceEncoderStartupError):
+        asyncio.run(adapter.warmup())
+
+
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)

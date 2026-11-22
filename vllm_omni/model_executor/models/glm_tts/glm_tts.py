@@ -38,7 +38,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -50,7 +49,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one as _ras_sample_one
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -674,7 +673,7 @@ class GLMTTSMultiModalProcessor(OmniMultiModalProcessor[GLMTTSMultiModalProcessi
         ]
 
 
-class GLMTTSDummyInputsBuilder(BaseDummyInputsBuilder[GLMTTSMultiModalProcessingInfo]):
+class GLMTTSDummyInputsBuilder(OmniDummyInputsBuilder[GLMTTSMultiModalProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return "This is a test of the GLM-TTS voice cloning system."
 

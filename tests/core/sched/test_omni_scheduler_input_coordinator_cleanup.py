@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -49,6 +52,8 @@ def test_finish_requests_cleans_input_coordinator_for_finished_ids(
     scheduler.requests = {}
     scheduler.running = []
     scheduler.waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
 
     def fake_finish_requests(self, request_ids, finished_status):
         assert request_ids == ["req-a", "req-b"]
@@ -76,7 +81,7 @@ def test_ar_free_request_cleans_input_coordinator_on_normal_free() -> None:
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.input_coordinator = coordinator
     scheduler.chunk_transfer_adapter = None
-    scheduler._omits_kv_transfer_cache = {"req-free": True}
+    scheduler._omits_kv_transfer_cache = {"req-free": (1, True, False)}
     scheduler.encoder_cache_manager = SimpleNamespace(free=lambda request: None)
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None

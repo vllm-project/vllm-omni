@@ -91,6 +91,25 @@ steps:
 
 - group: ":card_index_dividers: Diffusion Test"
   steps:
+    # AR paged attention is real GPU work, including cold AITER compilation.
+    # Keep its complete numerical matrix out of the CPU-marked Simple shards.
+    - label: "ROCm · AR Diffusion Paged Attention GPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 20
+      commands:
+        - export VLLM_ROCM_USE_AITER=1
+        - export VLLM_OMNI_AR_FA_REQUIRED=1
+        - export AITER_JIT_DIR="/tmp/vllm-omni-ar-aiter-$$BUILDKITE_JOB_ID"
+        - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-ar-torch-extensions-$$BUILDKITE_JOB_ID"
+        - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
+        - >-
+          timeout --signal=TERM --kill-after=2m 15m
+          pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+
     - label: "Diffusion · LoRA Test"
       agent_pool: mi300_1
       depends_on: amd-build

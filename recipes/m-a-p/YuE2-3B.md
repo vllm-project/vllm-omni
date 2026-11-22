@@ -19,6 +19,11 @@ renders it with the lyrics. `cot=off` skips the score and generates music
 directly. Weights are **CC BY-NC 4.0** (non-commercial); this recipe loads
 user-downloaded weights and bundles none.
 
+To start from a recording, use the [SheetSage2 H200 recipe](SheetSage2-H200.md)
+to transcribe it into ABC in a separate environment, then pass the score to
+YuE2 with `--abc-file`. It includes full-song frame budgets and offline cover
+validation details.
+
 ## References
 
 - Model card: [m-a-p/YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B)

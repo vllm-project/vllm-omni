@@ -111,7 +111,7 @@ class TestFailureCounterWiring:
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
-                build_and_log_summary=lambda: None,
+                log_timing_summary=lambda: None,
             ),
             failure_recorded=False,
         )
@@ -127,7 +127,7 @@ class TestFailureCounterWiring:
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
-                build_and_log_summary=lambda: None,
+                log_timing_summary=lambda: None,
             ),
             failure_recorded=False,
         )
@@ -426,6 +426,8 @@ def _make_scheduler_shell() -> OmniARScheduler:
     obj.requests = {}
     obj.running = []
     obj.waiting = []
+    obj.kv_holding_waiting = []
+    obj.deferred_waiting = set()
     obj._kv_wait_start_ts = {}
     obj._omni_kv_config = None
     return obj

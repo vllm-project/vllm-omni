@@ -31,6 +31,7 @@ def _make_request(request_id: str) -> OmniDiffusionRequest:
 
 def _make_engine() -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
     engine.scheduler.initialize(SimpleNamespace())
     engine.executor = SimpleNamespace(shutdown=Mock())

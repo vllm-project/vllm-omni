@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from typing import Any
 from uuid import uuid4
 
@@ -37,6 +37,7 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands as duplex_commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, ResponseCreateOptions
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import DuplexEvent, SessionClosed
 from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
@@ -66,7 +67,11 @@ class DuplexSessionHandle:
         self.capabilities: DuplexCapabilities = DuplexCapabilities()
         self.public_session: dict[str, object] = {}
         self.lease_generation: int = 0
-        self._outbox: asyncio.Queue[DuplexEvent | None] = asyncio.Queue()
+        limits = omni.duplex_session_config
+        self._outbox = DuplexOutputBuffer(
+            max_bytes=limits.max_pending_output_bytes_per_session,
+            max_events=limits.max_pending_output_events_per_session,
+        )
         self._closed = False
         self._close_reason: str | None = None
         self._closed_event = asyncio.Event()
@@ -219,12 +224,10 @@ class DuplexSessionHandle:
         self._consumer_active = True
         try:
             while True:
-                if self._closed and self._outbox.empty():
-                    return
                 event = await self._outbox.get()
                 if event is None:
-                    if self._closed and self._outbox.empty():
-                        return
+                    return
+                if not self._outbox.is_valid(event):
                     continue
                 yield event
                 if event.is_terminal:
@@ -235,6 +238,10 @@ class DuplexSessionHandle:
     async def wait_closed(self) -> str:
         await self._closed_event.wait()
         return self._close_reason or "closed"
+
+    def output_guard(self, event: DuplexEvent) -> AbstractContextManager[bool]:
+        """Recheck held audio while committing its delivery; never await inside this guard."""
+        return self._outbox.guard(event)
 
     async def __aenter__(self) -> DuplexSessionHandle:
         return self
@@ -256,7 +263,7 @@ class DuplexSessionHandle:
             self.lease_generation = int(result.lease_generation)
 
     def _deliver(self, event: DuplexEvent) -> None:
-        self._outbox.put_nowait(event)
+        self._outbox.put(event)
         if isinstance(event, SessionClosed):  # SessionExpired is a SessionClosed
             self._mark_closed(event.reason or event.type)
 
@@ -266,7 +273,7 @@ class DuplexSessionHandle:
         self._closed = True
         self._close_reason = reason
         self._closed_event.set()
-        self._outbox.put_nowait(None)
+        self._outbox.close()
 
 
 class DuplexOmni(AsyncOmni):
@@ -356,8 +363,11 @@ class DuplexOmni(AsyncOmni):
         self._handles[session_id] = handle
         self._final_output_handler()
         try:
-            result = await self.engine.open_session_async(session_id, session_config, timeout=timeout)
+            result = await self.engine.open_session_async(
+                session_id, session_config, output_buffer=handle._outbox, timeout=timeout
+            )
         except BaseException:
+            handle._mark_closed("open_failed")
             if self._handles.get(session_id) is handle:
                 self._handles.pop(session_id, None)
             # Dropping the handle only forgets the id here. The engine may still

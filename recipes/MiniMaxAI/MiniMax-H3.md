@@ -988,6 +988,42 @@ settings, and both videos with any comparison; the command alone is not quality
 evidence. A matching seed does not imply matching noise over differently sized
 full and windowed latents.
 
+## Request-scoped sampler
+
+H3 supports `euler` (the default) and `res_multistep`. Select the sampler per
+request; it applies to both video and audio, using their separate sigma schedules.
+For the HTTP examples above, set `num_inference_steps=20` and add
+`"sampler":"res_multistep"` to the existing `extra_params` object. For example,
+the T2VA fields become:
+
+```bash
+-F 'num_inference_steps=20' \
+-F 'extra_params={"task":"t2va","duration":8.7,"audio_flow_shift":3.0,"sampler":"res_multistep"}'
+```
+
+For the offline Python API, use `extra_args`:
+
+```python
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+sampling_params = OmniDiffusionSamplingParams(
+    num_inference_steps=20,
+    seed=42,
+    extra_args={"task": "t2va", "sampler": "res_multistep"},
+)
+```
+
+Both samplers use one DiT evaluation per step in request mode and step execution.
+`res_multistep` retains the previous denoised prediction independently for each
+request and each stream; its first and final updates use Euler. Omitting `sampler`
+or selecting `euler` preserves the existing Euler update. Reducing the step count
+reduces model evaluations, but quality depends on the prompt and configuration;
+20 RES steps are a candidate to compare against an Euler-50 reference.
+
+Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
+must keep `sampler="euler"`. RES sampling with those schedules has not been
+validated and is rejected with `ValueError`.
+
 ## Request-scoped quality
 
 Add one of these fields to any HTTP request above. No Cache-DiT startup option
@@ -1408,6 +1444,7 @@ four-step adapter keeps its original sampling and fixed-top-k behavior.
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
+| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |

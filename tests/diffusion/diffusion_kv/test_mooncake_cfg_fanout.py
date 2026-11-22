@@ -31,6 +31,10 @@ def producer(monkeypatch):
     # vLLM 0.30 send_kv_to_decode also reads the PP size (ce08bb5b34,
     # #56033), the MLA/Mamba flags and the head-resharding validator.
     worker.pp_size = 1
+    worker.opaque_packed_storages = set()
+    worker._prepared_transfer_regions = {}
+    worker.region_shared_groups = []
+    worker.region_row_offsets = []
     worker.use_mla = False
     worker.kv_cache_config = SimpleNamespace(has_mamba_layers=False)
     worker._validate_head_resharding_layout = Mock(return_value=None)

@@ -36,6 +36,7 @@ validation_paths:
   - tests/diffusion/test_diffusion_worker.py
   - tests/diffusion/test_multiproc_engine_concurrency.py
   - tests/diffusion/test_uniproc_executor.py
+  - tests/diffusion/test_ray_executor.py
   - tests/diffusion/test_result_pump.py
   - tests/diffusion/test_async_output_worker.py
   - tests/diffusion/test_diffusion_ipc.py
@@ -96,8 +97,10 @@ The executor then chooses how the worker runs:
   RPC.
 - **`mp`** (default when `num_gpus > 1`, or when set explicitly):
   `MultiprocDiffusionExecutor` starts one `WorkerProc` per device.
+- **`ray`** (explicit): `RayDiffusionExecutor` starts one GPU actor per worker
+  across one or more Ray nodes.
 
-Either way, each worker owns its device, distributed state,
+In all backends, each worker owns its device, distributed state,
 `DiffusionWorker`, `DiffusionModelRunner`, and pipeline instance.
 
 ```mermaid
@@ -108,7 +111,7 @@ flowchart TB
         stageProc["StageDiffusionProc<br/>stage transport and lifecycle"]
         engine["DiffusionEngine<br/>admission and control loop"]
         scheduler["RequestScheduler or StepScheduler<br/>request state and policy"]
-        executor["DiffusionExecutor<br/>uni or mp backend"]
+        executor["DiffusionExecutor<br/>uni, mp, or ray backend"]
         streams["Per-request output streams"]
 
         stageProc --> engine
@@ -132,6 +135,8 @@ flowchart TB
     client -.->|"inline: direct call"| engine
     executor -->|"mp: broadcast / result queues"| workerProc
     executor -.->|"uni: in-process call"| worker
+    executor -->|"ray: actor RPC"| rayActor["RayDiffusionWorkerWrapper"]
+    rayActor --> worker
     streams -->|"process-backed"| stageProc
     stageProc -->|"ZMQ results"| client
     streams -.->|"inline"| client
@@ -154,6 +159,7 @@ flowchart TB
 | `DiffusionExecutor` | Execution backend contract, worker RPC, health, shutdown | Admission and request-state transitions |
 | `UniProcDiffusionExecutor` | Single in-process worker for `num_gpus == 1`; no IPC or async output pump | Multi-GPU execution |
 | `MultiprocDiffusionExecutor` | Worker processes, shared-memory message queues, result dispatch, worker monitoring | In-process single-GPU path |
+| `RayDiffusionExecutor` | GPU actors, placement groups, remote RPC, actor monitoring | Local worker subprocesses and shared-memory IPC |
 | `WorkerProc` | One `mp` worker process's IPC loop and reply rules | Scheduling policy; unused by `uni` |
 | `DiffusionWorker` | Device/distributed setup, LoRA activation, profiling, sleep/wake, runner delegation | Request admission |
 | `DiffusionModelRunner` | Pipeline loading, request-local model state, cache/compile setup, request or step execution | Queueing and cross-stage routing |
@@ -219,12 +225,12 @@ uses fused `execute_model_batch()` and requires the pipeline to declare
 request-batch support.
 
 **Distributed layerwise offload with AllGather (DLO DP concurrency)** is a
-separate multiproc dispatch path. It activates when
+separate dispatch path supported by `mp` and `ray`. It activates when
 `data_parallel_size > 1`, `enable_distributed_layerwise_offload` is set, and
 `dlo_use_allgather` is true. The engine then sets `dp_concurrent = True` and
 raises `scheduler.max_num_running_reqs` to `dp_size`, overriding the
 `max_num_seqs` value from `initialize()`. The scheduler still emits a
-multi-request `DiffusionSchedulerOutput`; the multiproc executor routes that
+multi-request `DiffusionSchedulerOutput`; these executors route that
 wave through `execute_request()` instead of fused `execute_model_batch()`.
 
 Optional admission coalescing can fill a `dp_size` wave: when
@@ -233,7 +239,7 @@ the first schedule of a wave (under `dp_concurrent`, the stable window is
 `min(0.3s, wait/2)`). With the default `request_batch_max_wait_ms == 0`,
 there is no wait.
 
-Before dispatch, `MultiprocDiffusionExecutor.execute_request()` rejects waves
+Before dispatch, both backends reject waves
 whose requests differ in sampling-parameter compatibility or `extra_args`
 (AllGather requires every DP rank to follow the same forward schedule). Each
 worker rank then picks one envelope from the wave:
@@ -297,8 +303,9 @@ head-of-line blocking.
 | --- | --- | --- |
 | `uni` | Default for `num_gpus == 1`, or set explicitly | One in-process worker |
 | `mp` | Default for `num_gpus > 1`, or set explicitly | One worker process per device |
+| `ray` | Set explicitly | One GPU actor per worker across Ray nodes |
 
-Ray and external-launcher diffusion backends are not implemented. A custom
+The external-launcher diffusion backend is not implemented. A custom
 `DiffusionExecutor` subclass or import path is also accepted.
 
 ### Uniproc backend
@@ -337,11 +344,27 @@ result path and does not start those pumps.
 See [Async diffusion output](../../feature/async_diffusion_output.md) for the
 multiproc request-mode timeline.
 
+### Ray backend
+
+`RayDiffusionExecutor` reuses initialized Ray or calls `ray.init()` (respecting
+`RAY_ADDRESS`). It reuses the current placement group or reserves one GPU
+bundle per worker with `PACK` placement. Ray owns GPU placement; PyTorch
+owns distributed collectives through a shared TCP rendezvous. Global ranks
+are grouped by host, while each actor uses local device 0.
+
+Request batches, step execution, and DLO DP waves use actor RPCs with
+rank-aware replies. Returned tensors move to CPU before Ray serialization;
+this backend does not use the multiproc async output pumps. Driver inference
+settings and explicit stage `runtime.env` are forwarded, excluding worker
+identity and device assignment. See [Stage configuration](../../../configuration/stage_configs.md)
+for cluster setup and environment details.
+
 ## Worker and runner boundary
 
 On the `mp` path, `WorkerProc` receives messages and calls methods through
 `WorkerWrapperBase`. On the `uni` path, the executor owns that wrapper
-directly. In both cases, `DiffusionWorker` handles the parts tied to a device:
+directly. Ray actors also construct `WorkerWrapperBase`. In all cases,
+`DiffusionWorker` handles the parts tied to a device:
 distributed initialization, model-runner construction, LoRA activation,
 profiling, and memory sleep/wake. It delegates actual model work to
 `DiffusionModelRunner`.
@@ -399,6 +422,10 @@ streams with an error, closes scheduler state, and shuts down the executor.
   async-output futures as failed, then clears them. Completed async outputs
   cached for later `wait_output_ready()` calls are dropped with the executor
   object.
+- **`ray`**: the executor gives actors up to five seconds to shut down, then
+  kills them and removes placement groups it owns. Actor death is monitored
+  even while idle; actor errors and RPC timeouts fail the group and notify the
+  stage. The stage client allows subprocess cleanup before signal fallback.
 - **`uni`**: the executor shuts down the in-process worker, drops the final
   model reference, and empties the accelerator cache so a later engine can reuse
   the device.
@@ -407,7 +434,7 @@ streams with an error, closes scheduler state, and shuts down the executor.
 
     Do not continue using a worker group after a fatal collective timeout or
     unexpected worker exit. Distributed state may be incomplete. The
-    multiprocess executor deliberately fails closed so the stage can restart.
+    `mp` and `ray` executors deliberately fail closed so the stage can restart.
     The uniproc executor fails closed when the accelerator context itself is
     poisoned.
 
@@ -417,10 +444,11 @@ streams with an error, closes scheduler state, and shuts down the executor.
   `diffusion_model_runner_cls` configuration still wins.
 - Tests and custom engine integrations may inject a `BaseScheduler` subclass.
   `SchedulerInterface` remains only as a deprecated compatibility name.
-- `distributed_executor_backend` may be `"uni"`, `"mp"`, a custom `DiffusionExecutor`
+- `distributed_executor_backend` may be `"uni"`, `"mp"`, `"ray"`, a custom `DiffusionExecutor`
   subclass, or an import path. A backend must preserve scheduler output,
   request identity, health, and cleanup contracts. Use `"mp"` when you need
-  process isolation or multi-GPU; `"uni"` is the single-GPU default.
+  local process isolation or multi-GPU, or `"ray"` for workers across nodes;
+  `"uni"` is the single-GPU default.
 - Worker extensions go through `WorkerWrapperBase`. They add worker methods;
   they do not become a second scheduler or request lifecycle.
 
@@ -466,7 +494,7 @@ Test the smallest affected slice, then cover its neighboring boundary:
 | --- | --- |
 | Admission or state transitions | `test_diffusion_scheduler.py`, including duplicate IDs, compatibility, abort, and missing output |
 | Engine loop or output delivery | `test_diffusion_engine.py`, `test_diffusion_engine_cleanup.py`, `test_diffusion_engine_rpc_routing.py` |
-| Executor or IPC | `test_multiproc_engine_concurrency.py`, `test_uniproc_executor.py`, `test_result_pump.py`, `test_diffusion_ipc.py`, `test_async_output_worker.py` |
+| Executor or IPC | `test_multiproc_engine_concurrency.py`, `test_uniproc_executor.py`, `test_ray_executor.py`, `test_result_pump.py`, `test_diffusion_ipc.py`, `test_async_output_worker.py` |
 | Worker or runner | `test_diffusion_worker.py`, `test_diffusion_model_runner.py` |
 | Stage boundary | `test_stage_diffusion_proc.py`, `test_inline_stage_diffusion_client.py` |
 | Warmup or streaming | `test_diffusion_engine_dummy_run.py`, `test_diffusion_streaming_output.py` |

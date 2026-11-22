@@ -329,7 +329,9 @@ def _uneven_cfg_sharded_worker(
         init_method=init_method,
         rank=rank,
         world_size=4,
-        timeout=datetime.timedelta(seconds=10),
+        # Spawned workers import torch/vLLM before joining; allow startup
+        # skew without changing the collective deadlock checks below.
+        timeout=datetime.timedelta(seconds=60),
     )
     try:
         fs_groups = [

@@ -33,7 +33,10 @@ from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
     get_mammoth_moda2_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -90,12 +93,12 @@ def test_root_weight_source_forwards_revision() -> None:
     assert _root_weight_source(config).revision == "rev-7"
 
 
-def test_pipeline_declares_native_components_and_batch_request_mode() -> None:
+def test_pipeline_declares_native_components_and_batch_modes() -> None:
     assert MammothModa2DiTPipeline._dit_modules == ["gen_transformer"]
     assert MammothModa2DiTPipeline._encoder_modules == ["gen_image_condition_refiner"]
     assert MammothModa2DiTPipeline._vae_modules == ["gen_vae"]
     assert MammothModa2DiTPipeline.supports_request_batch is True
-    assert MammothModa2DiTPipeline.supports_step_execution is False
+    assert MammothModa2DiTPipeline.supports_step_execution is True
 
 
 def test_mammoth_postprocess_denormalizes_nonnegative_raw_vae_output() -> None:
@@ -340,6 +343,21 @@ class _FakeTransformer(nn.Module):
     def forward(self, *, hidden_states, **kwargs):
         self.calls += 1
         return torch.zeros_like(hidden_states)
+
+
+class _FakeImageRefiner(nn.Module):
+    def __init__(self, num_queries: int) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
+        self.num_queries = num_queries
+
+    def forward(self, image_embeds, attention_mask):
+        assert attention_mask.shape == image_embeds.shape[:2]
+        return image_embeds.new_zeros(
+            image_embeds.shape[0],
+            self.num_queries,
+            image_embeds.shape[-1],
+        )
 
 
 @dataclass
@@ -588,6 +606,25 @@ def test_pre_process_registers_batch_compatibility_key() -> None:
     req = _batch().requests[0]
     pre_process(req)
     assert req.batch_compatibility_key == ("mammoth_moda2_dit", 32, 48, 7)
+
+
+def test_step_pre_process_allows_different_step_counts() -> None:
+    config = _od_config()
+    config.step_execution = True
+    pre_process = get_mammoth_moda2_pre_process_func(config)
+    first = _batch(
+        request_id="short",
+        sampling=OmniDiffusionSamplingParams(height=32, width=48, num_inference_steps=2),
+    ).requests[0]
+    second = _batch(
+        request_id="long",
+        sampling=OmniDiffusionSamplingParams(height=32, width=48, num_inference_steps=7),
+    ).requests[0]
+
+    pre_process(first)
+    pre_process(second)
+
+    assert first.batch_compatibility_key == second.batch_compatibility_key == ("mammoth_moda2_dit", 32, 48)
 
 
 def test_pre_process_rejects_missing_ar_conditions() -> None:
@@ -1020,3 +1057,367 @@ def test_admission_and_inference_threshold_resolution_matches(llm_cfg_patch: dic
     text_cond, image_cond = pipeline._split_request_conditions(parsed_at)
     assert text_cond.shape == (1, 8)
     assert image_cond.shape == (1, 8)
+
+
+def _step_state(batch: DiffusionRequestBatch) -> StepRequestState:
+    request = batch.requests[0]
+    return StepRequestState(
+        request_id=request.request_id,
+        sampling=request.sampling_params,
+        prompt=request.prompt,
+    )
+
+
+@pytest.mark.parametrize("step_execution", [False, True])
+@pytest.mark.parametrize(
+    ("standard_steps", "extra_args", "extra_info", "expected_steps"),
+    [
+        (None, {}, {}, 50),
+        (None, {"num_inference_steps": 30}, {}, 30),
+        (50, {"num_inference_steps": 30}, {}, 30),
+        (None, {}, {"num_inference_steps": [20]}, 20),
+        (10, {}, {"num_inference_steps": [20]}, 10),
+    ],
+)
+def test_pre_process_normalizes_steps_before_scheduler_admission(
+    step_execution: bool,
+    standard_steps: int | None,
+    extra_args: dict,
+    extra_info: dict,
+    expected_steps: int,
+) -> None:
+    config = _od_config()
+    config.step_execution = step_execution
+    request = _batch(
+        sampling=OmniDiffusionSamplingParams(num_inference_steps=standard_steps, extra_args=extra_args),
+    ).requests[0]
+    request.prompt["additional_information"].update(extra_info)
+    request = get_mammoth_moda2_pre_process_func(config)(request)
+
+    assert request.sampling_params.num_inference_steps == expected_steps
+    parsed = _pipeline_shell()._parse_request(DiffusionRequestBatch([request]))
+    assert parsed.num_inference_steps == expected_steps
+    if step_execution:
+        scheduler = StepScheduler()
+        assert scheduler.add_request(request) == request.request_id
+        assert scheduler._request_progress[request.request_id].total_steps == expected_steps
+    else:
+        assert request.batch_compatibility_key[-1] == expected_steps
+
+
+def test_step_protocol_matches_request_mode() -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    batch = _batch(
+        sampling=OmniDiffusionSamplingParams(
+            height=32,
+            width=48,
+            seed=42,
+            guidance_scale=1.0,
+            num_inference_steps=2,
+        )
+    )
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch(f"{module}.randn_tensor", side_effect=lambda shape, **kwargs: torch.zeros(shape, dtype=kwargs["dtype"])),
+    ):
+        request_output = pipeline.forward(batch)[0]
+        state = pipeline.prepare_encode(_step_state(batch))
+        while not state.denoise_completed:
+            input_batch = InputBatch.make_batch([state])
+            noise_pred = pipeline.denoise_step(input_batch, states=[state])
+            pipeline.step_scheduler(state, noise_pred)
+        step_output = pipeline.post_decode(state)
+
+    torch.testing.assert_close(step_output.output, request_output.output)
+    assert state.step_index == 2
+
+
+@pytest.mark.parametrize(
+    ("guidance_scales", "expected_predictions", "expected_calls"),
+    [
+        ((1.0, 4.0), (2.0, 5.0), 2),
+        ((4.0, 1.0), (5.0, 2.0), 2),
+        ((1.0, 1.0), (2.0, 2.0), 1),
+    ],
+)
+def test_step_batch_handles_cfg_and_non_cfg_requests(
+    guidance_scales: tuple[float, float],
+    expected_predictions: tuple[float, float],
+    expected_calls: int,
+) -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    config = _od_config()
+    config.step_execution = True
+    pre_process = get_mammoth_moda2_pre_process_func(config)
+    scheduler = StepScheduler()
+    requests = [
+        pre_process(
+            _batch(
+                request_id=f"cfg-{index}",
+                sampling=OmniDiffusionSamplingParams(
+                    height=32,
+                    width=48,
+                    seed=index,
+                    guidance_scale=4.0,
+                    num_inference_steps=2,
+                    extra_args={"text_guidance_scale": scale},
+                ),
+            ).requests[0]
+        )
+        for index, scale in enumerate(guidance_scales)
+    ]
+    assert scheduler._build_sampling_params_key(requests[0]) == scheduler._build_sampling_params_key(requests[1])
+
+    def predict(*, hidden_states, text_hidden_states, **kwargs):
+        return torch.full_like(hidden_states, 2.0 if text_hidden_states.shape[1] else 1.0)
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch.object(pipeline.gen_transformer, "forward", side_effect=predict) as transformer_forward,
+    ):
+        states = [pipeline.prepare_encode(_step_state(DiffusionRequestBatch([request]))) for request in requests]
+        predictions = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+
+    for prediction, expected in zip(predictions, expected_predictions):
+        torch.testing.assert_close(prediction, torch.full_like(prediction, expected))
+    assert transformer_forward.call_count == expected_calls
+
+
+@pytest.mark.parametrize(
+    ("sampling", "extra_info", "expected_guidance"),
+    [
+        (OmniDiffusionSamplingParams(num_inference_steps=2), {}, 9.0),
+        (OmniDiffusionSamplingParams(num_inference_steps=2), {"text_guidance_scale": [3.5]}, 3.5),
+    ],
+)
+def test_step_protocol_resolves_guidance_like_request_mode(
+    sampling: OmniDiffusionSamplingParams,
+    extra_info: dict,
+    expected_guidance: float,
+) -> None:
+    """Guidance from defaults or additional_information must survive step mode.
+
+    prepare_encode() must parse the already-initialized step state directly
+    instead of re-wrapping its sampling params in a fresh OmniDiffusionRequest,
+    whose __post_init__ promotes the auto-filled 1.0 guidance_scale to an
+    explicitly-provided value and silently disables model-default CFG.
+    """
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    batch = _batch(sampling=sampling)
+    batch.prompts[0]["additional_information"].update(extra_info)
+    assert sampling.guidance_scale_provided is False
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch(f"{module}.randn_tensor", side_effect=lambda shape, **kwargs: torch.zeros(shape, dtype=kwargs["dtype"])),
+    ):
+        request_spec = pipeline._parse_request(batch)
+        request_output = pipeline.forward(batch)[0]
+        state = pipeline.prepare_encode(_step_state(batch))
+        while not state.denoise_completed:
+            noise_pred = pipeline.denoise_step(InputBatch.make_batch([state]), states=[state])
+            pipeline.step_scheduler(state, noise_pred)
+        step_output = pipeline.post_decode(state)
+
+    assert request_spec.text_guidance_scale == expected_guidance
+    assert state.extra["mammoth_text_guidance_scale"] == expected_guidance
+    assert state.negative_prompt_embeds is not None
+    assert sampling.guidance_scale_provided is False
+    torch.testing.assert_close(step_output.output, request_output.output)
+
+
+def test_refiner_output_uses_query_length_mask_in_request_and_step_modes() -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = _FakeImageRefiner(num_queries=3)
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    batch = _batch(
+        sampling=OmniDiffusionSamplingParams(
+            height=32,
+            width=48,
+            seed=42,
+            guidance_scale=1.0,
+            num_inference_steps=1,
+        )
+    )
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch(f"{module}.randn_tensor", side_effect=lambda shape, **kwargs: torch.zeros(shape, dtype=kwargs["dtype"])),
+    ):
+        assert len(pipeline.forward(batch)) == 1
+        state = pipeline.prepare_encode(_step_state(batch))
+
+    assert state.prompt_embeds is not None
+    assert state.prompt_embeds_mask is not None
+    assert state.prompt_embeds.shape[1] == 5
+    assert state.prompt_embeds_mask.shape == state.prompt_embeds.shape[:2]
+    assert state.prompt_embeds_mask.all()
+
+
+def test_step_protocol_keeps_request_schedulers_and_progress_independent() -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    short = _step_state(
+        _batch(
+            request_id="short",
+            sampling=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                seed=1,
+                guidance_scale=1.0,
+                num_inference_steps=1,
+            ),
+        )
+    )
+    long = _step_state(
+        _batch(
+            request_id="long",
+            sampling=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                seed=2,
+                guidance_scale=1.0,
+                num_inference_steps=2,
+            ),
+        )
+    )
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch(f"{module}.randn_tensor", side_effect=lambda shape, **kwargs: torch.zeros(shape, dtype=kwargs["dtype"])),
+    ):
+        pipeline.prepare_encode(short)
+        pipeline.prepare_encode(long)
+        predictions = pipeline.denoise_step(InputBatch.make_batch([short, long]), states=[short, long])
+        pipeline.step_scheduler(short, predictions[:1])
+        pipeline.step_scheduler(long, predictions[1:])
+
+    assert short.scheduler is not long.scheduler
+    assert short.denoise_completed
+    assert not long.denoise_completed
+    assert short.step_index == long.step_index == 1
+
+
+class _InputDependentTransformer(_FakeTransformer):
+    """Expose dropped masks, timesteps, conditioning and latent rows in outputs."""
+
+    def forward(self, *, hidden_states, timestep, text_hidden_states, text_attention_mask, **kwargs):
+        self.calls += 1
+        conditioning = (text_hidden_states * text_attention_mask.unsqueeze(-1)).sum(dim=(1, 2)) / 100
+        return hidden_states * 0.125 + timestep[:, None, None, None] + conditioning[:, None, None, None]
+
+
+def _step_test_pipeline() -> MammothModa2DiTPipeline:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _InputDependentTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    return pipeline
+
+
+def _step_test_request(request_id: str, *, seed: int = 11, steps: int = 4, text_tokens: int = 2):
+    return _batch(
+        request_id=request_id,
+        prompt={
+            "prompt": "",
+            "additional_information": {
+                "full_hidden_states": torch.arange((text_tokens + 2) * 8, dtype=torch.float32).reshape(-1, 8) / 10,
+                "full_token_ids": [10] * text_tokens + [100, 101],
+                "answer_start_index": text_tokens,
+            },
+        },
+        sampling=OmniDiffusionSamplingParams(
+            height=32,
+            width=48,
+            seed=seed,
+            guidance_scale=4.0,
+            num_inference_steps=steps,
+            extra_args={"cfg_range": [0.25, 0.75]},
+        ),
+    )
+
+
+def test_step_protocol_seed_conditioning_and_request_parity() -> None:
+    pipeline = _step_test_pipeline()
+    outputs = []
+    for seed, text_tokens in ((11, 2), (11, 2), (12, 2), (11, 5)):
+        batch = _step_test_request("solo", seed=seed, text_tokens=text_tokens)
+        state = pipeline.prepare_encode(_step_state(batch))
+        expected_noise = torch.randn(state.latents.shape, generator=torch.Generator().manual_seed(seed))
+        torch.testing.assert_close(state.latents, expected_noise, rtol=0, atol=0)
+        while not state.denoise_completed:
+            prediction = pipeline.denoise_step(InputBatch.make_batch([state]), states=[state])
+            pipeline.step_scheduler(state, prediction)
+        output = pipeline.post_decode(state).output
+        reference = pipeline.forward(batch)[0].output
+        torch.testing.assert_close(output, reference)
+        outputs.append(output)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+    assert not torch.allclose(outputs[0], outputs[2])
+    assert not torch.allclose(outputs[0], outputs[3])
+
+
+def test_step_protocol_handles_arrival_reordering_and_retirement() -> None:
+    pipeline = _step_test_pipeline()
+    long = pipeline.prepare_encode(_step_state(_step_test_request("long")))
+    solo_long = pipeline.prepare_encode(_step_state(_step_test_request("solo-long")))
+    solo_short = pipeline.prepare_encode(_step_state(_step_test_request("solo-short", seed=22, steps=2, text_tokens=5)))
+    short = None
+    cached_batch = None
+    completed = {}
+    retired_latents = None
+
+    # Match runner ordering: newly admitted requests precede existing requests.
+    for tick in range(4):
+        if tick == 1:
+            short = pipeline.prepare_encode(_step_state(_step_test_request("short", seed=22, steps=2, text_tokens=5)))
+            assert short.scheduler is not long.scheduler
+        active = [short, long] if tick in (1, 2) else [long]
+        references = [solo_short, solo_long] if tick in (1, 2) else [solo_long]
+        cached_batch = InputBatch.make_batch(active, cached_batch=cached_batch)
+        if tick == 1:
+            assert long.current_timestep != short.current_timestep
+            assert cached_batch.prompt_embeds_mask.sum(dim=1).tolist() == [7, 4]
+        predictions = pipeline.denoise_step(cached_batch, states=active)
+        for index, (state, reference) in enumerate(zip(active, references)):
+            solo_prediction = pipeline.denoise_step(InputBatch.make_batch([reference]), states=[reference])
+            torch.testing.assert_close(predictions[index : index + 1], solo_prediction)
+            pipeline.step_scheduler(state, predictions[index : index + 1])
+            pipeline.step_scheduler(reference, solo_prediction)
+            torch.testing.assert_close(state.latents, reference.latents)
+            assert state.step_index == reference.step_index == state.scheduler.step_index
+            if state.denoise_completed:
+                completed[state.request_id] = pipeline.post_decode(state).output
+                torch.testing.assert_close(completed[state.request_id], pipeline.post_decode(reference).output)
+        if tick == 2:
+            assert short.denoise_completed and not long.denoise_completed
+            assert list(completed) == ["short"]
+            retired_latents = short.latents.clone()
+
+    assert list(completed) == ["short", "long"]
+    assert (short.step_index, long.step_index) == (2, 4)
+    torch.testing.assert_close(short.latents, retired_latents, rtol=0, atol=0)
+    assert not torch.allclose(completed["short"], completed["long"])

@@ -17,13 +17,15 @@ runner injects it as ``promote_deferred_overlap``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
 from vllm_omni.engine.duplex.events import (
     DOMAIN_TERMINAL_EVENTS,
     MODEL_OUTPUT_EVENTS,
     DuplexEvent,
+    ResponseDone,
     error_event,
 )
 from vllm_omni.engine.duplex.realtime_events import (
@@ -84,8 +86,51 @@ class SessionEmitter:
     # ------------------------------------------------------------------ #
 
     def emit_events(self, events: list[DuplexEvent]) -> None:
-        for event in events:
-            self._ctx.manager.emit(self._ctx.session, event)
+        self._ctx.manager.emit(self._ctx.session, events)
+
+    def fail_output(self, message: str, *, response_id: str | None, terminal: ResponseDone | None) -> list[DuplexEvent]:
+        """Fail undelivered output, returning recovery events without sending them again."""
+        session = self._ctx.session
+        self._ctx.manager.invalidate_output(session.session_id, response_id, through_epoch=session.epoch)
+        if session.active_response_id is not None:
+            # Close still needs the request binding to abort the real engine work.
+            session.end_response(commit_text=False, preserve_request=True)
+        events: list[DuplexEvent] = [error_event("output_backpressure", message)]
+        if response_id is None:
+            return events
+        # Normal completion can commit just before its projected ending is
+        # delivered. An ending converted to failure must undo that commit.
+        session.delete_history_item(f"item_{response_id}")
+        payload = {
+            "type": "response.done",
+            "session_id": session.session_id,
+            "response_id": response_id,
+            "epoch": session.epoch,
+            "committed": False,
+            "status": "failed",
+            "status_details": {"type": "failed", "reason": "output_backpressure"},
+            "playback": session.playback.as_dict(),
+        }
+        if terminal is None:
+            projected = project_internal_event(self.require_projector(), payload)
+            terminal = next((event for event in projected if isinstance(event, ResponseDone)), None)
+        else:
+            response = dict(terminal.response)
+            metadata = response.get("metadata")
+            response.update(
+                status="failed",
+                status_details=payload["status_details"],
+                metadata={**(metadata if isinstance(metadata, Mapping) else {}), **payload},
+            )
+            output = response.get("output")
+            if isinstance(output, list):
+                response["output"] = [
+                    {**item, "status": "failed"} if isinstance(item, Mapping) else item for item in output
+                ]
+            terminal = replace(terminal, response=response)
+        if terminal is not None:
+            events.append(terminal)
+        return events
 
     def emit_error(
         self,
@@ -110,6 +155,13 @@ class SessionEmitter:
         accepted, deferred_overlap_payload = self._apply_outbound_session_event(payload)
         if not accepted:
             return
+        if payload.get("type") == "audio.cancelled":
+            response_id = payload.get("response_id")
+            cancelled_epoch = payload.get("cancelled_epoch")
+            if isinstance(response_id, str) and isinstance(cancelled_epoch, int):
+                self._ctx.manager.invalidate_output(
+                    self._ctx.session.session_id, response_id, through_epoch=cancelled_epoch
+                )
         self.emit_events(project_internal_event(self.require_projector(), payload))
         if deferred_overlap_payload is not None and not self._ctx.run.closing:
             precreate_response = self._ctx.model_state.deferred_precreate_response

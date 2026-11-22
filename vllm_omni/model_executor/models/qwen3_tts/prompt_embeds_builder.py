@@ -370,6 +370,11 @@ class Qwen3TTSPromptEmbedsBuilder:
         # CustomVoice prompt pieces that do not depend on the text, per
         # (device, speaker, language): bounded by the model's voices.
         self._custom_voice_prompt_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        # Speaker codec id and embedding per (device, speaker).
+        self._speaker_embed_cache: dict[tuple[str, str], tuple[int, torch.Tensor]] = {}
+        # Text-conditioning embeddings projected by ``preprocess_infos_batch``
+        # for the current step's new requests, keyed by request id.
+        self._batched_text_embeds: dict[str, torch.Tensor] = {}
 
         self._ref_audio_artifact_cache_max_entries = int(ref_audio_artifact_cache_max_entries)
         self._ref_audio_artifact_cache: OrderedDict[str, dict[str, torch.Tensor | bool]] = OrderedDict()
@@ -753,6 +758,18 @@ class Qwen3TTSPromptEmbedsBuilder:
         return False
 
     @staticmethod
+    def _non_streaming_mode(info_dict: dict[str, Any], task_type: str) -> bool:
+        value = info_dict.get("non_streaming_mode")
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if isinstance(value, bool):
+            return value
+        # Match official inference defaults:
+        # - CustomVoice/VoiceDesign: non_streaming_mode=True
+        # - Base: non_streaming_mode=False
+        return task_type in ("CustomVoice", "VoiceDesign")
+
+    @staticmethod
     def _needs_initial_prompt_preprocess(info_dict: dict[str, Any]) -> bool:
         embed = info_dict.get("embed")
         return not (isinstance(embed, dict) and "prefill" in embed)
@@ -806,15 +823,16 @@ class Qwen3TTSPromptEmbedsBuilder:
         req_infos: list[dict[str, Any]],
         device: torch.device,
     ) -> None:
-        """Batch Base voice-clone ref-audio codec extraction for current prefill requests.
+        """Batch per-request prompt work for current prefill requests.
 
-        Tokenizes assistant / ref text and runs the talker-supplied
-        ``encode_ref_audio_batch`` callable once per sample-rate group,
-        stashing the precomputed artifacts under
+        For Base voice cloning, tokenizes assistant / ref text and runs the
+        talker-supplied ``encode_ref_audio_batch`` callable once per
+        sample-rate group, stashing the precomputed artifacts under
         :data:`PRECOMPUTED_TEXT_IDS_KEY`, :data:`PRECOMPUTED_REF_IDS_KEY`,
-        :data:`PRECOMPUTED_REF_CODE_KEY`, and :data:`NORMALIZED_REF_AUDIO_KEY`
-        so the per-request :meth:`build_prompt_embeds` call can skip the
-        equivalent serial work.
+        :data:`PRECOMPUTED_REF_CODE_KEY`, and :data:`NORMALIZED_REF_AUDIO_KEY`.
+        For non-streaming CustomVoice / VoiceDesign, projects every request's
+        text at once (:meth:`_project_texts_batch`). The per-request
+        :meth:`build_prompt_embeds` call then skips the equivalent serial work.
         """
         pending_text: list[tuple[dict[str, Any], str]] = []
         pending_ref_text: list[tuple[dict[str, Any], str]] = []
@@ -919,6 +937,54 @@ class Qwen3TTSPromptEmbedsBuilder:
                 if isinstance(cache_key, str) and cache_key:
                     self.put_ref_audio_artifacts(cache_key, ref_code=ref_code_t)
 
+        self._batched_text_embeds = self._project_texts_batch(req_infos)
+
+    def _project_texts_batch(self, req_infos: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        """Embed and project the text of new non-streaming CustomVoice / VoiceDesign requests at once.
+
+        Each request otherwise uploads its text ids and runs the text
+        embedding + projection MLP on its own. Here every request's ids go up
+        in one pinned host-to-device copy and the MLP runs once over the
+        concatenated text tokens; the rows are independent, so each request's
+        slice equals its own per-request result. The device ids replace
+        :data:`PRECOMPUTED_TEXT_IDS_KEY` so ``build_prompt_embeds`` skips the
+        per-request copy too.
+        """
+        items: list[tuple[dict[str, Any], str, np.ndarray]] = []
+        for info_dict in req_infos:
+            req_id = info_dict.get("req_id")
+            if not isinstance(req_id, str) or not self._needs_initial_prompt_preprocess(info_dict):
+                continue
+            task_type = first_value(info_dict.get("task_type"), "CustomVoice")
+            if task_type not in ("CustomVoice", "VoiceDesign") or not self._non_streaming_mode(info_dict, task_type):
+                continue
+            ids = first_value(info_dict.get(PRECOMPUTED_TEXT_IDS_KEY))
+            if isinstance(ids, torch.Tensor) and ids.device.type == "cpu":
+                ids = ids.reshape(-1).numpy()
+            elif isinstance(ids, list) and ids and all(isinstance(v, (int, np.integer)) for v in ids):
+                ids = np.asarray(ids)
+            elif not (isinstance(ids, np.ndarray) and ids.ndim == 1):
+                continue
+            # The assistant template wraps the text in 3 leading and 5 trailing tokens.
+            if ids.size <= 8:
+                continue
+            items.append((info_dict, req_id, ids.astype(np.int64, copy=False)))
+        if not items:
+            return {}
+        full_ids = [ids for _info, _req_id, ids in items]
+        text_ids = [ids[3:-5] for ids in full_ids]
+        packed = to_device_nonblocking(torch.from_numpy(np.concatenate(full_ids + text_ids)), self._device())
+        num_full = sum(ids.size for ids in full_ids)
+        projected = self._text_projection(self._text_embedding(packed[num_full:].view(1, -1)))
+        embeds: dict[str, torch.Tensor] = {}
+        full_offset = text_offset = 0
+        for (info_dict, req_id, ids), text in zip(items, text_ids, strict=True):
+            info_dict[PRECOMPUTED_TEXT_IDS_KEY] = packed[full_offset : full_offset + ids.size].view(1, -1)
+            embeds[req_id] = projected[:, text_offset : text_offset + text.size]
+            full_offset += ids.size
+            text_offset += text.size
+        return embeds
+
     # -------------------- ICL prompt assembly --------------------
 
     def _generate_icl_prompt(
@@ -1010,18 +1076,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
         text = (info_dict.get("text") or [""])[0]
         language = (info_dict.get("language") or ["Auto"])[0]
-        non_streaming_mode_val = info_dict.get("non_streaming_mode")
-        if isinstance(non_streaming_mode_val, list):
-            non_streaming_mode_raw = non_streaming_mode_val[0] if non_streaming_mode_val else None
-        else:
-            non_streaming_mode_raw = non_streaming_mode_val
-        if isinstance(non_streaming_mode_raw, bool):
-            non_streaming_mode = non_streaming_mode_raw
-        else:
-            # Match official inference defaults:
-            # - CustomVoice/VoiceDesign: non_streaming_mode=True
-            # - Base: non_streaming_mode=False
-            non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
+        non_streaming_mode = self._non_streaming_mode(info_dict, task_type)
 
         # Text ids for assistant template (always).
         tok = self.get_text_tokenizer()
@@ -1412,15 +1467,19 @@ class Qwen3TTSPromptEmbedsBuilder:
             )
             if not speaker:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
-            spk_id_map = {k.lower(): v for k, v in (getattr(talker_config, "spk_id", None) or {}).items()}
-            if speaker not in spk_id_map:
-                raise ValueError(f"Unsupported speaker: {speaker}")
-            spk_id = spk_id_map[speaker]
-            # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
-            spk_tensor = index_to_device([spk_id], input_ids.device)
-            spk_embed = codec_embed(spk_tensor)
-            if spk_embed.ndim in (1, 2):
-                spk_embed = spk_embed.view(1, 1, -1)
+            speaker_key = (str(input_ids.device), speaker)
+            cached_speaker = self._speaker_embed_cache.get(speaker_key)
+            if cached_speaker is None:
+                spk_id_map = {k.lower(): v for k, v in (getattr(talker_config, "spk_id", None) or {}).items()}
+                if speaker not in spk_id_map:
+                    raise ValueError(f"Unsupported speaker: {speaker}")
+                spk_id = spk_id_map[speaker]
+                # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
+                spk_embed = codec_embed(index_to_device([spk_id], input_ids.device))
+                if spk_embed.ndim in (1, 2):
+                    spk_embed = spk_embed.view(1, 1, -1)
+                cached_speaker = self._speaker_embed_cache[speaker_key] = (spk_id, spk_embed)
+            spk_id, spk_embed = cached_speaker
             speaker_embed = spk_embed
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
@@ -1452,7 +1511,9 @@ class Qwen3TTSPromptEmbedsBuilder:
             talker_prompt = prefix
 
             if non_streaming_mode:
-                text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
+                text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
+                if text_all is None:
+                    text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
                 text_all = torch.cat([text_all, tts_eos_embed], dim=1)
                 talker_prompt = torch.cat([talker_prompt, text_all + pad_row, tail], dim=1)
                 trailing_text_hidden = tts_pad_embed
@@ -1477,7 +1538,9 @@ class Qwen3TTSPromptEmbedsBuilder:
             talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
 
             if non_streaming_mode:
-                text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
+                text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
+                if text_all is None:
+                    text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
                 text_all = torch.cat([text_all, tts_eos_embed], dim=1)
                 pad_ids = torch.full(
                     (1, int(text_all.shape[1])),

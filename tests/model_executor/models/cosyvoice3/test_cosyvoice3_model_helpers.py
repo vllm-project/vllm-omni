@@ -3,31 +3,31 @@
 
 from __future__ import annotations
 
-import functools
+from collections import OrderedDict
 from threading import Lock
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import pytest
 import torch
 import torch.nn as nn
+from vllm.config import VllmConfig
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.data_entry_keys import to_struct
+from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.worker import gpu_ar_model_runner
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-if TYPE_CHECKING:
-    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-
-
-@functools.lru_cache(maxsize=1)
-def _cosyvoice3_model_and_runner():
-    """Defer heavy Omni/vLLM imports until a test runs (avoids duplicate CustomOp init)."""
-    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    return CosyVoice3Model, GPUARModelRunner
 
 
 class _DummyCode2Wav:
@@ -89,7 +89,6 @@ def _make_code2wav_model(
     num_samples: int = 32,
     outputs: list[tuple[torch.Tensor, dict[str, object] | None]] | None = None,
 ) -> CosyVoice3Model:
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_code2wav"
@@ -115,7 +114,6 @@ def _make_code2wav_model(
 
 
 def _make_talker_model() -> CosyVoice3Model:
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_talker"
@@ -158,6 +156,162 @@ def _make_sampling_metadata(
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
     )
+
+
+@pytest.fixture
+def output_payload_vllm_config(tmp_path, request):
+    hf_config = CosyVoice3Config()
+    hf_config.llm.update(llm_input_size=16, llm_output_size=16, speech_token_size=32)
+    # Exercise the real config fields without model downloads or engine setup.
+    model_config = object.__new__(OmniModelConfig)
+    model_config.hf_config = hf_config
+    model_config.model_stage = "cosyvoice3_talker"
+    model_config.model = str(tmp_path)
+    model_config.async_chunk = getattr(request, "param", True)
+    model_config.enable_return_routed_experts = False
+    model_config.engine_output_type = "latent"
+    model_config.stage_connector_config = {"name": "SharedMemoryConnector", "extra": {"role": "sender"}}
+    vllm_config = object.__new__(VllmConfig)
+    vllm_config.model_config = model_config
+    return vllm_config
+
+
+@pytest.fixture
+def output_payload_talker(monkeypatch, output_payload_vllm_config):
+    class DummyEncoder(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def forward(self, inputs_embeds, positions):
+            return inputs_embeds
+
+    class DummyTalker(nn.Module):
+        def __init__(self, *, llm: nn.Module, **kwargs):
+            super().__init__()
+            self.llm = llm
+
+    monkeypatch.setattr(cosyvoice3_talker, "VLLMQwen2Encoder", DummyEncoder)
+    monkeypatch.setattr(cosyvoice3_talker, "CosyVoice3LM", DummyTalker)
+    monkeypatch.setattr(CosyVoice3Model, "_create_llm_vllm_config", lambda self, config: config)
+
+    return CosyVoice3Model(vllm_config=output_payload_vllm_config)
+
+
+@pytest.mark.parametrize(
+    "output_payload_vllm_config", [True, False], indirect=True, ids=["async_chunks", "sync_chunks"]
+)
+@pytest.mark.parametrize("async_scheduling", [True, False], ids=["async_scheduling", "sync_scheduling"])
+def test_talker_skips_unused_hidden_payload_without_async_materialization(
+    output_payload_talker, output_payload_vllm_config, async_scheduling
+):
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = async_scheduling
+    runner.omni_prefix_cache = None
+    runner.speculative_config = None
+    runner.model_config = output_payload_vllm_config.model_config
+    runner.model = output_payload_talker
+    # load_model caches this policy before the output path runs.
+    runner._pooler_payload_include_hidden_flag = bool(getattr(runner.model, "omni_pooler_payload_include_hidden", True))
+
+    assert runner._model_omni_pooler_payload_include_hidden() is (not runner.model_config.async_chunk)
+    assert runner._should_use_async_omni_output() is False
+
+
+@pytest.mark.parametrize("is_prefill", [True, False], ids=["prefill", "decode"])
+@pytest.mark.parametrize(
+    "output_payload_vllm_config", [True, False], indirect=True, ids=["async_chunks", "sync_chunks"]
+)
+def test_talker_inline_output_preserves_conditioning_and_tokens(
+    output_payload_talker, output_payload_vllm_config, monkeypatch, mocker, is_prefill
+):
+    """Token-only output retains prefill conditioning and sampled codec IDs."""
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = output_payload_talker
+    runner._pooler_payload_include_hidden_flag = bool(getattr(runner.model, "omni_pooler_payload_include_hidden", True))
+    runner.vllm_config = output_payload_vllm_config
+    runner.model_config = output_payload_vllm_config.model_config
+    runner._async_chunk = runner.model_config.async_chunk
+    runner.omni_prefix_cache = None
+    runner.supports_mm_inputs = False
+    runner.routed_experts_initialized = False
+    runner.model_intermediate_buffer = {}
+    runner.input_batch = object.__new__(InputBatch)
+    runner.input_batch._req_ids = ["r1", "r2"]
+    runner.input_batch.req_id_to_index = {"r1": 0, "r2": 1}
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    conditioning = {
+        "speech_token": torch.tensor([[11, 12], [21, 0]], dtype=torch.long),
+        "speech_token_len": torch.tensor([2, 1], dtype=torch.long),
+        "speech_feat": torch.arange(16, dtype=torch.float32).reshape(2, 4, 2),
+        "embedding": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+    }
+    expected = {key: value.clone() for key, value in conditioning.items()}
+    hidden_states = output_payload_talker.forward(
+        input_ids=torch.tensor([1, 2, 3]),
+        positions=torch.arange(3),
+        inputs_embeds=torch.ones(3, 16),
+        **(conditioning if is_prefill else {}),
+    )
+    model_output = output_payload_talker.make_omni_output(hidden_states, **(conditioning if is_prefill else {}))
+
+    cpu_materialization = mocker.spy(gpu_ar_model_runner, "_to_cpu_contiguous")
+    scheduler_output = object.__new__(SchedulerOutput)
+    scheduler_output.total_num_scheduled_tokens = 3
+    scheduler_output.num_scheduled_tokens = {"r1": 2, "r2": 1}
+    output = runner._build_omni_model_runner_output_from_snapshot(
+        scheduler_output=scheduler_output,
+        hidden_states=model_output.text_hidden_states,
+        staged_hidden_states_cpu=None,
+        multimodal_outputs=model_output.multimodal_outputs,
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101], [102]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=torch.tensor([2, 1], dtype=torch.int32).numpy(),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.long),
+    )
+    assert output.req_ids == ["r1", "r2"]
+    assert output.sampled_token_ids == [[101], [102]]
+    hidden_storage = model_output.text_hidden_states.untyped_storage().data_ptr()
+    hidden_copied = any(
+        call.args[0].untyped_storage().data_ptr() == hidden_storage for call in cpu_materialization.call_args_list
+    )
+    assert hidden_copied is (not runner._async_chunk)
+    if runner._async_chunk:
+        assert output.multimodal_outputs is None
+    if not is_prefill and runner._async_chunk:
+        assert not output.inter_stage_outputs or all(not item for item in output.inter_stage_outputs)
+        return
+
+    assert len(output.inter_stage_outputs) == 2
+    for idx, prompt_len in enumerate([2, 1]):
+        item = output.inter_stage_outputs[idx]
+        assert ("hidden" not in item) is runner._async_chunk
+        if not is_prefill:
+            continue
+        # The downstream processor removes padding using speech_token_len.
+        torch.testing.assert_close(item["embed.speech_token"], expected["speech_token"][idx : idx + 1])
+        torch.testing.assert_close(item["embed.speech_feat"], expected["speech_feat"][idx : idx + 1])
+        assert item["embed.speech_token_len"].item() == prompt_len
+        torch.testing.assert_close(item["embed.embedding"], expected["embedding"][idx : idx + 1])
+
+
+def test_talker_preserves_packed_payload_policy(output_payload_talker, output_payload_vllm_config, monkeypatch):
+    output_payload_vllm_config.model_config.async_chunk = False
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
+    model = CosyVoice3Model(vllm_config=output_payload_vllm_config)
+
+    assert model.omni_pooler_payload_include_hidden is False
+    assert not getattr(model, "use_async_omni_output", False)
 
 
 def test_forward_prefers_token_offset_when_present():
@@ -561,7 +715,6 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
             # runs for all sampling paths
             self.updated = True
 
-    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
 
@@ -602,7 +755,6 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
             # runs for all sampling paths
             self.update_async_called = True
 
-    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
 
@@ -649,7 +801,6 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
             # runs for all sampling paths (model sampler + fallback sampler)
             self.update_async_called = True
 
-    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
 
@@ -722,8 +873,6 @@ def test_embed_input_ids_preserves_interleaved_request_boundaries(order):
 
 
 def test_mrv2_conditioning_follows_encoded_prompts_to_batch_rows():
-    from collections import OrderedDict
-
     model = _make_talker_model()
     speech = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4))
     text = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4) + 1000)
@@ -791,10 +940,8 @@ def test_embed_input_ids_rejects_cross_request_placeholder_block():
 
 
 def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
-
     monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
-    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
     model = _make_code2wav_model()
     model.forward(
         input_ids=torch.tensor([0, 1, 2]),
@@ -816,10 +963,6 @@ def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
 
 
 def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
     model = _make_talker_model()
     hidden = torch.ones(2, 4)
     runner = object.__new__(OmniGPUModelRunner)
@@ -840,13 +983,11 @@ def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
 
 
 def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monkeypatch):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
-
     model = _make_code2wav_model()
     model._code2wav_trt_done = False
-    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
-    monkeypatch.setattr(module, "_cosyvoice3_trt_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "_cosyvoice3_trt_enabled", lambda: True)
 
     def unexpected_estimator_resolution():
         raise AssertionError("Packed Flow must not resolve or replace its torch estimator")
@@ -904,21 +1045,18 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
 
 
 def test_cancelled_stream_releases_only_its_vocoder_state():
-    model_cls, _ = _cosyvoice3_model_and_runner()
     model = SimpleNamespace(
         _stream_audio_cache_lock=Lock(),
         _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
     )
-    model_cls.on_requests_finished(model, {"cancelled", "unknown"})
-    model_cls.on_requests_finished(model, {"cancelled"})
+    CosyVoice3Model.on_requests_finished(model, {"cancelled", "unknown"})
+    CosyVoice3Model.on_requests_finished(model, {"cancelled"})
     assert set(model._stream_vocoder_cache_by_req) == {"live"}
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])
 def test_talker_output_contract(monkeypatch, mrv2, packed):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as mod
-
-    monkeypatch.setattr(mod, "cosyvoice3_packed_inference_enabled", lambda: packed)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: packed)
     model = _make_talker_model()
     hidden = torch.zeros(2, 4)
     model.model = SimpleNamespace(llm=lambda embeddings, positions: embeddings)
@@ -928,4 +1066,46 @@ def test_talker_output_contract(monkeypatch, mrv2, packed):
         model._sampling_eps = 1e-6
         model.mrv2_custom_sampler(SimpleNamespace(penalties_state=None))
     output = model.forward(torch.ones(2, dtype=torch.long), torch.arange(2), inputs_embeds=hidden)
-    assert output is (hidden if mrv2 or packed else sentinel)
+    assert output is hidden
+
+
+def test_request_conditioning_normalizes_singletons_without_changing_schema():
+    token = torch.tensor([[7, 8]], dtype=torch.int32)
+    feat = torch.randn(1, 4, 80)
+    speaker = torch.randn(1, 192)
+    length = torch.tensor([[2]], dtype=torch.int32)
+    raw = {"embed": {"speech_token": token, "speech_feat": feat, "embedding": speaker, "speech_token_len": [length]}}
+    result = to_struct(_normalize_request_conditioning(raw))
+    assert result.embed.speech_token is token
+    assert result.embed.speech_feat is feat
+    assert result.embed.embedding is speaker
+    assert result.embed.speech_token_len is length
+    assert raw["embed"]["speech_token_len"] == [length]
+
+
+def test_request_conditioning_rejects_unsplit_voices():
+    with pytest.raises(ValueError, match="unsplit batch"):
+        _normalize_request_conditioning({"embed": {"embedding": [torch.ones(1, 192), torch.zeros(1, 192)]}})
+
+
+def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
+    model = _make_code2wav_model()
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.arange(2),
+        model_intermediate_buffer=[
+            {
+                "embed": {
+                    "speech_token": torch.tensor([[3, 2, 0, 0]], dtype=torch.int32),
+                    "speech_feat": torch.randn(1, 8, 80),
+                    "embedding": torch.randn(1, 192),
+                    "speech_token_len": [torch.tensor([[2]], dtype=torch.int32)],
+                },
+                "meta": {"req_id": ["voice"]},
+            }
+        ],
+    )
+    call = model.code2wav.forward_calls[0]
+    assert call["prompt_token"].shape == (1, 2)
+    assert call["prompt_feat"].shape == (1, 4, 80)
+    assert output.multimodal_outputs
