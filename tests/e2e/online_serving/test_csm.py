@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Sesame CSM-1B through the shared speech client: text, streaming, concurrency and a reference turn.
-
-Not yet run on a GPU: the token limits and audio floors are starting values.
-"""
+"""Sesame CSM-1B through the shared speech client: text, streaming, concurrency and a reference turn."""
 
 import pytest
 
@@ -46,7 +43,7 @@ def test_streaming_pcm(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(
         {
             "model": omni_server.model,
-            "input": "Hello, this is a demonstration of natural speech synthesis.",
+            "input": "We walked along the beach and watched the sun go down.",
             "transcript_language": "en",
             "transcript_pcm_sample_rate": 24000,
             "transcript_escalation_model": "large-v3",
@@ -54,6 +51,9 @@ def test_streaming_pcm(omni_server, online_client) -> None:
             "min_audio_bytes": 24000,
             "stream": True,
             "stream_format": "audio",
+            # The reference implementation's own greedy output scores -0.6 to 3.8 dB and sampled
+            # streams -1.0 to 6.5 dB, so this floor only catches a broken codec.
+            "min_hnr_db": -3.0,
             "seed": 42,
             "max_new_tokens": 250,
         }

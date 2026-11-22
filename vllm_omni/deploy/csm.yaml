@@ -1,5 +1,5 @@
 # Sesame CSM-1B deploy: talker -> code2wav over shared-memory chunks.
-# Not yet verified on a GPU; batch sizes, memory shares and chunk sizes are starting values.
+# Batch sizes, memory shares and chunk sizes are starting values and have not been tuned.
 #
 # Streamed and complete responses use the same path. The code2wav stage keeps
 # each request's Mimi decoder state between chunks, so every frame is sent
