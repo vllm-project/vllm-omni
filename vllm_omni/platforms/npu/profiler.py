@@ -33,6 +33,37 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
         return ["CPU", "NPU"]
 
     @override
+    def _build_schedule(self, profiler_config: ProfilerConfig):
+        """Build the schedule with torch_npu's own schedule helper.
+
+        torch_npu.profiler.profile expects a schedule object from
+        torch_npu.profiler.schedule, so the base torch.profiler.schedule
+        object cannot be forwarded here (#9286).
+        """
+        import torch_npu
+
+        if profiler_config.warmup_iterations > 0 or profiler_config.wait_iterations > 0:
+            return torch_npu.profiler.schedule(
+                skip_first=0,
+                wait=profiler_config.wait_iterations,
+                warmup=profiler_config.warmup_iterations,
+                active=profiler_config.active_iterations,
+                repeat=1,
+            )
+        return None
+
+    @override
+    def _schedule_warmup_steps(self, profiler_config: ProfilerConfig) -> int:
+        """torch_npu's start() does not consume schedule step 0.
+
+        Verified on Ascend 910B1 (torch_npu 2.10.0.post4, CANN 9.1.0): the
+        first ``profiler.step()`` still executes step 0, so every wait and
+        warmup step must be excluded before RECORD steps start counting
+        toward max_iterations.
+        """
+        return profiler_config.wait_iterations + profiler_config.warmup_iterations
+
+    @override
     def _create_profiler(
         self,
         profiler_config: ProfilerConfig,
@@ -69,20 +100,20 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
 
         kwargs = dict(
             activities=npu_activities,
-            with_stack=False,
+            with_stack=profiler_config.torch_profiler_with_stack,
             profile_memory=profiler_config.torch_profiler_with_memory,
             # Forward the shape-recording flag; without it the NPU profiler
             # silently ignores ``torch_profiler_record_shapes=True``.
             record_shapes=profiler_config.torch_profiler_record_shapes,
-            # NOTE: torch_npu.profiler.with_modules is equivalent to
-            # torch.profiler.with_stack. The with_stack option in
-            # torch_npu.profiler introduces significant time overhead.
+            # Also collect the module hierarchy when stack profiling is enabled.
             with_modules=profiler_config.torch_profiler_with_stack,
             experimental_config=experimental_config,
             # Use tensorboard_trace_handler directly - NPU profiler expects
             # this specific handler format
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(npu_trace_dir),
         )
+        if self._schedule is not None:
+            kwargs["schedule"] = self._schedule
         kwargs.update(self._profiler_kwargs)
         return torch_npu.profiler.profile(**kwargs)
 

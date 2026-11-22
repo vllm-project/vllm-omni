@@ -195,8 +195,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 ```
 
 To let compatible requests share denoising waves, override the diffusion-stage
-capacity. The deploy files set `max_num_seqs: 1` for their diffusion stages, so
-the per-stage value takes precedence over the global `--max-num-seqs` flag.
+capacity. The deploy files set `max_num_seqs: 1` for their diffusion stages.
 Use Stage 0 for `bagel_single_stage.yaml`:
 
 ```bash
