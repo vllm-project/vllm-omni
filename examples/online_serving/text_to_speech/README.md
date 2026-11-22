@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| CSM-1B | `sesame/csm-1b` | ✓ (`ref_audio`+`ref_text`, continues the reference turn) | ✓ (PCM stream) | uploaded audio voice only; no presets | — |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -101,6 +102,83 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard and IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## CSM-1B
+
+Two-stage AR TTS at 24 kHz mono: a talker generates Mimi codes and the Mimi codec decodes them. It speaks one turn of text, optionally after a reference turn whose speaker it continues.
+
+### Prerequisites
+
+`sesame/csm-1b` is gated. Accept its license on Hugging Face and log in (`hf auth login`, or set `HF_TOKEN`) before the first launch.
+
+### Launch
+
+```bash
+vllm serve sesame/csm-1b --omni --port 8091
+```
+
+The packaged `vllm_omni/deploy/csm.yaml` is selected automatically. It keeps chunked delivery on; the pipeline has no `--no-async-chunk` mode.
+
+### Sending requests
+
+Text only (speaker label `0`):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello from Sesame.",
+        "response_format": "wav"
+    }' --output output.wav
+```
+
+Another speaker label, a fixed seed and a longer budget:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "This sentence is a little longer and needs more than ten seconds of budget.",
+        "extra_params": {"speaker_id": 1},
+        "seed": 7,
+        "max_new_tokens": 250
+    }' --output output.wav
+```
+
+Continuing a reference turn (the recording and its transcript are both required):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "And this is the next thing I want to say.",
+        "ref_audio": "https://example.com/reference.wav",
+        "ref_text": "This is what the reference recording says."
+    }' --output output.wav
+```
+
+Streaming PCM:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello from Sesame.",
+        "stream": true,
+        "stream_format": "audio",
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
+```
+
+### Notes
+
+- Output: 24 kHz mono. `max_new_tokens` is a **frame** budget (1 token = 1 frame = 80 ms). The default is 125 frames (10 s); a non-streaming response cut off at the budget sets the `x-audio-truncated: true` header.
+- `extra_params.speaker_id` labels the speaker of the turn; it does not select a fixed voice. Without a reference turn the voice differs from request to request unless `seed` is set.
+- `temperature`, `top_k` and `top_p` in `extra_params` apply to the first codebook only. The depth decoder (codebooks 1-31) uses the model-wide `subtalker_sampling_params` of the deploy YAML.
+- `voice` is used only when it names an uploaded voice (`POST /v1/audio/voices`), which then supplies the reference turn. There are no preset voices.
+- Unsupported: `instructions`, `language`, `sample_rate`, `ref_audio_2`, `speaker_embedding`, `x_vector_only_mode`, and `extra_params` keys other than the four above. See the [Speech API reference](../../../docs/serving/speech_api.md#csm-1b).
 
 ---
 

@@ -8,6 +8,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 - **Gepard-1.0** (`nineninesix/gepard-1.0`) -- single-stage native-AR TTS with a 22.05 kHz NanoCodec. Zero-shot default voice only.
+- **CSM-1B** (`sesame/csm-1b`) -- Llama backbone + depth decoder with the Mimi codec. Text-to-speech, optionally continuing a reference turn (`ref_audio` + `ref_text`). Output: 24 kHz.
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
@@ -50,6 +51,9 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
 vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
     --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml
+
+# CSM-1B (gated: accept the license on Hugging Face and log in first)
+vllm serve sesame/csm-1b --omni --port 8091
 ```
 
 ### Generate Speech
@@ -205,7 +209,7 @@ responses and `truncated` on the SSE `speech.audio.done` event:
 - absent: the model does not report truncation, or the server did not record
   why generation stopped. This does not mean the audio is complete.
 
-Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3,
+Models that report it today: Qwen3-TTS, Breeze-TTS-2, CSM-1B, Fish Audio Drama 3,
 CosyVoice3, Voxtral TTS and YuE2 (YuE2 on non-streaming responses only, from
 its own metadata). Qwen3-TTS returns the generated audio when any task
 (Base, CustomVoice or VoiceDesign) reaches its length limit, including a
@@ -1176,6 +1180,32 @@ parity should be checked against the upstream adapter on your deployment.
 | Model | Description |
 | ------- | ------------- |
 | `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
+
+### CSM-1B
+
+| Model | Description |
+| ----- | ----------- |
+| `sesame/csm-1b` | Two-stage AR TTS: a Llama backbone with a depth decoder generates 32 Mimi codebooks at 12.5 frames per second, and the Mimi codec decodes them to 24 kHz mono. Text only, or text after one reference turn (`ref_audio` + `ref_text`) whose speaker it continues. Gated on Hugging Face. |
+
+CSM request fields:
+
+| Field | Behavior |
+| ----- | -------- |
+| `input` | Required. Empty text returns 400, and so does text that contains the tokenizer's special tokens (such as `<\|AUDIO\|>`). |
+| `extra_params.speaker_id` | Non-negative integer, default `0`. It labels the speaker of the turn (`[0]`, `[1]`, ...); it does not select a fixed voice. |
+| `extra_params.temperature` / `top_k` / `top_p` | Sampling of the first codebook only. Other `extra_params` keys return 400. |
+| `ref_audio` + `ref_text` | One recording and its transcript, both required. They form an earlier turn of the same speaker, which the model continues in that voice. The recording is resampled to 24 kHz. |
+| `voice` | The name of an uploaded voice supplies `ref_audio` and its stored transcript. Any other value is ignored; there are no preset voices. |
+| `max_new_tokens` | Frame budget (1 token = 1 frame = 80 ms). Default 125 (10 s) from the deploy YAML; adapter bounds 1..2048. A response cut off at the budget is reported as [truncated](#truncated-audio). |
+| `seed` | Optional. Reaches both the first-codebook sampler and the depth decoder. |
+| `sample_rate` | Not supported; output is 24 kHz. |
+| Other conditioning fields | `instructions`, `language`, `ref_audio_2`, `speaker_embedding`, `x_vector_only_mode` and `ref_audio_codes` return 400. |
+
+Codebooks 1-31 are sampled by the depth decoder with model-wide settings from the deploy YAML (`subtalker_sampling_params`: `do_sample`, `temperature`, `top_k`, `top_p`); a request cannot change them. For repeatable output pass `seed`, or turn sampling off in the deploy YAML.
+
+A request whose generated codes the codec cannot decode fails with HTTP 500 (`speech.audio.error` on an SSE stream) instead of returning silent audio. The two stages are always connected by chunks, so `--no-async-chunk` is not supported.
+
+See the [CSM-1B section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#csm-1b) for launch and request examples.
 
 ## Error Responses
 
