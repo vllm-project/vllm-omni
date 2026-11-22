@@ -287,6 +287,22 @@ steps:
             --run-level "full_model"
         mirror_hardwares: l4_1
 
+  # sesame/csm-1b is gated: the CI Hugging Face account needs access to it.
+  - group: ":microphone: CSM Weekly Test"
+    depends_on: upload-weekly-pipeline
+    if: build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"
+    steps:
+
+      - label: "TTS · CSM-1B · L4"
+        source_file_dependencies: tts_csm_weekly
+        timeout_in_minutes: 90
+        env:
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/e2e/online_serving/test_csm.py -m "slow and L4 and tts" --run-level "full_model"
+        mirror_hardwares: l4_1
+
   # Run the aggregate CUDA H100 owner on parity PRs that touch one of the
   # executable H100 TTS workloads now represented on AMD. All selected paths
   # use the existing V2 environment, including YuE2's model-owned sampler.

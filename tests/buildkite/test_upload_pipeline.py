@@ -1066,6 +1066,33 @@ def test_yue2_offline_nightly_pr_validation_is_focused(monkeypatch: pytest.Monke
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
 
 
+def test_csm_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = "TTS · CSM-1B · L4"
+    matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+    assert len(matching_steps) == 1
+    step = matching_steps[0]
+    assert step["source_file_dependencies"] == "tts_csm_weekly"
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    command = "\n".join(step["commands"])
+    assert 'tests/e2e/online_serving/test_csm.py -m "slow and L4 and tts" --run-level "full_model"' in command
+
+    group = next(step for step in doc["steps"] if "CSM Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    for changed_file in (
+        "tests/e2e/online_serving/test_csm.py",
+        "vllm_omni/model_executor/models/csm/csm_talker.py",
+        "vllm_omni/model_executor/stage_input_processors/csm.py",
+        "vllm_omni/entrypoints/openai/tts_adapters/csm.py",
+        "vllm_omni/deploy/csm.yaml",
+    ):
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
     pipeline_path = Path(".buildkite/cuda/test-weekly.yml")

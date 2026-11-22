@@ -1259,6 +1259,24 @@ source_file_dependencies:
   tts_breeze_tts2_mrv2_weekly:
     - vllm_omni/worker_v2/
 
+  tts_csm_weekly:
+    - tests/assets/
+    - tests/e2e/online_serving/test_csm.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/csm.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/csm.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/csm/
+    - vllm_omni/model_executor/stage_input_processors/csm.py
+    - vllm_omni/outputs/
+    - vllm_omni/worker_v2/
+
   tts_gepard_weekly:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/assets/
