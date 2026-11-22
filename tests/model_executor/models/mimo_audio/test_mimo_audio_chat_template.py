@@ -34,7 +34,7 @@ def test_no_implicit_system_message(content):
 def test_text_only_output_uses_reference_dialogue_prompt():
     rendered = _render(
         [{"role": "user", "content": "What is the capital of China?"}],
-        output_modalities=["text"],
+        vllm_omni_output_modalities=["text"],
     )
 
     assert rendered == (
@@ -49,7 +49,7 @@ def test_text_only_output_uses_plain_assistant_history():
             {"role": "assistant", "content": "Beijing."},
             {"role": "user", "content": "Name one landmark."},
         ],
-        output_modalities=["text"],
+        vllm_omni_output_modalities=["text"],
     )
 
     assert "<|im_start|>assistant\nBeijing.<|im_end|>\n" in rendered
@@ -58,16 +58,16 @@ def test_text_only_output_uses_plain_assistant_history():
 
 
 @pytest.mark.parametrize(
-    "output_modalities",
+    "vllm_omni_output_modalities",
     [
         ["audio"],
         ["text", "audio"],
     ],
 )
-def test_audio_output_keeps_speech_prompt(output_modalities):
+def test_audio_output_keeps_speech_prompt(vllm_omni_output_modalities):
     rendered = _render(
         [{"role": "user", "content": "Please read this aloud."}],
-        output_modalities=output_modalities,
+        vllm_omni_output_modalities=vllm_omni_output_modalities,
     )
 
     assert rendered.endswith("<|im_start|>assistant\n<|sostm|>")
@@ -80,7 +80,7 @@ def test_audio_output_keeps_speech_assistant_history():
             {"role": "assistant", "content": "Hello."},
             {"role": "user", "content": "Please repeat it."},
         ],
-        output_modalities=["text", "audio"],
+        vllm_omni_output_modalities=["text", "audio"],
     )
 
     assert "<|im_start|>assistant\n<|sostm|>Hello.<|eot|><|eostm|><|im_end|>\n" in rendered

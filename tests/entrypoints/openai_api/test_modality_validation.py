@@ -114,12 +114,12 @@ async def test_preprocess_chat_owns_output_modalities_template_kwarg(
         request.messages,
         default_template=None,
         default_template_content_format="auto",
-        default_template_kwargs={"output_modalities": client_template_modalities},
+        default_template_kwargs={"vllm_omni_output_modalities": client_template_modalities},
         renderer=renderer,
     )
 
     template_kwargs = chat_params.with_defaults.call_args.args[0]
-    assert template_kwargs["output_modalities"] == request_modalities
+    assert template_kwargs["vllm_omni_output_modalities"] == request_modalities
 
 
 @pytest.mark.asyncio

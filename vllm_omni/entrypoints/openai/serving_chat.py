@@ -1130,7 +1130,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # clients cannot select a task that disagrees with the public request.
         # Mistral's renderer does not accept arbitrary template variables.
         if not isinstance(renderer.tokenizer, MistralTokenizer):
-            resolved_template_kwargs["output_modalities"] = getattr(request, "modalities", None)
+            resolved_template_kwargs["vllm_omni_output_modalities"] = getattr(request, "modalities", None)
 
         tok_params = request.build_tok_params(self.model_config)
         mm_config = self.model_config.multimodal_config

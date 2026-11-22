@@ -27,7 +27,7 @@
 {%- for message in messages %}
     {%- if message['role'] == 'assistant' %}
         {%- set _text = message['content'] if message['content'] is string else '' -%}
-        {%- if output_modalities == ['text'] %}
+        {%- if vllm_omni_output_modalities == ['text'] %}
             {%- set _body = _text[1:] if (_text and _text[0] == '\n') else _text -%}
             {{- '<|im_start|>assistant\n' + _body + '<|im_end|>\n' }}
         {%- else %}
@@ -85,7 +85,7 @@
 {%- endfor %}
 
 {%- if add_generation_prompt %}
-    {%- if output_modalities == ['text'] %}
+    {%- if vllm_omni_output_modalities == ['text'] %}
         {{- '<|im_start|>assistant\n<think>\n\n</think>\n' }}
     {%- else %}
         {{- '<|im_start|>assistant\n<|sostm|>' }}
