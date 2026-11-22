@@ -1042,8 +1042,6 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     port: int | None = None
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
-    default_resolution: list[int] | tuple[int, int] | None = None
-    max_pixels: int | None = None
     diffusion_attention_config: Any = None
     diffusion_attention_schedule: Any = None
     cache_strategy: str = "none"

@@ -3,27 +3,18 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, StrictBool, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, field_validator, model_validator
 
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_schema import (
     Cosmos3NanoSimBimanualActionSchema,
     canonical_sha256,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.unified_action_contract import UnifiedActionConditioning
 
 TRANSFER_HINTS = ("edge", "blur", "depth", "seg")
-TRANSFER_SYSTEM_PROMPT_ID = "cosmos3_transfer_v1"
-TRANSFER_CONTROL_ATTENTION_MODE = "causal_control_with_rgb_history"
 
 TransferHint = Literal["edge", "blur", "depth", "seg"]
-
-
-class Cosmos3NanoSimBimanualActionConditioning(Cosmos3NanoSimBimanualActionSchema):
-    """Schema-v1 action-conditioning branch."""
-
-    mode: Literal["action"]
 
 
 class Cosmos3NanoSimBimanualControlVideoConditioning(BaseModel):
@@ -62,12 +53,8 @@ class Cosmos3NanoSimBimanualControlVideoConditioning(BaseModel):
         return canonical_sha256(self.model_dump(mode="json"))
 
 
-Cosmos3NanoSimBimanualConditioning = (
-    Cosmos3NanoSimBimanualActionConditioning
-    | UnifiedActionConditioning
-    | Cosmos3NanoSimBimanualControlVideoConditioning
-)
-_CONDITIONING_ADAPTER = TypeAdapter(Cosmos3NanoSimBimanualConditioning)
+Cosmos3NanoSimBimanualConditioning = Cosmos3NanoSimBimanualActionSchema | Cosmos3NanoSimBimanualControlVideoConditioning
+_CONDITIONING_ADAPTER = TypeAdapter(Annotated[Cosmos3NanoSimBimanualConditioning, Field(discriminator="mode")])
 
 
 def parse_cosmos3_nano_sim_bimanual_conditioning(value: object) -> Cosmos3NanoSimBimanualConditioning:
@@ -77,12 +64,9 @@ def parse_cosmos3_nano_sim_bimanual_conditioning(value: object) -> Cosmos3NanoSi
 
 
 __all__ = [
-    "Cosmos3NanoSimBimanualActionConditioning",
     "Cosmos3NanoSimBimanualControlVideoConditioning",
     "Cosmos3NanoSimBimanualConditioning",
-    "TRANSFER_CONTROL_ATTENTION_MODE",
     "TRANSFER_HINTS",
-    "TRANSFER_SYSTEM_PROMPT_ID",
     "TransferHint",
     "parse_cosmos3_nano_sim_bimanual_conditioning",
 ]

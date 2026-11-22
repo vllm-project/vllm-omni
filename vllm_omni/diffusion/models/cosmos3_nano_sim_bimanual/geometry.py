@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
@@ -60,10 +60,6 @@ class Cosmos3NanoSimBimanualGeometry:
         ):
             raise ValueError("Cosmos3-Nano-Sim-Bimanual conditioning_tokens_per_frame must be a non-negative integer.")
         return self.vision_tokens_per_frame + conditioning_tokens_per_frame
-
-    @property
-    def session_key(self) -> tuple[int, int]:
-        return self.height, self.width
 
 
 @dataclass(frozen=True)
@@ -139,40 +135,11 @@ class Cosmos3NanoSimBimanualResolutionPolicy:
         width = math.floor(math.sqrt(self.max_pixels * aspect) / self.alignment) * self.alignment
         return self.resolve(max(self.alignment, height), max(self.alignment, width))
 
-    def iter_valid_geometries(self) -> Iterator[Cosmos3NanoSimBimanualGeometry]:
-        """Enumerate every aligned geometry admitted by this policy."""
-
-        max_height = int(math.sqrt(self.max_pixels / self.min_aspect))
-        for height in range(self.alignment, max_height + 1, self.alignment):
-            min_width = max(self.alignment, math.ceil(height * self.min_aspect / self.alignment) * self.alignment)
-            max_width = min(
-                math.floor(height * self.max_aspect / self.alignment) * self.alignment,
-                math.floor(self.max_pixels / height / self.alignment) * self.alignment,
-            )
-            for width in range(min_width, max_width + 1, self.alignment):
-                yield self.resolve(height, width)
-
 
 def _param(params: Any, name: str) -> Any:
     if isinstance(params, Mapping):
         return params.get(name)
     return getattr(params, name, None)
-
-
-def conditioning_image_size(params: Any) -> tuple[int, int, int, int] | None:
-    """Read the padded canvas and pre-padding content size, both in pixels."""
-    extra = _param(params, "extra_args") or {}
-    value = extra.get("conditioning_image_size")
-    if value is None:
-        return None
-    if not isinstance(value, list | tuple) or len(value) != 4:
-        raise ValueError("conditioning_image_size must be [padded_h, padded_w, content_h, content_w].")
-    padded_h, padded_w, content_h, content_w = (
-        _positive_int(item, "conditioning_image_size dimension") for item in value
-    )
-    if content_h > padded_h or content_w > padded_w:
-        raise ValueError("conditioning_image_size content must fit inside its padded canvas.")
-    return padded_h, padded_w, content_h, content_w
 
 
 def _media_hw(media: Any) -> tuple[int, int] | None:
@@ -215,17 +182,6 @@ def resolve_cosmos3_nano_sim_bimanual_geometry(
     width = _param(sampling_params, "width")
     if (height is None) != (width is None):
         raise ValueError("Cosmos3-Nano-Sim-Bimanual height and width must be supplied together.")
-    image_size = conditioning_image_size(sampling_params)
-    if image_size is not None:
-        padded_h, padded_w, content_h, content_w = image_size
-        policy.resolve(padded_h, padded_w)
-        factor = policy.vae_spatial_compression_factor
-        if content_h < factor or content_w < factor:
-            raise ValueError("conditioning_image_size content must span at least one VAE spatial cell.")
-        cropped = policy.resolve(content_h // factor * factor, content_w // factor * factor)
-        if height is not None and policy.resolve(height, width).session_key != cropped.session_key:
-            raise ValueError("Explicit height/width must match the conditioning_image_size cropped output.")
-        return cropped
     if height is not None:
         return policy.resolve(height, width)
     source_hw = _media_hw(media)

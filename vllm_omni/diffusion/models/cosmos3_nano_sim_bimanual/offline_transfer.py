@@ -14,12 +14,11 @@ import numpy as np
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import TRANSFER_HINTS
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_bimanual import _unwrap_video, _video_frames
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-TRANSFER_HINTS = ("edge", "blur", "depth", "seg")
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -81,54 +80,6 @@ def _load_video_frames(value: str, *, max_frames: int) -> list[Image.Image]:
     return frames
 
 
-def _unwrap_video(output: Any) -> Any:
-    seen: set[int] = set()
-    while isinstance(output, list | OmniRequestOutput | dict):
-        identity = id(output)
-        if identity in seen:
-            raise ValueError("Cosmos3-Nano-Sim-Transfer returned a cyclic video output envelope.")
-        seen.add(identity)
-
-        if isinstance(output, list):
-            if not output:
-                raise ValueError("Cosmos3-Nano-Sim-Transfer returned an empty video output list.")
-            output = output[0]
-        elif isinstance(output, OmniRequestOutput):
-            if not output.images:
-                raise ValueError("Cosmos3-Nano-Sim-Transfer returned no video frames.")
-            output = output.images
-        elif "video" in output:
-            output = output["video"]
-        elif "payload" in output:
-            output = output["payload"]
-        else:
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Transfer returned an unsupported output mapping; "
-                f"expected 'video' or 'payload', got keys {sorted(map(str, output))}."
-            )
-        if output is None:
-            raise ValueError("Cosmos3-Nano-Sim-Transfer returned an empty video payload.")
-    return output
-
-
-def _video_frames(video: Any) -> list[np.ndarray]:
-    if isinstance(video, torch.Tensor):
-        video = video.detach().cpu()
-        if video.ndim == 5:
-            video = video[0]
-        if video.ndim == 4 and video.shape[0] in (3, 4):
-            video = video[:3].permute(1, 2, 3, 0)
-        if video.is_floating_point():
-            video = video.clamp(-1, 1).mul(0.5).add(0.5)
-        video = video.numpy()
-    array = np.asarray(video)
-    if array.ndim == 5:
-        array = array[0]
-    if np.issubdtype(array.dtype, np.integer):
-        array = array.astype(np.float32) / 255.0
-    return [frame for frame in array]
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Converted Cosmos3-Nano-Sim-Transfer Diffusers directory.")
@@ -156,9 +107,6 @@ def parse_args() -> argparse.Namespace:
         "--attention-sink-size", type=int, help="Number of initial control/latent frame pairs to retain."
     )
     parser.add_argument("--emphasize-control-in-prompt", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument(
-        "--max-prompt-tokens", type=int, default=4096, help="Dense text K/V limit; captions are never truncated."
-    )
     parser.add_argument("--output-type", choices=("video", "latent"), default="video")
     return parser.parse_args()
 
@@ -196,7 +144,6 @@ def main() -> None:
         "reset": True,
         "close_session": True,
         "resolution": _first_not_none(args.resolution, record.get("resolution"), "480"),
-        "max_prompt_tokens": args.max_prompt_tokens,
         hint: hint_config,
     }
     for name in ("aspect_ratio", "kv_cache_inference_size", "attention_sink_size", "emphasize_control_in_prompt"):

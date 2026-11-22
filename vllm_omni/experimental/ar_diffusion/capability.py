@@ -9,29 +9,10 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from vllm_omni.errors import OmniClientError
-
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVState
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
-
-AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE = "ARDiffusionRequestRejectedError"
-
-
-class ARDiffusionRequestRejectedError(OmniClientError):
-    """A request failed admission validation before any state was touched.
-
-    Pipelines raise this for fail-closed rejections (session-fingerprint
-    mismatch, out-of-order chunk index, over-long prompt, wrong resolution,
-    malformed inputs). The contract: no session state, KV pool content, or
-    accounting was modified, so the runner must surface the error WITHOUT
-    releasing the session — the client keeps its paid-for KV history and can
-    retry a corrected request or explicitly reset.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, error_type=AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE)
 
 
 @dataclass(frozen=True)
@@ -121,29 +102,13 @@ class ARDiffusionKVCacheSpec:
     recent sliding tail and ``sink_frames`` is the separately retained prefix;
     both are expressed in the same frame/block unit.
 
-    ``eviction_group_frames`` is the number of consecutive KV frame blocks
-    that must be evicted together. The default, 1, permits independent block
-    eviction. Larger values keep related history entries together: eviction
-    rounds up to whole groups, so the retained tail may be smaller than
-    ``window_frames``. The sink prefix must also contain whole groups. This
-    grouping is independent of how many blocks a forward commits at once.
-
-    For example, Cosmos Sim Transfer's chunk1 sliding history stores a control
-    latent block followed by a clean latent block for each temporal position.
-    It uses ``eviction_group_frames=2`` so eviction cannot leave half a pair.
-    The count refers to KV frame blocks, not output video frames; intermediate
-    noisy latents occupy scratch and are not part of the committed history.
-
-    ``max_scratch_frames_per_branch`` is the maximum current-video span that a
-    non-committing forward writes to scratch. It defaults to
-    ``frames_per_block``. ``max_scratch_tokens_per_branch`` is the maximum
-    additional non-video KV (for example, action/state registers) that must
-    coexist with that video span.
-
     ``segmented`` opts into exact-token segments instead of frame-window
     retention. Its token bounds govern storage and the model supplies ordered
     retained segment handles; legacy frame fields are not retention policy
     for this path.
+
+    ``max_scratch_tokens_per_branch`` is the maximum non-video KV (for example,
+    action/state registers) that must coexist with an uncommitted video block.
     ``model_owned_state_bytes_per_session`` is a conservative upper bound for
     persistent per-session CUDA state outside runner-owned self/cross-attention
     KV and scratch pools.
@@ -164,15 +129,12 @@ class ARDiffusionKVCacheSpec:
     kv_branches: tuple[ARDiffusionKVBranchSpec, ...]
     session_capacity: int
     sink_frames: int = 0
-    # Number of consecutive KV frame blocks evicted together; see the policy above.
-    eviction_group_frames: int = 1
     reset_at_boundary: bool = False
     cross_attention: tuple[ARDiffusionCrossAttentionKVSpec, ...] = ()
     # Initial vLLM storage horizon; extended to fit an in-flight span.
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
-    max_scratch_frames_per_branch: int | None = None
     segmented: ARDiffusionSegmentedKVSpec | None = None
 
     def __post_init__(self) -> None:
@@ -183,7 +145,6 @@ class ARDiffusionKVCacheSpec:
             "tokens_per_frame": self.tokens_per_frame,
             "frames_per_block": self.frames_per_block,
             "window_frames": self.window_frames,
-            "eviction_group_frames": self.eviction_group_frames,
             "session_capacity": self.session_capacity,
             "max_model_len": self.max_model_len,
         }
@@ -192,17 +153,6 @@ class ARDiffusionKVCacheSpec:
                 raise ValueError(f"AR-Diffusion {name} must be positive, got {value}")
         if self.sink_frames < 0:
             raise ValueError(f"AR-Diffusion sink_frames must be non-negative, got {self.sink_frames}")
-        if self.sink_frames % self.eviction_group_frames:
-            raise ValueError("AR-Diffusion sinks must contain complete eviction groups")
-        if self.window_frames < self.eviction_group_frames - 1:
-            raise ValueError("AR-Diffusion window must accommodate an incomplete eviction group")
-        if self.reset_at_boundary and self.eviction_group_frames != 1:
-            raise ValueError("Grouped eviction does not support reset_at_boundary")
-        if self.max_scratch_frames_per_branch is not None and self.max_scratch_frames_per_branch < 0:
-            raise ValueError(
-                "AR-Diffusion max_scratch_frames_per_branch must be non-negative, "
-                f"got {self.max_scratch_frames_per_branch}"
-            )
         if self.max_scratch_tokens_per_branch < 0:
             raise ValueError(
                 "AR-Diffusion max_scratch_tokens_per_branch must be non-negative, "
@@ -240,41 +190,6 @@ class ARDiffusionKVCacheSpec:
     def cross_attention_kv_heads(self) -> dict[str, int]:
         """Per-cache head counts, for the caches that do not use the self-attention head count."""
         return {cache.name: cache.num_kv_heads for cache in self.cross_attention if cache.num_kv_heads is not None}
-
-
-@dataclass(frozen=True)
-class ARDiffusionRequestKVSpec:
-    """Request-specific KV requirements plus an opaque session geometry key."""
-
-    kv_spec: ARDiffusionKVCacheSpec
-    geometry_key: object
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.kv_spec, ARDiffusionKVCacheSpec):
-            raise TypeError(
-                f"AR-Diffusion request kv_spec must be ARDiffusionKVCacheSpec, got {type(self.kv_spec).__name__}"
-            )
-
-
-@runtime_checkable
-class SupportsDynamicARDiffusion(Protocol):
-    """Optional capability for pipelines whose KV geometry varies per request."""
-
-    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
-        """Return the request spec used for initial pool allocation."""
-        ...
-
-    def ar_diffusion_request_spec(self, request: OmniDiffusionRequest) -> ARDiffusionRequestKVSpec:
-        """Resolve one serialized request before runner session admission."""
-        ...
-
-    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
-        """Yield model-computed worst-case specs for startup capacity validation."""
-        ...
-
-    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
-        """Validate the runner's effective structure after deployment overrides."""
-        ...
 
 
 @runtime_checkable

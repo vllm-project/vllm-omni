@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Run Cosmos3-Nano-Sim-Bimanual from reference JSONL/NPZ or action-sidecar and camera JSONL inputs."""
+"""Run Cosmos3-Nano-Sim-Bimanual from reference JSONL/NPZ or prepared action sidecars."""
 
 from __future__ import annotations
 
@@ -40,9 +40,7 @@ def _load_record(jsonl_path: Path, sample_index: int) -> dict[str, Any]:
         if not path.is_absolute():
             path = jsonl_path.parent / path
         payload = json.loads(path.read_text())
-        if not isinstance(payload, dict):
-            return record  # Legacy cookbook arrays retain their existing preparation path.
-        if payload.get("action_space") != "normalized_unified_v1":
+        if not isinstance(payload, dict) or payload.get("action_space") != "normalized_unified_v1":
             raise ValueError("Expected a normalized_unified_v1 action sidecar")
         record = {**record, "action": payload["action"], "action_space": payload["action_space"]}
         if payload.get("domain_names") is not None:
@@ -93,26 +91,35 @@ def _first_image(record: dict[str, Any], *, base_dir: Path) -> Image.Image | Non
 
 
 def _unwrap_video(output: Any) -> Any:
+    """Return the video or latent payload from ``Omni.generate``; shared with ``offline_transfer``."""
     from vllm_omni.outputs import OmniRequestOutput
 
     if isinstance(output, list):
-        output = output[0]
+        if not output:
+            raise ValueError("Generation returned an empty output list.")
+        return _unwrap_video(output[0])
     if isinstance(output, OmniRequestOutput):
         if not output.images:
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual returned no video frames.")
+            raise ValueError("Generation returned no video frames.")
         return _unwrap_video(output.images)
     if isinstance(output, dict):
-        return output.get("video", output.get("frames", output))
+        for key in ("video", "frames", "payload"):
+            if output.get(key) is not None:
+                return _unwrap_video(output[key])
+        raise ValueError(f"Unsupported generation output mapping with keys {sorted(map(str, output))}.")
+    if output is None:
+        raise ValueError("Generation returned an empty video payload.")
     return output
 
 
 def _video_frames(video: Any) -> list[np.ndarray]:
+    """Convert generated video to float HWC frames for export; shared with ``offline_transfer``."""
     if isinstance(video, torch.Tensor):
         video = video.detach().cpu()
         if video.ndim == 5:
             video = video[0]
         if video.ndim == 4 and video.shape[0] in (3, 4):
-            video = video.permute(1, 2, 3, 0)
+            video = video[:3].permute(1, 2, 3, 0)
         if video.is_floating_point():
             video = video.float().clamp(-1, 1) * 0.5 + 0.5
         video = video.numpy()
@@ -131,7 +138,6 @@ def parse_args() -> argparse.Namespace:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--sample-index", type=int, default=0)
     selection.add_argument("--all-samples", action="store_true")
-    parser.add_argument("--input-format", choices=("reference", "cookbook"), default="reference")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
         "--deploy-config",
@@ -144,27 +150,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--output-type", choices=("video", "latent"), default="video")
-    parser.add_argument("--resolution", type=int, default=None)
-    parser.add_argument("--camera-trajectory")
-    parser.add_argument("--camera-translation-scale", type=float)
-    parser.add_argument("--camera-action-normalization", choices=("global_asinh", "scale"))
-    parser.add_argument("--camera-pose-convention", choices=("backward_chunk_anchored_16f", "backward_framewise"))
-    parser.add_argument("--camera-num-frames", type=int)
     args = parser.parse_args()
     if args.all_samples and args.output_dir is None:
         parser.error("--all-samples requires --output-dir")
-    if args.input_format == "reference" and any(
-        getattr(args, key) is not None
-        for key in (
-            "resolution",
-            "camera_trajectory",
-            "camera_translation_scale",
-            "camera_action_normalization",
-            "camera_pose_convention",
-            "camera_num_frames",
-        )
-    ):
-        parser.error("Resolution/camera recipe flags require --input-format cookbook")
     return args
 
 
@@ -198,8 +186,6 @@ def _reference_request(
         extra["action"] = action
     if "action_space" in record:
         extra["action_space"] = record["action_space"]
-    if "conditioning_image_size" in record:
-        extra["conditioning_image_size"] = record["conditioning_image_size"]
     params = {
         "height": args.height,
         "width": args.width,
@@ -238,8 +224,7 @@ def main() -> None:
     artifact = Cosmos3NanoSimBimanualManifest.from_od_config(
         SimpleNamespace(tf_model_config=json.loads(config_path.read_text(encoding="utf-8")))
     )
-    artifact.require_exported_artifact()
-    manifest = artifact if args.input_format == "cookbook" else None
+    artifact.require_action_schema()
     count = sum(bool(line.strip()) for line in args.jsonl.read_text().splitlines())
     indexes = range(count) if args.all_samples else [args.sample_index]
     if count == 0:
@@ -266,57 +251,8 @@ def main() -> None:
                 else:
                     output = args.output
                 status["output"] = str(output)
-                if manifest is not None:
-                    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.cookbook import prepare_cookbook_input
-
-                    keys = (
-                        "seed",
-                        "fps",
-                        "num_frames",
-                        "height",
-                        "width",
-                        "resolution",
-                        "camera_trajectory",
-                        "camera_translation_scale",
-                        "camera_action_normalization",
-                        "camera_pose_convention",
-                        "camera_num_frames",
-                    )
-                    prepared = prepare_cookbook_input(
-                        record,
-                        manifest=manifest,
-                        base_dir=args.jsonl.parent,
-                        cache_dir=output_dir / ".inputs",
-                        overrides={key: getattr(args, key) for key in keys},
-                    )
-                    prompt_data = {"prompt": prepared.prompt}
-                    if prepared.image is not None:
-                        prompt_data["multi_modal_data"] = {"image": prepared.image}
-                    params = {
-                        "height": prepared.height,
-                        "width": prepared.width,
-                        "num_frames": prepared.num_frames,
-                        "frame_rate": prepared.fps,
-                        "seed": prepared.seed,
-                        "extra_args": prepared.extra_args,
-                    }
-                    status.update(prepared.metadata)
-                    status.pop("num_steps", None)
-                    status.update(
-                        window_frames=manifest.window_frames,
-                        sink_frames=manifest.sink_frames,
-                        sampler=manifest.sample_type,
-                        t_list=manifest.t_list,
-                        num_steps=len(manifest.t_list),
-                        inference_id=manifest.digest,
-                    )
-                    if prepared.poses is not None:
-                        pose_path = output.with_suffix(".camera_trajectory.json")
-                        pose_path.write_text(json.dumps(prepared.poses.tolist()) + "\n", encoding="utf-8")
-                        status["camera_trajectory_path"] = str(pose_path)
-                else:
-                    prompt_data, params, metadata = _reference_request(record, args)
-                    status.update(metadata)
+                prompt_data, params, metadata = _reference_request(record, args)
+                status.update(metadata)
                 params["extra_args"].update(session_id=f"offline-{index}", reset=True, close_session=True)
                 print(
                     json.dumps(

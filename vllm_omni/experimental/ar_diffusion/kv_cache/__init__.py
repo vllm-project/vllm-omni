@@ -15,12 +15,9 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVCon
 from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVBackend, KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
     ARDiffusionKVCache,
-    ARDiffusionKVCacheMemoryEstimate,
     ARDiffusionRequestAdapter,
-    ar_diffusion_scratch_blocks_override,
     build_kv_manager,
     compute_num_blocks,
-    estimate_ar_diffusion_kv_cache_memory,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
@@ -41,7 +38,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 
 __all__ = [
     "ARDiffusionKVCache",
-    "ARDiffusionKVCacheMemoryEstimate",
     "ARDiffusionKVConfig",
     "ARDiffusionPagedForwardContext",
     "ARDiffusionPagedLayerContext",
@@ -52,13 +48,11 @@ __all__ = [
     "KVBackend",
     "KVCacheLifecycle",
     "allocate_kv_pool_with_views",
-    "ar_diffusion_scratch_blocks_override",
     "ar_diffusion_paged_attention",
     "build_kv_manager",
     "chunk_slot_mapping",
     "compute_num_blocks",
     "compute_slot_mapping",
-    "estimate_ar_diffusion_kv_cache_memory",
     "paged_write_attn",
     "pool_write_chunk",
     "resident_block_ids",

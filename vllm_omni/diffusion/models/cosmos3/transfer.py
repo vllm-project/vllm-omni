@@ -529,9 +529,10 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     scale = max(width / orig_w, height / orig_h)
     resize_h = int(np.ceil(scale * orig_h))
     resize_w = int(np.ceil(scale * orig_w))
-    # Antialias before quantizing back to uint8; aliasing changes the control
-    # signal. Center-crop uses rounded offsets when a margin is odd.
     frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
+    # Match torchvision resize + center_crop, which the reference and training
+    # use: antialiased bilinear (plain bilinear aliases large downscales such
+    # as 1080p WSM to 480p) and offsets rounded half to even.
     resized = F.interpolate(
         frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False, antialias=True
     )

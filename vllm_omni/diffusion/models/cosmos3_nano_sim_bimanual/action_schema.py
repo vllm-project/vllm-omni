@@ -125,22 +125,6 @@ class Cosmos3NanoSimBimanualActionSchema(_StrictModel):
     def input_action_dim(self) -> int:
         return UNIFIED_ACTION_DIM
 
-    @property
-    def raw_action_dim(self) -> int:
-        return self.input_action_dim
-
-    def raw_action_dim_for(self, embodiment: str) -> int:
-        self.resolve_embodiment(embodiment, None)
-        return self.input_action_dim
-
-    @property
-    def normalizers(self) -> dict[str, Any]:
-        return {}
-
-    @property
-    def inference_camera_profile(self) -> None:
-        return None
-
     def validate_temporal_compression_factor(self, factor: int) -> None:
         if factor != self.action_tokens_per_frame:
             raise ValueError("Action token count disagrees with temporal compression")

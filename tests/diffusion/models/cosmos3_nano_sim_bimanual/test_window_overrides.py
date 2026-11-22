@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_action_schema import manifest
-from test_cookbook import manifest as legacy_manifest
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS,
@@ -19,8 +18,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def config(artifact_values=None, *, original=None, **overrides):
-    original = manifest() if original is None else original
+def config(artifact_values=None, **overrides):
+    original = manifest()
     artifact = {
         key: getattr(original, key)
         for key in COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS - {"conditioning", "fixed_step_sampler_config"}
@@ -47,14 +46,24 @@ def test_override_preserves_checkpoint_and_separates_sessions(cache_size, sinks)
 
 
 def test_transfer_keeps_request_window_semantics():
-    from test_transfer_resolution_contract import pipeline
-
-    options = config(original=legacy_manifest(), kv_cache_inference_size=30, attention_sink_size=3)
-    artifact = options.tf_model_config["cosmos3_nano_sim_bimanual"]
-    artifact["conditioning"] = pipeline().manifest.require_control_video_conditioning().model_dump(mode="json")
-    artifact.update(chunk_size=1, window_frames=51, sink_frames=1)
+    control = {
+        "mode": "control_video",
+        "hints": ["edge", "blur", "depth", "seg"],
+        "transfer_control_attention_mode": "causal_control_with_rgb_history",
+        "share_vision_temporal_positions": True,
+        "system_prompt_id": "cosmos3_transfer_v1",
+        "emphasize_control_in_prompt": True,
+        "no_eviction": True,
+    }
+    options = config(
+        dict(conditioning=control, chunk_size=1, window_frames=51, sink_frames=1),
+        kv_cache_inference_size=30,
+        attention_sink_size=3,
+    )
     effective = Cosmos3NanoSimBimanualManifest.from_od_config(options)
     assert (effective.window_frames, effective.sink_frames) == (51, 1)
+    assert effective.conditioning_tokens_per_frame == 0
+    assert effective.require_control_video_conditioning().model_dump(mode="json") == control
 
 
 @pytest.mark.parametrize(("cache_size", "sinks"), [(16, 0), (30, 3), (64, 8), (128, 32)])

@@ -31,52 +31,6 @@ BLOCK = 16
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("tokens_per_frame", [16, 32, 30, 1560])
-def test_memory_estimate_matches_pool_with_separate_paging_size(tokens_per_frame):
-    from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionCrossAttentionKVSpec, ARDiffusionKVCacheSpec
-    from vllm_omni.experimental.ar_diffusion.kv_cache import estimate_ar_diffusion_kv_cache_memory
-
-    config = ARDiffusionKVConfig(enable=True, chunk_size=tokens_per_frame, window_chunks=2, sink_chunks=1)
-    spec = ARDiffusionKVCacheSpec(
-        num_layers=1,
-        num_kv_heads=2,
-        head_size=64,
-        tokens_per_frame=tokens_per_frame,
-        frames_per_block=2,
-        max_scratch_frames_per_branch=4,
-        max_scratch_tokens_per_branch=19,
-        window_frames=2,
-        sink_frames=1,
-        session_capacity=1,
-        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
-        cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 5, 4),),
-        model_owned_state_bytes_per_session=100,
-    )
-    estimate = estimate_ar_diffusion_kv_cache_memory(config, spec, torch.float32, block_size=BLOCK)
-    cache = ARDiffusionKVCache(
-        config,
-        num_layers=spec.num_layers,
-        num_kv_heads=spec.num_kv_heads,
-        head_size=spec.head_size,
-        dtype=torch.float32,
-        block_size=BLOCK,
-        max_model_len=spec.max_model_len,
-        available_bytes=estimate.required_bytes,
-        kv_branches=spec.kv_branches,
-        session_capacity=1,
-        frames_per_block=spec.frames_per_block,
-        max_scratch_frames_per_branch=spec.max_scratch_frames_per_branch,
-        max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
-        cross_attention_lengths=spec.cross_attention_lengths,
-        cross_attention_kv_heads=spec.cross_attention_kv_heads,
-        model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
-    )
-    assert cache.scratch_num_blocks == estimate.scratch_num_blocks
-    assert cache.scratch_reserved_bytes == estimate.scratch_reserved_bytes
-    assert cache.cross_attention_bytes_per_session == estimate.cross_attention_bytes_per_session
-    assert cache.memory_budget_bytes == estimate.required_bytes
-
-
 def make_spec(*, chunk_size=BLOCK, window_chunks=2, sink_chunks=0, reset_at_boundary=False):
     return ChunkWindowSpec(
         block_size=BLOCK,
@@ -410,7 +364,6 @@ def _make_tiny_capacity_kv(
     gpu_memory_fraction: float = 1.0,
     model_owned_state_bytes_per_session: int = 0,
     reuse_history_staging: bool = False,
-    cross_attention_heads: int = 1,
 ) -> ARDiffusionKVCache:
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
@@ -431,19 +384,10 @@ def _make_tiny_capacity_kv(
         kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
         session_capacity=requested_capacity,
         cross_attention_lengths={"text": 2},
-        cross_attention_kv_heads={"text": cross_attention_heads},
         frames_per_block=3,
         model_owned_state_bytes_per_session=model_owned_state_bytes_per_session,
         device=torch.device("cpu"),
     )
-
-
-def test_cross_attention_head_count_is_reserved_in_the_kv_budget():
-    kv = _make_tiny_capacity_kv(requested_capacity=2, available_bytes=192, cross_attention_heads=2)
-    assert kv.session_capacity == 1
-    assert kv.cross_attention_bytes_per_session == 32
-    assert kv.cross_attention_reserved_bytes == 32
-    assert kv.num_blocks_total * 8 + kv.cross_attention_reserved_bytes <= 192
 
 
 def test_history_staging_is_reserved_in_the_kv_budget(monkeypatch):
@@ -581,7 +525,6 @@ def _make_kv(
     local_branches,
     num_frame_per_block=2,
     window_chunks=9,
-    max_scratch_frames_per_branch=None,
     max_scratch_tokens_per_branch=0,
 ):
     kv_branches = (
@@ -590,9 +533,8 @@ def _make_kv(
         else (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 1))
     )
     page_bytes = 2 * BLOCK * 4 * 64 * torch.float32.itemsize
-    scratch_frames = num_frame_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
     declared_scratch_blocks = (max_scratch_tokens_per_branch + BLOCK - 1) // BLOCK
-    scratch_blocks = local_branches * (scratch_frames + declared_scratch_blocks)
+    scratch_blocks = local_branches * (num_frame_per_block + declared_scratch_blocks)
     managed_blocks = local_branches * (window_chunks + num_frame_per_block) + 2
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
@@ -612,7 +554,6 @@ def _make_kv(
         kv_branches=kv_branches,
         session_capacity=1,
         frames_per_block=num_frame_per_block,
-        max_scratch_frames_per_branch=max_scratch_frames_per_branch,
         max_scratch_tokens_per_branch=max_scratch_tokens_per_branch,
     )
 
@@ -639,21 +580,6 @@ def test_scratch_capacity_is_derived_from_declared_geometry(monkeypatch):
         max_scratch_tokens_per_branch=BLOCK + 1,
     )
     assert kv.scratch_blocks_per_kv_branch == 8  # six video blocks + two auxiliary blocks
-
-
-def test_scratch_video_span_is_independent_of_managed_inflight_span(monkeypatch):
-    monkeypatch.delenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", raising=False)
-    kv = _make_kv(
-        local_branches=1,
-        num_frame_per_block=1,
-        max_scratch_frames_per_branch=4,
-        max_scratch_tokens_per_branch=BLOCK + 1,
-    )
-
-    assert kv.frames_per_block == 1
-    assert kv.max_scratch_frames_per_branch == 4
-    assert kv.managed_num_blocks == 12  # nine window + one managed in-flight + two sentinels
-    assert kv.scratch_blocks_per_kv_branch == 6  # four current-video + two auxiliary
 
 
 def test_scratch_env_override_cannot_reduce_declared_minimum(monkeypatch):

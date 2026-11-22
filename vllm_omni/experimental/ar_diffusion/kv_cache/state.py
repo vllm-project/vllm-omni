@@ -18,7 +18,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapp
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedForwardContext,
     ARDiffusionPagedLayerContext,
-    _to_device_async,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 
@@ -30,8 +29,6 @@ class PagedKVTask:
     kv_branch: str
     seq_len: int
     commit_current: bool
-    extra_visible_tokens: int = 0
-    frame_causal: bool = False
 
 
 if TYPE_CHECKING:
@@ -122,19 +119,10 @@ class ARDiffusionKVState(KVBackend[PagedKVTask, list[ARDiffusionPagedLayerContex
         kv_branch: str,
         seq_len: int | None = None,
         commit_current: bool = False,
-        *,
-        extra_visible_tokens: int = 0,
-        frame_causal: bool = False,
     ) -> list[ARDiffusionPagedLayerContext]:
         if seq_len is None:
             raise ValueError("AR-Diffusion paged self-attention requires seq_len in get_kv_caches()")
-        return self.prepare_paged_context(
-            kv_branch,
-            seq_len,
-            commit_current,
-            extra_visible_tokens=extra_visible_tokens,
-            frame_causal=frame_causal,
-        )
+        return self.prepare_paged_context(kv_branch, seq_len, commit_current)
 
     def prepare(self, tasks: Sequence[PagedKVTask]) -> list[list[ARDiffusionPagedLayerContext]]:
         """Prepare branch-local paged views, without converting segmented KV."""
@@ -149,16 +137,7 @@ class ARDiffusionKVState(KVBackend[PagedKVTask, list[ARDiffusionPagedLayerContex
             pending = self._paged_pending.get(task.kv_branch)
             if pending is not None and pending.commit_current and pending._allocated_video and not pending._committed:
                 raise RuntimeError("AR-Diffusion paged context replaced before its managed current chunk was committed")
-        views = [
-            self._prepare_paged_context(
-                task.kv_branch,
-                task.seq_len,
-                task.commit_current,
-                extra_visible_tokens=task.extra_visible_tokens,
-                frame_causal=task.frame_causal,
-            )
-            for task in tasks
-        ]
+        views = [self._prepare_paged_context(task.kv_branch, task.seq_len, task.commit_current) for task in tasks]
         self._paged_tasks.update((task.kv_branch, task) for task in tasks)
         return views
 
@@ -179,42 +158,23 @@ class ARDiffusionKVState(KVBackend[PagedKVTask, list[ARDiffusionPagedLayerContex
         kv_branch: str,
         seq_len: int,
         commit_current: bool,
-        *,
-        extra_visible_tokens: int = 0,
-        frame_causal: bool = False,
     ) -> list[ARDiffusionPagedLayerContext]:
-        return self.prepare((PagedKVTask(kv_branch, seq_len, commit_current, extra_visible_tokens, frame_causal),))[0]
+        return self.prepare((PagedKVTask(kv_branch, seq_len, commit_current),))[0]
 
     def _prepare_paged_context(
-        self, kv_branch: str, seq_len: int, commit_current: bool, *, extra_visible_tokens: int, frame_causal: bool
+        self, kv_branch: str, seq_len: int, commit_current: bool
     ) -> list[ARDiffusionPagedLayerContext]:
         """Return per-layer paged attention contexts for one KV branch forward.
 
         Allocation is lazy so distributed workers allocate only for KV branches
-        they actually execute. ``extra_visible_tokens`` extends only the
-        attention view, not the retained manager window; models whose window is
-        defined as history can use it to include the current chunk in addition.
+        they actually execute.
         """
         if self.kv_cache.segmented_spec is not None:
             raise RuntimeError("Segmented KV capabilities must use segmented() instead of frame-window contexts")
         cs = self.kv_cache.spec.chunk_size
-        if frame_causal and (not commit_current or seq_len <= 0 or extra_visible_tokens != cs):
-            raise ValueError(
-                "Frame-causal clean refresh requires committing complete frames and exactly one extra visible frame"
-            )
         if int(seq_len) % cs != 0:
             raise AssertionError(
                 f"AR-Diffusion expects frame-aligned seq_len (multiple of chunk_size={cs}), got {seq_len}"
-            )
-        if (
-            isinstance(extra_visible_tokens, bool)
-            or not isinstance(extra_visible_tokens, int)
-            or extra_visible_tokens < 0
-            or extra_visible_tokens % cs != 0
-        ):
-            raise AssertionError(
-                "AR-Diffusion extra_visible_tokens must be a non-negative multiple "
-                f"of chunk_size={cs}, got {extra_visible_tokens}"
             )
 
         pending = self._paged_pending.get(kv_branch)
@@ -229,11 +189,8 @@ class ARDiffusionKVState(KVBackend[PagedKVTask, list[ARDiffusionPagedLayerContex
             history_block_ids=self.kv_cache.window_block_ids(adapter),
             seq_len=int(seq_len),
             commit_current=bool(commit_current),
-            frame_causal=frame_causal,
             max_video_tokens=int(
-                self.kv_cache.spec.sliding_window
-                + self.kv_cache.spec.sink_chunks * self.kv_cache.spec.chunk_size
-                + extra_visible_tokens
+                self.kv_cache.spec.sliding_window + self.kv_cache.spec.sink_chunks * self.kv_cache.spec.chunk_size
             ),
         )
         self._paged_pending[kv_branch] = forward_ctx
@@ -261,22 +218,7 @@ class ARDiffusionKVState(KVBackend[PagedKVTask, list[ARDiffusionPagedLayerContex
             return
         if ctx.commit_current and ctx._allocated_video:
             n_chunks = ctx.seq_len // self.kv_cache.spec.chunk_size
-            for frame in range(n_chunks):
-                if ctx.frame_causal:
-                    # Only publish after the transformer has finished reading
-                    # all old history. Sequential allocation preserves the
-                    # manager's sink/window eviction and partial-chunk rules.
-                    table = self.kv_cache.allocate_chunk(ctx.adapter)
-                    size = self.kv_cache.spec.chunk_size
-                    start = ctx.adapter.num_computed_tokens
-                    assert ctx.current_video_slot_mapping is not None
-                    source = ctx.current_video_slot_mapping[frame * size : (frame + 1) * size]
-                    destination = _to_device_async(
-                        compute_slot_mapping(table, torch.arange(start, start + size), ctx.block_size), source.device
-                    )
-                    for layer in range(self.num_layers):
-                        for pool in (self.kv_cache._k_pools[layer], self.kv_cache._v_pools[layer]):
-                            pool.index_copy_(0, destination, pool.index_select(0, source))
+            for _ in range(n_chunks):
                 self.kv_cache.commit_chunk(ctx.adapter)
             self._committed[kv_branch] += ctx.seq_len
             _log.debug(

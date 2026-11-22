@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
@@ -130,11 +129,13 @@ class Cosmos3NanoSimBimanualSessionFingerprint:
     height: int
     width: int
     fps: float
-    conditioning: tuple[tuple[str, Any], ...]
+    domain_id: int
+    embodiment: str
+    action_contract_sha256: str
     checkpoint_id: str
     manifest_id: str
     sampler_id: str
-    action_space: str = "raw"
+    action_space: str = "normalized_unified_v1"
     inference_id: str = ""
 
     def __post_init__(self) -> None:
@@ -145,11 +146,12 @@ class Cosmos3NanoSimBimanualSessionFingerprint:
                 "Cosmos3-Nano-Sim-Bimanual fingerprint resolution/FPS must be "
                 f"positive, got {self.height}x{self.width}@{self.fps}"
             )
-        if not self.conditioning:
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires conditioning")
-        names = [name for name, _ in self.conditioning]
-        if any(not name for name in names) or len(names) != len(set(names)):
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual conditioning fingerprint keys must be non-empty and unique")
+        if self.domain_id < 0:
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual domain_id must be non-negative, got {self.domain_id}")
+        if not self.embodiment:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires an embodiment")
+        if not self.action_contract_sha256:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires action_contract_sha256")
         if not self.real_text_kv_lengths:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual fingerprint requires at least one text KV branch")
         if any(length <= 0 for _, length in self.real_text_kv_lengths):
@@ -259,9 +261,7 @@ class Cosmos3NanoSimBimanualSessionState:
         self.dense_kv_by_branch.clear()
         self.dense_attention = None
         self.latents.clear()
-        if self.vae_decode is not None:
-            self.vae_decode.release()
-            self.vae_decode = None
+        self.vae_decode = None
         self.last_vae_decode_input_frames = 0
         self.max_vae_decode_input_frames = 0
 
