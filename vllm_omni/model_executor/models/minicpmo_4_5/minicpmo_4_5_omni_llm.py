@@ -141,6 +141,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder as streaming_audio
 from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder_graph as streaming_audio_graph
+from vllm_omni.model_executor.models.minicpmo_4_5.audio_feature_padding import trim_whisper_max_length_padding
 from vllm_omni.model_executor.models.minicpmo_4_5.vision_fused import (
     VisionGraphEncoder,
     encode_packed_fused,
@@ -3457,6 +3458,10 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
             val = getattr(image_processor, attr)
             if isinstance(val, np.ndarray):
                 setattr(image_processor, attr, val.tolist())
+
+        # The checkpoint processor pads every audio clip to 30 s and then
+        # slices it back to the clip's own length; pad to that length up front.
+        trim_whisper_max_length_padding(hf_processor)
 
         return hf_processor
 
