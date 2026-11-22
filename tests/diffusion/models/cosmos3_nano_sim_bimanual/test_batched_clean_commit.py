@@ -76,7 +76,20 @@ def state(device, dtype, window, sink, page_size=None):
 
 
 @torch.no_grad()
-def run_forward(net, h, text, start, *, paged=None, dense=None, batched=False, window=5, sink=0, commit=True):
+def run_forward(
+    net,
+    h,
+    text,
+    start,
+    *,
+    paged=None,
+    dense=None,
+    batched=False,
+    window=5,
+    sink=0,
+    commit=True,
+    dense_cache=None,
+):
     frames = h.shape[1] // BLOCK
     nulls = tuple(i for i in range(frames) if (start + i) % 3 == 0)
     positions = torch.arange(start * BLOCK, (start + frames) * BLOCK, device=h.device).float()
@@ -101,7 +114,9 @@ def run_forward(net, h, text, start, *, paged=None, dense=None, batched=False, w
             real_text_kv_len=text[index][0].shape[1],
             freqs_cos=cos,
             freqs_sin=sin,
-            dense_history=None if dense is None else dense[index],
+            dense_history=None if dense is None or dense_cache is not None else dense[index],
+            dense_joint_kv=None if dense_cache is None else dense_cache.kv[index],
+            dense_history_tokens=0 if dense_cache is None else dense_cache.history_length,
             paged_context=None if contexts is None else contexts[index].to_layer_inputs(),
             num_frames=frames,
             tokens_per_frame=BLOCK,
@@ -112,6 +127,8 @@ def run_forward(net, h, text, start, *, paged=None, dense=None, batched=False, w
         current.append((k, v))
     if paged is not None:
         paged.commit_paged_context("main")
+    elif commit and dense_cache is not None:
+        dense = dense_cache.commit(frames * BLOCK)
     elif commit:
         for offset in range(frames):
             dense = append_dense_kv_history(

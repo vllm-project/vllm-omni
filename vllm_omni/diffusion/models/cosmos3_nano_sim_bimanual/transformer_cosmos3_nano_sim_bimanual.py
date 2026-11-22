@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Causal three-way Cosmos3 transformer used by Cosmos3-Nano-Sim-Bimanual."""
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     _tf_config_get,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import Cosmos3NanoSimBimanualGeometry
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     build_interleaved_mrope_position_ids,
@@ -39,6 +41,25 @@ class Cosmos3NanoSimBimanualTransformerOutput:
     current_kv: list[tuple[torch.Tensor, torch.Tensor]]
 
 
+def _dense_clean_kv(text, history, current, start, end, sink_tokens, tail_tokens):
+    """Assemble text + retained prefix + current frame with one allocation.
+
+    Select views before concatenating, preserving the exact sequential clean
+    attention order even when a chunk spans a sink/window eviction boundary.
+    """
+    if tail_tokens is None or history.shape[1] + start <= sink_tokens + tail_tokens:
+        return torch.cat([text, history, current[:, :end]], dim=1)
+    old_sink = min(sink_tokens, history.shape[1])
+    new_sink = sink_tokens - old_sink
+    new_tail = min(start, tail_tokens)
+    old_tail = tail_tokens - new_tail
+    parts = [text, history[:, :old_sink], current[:, :new_sink]]
+    if old_tail:
+        parts.append(history[:, -old_tail:])
+    parts.append(current[:, start - new_tail : end])
+    return torch.cat(parts, dim=1)
+
+
 class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
     """One softmax over text, committed history, and the current chunk."""
 
@@ -52,6 +73,8 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         dense_history: tuple[torch.Tensor, torch.Tensor] | None = None,
+        dense_joint_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        dense_history_tokens: int = 0,
         paged_context: ARDiffusionPagedLayerInputs | None = None,
         num_frames: int,
         tokens_per_frame: int,
@@ -104,6 +127,28 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
                 self.head_dim**-0.5,
                 framewise_attention=clean_history_window is not None,
             ).unsqueeze(0)
+        elif dense_joint_kv is not None:
+            # Full-history storage is already text + committed history. Only
+            # current K/V changes; keep the exact dense attention layout/policy.
+            joint_k, joint_v = dense_joint_kv
+            offset = real_text_kv_len + dense_history_tokens
+            end = offset + seq_len
+            if end > joint_k.shape[1]:
+                raise ValueError("Dense joint-attention forward exceeds its reserved capacity")
+            joint_k[:, offset:end].copy_(k)
+            joint_v[:, offset:end].copy_(v)
+            if clean_history_window is not None:
+                outputs = [
+                    self.attn(
+                        q[:, frame * tokens_per_frame : (frame + 1) * tokens_per_frame],
+                        joint_k[:, : offset + (frame + 1) * tokens_per_frame],
+                        joint_v[:, : offset + (frame + 1) * tokens_per_frame],
+                    )
+                    for frame in range(num_frames)
+                ]
+                output = torch.cat(outputs, dim=1)
+            else:
+                output = self.attn(q, joint_k[:, :end], joint_v[:, :end])
         elif clean_history_window is not None:
             # Dense oracle for batched clean refresh. Projections and MLPs
             # remain batched, while each attention sees its sequential prefix.
@@ -114,16 +159,15 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
             outputs = []
             for frame in range(num_frames):
                 start, end = frame * tokens_per_frame, (frame + 1) * tokens_per_frame
-                key = torch.cat([history_k, k[:, :start]], dim=1)
-                value = torch.cat([history_v, v[:, :start]], dim=1)
-                if tail_tokens is not None and key.shape[1] > sink_tokens + tail_tokens:
-                    key = torch.cat([key[:, :sink_tokens], key[:, -tail_tokens:]], dim=1)
-                    value = torch.cat([value[:, :sink_tokens], value[:, -tail_tokens:]], dim=1)
                 outputs.append(
                     self.attn(
                         q[:, start:end],
-                        torch.cat([text_k[:, :real_text_kv_len], key, k[:, start:end]], dim=1),
-                        torch.cat([text_v[:, :real_text_kv_len], value, v[:, start:end]], dim=1),
+                        _dense_clean_kv(
+                            text_k[:, :real_text_kv_len], history_k, k, start, end, sink_tokens, tail_tokens
+                        ),
+                        _dense_clean_kv(
+                            text_v[:, :real_text_kv_len], history_v, v, start, end, sink_tokens, tail_tokens
+                        ),
                     )
                 )
             output = torch.cat(outputs, dim=1)
@@ -366,6 +410,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         action_domain_ids: torch.Tensor,
         paged_kv: list[Any] | None = None,
         dense_history: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        dense_attention: CosmosSimDenseAttentionCache | None = None,
         condition_vision: bool = False,
         null_action_frame_indexes: tuple[int, ...] = (),
         frame_causal: bool = False,
@@ -396,6 +441,10 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
             )
         if paged_kv is not None and dense_history is not None:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual forward accepts either paged_kv or dense_history, not both")
+        if dense_attention is not None and (paged_kv is not None or dense_history is not None):
+            raise ValueError("Dense joint storage cannot be combined with paged or separate dense history")
+        dense_joint_kv = None if dense_attention is None else dense_attention.kv
+        dense_history_tokens = 0 if dense_attention is None else dense_attention.history_length
         if paged_kv is not None and len(paged_kv) != self.num_hidden_layers:
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}"
@@ -464,6 +513,8 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
             null_action_frame_indexes=null_action_frame_indexes,
             frame_causal=frame_causal,
         )
+        if dense_attention is not None and self._inductor_cudagraphs:
+            freqs_cos, freqs_sin = dense_attention.stage_rope(freqs_cos, freqs_sin, geometry.patch_grid)
 
         if paged_kv is not None:
             forward_context = paged_kv[0].forward_ctx
@@ -482,7 +533,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         # Only the dense path reads current_kv; in paged mode the K/V are
         # already in the pool, so keeping 40 layers of them alive per denoise
         # step would defeat the point of paging.
-        collect_current_kv = paged_kv is None
+        collect_current_kv = paged_kv is None and dense_joint_kv is None
         current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         with self._offload_context("generator"):
             for layer_idx, layer in enumerate(self.gen_layers):
@@ -495,6 +546,8 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                     freqs_cos=freqs_cos,
                     freqs_sin=freqs_sin,
                     dense_history=None if dense_history is None else dense_history[layer_idx],
+                    dense_joint_kv=None if dense_joint_kv is None else dense_joint_kv[layer_idx],
+                    dense_history_tokens=dense_history_tokens,
                     paged_context=None if paged_kv is None else paged_kv[layer_idx],
                     num_frames=num_frames,
                     tokens_per_frame=actual_tokens_per_frame,
