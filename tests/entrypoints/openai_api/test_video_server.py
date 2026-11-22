@@ -996,6 +996,36 @@ def test_i2v_minimax_h3_preserves_reference_geometry():
     assert (sampling_params.width, sampling_params.height) == (96, 64)
 
 
+@pytest.mark.parametrize(
+    ("model_class_name", "expected_size"),
+    [
+        ("Cosmos3OmniDiffusersPipeline", (480, 800)),
+        ("Cosmos3OmniPipeline", (480, 800)),
+        ("Cosmos3NanoSimBimanualPipeline", (320, 192)),
+    ],
+)
+def test_i2v_cosmos3_reference_geometry_reaches_pipeline(model_class_name, expected_size):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = model_class_name
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="nvidia/Cosmos3-Nano",
+    )
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A robot arm picks up a cup.", width=320, height=192),
+            "cosmos3-reference-geometry",
+            reference_image=ReferenceImage(Image.new("RGB", (480, 800))),
+        )
+    )
+
+    assert engine.captured_prompt is not None
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == expected_size
+
+
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
     image_bytes = _make_test_image_bytes((48, 48))
     mocker.patch(

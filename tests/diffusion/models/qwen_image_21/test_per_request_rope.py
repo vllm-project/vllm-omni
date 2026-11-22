@@ -112,25 +112,31 @@ def test_batched_rotary_matches_individual_requests():
     assert torch.equal(actual, expected)
 
 
-def test_npu_rope_tables_keep_the_batch_axis_of_a_per_request_table():
-    """The fused NPU kernel takes a (B', S, 1, W) table.
+def test_npu_rope_tables_flatten_a_per_request_table_into_the_sequence_axis():
+    """The fused NPU kernel takes a (B', S, 1, W) table whose batch axis is 1.
 
-    A per-request table carries one row of angles per batch element, so its
-    batch axis must survive the normalization: flattening it into the sequence
-    axis would give every request the angles of another one.
+    A per-request table carries one row of angles per batch element, so the
+    batch axis is folded into the sequence axis instead of being dropped: the
+    rows stay in request order, and every request keeps its own angles.
     """
     freqs = torch.polar(torch.ones(3, 5, 64), torch.randn(3, 5, 64))
     cos, sin = _npu_rope_tables(freqs)
 
-    assert cos.shape == (3, 5, 1, 128)
-    assert sin.shape == (3, 5, 1, 128)
-    # Each batch row keeps its own angles.
+    assert cos.shape == (1, 15, 1, 128)
+    assert sin.shape == (1, 15, 1, 128)
+    # Each batch row keeps its own angles, laid out in request order.
     for batch in range(3):
         torch.testing.assert_close(
-            cos[batch, :, 0], torch.real(freqs[batch]).float().repeat_interleave(2, dim=-1), atol=0, rtol=0
+            cos[0, batch * 5 : (batch + 1) * 5, 0],
+            torch.real(freqs[batch]).float().repeat_interleave(2, dim=-1),
+            atol=0,
+            rtol=0,
         )
         torch.testing.assert_close(
-            sin[batch, :, 0], torch.imag(freqs[batch]).float().repeat_interleave(2, dim=-1), atol=0, rtol=0
+            sin[0, batch * 5 : (batch + 1) * 5, 0],
+            torch.imag(freqs[batch]).float().repeat_interleave(2, dim=-1),
+            atol=0,
+            rtol=0,
         )
 
 
@@ -187,10 +193,10 @@ def test_npu_interleaved_rotation_matches_the_reference_per_request_rotation(mon
 
     actual = _apply_qwen_image21_rotary_emb_npu(x, freqs)
 
-    # The interleaved kernel cannot take a per-batch table, so every request
-    # is rotated with its own angles.
-    assert len(calls) == 2
-    assert [tuple(call[1].shape) for call in calls] == [(1, 10, 1, 128), (1, 10, 1, 128)]
+    # The interleaved kernel cannot take a per-batch table, so the batch is
+    # folded into the sequence axis and every request keeps its own angles.
+    assert len(calls) == 1
+    assert tuple(calls[0][1].shape) == (1, 20, 1, 128)
     expected = torch.cat([_apply_qwen_image21_rotary_emb_native(x[i : i + 1], freqs[i]) for i in range(2)])
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
