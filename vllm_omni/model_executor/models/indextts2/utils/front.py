@@ -1,16 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 import warnings
 from typing import overload
 
+import regex as re
 from sentencepiece import SentencePieceProcessor
 
 from vllm_omni.model_executor.models.indextts2.utils.common import (
     de_tokenized_by_CJK_char,
     tokenize_by_CJK_char,
 )
+
+# Chinese punctuation → ASCII punctuation mapping used by the official
+# IndexTTS-2 inference pipeline (indextts/utils/front.py).  The BPE
+# vocabulary contains English punctuation tokens (``.``, ``!``, ``?``)
+# which the model was trained on; feeding raw Chinese punctuation
+# produces incorrect subword tokenization and garbled pronunciation
+# (e.g. '。' read as '哦').  Normalise before tokenisation.
+_CHAR_REP_MAP = {
+    "\u3002": ".",  # 。
+    "\uff01": "!",  # ！
+    "\uff1f": "?",  # ？
+    "\uff1a": ",",  # ：
+    "\uff1b": ",",  # ；
+    "\uff0c": ",",  # ，
+    "\u201c": "'",  # "
+    "\u201d": "'",  # "
+    "\u2018": "'",  # '
+    "\u2019": "'",  # '
+    "\uff08": "'",  # （
+    "\uff09": "'",  # ）
+    "\u300a": "'",  # 《
+    "\u300b": "'",  # 》
+    "\u3010": "'",  # 【
+    "\u3011": "'",  # 】
+    "\u2014": "-",  # —
+    "\uff5e": "-",  # ～
+    "\u00b7": "-",  # ·
+    "\u3001": ",",  # 、
+    "\n": " ",
+}
+
+_CHAR_REP_PATTERN = re.compile("|".join(re.escape(p) for p in _CHAR_REP_MAP.keys()))
+
+
+def normalize_text(text: str) -> str:
+    """Normalise Chinese punctuation to ASCII equivalents.
+
+    This is a lightweight replacement for the ``TextNormalizer`` used in
+    the official index-tts-vllm pipeline.  It strips Chinese punctuation
+    marks and replaces them with the ASCII tokens the BPE model was
+    trained on.  Full text normalisation (numbers, dates, currency, etc.)
+    is intentionally omitted here — it should be handled by the caller
+    when needed.
+    """
+    return _CHAR_REP_PATTERN.sub(lambda m: _CHAR_REP_MAP[m.group()], text)
 
 
 class TextTokenizer:
@@ -93,6 +139,7 @@ class TextTokenizer:
     def encode(self, text: str, **kwargs):
         if len(text) == 0:
             return []
+        text = normalize_text(text)
         if len(text.strip()) == 1:
             return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
         for pre_tokenizer in self.pre_tokenizers:

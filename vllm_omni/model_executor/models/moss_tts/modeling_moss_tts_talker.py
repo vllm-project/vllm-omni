@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSDelayConfig,
@@ -39,6 +38,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -124,6 +126,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
 
     # vLLM-Omni integration flags
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_preprocess: bool = True
     has_postprocess: bool = True
 
@@ -232,6 +235,10 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
         )
 
+    def compute_prompt_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Return stateless text logits for an arbitrary prompt chunk."""
+        return self.logits_processor(self.text_lm_head, hidden_states)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor | OmniOutput,
@@ -251,7 +258,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
-        logits = self.logits_processor(self.text_lm_head, hidden_states)
+        logits = self.compute_prompt_logits(hidden_states)
         if logits is None or self._batch_state is None:
             return logits
 
@@ -794,6 +801,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     """
 
     have_multimodal_outputs: bool = True
+    # forward() returns plain backbone hidden states; make_omni_output() builds
+    # multimodal outputs after replay, keeping MRv2 FULL CUDA graphs enabled (#10435).
+    mrv2_forward_returns_tensor: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
     # Intermediate prefill chunks reach make_omni_output but must not produce
@@ -893,6 +903,12 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+
+    def compute_prompt_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return request-independent continuation logits for a prompt chunk."""
+        logits = hidden_states.new_full((hidden_states.shape[0], self.text_vocab_size), float("-inf"))
+        logits[:, self.text_pad_id] = 0.0
+        return logits
 
     def compute_logits(
         self,
@@ -1315,6 +1331,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     """
 
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_preprocess: bool = True
     has_postprocess: bool = True
 
@@ -1421,6 +1438,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+
+    def compute_prompt_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return request-independent continuation logits for a prompt chunk."""
+        logits = hidden_states.new_full((hidden_states.shape[0], self.text_vocab_size), float("-inf"))
+        logits[:, self.audio_assistant_slot_token_id] = 0.0
+        return logits
 
     def compute_logits(
         self,

@@ -1,18 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""OmniVoice serving adapter (AR engine_client path).
-
-OmniVoice can also be served through the pure-diffusion engine via
-``for_diffusion`` (``_create_diffusion_speech``); unifying that path is a
-follow-up. This adapter covers the AR-stage deployment.
-"""
+"""OmniVoice adapter for the pure-diffusion speech serving path."""
 
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import DiffusionTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.omnivoice.prompt_utils import prepare_instruct, validate_instruction
 
 if TYPE_CHECKING:
@@ -20,18 +15,24 @@ if TYPE_CHECKING:
 
 
 @register_tts_adapter
-class OmniVoiceAdapter(ARTTSAdapter):
-    stage_keys = frozenset({"omnivoice_generator"})
+class OmniVoiceAdapter(DiffusionTTSAdapter):
+    model_archs = frozenset({"OmniVoicePipeline"})
     name = "omnivoice"
+    supported_output_sample_rates = frozenset({24000})
+
+    def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
+        request.voice = self.ctx.server._get_normalized_voice(request.voice)
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
-
+        if request.ref_audio is not None:
+            format_error = self.ctx.server._validate_ref_audio_format(request.ref_audio)
+            if format_error:
+                return format_error
         err = self.ctx.server._apply_uploaded_speaker(request)
         if err is not None:
             return err
-
         return validate_instruction(request.instructions)
 
     async def build(

@@ -7,11 +7,10 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
+from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import HiggsAudioSamplingParams
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
 from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -41,8 +40,6 @@ class HiggsModelState(OmniModelState):
                 "temperature": torch.zeros(capacity, device=device),
                 "top_p": torch.ones(capacity, device=device),
                 "top_k": torch.full((capacity,), -1, dtype=torch.long, device=device),
-                "zeros": torch.zeros(capacity, device=device),
-                "ones": torch.ones(capacity, device=device),
             }
         self.requests = {}
         self.generators = {}
@@ -215,38 +212,22 @@ class HiggsModelState(OmniModelState):
         key = tuple(req_ids)
         if self.metadata_key != key:
             params = [self.requests[r].sampling_params for r in req_ids]
-            n = len(params)
             if self.sampling_slots is not None:
                 if slots is None:
                     slots = torch.tensor([self.request_slots[r] for r in req_ids], device=self.device)
                 temperature, top_p, top_k = (
                     self.sampling_slots[name].index_select(0, slots) for name in ("temperature", "top_p", "top_k")
                 )
-                zeros = self.sampling_slots["zeros"][:n]
-                ones = self.sampling_slots["ones"][:n]
             else:
                 temperature = torch.tensor([p.temperature for p in params], device=self.device)
                 top_p = torch.tensor([p.top_p for p in params], device=self.device)
                 top_k = torch.tensor([p.top_k for p in params], device=self.device)
-                zeros = torch.zeros(n, device=self.device)
-                ones = torch.ones(n, device=self.device)
-            self.metadata = SamplingMetadata(
+            self.metadata = HiggsAudioSamplingParams(
                 temperature=temperature,
                 all_greedy=all(p.temperature == 0 for p in params),
-                all_random=all(p.temperature != 0 for p in params),
                 top_p=top_p,
                 top_k=top_k,
                 generators={i: self.generators[r] for i, r in enumerate(req_ids) if r in self.generators},
-                max_num_logprobs=None,
-                no_penalties=True,
-                prompt_token_ids=None,
-                frequency_penalties=zeros,
-                presence_penalties=zeros,
-                repetition_penalties=ones,
-                output_token_ids=[[] for _ in params],
-                allowed_token_ids_mask=None,
-                bad_words_token_ids={},
-                logitsprocs=LogitsProcessors(),
             )
             self.metadata_key = key
         return self.metadata
@@ -296,7 +277,14 @@ class HiggsSampler(OmniSampler):
         metadata = self.state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
         hidden = hidden_states[input_batch.logits_indices]
         logits = self.state.model.compute_logits(hidden, metadata)
-        sampled = self.state.model.sample(logits, metadata)
+        stock_output = None
+
+        def sample_text(text_logits):
+            nonlocal stock_output
+            stock_output = self.base_sampler(text_logits, input_batch)
+            return stock_output.sampled_token_ids
+
+        sampled = self.state.model.sample(logits, metadata, sample_text=sample_text)
         count, rejected = get_num_sampled_and_rejected(
             torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device),
             input_batch.seq_lens,
@@ -304,7 +292,14 @@ class HiggsSampler(OmniSampler):
             input_batch.idx_mapping,
             req_states.prefill_len.gpu,
         )
-        output = SamplerOutput(sampled.sampled_token_ids, sampled.logprobs_tensors, None, count, rejected)
+        output = SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None if stock_output is None else stock_output.logprobs_tensors,
+            num_nans=None if stock_output is None else stock_output.num_nans,
+            num_sampled=count,
+            num_rejected=rejected,
+            sampling_mask_tensors=None if stock_output is None else stock_output.sampling_mask_tensors,
+        )
         payload = self.state.model.post_sample_multimodal_outputs(
             req_ids=input_batch.req_ids,
             invalid_req_indices=[],

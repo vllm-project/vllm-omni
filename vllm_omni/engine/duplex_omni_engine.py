@@ -99,7 +99,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
         self.plugin.configure_pipeline(pipeline_config)
         self.plugin.configure_server(self.duplex_session_config)
-        validate_duplex_replica_policy(self.plugin, self.duplex_session_config, distributed=self.single_stage_mode)
+        validate_duplex_replica_policy(self.plugin, self.duplex_session_config)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
@@ -107,6 +107,10 @@ class DuplexOmniEngine(AsyncOmniEngine):
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
         assert self.pipeline_config is not None, "Duplex deployment must resolve a model pipeline"
+        # ``self.async_chunk`` is the deploy-resolved flag (per-stage connector
+        # override included). Plugins that gate their own streaming on it
+        # receive it here, before any session can be admitted.
+        self.plugin.configure_async_chunk(enabled=bool(self.async_chunk))
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
         model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
@@ -336,21 +340,32 @@ class DuplexOmniEngine(AsyncOmniEngine):
             ),
         )
 
-    def _submit_command(self, session_id: str, command: DuplexCommand) -> None:
-        """One-way: enqueue a session command in caller order (blocks only on queue backpressure)."""
+    def _submit_command(self, message: DuplexSessionCommandMessage, *, block: bool = True) -> None:
+        """Enqueue a command; propagate nonblocking queue.Full, or map a blocking timeout to backpressure."""
         if not self.is_alive():
-            raise DuplexSessionError("engine is not alive", code="engine_dead", session_id=session_id)
-        message = DuplexSessionCommandMessage(session_id=session_id, command=command)
+            raise DuplexSessionError("engine is not alive", code="engine_dead", session_id=message.session_id)
         try:
-            self.request_queue.sync_q.put(message, timeout=_COMMAND_PUT_TIMEOUT_S)
+            self.request_queue.sync_q.put(message, block=block, timeout=_COMMAND_PUT_TIMEOUT_S if block else None)
         except queue.Full as exc:
+            if not block:
+                raise
             raise DuplexSessionError(
-                "engine request queue is full", code="engine_backpressure", retryable=True, session_id=session_id
+                "engine request queue is full",
+                code="engine_backpressure",
+                retryable=True,
+                session_id=message.session_id,
             ) from exc
 
     async def submit_command_async(self, session_id: str, command: DuplexCommand) -> None:
+        message = DuplexSessionCommandMessage(session_id=session_id, command=command)
+        try:
+            self._submit_command(message, block=False)
+            return
+        except queue.Full:
+            # Wait for capacity off the event loop, retaining the existing timeout.
+            pass
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: self._submit_command(session_id, command))
+        await loop.run_in_executor(None, self._submit_command, message)
 
 
 __all__ = ["DuplexOmniEngine"]

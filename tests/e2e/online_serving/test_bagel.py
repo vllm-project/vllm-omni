@@ -46,11 +46,11 @@ test_params = [
     OmniServerParams(
         model=MODEL,
         stage_config_path=STAGE_CONFIGS_PATH,
-        # Cold ROCm AITER MHA builds have varied from 551 seconds on a passing
-        # run to more than 1039 seconds under CI load. Keep this weekly lane
-        # bounded while leaving startup headroom after model loading.
-        stage_init_timeout=1800,
-        init_timeout=2100,
+        # Cold ROCm AITER compilation has now exhausted the former 1800-second
+        # stage deadline in both the online and offline weekly owners. Keep the
+        # same bounded headroom for every BAGEL fixture that can run on MI325.
+        stage_init_timeout=2400,
+        init_timeout=2700,
     ),
 ]
 
