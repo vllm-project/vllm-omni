@@ -4,9 +4,14 @@
 
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from transformers import CsmConfig
+from vllm.exceptions import VLLMValidationError
+from vllm.sampling_params import SamplingParams
+from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.model_arch_config_convertor import ModelArchConfigConvertorBase
 
 from tests.model_executor.models.csm.test_csm_talker import _build_talker, _config
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
@@ -50,8 +55,10 @@ def test_talker_stage_declarations(monkeypatch: pytest.MonkeyPatch) -> None:
     assert talker_stage.sampling_constraints["detokenize"] is False
     assert "min_tokens" not in talker_stage.sampling_constraints
 
+    # The pipeline cannot read the checkpoint config, so its literal is tied to the config default here.
     talker = _build_talker(_config(), monkeypatch)
     assert talker_stage.sampling_constraints["stop_token_ids"] == [talker.stop_token_id]
+    assert talker_stage.sampling_constraints["stop_token_ids"] == [CsmConfig().codebook_pad_token_id]
 
 
 def test_codec_stage_declarations() -> None:
@@ -101,9 +108,24 @@ def test_merged_stage_arguments(deploy) -> None:
     assert talker.yaml_engine_args["subtalker_sampling_params"]["top_k"] == 50
     assert talker.yaml_engine_args["custom_process_next_stage_input_func"].endswith("csm.talker2code2wav_async_chunk")
     sampling = talker.yaml_extras["default_sampling_params"]
-    assert sampling["stop_token_ids"] == [2051] and sampling["detokenize"] is False
+    assert sampling["stop_token_ids"] == [2050] and sampling["detokenize"] is False
     assert "min_tokens" not in sampling
 
     assert codec.yaml_engine_args["model_arch"] == "CsmCode2Wav"
     assert codec.yaml_engine_args["retains_state_across_chunks"] is True
     assert codec.yaml_engine_args["async_chunk"] is True
+
+
+def test_stage_sampling_params_pass_the_engine_stop_token_check(deploy) -> None:
+    """vLLM rejects every request of a stage whose stop token ids lie outside the model's vocabulary."""
+    talker, _ = merge_pipeline_deploy(CSM_PIPELINE, deploy)
+    params = SamplingParams(**talker.yaml_extras["default_sampling_params"])
+    # What ModelConfig.get_vocab_size() resolves to for this model type, without a model directory.
+    hf_config = CsmConfig()
+    convertor = ModelArchConfigConvertorBase(hf_config, get_hf_text_config(hf_config))
+    model_config = SimpleNamespace(get_vocab_size=convertor.get_vocab_size)
+
+    params._validate_stop_token_ids(model_config)
+    one_past = SamplingParams(stop_token_ids=[convertor.get_vocab_size()])
+    with pytest.raises(VLLMValidationError, match="out-of-vocab"):
+        one_past._validate_stop_token_ids(model_config)

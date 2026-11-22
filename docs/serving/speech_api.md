@@ -1196,7 +1196,7 @@ CSM request fields:
 | `extra_params.temperature` / `top_k` / `top_p` | Sampling of the first codebook only. Other `extra_params` keys return 400. |
 | `ref_audio` + `ref_text` | One recording and its transcript, both required. They form an earlier turn of the same speaker, which the model continues in that voice. The recording is resampled to 24 kHz. |
 | `voice` | The name of an uploaded voice supplies `ref_audio` and its stored transcript. Any other value is ignored; there are no preset voices. |
-| `max_new_tokens` | Frame budget (1 token = 1 frame = 80 ms). Default 125 (10 s) from the deploy YAML; adapter bounds 1..2048. A response cut off at the budget is reported as [truncated](#truncated-audio). |
+| `max_new_tokens` | Token budget. One token is one 80 ms frame. A response that ends on its own spends two more tokens, on the end frame and the stop token, so N frames of audio need a budget of N + 2 to finish without being reported as [truncated](#truncated-audio). Default 125 from the deploy YAML (at most 10 s); adapter bounds 1..2048. |
 | `seed` | Optional. Reaches both the first-codebook sampler and the depth decoder. |
 | `sample_rate` | Not supported; output is 24 kHz. |
 | Other conditioning fields | `instructions`, `language`, `ref_audio_2`, `speaker_embedding`, `x_vector_only_mode` and `ref_audio_codes` return 400. |

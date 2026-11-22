@@ -192,12 +192,20 @@ def test_declared_capabilities(talker: CsmTalkerForConditionalGeneration) -> Non
     assert talker.has_talker_mtp and talker.has_preprocess and talker.have_multimodal_outputs
     assert talker.mtp_accepts_req_infos and talker.mtp_accepts_per_row_generators
     assert talker.logitsprocs_need_output_token_ids
-    assert talker.stop_token_id == 2051
-    assert talker.logits_vocab_size == 2052
+    assert talker.stop_token_id == talker.config.codebook_pad_token_id == 2050
+    assert talker.logits_vocab_size == talker.config.vocab_size == 2051
     assert talker.mtp_output_key == ("codes", "audio")
     assert talker.mtp_sampling_params == {"do_sample": True, "temperature": 0.9, "top_k": 50, "top_p": 1.0}
     assert talker.get_mtp_seed(SamplingParams(extra_args={"tts_local_seed": 7})) == 7
-    assert talker.mtp_frame_valid(torch.tensor([0, 2050, 2051])).tolist() == [True, True, False]
+    assert talker.mtp_frame_valid(torch.tensor([0, 2049, 2050, 2051])).tolist() == [True, True, False, False]
+
+
+def test_stop_token_follows_the_configured_padding_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    talker = _build_talker(_config(codebook_pad_token_id=2049), monkeypatch)
+    assert talker.stop_token_id == 2049
+    assert talker.mtp_frame_valid(torch.tensor([2048, 2049, 2050])).tolist() == [True, False, True]
+    logits = talker.compute_logits(torch.zeros((1, talker.config.hidden_size)))
+    assert torch.isneginf(logits[0]).nonzero().flatten().tolist() == [2049]
 
 
 def test_deploy_sampling_params_override_the_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -250,7 +258,7 @@ def test_the_step_after_the_stop_token_publishes_nothing(engine: _Engine) -> Non
     # The depth decoder only ever sees codes: the stop token is replaced before the lookup.
     assert len(engine.first_codes) == 4
     for first_codes in engine.first_codes:
-        assert int(first_codes.min()) >= 0 and int(first_codes.max()) < talker.codebook_vocab_size
+        assert talker.stop_token_id not in first_codes.tolist()
     assert engine.first_codes[-1].tolist() == [0, 9]
 
     # The runner reports the request finished only after that step; nothing of it stays behind.

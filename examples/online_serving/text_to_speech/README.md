@@ -174,7 +174,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ### Notes
 
-- Output: 24 kHz mono. `max_new_tokens` is a **frame** budget (1 token = 1 frame = 80 ms). The default is 125 frames (10 s); a non-streaming response cut off at the budget sets the `x-audio-truncated: true` header.
+- Output: 24 kHz mono. `max_new_tokens` is a token budget: one token per 80 ms frame, plus two tokens (the end frame and the stop token) when the response ends on its own. The default is 125 tokens, at most 10 s; a non-streaming response cut off at the budget sets the `x-audio-truncated: true` header.
 - `extra_params.speaker_id` labels the speaker of the turn; it does not select a fixed voice. Without a reference turn the voice differs from request to request unless `seed` is set.
 - `temperature`, `top_k` and `top_p` in `extra_params` apply to the first codebook only. The depth decoder (codebooks 1-31) uses the model-wide `subtalker_sampling_params` of the deploy YAML.
 - `voice` is used only when it names an uploaded voice (`POST /v1/audio/voices`), which then supplies the reference turn. There are no preset voices.

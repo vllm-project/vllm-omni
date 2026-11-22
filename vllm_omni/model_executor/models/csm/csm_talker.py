@@ -8,8 +8,9 @@ of the frame's codebook embeddings is the backbone's next input.
 
 Generation ends on a frame whose codebooks, except the last, are all the EOS id.
 That cannot be seen from the first codebook alone, so the step after such a
-frame is forced to emit ``stop_token_id``, an engine-only id one past the
-codebook vocabulary.
+frame is forced to emit ``stop_token_id``. This is the codebook padding id,
+which the transformers generation loop writes into the frames that follow a
+finished row; it is closed on every other step.
 
 A prompt may carry one reference recording. Its waveform arrives with the
 request, is encoded with the Mimi codec at prefill, and the resulting frame
@@ -25,7 +26,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import MimiModel
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -144,8 +144,10 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         # Enables mrv2_sampling_context, which gives compute_logits the request order.
         self.logitsprocs_need_output_token_ids = True
         self.omni_pooler_payload_include_hidden = False
-        self.stop_token_id = self.codebook_vocab_size
-        self.logits_vocab_size = self.codebook_vocab_size + 1
+        # transformers pads the frames after a finished row with this id, so it never names a code.
+        self.stop_token_id = int(config.codebook_pad_token_id)
+        # Lets the runner drop stop ids the head cannot emit (the text EOS) from the min_tokens mask.
+        self.logits_vocab_size = self.codebook_vocab_size
         sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self.mtp_sampling_params = {**_DEFAULT_DEPTH_SAMPLING, **(sampling if isinstance(sampling, Mapping) else {})}
 
@@ -184,12 +186,13 @@ class CsmTalkerForConditionalGeneration(nn.Module):
     def compute_logits(
         self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
     ) -> torch.Tensor | None:
-        """Return first-codebook logits plus the stop column, ``[N, logits_vocab_size]``."""
+        """Return first-codebook logits ``[N, logits_vocab_size]``; the stop token is closed unless forced."""
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
-        logits = F.pad(self.lm_head(hidden_states), (0, 1), value=float("-inf"))
+        logits = self.lm_head(hidden_states)
+        logits[..., self.stop_token_id] = float("-inf")
         mask = self._forced_stop_mask
         # The mask is set only while sampling; prompt-logprob calls have other row counts.
         if mask is not None and mask.shape[0] == logits.shape[0]:
@@ -300,7 +303,8 @@ class CsmTalkerForConditionalGeneration(nn.Module):
 
     def mtp_frame_valid(self, layer0: torch.Tensor) -> torch.Tensor:
         """Rows whose first codebook is a code rather than the stop token."""
-        return (layer0 >= 0) & (layer0 < self.codebook_vocab_size)
+        in_vocab = (layer0 >= 0) & (layer0 < self.codebook_vocab_size)
+        return in_vocab & (layer0 != self.stop_token_id)
 
     def talker_mtp(
         self,

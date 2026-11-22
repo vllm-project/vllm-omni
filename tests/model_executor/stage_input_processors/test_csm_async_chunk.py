@@ -15,7 +15,7 @@ from vllm_omni.model_executor.stage_input_processors.csm import talker2code2wav_
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
 NUM_CODEBOOKS = 32
-STOP_TOKEN = 2051
+STOP_TOKEN = 2050
 
 
 def _manager(**extra) -> SimpleNamespace:
@@ -190,8 +190,13 @@ def test_native_data_plane_sends_each_frame_once_and_nothing_after_the_stop_toke
     plane.register_request(request)
     frames = _frames(8)
     steps = [(_step(frame), int(frame[0])) for frame in frames]
-    # The forced stop step publishes no frame; the two steps after it were already scheduled.
-    steps.append((_step(torch.zeros(NUM_CODEBOOKS, dtype=torch.long), valid=False), STOP_TOKEN))
+    # A request that ends on its own spends two tokens beyond its audio frames: the all-zero
+    # end frame, which is not audio, and the forced stop token, which publishes no frame.
+    end_frame = torch.zeros(NUM_CODEBOOKS, dtype=torch.long)
+    steps.append((_step(end_frame), 0))
+    steps.append((_step(end_frame, valid=False), STOP_TOKEN))
+    assert len(steps) == frames.shape[0] + 2
+    # The two steps after the stop token were already scheduled.
     steps.extend((_step(frame), STOP_TOKEN) for frame in _frames(2, seed=9))
     try:
         for output, token in steps:

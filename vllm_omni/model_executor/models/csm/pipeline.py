@@ -10,6 +10,11 @@ from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, St
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.csm"
 
+# The talker forces this id on the step after a stop frame. It is the
+# checkpoint's codebook_pad_token_id: inside the first-codebook vocabulary
+# (0..2050), which vLLM requires of a stop token id, and never an audio code.
+_CSM_STOP_TOKEN_ID = 2050
+
 CSM_PIPELINE = PipelineConfig(
     model_type="csm",
     default_deploy_config_name="csm.yaml",
@@ -24,8 +29,7 @@ CSM_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             supports_native_mrv2_data_plane=True,
-            # 2051 is the engine-only stop token the talker forces after a stop frame.
-            sampling_constraints={"detokenize": False, "stop_token_ids": [2051]},
+            sampling_constraints={"detokenize": False, "stop_token_ids": [_CSM_STOP_TOKEN_ID]},
             # Each decode step feeds the previous frame's 32 codes, which the token stream does not hold.
             recompute_preemption="fail",
         ),

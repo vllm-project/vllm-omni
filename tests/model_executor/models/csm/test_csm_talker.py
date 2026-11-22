@@ -193,11 +193,10 @@ def test_embeddings_and_first_codebook_head_match_transformers(
         torch.testing.assert_close(
             talker.embed_audio_frames(codes), reference.backbone_model.embed_tokens(codes[:, None, :])[:, 0]
         )
-        logits = talker.compute_logits(hidden)
-        torch.testing.assert_close(logits[:, : reference.config.vocab_size], reference.lm_head(hidden))
-        # The extra column is the engine-only stop token, closed unless forced.
-        assert logits.shape == (5, reference.config.vocab_size + 1)
-        assert torch.isneginf(logits[:, -1]).all()
+        expected = reference.lm_head(hidden)
+        # The padding id is the stop token: closed unless forced.
+        expected[:, talker.stop_token_id] = float("-inf")
+        torch.testing.assert_close(talker.compute_logits(hidden), expected)
 
 
 def test_generate_frame_matches_transformers_greedy(

@@ -34,7 +34,8 @@ stages:
     default_sampling_params:
       temperature: 0.9
       top_k: 50
-      # 125 frames are 10 s of audio, the checkpoint's default limit.
+      # The checkpoint's default limit, at most 10 s: one token is one 80 ms frame, and a
+      # request that ends on its own spends two more on the end frame and the stop token.
       max_tokens: 125
     # Sampling of codebooks 1-31 (depth decoder). Model-wide: requests cannot override it.
     subtalker_sampling_params:
