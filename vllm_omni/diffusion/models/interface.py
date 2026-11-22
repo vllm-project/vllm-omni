@@ -198,6 +198,11 @@ def supports_step_execution(pipeline: object) -> bool:
     )
 
 
+def allows_streaming_step_execution(pipeline: object) -> bool:
+    """Whether streaming alone may opt this pipeline into step execution."""
+    return supports_step_execution(pipeline) and getattr(pipeline, "auto_step_execution_for_streaming", True)
+
+
 # --- Generic role-based component loading for diffusion disaggregation ---------
 
 # Which component groups (as declared by ``SupportsComponentDiscovery``) each

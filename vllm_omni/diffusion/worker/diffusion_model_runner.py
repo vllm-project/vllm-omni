@@ -68,6 +68,7 @@ from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
     SupportsSamplingStep,
     adopt_request_scoped_cache_dit,
+    allows_streaming_step_execution,
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
     supports_step_execution,
@@ -454,7 +455,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         logger.info("Model runner: Model loaded successfully.")
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
-        if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
+        if (
+            self.od_config.streaming_output
+            and not self.od_config.step_execution
+            and allows_streaming_step_execution(self.pipeline)
+        ):
             logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")
             self.od_config.step_execution = True
 

@@ -201,8 +201,16 @@ CFG-sensitive, LoRA, `attention_schedule` (with its source), and
 `attention_sigma_schedule` fields must be compatible, resolved as in the
 request-batch key. FIFO head-of-line blocking also applies here.
 
+SD3 adds its text encoder padding length or the supplied embedding and pooled
+tensor layouts to the step key. With classifier-free guidance, the negative
+condition also participates. SD3 attention uses unmasked text conditioning,
+so requests with distinct layouts advance in separate waves.
+
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.
+Streaming enables step execution automatically on pipelines that permit it.
+SD3 requires explicit `step_execution=True` in both streaming and non-streaming
+configurations.
 
 ### MixFusion (Mixed-Resolution Step Batching)
 
@@ -220,7 +228,7 @@ cost of a pipeline contract the scheduler must not assume generically:
   `diffusion_kv_mode=paged_scheduler` (request-level only). Because
   resolution only leaves the step-batch key under the `StepScheduler`,
   server-level `enable_mixfusion` also enables step execution automatically
-  (same coupling as `streaming_output`).
+  on the pipelines that support MixFusion.
 - The scheduler resolves the capability in `initialize()` and only then
   applies the shape relaxation through `mixfusion.request.relax_step_batch_key`.
   MixFusion policy and packing live under `vllm_omni/diffusion/mixfusion/`.

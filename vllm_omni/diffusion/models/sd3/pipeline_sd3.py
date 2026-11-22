@@ -6,7 +6,7 @@ import inspect
 import json
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, ClassVar
 
 import torch
@@ -35,11 +35,70 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_DEFAULT_MAX_SEQUENCE_LENGTH = 256
+
+
+def _max_sequence_length(sampling: OmniDiffusionSamplingParams) -> int:
+    return sampling.max_sequence_length or _DEFAULT_MAX_SEQUENCE_LENGTH
+
+
+def _conditioning_layout(
+    prompt: OmniPromptType, max_sequence_length: int, prefix: str = ""
+) -> tuple[str | int | tuple[int, ...], ...]:
+    embeds_name = f"{prefix}prompt_embeds"
+    pooled_name = f"{prefix}pooled_prompt_embeds"
+    embeds = DiffusionRequestBatch.get_prompt_field(prompt, embeds_name)
+    if embeds is None:
+        # The two CLIP encoders have a fixed length for this model. Only the
+        # T5 padding length can vary between text requests.
+        return ("text", max_sequence_length)
+
+    pooled = DiffusionRequestBatch.get_prompt_field(prompt, pooled_name)
+    if not isinstance(embeds, torch.Tensor) or embeds.ndim != 2 or not embeds.numel():
+        raise OmniClientError(f"SD3 step execution requires nonempty 2D {embeds_name}.")
+    if not isinstance(pooled, torch.Tensor) or pooled.ndim != 1 or not pooled.numel():
+        raise OmniClientError(f"SD3 step execution requires nonempty 1D {pooled_name} with {embeds_name}.")
+    # The collator adds the leading request dimension. The trailing shapes,
+    # dtypes and devices must agree for the runner to assemble a step wave.
+    return (
+        "embeds",
+        tuple(embeds.shape),
+        tuple(pooled.shape),
+        str(embeds.dtype),
+        str(embeds.device),
+        str(pooled.dtype),
+        str(pooled.device),
+    )
+
+
+def get_sd3_pre_process_func(
+    od_config: OmniDiffusionConfig,
+) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
+    def preprocess(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        if not od_config.step_execution or not request.use_step_execution:
+            return request
+
+        sampling = request.sampling_params
+        max_length = _max_sequence_length(sampling)
+        positive = _conditioning_layout(request.prompt, max_length)
+        negative = (
+            _conditioning_layout(request.prompt, max_length, "negative_")
+            if (sampling.guidance_scale or 1.0) > 1
+            else None
+        )
+        request.batch_compatibility_key = (positive, negative)
+        return request
+
+    return preprocess
 
 
 def get_sd3_image_post_process_func(
@@ -144,6 +203,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
     supports_cfg_batching = True
     supports_request_batch = True
     supports_step_execution = True
+    auto_step_execution_for_streaming = False
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2", "text_encoder_3"]
@@ -399,7 +459,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self,
         prompt: str | list[str] = "",
         num_images_per_prompt: int = 1,
-        max_sequence_length: int = 256,
+        max_sequence_length: int = _DEFAULT_MAX_SEQUENCE_LENGTH,
     ) -> torch.Tensor:
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
@@ -449,7 +509,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         prompt_3: str | list[str],
         prompt_embeds: torch.Tensor | None = None,
         pooled_prompt_embeds: torch.Tensor | None = None,
-        max_sequence_length: int = 256,
+        max_sequence_length: int = _DEFAULT_MAX_SEQUENCE_LENGTH,
         num_images_per_prompt: int = 1,
     ):
         r"""
@@ -671,7 +731,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
         sigmas = common_sampling_params.sigmas
-        max_sequence_length = common_sampling_params.max_sequence_length or 256
+        max_sequence_length = _max_sequence_length(common_sampling_params)
         num_inference_steps = common_sampling_params.num_inference_steps or 28
         num_images_per_prompt = (
             common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
