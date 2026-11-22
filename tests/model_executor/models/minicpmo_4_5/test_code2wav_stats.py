@@ -20,7 +20,7 @@ def test_stats_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     stats = Code2WavSolveStats()
 
     assert stats.enabled is False
-    stats.record("cfm", batch=4, frames=32)
+    stats.record("cfm", batch=4, frames=32, duration=0.1)
     assert stats.summary()["solves"] == 0
     assert stats.summary()["frames"] == {}
 
@@ -31,9 +31,9 @@ def test_stats_count_solve_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert stats.enabled is True
     for _ in range(3):
-        stats.record("cfm", batch=16, frames=32)
-    stats.record("cfm", batch=16, frames=4, ragged=True)
-    stats.record("hift", batch=16, frames=128)
+        stats.record("cfm", batch=16, frames=32, duration=0.1)
+    stats.record("cfm", batch=16, frames=4, duration=0.1, ragged=True)
+    stats.record("hift", batch=16, frames=128, duration=0.1)
 
     summary = stats.summary()
     assert summary["solves"] == 5
@@ -106,7 +106,7 @@ def test_flush_reports_window_and_starts_a_new_one(
 
     with caplog.at_level(logging.INFO):
         for _ in range(4):
-            stats.record("cfm", batch=8, frames=32)
+            stats.record("cfm", batch=8, frames=32, duration=0.1)
 
     assert "duty=" in caplog.text
     assert "cfm(n=4 frames={32:4}" in caplog.text
@@ -118,7 +118,7 @@ def test_flush_reports_window_and_starts_a_new_one(
     # The next window counts from zero again but keeps the running total.
     with caplog.at_level(logging.INFO):
         for _ in range(4):
-            stats.record("cfm", batch=8, frames=4)
+            stats.record("cfm", batch=8, frames=4, duration=0.1)
 
     assert stats.summary()["solves"] == 8
     assert "frames={4:4}" in caplog.text

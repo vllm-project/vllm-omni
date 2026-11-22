@@ -69,34 +69,22 @@ class Code2WavSolveStats:
     def enabled(self) -> bool:
         return self._enabled
 
-    def record(
-        self, kind: str, *, batch: int, frames: int, ragged: bool = False, duration: float | None = None
-    ) -> None:
+    def record(self, kind: str, *, batch: int, frames: int, duration: float, ragged: bool = False) -> None:
         """Count one solve of ``kind`` covering ``frames`` frames per row.
 
         ``duration`` is the solve's measured wall time (start/stop around the
-        CFM/HiFT call). It is what makes ``duty`` a real occupancy figure:
-        accumulating the inter-record gaps instead telescopes every solve
-        into the next one, so ``busy`` always equals ``wall`` and duty reads
-        a flat 100% however idle stage 2 is. Without a duration the gap is
-        the only signal available and the old, overstated behaviour applies.
+        CFM/HiFT call), excluding idle time between solves.
         """
         if not self._enabled:
             return
         now = self._clock()
-        if self._last_ts is not None:
-            if duration is not None:
-                self._window_busy += duration
-            else:
-                self._window_busy += now - self._last_ts
-        else:
+        if self._window_start is None:
             # Anchor the window at the *start* of the first solve: its
             # duration is already counted in busy, so anchoring at its end
             # would report busy > wall (duty above 100%) for back-to-back
             # solves.
-            self._window_start = now - (duration if duration is not None else 0.0)
-            if duration is not None:
-                self._window_busy += duration
+            self._window_start = now - duration
+        self._window_busy += duration
         self._last_ts = now
         self._solves += 1
         self._frames[(kind, int(frames))] += 1
