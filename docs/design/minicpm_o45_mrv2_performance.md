@@ -1,10 +1,12 @@
 # MiniCPM-o 4.5 MRv2 profiles
 
-The default `minicpmo_4_5.yaml` selects MRv2 for all three CUDA stages
-and FlashAttention for the Talker. All three duplex stages keep
-`async_chunk: true`. CUDA turn serving sends the completed Thinker payload
-to the Talker. Turn profiles inherit Thinker ngram speculation and disabled
-prefix caching. Both V1 and MRv2 can restore cached Thinker outputs when an
+The default `minicpmo_4_5.yaml` selects MRv2 for all three stages on CUDA,
+ROCm and NPU. CUDA additionally selects FlashAttention for the Talker. All
+three duplex stages keep `async_chunk: true`. CUDA turn serving sends the
+completed Thinker payload to the Talker. Turn profiles inherit Thinker ngram
+speculation and disabled prefix caching. XPU and MUSA retain the deferred V1
+default and are rejected by vLLM 0.34 rather than being implicitly qualified
+for V2. Both V1 and MRv2 can restore cached Thinker outputs when an
 overlay disables speculation and enables caching. MRv2 restores `latent`,
 `latent_input_ids` and `latent_positions` together. Duplex profiles keep
 caching disabled for their mutable KV window.
@@ -61,11 +63,12 @@ The CUDA duplex profile uses MRv2 on all three stages.
 
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
-matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA also
-requires TF32 to be allowed; NPU fusion is independent of TF32. Set
+matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA
+FP32 fusion requires TF32 to be allowed. With `token2wav_float16: true` or
+`cfm_float16: true`, CUDA fusion is independent of TF32, as is NPU fusion. Set
 `cfm_fused_body: false` in the stage connector extra to restore the original
 body. On CUDA, disabling `token2wav_allow_tf32` or setting
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body` setting takes precedence. Startup precapture includes query
 buckets for final chunks with encoder lookahead, after steady-state buckets
 and within `cfm_max_graphs`. Capture logs report host warmup and capture times.
@@ -82,14 +85,16 @@ apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
 
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
-allowed) and on NPU. NVIDIA SM80+ uses tiled TF32 attention; older CUDA devices
-use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
+allowed or FP16 CFM is selected) and on NPU. NVIDIA SM80+ uses the existing
+tiled attention kernel for both FP32 and FP16 Q/K/V, including the non-pooled
+CFM arena. FP32 uses TF32 dots; FP16 uses FP16 dots with FP32 accumulation.
+Older CUDA devices use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts and cache types
 retain the original body. CUDA supports matching FP32 or FP16 estimator/cache
 types; NPU supports FP32. Other platforms retain their existing default.
 Set `cfm_fused_body: false` in connector `extra` to restore the original body.
 On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body: true` overrides that choice and may use TF32 attention.
 Slot pooling and its `cfm_row_offset_merge` option remain opt-in. Fusion changes
 floating-point rounding and does not promise identical waveforms.
@@ -159,8 +164,9 @@ vLLM 0.33 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
 layers require the Thinker on MRv2; the V1 Thinker rejects them at load.
 Validation covers CUDA turn sessions with greedy text and speech output.
-Duplex sessions keep their own sampler and are not covered, and platforms
-whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
+Duplex sessions keep their own sampler and are not covered. NPU and ROCm use
+MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
+the deferred V1 default and cannot run it with vLLM 0.34.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
 The default single-card and two-card Ascend profiles use synchronous MRv2
@@ -298,9 +304,12 @@ or reference normalization policy.
 
 ## Full-duplex MRv2
 
-`minicpmo_4_5.yaml` selects MRv2 for the CUDA Thinker, Talker and Code2Wav.
-The Thinker has no async producer, so the orchestrator hands each finished
-segment to `llm2tts`.
+`minicpmo_4_5.yaml` selects MRv2 for the Thinker, Talker and Code2Wav on CUDA,
+ROCm and NPU. ROCm keeps the shared duplex topology, async chunks, devices and
+connector contract; it does not inherit the CUDA-only attention, speculation,
+graph or fused-kernel settings. This runner selection alone does not establish
+ROCm performance or quality qualification. The Thinker has no async producer,
+so the orchestrator hands each finished segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
 prefix until capacity; sliding recompute rebuilds the previous condition,
 confirmed codec ids and current condition) and keeps the 16-frame codec
@@ -418,6 +427,32 @@ transpose per body, instead of a per-block gather/transpose/copy or a per-block
 Triton kernel. The whole-block CNN cache is transposed to frames-major once per
 body rather than per block. CUDA and the unfused DiT body are unaffected.
 
+## NPU packed QKV normalization and cache writes
+
+The NPU fused CFM body reuses `qkv_head_layer_norm` for FP32 packed QKV with
+standard per-head LayerNorm. One Triton kernel reads the packed projection,
+normalizes Q/K in FP32 and writes Q plus the current K/V frames directly into
+the existing split cache. LayerNorm epsilon and affine parameters are retained;
+NPU launch disables implicit floating-point multiply/add contraction. Reduction
+rounding can differ from ACLNN, so this does not promise bitwise-identical audio.
+Unsupported types, partial affine parameters, indexed slot writes and environments
+without Triton retain the native operator path. CUDA launch behavior is unchanged.
+History copies, masked cache-gap clearing, attention masks and attention itself
+retain their existing semantics.
+
+Eligible NPU inputs automatically use the shared fused kernel; unsupported
+inputs use its native fallback. No deployment switch is required.
+
+Migration: the former stage-2 `additional_config.code2wav_fused_qkv_norm`
+key has been removed. A leftover value, including `false`, is ignored and
+does not disable fusion after restart. Remove this key from deployment and
+overlay YAML files. The NPU stage reader emits a one-time warning when it
+encounters the stale key; eligible FP32 inputs still automatically use fusion,
+and unsupported inputs retain the native fallback.
+
+NPU compilation, graph replay, numerical parity and service performance must be
+validated on the target stack; implementation alone does not establish a speedup.
+
 ## Reference prefetch at higher concurrency
 
 `token2wav_ref_prefetch_max_waiters` (connector extra, default `1`, minimum `1`)
@@ -441,9 +476,25 @@ uses this speaker. If `tensorrt` cannot be imported, startup logs a warning and
 keeps the Torch speaker, so CI images without TensorRT still load this profile.
 Set the flag to `false` in an overlay to keep Torch even when TensorRT is
 installed. Other platforms ignore the flag. An
-explicit `token2wav_trt: true`,
-`MINICPMO_TOKEN2WAV_TRT=1`, or `token2wav_device_spk: false` keeps the full
+explicit `token2wav_trt: true` or `token2wav_device_spk: false` keeps the full
 DiT TensorRT path or the CPU onnxruntime fallback and drops this flag.
+
+Full DiT TensorRT is configured with connector `extra` keys. Each key, when
+set, wins over its deprecated environment variable, including an explicit
+`token2wav_trt: false`. The environment variable applies only while its key is
+unset or `null`, and logs a one-time deprecation warning. Because TensorRT is
+CUDA-only, the environment variables are read only on CUDA, and the dtype and
+cache variables only when full DiT TensorRT is enabled.
+
+| Key | Values | Deprecated environment variable |
+| --- | --- | --- |
+| `token2wav_trt` | boolean, default `false` | `MINICPMO_TOKEN2WAV_TRT=1` |
+| `token2wav_trt_dtype` | `fp16` (default), `float16`, `fp32`, `float32` | `MINICPMO_TOKEN2WAV_TRT_DTYPE` |
+| `token2wav_trt_cache_dir` | path, default `$HF_HOME/vllm_omni/token2wav_trt` | `MINICPMO_TOKEN2WAV_TRT_CACHE` |
+
+Any other `token2wav_trt_dtype` fails at startup on every platform instead of
+silently selecting fp16. An invalid `MINICPMO_TOKEN2WAV_TRT_DTYPE` fails when
+it is used.
 The CAM++ TensorRT profile accepts 4 to 3000 fbank frames. The default 6 s
 window is 598 frames and stays on this path. A wider
 `ref_audio_max_seconds` is checked before the engine is installed: 31 s

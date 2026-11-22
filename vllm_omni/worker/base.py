@@ -103,6 +103,8 @@ class OmniGPUWorkerBase(GPUWorker):
     for custom trace naming, background gzip, and trace path collection.
     """
 
+    use_v2_model_runner = True
+
     def _capture_auxiliary_graphs(self) -> None:
         """Let opt-in models warm valid inputs before the worker becomes ready."""
         capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
@@ -423,7 +425,7 @@ class OmniGPUWorkerBase(GPUWorker):
             return
         total = self.init_snapshot.total_memory
         free = self.init_snapshot.free_memory
-        current_util = self.cache_config.gpu_memory_utilization
+        current_util = self.cache_config.resolved_gpu_memory_utilization
         # Round up so the suggested value restores at least the reserved amount.
         # (0.8 + 0.1) * 10_000 is 9000.000000000002 in floating point, hence the inner round.
         scaled = round((current_util + cudagraph_memory_estimate / total) * 10_000, 6)
@@ -489,7 +491,11 @@ class OmniGPUWorkerBase(GPUWorker):
         gc.collect()
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
+        # V2 keeps block-table pointers and captured inputs in these pools;
+        # waking their allocations does not recreate discarded contents.
+        offload_tags: tuple[str, ...] = ("runtime", "cudagraph")
+        if level == 1:
+            offload_tags = ("weights", *offload_tags)
         allocator = get_mem_allocator_instance()
         if level == 2:
             self._sleep_saved_tensors = _save_non_parameter_tensors(self._sleep_models(), allocator)

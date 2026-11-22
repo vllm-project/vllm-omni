@@ -630,6 +630,7 @@ class DiffusionWorker:
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
+                hsdp_data_parallel=getattr(parallel_config, "hsdp_data_parallel", False),
             )
             _setup_diffusion_worker_proc_title_and_log_prefix(
                 enable_ep=parallel_config.enable_expert_parallel,
@@ -892,6 +893,12 @@ class DiffusionWorker:
         return _run_and_gather_rank_values(
             "MixFusion capability discovery", lambda: inspect_mixfusion_capability(pipeline)
         )
+
+    def run_helios_vae_warmup(self) -> None:
+        """Run the optional, model-owned warmup once startup dummy work completes."""
+        if self.model_runner is None:
+            raise RuntimeError("Model runner must be initialized before Helios VAE warmup")
+        self.model_runner.run_helios_vae_warmup()
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""
@@ -1201,12 +1208,11 @@ class DiffusionWorker:
     ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
         """Execute a forward pass by delegating to the model runner.
 
-        If *req* is a list (DP multi-concurrency), each rank picks one complete
-        NewRequestData envelope based on its distributed rank. AllGather in
-        the layerwise offload only gathers weight shards (request-independent),
-        so all ranks stay synchronised at each AllGather call while computing
-        different activations. Selecting the envelope keeps Scheduler-issued
-        KV metadata bound to the request that owns its block tables.
+        If *req* is a list (rank-local DP concurrency), each rank picks one
+        complete NewRequestData envelope based on its distributed rank. Weight
+        collectives are request-independent, so ranks can compute different
+        activations while remaining synchronized. Selecting the envelope keeps
+        Scheduler-issued KV metadata bound to its owning request.
 
         Each rank returns its OWN DiffusionOutput (no gather). The executor
         collects N responses via the per-worker result queues.
@@ -2345,10 +2351,17 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
         *,
         sharing_registry: ConsumerWorkerRegistry | None = None,
+        parent_pid: int | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
         if sharing_registry is not None and not sharing_registry.register(rank):
             return  # Parent sealed the sharing group before this worker started.
+
+        # Register first, then catch a parent that exited before registration.
+        set_death_signal(signal.SIGKILL)
+        if sys.platform == "linux" and parent_pid is not None and os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+
         from vllm_omni.plugins import load_omni_general_plugins
 
         # Spawned workers do not inherit the API server's logging setup.
@@ -2367,13 +2380,6 @@ class WorkerProc:
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
-
-        # Normal executor shutdown still reaches the handlers above and cleans
-        # up gracefully. If the API-server parent is already gone, however, no
-        # manager remains to escalate a worker that stalls during cleanup. Use
-        # a hard parent-death signal so an abrupt parent exit cannot orphan a
-        # GPU-owning diffusion worker.
-        set_death_signal(signal.SIGKILL)
 
         _setup_diffusion_worker_proc_title_and_log_prefix(
             enable_ep=od_config.parallel_config.enable_expert_parallel,

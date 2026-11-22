@@ -11,6 +11,7 @@ Covers:
 import asyncio
 import contextlib
 import queue
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -464,6 +465,9 @@ class TestPipelineStreamingOutputToEntrypoint:
         omni._paused = False
         omni.request_states = {}
         omni.final_output_task = None
+        omni._output_loop = None
+        omni._output_loop_lock = threading.Lock()
+        omni._frontend_shutting_down = False
         omni.event_resolver = AsyncEventResolver()
         omni._enable_ar_profiler = False
         omni.prom_metrics = MagicMock()
@@ -552,7 +556,11 @@ class TestSupportedPipelines:
             streaming_output=True,
             step_execution=False,
             model_class_name="NoStepPipeline",
-            parallel_config=SimpleNamespace(use_hsdp=False),
+            enable_prompt_embed_cache=False,
+            prompt_embed_cache_size=32,
+            diffusion_use_graph=False,
+            parallel_config=SimpleNamespace(use_hsdp=False, data_parallel_size=1),
+            diffusion_attention_schedule=None,
         )
         runner.device = torch.device("cpu")
         runner.pipeline = None
