@@ -43,6 +43,7 @@ class _NativeRequestState:
     sampling_params: Any = None
     num_computed_tokens: int = 0
     resumable: bool = False
+    segment_generation: int | None = None
     output_token_ids: list[int] = field(default_factory=list)
     finished: bool = False
     output_stopped: bool = False
@@ -360,11 +361,12 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_id = str(request_data.req_id)
         external_req_id = str(getattr(request_data, "external_req_id", None) or req_id)
         with self._native_output_lock:
-            # Preemption retains history and output holds; a fresh resumable
-            # segment instead replaces the prompt after scheduler commits.
-            if req_id in self._native_requests and (
-                not bool(getattr(request_data, "resumable", False))
-                or int(getattr(request_data, "num_computed_tokens", 0) or 0) > 0
+            segment_generation = getattr(request_data, "segment_generation", None)
+            previous = self._native_requests.get(req_id)
+            # Computed tokens may be nonzero for both an append and preemption.
+            # Only a new segment identity replaces the prompt/metadata ledger.
+            if previous is not None and (
+                not bool(getattr(request_data, "resumable", False)) or segment_generation == previous.segment_generation
             ):
                 return
             if (
@@ -385,6 +387,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 sampling_params=getattr(request_data, "sampling_params", None),
                 num_computed_tokens=int(getattr(request_data, "num_computed_tokens", 0) or 0),
                 resumable=bool(getattr(request_data, "resumable", False)),
+                segment_generation=segment_generation,
             )
 
     def commit_resumable_outputs(self, commits: list[OmniChunkCommit]) -> None:

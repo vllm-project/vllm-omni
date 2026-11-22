@@ -1362,6 +1362,7 @@ def test_native_request_preserves_streaming_flag_and_reference_audio(plane, fact
         request_id="internal",
         external_req_id="voice",
         resumable=True,
+        _omni_segment_generation=7,
         model_intermediate_buffer={"codes": {"ref": [0.1, -0.1]}, "meta": {"ref_audio_sr": 16000}},
     )
     data = (
@@ -1372,6 +1373,7 @@ def test_native_request_preserves_streaming_flag_and_reference_audio(plane, fact
     plane.register_request(data)
     state = plane._native_requests["internal"]
     assert state.resumable is True
+    assert data.segment_generation == state.segment_generation == 7
     state.accept_tokens([6561])
     snapshot = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
     payload = tts2code2wav_async_chunk(
@@ -1514,26 +1516,39 @@ def test_native_perf_tags_survive_deferred_cohort_wire_and_shared_payload(raw_pl
         assert shared == {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": 7, "duplex_epoch": 3}}
 
 
-@pytest.mark.parametrize("resumable,num_computed_tokens", [(False, 0), (False, 3), (True, 3), (True, 0)])
-def test_reregister_preserves_preemption_but_replaces_resumable_segment(plane, resumable, num_computed_tokens):
+@pytest.mark.parametrize("resumable", [False, True])
+@pytest.mark.parametrize("num_computed_tokens", [0, 3])
+@pytest.mark.parametrize("new_segment", [False, True])
+def test_reregister_preserves_preemption_but_replaces_resumable_segment(
+    plane, resumable, num_computed_tokens, new_segment
+):
     plane._native_resumable = True
     initial = _new_request()
     initial.resumable = resumable
+    initial.segment_generation = 0
     plane.register_request(initial)
     previous = plane._native_requests["internal"]
     previous.output_token_ids = [21]
     plane.reserve_outputs(["internal"])
+    pending = plane._uncommitted_payloads.get("internal")
     replacement = _new_request()
     replacement.resumable = resumable
+    replacement.segment_generation = int(new_segment)
     replacement.prompt_token_ids = [71, 72]
+    replacement.additional_information = {"new_segment": True}
+    replacement.model_intermediate_buffer = {"embed": "new"}
     replacement.num_computed_tokens = num_computed_tokens
     plane.register_request(replacement)
     current = plane._native_requests["internal"]
-    if resumable and num_computed_tokens == 0:
+    if resumable and new_segment:
         assert current is not previous
         assert current.prompt_token_ids == [71, 72]
+        assert current.additional_information == {"new_segment": True}
+        assert current.model_intermediate_buffer == {"embed": "new"}
+        assert current.num_computed_tokens == num_computed_tokens
         assert current.output_token_ids == []
     else:
         assert current is previous
         assert current.output_token_ids == [21]
     assert plane._native_outputs_in_flight["internal"] == 1
+    assert plane._uncommitted_payloads.get("internal") is pending

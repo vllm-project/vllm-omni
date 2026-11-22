@@ -32,6 +32,7 @@ class OmniNewRequestData(NewRequestData):
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
     resumable: bool = False
+    segment_generation: int | None = None
 
     @classmethod
     def from_base(
@@ -47,6 +48,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            segment_generation=getattr(request, "_omni_segment_generation", None),
         )
 
     @classmethod
@@ -82,6 +84,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            segment_generation=getattr(request, "_omni_segment_generation", None),
         )
 
 

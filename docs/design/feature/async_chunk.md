@@ -347,3 +347,9 @@ speculative sampling width. Native generation scheduler outputs carry segment
 completion separately from input termination: Code2Wav parks an open resumable
 session after a payload-bearing or marker-only segment, and releases it only
 after true request termination.
+
+MRv2 request admission carries the scheduler's resumable segment generation to
+the native data plane. Re-admitting the same generation preserves the live
+ledger and output holds after preemption. A new generation refreshes prompt IDs
+and metadata even when computed tokens are nonzero, without releasing pending
+output reservations or replacing the uncommitted payload queue.
