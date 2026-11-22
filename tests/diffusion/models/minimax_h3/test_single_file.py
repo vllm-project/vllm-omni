@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import glob
 import json
 from fnmatch import fnmatch
 from types import SimpleNamespace
@@ -18,7 +17,6 @@ from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
-    _add_safetensors_source,
     build_checkpoint_binding_plan,
     build_checkpoint_mmap_plan,
 )
@@ -244,8 +242,23 @@ def test_single_file_disaggregated_decoder_uses_base_components(tmp_path, monkey
         (None, False, "default", "42ed227ee7df40d41602854ae760620d6eb651fe"),
     ],
 )
+# Glob metacharacters in the directory or the filename must not hide the file.
+@pytest.mark.parametrize(
+    ("folders", "filename"),
+    [
+        (["H3[beta]"], "hybrid[beta5].safetensors"),
+        (["H3[a][b]"], "x[1][2].safetensors"),
+        (["a[1]", "b[2]"], "m[3].safetensors"),
+        (["H3[[beta]]"], "m[[x]].safetensors"),
+        (["H3[beta", "x]y"], "m]x[.safetensors"),
+        (["H3[a-z]"], "m[0-9].safetensors"),
+        (["H3[!x]"], "m[!y].safetensors"),
+        (["H3*star?"], "m*?.safetensors"),
+        (["H3 [test]"], "model [b].safetensors"),
+    ],
+)
 def test_pipeline_loads_selected_file_for_each_task(
-    tmp_path, checkpoint_tensors, monkeypatch, task, as_symlink, base_source, expected_revision
+    tmp_path, checkpoint_tensors, monkeypatch, task, as_symlink, base_source, expected_revision, folders, filename
 ):
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
     monkeypatch.setattr(blocks, "Attention", _FakeAttention)
@@ -278,10 +291,9 @@ def test_pipeline_loads_selected_file_for_each_task(
     monkeypatch.setattr(pipeline_module, "download_weights_from_hf_specific", download_base)
     checkpoint_tensors["adaln_t_table"] = torch.tensor([[0, 4], [2, 8], [10, -4]], dtype=torch.bfloat16)
     checkpoint_tensors["blocks.0.attn.qkv_proj.weight"] = torch.arange(192).reshape(24, 8).to(torch.bfloat16)
-    # Glob metacharacters in both the directory and the filename must not hide the file.
-    checkpoint_dir = tmp_path / "H3[beta]"
-    checkpoint_dir.mkdir()
-    path = checkpoint_dir / "hybrid[beta5].safetensors"
+    checkpoint_dir = tmp_path.joinpath(*folders)
+    checkpoint_dir.mkdir(parents=True)
+    path = checkpoint_dir / filename
     save_file(checkpoint_tensors, path)
     if as_symlink:
         blob = tmp_path / "blobs" / "blob_without_extension"
@@ -413,36 +425,3 @@ def test_single_file_base_download_excludes_dense_dits(monkeypatch, tmp_path, pa
 )
 def test_base_source_pins_only_the_default_repository(args, expected):
     assert resolve_minimax_h3_base_source(args) == expected
-
-
-@pytest.mark.parametrize(
-    ("folders", "name"),
-    [
-        (["H3[a][b][c]"], "x[1][2][3].safetensors"),
-        (["a[1]", "b[2]", "c[3]"], "m[4].safetensors"),
-        (["H3[[beta]]"], "m[[x]].safetensors"),
-        (["H3[beta", "x]y"], "m]x[.safetensors"),
-        (["H3[a-z]"], "m[0-9].safetensors"),
-        (["H3[!x]"], "m[!y].safetensors"),
-        (["H3*star?"], "m*?.safetensors"),
-        (["H3 [test]"], "model [b].safetensors"),
-    ],
-    ids=["repeated", "nested-dirs", "doubled", "unbalanced", "range", "negated", "star-question", "spaces"],
-)
-def test_special_characters_in_path(tmp_path, folders, name):
-    # Every file lives under pytest's per-test tmp_path, which pytest cleans up.
-    folder = tmp_path.joinpath(*folders)
-    folder.mkdir(parents=True)
-    target = str(folder / name)
-    save_file({"weight": torch.zeros(1)}, target)
-    save_file({"decoy": torch.zeros(1)}, folder / "decoy.safetensors")
-    patterns = [glob.escape(name)]
-
-    loader = object.__new__(DiffusersPipelineLoader)
-    loader.load_config = LoadConfig()
-    _, files, use_safetensors = loader._prepare_weights(str(folder), None, None, False, patterns)
-    assert files == [target] and use_safetensors
-
-    bindings: dict[str, tuple[str, str]] = {}
-    _add_safetensors_source(str(folder), "transformer.", None, bindings, allow_patterns=patterns)
-    assert bindings == {"transformer.weight": ("weight", target)}
