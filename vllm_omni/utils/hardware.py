@@ -119,11 +119,9 @@ def _from_torch() -> list[Device]:
     if torch.cuda.is_available():
         kind = "rocm" if getattr(torch.version, "hip", None) else "cuda"
         devices = []
-        for index in range(torch.cuda.device_count()):
+        for index in range(torch.accelerator.device_count()):
             properties = torch.cuda.get_device_properties(index)
-            devices.append(
-                Device(kind=kind, name=properties.name, total_mib=properties.total_memory // (1024 * 1024))
-            )
+            devices.append(Device(kind=kind, name=properties.name, total_mib=properties.total_memory // (1024 * 1024)))
         return devices
 
     for kind, probe in (
