@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -323,6 +324,11 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        # CUMULATIVE requests (each output holds all audio so far per sample) and
+        # the audio frames each already reported in earlier per-segment events.
+        self._cumulative_output_requests: set[str] = set()
+        self._cumulative_audio_frames_by_sample: dict[str, dict[int, int]] = {}
+        self._reported_audio_frames_by_request: dict[str, int] = {}
         # Run requests' stage payloads that came back on the stage output instead of a connector.
         self._stage_payloads: dict[str, bytes] = {}
         # Tracks which requests should apply watermarking
@@ -894,6 +900,9 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        self._cumulative_output_requests.discard(str(request_id))
+        self._cumulative_audio_frames_by_sample.pop(str(request_id), None)
+        self._reported_audio_frames_by_request.pop(str(request_id), None)
         self._stage_payloads.pop(str(request_id), None)
 
     def get_payload_sender_info(self, request_id: str) -> PayloadSenderInfo | None:
@@ -1218,7 +1227,22 @@ class StagePool:
         current_audio_frames, current_audio_sample_rate, _ = self._collect_audio_metrics(request_outputs)
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
-        audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        if request_id and request_id in self._cumulative_output_requests:
+            cumulative_total = accumulated_audio_frames
+            for ro in request_outputs:
+                cumulative_total = max(cumulative_total, self._record_cumulative_audio_frames(request_id, ro))
+            audio_generated_frames = max(cumulative_total, current_audio_frames)
+            # Both counts are the request's whole audio so far; this event
+            # reports only what came after the request's previous event.
+            reported_audio_frames = self._reported_audio_frames_by_request.get(request_id, 0)
+            if audio_generated_frames > reported_audio_frames:
+                self._reported_audio_frames_by_request[request_id] = audio_generated_frames
+            audio_generated_frames = max(audio_generated_frames - reported_audio_frames, 0)
+        else:
+            audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        if output_unit_type == "audio" and (current_audio_frames > 0 or accumulated_audio_frames > 0):
+            # An audio event's units are the frames it reports, not the audio of its output.
+            output_unit_count = audio_generated_frames
         audio_sample_rate = accumulated_audio_sample_rate or current_audio_sample_rate
         audio_duration_s = (
             float(audio_generated_frames) / float(audio_sample_rate)
@@ -1430,10 +1454,10 @@ class StagePool:
         if final_output_type == "text":
             return any(bool(getattr(output, "text", "")) for output in iter_request_output_items(request_output))
 
-        if getattr(request_output, "images", None):
-            return True
-        if getattr(request_output, "video", None) or getattr(request_output, "videos", None):
-            return True
+        # Payloads may be arrays or tensors, whose truth value is ambiguous.
+        for name in ("images", "video", "videos"):
+            if self._is_non_empty_value(getattr(request_output, name, None)):
+                return True
         if getattr(request_output, "trajectory_latents", None) is not None:
             return True
         custom_output = getattr(request_output, "_custom_output", None)
@@ -1511,9 +1535,43 @@ class StagePool:
                 use_default_sample_rate=False,
             )
             if audio_frames > 0:
-                self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
+                if rid in self._cumulative_output_requests:
+                    # A CUMULATIVE output already holds each included sample's
+                    # audio so far; track per completion index so parallel
+                    # samples (n > 1) under one parent id do not overwrite each other.
+                    self._audio_frames_by_request[rid] = self._record_cumulative_audio_frames(rid, request_output)
+                else:
+                    self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
+
+    def _record_cumulative_audio_frames(self, rid: str, request_output: Any) -> int:
+        """Track CUMULATIVE audio frames per completion index and return the request total."""
+        by_sample = self._cumulative_audio_frames_by_sample.setdefault(rid, {})
+        outer_mm = getattr(request_output, "multimodal_output", None)
+        if isinstance(outer_mm, Mapping) and outer_mm:
+            outer_frames = count_audio_frames(outer_mm)
+            if outer_frames > 0:
+                by_sample[-1] = max(by_sample.get(-1, 0), outer_frames)
+        for idx, output in enumerate(iter_request_output_items(request_output)):
+            inner_mm = getattr(output, "multimodal_output", None)
+            if isinstance(inner_mm, Mapping) and inner_mm:
+                inner_frames = count_audio_frames(inner_mm)
+                if inner_frames > 0:
+                    sample_index = getattr(output, "index", None)
+                    key = sample_index if isinstance(sample_index, int) else idx
+                    by_sample[key] = max(by_sample.get(key, 0), inner_frames)
+        return sum(by_sample.values())
+
+    def _note_output_kind(self, request_id: str, request: Any) -> None:
+        """Remember whether *request*'s outputs are CUMULATIVE (for audio frame counts)."""
+        rid = str(request_id)
+        sampling_params = getattr(request, "sampling_params", None)
+        if getattr(sampling_params, "output_kind", None) == RequestOutputKind.CUMULATIVE:
+            self._cumulative_output_requests.add(rid)
+        else:
+            self._cumulative_output_requests.discard(rid)
+            self._cumulative_audio_frames_by_sample.pop(rid, None)
 
     def will_watermark(self, params: OmniSamplingParams | PoolingParams) -> bool:
         """Whether this stage watermarks the outputs of a request with these params."""
@@ -1672,6 +1730,7 @@ class StagePool:
                 for added_request_id in added:
                     rollback(added_request_id)
             raise
+        self._note_output_kind(request_id, request)
 
         try:
             for engine_request in engine_requests:
@@ -1748,6 +1807,7 @@ class StagePool:
                 )
             await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
         else:
+            self._note_output_kind(request_id, request)
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
             # prompt/token metadata.
