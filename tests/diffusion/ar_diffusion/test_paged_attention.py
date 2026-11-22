@@ -1046,20 +1046,50 @@ def test_history_staging_holds_a_ragged_window_and_restages_it_whole(monkeypatch
         st.commit_paged_context(POS)
 
 
-@pytest.mark.parametrize("commit_current", [False, True])
 @pytest.mark.cpu
-def test_action_tokens_after_a_partly_written_video_block_are_refused(commit_current):
-    """Action K/V follows the video blocks in the table, and the kernel reads it as one run.
+@pytest.mark.parametrize("frame_tokens", [24, 394, 924])
+@pytest.mark.parametrize("commit_current", [False, True])
+def test_partial_video_pages_with_text_match_dense(frame_tokens, commit_current):
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
 
-    A 24-token chunk from an empty history ends 8 slots into its second 16-token
-    block, so the run would read those 8 unwritten slots as the first action
-    tokens and never reach the last ones. Every shape stays right, which is why
-    this is refused rather than computed.
-    """
-    _, st = make_state(window_chunks=2, chunk_size=RAGGED_CHUNK)
-    ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=commit_current)[0].forward_ctx
-    with pytest.raises(ValueError, match="partly written video block"):
-        ctx.build_block_table(action_len=3, query_len=RAGGED_CHUNK + 3, device=torch.device("cpu"))
+    torch.manual_seed(7)
+    kv, st = make_state(chunk_size=frame_tokens, window_chunks=8)
+    try:
+        history_k, history_v = _commit_video_span(
+            kv,
+            st,
+            kv_branch=POS,
+            n_chunks=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            chunk_size=frame_tokens,
+        )
+        count = 2 * frame_tokens
+        ctx = st.get_kv_caches(
+            POS,
+            seq_len=count,
+            commit_current=commit_current,
+            extra_visible_tokens=frame_tokens,
+        )[0].forward_ctx
+        ctx.prepare(torch.device("cpu"), action_len=13, query_len=count)
+        q, k, v = [torch.randn(count, N_HEADS, HEAD_DIM) for _ in range(3)]
+        kt, vt = [torch.randn(13, N_HEADS, HEAD_DIM) for _ in range(2)]
+        inputs = ctx.layer_inputs(0)
+        actual = paged_write_attn(inputs, q, k, v, kt, vt, HEAD_DIM**-0.5)
+        keys = torch.cat([history_k.flatten(0, 1), k, kt]).unsqueeze(0)
+        values = torch.cat([history_v.flatten(0, 1), v, vt]).unsqueeze(0)
+        expected = _dense_attention(q.unsqueeze(0), keys, values)[0]
+        torch.testing.assert_close(actual, expected)
+        st.commit_paged_context(POS)
+        if commit_current:
+            table = kv.block_table(st.adapter(POS))
+            from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
+
+            slots = compute_slot_mapping(table, torch.arange(3 * frame_tokens), BLOCK)
+            torch.testing.assert_close(kv._k_pools[0][slots], torch.cat([history_k.flatten(0, 1), k]))
+            torch.testing.assert_close(kv._v_pools[0][slots], torch.cat([history_v.flatten(0, 1), v]))
+    finally:
+        st.close()
 
 
 @pytest.mark.cpu

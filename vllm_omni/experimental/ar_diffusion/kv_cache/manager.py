@@ -194,6 +194,8 @@ def estimate_ar_diffusion_kv_cache_memory(
     if spec.max_scratch_frames_per_branch is not None:
         scratch_frames = spec.max_scratch_frames_per_branch
     extra_scratch_blocks = -(-spec.max_scratch_tokens_per_branch // block_size)
+    if spec.tokens_per_frame % block_size and spec.max_scratch_tokens_per_branch:
+        extra_scratch_blocks = -(-(block_size - 1 + spec.max_scratch_tokens_per_branch) // block_size)
     scratch_blocks_per_local_branch = max(
         scratch_frames * blocks_per_frame + extra_scratch_blocks,
         scratch_blocks_override,
