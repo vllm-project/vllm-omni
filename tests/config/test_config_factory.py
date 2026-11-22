@@ -775,7 +775,7 @@ class TestModelIndexDiscovery:
             config = StageConfigFactory.create_from_model(
                 str(tmp_path),
                 trust_remote_code=False,
-                cli_overrides={"parallel_config": DiffusionParallelConfig(tensor_parallel_size=tp_size)},
+                cli_overrides={"tensor_parallel_size": tp_size},
                 deploy_config_path=None,
             )
             explicit_pipeline = StageConfigFactory.get_pipeline_config(
