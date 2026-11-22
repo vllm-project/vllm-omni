@@ -30,6 +30,12 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
+from vllm_omni.diffusion.models.sd3.step_state import (
+    export_step_state,
+    restore_step_state,
+    step_execution_profile,
+    step_request_from_snapshot,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -905,6 +911,29 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         return self._decode_latents(state.latents, state.sampling.output_type or "pil")
+
+    def export_step_state(self, state: StepRequestState, *, policy_ref: str, max_bytes: int) -> bytes:
+        return export_step_state(
+            state,
+            policy_ref=policy_ref,
+            max_bytes=max_bytes,
+            execution_profile=step_execution_profile(self.od_config, self.device),
+        )
+
+    def restore_step_state(self, payload: bytes, *, policy_ref: str, max_bytes: int) -> StepRequestState:
+        return restore_step_state(
+            payload,
+            policy_ref=policy_ref,
+            device=self.device,
+            max_bytes=max_bytes,
+            execution_profile=step_execution_profile(self.od_config, self.device),
+        )
+
+    @staticmethod
+    def step_request_from_snapshot(
+        payload: bytes | memoryview, *, policy_ref: str, max_bytes: int
+    ) -> OmniDiffusionRequest:
+        return step_request_from_snapshot(payload, policy_ref=policy_ref, max_bytes=max_bytes)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         context = self._prepare_generation_context(req)

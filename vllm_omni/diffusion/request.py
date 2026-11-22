@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -89,11 +89,15 @@ class OmniDiffusionRequest:
     # Engine-owned shared-memory signal for cooperative full-forward workers.
     # Only the engine creates/unlinks it; workers attach readers until return.
     cancellation_signal: str | None = field(default=None, repr=False)
+    external_req_id: str | None = None
+    sampling_resolved: InitVar[bool] = False
 
-    def __post_init__(self):
+    def __post_init__(self, sampling_resolved: bool):
         """Initialize dependent fields after dataclass initialization."""
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
+        if sampling_resolved:
+            return
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.

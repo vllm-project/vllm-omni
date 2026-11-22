@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
+import json
+import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -11,7 +15,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 from torch import nn
 
 from tests.diffusion.test_diffusion_step_pipeline import _make_runner, _noop_forward_context
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.models.interface import allows_streaming_step_execution, supports_step_execution
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
@@ -24,6 +28,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -523,3 +528,149 @@ def test_streaming_engine_and_runner_agree_on_execution_mode(monkeypatch, model,
     assert runner.od_config.step_execution is step
     if runner.od_config.cache_backend == "tea_cache":
         assert runner.cache_backend is cache
+
+
+def _advance_step(pipeline, state):
+    noise = pipeline.denoise_step(InputBatch.make_batch([state]))
+    pipeline.step_scheduler(state, noise)
+
+
+def test_cpu_snapshot_restores_in_fresh_process_without_original_objects(monkeypatch, tmp_path):
+    pipeline = _make_step_sd3_pipeline()
+    monkeypatch.setattr("vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg", lambda *args: None)
+    request = _make_step_sd3_requests(4.0)[0]
+    state = StepRequestState(
+        request_id=request.request_id,
+        external_req_id="original-client-request",
+        sampling=request.sampling_params,
+        prompt=request.prompt,
+    )
+    pipeline.prepare_encode(state)
+    state.sampling.lora_request = LoRARequest("adapter-v7", 7, "/served/adapter-v7")
+    state.sampling.generator = torch.Generator().manual_seed(42)
+    state.sampling.seed = None
+    state.sampling.extra_args["requested_outputs"] = ["image_latent", "image_preview"]
+    torch.randn(7, generator=state.sampling.generator)
+    _advance_step(pipeline, state)
+    path = tmp_path / "request.msgpack"
+    path.write_bytes(pipeline.export_step_state(state, policy_ref="served-adapter-v7", max_bytes=1 << 20))
+    expected_rng = torch.randn(4, generator=state.sampling.generator)
+    while not state.denoise_completed:
+        _advance_step(pipeline, state)
+    command = """
+import json, random, sys
+from pathlib import Path
+import torch
+from tests.diffusion.models.sd3.test_sd3_pipeline import _make_step_sd3_pipeline, _advance_step
+pipeline = _make_step_sd3_pipeline()
+payload = Path(sys.argv[1]).read_bytes()
+random_state = random.getstate()
+request = pipeline.step_request_from_snapshot(payload, policy_ref='served-adapter-v7', max_bytes=1 << 20)
+assert random.getstate() == random_state
+state = pipeline.restore_step_state(payload, policy_ref='served-adapter-v7', max_bytes=1 << 20)
+assert request.request_id == state.request_id
+assert request.external_req_id == state.external_req_id == 'original-client-request'
+assert request.sampling_params.step_index == state.step_index == 1
+assert request.sampling_params.seed is None and request.sampling_params.generator is None
+assert request.sampling_params.guidance_scale_2_provided is state.sampling.guidance_scale_2_provided
+assert list(request.sampling_params.extra_args['requested_outputs']) == ['image_latent', 'image_preview']
+assert request.sampling_params.lora_request == state.sampling.lora_request
+rng = torch.randn(4, generator=state.sampling.generator)
+while not state.denoise_completed:
+    _advance_step(pipeline, state)
+adapter = state.sampling.lora_request
+Path(sys.argv[2]).write_text(json.dumps({'latent': state.latents.tolist(), 'rng': rng.tolist(), 'step': state.step_index,
+    'adapter': [adapter.lora_name, adapter.lora_int_id, adapter.lora_path]}))
+"""
+    result_path = tmp_path / "restored.json"
+    subprocess.run(
+        [sys.executable, "-c", command, str(path), str(result_path)],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        check=True,
+        timeout=120,
+    )
+    restored = json.loads(result_path.read_text())
+    assert restored["step"] == state.step_index == 3
+    assert restored["adapter"] == ["adapter-v7", 7, "/served/adapter-v7"]
+    torch.testing.assert_close(torch.tensor(restored["latent"]), state.latents, rtol=0, atol=0)
+    torch.testing.assert_close(torch.tensor(restored["rng"]), expected_rng, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_snapshot_preserves_shared_and_independent_generator_streams(monkeypatch, shared):
+    pipeline = _make_step_sd3_pipeline()
+    monkeypatch.setattr("vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg", lambda *args: None)
+    request = _make_step_sd3_requests(1.0)[0]
+    state = StepRequestState(request_id=request.request_id, sampling=request.sampling_params, prompt=request.prompt)
+    pipeline.prepare_encode(state)
+    generator = torch.Generator().manual_seed(42)
+    torch.randn(7, generator=generator)
+    second = generator if shared else torch.Generator().set_state(generator.get_state())
+    state.sampling.generator = [generator, second]
+    payload = pipeline.export_step_state(state, policy_ref="same-policy", max_bytes=1 << 20)
+    expected = torch.stack([torch.randn(3, generator=item) for item in state.sampling.generator])
+    restored = pipeline.restore_step_state(payload, policy_ref="same-policy", max_bytes=1 << 20)
+    actual = torch.stack([torch.randn(3, generator=item) for item in restored.sampling.generator])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert (restored.sampling.generator[0] is restored.sampling.generator[1]) == shared
+
+
+def test_snapshot_policy_mismatch_and_budget_leave_original_state_usable(monkeypatch):
+    pipeline = _make_step_sd3_pipeline()
+    monkeypatch.setattr("vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg", lambda *args: None)
+    request = _make_step_sd3_requests(1.0)[0]
+    state = StepRequestState(request_id=request.request_id, sampling=request.sampling_params, prompt=request.prompt)
+    pipeline.prepare_encode(state)
+    before = state.latents.clone()
+    payload = pipeline.export_step_state(state, policy_ref="v7", max_bytes=1 << 20)
+    with pytest.raises(ValueError, match="policy"):
+        pipeline.restore_step_state(payload, policy_ref="v8", max_bytes=1 << 20)
+    with pytest.raises(ValueError, match="byte budget"):
+        pipeline.export_step_state(state, policy_ref="v7", max_bytes=1)
+    assert state.step_index == 0 and torch.equal(state.latents, before)
+    _advance_step(pipeline, state)
+    assert state.step_index == 1
+
+
+@pytest.mark.parametrize(
+    "different",
+    ["dtype", "attention", "determinism", "bf16_reduction", "eager", "compile_granularity", "compile_dynamic"],
+)
+def test_snapshot_execution_profile_is_checked_before_tensor_decode(monkeypatch, different):
+    pipeline = _make_step_sd3_pipeline()
+    monkeypatch.setattr("vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg", lambda *args: None)
+    request = _make_step_sd3_requests(1.0)[0]
+    state = StepRequestState(request_id=request.request_id, sampling=request.sampling_params, prompt=request.prompt)
+    pipeline.prepare_encode(state)
+    _advance_step(pipeline, state)
+    if different == "bf16_reduction":
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 0))
+        monkeypatch.setattr(torch.backends.cuda, "preferred_blas_library", lambda: "default")
+        matmul = SimpleNamespace(
+            allow_tf32=False, allow_bf16_reduced_precision_reduction=False, allow_fp16_reduced_precision_reduction=False
+        )
+        monkeypatch.setattr(torch.backends.cuda, "matmul", matmul)
+        pipeline.device = torch.device("cuda")
+    payload = pipeline.export_step_state(state, policy_ref="stable", max_bytes=1 << 20)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    if different == "dtype":
+        pipeline.od_config.dtype = torch.bfloat16
+    elif different == "attention":
+        pipeline.od_config.diffusion_attention_config = AttentionConfig(default="TORCH_SDPA")
+    elif different == "bf16_reduction":
+        matmul.allow_bf16_reduced_precision_reduction = True
+    elif different == "eager":
+        pipeline.od_config.enforce_eager = True
+    elif different == "compile_granularity":
+        pipeline.od_config.diffusion_compile_granularity = "full"
+    elif different == "compile_dynamic":
+        pipeline.od_config.diffusion_compile_dynamic = False
+    else:
+        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: not enabled)
+
+    def fail_decode(*_):
+        raise AssertionError("Decoded tensors from an incompatible snapshot")
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.sd3.step_state._StateDecoder.decode", fail_decode)
+    with pytest.raises(ValueError, match="execution profile"):
+        pipeline.restore_step_state(payload, policy_ref="stable", max_bytes=1 << 20)
