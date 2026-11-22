@@ -198,6 +198,14 @@ class VideoTokenSpan:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageTokenSpan:
+    """One physical reference-image grid in packed document 0."""
+
+    start: int
+    latent_grid: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
 class VideoTokenLayout:
     """Video-grid slices in a packed multimodal sequence.
 
@@ -209,7 +217,7 @@ class VideoTokenLayout:
 
     ``prefix_len``/``latent_grid`` retain the original one-tail contract. A
     Ref2VA layout instead publishes ``used_len`` and every physical video
-    span, so audio and image rows between videos remain dense.
+    span. Optional image spans describe reference grids for RainFusion.
 
     Plain ints, so reading it never forces a device-to-host sync.
     """
@@ -218,9 +226,18 @@ class VideoTokenLayout:
     latent_grid: tuple[int, int, int] | None = None
     used_len: int | None = None
     video_spans: tuple[VideoTokenSpan, ...] = ()
-    # Original image ranges, or exact positions after cached-reference packing.
-    reference_image_spans: tuple[tuple[int, int], ...] = ()
-    reference_image_positions: tuple[tuple[int, ...], ...] = ()
+    image_spans: tuple[ImageTokenSpan, ...] = ()
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ReferenceImageLayout:
+    """Request-wide original geometry for compact RainFusion attention.
+
+    Identity hashing keeps plan cache lookups independent of the reference length.
+    """
+
+    original: VideoTokenLayout
+    reference_positions: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)

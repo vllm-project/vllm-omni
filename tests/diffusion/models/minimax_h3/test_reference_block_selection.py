@@ -9,11 +9,9 @@ checks do not execute or simulate the native attention kernels.
 import ast
 import dataclasses
 import functools
-import importlib.util
 import inspect
 import math
 import sys
-from bisect import bisect_left
 from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
@@ -71,23 +69,11 @@ def config():
 
 @pytest.fixture
 def geometry():
-    layouts = definitions(
+    return definitions(
         "_rbs_layout",
         "vllm_omni/diffusion/attention/backends/abstract.py",
-        {"VideoTokenSpan", "VideoTokenLayout", "AttentionMetadata"},
+        {"ImageTokenSpan", "VideoTokenSpan", "VideoTokenLayout", "ReferenceImageLayout", "AttentionMetadata"},
         {"dataclass": dataclasses.dataclass, "field": dataclasses.field},
-    )
-    return definitions(
-        "_rbs_geometry",
-        "vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py",
-        {"_reference_kv_video_layout"},
-        {
-            "VideoTokenSpan": layouts.VideoTokenSpan,
-            "VideoTokenLayout": layouts.VideoTokenLayout,
-            "AttentionMetadata": layouts.AttentionMetadata,
-            "math": math,
-            "bisect_left": bisect_left,
-        },
     )
 
 
@@ -106,7 +92,13 @@ def backend(progress, mocker):
     return definitions(
         "_rbs_backend",
         "vllm_omni/diffusion/attention/backends/rainfusion_attn.py",
-        {"RainFusionConfig", "RainFusionPlan", "RainFusionAttentionImpl", "_supports_video_spans"},
+        {
+            "RainFusionConfig",
+            "RainFusionPlan",
+            "RainFusionAttentionImpl",
+            "_supports_video_spans",
+            "_supports_image_sparsity",
+        },
         {
             "dataclass": dataclasses.dataclass,
             "replace": dataclasses.replace,
@@ -129,136 +121,57 @@ def backend(progress, mocker):
     )
 
 
-@pytest.mark.parametrize("ratio", [0.2, 0.5, 0.8, 1.0])
-def test_ratio_reaches_backend_from_standard_config(config, backend, ratio):
+@pytest.mark.parametrize("ratio", [0.0, 0.2, 0.8, 1.0])
+def test_image_sparsity_reaches_backend_from_standard_config(config, backend, ratio):
     parsed = config.AttentionConfig(
         default={
             "backend": "RAINFUSION_ATTN",
-            "block_sparse": {"sparsity": 0.8, "precision": "mix"},
-            "rainfusion": {"ref_keep_ratio": ratio},
+            "block_sparse": {"sparsity": 0.0, "precision": "mix"},
+            "rainfusion": {"image_sparsity": ratio},
         }
     )
     kwargs = parsed.default.backend_kwargs()
-    assert backend.RainFusionConfig.from_backend_kwargs(kwargs).ref_keep_ratio == ratio
-    if ratio == 1.0:
-        assert "ref_keep_ratio" not in kwargs
+    resolved = backend.RainFusionConfig.from_backend_kwargs(kwargs)
+    assert resolved.image_sparsity == ratio
+    assert resolved.enabled is (ratio > 0)
+    if ratio == 0.0:
+        assert "image_sparsity" not in kwargs
 
 
-@pytest.mark.parametrize("ratio", [0.0, -0.1, 1.1, float("nan"), float("inf")])
-def test_invalid_ratio_is_rejected(config, backend, ratio):
+@pytest.mark.parametrize("ratio", [-0.1, 1.1, float("nan"), float("inf"), True, "0.9"])
+def test_invalid_image_sparsity_is_rejected(config, backend, ratio):
     for cls in (config.RainFusionSpec, backend.RainFusionConfig):
-        with pytest.raises(ValueError, match="ref_keep_ratio"):
-            cls(ref_keep_ratio=ratio)
-
-
-def test_rbs_requires_sparse_attention(config, backend):
-    with pytest.raises(ValueError, match="positive block sparsity"):
-        config.AttentionSpec(
-            backend="RAINFUSION_ATTN", block_sparse={"sparsity": 0}, rainfusion={"ref_keep_ratio": 0.5}
-        )
-    with pytest.raises(ValueError, match="positive block sparsity"):
-        backend.RainFusionConfig(sparsity=0, ref_keep_ratio=0.5)
-    assert config.RainFusionSpec().ref_keep_ratio == 1.0
+        with pytest.raises(ValueError, match="image_sparsity"):
+            cls(image_sparsity=ratio)
 
 
 def test_rainfusion_options_reject_unrelated_backend(config):
     with pytest.raises(ValueError, match="only supported"):
-        config.AttentionSpec(backend="FLASH_ATTN", rainfusion={"ref_keep_ratio": 0.5})
+        config.AttentionSpec(backend="FLASH_ATTN", rainfusion={"image_sparsity": 0.5})
 
 
-def test_reference_images_follow_cached_prefix_positions(geometry):
-    layout = geometry.VideoTokenLayout(
-        used_len=36,
-        reference_image_spans=((2, 4), (8, 10)),
-        video_spans=(
-            geometry.VideoTokenSpan(start=16, latent_grid=(1, 2, 2), role="reference"),
-            geometry.VideoTokenSpan(start=20, latent_grid=(4, 2, 2), role="target"),
-        ),
-    )
-    # Other cached context makes the second image non-contiguous in the prefix.
-    positions = torch.tensor([0, 2, 3, 6, 8, 9, 16, 17, 18, 19])
-    compact = geometry.VideoTokenLayout(
-        used_len=26, video_spans=(geometry.VideoTokenSpan(start=10, latent_grid=(4, 2, 2), role="target"),)
-    )
-    remapped = geometry._reference_kv_video_layout(layout, positions, compact)
-    assert remapped.reference_image_positions == ((1, 2), (4, 5))
-    assert [(span.start, span.role) for span in remapped.video_spans] == [(6, "reference"), (20, "target")]
-
-
-def test_partially_cached_image_is_rejected(geometry):
-    original = geometry.VideoTokenLayout(reference_image_spans=((2, 5),))
-    compact = geometry.VideoTokenLayout(used_len=10)
-    with pytest.raises(ValueError, match="not fully represented"):
-        geometry._reference_kv_video_layout(original, torch.tensor([2, 4]), compact)
-
-
-def test_full_query_plan_preserves_per_image_and_target_ownership(backend, geometry, monkeypatch, mocker):
-    bridge = ModuleType("vllm_omni.diffusion.attention.ops.reference_block_selection")
-    bridge.__dict__["require_rbs"] = mocker.Mock()
-    monkeypatch.setitem(sys.modules, bridge.__name__, bridge)
+def test_full_plan_carries_image_geometry_and_checks_alignment(backend, geometry):
     impl = backend.RainFusionAttentionImpl.__new__(backend.RainFusionAttentionImpl)
-    impl.rainfusion = backend.RainFusionConfig(sparsity=0.8, ref_keep_ratio=0.2)
     layout = geometry.VideoTokenLayout(
         used_len=8192,
-        reference_image_spans=((0, 256), (384, 640)),
+        image_spans=(geometry.ImageTokenSpan(16, (8, 20)), geometry.ImageTokenSpan(300, (16, 16))),
         video_spans=(geometry.VideoTokenSpan(start=1024, latent_grid=(4, 32, 56), role="target"),),
     )
+    impl.rainfusion = backend.RainFusionConfig(sparsity=0, image_sparsity=0.75)
     plan = impl._resolve_multi_span_plan(layout, 8192)
-    assert plan.video_spans[0]["_ref_keep_ratio"] == 0.2
-    assert plan.video_spans[0]["_ref_images"] == [(0, 256), (384, 640)]
-    assert plan.video_spans[0]["_ref_image_positions"] == []
-    assert plan.video_spans[0]["_ref_targets"] == [(1024, 8192)]
-    bridge.require_rbs.assert_called_once_with()
+    assert plan.video_spans == [{"start": 1024, "latent_shape": [4, 32, 56]}]
+    assert plan.image_spans == [{"start": 16, "latent_shape": [8, 20]}, {"start": 300, "latent_shape": [16, 16]}]
+    # The 160-token image needs 96 context tokens before the next span.
+    tight = dataclasses.replace(
+        layout,
+        used_len=7328,
+        image_spans=(geometry.ImageTokenSpan(0, (8, 20)),),
+        video_spans=(geometry.VideoTokenSpan(start=160, latent_grid=(4, 32, 56), role="target"),),
+    )
+    assert impl._resolve_multi_span_plan(tight, tight.used_len) is None
+    assert impl._resolve_multi_span_plan(dataclasses.replace(layout, image_spans=()), 8192) is None
     impl.rainfusion = backend.RainFusionConfig(sparsity=0.8)
-    assert "_ref_keep_ratio" not in impl._resolve_multi_span_plan(layout, 8192).video_spans[0]
-    bridge.require_rbs.assert_called_once_with()
-
-
-@pytest.fixture
-def selection():
-    path = ROOT / "vllm_omni/diffusion/attention/ops/reference_block_selection.py"
-    spec = importlib.util.spec_from_file_location("_rbs_selection", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_missing_mindiesd_rbs_helper_raises(selection, monkeypatch):
-    monkeypatch.setitem(sys.modules, "mindiesd.layers.flash_attn.ref_sparse_mask", None)
-    with pytest.raises(ImportError, match="RBS-capable MindIE-SD"):
-        selection.require_rbs()
-
-
-def test_rectangular_query_blocks_are_remapped_and_plan_is_cached(selection, monkeypatch, mocker):
-    geometry = definitions(
-        "_rbs_rectangular_geometry",
-        "vllm_omni/diffusion/attention/ops/rainfusion_rectangular.py",
-        {"Plan"},
-        {"dataclass": dataclasses.dataclass},
-    )
-    plan = geometry.Plan(
-        key_indices=torch.arange(896),
-        sparse_indices=torch.arange(384),
-        dense_indices=torch.arange(128),
-        protected_keys=torch.tensor([0, 1]),
-        sparse_blocks=(2, 4, 6),
-        sparse_rows=384,
-        dense_rows=128,
-        key_rows=896,
-    )
-    native_geometry = ModuleType("vllm_omni.diffusion.attention.ops.rainfusion_rectangular")
-    native_geometry.__dict__["get_plan"] = mocker.Mock(return_value=plan)
-    helper = ModuleType("mindiesd.layers.flash_attn.ref_sparse_mask")
-    helper.__dict__["build_ref_plan"] = mocker.Mock(return_value=(((0, 1),), (4, 6)))
-    helper.__dict__["apply_ref_mask"] = mocker.Mock()
-    monkeypatch.setitem(sys.modules, native_geometry.__name__, native_geometry)
-    monkeypatch.setitem(sys.modules, helper.__name__, helper)
-    args = (896, 384, ((384, (4, 8, 16)),), "cpu", (), ((0, 2, 4, 6),), ((384, 896),))
-    assert selection.rectangular_plan(*args) == (((0, 1),), (1, 2))
-    assert selection.rectangular_plan(*args) == (((0, 1),), (1, 2))
-    helper.build_ref_plan.assert_called_once_with(list(range(896)), (), ((384, 896),), 128, {0, 1}, ((0, 2, 4, 6),))
-    native_geometry.get_plan.assert_called_once_with(*args[:4])
+    assert impl._resolve_multi_span_plan(layout, 8192).image_spans is None
 
 
 @pytest.mark.parametrize("precision", ["bf16", "mix"])
@@ -297,20 +210,24 @@ def test_default_compact_keeps_existing_path(backend, geometry, monkeypatch, moc
 
 
 @pytest.mark.parametrize("override", [None, "float"])
-@pytest.mark.parametrize("ratio", [0.1, 1.0])
-def test_eight_steps_dispatch_full_then_rectangular(backend, config, geometry, progress, monkeypatch, override, ratio):
+@pytest.mark.parametrize("image_sparsity", [0.0, 0.9])
+def test_eight_steps_dispatch_full_then_rectangular(
+    backend, config, geometry, progress, monkeypatch, mocker, override, image_sparsity
+):
     calls = []
+    full_len = 4480
+    ref_rows = 256
+    active_len = full_len - ref_rows
+    images = [{"start": 128, "latent_shape": [16, 16]}]
 
-    @dataclasses.dataclass
-    class RectangularPlan:
-        dense_rows: int = 0
-
-    def sparse_attention(q, k, v, *, precision, video_spans, sparsity, **kwargs):
-        calls.append(("full", sparsity, video_spans[0].get("_ref_keep_ratio", 1.0), precision))
+    def sparse_attention(q, k, v, *, precision, video_spans, sparsity, image_spans=None, image_sparsity=None, **kwargs):
+        assert q.shape[1] == k.shape[1] == full_len
+        calls.append(("full", sparsity, image_spans, image_sparsity, precision))
         return torch.zeros_like(q)
 
-    def run(q, k, v, plan, sparsity, scale, *, ref_keep_ratio, **kwargs):
-        calls.append(("rectangular", sparsity, ref_keep_ratio, kwargs["precision"]))
+    def run(q, k, v, plan, sparsity, scale, *, image_sparsity, precision):
+        assert q.shape[1] == active_len < k.shape[1] == full_len
+        calls.append(("rectangular", sparsity, None, image_sparsity, precision))
         return torch.zeros_like(q)
 
     native = ModuleType("mindiesd")
@@ -318,32 +235,32 @@ def test_eight_steps_dispatch_full_then_rectangular(backend, config, geometry, p
     platform = ModuleType("mindiesd.utils.get_platform")
     platform.__dict__["is_a5_device"] = lambda: True
     rectangular = ModuleType("vllm_omni.diffusion.attention.ops.rainfusion_rectangular")
-    rectangular.__dict__["get_plan"] = lambda *args: RectangularPlan()
-    rectangular.__dict__["run"] = run
-    selection = ModuleType("vllm_omni.diffusion.attention.ops.reference_block_selection")
-    selection.__dict__["rectangular_plan"] = lambda *args: (((0,),), (1,))
-    for module in (native, platform, rectangular, selection):
+    get_plan = mocker.Mock()
+    rectangular.__dict__.update(get_plan=get_plan, run=run)
+    for module in (native, platform, rectangular):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     instance = backend.RainFusionAttentionImpl.__new__(backend.RainFusionAttentionImpl)
     instance.rainfusion = backend.RainFusionConfig.from_backend_kwargs(
         config.AttentionSpec(
             backend="RAINFUSION_ATTN",
             block_sparse={"sparsity": 0.8, "precision": "mix"},
-            rainfusion={"ref_keep_ratio": ratio},
+            rainfusion={"image_sparsity": image_sparsity},
         ).backend_kwargs()
     )
+    instance.layer_idx = None
     instance.qkv_layout = "BSND"
     instance.softmax_scale = 0.25
-    instance._resolve_plan = lambda metadata: backend.RainFusionPlan(
-        used_len=int(metadata.extra["max_seqlen_q"]),
-        video_spans=[{"start": 4, "latent_shape": [1, 1, 8], "_ref_keep_ratio": ratio}],
+    span = geometry.VideoTokenSpan(start=384, latent_grid=(8, 16, 32), role="target")
+    original = geometry.VideoTokenLayout(
+        used_len=full_len, video_spans=(span,), image_spans=(geometry.ImageTokenSpan(128, (16, 16)),)
     )
-    q = torch.ones(1, 8, 2, 16)
-    span = geometry.VideoTokenSpan(start=0, latent_grid=(1, 1, 8), role="target")
-    layout = geometry.VideoTokenLayout(used_len=8, video_spans=(span,))
-    kv_layout = dataclasses.replace(layout, used_len=12, reference_image_spans=((0, 4),))
+    compact = geometry.VideoTokenLayout(used_len=active_len, video_spans=(dataclasses.replace(span, start=128),))
+    physical = geometry.VideoTokenLayout(used_len=full_len, video_spans=(span,))
+    image_layout = geometry.ReferenceImageLayout(original, tuple(range(128, 384)))
+    full = torch.ones(1, full_len, 1, 4)
+    compact_q = torch.ones(1, active_len, 1, 4)
     schedule = definitions(
-        "_lq_main_schedule",
+        "_rbs_schedule",
         "vllm_omni/diffusion/attention/schedule.py",
         {"AttentionScheduleRange", "_validate_step", "validate_attention_profile_name", "select_attention_profile"},
         {"dataclass": dataclasses.dataclass},
@@ -353,32 +270,108 @@ def test_eight_steps_dispatch_full_then_rectangular(backend, config, geometry, p
         profile = schedule.select_attention_profile(ranges, step, total_steps=8)
         instance.rainfusion = dataclasses.replace(instance.rainfusion, sparsity=0.85 if profile == "late" else 0.8)
         progress.denoise_step_idx = step
-        metadata = geometry.AttentionMetadata(extra={"max_seqlen_q": 8})
-        kv = q
+        q = compact_q if step else full
+        extra = {"max_seqlen_q": full_len}
+        metadata = geometry.AttentionMetadata(extra=extra, video_layout=original)
         if step:
-            metadata = geometry.AttentionMetadata(
-                extra={
-                    "max_seqlen_q": 8,
-                    "max_seqlen_k": 12,
-                    "minimax_h3_compact_reference_rows": 4,
-                    "minimax_h3_resident_reference_kv": True,
-                    "minimax_h3_reference_kv_video_layout": kv_layout,
-                },
-                video_layout=layout,
+            extra.update(
+                max_seqlen_q=active_len,
+                max_seqlen_k=full_len,
+                minimax_h3_compact_reference_rows=ref_rows,
+                minimax_h3_resident_reference_kv=True,
+                minimax_h3_reference_kv_video_layout=physical,
+                minimax_h3_reference_image_layout=image_layout,
             )
-            kv = torch.ones(1, 12, 2, 16)
+            metadata.video_layout = compact
         if override is not None:
-            metadata.extra["kv_cache_dtype"] = override
-        assert instance.forward_npu(q, kv, kv, metadata).shape == q.shape
+            extra["kv_cache_dtype"] = override
+        assert instance.forward_npu(q, full, full, metadata).shape == q.shape
     precision = "bf16" if override == "float" else "mix"
     assert (
         calls
-        == [("full", 0.8, ratio, precision), ("rectangular", 0.8, ratio, precision)]
-        + [("rectangular", 0.85, ratio, precision)] * 6
+        == [
+            ("full", 0.8, images if image_sparsity else None, image_sparsity or None, precision),
+            ("rectangular", 0.8, None, image_sparsity, precision),
+        ]
+        + [("rectangular", 0.85, None, image_sparsity, precision)] * 6
     )
-    # Token-refiner calls without sparse geometry must not need a step index.
-    progress.denoise_step_idx = progress.total_denoise_steps = None
-    instance._resolve_plan = lambda metadata: None
-    instance.dense_fallback = torch.nn.Module()
-    instance.dense_fallback.forward_npu = lambda q, k, v, metadata: q
-    assert instance.forward_npu(q, q, q) is q
+    assert get_plan.call_args.kwargs == {
+        "image_spans": ((128, (16, 16)),) if image_sparsity else (),
+        "image_layout": image_layout if image_sparsity else None,
+    }
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mix"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_rectangular_image_mask_and_cached_row_mapping(geometry, monkeypatch, mocker, precision, partial):
+    # RF order for a layout with text between two images and a reference video.
+    # Block 5 contains the second image's 32-token tail and 96 context tokens.
+    perm = torch.tensor(
+        [
+            *range(24, 280),
+            *range(312, 568),
+            *range(568, 728),
+            *range(24),
+            *range(280, 312),
+            *range(728, 768),
+            *range(768, 1152),
+        ]
+    )
+    first = {2, 6}
+    protected = {0, 1, 4, 5}
+    video_rows = (2, 3, 6, 7, 8)
+    packed_mask_input = mocker.Mock(return_value=(perm, None, protected, first, (((0, 1), (4,)), video_rows)))
+    rf_v2 = ModuleType("mindiesd.layers.flash_attn.sparse_flash_attn_rf_v2")
+    rf_v2.__dict__["_normalize_image_spans"] = lambda spans, length: spans
+    monkeypatch.setitem(sys.modules, rf_v2.__name__, rf_v2)
+    rectangular = definitions(
+        "_rbs_rectangular",
+        "vllm_omni/diffusion/attention/ops/rainfusion_rectangular.py",
+        {"Plan", "get_plan", "run"},
+        {
+            "dataclass": dataclasses.dataclass,
+            "lru_cache": functools.lru_cache,
+            "math": math,
+            "torch": torch,
+            "_normalize_video_spans": lambda spans, length: spans,
+            "_multi_span_permutation": packed_mask_input,
+            "avgpool": lambda values, block_size, layout: values.reshape(1, -1, block_size, 1, 1).mean(2),
+        },
+    )
+    calls = []
+
+    def native(q, k, v, mask, scale):
+        calls.append((q.clone(), k.clone(), mask.clone()))
+        return q
+
+    rectangular.__dict__["native_bf16"] = native if precision == "bf16" else mocker.Mock(side_effect=AssertionError)
+    rectangular.__dict__["native_mix"] = native if precision == "mix" else mocker.Mock(side_effect=AssertionError)
+    ref_positions = tuple(range(24, 280)) + tuple(range(312, 728))
+    if partial:
+        ref_positions += (896,)
+    active_positions = tuple(sorted(set(range(1152)) - set(ref_positions)))
+    physical = ref_positions + active_positions
+    layout = geometry.ReferenceImageLayout(geometry.VideoTokenLayout(used_len=1152), ref_positions)
+    videos = ((312, (2, 8, 16)), (768, (3, 8, 16)))
+    images = ((24, (16, 16)), (568, (10, 16)))
+    plan = rectangular.get_plan(1152, len(ref_positions), videos, "cpu", image_spans=images, image_layout=layout)
+    assert (
+        rectangular.get_plan(1152, len(ref_positions), videos, "cpu", image_spans=images, image_layout=layout) is plan
+    )
+    assert packed_mask_input.call_count == 1
+    assert packed_mask_input.call_args.kwargs["return_reference_plan"]
+    assert plan.image_query_blocks.tolist() == ([0] if partial else [0, 1])
+
+    # Head dim 1 suffices for recording kernels. The second block of image 1
+    # wins, while image 2's only full block and its protected tail both survive.
+    logical = torch.arange(1152, dtype=torch.float32).view(1, -1, 1, 1).div(1152).to(torch.bfloat16)
+    kv = logical[:, list(physical)]
+    q = torch.ones_like(logical[:, list(active_positions)])
+    result = rectangular.run(q, kv, kv, plan, 0, 1, precision=precision, image_sparsity=0.75)
+    torch.testing.assert_close(result, q)
+    assert len(calls) == 2
+    sparse_q, reordered_k, mask = calls[0]
+    assert sparse_q.shape[1] == (128 if partial else 256)
+    torch.testing.assert_close(reordered_k, logical[:, perm])
+    assert mask[0, 0].tolist() == [[0, 1, 1, 1, 1, 1, 1, 1, 1]] * (1 if partial else 2)
+    assert calls[1][2].all()

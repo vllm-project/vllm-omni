@@ -2290,11 +2290,15 @@ class BlockSparseSpec:
 class RainFusionSpec:
     """RainFusion-only controls; shared sparsity options stay in BlockSparseSpec."""
 
-    ref_keep_ratio: float = 1.0
+    image_sparsity: float = 0.0
 
     def __post_init__(self) -> None:
-        if not 0.0 < self.ref_keep_ratio <= 1.0:
-            raise ValueError("rainfusion.ref_keep_ratio must be in (0, 1]")
+        if (
+            isinstance(self.image_sparsity, bool)
+            or not isinstance(self.image_sparsity, (int, float))
+            or not 0.0 <= self.image_sparsity <= 1.0
+        ):
+            raise ValueError("rainfusion.image_sparsity must be a number in [0, 1]")
 
 
 @dataclass
@@ -2356,8 +2360,6 @@ class AttentionSpec:
             # Selecting the backend is the opt-in; without an explicit block the
             # defaults apply rather than silently running dense.
             self.block_sparse = self.block_sparse or BlockSparseSpec()
-            if self.rainfusion is not None and self.rainfusion.ref_keep_ratio < 1.0 and self.block_sparse.sparsity <= 0:
-                raise ValueError("ref_keep_ratio requires positive block sparsity")
         elif self.block_sparse is not None:
             raise ValueError(
                 f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
@@ -2420,8 +2422,8 @@ class AttentionSpec:
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 
-        if self.rainfusion is not None and self.rainfusion.ref_keep_ratio < 1.0:
-            kw["ref_keep_ratio"] = self.rainfusion.ref_keep_ratio
+        if self.rainfusion is not None and self.rainfusion.image_sparsity > 0.0:
+            kw["image_sparsity"] = self.rainfusion.image_sparsity
 
         return kw or None
 

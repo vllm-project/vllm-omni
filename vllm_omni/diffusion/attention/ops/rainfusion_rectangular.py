@@ -11,6 +11,8 @@ import torch
 from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v2 import _multi_span_permutation, _normalize_video_spans, avgpool
 from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v3 import rain_fusion_attention_v3
 
+from vllm_omni.diffusion.attention.backends.abstract import ReferenceImageLayout
+
 
 @dataclass
 class Plan:
@@ -18,45 +20,90 @@ class Plan:
     sparse_indices: torch.Tensor
     dense_indices: torch.Tensor
     protected_keys: torch.Tensor
-    sparse_blocks: tuple[int, ...]
+    image_groups: tuple[torch.Tensor, ...]
+    image_query_blocks: torch.Tensor
     sparse_rows: int
     dense_rows: int
     key_rows: int
 
 
 @lru_cache(maxsize=32)
-def get_plan(kv_rows: int, reference_rows: int, spans: tuple[tuple[int, tuple[int, ...]], ...], device: str) -> Plan:
+def get_plan(
+    kv_rows: int,
+    reference_rows: int,
+    spans: tuple[tuple[int, tuple[int, ...]], ...],
+    device: str,
+    *,
+    image_spans: tuple[tuple[int, tuple[int, ...]], ...] = (),
+    image_layout: ReferenceImageLayout | None = None,
+) -> Plan:
+    block_size = 128
     descriptors = [{"start": start, "latent_shape": list(grid)} for start, grid in spans]
     normalized = _normalize_video_spans(descriptors, kv_rows)
-    perm, _, dense_blocks, first = _multi_span_permutation(normalized, kv_rows, 128, "BSND", "cpu")
+    image_groups: tuple[tuple[int, ...], ...] = ()
+    eligible_blocks: tuple[int, ...] = ()
+    if image_spans:
+        if image_layout is None:
+            raise ValueError("rectangular image sparsity requires the original reference layout")
+        from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v2 import _normalize_image_spans
+
+        images = _normalize_image_spans(
+            [{"start": start, "latent_shape": list(grid)} for start, grid in image_spans], kv_rows
+        )
+        perm, _, dense_blocks, first, (image_groups, eligible_blocks) = _multi_span_permutation(
+            normalized, kv_rows, block_size, "BSND", "cpu", image_spans=images, return_reference_plan=True
+        )
+        positions = image_layout.reference_positions
+        if (
+            len(positions) != reference_rows
+            or tuple(sorted(set(positions))) != positions
+            or (positions and (positions[0] < 0 or positions[-1] >= kv_rows))
+        ):
+            raise ValueError("reference positions must describe the valid, sorted cached KV rows")
+        reference_idx = torch.tensor(positions, dtype=torch.long, device="cpu")
+        is_active = torch.ones(kv_rows, dtype=torch.bool, device="cpu")
+        is_active[reference_idx] = False
+        # Gather directly from [cached reference KV | active KV] into RF order.
+        original_to_kv = torch.empty(kv_rows, dtype=torch.long, device="cpu")
+        original_to_kv[reference_idx] = torch.arange(reference_rows, device="cpu")
+        original_to_kv[is_active] = torch.arange(reference_rows, kv_rows, device="cpu")
+        perm = original_to_kv[perm]
+    else:
+        perm, _, dense_blocks, first = _multi_span_permutation(normalized, kv_rows, block_size, "BSND", "cpu")
+
     protected = dense_blocks | first
-    sparse = []
-    dense = []
-    blocks = []
-    for block in range(math.ceil(kv_rows / 128)):
-        ids = perm[block * 128 : (block + 1) * 128]
+    eligible = set(eligible_blocks)
+    sparse: list[int] = []
+    dense: list[int] = []
+    image_query_blocks: list[int] = []
+    for block in range(math.ceil(kv_rows / block_size)):
+        ids = perm[block * block_size : (block + 1) * block_size]
         kept = ids[ids >= reference_rows]
         if not kept.numel():
             continue
-        if block in protected:
+        partial = kept.numel() != ids.numel()
+        if block in protected or (image_spans and partial):
             dense.extend((kept - reference_rows).tolist())
         else:
-            if kept.numel() != ids.numel():
+            if partial:
                 raise ValueError("unprotected block crosses removed reference Q boundary")
+            if block in eligible:
+                image_query_blocks.append(len(sparse) // block_size)
+            # Kept sparse blocks retain their RF boundaries and order.
             sparse.extend((kept - reference_rows).tolist())
-            blocks.append(block)
-    # A partial sparse source block must remain at the end, preserving pooling.
-    for block in blocks[:-1]:
-        if min(128, kv_rows - block * 128) != 128:
-            raise ValueError("partial sparse block inside packed query")
     if sorted(sparse + dense) != list(range(kv_rows - reference_rows)):
         raise ValueError("rectangular query plan must cover every surviving row once")
 
-    def up(x: list[int]) -> torch.Tensor:
-        return torch.tensor(x, dtype=torch.long, device=device)
-
     return Plan(
-        perm.to(device), up(sparse), up(dense), up(sorted(protected)), tuple(blocks), len(sparse), len(dense), kv_rows
+        key_indices=perm.to(device),
+        sparse_indices=torch.tensor(sparse, dtype=torch.long, device=device),
+        dense_indices=torch.tensor(dense, dtype=torch.long, device=device),
+        protected_keys=torch.tensor(sorted(protected), dtype=torch.long, device=device),
+        image_groups=tuple(torch.tensor(group, dtype=torch.long, device=device) for group in image_groups if group),
+        image_query_blocks=torch.tensor(image_query_blocks, dtype=torch.long, device=device),
+        sparse_rows=len(sparse),
+        dense_rows=len(dense),
+        key_rows=kv_rows,
     )
 
 
@@ -122,8 +169,7 @@ def run(
     scale: float,
     *,
     precision: str = "bf16",
-    ref_selection: tuple[tuple[tuple[int, ...], ...], tuple[int, ...]] | None = None,
-    ref_keep_ratio: float = 1.0,
+    image_sparsity: float = 0.0,
 ) -> torch.Tensor:
     if precision not in ("bf16", "mix"):
         raise ValueError("unsupported rectangular precision")
@@ -143,7 +189,6 @@ def run(
     kr = k.index_select(1, plan.key_indices)
     vr = v.index_select(1, plan.key_indices)
     out = torch.empty_like(q)
-    mask = None
     if plan.sparse_rows:
         qs = q.index_select(1, plan.sparse_indices)
         qp = avgpool(qs, 128, "BSND")
@@ -155,12 +200,17 @@ def run(
         mask = probs >= threshold
         if plan.protected_keys.numel():
             mask[:, :, :, plan.protected_keys] = True
-        if ref_keep_ratio < 1.0:
-            from mindiesd.layers.flash_attn.ref_sparse_mask import apply_ref_mask
-
-            if ref_selection is None:
-                raise ValueError("reference selection requires an image/query ownership plan")
-            mask = apply_ref_mask(mask, scores, ref_selection, ref_keep_ratio)
+        # Match RF-v3: overwrite just the complete image columns on eligible
+        # query blocks, ranking by the original Q/K scores before softmax.
+        rows = plan.image_query_blocks
+        if image_sparsity > 0 and rows.numel():
+            for columns in plan.image_groups:
+                values = scores[..., rows[:, None], columns[None, :]]
+                keep = max(1, math.ceil(columns.numel() * (1 - image_sparsity)))
+                selected = values.topk(keep, dim=-1).indices
+                mask[..., rows[:, None], columns[None, :]] = torch.zeros_like(values, dtype=torch.bool).scatter_(
+                    -1, selected, True
+                )
         ys = native(qs, kr, vr, mask.to(torch.int8), scale)
         out.index_copy_(1, plan.sparse_indices, ys)
     if plan.dense_rows:

@@ -136,8 +136,11 @@ stream in layer order and released when the request closes.
 Reference reuse does not install an adapter or change weight loading. A request
 keeps its model and adapter fixed for the denoise run; its cache closes before
 another request can reuse storage. Refresh intervals are independent of the
-step count. Per-image reference selection is a separate RainFusion option and
-requires exact image ownership metadata. See the
+step count. Per-image reference sparsity is a separate RainFusion option.
+H3 publishes each image's original token offset and two-dimensional grid.
+On A5 reuse steps, Omni maps that same RainFusion block layout to cached KV
+and compact Q indices. Block scores cover only surviving sparse query blocks
+against the full KV sequence. See the
 [reference optimization recipe](../../../../recipes/h3_ref_optimizations/README.md)
 for configuration, its independent MindIE-SD dependency and validation limits.
 

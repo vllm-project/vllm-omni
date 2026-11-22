@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
+from vllm_omni.diffusion.attention.backends.abstract import ImageTokenSpan, VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
@@ -152,7 +152,10 @@ class MiniMaxH3DenoiseBranch:
             self.static_kwargs["video_token_layout"] = VideoTokenLayout(
                 used_len=int(cu[1]),
                 video_spans=spans,
-                reference_image_spans=tuple(packed.get("reference_image_spans", ())),
+                image_spans=tuple(
+                    ImageTokenSpan(start=span["start"], latent_grid=span["latent_grid"])
+                    for span in packed.get("image_spans", ())
+                ),
             )
             # FastH3-specific prefix geometry belongs to MiniMax-H3's packed
             # attention contract, not the shared VideoTokenLayout interface.

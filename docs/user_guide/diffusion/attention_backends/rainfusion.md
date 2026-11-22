@@ -115,31 +115,32 @@ for the shared configuration structure and index semantics.
 
 ## Reference-image block selection
 
-Set `rainfusion.ref_keep_ratio` alongside `block_sparse` in an attention spec:
+Set `rainfusion.image_sparsity` alongside `block_sparse` in an attention spec:
 
 ```json
 {
   "default": {
     "backend": "RAINFUSION_ATTN",
     "block_sparse": {"sparsity": 0.8, "precision": "mix"},
-    "rainfusion": {"ref_keep_ratio": 0.1}
+    "rainfusion": {"image_sparsity": 0.9}
   }
 }
 ```
 
-The ratio must be in `(0, 1]`; default 1 preserves the original mask. Values
-below 1 require positive block sparsity and a MindIE-SD build containing
-[PR #842](https://gitcode.com/Ascend/MindIE-SD/pull/842/discuss). For each image,
-head and eligible target query block, selection keeps `max(1, ceil(N * ratio))`
-of that image's N candidate key blocks, independently of global top-k. Selected
-connections can be restored even when global top-k removed them. Mixed image
-blocks and protected rows/blocks retain their protection. Models must supply
-exact reference-image ownership; the backend does not infer it from a prefix.
+`image_sparsity` is the fraction of each image's candidate key blocks dropped,
+in `[0, 1]` with default `0`. It requires a MindIE-SD build containing
+[PR #859](https://gitcode.com/Ascend/MindIE-SD/pull/859). Models provide each
+image's start and two-dimensional token grid. RainFusion packs each image on a
+block boundary and keeps `max(1, ceil(N * (1 - image_sparsity)))` of its `N`
+complete blocks per head and eligible video query block. The reference
+selection overwrites just those image connections after global selection and
+preserves first-frame query protection and mixed or partial image blocks.
 
 MiniMax-H3 supplies this metadata for full and compact reference-KV attention.
 On A5, its rectangular path supports BF16 and mix with unquantized cached KV.
 An explicit floating-point KV precision override also selects BF16 rectangular
-execution. Ring parallelism is unsupported. Reference selection changes the
+execution. Reuse steps score surviving sparse queries against the full KV block
+layout. Ring parallelism is unsupported. Reference selection changes the
 attention mask and does not reduce the reference KV allocation.
 
 Use the existing attention schedule to vary target sparsity across steps. Each

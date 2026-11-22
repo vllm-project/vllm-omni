@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import (
+    ReferenceImageLayout,
     VideoTokenLayout,
     VideoTokenSpan,
 )
@@ -100,11 +101,10 @@ def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
 
 def _compact_reference_video_layout(
     layout: VideoTokenLayout,
-    reference_positions: torch.Tensor,
+    positions: tuple[int, ...],
     used_length: int,
 ) -> VideoTokenLayout | None:
     """Map the surviving video frames to the target-only query layout."""
-    positions = reference_positions.detach().cpu().tolist()
     spans = layout.video_spans
     if not spans:
         if layout.prefix_len is None or layout.latent_grid is None:
@@ -139,17 +139,12 @@ def _compact_reference_video_layout(
 
 def _reference_kv_video_layout(
     original: VideoTokenLayout,
-    reference_positions: torch.Tensor,
+    positions: tuple[int, ...],
     compact: VideoTokenLayout | None,
 ) -> VideoTokenLayout | None:
-    """Keep complete reference-video spans in the cached K/V prefix.
-
-    Q has only target rows. Track images separately so RBS can select their
-    complete blocks while mixed context and partial video spans remain protected.
-    """
+    """Keep complete reference-video spans in the cached K/V prefix."""
     if compact is None:
         return None
-    positions = reference_positions.detach().cpu().tolist()
     reference_rows = len(positions)
     spans = []
     for span in original.video_spans:
@@ -164,14 +159,7 @@ def _reference_kv_video_layout(
         VideoTokenSpan(start=span.start + reference_rows, latent_grid=span.latent_grid, role=span.role)
         for span in compact.video_spans
     )
-    image_positions = []
-    for start, stop in original.reference_image_spans:
-        owned = tuple(i for i, position in enumerate(positions) if start <= position < stop)
-        if len(owned) != stop - start:
-            raise ValueError("reference image not fully represented in cached prefix")
-        image_positions.append(owned)
     return VideoTokenLayout(
-        reference_image_positions=tuple(image_positions),
         used_len=compact.used_len + reference_rows,
         video_spans=tuple(sorted(spans, key=lambda span: span.start)),
     )
@@ -1586,16 +1574,15 @@ class MiniMaxH3DiTModel(nn.Module):
             block_video_layout = None
             if video_layout is not None:
                 if not hasattr(reference_kv_state, "_compact_video_layout"):
+                    positions = tuple(reference_kv_state.global_reference_positions.cpu().tolist())
                     reference_kv_state._compact_video_layout = _compact_reference_video_layout(
-                        video_layout,
-                        reference_kv_state.global_reference_positions,
-                        block_max_seqlen,
+                        video_layout, positions, block_max_seqlen
                     )
                     reference_kv_state._reference_kv_video_layout = _reference_kv_video_layout(
-                        video_layout,
-                        reference_kv_state.global_reference_positions,
-                        reference_kv_state._compact_video_layout,
+                        video_layout, positions, reference_kv_state._compact_video_layout
                     )
+                    if video_layout.image_spans:
+                        reference_kv_state._reference_image_layout = ReferenceImageLayout(video_layout, positions)
                 block_video_layout = reference_kv_state._compact_video_layout
 
         control_rows = kwargs.get("control_rows")

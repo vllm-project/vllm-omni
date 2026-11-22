@@ -18,11 +18,11 @@ cd vllm-omni
 VLLM_OMNI_TARGET_DEVICE=npu pip install -e . --no-build-isolation
 ```
 
-Reference block selection additionally needs a MindIE-SD build containing
-[PR #842](https://gitcode.com/Ascend/MindIE-SD/pull/842/discuss), including its
-full-keep boundary correction. The dependency revision used during preparation
-is `98fd99717182623bbfa952dd676f6865f2729f9d`; it is installed separately from
-vLLM-Omni. No new native attention operator is introduced by this branch.
+Reference-image sparsity uses the official MindIE-SD implementation from
+[PR #859](https://gitcode.com/Ascend/MindIE-SD/pull/859). Build MindIE-SD from
+official `dev` at `b7386be8b8397581a63dcc78d73feb64eabe92a0` and install it
+separately from vLLM-Omni. The rectangular reuse path uses the image-aware RF
+permutation helper from that revision.
 
 ## Add reference KV reuse
 
@@ -51,33 +51,31 @@ Compact SP transport padding is excluded from attention and cache capture.
 ## Add reference-image sparsity
 
 For an existing RainFusion deployment, retain its `block_sparse` options and add
-`rainfusion.ref_keep_ratio` in the same attention spec. For example:
+`rainfusion.image_sparsity` in the same attention spec. For example:
 
 ```bash
---diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"ref_keep_ratio":0.1}}}'
+--diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"image_sparsity":0.9}}}'
 ```
 
-This option can be used with or without reference KV reuse. It requires positive
-block sparsity and exact reference-image ownership, which MiniMax-H3 supplies.
-Other backends do not consume the option; selecting RainFusion changes the
-attention backend if your deployment previously used another one.
+MiniMax-H3 supplies each reference image's start and two-dimensional token grid.
+`image_sparsity` is the fraction of candidate blocks dropped, in `[0, 1]`, with
+default `0` disabling image sparsity. The option can be used with or without
+reference KV reuse and independently of video sparsity.
 
-For each image, head and eligible target query block, selection keeps
-`max(1, ceil(N * ratio))` of that image's N candidate key blocks. It can restore
-connections removed by global top-k, then drops the other candidates in that
-image group. Mixed image blocks and protected rows/blocks remain protected.
-Reference videos and audio do not use this image keep ratio.
+RainFusion packs each image on a block boundary. For each eligible video query
+block, head and image, it keeps `max(1, ceil(N * (1 - image_sparsity)))` of the
+image's `N` complete candidate blocks. First-frame query blocks and mixed or
+partial image blocks retain their protection. This changes attention
+connections while retaining the reference KV allocation.
 
-The ratio must be in `(0, 1]`. Default 1 preserves the original reference mask.
-Selection changes attention connections; it does not shrink the reference KV
-pool or remove reference keys from the sequence.
+Full-length steps use the MindIE-SD API. On compact reuse steps, Omni maps
+the same block layout to the cached KV and surviving Q positions, then selects
+blocks from the rectangular score matrix.
 
 When combined with compact reference KV on A5, the rectangular attention path
 supports BF16 and mix. Mix uses the existing MindIE-SD Q/K INT8 and V FP8
-quantization functions and operator; cached KV and outputs remain BF16. This
-integration adapts the shorter Q sequence and its block mapping. It does not
-introduce a new quantization algorithm. Other precision/backend combinations
-require separate compatibility validation.
+quantization functions and operator; cached KV and outputs remain BF16. Other precision and backend
+combinations require separate compatibility validation.
 
 ## Recommended eight-step LoRA configuration
 
@@ -105,7 +103,7 @@ vllm serve "$MODEL" --omni --task-type ref2va \
     --vae-parallel-mode tile --vae-use-tiling --vae-patch-parallel-size 4 \
     --lora-path "$LORA" --lora-backend distill --lora-scale 1 \
     --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}' \
-    --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"ref_keep_ratio":0.1}}}' \
+    --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix"},"rainfusion":{"image_sparsity":0.9}}}' \
     --kv-offload-config '{"mode":"on","kv_storage":"npu","kv_refresh_interval":8,"kv_host_quantization":"none"}'
 ```
 
@@ -148,7 +146,7 @@ if your workload benefits from different sparsity at different steps. The
 following is an optional working point; neither extension requires it:
 
 ```bash
---diffusion-attention-schedule '{"profiles":{"late":{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.85,"precision":"mix"},"rainfusion":{"ref_keep_ratio":0.1}}}},"default":[{"start":2,"end":null,"profile":"late"}]}'
+--diffusion-attention-schedule '{"profiles":{"late":{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.85,"precision":"mix"},"rainfusion":{"image_sparsity":0.9}}}},"default":[{"start":2,"end":null,"profile":"late"}]}'
 ```
 
 Each profile is a complete configuration. Keep the base attention configuration

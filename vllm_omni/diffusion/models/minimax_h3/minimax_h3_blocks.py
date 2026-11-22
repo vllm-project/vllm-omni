@@ -458,6 +458,9 @@ class MiniMaxH3Attention(nn.Module):
                 kv_video_layout = getattr(reference_kv_state, "_reference_kv_video_layout", None)
                 if kv_video_layout is not None:
                     extra["minimax_h3_reference_kv_video_layout"] = kv_video_layout
+                image_layout = getattr(reference_kv_state, "_reference_image_layout", None)
+                if image_layout is not None:
+                    extra["minimax_h3_reference_image_layout"] = image_layout
 
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
