@@ -870,16 +870,22 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             plan=plan.flatten(), num_passes=len(plan.passes), kernel=self._maskless_kernel_name()
         )
 
+    def _flat_kv_pools(self, kv_cache: Any) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Per-layer ``[slots, H_kv, D]`` views of the paged pools, indexed by flat slot id."""
+        # The engine caches are ``[num_blocks, block_size, H_kv, D]``; slot ids are
+        # ``block_id * block_size + offset``, so dim 0 must span every slot.
+        return [
+            (kv_cache.key_cache(layer).flatten(0, 1), kv_cache.value_cache(layer).flatten(0, 1))
+            for layer in range(self.transformer.num_hidden_layers)
+        ]
+
     def _history_kv(
         self, state: Cosmos3NanoSimAutoSessionState, bound: Any
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
         if not state.ring_metadata:
             return None
         if bound is not None:
-            return [
-                (bound.kv_cache.key_cache(layer), bound.kv_cache.value_cache(layer))
-                for layer in range(self.transformer.num_hidden_layers)
-            ]
+            return self._flat_kv_pools(bound.kv_cache)
         assert state.dense_ring is not None
         return state.dense_ring.layer_kv()
 
@@ -1022,10 +1028,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             slots = compute_slot_mapping(table, torch.arange(start, start + state.frame_unit), kv_cache.block_size).to(
                 self.device
             )
-            pools = [
-                (kv_cache.key_cache(layer), kv_cache.value_cache(layer))
-                for layer in range(self.transformer.num_hidden_layers)
-            ]
+            pools = self._flat_kv_pools(kv_cache)
             if num_real < state.frame_unit:
                 padding = slots[num_real:]
                 for key_pool, value_pool in pools:
