@@ -63,11 +63,12 @@ The CUDA duplex profile uses MRv2 on all three stages.
 
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
-matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA also
-requires TF32 to be allowed; NPU fusion is independent of TF32. Set
+matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA
+FP32 fusion requires TF32 to be allowed. With `token2wav_float16: true` or
+`cfm_float16: true`, CUDA fusion is independent of TF32, as is NPU fusion. Set
 `cfm_fused_body: false` in the stage connector extra to restore the original
 body. On CUDA, disabling `token2wav_allow_tf32` or setting
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body` setting takes precedence. Startup precapture includes query
 buckets for final chunks with encoder lookahead, after steady-state buckets
 and within `cfm_max_graphs`. Capture logs report host warmup and capture times.
@@ -84,14 +85,16 @@ apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
 
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
-allowed) and on NPU. NVIDIA SM80+ uses tiled TF32 attention; older CUDA devices
-use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
+allowed or FP16 CFM is selected) and on NPU. NVIDIA SM80+ uses the existing
+tiled attention kernel for both FP32 and FP16 Q/K/V, including the non-pooled
+CFM arena. FP32 uses TF32 dots; FP16 uses FP16 dots with FP32 accumulation.
+Older CUDA devices use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts and cache types
 retain the original body. CUDA supports matching FP32 or FP16 estimator/cache
 types; NPU supports FP32. Other platforms retain their existing default.
 Set `cfm_fused_body: false` in connector `extra` to restore the original body.
 On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body: true` overrides that choice and may use TF32 attention.
 Slot pooling and its `cfm_row_offset_merge` option remain opt-in. Fusion changes
 floating-point rounding and does not promise identical waveforms.
@@ -423,6 +426,32 @@ staging tensor and written to the caller's `(N, C, W)` cache in a single
 transpose per body, instead of a per-block gather/transpose/copy or a per-block
 Triton kernel. The whole-block CNN cache is transposed to frames-major once per
 body rather than per block. CUDA and the unfused DiT body are unaffected.
+
+## NPU packed QKV normalization and cache writes
+
+The NPU fused CFM body reuses `qkv_head_layer_norm` for FP32 packed QKV with
+standard per-head LayerNorm. One Triton kernel reads the packed projection,
+normalizes Q/K in FP32 and writes Q plus the current K/V frames directly into
+the existing split cache. LayerNorm epsilon and affine parameters are retained;
+NPU launch disables implicit floating-point multiply/add contraction. Reduction
+rounding can differ from ACLNN, so this does not promise bitwise-identical audio.
+Unsupported types, partial affine parameters, indexed slot writes and environments
+without Triton retain the native operator path. CUDA launch behavior is unchanged.
+History copies, masked cache-gap clearing, attention masks and attention itself
+retain their existing semantics.
+
+Eligible NPU inputs automatically use the shared fused kernel; unsupported
+inputs use its native fallback. No deployment switch is required.
+
+Migration: the former stage-2 `additional_config.code2wav_fused_qkv_norm`
+key has been removed. A leftover value, including `false`, is ignored and
+does not disable fusion after restart. Remove this key from deployment and
+overlay YAML files. The NPU stage reader emits a one-time warning when it
+encounters the stale key; eligible FP32 inputs still automatically use fusion,
+and unsupported inputs retain the native fallback.
+
+NPU compilation, graph replay, numerical parity and service performance must be
+validated on the target stack; implementation alone does not establish a speedup.
 
 ## Reference prefetch at higher concurrency
 

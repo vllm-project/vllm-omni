@@ -134,6 +134,57 @@ def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypat
     assert "base_layer" not in manager._supported_lora_modules
 
 
+def test_runtime_adapter_round_trip_preserves_installed_factors(monkeypatch):
+    import vllm_omni.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(manager_mod, "from_layer", lambda *, layer, **_: _DummyBaseLayerWithLoRA(layer))
+    monkeypatch.setattr(manager_mod, "replace_submodule", fake_replace_submodule)
+    source, target = (
+        DiffusionLoRAManager(
+            pipeline=_DummyPipeline(),
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            max_cached_adapters=1,
+        )
+        for _ in range(2)
+    )
+    weights = LoRALayerWeights(
+        "transformer.foo",
+        rank=2,
+        lora_alpha=6,
+        lora_a=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
+        lora_b=torch.arange(8, dtype=torch.bfloat16).reshape(4, 2),
+    ).optimize()
+    source._registered_adapters[7] = LoRAModel(7, 2, {weights.module_name: weights})
+    expected = source.runtime_adapter_fingerprint(7)
+    payload = source.export_runtime_adapter(7, max_bytes=4096)
+    with pytest.raises(ValueError, match="byte budget"):
+        target.restore_runtime_adapter(payload, max_bytes=len(payload) - 1)
+    assert not target.list_adapters()
+    assert target.restore_runtime_adapter(payload, max_bytes=4096)
+    assert target.restore_runtime_adapter(payload, max_bytes=4096)
+    assert target.runtime_adapter_fingerprint(7) == expected
+
+    snapshot = manager_mod.msgspec.msgpack.decode(payload, type=manager_mod._RuntimeAdapterSnapshot)
+    invalid = manager_mod.msgspec.msgpack.encode(
+        manager_mod._RuntimeAdapterSnapshot(8, max(target._VALID_MAX_RANKS) + 1, snapshot.fingerprint, snapshot.factors)
+    )
+    with pytest.raises(ValueError, match="rank"):
+        target.restore_runtime_adapter(invalid, max_bytes=4096)
+    assert target.list_adapters() == [7]
+    assert target.runtime_adapter_fingerprint(7) == expected
+    actual = target.installed_runtime_adapter(7).loras[weights.module_name]
+    assert type(actual.scaling) is type(weights.scaling)
+    torch.testing.assert_close(actual.lora_a, weights.lora_a, rtol=0, atol=0)
+    torch.testing.assert_close(actual.lora_b, weights.lora_b, rtol=0, atol=0)
+    actual.lora_b.add_(1)
+    changed = target.runtime_adapter_fingerprint(7)
+    with pytest.raises(ValueError, match="already installed"):
+        target.restore_runtime_adapter(payload, max_bytes=4096)
+    assert target.runtime_adapter_fingerprint(7) == changed
+
+
 def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
     import vllm_omni.lora.manager as manager_mod
 

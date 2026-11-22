@@ -732,6 +732,58 @@ def test_cosmos3_images_api_keeps_image_and_video_tasks(test_client, deploy_over
     assert response.json()["data"][0]["b64_json"]
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["robbyant/lingbot-video-dense-1.3b", "robbyant/lingbot-video-moe-30b-a3b"],
+)
+def test_lingbot_images_api_accepts_single_frame_with_video_defaults(test_client, mock_async_diffusion, model):
+    config = StageConfigFactory.create_typed_default_diffusion(model, {"model_class_name": "LingBotVideoPipeline"})
+    assert config.stage_configs[0].final_output_type == "video"
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+    test_client.app.state.openai_serving_models = _DiffusionServingModels([BaseModelPath(name=model, model_path=model)])
+    mock_async_diffusion.default_sampling_params_list[0].num_frames = 81
+
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "model": model,
+            "prompt": "a robotic arm picks up a red block",
+            "size": "320x192",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_frames": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 3.0,
+            "flow_shift": 3.0,
+            "seed": 42,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["b64_json"]
+    assert test_client.app.state.supported_tasks == ("x2i", "x2v")
+    assert mock_async_diffusion.captured_prompt["modalities"] == ["image"]
+    assert mock_async_diffusion.captured_sampling_params_list[0].num_frames == 1
+    assert mock_async_diffusion.default_sampling_params_list[0].num_frames == 81
+
+
+@pytest.mark.parametrize("model_class", ["LingBotWorldCausalDMDPipeline", "WanPipeline"])
+def test_video_only_pipeline_rejects_image_generation(test_client, mock_async_diffusion, model_class):
+    config = StageConfigFactory.create_typed_default_diffusion("test-model", {"model_class_name": model_class})
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+
+    response = test_client.post(
+        "/v1/images/generations", json={"prompt": "a robotic arm picks up a red block", "num_frames": 1}
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == "The model does not support image generation"
+    assert test_client.app.state.supported_tasks == ("x2v",)
+    assert mock_async_diffusion.generate_calls == 0
+
+
 def test_generate_images_guardrail_error_returns_400(test_client, mock_async_diffusion):
     async def blocked_generate(**kwargs):
         raise GuardrailViolationError("Input was blocked by Cosmos3 guardrails.")
