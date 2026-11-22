@@ -2227,7 +2227,7 @@ class TestMmapValidation:
         )
 
         assert result.plan is None
-        assert "1 required DiT tensors" in result.fallback_reason
+        assert "1 required component tensors" in result.fallback_reason
         assert pipeline.transformer.blocks[0].weight is original_weight
         assert not original_weight.is_meta
 

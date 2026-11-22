@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, TypeVar
 
+from .offload_plan import BackingKind
+
 DIT_COMPONENT = "dit"
 TEXT_ENCODER_COMPONENT = "text_encoder"
 OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT, TEXT_ENCODER_COMPONENT})
@@ -445,3 +447,34 @@ def should_offload_component(config: Any, component: str) -> bool:
 def any_selected_component_uses_allgather(config: Any) -> bool:
     """Return whether an enabled layer backend requires weight collectives."""
     return resolve_offload(config).any_allgather
+
+
+def validate_disk_backing(
+    *,
+    backing: BackingKind,
+    one_shot: bool,
+    use_hsdp: bool,
+    dp_size: int,
+    uses_allgather: bool,
+) -> str | None:
+    """Return a fail-closed reason when a disk-streaming backing cannot be served.
+
+    Disk streaming needs a single-rank, rank-local, HSDP-free, one-shot
+    configuration. ``dp_size > 1`` with AllGather transport means the loader
+    re-assembles shards through a collective, which has no sequential mmap
+    source; ``PINNED`` (the loader fallback) is the only safe answer. The
+    loader-side preflight in ``build_checkpoint_mmap_plan`` separately rejects
+    TP>1 and online quantization, so those constraints do not surface here.
+
+    ``DISK`` additionally requires one-shot sequential access because it has no
+    random-access backing store in this release.
+    """
+    if backing not in (BackingKind.CHECKPOINT_MMAP, BackingKind.DISK):
+        return None
+    if use_hsdp:
+        return "HSDP requires the ordinary loader"
+    if dp_size > 1 and uses_allgather:
+        return "disk backing requires rank-local transfer"
+    if backing is BackingKind.DISK and not one_shot:
+        return "DISK backing requires one-shot sequential access"
+    return None

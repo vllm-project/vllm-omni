@@ -218,33 +218,33 @@ def _is_persistent_buffer(module: nn.Module, local_name: str) -> bool:
     return parts[-1] not in owner._non_persistent_buffers_set
 
 
-def _collect_required_dit_tensors(
-    dit_modules: Sequence[tuple[str, nn.Module]],
+def _collect_required_component_tensors(
+    component_modules: Sequence[tuple[str, nn.Module]],
 ) -> dict[str, torch.Tensor]:
     required: dict[str, torch.Tensor] = {}
-    for dit_name, dit_module in dit_modules:
-        for local_name, tensor in dit_module.named_parameters():
-            required[f"{dit_name}.{local_name}"] = tensor
-        for local_name, tensor in dit_module.named_buffers():
-            if _is_persistent_buffer(dit_module, local_name):
-                required[f"{dit_name}.{local_name}"] = tensor
+    for component_name, component_module in component_modules:
+        for local_name, tensor in component_module.named_parameters():
+            required[f"{component_name}.{local_name}"] = tensor
+        for local_name, tensor in component_module.named_buffers():
+            if _is_persistent_buffer(component_module, local_name):
+                required[f"{component_name}.{local_name}"] = tensor
     return required
 
 
 def _planned_source_prefixes(
     sources: Sequence[object],
-    dit_modules: Sequence[tuple[str, nn.Module]],
+    component_modules: Sequence[tuple[str, nn.Module]],
 ) -> frozenset[str]:
-    """Identify component sources that the DiT-only plan owns completely."""
+    """Identify component sources that the checkpoint-mmap plan owns completely."""
     if not sources:
         return frozenset()
 
-    expected = frozenset(f"{dit_name}." for dit_name, _ in dit_modules)
+    expected = frozenset(f"{component_name}." for component_name, _ in component_modules)
     available = {getattr(source, "prefix", "") for source in sources}
     missing = sorted(expected - available)
     if missing:
         raise _PlanIncompatibleError(
-            f"direct mmap requires a dedicated component weight source for each DiT; missing prefixes: {missing}"
+            f"direct mmap requires a dedicated component weight source for each component; missing prefixes: {missing}"
         )
     return expected
 
@@ -338,9 +338,10 @@ def build_checkpoint_binding_plan(
     if not callable(remap_fn):
         remap_fn = None
     adapter = get_direct_mmap_adapter(pipeline)
+    component_modules = tuple(dit_modules)
 
     try:
-        planned_source_prefixes = _planned_source_prefixes(sources, dit_modules)
+        planned_source_prefixes = _planned_source_prefixes(sources, component_modules)
         planned_sources = tuple(
             source for source in sources if getattr(source, "prefix", "") in planned_source_prefixes
         )
@@ -349,14 +350,14 @@ def build_checkpoint_binding_plan(
             model_path=model_path,
             remap_fn=remap_fn,
         )
-        required = _collect_required_dit_tensors(dit_modules)
+        required = _collect_required_component_tensors(component_modules)
         if not required:
-            raise _PlanIncompatibleError("no DiT parameters or persistent buffers were discovered")
+            raise _PlanIncompatibleError("no component parameters or persistent buffers were discovered")
 
         missing = sorted(set(required) - set(model_to_ckpt))
         if missing:
             raise _PlanIncompatibleError(
-                f"{len(missing)} required DiT tensors have no checkpoint binding (first 5: {missing[:5]})"
+                f"{len(missing)} required component tensors have no checkpoint binding (first 5: {missing[:5]})"
             )
 
         bindings: dict[str, TensorBinding] = {}
