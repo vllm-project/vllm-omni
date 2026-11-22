@@ -223,6 +223,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         # Later forwards of a chunk reuse the control K/V of its first forward
         # (exact; ``model_config["reuse_control_kv"] = False`` recomputes it for A/B checks).
         self._reuse_control_kv = bool((od_config.model_config or {}).get("reuse_control_kv", True))
+        # Plans of the current rollout only: keys include its caption lengths, so they
+        # rarely repeat across requests, and each plan holds device index tensors.
         self._plan_cache: dict[tuple, CausalMasklessPlan] = {}
         self._states: OrderedDict[str, Cosmos3NanoSimAutoSessionState] = OrderedDict()
 
@@ -403,7 +405,11 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         this pipeline defaults it to true, so a reset also releases the bound
         session's KV pages and caption cache here. Without that, the pool would
         still hold the previous rollout's ring when the new one commits chunk 0.
+
+        It also drops the previous rollout's attention plans, which bounds the
+        plan cache to one rollout.
         """
+        self._plan_cache.clear()
         if reset:
             self._drop_session(session_id)
             if bound is not None:

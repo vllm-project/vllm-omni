@@ -707,7 +707,7 @@ class _RunnerSessionKV:
 
 
 def _session_host() -> SimpleNamespace:
-    host = SimpleNamespace(_states=OrderedDict(), _SESSION_CAPACITY=1)
+    host = SimpleNamespace(_states=OrderedDict(), _SESSION_CAPACITY=1, _plan_cache={})
     for name in ("_drop_session", "_get_or_create_state", "_begin_rollout", "_end_rollout"):
         setattr(host, name, functools.partial(getattr(pipeline.Cosmos3NanoSimAutoPipeline, name), host))
     return host
@@ -751,6 +751,25 @@ def test_kept_session_holds_its_ring_until_a_reset_rollout_releases_it() -> None
     fresh = _rollout(host, bound, reset=True, close_session=False)
     assert bound.resets == 1 and bound.pages == [2, 3]
     assert host._states["default"] is fresh and kept.fingerprint is None
+
+
+@pytest.mark.parametrize("reset", [True, False])
+def test_each_rollout_starts_with_an_empty_plan_cache(reset: bool) -> None:
+    # Plan keys include the request's caption lengths, so plans kept across rollouts
+    # would accumulate device index tensors for every distinct prompt.
+    host = _session_host()
+    state = _plan_state(1, 19 * 4 / 30)
+    chunk = build_chunk_schedule(rgb_latents=19, lidar_sweeps=None, frames_per_chunk=3, rgb_seconds_per_frame=4 / 30)[0]
+    metadata, _ = chunk_token_metadata(
+        _items(chunk, num_views=1, rgb_seconds_per_frame=4 / 30), step=0, pass_kind="noisy"
+    )
+    planner = _plan_host()
+    planner._runtime_plan(state, metadata, None)
+    host._plan_cache.update(planner._plan_cache)
+    assert host._plan_cache
+
+    host._begin_rollout("default", reset=reset, bound=None)
+    assert host._plan_cache == {}
 
 
 def test_dense_rollouts_drop_pipeline_state_by_the_same_flags() -> None:
