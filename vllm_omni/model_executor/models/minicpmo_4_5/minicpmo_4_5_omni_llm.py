@@ -2567,19 +2567,6 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         )
 
 
-def get_version_by_config(config: PretrainedConfig) -> tuple[int, ...]:
-    version_float = getattr(config, "version", None)
-
-    # The old configs do not include version number
-    # TODO: Remove this after the HF repos are updated
-    if version_float is None:
-        if config.hidden_size == 2304 and config.query_num == 64:
-            return (2, 0)
-        return (2, 5)
-    version_str = str(version_float)
-    return tuple(int(x) for x in version_str.split("."))
-
-
 _MAX_FRAMES_PER_VIDEO = 64
 
 
@@ -2601,11 +2588,7 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         return self._lazy_tokenizer
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        mm_limits = {"image": None, "audio": None}
-        if self.get_model_version() in {(2, 6), (4, 0), (4, 5)}:
-            mm_limits["video"] = None
-
-        return mm_limits
+        return {"image": None, "audio": None, "video": None}
 
     def get_audio_placeholder(
         self,
@@ -2697,8 +2680,9 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
 
         return hf_processor
 
-    def get_model_version(self):
-        return get_version_by_config(self.get_hf_config())
+    def get_model_version(self) -> tuple[int, int]:
+        # Required by the upstream MiniCPMV processor's prompt batching helper.
+        return (4, 5)
 
     def get_image_processor(self, **kwargs: object):
         return self.get_hf_processor(**kwargs).image_processor
@@ -2706,17 +2690,11 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_slice_image_placeholder(
         self,
         image_size: ImageSize,
-        # For MiniCPM V/O 2.6
         image_idx: int = 0,
         max_slice_nums: int | None = None,
         use_image_id: bool = True,
     ) -> str:
         image_processor = self.get_image_processor()
-        version = self.get_model_version()
-
-        if version == (2, 0) or version == (2, 5):
-            return image_processor.get_slice_image_placeholder(image_size)
-
         return image_processor.get_slice_image_placeholder(
             image_size,
             image_idx=image_idx,
@@ -2727,15 +2705,9 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_sliced_grid(
         self,
         image_size: ImageSize,
-        # For MiniCPM V/O 2.6
         max_slice_nums: int | None = None,
     ) -> tuple[int, int] | None:
         image_processor = self.get_image_processor()
-        version = self.get_model_version()
-
-        if version == (2, 0) or version == (2, 5):
-            return image_processor.get_sliced_grid(image_size)
-
         if max_slice_nums is None:
             max_slice_nums = image_processor.max_slice_nums
 
@@ -3578,13 +3550,11 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_output_dim = int(self.apm.config.encoder_ffn_dim // 4)
             self.audio_avg_pooler = nn.AvgPool1d(config.audio_pool_step, stride=config.audio_pool_step)
             self.audio_projection_layer = MultiModalProjector(in_dim=audio_output_dim, out_dim=embed_dim)
-            self.audio_encoder_layer = -1
             self.audio_past_key_values = None
         else:
             self.apm = None
             self.audio_avg_pooler = None
             self.audio_projection_layer = None
-            self.audio_encoder_layer = None
             self.audio_past_key_values = None
 
         # Ascend Conv1d must stay outside NPUGraph; CUDA retains the full
@@ -3891,7 +3861,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if (
             graph is not None
             and not self.training
-            and self.audio_encoder_layer == -1
             # Whisper's FP16 overflow guard reads tensor booleans on the host.
             and self.apm.conv1.weight.dtype != torch.float16
         ):
@@ -3933,26 +3902,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def _encode_audio_features(self, wavforms: torch.Tensor, audio_attention_mask: torch.Tensor) -> torch.Tensor:
         """Stateless audio encoder, projection and pooling (no streaming KV)."""
-        selects_final_layer = self.audio_encoder_layer == -1
         audio_outputs = self.apm(
             wavforms,
             attention_mask=audio_attention_mask,
-            output_hidden_states=not selects_final_layer,
+            output_hidden_states=False,
         )
-        if selects_final_layer:
-            audio_states = audio_outputs.last_hidden_state
-        else:
-            # Whisper follows the Hugging Face hidden-state ordering: the
-            # embedding output, followed by each encoder layer output.
-            assert audio_outputs.hidden_states is not None
-            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
-        audio_embeds = self.audio_projection_layer(audio_states)
-
-        audio_embeds = audio_embeds.transpose(1, 2)
-        audio_embeds = self.audio_avg_pooler(audio_embeds)
-        audio_embeds = audio_embeds.transpose(1, 2)
-
-        return audio_embeds
+        return self._project_pooled_audio(audio_outputs.last_hidden_state)
 
     def get_audio_embedding_streaming(
         self,
@@ -4018,29 +3973,19 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             device=wavforms.device,
         )
 
-        # As in get_audio_embedding: every layer's output only to pick the last one keeps 25 activations alive.
-        selects_final_layer = self.audio_encoder_layer == -1
         audio_outputs = self.apm(
             wavforms,
             past_key_values=self.audio_past_key_values,
             use_cache=True,
-            output_hidden_states=not selects_final_layer,
+            output_hidden_states=False,
             attention_mask=audio_attention_mask,
             use_extra_context=use_extra_context,
             prefix_extra_frames=prefix_extra_frames,
             suffix_extra_frames=suffix_extra_frames,
             cnn_min_length=cnn_min_length,
         )
-        if selects_final_layer:
-            audio_states = audio_outputs.last_hidden_state
-        else:
-            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
         self.audio_past_key_values = audio_outputs.past_key_values
-
-        audio_embeds = self.audio_projection_layer(audio_states)
-        audio_embeds = audio_embeds.transpose(1, 2)
-        audio_embeds = self.audio_avg_pooler(audio_embeds)
-        audio_embeds = audio_embeds.transpose(1, 2)
+        audio_embeds = self._project_pooled_audio(audio_outputs.last_hidden_state)
 
         _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
         # One host read of the lengths instead of a device sync per slice bound.
@@ -4062,9 +4007,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         requested = getattr(self.config, "duplex_audio_encoder_batching", None)
         if requested is not None and not bool(requested):
             return False
-        reason = streaming_audio.streaming_batch_unsupported_reason(
-            self.apm, audio_encoder_layer=self.audio_encoder_layer
-        )
+        reason = streaming_audio.streaming_batch_unsupported_reason(self.apm)
         if reason is not None:
             logger.info("MiniCPM-o streaming audio encoder stays per-session: %s", reason)
             return False

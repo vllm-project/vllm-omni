@@ -45,7 +45,7 @@ def _thinker() -> Any:
     thinker.apm = MiniCPMWhisperEncoder(config).eval()
     thinker.audio_projection_layer = MultiModalProjector(in_dim=32, out_dim=24)  # takes ffn // 4, as the checkpoint
     thinker.audio_avg_pooler = nn.AvgPool1d(POOL, stride=POOL)
-    thinker.audio_encoder_layer, thinker.audio_past_key_values = -1, None
+    thinker.audio_past_key_values = None
     thinker.config = SimpleNamespace(audio_pool_step=POOL, duplex_audio_kv_page_positions=16)
     return thinker
 

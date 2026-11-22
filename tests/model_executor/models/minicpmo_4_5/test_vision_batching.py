@@ -39,7 +39,6 @@ class _FakeConv:
 @dataclass
 class _AudioEncoderOutput:
     last_hidden_state: torch.Tensor
-    hidden_states: tuple[torch.Tensor, ...] | None
 
 
 class _FakeVisionEncoder:
@@ -87,11 +86,7 @@ class _FakeAudioEncoder:
         self.output_hidden_states.append(output_hidden_states)
         assert attention_mask.shape == (1, 1, 2, 2)
         final = torch.full((1, 2, 4), 2.0)
-        earlier = torch.full((1, 2, 4), 1.0)
-        return _AudioEncoderOutput(
-            last_hidden_state=final,
-            hidden_states=(earlier, final) if output_hidden_states else None,
-        )
+        return _AudioEncoderOutput(last_hidden_state=final)
 
 
 class _FakeVisionModel:
@@ -104,13 +99,13 @@ class _FakeVisionModel:
 
 class _FakeAudioModel:
     _encode_audio_features = MiniCPMO45OmniLLMForConditionalGeneration._encode_audio_features
+    _project_pooled_audio = MiniCPMO45OmniLLMForConditionalGeneration._project_pooled_audio
 
-    def __init__(self, audio_encoder: _FakeAudioEncoder, audio_encoder_layer: int) -> None:
+    def __init__(self, audio_encoder: _FakeAudioEncoder) -> None:
         self.config = _AudioConfig()
         self.apm = audio_encoder
         self.audio_projection_layer = torch.nn.Identity()
         self.audio_avg_pooler = torch.nn.Identity()
-        self.audio_encoder_layer = audio_encoder_layer
 
     def _get_feat_extract_output_lengths(
         self,
@@ -162,17 +157,9 @@ def test_vision_encoder_clamps_nonpositive_batch_size(vision_batch_size: int) ->
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize(
-    ("audio_encoder_layer", "expected_value", "expected_hidden_states"),
-    [(-1, 2.0, False), (0, 1.0, True)],
-)
-def test_audio_encoder_retains_layers_only_for_nonfinal_selection(
-    audio_encoder_layer: int,
-    expected_value: float,
-    expected_hidden_states: bool,
-) -> None:
+def test_audio_encoder_uses_final_layer_without_retaining_hidden_states() -> None:
     audio_encoder = _FakeAudioEncoder()
-    model = _FakeAudioModel(audio_encoder, audio_encoder_layer)
+    model = _FakeAudioModel(audio_encoder)
 
     result = MiniCPMO45OmniLLMForConditionalGeneration.get_audio_hidden_states(
         model,
@@ -182,8 +169,8 @@ def test_audio_encoder_retains_layers_only_for_nonfinal_selection(
         },
     )
 
-    assert audio_encoder.output_hidden_states == [expected_hidden_states]
-    torch.testing.assert_close(result[0], torch.full((2, 4), expected_value))
+    assert audio_encoder.output_hidden_states == [False]
+    torch.testing.assert_close(result[0], torch.full((2, 4), 2.0))
 
 
 class _TorchResamplerAttention(torch.nn.MultiheadAttention):

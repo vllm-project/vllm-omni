@@ -140,10 +140,8 @@ def _extra_context_trim(frames: int) -> int:
     return (int(frames) + 1) // 2 if frames > 0 else 0
 
 
-def streaming_batch_unsupported_reason(encoder: nn.Module, *, audio_encoder_layer: int | None) -> str | None:
+def streaming_batch_unsupported_reason(encoder: nn.Module) -> str | None:
     """Why ``encoder`` cannot take the batched path, or ``None`` when it can."""
-    if audio_encoder_layer != -1:
-        return "only the final encoder layer output is batched"
     if encoder.training:
         return "training mode (dropout / layerdrop)"
     weight = getattr(getattr(encoder, "conv1", None), "weight", None)
