@@ -112,6 +112,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def __init__(self) -> None:
         from vllm_ascend.utils import adapt_patch
 
+        from vllm_omni.platforms.npu import log_ascend_runtime_build
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
         from vllm_omni.platforms.npu.a5_fft import apply_a5_fft_patches
         from vllm_omni.platforms.npu.ascend_warmup_patch import (
@@ -121,17 +122,18 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             apply_minicpmo_4_5_code2wav_patch,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts import (
-            apply_qwen3_tts_patches,
+            apply_qwen3_tts_code2wav_patch,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
             apply_qwen3_tts_tokenizer_v2_patch,
         )
 
+        log_ascend_runtime_build()
         adapt_patch(is_global_patch=True)
         apply_a5_fft_patches()
         apply_contiguous_kv_patch()
         apply_minicpmo_4_5_code2wav_patch()
-        apply_qwen3_tts_patches()
+        apply_qwen3_tts_code2wav_patch()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
         # The Triton rejection/penalties warmup guard for multi-frame decode must
@@ -252,6 +254,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # both multi-token updates and single-token updates in this path.
         kwargs["attn_state"] = AscendAttentionState.ChunkedPrefill
         return build_attn_metadata(**kwargs)
+
+    @classmethod
+    def apply_diffusion_model_patches(cls, model, od_config) -> None:
+        from vllm_omni.platforms.npu.models.minimax_h3_image import apply_minimax_h3_image_graphs
+
+        apply_minimax_h3_image_graphs(model, od_config)
 
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:

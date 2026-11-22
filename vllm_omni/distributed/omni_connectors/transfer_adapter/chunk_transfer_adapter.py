@@ -6,9 +6,10 @@ import importlib
 import inspect
 import threading
 import time
+from array import array
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.v1.metrics.stats import PrefillStats
@@ -16,7 +17,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.core.sched.duplex_stage_work import parse_perf_chunk, request_perf_chunk, set_request_perf_chunk
-from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY, MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
@@ -174,7 +175,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        # The chunk adapter always creates a concrete connector before the
+        # base class starts its worker threads. Connector implementations are
+        # heterogeneous and expose transport-specific methods such as
+        # ``cleanup_prefix``, so retain the existing dynamic interface here.
+        self.connector: Any = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -205,7 +210,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
         # Save-thread only: running count of segments reclaimed after finish.
@@ -213,9 +218,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -247,9 +252,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
+        if value is None:
+            return False
         if isinstance(value, torch.Tensor):
             return value.numel() == 1 and bool(value.item())
-        return bool(value) if value is not None else False
+        # Wire decode of a 0-d bool tensor can land as a 1-element list.
+        # ``bool([False])`` is True, so recurse instead of treating any
+        # non-empty container as finished. Producers never send ``finished`` as
+        # a multi-element list/tuple; ``len != 1`` is not a scalar.
+        if isinstance(value, (list, tuple)):
+            return len(value) == 1 and OmniChunkTransferAdapter._is_truthy_scalar(value[0])
+        return bool(value)
 
     @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
@@ -293,8 +306,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             ("_output_token_ids", "output_token_ids"),
         ):
             token_ids = getattr(request, private_name, None)
-            if isinstance(token_ids, list):
-                frozen_ids = token_ids.copy()
+            # vLLM 0.34 keeps token ids in array-backed TokenBuffers, which are
+            # not list instances; freeze them exactly like the list form or the
+            # snapshot would alias live storage.
+            if isinstance(token_ids, (list, array)):
+                frozen_ids = token_ids.copy() if isinstance(token_ids, list) else list(token_ids)
                 setattr(snapshot, private_name, frozen_ids)
                 setattr(snapshot, public_name, ConstantList(frozen_ids))
                 if public_name == "output_token_ids":
@@ -303,6 +319,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
+        # A received generation chunk replaces the prewarm placeholder and is
+        # scheduled as a fresh prefill. Keep the canonical request token
+        # mirrors synchronized at the replacement point so every downstream
+        # consumer observes the current prompt, regardless of its length.
+        del request._all_token_ids[:]
+        request._all_token_ids.extend(request.prompt_token_ids)
+        request._output_token_ids.clear()
         request.num_prompt_tokens = len(request.prompt_token_ids)
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
@@ -478,6 +501,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         duplex_perf_chunk: tuple[int, int] | None = None,
     ) -> dict[str, Any] | None:
         """Per-request admission of a chunk; returns the task to queue, or None."""
+        if request is None:
+            raise ValueError("save_async requires a request")
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -717,7 +742,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            # Incremental chunks keep an earlier meta.finished
+                            # (diffusion and generation tests rely on this).
+                            # A request-terminal generation chunk must publish
+                            # finished=True: Code2Wav reads it from
+                            # additional_information, not from the adapter flag.
+                            if (
+                                key == "meta"
+                                and sk == "finished"
+                                and not (payload_finished and self.model_mode == "generation")
+                            ):
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub
@@ -736,6 +770,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if not has_new_ids and payload_segment_finished:
                     # Preserve an explicit scheduler boundary even when it
                     # contains no new codec frames.
+                    request.prompt_token_ids = [0]
+                elif (
+                    not has_new_ids
+                    and payload_finished
+                    and not use_tensor_codes
+                    and self._is_truthy_scalar(meta.get(JOYAI_FINISH_ON_NEXT_STOP_KEY))
+                ):
+                    # Last-sentence empty finished marker after frames were
+                    # already sent. The Talker processor stamps this on meta;
+                    # leaving prompt_token_ids=[] parks Code2Wav in
+                    # WAITING_FOR_CHUNK. Independent Qwen3 never stamps it, so
+                    # it keeps [] and the existing pending_finish path. 2-D
+                    # empty windows (Fish Omni / Drama 3) stay [] via
+                    # use_tensor_codes.
                     request.prompt_token_ids = [0]
                 if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and
@@ -833,12 +881,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         try:
             if live and processor is not None:
                 try:
-                    outputs = [
-                        unflatten_payload(t["multimodal_output"])
-                        if isinstance(t["multimodal_output"], Mapping)
-                        else t["multimodal_output"]
-                        for t in live
-                    ]
+                    outputs = []
+                    for task in live:
+                        raw_output = task["multimodal_output"]
+                        outputs.append(
+                            unflatten_payload(cast(dict[str, Any], raw_output))
+                            if isinstance(raw_output, Mapping)
+                            else raw_output
+                        )
                     payloads = list(
                         processor(
                             self,
@@ -914,7 +964,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = unflatten_payload(cast(dict[str, Any], raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -1781,6 +1831,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
+            assert requests is not None
             request_ids = requests.keys()
 
         connector_owned_ids = {

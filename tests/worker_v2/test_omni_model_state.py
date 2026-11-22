@@ -36,15 +36,19 @@ def test_prepare_attn_forwards_release_model_specific_metadata():
 
 
 class _DummyInputBatch:
+    num_computed_prefill_tokens_np: np.ndarray
+    prefill_len_np: np.ndarray
     is_prefilling_np: np.ndarray
     req_ids: list[str]
 
     input_ids: SimpleNamespace
+    logits_indices: torch.Tensor
     query_start_loc: torch.Tensor
 
     def __init__(self, indices, *, num_computed_tokens_cpu=None):
         self.idx_mapping_np = indices
         self.num_reqs = len(indices)
+        self.logits_indices = torch.arange(self.num_reqs)
         self.num_scheduled_tokens = [1] * len(indices)
         self.query_start_loc_np = list(range(len(indices)))
         if num_computed_tokens_cpu is not None:
@@ -74,6 +78,9 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.postprocess_batch_mrv2 = None
     model.eager_decode_settled = None
     model.eager_frames_need_postprocess = True
+    # Explicit False so MagicMock does not look truthy to the eligibility helper.
+    model.requires_request_sample_eligibility = False
+    model.postprocess_requires_multimodal_outputs = False
     state.model = model
     state.scheduler_config = SimpleNamespace(max_num_seqs=max_num_reqs)
     state.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
@@ -213,6 +220,7 @@ def test_output_spans_follow_reordered_mixed_batch():
     batch.req_ids = ["prefill", "decode"]
     batch.num_scheduled_tokens = [3, 1]
     batch.query_start_loc_np = [0, 3]
+    batch.logits_indices = torch.tensor([2, 3])
     state.intermediate_buffer.buffers[2] = {"req_id": "prefill"}
     state.intermediate_buffer.buffers[0] = {"req_id": "decode"}
     seen = {}
@@ -221,7 +229,157 @@ def test_output_spans_follow_reordered_mixed_batch():
     )
     state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
     assert seen["request_token_spans"] == [(0, 3), (3, 4)]
+    assert seen["logits_index"] is batch.logits_indices
     assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
+
+    assert "request_sample_eligible" not in seen
+
+
+def _eligibility_batch(indices, req_ids, scheduled, computed, prefill_len, is_prefilling):
+    batch = _DummyInputBatch(indices)
+    batch.req_ids = list(req_ids)
+    batch.num_scheduled_tokens = list(scheduled)
+    starts = [0]
+    for count in scheduled[:-1]:
+        starts.append(starts[-1] + count)
+    batch.query_start_loc_np = starts
+    batch.num_computed_prefill_tokens_np = np.array(computed, dtype=np.int32)
+    batch.prefill_len_np = np.array(prefill_len, dtype=np.int32)
+    batch.is_prefilling_np = np.array(is_prefilling, dtype=np.bool_)
+    return batch
+
+
+def _capture_eligibility(state, batch, hidden_rows):
+    seen = {}
+    state.model.make_omni_output = lambda hidden, **kwargs: (
+        seen.update(kwargs) or OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    )
+    for i, req_id in enumerate(batch.req_ids):
+        state.intermediate_buffer.buffers[int(batch.idx_mapping_np[i])] = {"req_id": req_id}
+    state.postprocess_model_output(torch.zeros(hidden_rows, 2), batch, SimpleNamespace())
+    return seen
+
+
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_"])
+def test_postprocess_marks_warmup_ineligible_when_model_requires_eligibility(req_id):
+    # A finished dummy sequence, even a decode-flagged one, would look
+    # sample-eligible under the keep mask; warmup IDs must still be skipped
+    # so missing stage metadata does not raise.
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0],
+        [req_id],
+        scheduled=[4],
+        computed=[4],
+        prefill_len=[4],
+        is_prefilling=[False],
+    )
+    seen = _capture_eligibility(state, batch, 4)
+    assert seen["request_sample_eligible"] == [False]
+
+
+def test_postprocess_eligibility_keeps_finishing_prefill_and_skips_chunked_prefill():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    # Finishing prefill: 0 + 3 >= 3, still marked prefilling this step.
+    # Mid/chunked prefill (renamed from the old "decode" row): 5 + 1 >= 8 is
+    # false and is_prefilling=True, so both the finishing-only rule and the
+    # shared keep mask leave the row ineligible.
+    batch = _eligibility_batch(
+        [2, 0],
+        ["prefill", "chunked_prefill"],
+        scheduled=[3, 1],
+        computed=[0, 5],
+        prefill_len=[3, 8],
+        is_prefilling=[True, True],
+    )
+    seen = _capture_eligibility(state, batch, 4)
+    assert seen["request_sample_eligible"] == [True, False]
+    assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "chunked_prefill"]
+
+
+def test_postprocess_eligibility_keeps_official_decode_rows():
+    # Official InputBatch decode: is_prefilling=False and computed == prefill_len.
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0],
+        ["decode"],
+        scheduled=[1],
+        computed=[8],
+        prefill_len=[8],
+        is_prefilling=[False],
+    )
+    seen = _capture_eligibility(state, batch, 1)
+    assert seen["request_sample_eligible"] == [True]
+
+
+def test_sample_keep_mask_agrees_with_eligibility_when_counts_diverge():
+    # One shared-helper contract case, not a claim that this combination occurs
+    # on a well-formed official InputBatch (is_prefilling_np == computed < prefill_len).
+    # is_prefilling=False but 5 + 1 < 8: finishing-only eligibility would drop
+    # the row. Both callers of _sample_keep_mask must agree, so a single check
+    # of the helper plus eligibility is enough.
+    batch = _eligibility_batch(
+        [0],
+        ["decode_flagged"],
+        scheduled=[1],
+        computed=[5],
+        prefill_len=[8],
+        is_prefilling=[False],
+    )
+    mask = OmniModelState._sample_keep_mask(batch)
+    assert mask.tolist() == [True]
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    seen = _capture_eligibility(state, batch, 1)
+    assert seen["request_sample_eligible"] == [bool(v) for v in mask]
+
+
+def test_postprocess_mixed_warmup_and_real_request_eligibility():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0, 1],
+        ["_warmup_0_", "request-1"],
+        scheduled=[4, 4],
+        computed=[0, 0],
+        prefill_len=[4, 4],
+        is_prefilling=[True, True],
+    )
+    seen = _capture_eligibility(state, batch, 8)
+    assert seen["request_sample_eligible"] == [False, True]
+
+
+def test_structured_postprocess_rejects_multiple_logits_rows_per_request():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.postprocess_requires_multimodal_outputs = True
+    batch = _DummyInputBatch([0, 1])
+    batch.logits_indices = torch.tensor([0, 1, 1])
+
+    with pytest.raises(RuntimeError, match="exactly one logits row per request"):
+        state.postprocess_model_output(torch.zeros(2, 4), batch, SimpleNamespace())
+
+    state.model.make_omni_output.assert_not_called()
+
+
+def test_postprocess_eligibility_fails_loudly_when_keep_mask_arrays_are_short():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0],
+        ["request-1"],
+        scheduled=[4],
+        computed=[0],
+        prefill_len=[4],
+        is_prefilling=[True],
+    )
+    batch.num_computed_prefill_tokens_np = np.array([], dtype=np.int32)
+    state.intermediate_buffer.buffers[0] = {"req_id": "request-1"}
+    state.model.make_omni_output = lambda hidden, **kwargs: OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    with pytest.raises(ValueError, match="sample keep mask requires batch-ordered arrays"):
+        state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
 
 
 @pytest.mark.parametrize("hook_name", ["preprocess_decode_batch_mrv2", "preprocess_decode_batch", "legacy"])
@@ -275,6 +433,48 @@ def test_decode_cohort_uses_batch_hook(hook_name):
     assert torch.equal(model_inputs["input_ids"], torch.tensor([111, 212]))
     assert state.intermediate_buffer.buffers[0]["meta"]["step"] == 11
     assert torch.equal(seen_text_steps[0], torch.tensor([[51.0, 52.0], [61.0, 62.0]]))
+
+
+def test_decode_cohort_accepts_three_value_hook_without_mtp():
+    # preprocess_phase_contract.md: without talker_mtp the hook returns
+    # (input_ids, inputs_embeds, updates), as Voxtral TTS does.
+    state = _make_state(max_num_reqs=2, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1", "meta": {"step": 1}}
+    state.intermediate_buffer.buffers[1] = {"req_id": "r2", "meta": {"step": 2}}
+    new_embeds = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+    def preprocess_decode_batch(*, input_ids, req_infos):
+        assert [info["req_id"] for info in req_infos] == ["r1", "r2"]
+        return input_ids, new_embeds, [{"meta": {"step": 11}}, {"meta": {"step": 12}}]
+
+    def unexpected_preprocess(*_args, **_kwargs):
+        raise AssertionError("decode requests must use the batch hook")
+
+    state.model.preprocess_decode_batch = preprocess_decode_batch
+    state.model.preprocess = unexpected_preprocess
+    model_inputs = {
+        "input_ids": torch.tensor([101, 202], dtype=torch.long),
+        "inputs_embeds": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    }
+    state.run_preprocess(
+        _DummyInputBatch([0, 1], num_computed_tokens_cpu=[1, 1]),
+        model_inputs,
+    )
+    assert torch.equal(model_inputs["input_ids"], torch.tensor([101, 202]))
+    assert torch.equal(model_inputs["inputs_embeds"], new_embeds)
+    assert state.intermediate_buffer.buffers[1]["meta"]["step"] == 12
+
+
+def test_decode_cohort_rejects_three_value_hook_with_mtp():
+    state = _make_state(max_num_reqs=1, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1"}
+    state.model.preprocess_decode_batch = lambda *, input_ids, req_infos: (input_ids, torch.zeros(1, 2), [{}])
+    state._has_mtp = True
+    with pytest.raises(RuntimeError, match="five values"):
+        state.run_preprocess(
+            _DummyInputBatch([0], num_computed_tokens_cpu=[1]),
+            {"input_ids": torch.tensor([101], dtype=torch.long), "inputs_embeds": torch.zeros(1, 2)},
+        )
 
 
 def test_static_decode_embeddings_refresh_from_input_ids():
@@ -462,6 +662,31 @@ def test_batched_postprocess_gpu_snapshot_writeback(owned):
         assert first.untyped_storage().data_ptr() != produced[0].untyped_storage().data_ptr()
 
 
+def test_scalar_postprocess_uses_declared_multimodal_output_batch_row():
+    state = _make_state(max_num_reqs=3, has_postprocess=True)
+    state.model.postprocess_requires_multimodal_outputs = True
+    # The first batch row has no live request buffer.  The second row must
+    # still consume frame 1 rather than silently shifting to frame 0.
+    state.intermediate_buffer.buffers[0] = {"req_id": "r0"}
+    batch = _DummyInputBatch([2, 0])
+    batch.num_scheduled_tokens = [1, 1]
+    batch.query_start_loc_np = [0, 1]
+    frames = [torch.tensor([[1, 2]]), torch.tensor([[3, 4]])]
+    multimodal_outputs = {"codes": {"audio": frames}}
+    seen_rows = []
+
+    def postprocess(_hidden_states, *, multimodal_outputs, _omni_batch_row, **_info):
+        seen_rows.append(_omni_batch_row)
+        return {"codes": {"audio": multimodal_outputs["codes"]["audio"][_omni_batch_row]}}
+
+    state.model.postprocess = postprocess
+    hidden = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
+    state.run_postprocess(hidden, batch, multimodal_outputs)
+
+    assert seen_rows == [1]
+    torch.testing.assert_close(state.intermediate_buffer.buffers[0]["codes"]["audio"], frames[1])
+
+
 def test_seed_independence_resolve_once_and_sampling_kwargs():
     state = _make_state(max_num_reqs=2)
     # vLLM sampling seed must not produce a talker generator.
@@ -474,6 +699,7 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
         state._mtp_state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1).clone(),
         state._mtp_state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1),
     )
+    state._mtp_state._mtp_sample_uniforms = None
     # Per-request generators are resolved once per step and ride sampling kwargs.
     state.model.mtp_sampling_params = {"do_sample": True, "temperature": 0.7}
     state.model.mtp_accepts_per_row_generators = True
@@ -494,6 +720,33 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     )
     assert resolver.call_count == 2
     assert torch.equal(codes, torch.tensor([[1, 2, 3], [4, 5, 6]]))
+
+
+@pytest.mark.parametrize("order", [[0, 1], [1, 0]])
+@pytest.mark.parametrize("is_npu,graph_runner", [(True, False), (False, True)])
+def test_mtp_prepares_request_local_uniforms_for_graph_paths(order, is_npu, graph_runner, monkeypatch):
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states.mtp_model_state.current_omni_platform.is_npu", lambda: is_npu)
+    state = _make_state(max_num_reqs=2)
+    _init_static(state, 2)
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.empty((2, 2, 4), dtype=torch.float32)
+    mtp_state._is_mtp_graph_runner = MagicMock(return_value=graph_runner)
+    for slot, seed in enumerate([11, 22]):
+        state.intermediate_buffer.buffers[slot] = {"req_id": f"r{slot}", "sampling_params": _seeded(seed)}
+    expected_generators = [torch.Generator().manual_seed(seed) for seed in [11, 22]]
+
+    def mtp(ids, embeds, hidden, step, **kwargs):
+        uniforms = kwargs["sample_uniforms"]
+        assert uniforms.is_contiguous() and uniforms.dtype == torch.float32
+        assert uniforms.shape == (2, 2, 4)
+        for row, slot in enumerate(order):
+            expected = torch.empty((1, 2, 4)).uniform_(1e-20, 1.0 - 1e-20, generator=expected_generators[slot])
+            torch.testing.assert_close(uniforms[row : row + 1], expected, rtol=0, atol=0)
+        return embeds, ids.reshape(-1, 1)
+
+    state.model.mtp = mtp
+    for _ in range(2):
+        mtp_state._mtp_forward(order, torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3))
 
 
 def test_seeded_mtp_bypasses_outer_graph_runner():
@@ -623,6 +876,8 @@ def test_rope_shim_constructs_sequential_mrope_state():
     with (
         patch("vllm.platforms.current_platform", CpuPlatform()),
         patch("vllm.v1.worker.gpu.buffer_utils.is_uva_available", return_value=False),
+        # Pin-memory support is cached separately from the platform and UVA.
+        patch("vllm.v1.worker.gpu.buffer_utils.is_pin_memory_available", return_value=False),
     ):
         rope = _make_safe_get_rope(get_rope_state)(
             config,
@@ -641,7 +896,16 @@ def test_rope_shim_constructs_sequential_mrope_state():
     rope.init_prefill_positions(1, model, [11, 22, 33, 44], [])
     assert rope.prefill_delta.np[1] == 0
     assert rope.prefill_positions._staged_write_indices == [3, 4, 5]
-    assert rope.prefill_positions._staged_write_contents == [0, 1, 2, 3] * 3
+    # The pin's StagedWriteTensor keeps ndarray staged rows by reference in
+    # _staged_write_chunks instead of extending _staged_write_contents.
+    # With UVA available, omni's staged-write shim replaces stage_write and
+    # stages the same rows as a list of ndarrays in _staged_write_contents,
+    # leaving _staged_write_chunks empty. Accept either representation.
+    staged = rope.prefill_positions._staged_write_chunks
+    if not staged:
+        contents = rope.prefill_positions._staged_write_contents
+        staged = contents if isinstance(contents, list) else [contents]
+    assert [np.asarray(chunk).reshape(-1).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
 
 
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])
@@ -1365,3 +1629,41 @@ def test_qwen3_tts_current_step_output_uses_current_spans_and_isolates_requests(
             torch.testing.assert_close(row["codes"]["ref"], refs[i])
     assert [info["codes"]["audio"].shape[0] for info in infos] == [3, 4]
     torch.testing.assert_close(prefill["codes"]["audio"], prefill_snapshot)
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+def test_non_npu_eager_mtp_keeps_per_step_generators_with_uniform_buffer(monkeypatch, seeded):
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states.mtp_model_state.current_omni_platform.is_npu", lambda: False)
+    state = _make_state(max_num_reqs=2)
+    _init_static(state, 2)
+    state.model.mtp_accepts_per_row_generators = True
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.full((2, 2, 4), 0.25)
+    mtp_state._is_mtp_graph_runner = MagicMock(return_value=False)
+    mtp_state._prepare_mtp_sample_uniforms = MagicMock(side_effect=AssertionError("eager path must not draw a span"))
+    seeds = [11, 22]
+    order = [1, 0]
+    expected_generators = [torch.Generator().manual_seed(seed) for seed in seeds]
+    for slot, seed in enumerate(seeds):
+        state.intermediate_buffer.buffers[slot] = {
+            "req_id": f"r{slot}",
+            "sampling_params": _seeded(seed) if seeded else None,
+        }
+
+    def mtp(ids, embeds, hidden, step, **kwargs):
+        assert "sample_uniforms" not in kwargs
+        if seeded:
+            for generator, slot in zip(kwargs["generators"], order, strict=True):
+                # Request streams must reach the model without an earlier span draw.
+                actual = torch.rand((1, 4), generator=generator)
+                expected = torch.rand((1, 4), generator=expected_generators[slot])
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            assert kwargs.get("generator") is None and kwargs.get("generators") is None
+        return embeds, ids.reshape(-1, 1)
+
+    state.model.mtp = mtp
+    for _ in range(2):
+        mtp_state._mtp_forward(order, torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3))
+    mtp_state._prepare_mtp_sample_uniforms.assert_not_called()
+    torch.testing.assert_close(mtp_state._mtp_sample_uniforms, torch.full((2, 2, 4), 0.25))

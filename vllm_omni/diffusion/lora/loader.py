@@ -12,6 +12,12 @@ from diffusers.loaders.lora_conversion_utils import (
 )
 from safetensors.torch import load_file
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
@@ -126,6 +132,54 @@ def _prepare_lora_delta(
     return delta, used_keys
 
 
+def _shard_lora_delta(delta: torch.Tensor, layer: torch.nn.Module, is_bias: bool) -> torch.Tensor:
+    """Match an adapter's full delta to the linear layer's local TP partition."""
+    if not isinstance(layer, (ColumnParallelLinear, RowParallelLinear)) or layer.tp_size == 1:
+        return delta
+
+    if isinstance(layer, RowParallelLinear):
+        if delta.shape[0] != layer.output_size:
+            raise ValueError(f"LoRA output size {delta.shape[0]} does not match layer output size {layer.output_size}.")
+        # Row-parallel biases are replicated; only the weight's input is split.
+        if is_bias:
+            return delta
+        if delta.shape[1] != layer.input_size:
+            raise ValueError(f"LoRA input size {delta.shape[1]} does not match layer input size {layer.input_size}.")
+        size = layer.input_size_per_partition
+        return delta.narrow(1, layer.tp_rank * size, size)
+
+    if isinstance(layer, QKVParallelLinear):
+        output_sizes = [
+            layer.total_num_heads * layer.head_size,
+            layer.total_num_kv_heads * layer.head_size,
+            layer.total_num_kv_heads * layer.v_head_size,
+        ]
+        shard_sizes = [
+            layer.num_heads * layer.head_size,
+            layer.num_kv_heads * layer.head_size,
+            layer.num_kv_heads * layer.v_head_size,
+        ]
+        kv_rank = layer.tp_rank // layer.num_kv_head_replicas
+        shard_ranks = [layer.tp_rank, kv_rank, kv_rank]
+    else:
+        output_sizes = layer.output_sizes if isinstance(layer, MergedColumnParallelLinear) else [layer.output_size]
+        shard_sizes = layer.output_partition_sizes
+        shard_ranks = [layer.tp_rank] * len(output_sizes)
+
+    output_size = sum(output_sizes)
+    if delta.shape[0] != output_size:
+        raise ValueError(f"LoRA output size {delta.shape[0]} does not match layer output size {output_size}.")
+    if not is_bias and delta.shape[1] != layer.input_size:
+        raise ValueError(f"LoRA input size {delta.shape[1]} does not match layer input size {layer.input_size}.")
+
+    # Packed projections must be sharded separately, then repacked locally.
+    shards = [
+        part.narrow(0, rank * size, size)
+        for part, rank, size in zip(delta.split(output_sizes, dim=0), shard_ranks, shard_sizes, strict=True)
+    ]
+    return shards[0] if len(shards) == 1 else torch.cat(shards, dim=0)
+
+
 def _resolve_lora_compute_device() -> torch.device | None:
     """Return the local accelerator device if actually usable, else None.
 
@@ -219,6 +273,48 @@ def _remap_state_dict_keys(sd, rules):
     return new_sd
 
 
+_DIFFUSION_MODEL_PREFIX = "diffusion_model."
+_LEGACY_LORA_WEIGHT_SUFFIXES = (".lora_A.weight", ".lora_B.weight", ".lora_down.weight", ".lora_up.weight")
+
+
+def _partition_diffusion_model_lora_keys(
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Split ``diffusion_model.`` keys out of an otherwise diffusers state dict.
+
+    A bare ``<module>.alpha`` rides with that pair only when the same module has no
+    dotted A/B of its own. Both a prefixed and a bare alpha for one legacy module is
+    ambiguous, so it raises instead of letting the converter keep whichever key it
+    sees last.
+    """
+    legacy = {key: value for key, value in state_dict.items() if key.startswith(_DIFFUSION_MODEL_PREFIX)}
+    if not legacy:
+        return {}, state_dict
+
+    bases: set[str] = set()
+    for key in legacy:
+        stripped = key.removeprefix(_DIFFUSION_MODEL_PREFIX)
+        for suffix in _LEGACY_LORA_WEIGHT_SUFFIXES:
+            if stripped.endswith(suffix):
+                bases.add(stripped[: -len(suffix)])
+                break
+
+    for key, value in state_dict.items():
+        if not key.endswith(".alpha") or key.startswith(_DIFFUSION_MODEL_PREFIX):
+            continue
+        base = key[: -len(".alpha")]
+        dotted_owns_alpha = f"{base}.lora_A.weight" in state_dict and f"{base}.lora_B.weight" in state_dict
+        if dotted_owns_alpha or base not in bases:
+            continue
+        prefixed_alpha = f"{_DIFFUSION_MODEL_PREFIX}{base}.alpha"
+        if prefixed_alpha in legacy:
+            raise ValueError(f"LoRA module {base!r} has both {prefixed_alpha!r} and {key!r}.")
+        legacy[key] = value
+
+    rest = {key: value for key, value in state_dict.items() if key not in legacy}
+    return legacy, rest
+
+
 def _apply_diffusers_lora_alpha_scaling(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Fold Diffusers-format LoRA alpha values into their B matrices."""
     scaled_state_dict = dict(state_dict)
@@ -294,6 +390,7 @@ class LoraLoaderMixin:
 
         # Resolve the accelerator fallback once, outside the parameter loop.
         accel_dev = _resolve_lora_compute_device()
+        layers = dict(module.named_modules(prefix=prefix))
 
         for name, params in module.named_parameters(prefix):
             is_bias = False
@@ -318,6 +415,12 @@ class LoraLoaderMixin:
             )
             if delta is None:
                 continue
+            delta = _shard_lora_delta(delta, layers[base_key], is_bias)
+            if delta.shape != params.shape:
+                raise ValueError(
+                    f"LoRA delta shape {tuple(delta.shape)} does not match "
+                    f"parameter {name} shape {tuple(params.shape)}."
+                )
             lora_loaded_keys.update(used_keys)
 
             delta = delta.to(device=params.device, dtype=params.dtype)
@@ -351,6 +454,7 @@ class LoraLoaderMixin:
 
         # Resolve the accelerator fallback once, outside the parameter loop.
         accel_dev = _resolve_lora_compute_device()
+        layers = dict(module.named_modules(prefix=prefix))
 
         for name, param in module.named_parameters(prefix):
             is_bias = False
@@ -375,6 +479,11 @@ class LoraLoaderMixin:
             )
             if delta is None:
                 continue
+            delta = _shard_lora_delta(delta, layers[base_key], is_bias)
+            if delta.shape != param.shape:
+                raise ValueError(
+                    f"LoRA delta shape {tuple(delta.shape)} does not match parameter {name} shape {tuple(param.shape)}."
+                )
             lora_unloaded_keys.update(used_keys)
 
             delta = delta.to(device=param.device, dtype=param.dtype)
@@ -404,26 +513,74 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
         else:
             state_dict = _load_lora_state_dict(pretrained_model_name_or_path_or_dict)
 
+        # Normalize PEFT's default adapter suffix before folding alpha into B.
+        state_dict = _remap_state_dict_keys(
+            state_dict,
+            [(".lora_A.default.weight", ".lora_A.weight"), (".lora_B.default.weight", ".lora_B.weight")],
+        )
+        # ``diffusion_model.`` pairs stay out of the diffusers alpha fold. That fold matches
+        # ``<module>.alpha`` to ``<module>.lora_A.weight`` and raises while the weights are
+        # still prefixed. The converter strips the prefix and applies the alpha once.
+        legacy, state_dict = _partition_diffusion_model_lora_keys(state_dict)
+        converted: dict[str, torch.Tensor] = {}
+        if legacy:
+            converter = get_converter_by_pipeline(self)
+            if converter is None:
+                raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
+            converted = converter({k.removeprefix("transformer."): v for k, v in legacy.items()})
+
         has_alpha = any(k.endswith(".alpha") for k in state_dict)
         is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
         is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
+        has_unprefixed_keys = any(not k.startswith("transformer.") for k in state_dict)
         if has_alpha and is_diffusers_lora_format:
             state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
 
-        if has_alpha or is_non_diffusers_format:
+        # The legacy converter only understands non-diffusers layouts. Already-dotted
+        # diffusers keys (including a `.default` suffix normalized above) only need the
+        # module prefix, for both the A/B pair and the bias of the same target. Sending
+        # the whole dict through the converter drops other tensors, such as a bias delta,
+        # and raises before any fusion.
+        if is_non_diffusers_format or (has_alpha and not is_diffusers_lora_format):
             converter = get_converter_by_pipeline(self)
             if converter is None:
                 raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
 
-            state_dict = converter(state_dict)
+            # The converter adds the transformer prefix itself.
+            state_dict = converter({k.removeprefix("transformer."): v for k, v in state_dict.items()})
+        else:
+            # Flattened legacy module names (`lora_unet_*`) keep the `.lora_A.weight`
+            # suffix of diffusers keys, so they are routed to the converter by name,
+            # separately from the dotted keys in the same state dict.
+            flattened = {k: v for k, v in state_dict.items() if k.startswith("lora_unet_")}
+            if flattened:
+                converter = get_converter_by_pipeline(self)
+                if converter is None:
+                    raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
 
+                flattened_converted = converter(flattened)
+                state_dict = {k: v for k, v in state_dict.items() if k not in flattened}
+                state_dict = {
+                    k if k.startswith("transformer.") else f"transformer.{k}": v for k, v in state_dict.items()
+                }
+                state_dict.update(flattened_converted)
+            elif has_unprefixed_keys:
+                state_dict = {
+                    k if k.startswith("transformer.") else f"transformer.{k}": v for k, v in state_dict.items()
+                }
+
+        state_dict.update(converted)
         state_dict = _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
 
-        self.load_lora_into_module(
+        loaded_keys = self.load_lora_into_module(
             state_dict,
             self.transformer,
             prefix=self.transformer_name,
         )
+        if not loaded_keys:
+            raise ValueError(
+                f"No LoRA weights matched {self.__class__.__name__}. Check the adapter's keys and target model."
+            )
 
         self.lora_loaded[adapter_name] = state_dict
 

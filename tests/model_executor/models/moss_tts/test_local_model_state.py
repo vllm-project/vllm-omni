@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Compare slot lifecycle with canonical Local hooks, including output ownership."""
 
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,8 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
+import vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker as talker_module
+from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
@@ -30,7 +33,7 @@ pytestmark = pytest.mark.core_model
     ]
 )
 def device(request):
-    if request.param == "cuda" and not torch.cuda.is_available():
+    if request.param == "cuda" and not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
     return torch.device(request.param)
 
@@ -141,6 +144,7 @@ def _batch(device, slots, counts, index_dtype=torch.int32):
         num_scheduled_tokens=np.array(counts),
         query_start_loc_np=starts,
         query_start_loc=torch.tensor(starts, device=device),
+        logits_indices=torch.tensor(starts[1:] - 1, dtype=torch.long, device=device),
         # Upstream MRV2 uses int32 token buffers, unlike the MTP graph inputs.
         input_ids=torch.full((int(starts[-1]),), 2, dtype=torch.int32, device=device),
     )
@@ -259,11 +263,11 @@ def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch():
     assert frame.call_args.kwargs["generator"] is None
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_slot_mtp_graph_padding_reorder_and_owned_output():
-    if not torch.cuda.is_available():
+    if not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
-    states = [_state(cls, torch.device("cuda")) for cls in (OmniModelState, MossLocalModelState)]
+    states = [_state(cls, torch.device(DEVICE_TYPE)) for cls in (OmniModelState, MossLocalModelState)]
     for state in states:
 
         def frame(hidden, *_args, **_kwargs):
@@ -279,14 +283,14 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
         candidate._mtp_state._mtp_hidden[:4],
         candidate._mtp_state._mtp_text_step[:4],
     ]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream), torch.inference_mode():
+    stream = DEVICE_MODULE.Stream()
+    stream.wait_stream(DEVICE_MODULE.current_stream())
+    with DEVICE_MODULE.stream(stream), torch.inference_mode():
         for _ in range(3):
             candidate.model.mtp(*buffers)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph), torch.inference_mode():
+    DEVICE_MODULE.current_stream().wait_stream(stream)
+    graph = DEVICE_GRAPH()
+    with DEVICE_MODULE.graph(graph), torch.inference_mode():
         graph_output = candidate.model.mtp(*buffers)
 
     def replay(*args, **kwargs):
@@ -308,7 +312,7 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
         out = [
             _step(
                 state,
-                _batch(torch.device("cuda"), slots, [1] * len(slots)),
+                _batch(torch.device(DEVICE_TYPE), slots, [1] * len(slots)),
                 req,
                 dispatcher if state is candidate else None,
             )
@@ -346,9 +350,21 @@ def test_factory_requires_explicit_class_capability_and_valid_state(monkeypatch)
 
 @pytest.mark.cpu
 def test_local_factory_uses_dedicated_state(monkeypatch):
+    monkeypatch.setattr(talker_module, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
     monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
     monkeypatch.setattr(MossLocalModelState, "__init__", lambda *args: None)
     model = _model(torch.device("cpu"))
     model.config = SimpleNamespace()
     state = init_omni_model_state(None, model, None, torch.device("cpu"))
     assert type(state) is MossLocalModelState
+
+
+@pytest.mark.cpu
+def test_local_factory_selects_ascend_state_on_npu(monkeypatch):
+    """The NPU module needs vllm_ascend, so stand in for it and check only the dispatch."""
+    sentinel = object()
+    npu_module = "vllm_omni.platforms.npu.models.moss_tts_local_model_state"
+    monkeypatch.setitem(sys.modules, npu_module, SimpleNamespace(NPUMossLocalModelState=lambda *a, **k: sentinel))
+    monkeypatch.setattr(talker_module, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+    model = _model(torch.device("cpu"))
+    assert model.create_mrv2_model_state(None, None, torch.device("cpu")) is sentinel

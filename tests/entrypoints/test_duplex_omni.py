@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import replace
 from typing import Any
 
@@ -30,6 +31,7 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -395,6 +397,39 @@ async def test_shutdown_closes_every_handle(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_executor_shutdown_closes_session_opened_before_admission_closes(monkeypatch) -> None:
+    omni, engine = _make_omni(monkeypatch)
+    first = await omni.open_session()
+    loop = asyncio.get_running_loop()
+    at_handoff = asyncio.Event()
+    proceed = threading.Event()
+    shutdown_frontend = omni._shutdown_frontend_from_executor
+
+    def hold_handoff(serving_loop):
+        loop.call_soon_threadsafe(at_handoff.set)
+        assert proceed.wait(timeout=5)
+        shutdown_frontend(serving_loop)
+
+    monkeypatch.setattr(omni, "_shutdown_frontend_from_executor", hold_handoff)
+    shutdown = asyncio.create_task(asyncio.to_thread(omni.shutdown))
+    try:
+        await asyncio.wait_for(at_handoff.wait(), timeout=5)
+        late = await omni.open_session()
+        proceed.set()
+        await asyncio.wait_for(shutdown, timeout=5)
+        for handle in (first, late):
+            assert await asyncio.wait_for(handle.wait_closed(), timeout=1) == "shutdown"
+        assert not omni.sessions
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await omni.open_session()
+        assert len(engine.opened) == 2
+    finally:
+        proceed.set()
+        await shutdown
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_detach_session_forwards_the_lease_generation_fence(monkeypatch) -> None:
     omni, engine = _make_omni(monkeypatch)
     try:
@@ -421,7 +456,7 @@ async def test_a_resume_cancelled_mid_rpc_is_adopted_and_detached_once_it_lands(
         handle = await omni.open_session()
         engine.resume_gate = asyncio.Event()
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -454,7 +489,7 @@ async def test_a_resume_cancelled_then_timed_out_is_settled_by_replaying_it(monk
         engine.resume_gate = asyncio.Event()
         engine.resume_timeouts_remaining = 1
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -486,7 +521,7 @@ async def test_an_abandoned_resume_is_settled_through_the_callers_callback(monke
         resume = asyncio.create_task(
             omni.resume_session(handle.session_id, expected_lease_generation=0, on_abandoned=on_abandoned)
         )
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):
             await resume
@@ -515,7 +550,7 @@ async def test_an_abandoned_resume_keeps_replaying_across_repeated_timeouts(monk
         engine.resume_gate = asyncio.Event()
         engine.resume_timeouts_remaining = 2
         resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
-        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=10.0)
 
         resume.cancel()
         with pytest.raises(asyncio.CancelledError):

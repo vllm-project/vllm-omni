@@ -10,6 +10,10 @@
 # H20). For smaller cards raise Stage-0 tensor_parallel_size or split the stages
 # onto separate devices. Multi-request batching is not yet validated (max_num_seqs: 1).
 pipeline: ming_tts_moe
+# Both stages run on Model Runner V2 (native data plane); vLLM 0.34+ does not
+# support Model Runner V1. Qualified on CUDA; ROCm, NPU, XPU and MUSA are not
+# yet qualified on MRV2.
+model_runner: v2
 async_chunk: true
 # The MoE ships a custom tokenizer (tokenization_bailing.BailingTokenizer) that
 # must be executed to load. The model config still resolves to the registered

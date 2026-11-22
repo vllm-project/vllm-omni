@@ -11,7 +11,7 @@ import torch
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
-from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
+from vllm_omni.utils.device_copy import HostCopyBatch
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
@@ -43,7 +43,7 @@ def test_istft_is_bitwise_and_sync_free_on_cuda():
 
 
 def test_host_copy_batch_copies_without_blocking_until_wait():
-    to_host = _HostCopyBatch(pin_memory=True)
+    to_host = HostCopyBatch(pin_memory=True)
     outputs = [torch.randn(1000, device="cuda") * (row + 1) for row in range(4)]
     strided = torch.randn(8, 6, device="cuda").t()
     to_host.copy(torch.zeros(1, device="cuda"))

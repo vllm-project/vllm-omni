@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
+from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -101,6 +102,8 @@ class OmniGPUWorkerBase(GPUWorker):
     for custom trace naming, background gzip, and trace path collection.
     """
 
+    use_v2_model_runner = True
+
     def _capture_auxiliary_graphs(self) -> None:
         """Let opt-in models warm valid inputs before the worker becomes ready."""
         capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
@@ -146,11 +149,53 @@ class OmniGPUWorkerBase(GPUWorker):
         return result
 
     def load_model(self, *args, **kwargs):
+        weight_transfer = self.vllm_config.weight_transfer_config
+        if (
+            weight_transfer is not None
+            and weight_transfer.backend == "omni_lora_ipc"
+            and self.vllm_config.lora_config is not None
+        ):
+            raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
         with self._maybe_get_memory_pool_context("weights"):
             res = super().load_model(*args, **kwargs)
             current_omni_platform.synchronize()
             gc.collect()
             return res
+
+    def finish_weight_update(self) -> None:
+        """End failed merged sessions so the trainer can publish a new adapter.
+
+        Keep this cleanup on the public worker/engine lifecycle: the vLLM
+        version pinned by vLLM-Omni does not provide ``_end_weight_update``.
+        """
+        try:
+            super().finish_weight_update()
+        except Exception:
+            if isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine):
+                self._weight_update_active = False
+                self.weight_transfer_engine.reset_weight_update_target()
+            raise
+
+    def remove_lora(self, lora_id: int) -> bool:
+        """Restore the dense base for a merged policy, or remove a runtime adapter.
+
+        Args:
+            lora_id: Adapter identifier to remove.
+
+        Returns:
+            Whether an adapter was removed.
+        """
+        engine = self.weight_transfer_engine
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and hasattr(engine, "lora_manager"):
+            return engine.lora_manager.remove_adapter(lora_id)
+        return super().remove_lora(lora_id)
+
+    def list_loras(self) -> set[int]:
+        """Return registered merged or runtime adapter identifiers."""
+        engine = self.weight_transfer_engine
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and hasattr(engine, "lora_manager"):
+            return set(engine.lora_manager.list_adapters())
+        return super().list_loras()
 
     def get_stage_post_warmup_memory_stats(self) -> dict[str, int] | None:
         if self.rank != 0:
@@ -199,6 +244,7 @@ class OmniGPUWorkerBase(GPUWorker):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ):
         """Override to set trace filename before starting the profiler.
 
@@ -207,6 +253,7 @@ class OmniGPUWorkerBase(GPUWorker):
             profile_prefix: Optional prefix for trace filename (vLLM compat).
             delay_iterations: Optional per-session delayed start (vLLM compat).
             max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
 
         Generate a stage-specific trace filename before delegating the
         lifecycle and iteration controls to the profiler.
@@ -225,6 +272,9 @@ class OmniGPUWorkerBase(GPUWorker):
                 stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
                 filename = profile_prefix or f"stage{stage_id}_rank{self.rank}_{int(time.time())}"
                 self.profiler.set_trace_filename(filename)
+            # WorkerProfiler.start accepts only the iteration bounds.
+            # Session kwargs go through set_profiler_kwargs, matching Worker.profile.
+            self.profiler.set_profiler_kwargs(profiler_kwargs)
             kwargs: dict[str, int] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
@@ -373,7 +423,7 @@ class OmniGPUWorkerBase(GPUWorker):
             return
         total = self.init_snapshot.total_memory
         free = self.init_snapshot.free_memory
-        current_util = self.cache_config.gpu_memory_utilization
+        current_util = self.cache_config.resolved_gpu_memory_utilization
         # Round up so the suggested value restores at least the reserved amount.
         # (0.8 + 0.1) * 10_000 is 9000.000000000002 in floating point, hence the inner round.
         scaled = round((current_util + cudagraph_memory_estimate / total) * 10_000, 6)
@@ -439,7 +489,11 @@ class OmniGPUWorkerBase(GPUWorker):
         gc.collect()
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
+        # V2 keeps block-table pointers and captured inputs in these pools;
+        # waking their allocations does not recreate discarded contents.
+        offload_tags: tuple[str, ...] = ("runtime", "cudagraph")
+        if level == 1:
+            offload_tags = ("weights", *offload_tags)
         allocator = get_mem_allocator_instance()
         if level == 2:
             self._sleep_saved_tensors = _save_non_parameter_tensors(self._sleep_models(), allocator)

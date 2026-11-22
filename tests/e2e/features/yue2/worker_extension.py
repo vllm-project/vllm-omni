@@ -5,11 +5,11 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 
 class Yue2LifecycleWorkerExtension:
-    model_runner: "GPUARModelRunner"
+    model_runner: "OmniARModelRunner"
 
     def start_yue2_probe(self):
         from unittest.mock import patch
@@ -48,6 +48,17 @@ class Yue2LifecycleWorkerExtension:
         # Count vLLM AR replays, separately from model-owned sampler/NAR graphs.
         self.yue2_graph_patch = patch.object(CUDAGraphWrapper, "__call__", count_ar_replays)
         self.yue2_graph_patch.start()
+        # V2 replays FULL graphs through its manager, outside CUDAGraphWrapper.
+        manager = self.model_runner.cudagraph_manager
+        run_fullgraph = manager.run_fullgraph
+
+        def count_full_replays(*args, **kwargs):
+            result = run_fullgraph(*args, **kwargs)
+            self.yue2_probe["ar_full_replays"] += 1
+            return result
+
+        self.yue2_full_graph_patch = patch.object(manager, "run_fullgraph", count_full_replays)
+        self.yue2_full_graph_patch.start()
         self.yue2_cancel_job = None
         previous: dict[str, int] = {}
         prepare = model.prepare_runner_inputs
