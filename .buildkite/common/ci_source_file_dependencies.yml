@@ -1547,6 +1547,31 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
+  diffusion_qwen_image_edit_weekly:
+    - *qwen_image
+    - tests/e2e/online_serving/test_qwen_image_edit.py
+    - tests/e2e/online_serving/test_qwen_image_edit_expansion.py
+    - tests/e2e/online_serving/test_qwen_image_layered.py
+    - tests/e2e/online_serving/test_qwen_image_layered_expansion.py
+    - tests/e2e/accuracy/test_qwen_image_edit.py
+    - tests/e2e/accuracy/test_qwen_image_layered.py
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    - tests/assets/qwen_image_edit/
+    - tests/helpers/
+    - tests/conftest.py
+
+  diffusion_qwen_image_autoround_weekly:
+    - *qwen_image
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/model_loader/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/engine/stage_init_utils.py
+    - vllm_omni/quantization/
+    - tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py
+    - tests/helpers/
+    - tests/conftest.py
+
   diffusion_qwen_image_21_accuracy:
     - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - .buildkite/amd/scripts/assert-pytest-collection.sh
