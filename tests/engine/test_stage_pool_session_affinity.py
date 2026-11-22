@@ -31,14 +31,21 @@ def _pool(mocker, replicas: int = 2) -> StagePool:
 
 
 @pytest.mark.parametrize(
-    "primary, secondary, expected",
-    [(0, 0, 0), (24, 2, 1), (3, 8, 0), (64, 16, 0)],
+    "mode, primary, secondary, expected",
+    [
+        ("adaptive", 0, 0, 0),
+        ("adaptive", 24, 2, 1),
+        ("adaptive", 3, 8, 0),
+        ("adaptive", 22, 7, 0),
+        ("adaptive_secondary", 22, 7, 1),
+        ("adaptive_secondary", 64, 16, 0),
+    ],
 )
 def test_code2wav_adaptive_route_uses_live_and_reserved_turns(
-    monkeypatch, mocker, tmp_path, primary, secondary, expected
+    monkeypatch, mocker, tmp_path, mode, primary, secondary, expected
 ):
     route = tmp_path / "vocoder-route"
-    route.write_text("adaptive benchmark\n")
+    route.write_text(f"{mode} benchmark\n")
     monkeypatch.setenv("MINICPMO_C8_VOCODER_ROUTE_FILE", str(route))
     config = mocker.Mock(model_config=mocker.Mock(async_chunk=True))
     pool = StagePool(2, [_Replica(), _Replica()], stage_vllm_config=config)

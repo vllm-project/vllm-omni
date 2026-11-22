@@ -1123,15 +1123,16 @@ class StagePool:
             mode, arm = self._c8_vocoder_route_file.read_text().split()
         except (OSError, ValueError):
             return None
-        if mode not in ("primary", "secondary", "eighth", "quarter", "adaptive"):
+        if mode not in ("primary", "secondary", "eighth", "quarter", "adaptive", "adaptive_secondary"):
             return None
         if (mode, arm) != self._c8_vocoder_route_run:
             self._c8_vocoder_route_run = (mode, arm)
             self._c8_vocoder_route_counts[:] = [0, 0]
         n = sum(self._c8_vocoder_route_counts) + 1
         pick_secondary = mode == "secondary" or (mode == "eighth" and n % 8 == 0) or (mode == "quarter" and n % 4 == 0)
-        if mode == "adaptive":
-            pick_secondary = self._adaptive_code2wav_route(n)
+        if mode in ("adaptive", "adaptive_secondary"):
+            primary_weight = 2.5 if mode == "adaptive_secondary" else 3.0
+            pick_secondary = self._adaptive_code2wav_route(n, primary_weight=primary_weight)
         chosen = int(pick_secondary)
         self._c8_vocoder_route_counts[chosen] += 1
         if n in (4, 32, 96):
@@ -1143,8 +1144,8 @@ class StagePool:
             )
         return chosen
 
-    def _adaptive_code2wav_route(self, ordinal: int) -> bool:
-        """Compare live turns relative to the two replicas' configured 3:1 split."""
+    def _adaptive_code2wav_route(self, ordinal: int, *, primary_weight: float) -> bool:
+        """Compare live turns relative to the two replicas' processing capacity."""
         bindings = {
             **self._requested_replica_ids,
             **{req: self._addr_to_replica_id.get(addr) for req, addr in self._affinity.items()},
@@ -1157,7 +1158,7 @@ class StagePool:
         if secondary >= 16:
             return False
         if primary + secondary >= 8:
-            primary_wait = (primary + 1) / 3
+            primary_wait = (primary + 1) / primary_weight
             secondary_wait = secondary + 1
             if abs(primary_wait - secondary_wait) >= 1:
                 return secondary_wait < primary_wait
