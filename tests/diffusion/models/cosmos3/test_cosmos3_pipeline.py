@@ -2955,7 +2955,9 @@ def test_diffuse_batched_outputs_match_serial(
         batched = run(latents)
 
     # The prompt's UND K/V stay batch 1 and are broadcast in the GEN layers.
-    torch.testing.assert_close(batched, serial, atol=0, rtol=0)
+    # Batch size can select a different CPU GEMM kernel (e.g. MKL on AVX-512),
+    # so batched and serial fp32 results may differ in the last bits.
+    torch.testing.assert_close(batched, serial, atol=1e-5, rtol=1e-5)
 
 
 def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeline) -> None:

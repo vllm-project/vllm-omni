@@ -2152,8 +2152,11 @@ def test_gen_layers_broadcast_batch1_und_kv_to_gen_batch(config_kind, batch_size
         assert all(key.shape[0] == 1 and value.shape[0] == 1 for key, value in model.cached_kv)
         cached = model(hidden_states=latents, **kwargs)
 
-    torch.testing.assert_close(batched, serial, atol=0, rtol=0)
-    torch.testing.assert_close(cached, serial, atol=0, rtol=0)
+    # Batch size can select a different CPU GEMM kernel (e.g. MKL on AVX-512),
+    # so batched and serial fp32 results may differ in the last bits. Reusing
+    # the batch-1 cache at the same batch size must be exact.
+    torch.testing.assert_close(batched, serial, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(cached, batched, atol=0, rtol=0)
 
 
 def test_broadcast_und_kv_expands_batch1_views_only() -> None:
