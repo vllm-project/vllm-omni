@@ -38,6 +38,10 @@ Tensor parallelism and LoRA are unsupported. Every worker needs checkpoint acces
 
 ## Model-specific weight loading
 
+Each DiT root must opt in with `_hsdp_pre_sharded_block_load = True` once its
+block-local loading has been verified (Cosmos 3 and its Edge and Multiview
+variants do). Other models are rejected before any checkpoint read.
+
 Weights are loaded independently for each module selected by
 `_hsdp_shard_conditions` (typically transformer blocks), then for the remaining
 DiT root parameters. Keep model-specific loading logic local to these groups:

@@ -147,6 +147,15 @@ def _plan_checkpoint_groups(
         conditions = getattr(root, "_hsdp_shard_conditions", None)
         if not conditions:
             raise ValueError(f"Model {type(root).__name__} has no _hsdp_shard_conditions defined")
+        if not getattr(root, "_hsdp_pre_sharded_block_load", False):
+            # Per-group loading bypasses the DiT root's load_weights for block
+            # tensors. A root that renames, fuses or transforms block weights
+            # only there would load incomplete or wrong values, so each model
+            # opts in after its block-local loading is verified.
+            raise ValueError(
+                f"Model {type(root).__name__} has not declared block-local weight loading safe for "
+                "hsdp_weight_load_strategy='pre_sharded' (_hsdp_pre_sharded_block_load)"
+            )
         for local_name, module in reversed(list(root.named_modules())):
             if any(condition(local_name, module) for condition in conditions):
                 if not local_name:

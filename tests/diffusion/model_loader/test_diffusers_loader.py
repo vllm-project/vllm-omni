@@ -2465,6 +2465,7 @@ def test_checkpoint_proxies_load_then_process_then_shard(
         module.load_weights = mocker.Mock(side_effect=lambda weights, module=module: load_group(module, weights))
     model.load_weights = mocker.Mock(side_effect=AssertionError("Must not invoke the full-pipeline loader"))
     model.transformer._hsdp_shard_conditions = [lambda name, _: name.startswith("blocks.") and name.count(".") == 1]
+    model.transformer._hsdp_pre_sharded_block_load = True
     model.transformer._hsdp_ignored_modules = ["blocks.0.norm"]
     model.weights_sources = [DiffusersPipelineLoader.ComponentSource(str(tmp_path), None, None, prefix="transformer.")]
     model.convert_checkpoint_tensor = lambda name, tensor: tensor.t() if name.endswith("weight") else tensor
@@ -2599,6 +2600,7 @@ def test_checkpoint_proxies_apply_component_adapter_before_conversion(tmp_path, 
                 [nn.Linear(2, 2, bias=False, dtype=torch.bfloat16, device="meta") for _ in range(2)]
             )
             self.transformer._hsdp_shard_conditions = [lambda name, _: name in {"blocks.0", "blocks.1"}]
+            self.transformer._hsdp_pre_sharded_block_load = True
 
         @staticmethod
         def remap_checkpoint_key(name):
@@ -2756,6 +2758,7 @@ def test_pre_sharded_groups_apply_model_remap(tmp_path):
             super().__init__()
             self.transformer = nn.Linear(2, 2, bias=False)
             self.transformer._hsdp_shard_conditions = [lambda name, module: False]
+            self.transformer._hsdp_pre_sharded_block_load = True
 
         @staticmethod
         def remap_checkpoint_key(name):
@@ -2784,6 +2787,34 @@ def test_pre_sharded_groups_apply_model_remap(tmp_path):
     assert groups[0].checkpoint_entries["transformer.weight"] == ("renamed", str(checkpoint))
 
 
+
+def test_pre_sharded_groups_require_block_load_opt_in(tmp_path):
+    """A DiT whose block-local loading is unverified is rejected before any checkpoint read."""
+    from vllm_omni.diffusion.model_loader.checkpoint_load_proxy import _plan_checkpoint_groups
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    model = nn.Module()
+    model.transformer = nn.Module()
+    model.transformer.blocks = nn.ModuleList([nn.Linear(2, 2, bias=False)])
+    model.transformer._hsdp_shard_conditions = [lambda name, _: name == "blocks.0"]
+    model.weights_sources = [
+        SimpleNamespace(model_or_path=str(tmp_path), subfolder=None, revision=None, prefix="transformer.")
+    ]
+    loader = DiffusersPipelineLoader(LoadConfig(), OmniDiffusionConfig(model=str(tmp_path)))
+    discovered = PipelineModules(
+        dits=[model.transformer], dit_names=["transformer"], encoders=[], encoder_names=[], vaes=[]
+    )
+
+    with pytest.raises(ValueError, match="_hsdp_pre_sharded_block_load"):
+        _plan_checkpoint_groups(loader, model, discovered)
+
+
+def test_cosmos3_transformers_opt_in_to_pre_sharded_block_load():
+    from vllm_omni.diffusion.models.cosmos3 import Cosmos3EdgeVFMTransformer, Cosmos3VFMTransformer
+
+    assert Cosmos3VFMTransformer._hsdp_pre_sharded_block_load is True
+    assert Cosmos3EdgeVFMTransformer._hsdp_pre_sharded_block_load is True
+
 def test_pre_sharded_groups_assign_nested_blocks_before_parent_and_root(tmp_path):
     from vllm_omni.diffusion.model_loader.checkpoint_load_proxy import _plan_checkpoint_groups
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
@@ -2795,6 +2826,7 @@ def test_pre_sharded_groups_assign_nested_blocks_before_parent_and_root(tmp_path
     root.block.weight = nn.Parameter(torch.ones(2))
     root.block.inner = nn.Linear(2, 2, bias=False)
     root._hsdp_shard_conditions = [lambda name, _: name in {"block", "block.inner"}]
+    root._hsdp_pre_sharded_block_load = True
     checkpoint = tmp_path / "model.safetensors"
     save_file(root.state_dict(), str(checkpoint))
     model.weights_sources = [DiffusersPipelineLoader.ComponentSource(str(tmp_path), None, None, prefix="transformer.")]
@@ -2917,6 +2949,7 @@ def test_pre_sharded_groups_plan_packed_sidecar_next_to_index(tmp_path):
     model.transformer.blocks[0].norm1 = nn.Module()
     model.transformer.blocks[0].norm1.weight = nn.Parameter(torch.empty(2))
     model.transformer._hsdp_shard_conditions = [lambda name, module: name == "blocks.0"]
+    model.transformer._hsdp_pre_sharded_block_load = True
     packed = DiffusersPipelineLoader.ComponentSource(
         str(tmp_path),
         "transformer",
