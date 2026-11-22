@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
+from weakref import WeakSet
 
 import pytest
 import torch
@@ -57,6 +58,10 @@ def platform(monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(graph_mod, "current_omni_platform", fake)
     monkeypatch.setattr(cuda_graph_mod, "current_omni_platform", fake)
     monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
+    # Production keeps one process-global runner registry. A runner leaked by an
+    # earlier test can still be alive in a reference cycle when this test runs,
+    # so give every test its own registry instead of visiting foreign runners.
+    monkeypatch.setattr(graph_mod, "_RUNNERS", WeakSet())
     return fake
 
 
