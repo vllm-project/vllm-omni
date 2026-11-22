@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     append_dense_kv_history,
 )
@@ -230,7 +231,7 @@ def test_batched_clean_cache_matches_sequential_cpu(history, window, sink, frame
     )
 
 
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged FlashAttention")
 @pytest.mark.parametrize("history,window,sink,frames", [(0, 5, 0, 4), (4, 5, 0, 4), (8, 2, 0, 3), (8, 2, 1, 4)])
 def test_batched_clean_cache_matches_sequential_cuda(history, window, sink, frames):
@@ -287,7 +288,7 @@ def test_clean_rope_matches_individual_frames(nulls, fps):
     torch.testing.assert_close(batched, torch.cat(sequential, dim=1), rtol=0, atol=0)
 
 
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged FlashAttention")
 @pytest.mark.parametrize("tokens_per_frame", [394, 924])
 @pytest.mark.parametrize("frames", [3, 4])
@@ -348,7 +349,7 @@ def test_real_frame_geometry_on_small_pages_cpu(monkeypatch):
     )
 
 
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashAttention")
 @pytest.mark.parametrize("frame_tokens", [394, 924])
 @pytest.mark.parametrize("fa_version", [2, 4])

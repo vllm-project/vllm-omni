@@ -27,9 +27,15 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     Cosmos3OmniDiffusersPipeline,
-    get_cosmos3_ir_op_priority_func,
-    get_cosmos3_post_process_func,
     get_cosmos3_pre_process_func,
+)
+
+# Re-exported: the registry resolves the process functions on this module.
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    get_cosmos3_ir_op_priority_func as get_cosmos3_ir_op_priority_func,  # noqa: F401
+)
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    get_cosmos3_post_process_func as get_cosmos3_post_process_func,  # noqa: F401
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import (
     domains_for_frames,
@@ -40,25 +46,21 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     Cosmos3NanoSimBimanualManifest,
     deploy_option,
     resolve_ar_compile_mode,
+    validate_ar_diffusion_kv_overrides,
     validate_sim_parallel_config,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frustum_cache import FrustumKVArchive
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frustum_retrieval import FrustumHistorySelector
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
-    conditioning_image_size,
     resolve_cosmos3_nano_sim_bimanual_geometry,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualSessionFingerprint,
     Cosmos3NanoSimBimanualSessionState,
     append_dense_kv_history,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.streaming_vae import decode_wan_causal_chunk
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import parse_cosmos3_nano_sim_bimanual_tick
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualTransformer,
@@ -77,6 +79,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
+from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
@@ -130,7 +133,7 @@ class _RequestControls:
     frame_idx: Any
     num_latent_frames: Any
     action: Any
-    action_space: str = "raw"
+    action_space: str = "normalized_unified_v1"
 
 
 def _resolution_policy(
@@ -159,30 +162,22 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
 
     manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
     policy = _resolution_policy(od_config, manifest)
-    cosmos3_pre_process = get_cosmos3_pre_process_func(od_config)
+    cosmos3_pre_process = get_cosmos3_pre_process_func(od_config, crop_action_image=True)
 
     def pre_process_func(request):
         sp = request.sampling_params
         prompt = request.prompt
         media = _request_media(prompt)
-        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
-        image_size = conditioning_image_size(sp)
-        if image_size is not None:
-            from vllm_omni.diffusion.models.cosmos3.transfer import media_hw
-
-            if media is None or media_hw(media) != image_size[:2]:
-                raise ValueError("conditioning_image_size requires media matching the padded canvas exactly.")
-            # Encode the original padded pixels, but admit/schedule the cropped grid.
-            sp.height, sp.width = image_size[:2]
-        else:
+        multimodal = prompt.get("multi_modal_data", {}) if isinstance(prompt, Mapping) else {}
+        if multimodal.get("image") is None or sp.height is not None or sp.width is not None:
+            geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
             sp.height, sp.width = geometry.height, geometry.width
 
-        try:
-            result = cosmos3_pre_process(request)
-        finally:
-            sp.height, sp.width = geometry.height, geometry.width
-        if image_size is not None:
-            result.sampling_params.height, result.sampling_params.width = geometry.height, geometry.width
+        result = cosmos3_pre_process(request)
+        if isinstance(result.prompt, Mapping):
+            image = result.prompt.get("additional_information", {}).get("preprocessed_image")
+            if image is not None:
+                policy.resolve(*image.shape[-2:])
         # Re-resolving explicit final dimensions catches any downstream
         # alignment, area, aspect, or model-grid violation.
         final_sp = result.sampling_params
@@ -193,23 +188,12 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
     return pre_process_func
 
 
-# The registry resolves process funcs by name against this model's own
-# module, so reusing the Cosmos3 implementations means re-exporting them
-# under a Cosmos3-Nano-Sim-Bimanual name rather than registering them directly.
-def get_cosmos3_nano_sim_bimanual_post_process_func(od_config: OmniDiffusionConfig):
-    return get_cosmos3_post_process_func(od_config)
-
-
-def get_cosmos3_nano_sim_bimanual_ir_op_priority_func(od_config: OmniDiffusionConfig):
-    return get_cosmos3_ir_op_priority_func(od_config)
-
-
 class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     """Cosmos3-Nano-Sim-Bimanual inference with dense-or-paged persistent GEN K/V.
 
-    The default diffusion engine exercises the dense numerical-oracle path,
-    which Cosmos3-Nano-Sim-Transfer also runs on. When the AR-Diffusion runner
-    binds a state, the exact same attention uses paged storage instead.
+    The default diffusion engine exercises the dense numerical-oracle path.
+    When the AR-Diffusion runner binds a state, the same attention uses paged
+    storage instead.
     """
 
     # The engine's generic warmup request is 512x512 with a one-step sampler,
@@ -226,12 +210,14 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
     _vae_decode_stream: torch.cuda.Stream | None = None
+    _streaming_decoder: WanStreamingDecoder | None = None
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         self._ar_compile_mode = resolve_ar_compile_mode(od_config)
         validate_sim_parallel_config(od_config)
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
+        validate_ar_diffusion_kv_overrides(od_config, self.manifest)
         self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "batched")
         self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", True))
         if self.clean_commit_mode not in {"framewise", "batched"}:
@@ -273,10 +259,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3-Nano-Sim-Bimanual action pipeline requires validated schema-v1 action conditioning."
             )
         action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
-        self.action_normalizers = {
-            embodiment: ActionAffineNormalizer.from_contract(contract)
-            for embodiment, contract in action_schema.normalizers.items()
-        }
         configured_domain_id = deploy_option(od_config, "default_domain_id")
         artifact_domain_id = action_schema.embodiment_to_domain[action_schema.default_embodiment]
         self.default_domain_id = int(artifact_domain_id if configured_domain_id is None else configured_domain_id)
@@ -345,7 +327,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         )
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        """Return the default-resolution specification for static consumers."""
+        """Return the default-resolution specification that sizes the initial pool."""
 
         geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
         return self._kv_spec_for_geometry(geometry)
@@ -518,7 +500,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if getattr(self.transformer, "_inductor_cudagraphs", False):
             torch._dynamo.reset()
         self._dense_attention_cache = None
-        self._frustum_attention_cache = None
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self._drop_session(session_id)
@@ -526,8 +507,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     def _drop_session(self, session_id: str) -> None:
         state = self._states.pop(str(session_id or "default"), None)
         if state is not None:
-            if state.vae_decoder_initialized:
-                self.vae.clear_cache()
             state.reset()
 
     def _sync_for_tick_timing(self, enabled: bool) -> None:
@@ -574,13 +553,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     def _request_controls(self, sp, extra: Mapping, typed_tick) -> _RequestControls:
         """Read one request's controls from whichever transport supplied them."""
 
-        action_space = self._get_sp_param(sp, "action_space", "raw")
-        if action_space not in ("raw", "model", "normalized_unified_v1") or (
-            typed_tick is not None and action_space != "raw"
-        ):
-            raise ARDiffusionRequestRejectedError(
-                "action_space must be 'raw' or 'model'; typed ticks require raw actions."
-            )
+        action_space = self._get_sp_param(sp, "action_space", "normalized_unified_v1")
+        if action_space != "normalized_unified_v1":
+            raise ARDiffusionRequestRejectedError("action_space must be 'normalized_unified_v1'.")
         if typed_tick is not None:
             typed = parse_cosmos3_nano_sim_bimanual_tick(typed_tick)
             return _RequestControls(
@@ -589,7 +564,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 close_session=typed_tick.close_session,
                 tick=True,
                 measure_tick_latency=typed.measure_tick_latency,
-                domain_id=typed.domain_id,
+                domain_id=None,
                 domain_name=typed.domain_name,
                 frame_idx=typed.frame_idx,
                 num_latent_frames=typed.num_latent_frames,
@@ -669,7 +644,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         fps: float,
         domain_id: int,
         embodiment: str,
-        action_space: str = "raw",
+        action_space: str = "normalized_unified_v1",
     ) -> Cosmos3NanoSimBimanualSessionFingerprint:
         return Cosmos3NanoSimBimanualSessionFingerprint(
             prompt_hash=prompt_token_hash(text_ids),
@@ -748,11 +723,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         paged_kv = None
         dense_history = None
         dense_cache = getattr(state, "dense_attention", None) if paged_state is None else None
-        retrieval = getattr(state, "frustum_archive", None)
-        if retrieval is not None:
-            retrieval.prepare(frame_start)
-            dense_cache = retrieval.attention
-        elif paged_state is not None:
+        if paged_state is not None:
             paged_kv = paged_state.get_kv_caches(
                 self._MAIN_BRANCH,
                 seq_len=seq_len,
@@ -781,10 +752,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             frame_causal=frame_causal,
             history_window=(self.manifest.sink_frames, self.manifest.window_frames),
         )
-        if retrieval is not None:
-            if commit_current:
-                retrieval.commit(hidden_states.shape[2])
-        elif paged_state is not None:
+        if paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
         elif commit_current and dense_cache is not None:
             state.dense_kv_by_branch[self._MAIN_BRANCH] = dense_cache.commit(seq_len)
@@ -801,38 +769,33 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- Action and latent preparation ------------------------------------
 
-    def _prepare_raw_action(
+    def _prepare_action(
         self,
         *,
         embodiment: str,
         action_value: Any,
-        action_space: str = "raw",
+        action_space: str = "normalized_unified_v1",
     ) -> torch.Tensor | None:
         if action_value is None:
             return None
-        expected_raw_action_dim = self.manifest.raw_action_dim_for(embodiment)
-        unified = self.manifest.require_action_schema().schema_version == 5
-        if unified != (action_space == "normalized_unified_v1"):
-            raise ValueError(
-                "Schema 5 requires normalized_unified_v1 actions; native schemas require raw/model actions"
-            )
+        self.manifest.require_action_schema().resolve_embodiment(embodiment, None)
+        if action_space != "normalized_unified_v1":
+            raise ValueError("action_space must be 'normalized_unified_v1'.")
         action = prepare_action_values(
             action_value,
-            width=expected_raw_action_dim,
+            width=self.manifest.input_action_dim,
             model_width=self.manifest.max_action_dim,
-            action_space="model" if unified else action_space,
-            normalizer=self.action_normalizers.get(embodiment),
         )
         return action.to(device=self.device, dtype=self.dtype)
 
     def _resolve_action_layout(
         self,
-        raw_action: torch.Tensor | None,
+        action: torch.Tensor | None,
         *,
         start_frame: int,
         target_frame: int,
     ) -> str | None:
-        """Decide once per request how raw action rows are indexed.
+        """Decide once per request how action rows are indexed.
 
         ``global``: row block ``[(f-1)*A, f*A)`` conditions latent frame ``f``
         ``local``:
@@ -842,12 +805,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         insufficient coverage into an admission rejection instead of a
         mid-rollout failure after frames were already committed.
         """
-        if raw_action is None:
+        if action is None:
             return None
         action_count = self.manifest.action_tokens_per_frame
         global_rows = max((target_frame - 1) * action_count, 0)
         local_rows = sum(action_count for frame in range(start_frame, target_frame) if frame > 0)
-        rows = raw_action.shape[0]
+        rows = action.shape[0]
         if rows >= global_rows:
             return "global"
         if rows == local_rows:
@@ -860,7 +823,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _actions_for_frames(
         self,
-        raw_action: torch.Tensor | None,
+        action: torch.Tensor | None,
         *,
         layout: str | None,
         request_start_frame: int,
@@ -869,7 +832,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
         action_count = self.manifest.action_tokens_per_frame
         frame_count = frame_end - frame_start
-        if raw_action is None or layout is None:
+        if action is None or layout is None:
             zeros = torch.zeros(
                 1,
                 frame_count * action_count,
@@ -885,14 +848,14 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         null_indexes: list[int] = []
         for local_idx, frame_idx in enumerate(range(frame_start, frame_end)):
             if frame_idx == 0:
-                rows.append(raw_action.new_zeros(action_count, self.manifest.max_action_dim))
+                rows.append(action.new_zeros(action_count, self.manifest.max_action_dim))
                 null_indexes.append(local_idx)
                 continue
             if layout == "global":
                 start = (frame_idx - 1) * action_count
             else:
                 start = (frame_idx - local_base_frame) * action_count
-            rows.append(raw_action[start : start + action_count])
+            rows.append(action[start : start + action_count])
         return torch.cat(rows, dim=0).unsqueeze(0), tuple(null_indexes)
 
     def _initial_condition_latent(
@@ -936,11 +899,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if not isinstance(image, torch.Tensor):
             raise TypeError("Cosmos3-Nano-Sim-Bimanual preprocessed image must be a torch.Tensor.")
         latent = self._encode_conditioning_image_latent(image)
-        image_size = conditioning_image_size(sp)
-        if image_size is not None:
-            if tuple(image.shape[-2:]) != image_size[:2]:
-                raise ValueError("Preprocessed conditioning image no longer matches its padded canvas.")
-            latent = self._crop_latent_to_image_size(latent, image_size)
+        latent = latent[..., : geometry.latent_height, : geometry.latent_width].contiguous()
         expected = (
             1,
             self.transformer.latent_channel_size,
@@ -1044,17 +1003,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> torch.Tensor:
         """Decode a new causal block with session-owned Wan features."""
 
-        result = decode_wan_causal_chunk(
-            self.vae,
-            self._denormalize_vae_latents(latents),
-            feature_cache=state.vae_decoder_feat_cache,
-            initialized=state.vae_decoder_initialized,
-        )
-        state.record_incremental_decode(
-            input_frames=int(latents.shape[2]),
-            feature_cache=result.feature_cache,
-        )
-        return result.video
+        if self._streaming_decoder is None:
+            self._streaming_decoder = WanStreamingDecoder(self.vae)
+        if state.vae_decode is None:
+            state.vae_decode = self._streaming_decoder.new_decode_state(state.session_id)
+        video = self._streaming_decoder.decode_chunk(self._denormalize_vae_latents(latents), state.vae_decode)
+        state.record_incremental_decode(input_frames=int(latents.shape[2]))
+        return video
 
     # -- Generation --------------------------------------------------------
 
@@ -1240,8 +1195,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             domain_value = domain_value.item()
         per_row_domains = isinstance(domain_value, (list, tuple, torch.Tensor))
         if per_row_domains:
-            if self.manifest.require_action_schema().schema_version != 5:
-                raise ARDiffusionRequestRejectedError("Per-row domains require unified actions")
             domain_value = self.manifest.resolve_domain_name(domain_name) if domain_name else self.default_domain_id
         if domain_value is None and domain_name is None:
             domain_value = self.default_domain_id
@@ -1318,28 +1271,27 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 )
 
         try:
-            raw_action = self._prepare_raw_action(
+            action = self._prepare_action(
                 embodiment=embodiment, action_value=controls.action, action_space=controls.action_space
             )
         except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         prepared_domains = None
-        if self.manifest.require_action_schema().schema_version == 5:
-            if raw_action is None:
-                raise ARDiffusionRequestRejectedError("Unified forward dynamics requires prepared actions")
-            try:
-                prepared_domains = prepare_domain_ids(
-                    controls.domain_id if per_row_domains else domain_id,
-                    rows=raw_action.shape[0],
-                    allowed=set(self.manifest.require_action_schema().embodiment_to_domain.values()),
-                )
-                camera_rows = prepared_domains.eq(2)
-                if camera_rows.numel() == 1:
-                    camera_rows = camera_rows.expand(raw_action.shape[0])
-                if torch.count_nonzero(raw_action[camera_rows.to(raw_action.device), 9:59]):
-                    raise ValueError("Camera rows must have zero non-camera action slots")
-            except ValueError as exc:
-                raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if action is None:
+            raise ARDiffusionRequestRejectedError("Forward dynamics requires prepared actions")
+        try:
+            prepared_domains = prepare_domain_ids(
+                controls.domain_id if per_row_domains else domain_id,
+                rows=action.shape[0],
+                allowed=set(self.manifest.require_action_schema().embodiment_to_domain.values()),
+            )
+            camera_rows = prepared_domains.eq(2)
+            if camera_rows.numel() == 1:
+                camera_rows = camera_rows.expand(action.shape[0])
+            if torch.count_nonzero(action[camera_rows.to(action.device), 9:59]):
+                raise ValueError("Camera rows must have zero non-camera action slots")
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if tick:
             tick_frames = _admission_int(
                 _first_not_none(controls.num_latent_frames, self.manifest.chunk_size),
@@ -1351,14 +1303,14 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 )
             target_frame = start_frame + tick_frames
             # Frame zero is the singleton causal prefix. A normal first tick
-            # therefore advances through [0, 1) and then one [1, 5) chunk,
+            # therefore advances through [0, 1) and then one checkpoint-sized chunk,
             # regardless of whether frame zero is supplied or generated.
             if start_frame == 0:
                 target_frame += 1
             if not close_session and (target_frame - 1) % self.manifest.chunk_size != 0:
                 raise ARDiffusionRequestRejectedError(
-                    "Cosmos3-Nano-Sim-Bimanual non-terminal ticks must end on a canonical [1,4,4,...] "
-                    f"chunk boundary, got target latent frame {target_frame}."
+                    "Cosmos3-Nano-Sim-Bimanual non-terminal ticks must end on a checkpoint chunk boundary; "
+                    f"chunk_size={self.manifest.chunk_size}, target latent frame={target_frame}."
                 )
         else:
             requested_pixel_frames = _admission_int(_first_not_none(sp.num_frames, 1), "num_frames")
@@ -1394,27 +1346,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             )
 
         action_layout = self._resolve_action_layout(
-            raw_action,
+            action,
             start_frame=start_frame,
             target_frame=target_frame,
         )
-
-        selector = None
-        if extra.get("frustum_geometry") is not None:
-            if tick or not state_was_new or start_frame != 0:
-                raise ARDiffusionRequestRejectedError("Frustum retrieval requires a fresh complete offline rollout")
-            if self.manifest.window_frames is not None or self.manifest.sink_frames != 0:
-                raise ARDiffusionRequestRejectedError(
-                    "Frustum retrieval requires a full archive: window_frames=null, sink_frames=0"
-                )
-            if initial_latent is None:
-                raise ARDiffusionRequestRejectedError("Frustum retrieval requires an initial conditioning image")
-            try:
-                selector = FrustumHistorySelector(
-                    extra["frustum_geometry"], target_frame, self.manifest.temporal_compression_factor, fps
-                )
-            except (TypeError, ValueError, RuntimeError) as exc:
-                raise ARDiffusionRequestRejectedError(str(exc)) from exc
 
         # ---- Side effects begin ---------------------------------------------
         tick_durations: dict[str, float] = {}
@@ -1442,30 +1377,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
         domain_ids = frame_domains(0, 1)
         text_kv = self._ensure_text_kv(state, text_ids, text_mask)
-        if selector is None:
-            self._prepare_dense_attention(state, text_kv, real_text_kv_len, geometry, target_frame)
-        else:
-            attention = getattr(self, "_frustum_attention_cache", None)
-            if attention is None:
-                attention = CosmosSimDenseAttentionCache()
-            capacity = real_text_kv_len + (sum(selector.sizes) + self.manifest.chunk_size) * geometry.tokens_per_frame(
-                self.manifest.conditioning_tokens_per_frame
-            )
-            if attention.kv and not attention.fits(text_kv, capacity):
-                self.release_captured_graphs()
-            self._frustum_attention_cache = attention
-            state.frustum_archive = FrustumKVArchive(
-                state,
-                text_kv,
-                real_text_kv_len,
-                geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame),
-                target_frame,
-                sum(selector.sizes),
-                self.manifest.chunk_size,
-                attention,
-                self._ar_diffusion_kv_state,
-                self._MAIN_BRANCH,
-            )
+        self._prepare_dense_attention(state, text_kv, real_text_kv_len, geometry, target_frame)
 
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)
@@ -1494,7 +1406,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
         if initial_latent is not None and state.next_frame_idx == 0:
             initial_action, initial_null = self._actions_for_frames(
-                raw_action,
+                action,
                 layout=action_layout,
                 request_start_frame=start_frame,
                 frame_start=0,
@@ -1532,12 +1444,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             self.manifest.chunk_size,
         ):
             chunk_frames = chunk_end - chunk_start
-            if selector is not None:
-                selected = selector.select(chunk_start, chunk_end)
-                state.frustum_archive.select(chunk_start, selected)
-                logger.info("Frustum KV chunk [%d,%d): %s", chunk_start, chunk_end, selected)
             action_chunk, null_action_indexes = self._actions_for_frames(
-                raw_action,
+                action,
                 layout=action_layout,
                 request_start_frame=start_frame,
                 frame_start=chunk_start,

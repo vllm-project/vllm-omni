@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Validation of raw and model-space action inputs, before session mutation."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Validation of unified action inputs before session mutation."""
 
 from __future__ import annotations
 
@@ -39,17 +40,11 @@ def validate_action_values(value: Any, *, width: int) -> torch.Tensor:
     return action
 
 
-def prepare_action_values(
-    value: Any, *, width: int, model_width: int, action_space: str, normalizer: Any
-) -> torch.Tensor:
-    """Normalize raw actions once; preserve explicitly model-space values."""
-    if action_space not in ("raw", "model"):
-        raise ValueError("action_space must be 'raw' or 'model'.")
+def prepare_action_values(value: Any, *, width: int, model_width: int) -> torch.Tensor:
+    """Validate normalized unified actions and pad them to the model width."""
     action = validate_action_values(value, width=width)
-    if action_space == "raw":
-        action = normalizer.normalize(action)
     if model_width < width:
-        raise ValueError("Model action width must cover the embodiment width.")
+        raise ValueError("Model action width must cover the input action width.")
     return torch.nn.functional.pad(action, (0, model_width - width))
 
 

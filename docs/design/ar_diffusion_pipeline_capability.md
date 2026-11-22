@@ -86,6 +86,24 @@ trusted. Pipelines must therefore complete every fail-closed check (session
 fingerprint, chunk-index ordering, prompt-length, resolution, action coverage)
 before their first side effect.
 
+## Per-request KV geometry
+
+A pipeline whose KV geometry depends on the request, for example on its
+resolution or full-history length, also implements
+`SupportsDynamicARDiffusion`. Its `ar_diffusion_default_request_spec()` sizes
+the initial pool, and `ar_diffusion_request_spec(request)` returns an
+`ARDiffusionRequestKVSpec` containing the KV requirements and an opaque session
+geometry key. The runner validates effective deployment overrides through
+`validate_ar_diffusion_effective_spec()` and checks the model-declared
+`ar_diffusion_worst_case_request_specs()` against the load-time memory budget.
+
+When a request resolves to different KV requirements, the runner releases every
+session and replaces the pool within that budget. Before releasing anything,
+it rejects the request with `ARDiffusionRequestRejectedError` if the request's
+own session is live without `reset`, or if one session of the new geometry
+cannot fit. A changed session geometry key also requires `reset`, including
+transposed resolutions with identical token counts and KV requirements.
+
 ## DreamZero adapter
 
 DreamZero implements the capability directly on `DreamZeroPipeline`. Its adapter

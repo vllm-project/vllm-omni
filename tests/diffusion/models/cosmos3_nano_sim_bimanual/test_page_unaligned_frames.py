@@ -15,7 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from test_cookbook import manifest
+from test_action_schema import manifest
 from test_sampling_history import methods
 from vllm.v1.attention.backend import MultipleOf
 

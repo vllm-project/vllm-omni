@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reference cache capacity, checkpoint defaults, and session separation."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
-from test_cookbook import manifest
+from test_action_schema import manifest
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS,
     Cosmos3NanoSimBimanualManifest,
+    validate_ar_diffusion_kv_overrides,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     append_dense_kv_history,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -33,11 +36,12 @@ def config(**overrides):
     return SimpleNamespace(tf_model_config={"cosmos3_nano_sim_bimanual": artifact}, model_config=overrides)
 
 
-def test_override_preserves_checkpoint_and_separates_sessions():
+@pytest.mark.parametrize(("cache_size", "sinks"), [(16, 0), (64, 8), (128, 32)])
+def test_override_preserves_checkpoint_and_separates_sessions(cache_size, sinks):
     baseline = Cosmos3NanoSimBimanualManifest.from_od_config(config())
-    options = config(kv_cache_inference_size=64, attention_sink_size=8)
+    options = config(kv_cache_inference_size=cache_size, attention_sink_size=sinks)
     effective = Cosmos3NanoSimBimanualManifest.from_od_config(options)
-    assert (effective.window_frames, effective.sink_frames) == (55, 8)
+    assert (effective.window_frames, effective.sink_frames) == (cache_size - sinks - 1, sinks)
     assert effective.digest != baseline.digest
     assert effective.chunk_size == baseline.chunk_size and effective.t_list == baseline.t_list
     assert options.tf_model_config["cosmos3_nano_sim_bimanual"]["window_frames"] == baseline.window_frames
@@ -73,3 +77,25 @@ def test_retained_history_matches_reference_frame_indices():
 def test_invalid_override_rejected(overrides):
     with pytest.raises(ValueError):
         Cosmos3NanoSimBimanualManifest.from_od_config(config(**overrides))
+
+
+@pytest.mark.parametrize(
+    ("kv_config", "message"),
+    [
+        ({"window_chunks": 32}, "window_chunks=32"),
+        (ARDiffusionKVConfig(sink_chunks=2), "sink_chunks=2"),
+        ({"reset_at_boundary": True}, "reset_at_boundary"),
+    ],
+)
+def test_runner_history_override_rejected(kv_config, message):
+    windowed = Cosmos3NanoSimBimanualManifest.from_od_config(config(kv_cache_inference_size=64, attention_sink_size=8))
+    with pytest.raises(ValueError, match=message):
+        validate_ar_diffusion_kv_overrides(config(ar_diffusion_kv_config=kv_config), windowed)
+
+
+def test_runner_override_matching_manifest_or_capping_full_history_allowed():
+    windowed = Cosmos3NanoSimBimanualManifest.from_od_config(config(kv_cache_inference_size=64, attention_sink_size=8))
+    matching = {"window_chunks": 55, "sink_chunks": 8, "gpu_memory_fraction": 0.35}
+    validate_ar_diffusion_kv_overrides(config(ar_diffusion_kv_config=matching), windowed)
+    assert manifest().window_frames is None
+    validate_ar_diffusion_kv_overrides(config(ar_diffusion_kv_config={"window_chunks": 32}), manifest())

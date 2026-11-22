@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA ordering, storage lifetime and failure cleanup for overlapped decode."""
 
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.diffusion,
+    *hardware_marks(res={"cuda": "L4"}),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+]
 
 
 def test_causal_decode_preserves_producer_order_and_pinned_outputs():

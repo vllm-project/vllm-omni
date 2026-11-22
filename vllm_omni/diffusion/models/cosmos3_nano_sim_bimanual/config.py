@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict schema-v1 artifact and deployment configuration for Cosmos3-Nano-Sim-Bimanual."""
 
 from __future__ import annotations
@@ -9,14 +10,7 @@ import math
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import Cosmos3NanoSimBimanualActionSchema
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
-    Cosmos3NanoSimBimanualActionConditioning,
-    Cosmos3NanoSimBimanualConditioning,
-    Cosmos3NanoSimBimanualControlVideoConditioning,
-    parse_cosmos3_nano_sim_bimanual_conditioning,
-)
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.unified_action_contract import UnifiedActionConditioning
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_schema import Cosmos3NanoSimBimanualActionSchema
 
 COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION = 1
 COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS = frozenset(
@@ -120,6 +114,36 @@ def validate_sim_parallel_config(config: Any) -> None:
         raise ValueError("Cosmos Sim uses dense MLP blocks; there are no experts to distribute")
 
 
+def validate_ar_diffusion_kv_overrides(config: Any, manifest: Cosmos3NanoSimBimanualManifest) -> None:
+    """Reject AR-Diffusion runner overrides that contradict the manifest history policy.
+
+    The attention mask follows the manifest, so a different paged window, sink,
+    or boundary reset would desynchronize it from the pool. A full-history
+    manifest may cap its pool with ``window_chunks``.
+    """
+    raw = deploy_option(config, "ar_diffusion_kv_config")
+    if raw is None:
+        return
+
+    def value(name: str) -> Any:
+        return raw.get(name) if isinstance(raw, dict) else getattr(raw, name, None)
+
+    window, sinks = value("window_chunks"), value("sink_chunks")
+    conflicts = []
+    if window and manifest.window_frames is not None and window != manifest.window_frames:
+        conflicts.append(f"window_chunks={window} (manifest window_frames={manifest.window_frames})")
+    if sinks and sinks != manifest.sink_frames:
+        conflicts.append(f"sink_chunks={sinks} (manifest sink_frames={manifest.sink_frames})")
+    if value("reset_at_boundary"):
+        conflicts.append("reset_at_boundary=True")
+    if conflicts:
+        raise ValueError(
+            "Cosmos3-Nano-Sim-Bimanual history comes from the checkpoint manifest or "
+            "kv_cache_inference_size/attention_sink_size; remove ar_diffusion_kv_config "
+            f"{', '.join(conflicts)}."
+        )
+
+
 def _exported_artifact_source(config: Any) -> dict[str, Any]:
     """Return the sole supported artifact source in transformer configuration."""
 
@@ -208,7 +232,7 @@ def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_id": artifact["checkpoint_id"],
         "checkpoint_iteration": _strict_int(artifact["checkpoint_iteration"], "checkpoint_iteration"),
         "checkpoint_hash": artifact["checkpoint_hash"],
-        "conditioning": parse_cosmos3_nano_sim_bimanual_conditioning(artifact["conditioning"]),
+        "conditioning": Cosmos3NanoSimBimanualActionSchema.model_validate(artifact["conditioning"]),
     }
 
 
@@ -217,7 +241,7 @@ class Cosmos3NanoSimBimanualManifest:
     """Immutable schema-v1 artifact fields required by Cosmos3-Nano-Sim-Bimanual runtime."""
 
     schema_version: int = COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION
-    chunk_size: int = 4
+    chunk_size: int = 2
     window_frames: int | None = 96
     sink_frames: int = 0
     text_cache_max_len: int = 512
@@ -236,7 +260,7 @@ class Cosmos3NanoSimBimanualManifest:
     checkpoint_id: str = "unknown"
     checkpoint_iteration: int = 0
     checkpoint_hash: str = "unknown"
-    conditioning: Cosmos3NanoSimBimanualConditioning | None = None
+    conditioning: Cosmos3NanoSimBimanualActionSchema | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION:
@@ -305,44 +329,26 @@ class Cosmos3NanoSimBimanualManifest:
             )
         if self.checkpoint_hash != "unknown" and set(self.checkpoint_hash) == {"0"}:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoint_hash cannot be the all-zero template value")
-        if self.conditioning is not None and not isinstance(
-            self.conditioning,
-            Cosmos3NanoSimBimanualActionConditioning
-            | UnifiedActionConditioning
-            | Cosmos3NanoSimBimanualControlVideoConditioning,
-        ):
+        if self.conditioning is not None and not isinstance(self.conditioning, Cosmos3NanoSimBimanualActionSchema):
             raise ValueError("Cosmos3-Nano-Sim-Bimanual schema v1 requires a recognized conditioning payload")
 
     @property
-    def action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | UnifiedActionConditioning | None:
-        return (
-            self.conditioning
-            if isinstance(self.conditioning, (Cosmos3NanoSimBimanualActionConditioning, UnifiedActionConditioning))
-            else None
-        )
+    def action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | None:
+        return self.conditioning if isinstance(self.conditioning, Cosmos3NanoSimBimanualActionSchema) else None
 
-    def require_action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | UnifiedActionConditioning:
+    def require_action_schema(self) -> Cosmos3NanoSimBimanualActionSchema:
         schema = self.action_schema
         if schema is None:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual action conditioning is unavailable.")
         return schema
-
-    def require_control_video_conditioning(self) -> Cosmos3NanoSimBimanualControlVideoConditioning:
-        conditioning = self.conditioning
-        if not isinstance(conditioning, Cosmos3NanoSimBimanualControlVideoConditioning):
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual control_video conditioning is unavailable.")
-        return conditioning
 
     @property
     def action_tokens_per_frame(self) -> int:
         return self.require_action_schema().action_tokens_per_frame
 
     @property
-    def raw_action_dim(self) -> int:
-        return self.require_action_schema().raw_action_dim
-
-    def raw_action_dim_for(self, embodiment: str) -> int:
-        return self.require_action_schema().raw_action_dim_for(embodiment)
+    def input_action_dim(self) -> int:
+        return self.require_action_schema().input_action_dim
 
     @property
     def max_action_dim(self) -> int:
@@ -362,8 +368,6 @@ class Cosmos3NanoSimBimanualManifest:
 
     @property
     def conditioning_tokens_per_frame(self) -> int:
-        if isinstance(self.conditioning, Cosmos3NanoSimBimanualControlVideoConditioning):
-            return 0
         return self.action_tokens_per_frame
 
     @property

@@ -245,6 +245,28 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     f"tokens_per_frame={effective.tokens_per_frame}."
                 )
 
+    def _validate_replacement_spec(self, spec: ARDiffusionKVCacheSpec, config: ARDiffusionKVConfig) -> None:
+        """Admit a replacement pool before releasing live sessions."""
+
+        budget = self._available_memory_budget
+        if budget is None:
+            raise RuntimeError("AR-Diffusion load-time memory budget is unavailable")
+        if spec.segmented is not None:
+            budget = self._segmented_all_rank_min(budget)
+        estimate = estimate_ar_diffusion_kv_cache_memory(
+            config,
+            spec,
+            self.od_config.dtype,
+            scratch_blocks_override=ar_diffusion_scratch_blocks_override(),
+            block_size=paging_block_size(spec.segmented.block_size if spec.segmented else spec.tokens_per_frame),
+        )
+        if estimate.required_bytes > budget:
+            raise ARDiffusionRequestRejectedError(
+                "AR-Diffusion KV cache for this request cannot fit one session: "
+                f"available={budget} bytes, required={estimate.required_bytes} bytes, "
+                f"tokens_per_frame={spec.tokens_per_frame}, window_frames={spec.window_frames}."
+            )
+
     @staticmethod
     def _segmented_all_rank_min(value: int) -> int:
         """Agree on segmented allocation admission before a model collective."""
@@ -692,7 +714,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 raise ARDiffusionRequestRejectedError(str(exc)) from exc
             request_spec = self._require_request_spec(request_spec, "ar_diffusion_request_spec()")
             geometry_key = request_spec.geometry_key
-            requested_spec, _ = self._effective_spec(capability, request_spec.kv_spec)
+            requested_spec, config = self._effective_spec(capability, request_spec.kv_spec)
 
             geometry_keys = getattr(self, "_session_geometry_keys", {})
             if session_id in self._sessions and geometry_keys.get(session_id) != geometry_key and not reset:
@@ -704,6 +726,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if requested_spec is None:
             raise RuntimeError("AR-Diffusion request specification is unavailable")
         if requested_spec != self._ar_diffusion_kv_cache_spec:
+            if session_id in self._sessions and not reset:
+                raise ARDiffusionRequestRejectedError(
+                    f"AR-Diffusion session {session_id!r} needs a different KV geometry; reset is required."
+                )
+            self._validate_replacement_spec(requested_spec, config)
             self._rebuild_for_spec(requested_spec)
         elif reset:
             self.reset_session(session_id)

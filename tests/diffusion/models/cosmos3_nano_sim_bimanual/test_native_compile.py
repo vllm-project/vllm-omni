@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Admission contracts for the native Inductor path and Sim parallel execution."""
 
 from types import SimpleNamespace
@@ -9,6 +10,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     resolve_ar_compile_mode,
     validate_sim_parallel_config,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("source", ["direct", "model_config", "custom_pipeline_args"])

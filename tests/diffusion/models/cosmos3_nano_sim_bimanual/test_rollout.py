@@ -16,7 +16,7 @@ import sys
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -42,7 +42,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualResolutionPolicy,
     resolve_cosmos3_nano_sim_bimanual_geometry,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualSessionFingerprint,
     Cosmos3NanoSimBimanualSessionState,
@@ -52,6 +51,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import (
     parse_cosmos3_nano_sim_bimanual_tick,
 )
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
+from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionChunkMetadata, ARDiffusionTickRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -99,7 +99,7 @@ def pipeline_methods() -> type:
         "_forward_impl",
         "_request_controls",
         "_validate_session_mode",
-        "_prepare_raw_action",
+        "_prepare_action",
         "_fingerprint",
         "_resolve_action_layout",
         "_actions_for_frames",
@@ -131,7 +131,7 @@ def guardrail_gate(monkeypatch):
 
 
 def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
-    from test_cookbook import manifest
+    from test_action_schema import manifest
 
     pipe = pipeline_methods()()
     pipe.manifest = manifest()
@@ -145,10 +145,6 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
     pipe._MAIN_BRANCH = "main"
     pipe.od_config = SimpleNamespace(model_config={"guardrails": True})
     pipe.resolution_policy = Cosmos3NanoSimBimanualResolutionPolicy(default_resolution=(32, 32))
-    pipe.action_normalizers = {
-        name: ActionAffineNormalizer.from_contract(contract.normalizer)
-        for name, contract in pipe.manifest.require_action_schema().embodiments.items()
-    }
     pipe.transformer = SimpleNamespace(latent_channel_size=3)
     pipe.clean_commit_mode = "framewise"
     pipe.device = "cpu"
@@ -165,8 +161,11 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
         return state
 
     def decode(state: Any, latent: torch.Tensor) -> torch.Tensor:
-        frames = latent.shape[2] * 4 - (0 if state.vae_decoder_initialized else 3)
-        state.record_incremental_decode(input_frames=latent.shape[2], feature_cache=[])
+        if state.vae_decode is None:
+            state.vae_decode = StreamingDecodeState(state.session_id, feat_map=[])
+        frames = latent.shape[2] * 4 - (3 if not state.vae_decode.started else 0)
+        state.vae_decode.frames_decoded += latent.shape[2]
+        state.record_incremental_decode(input_frames=latent.shape[2])
         return torch.zeros(1, 3, frames, 32, 32)
 
     pipe._get_or_create_state = create_state
@@ -183,6 +182,8 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
 
 
 def request(frames: int = 61, *, output_type: str | None = None, **extra: Any) -> Any:
+    extra.setdefault("action", torch.zeros(8 if extra.get("chunk_only") else frames - 1, 59))
+    extra.setdefault("action_space", "normalized_unified_v1")
     return SimpleNamespace(
         prompts=[{"prompt": "test"}],
         sampling_params=SimpleNamespace(
@@ -241,7 +242,7 @@ def test_batched_clean_commit_preserves_terminal_frame_and_action_slices(frames,
         committed.extend(range(start, start + count))
         assert call.kwargs["condition_vision"] and call.kwargs["commit_current"]
         assert call.kwargs["action_latents"].shape[1] == count * pipe.manifest.action_tokens_per_frame
-        assert call.kwargs["null_action_frame_indexes"] == tuple(range(count))
+        assert call.kwargs["null_action_frame_indexes"] == tuple(index for index in range(count) if start + index == 0)
     assert committed == list(range(state.next_frame_idx - 1))
     assert pipe._set_mixed_precision_step.call_count == pipe._reset_mixed_precision.call_count
 
@@ -271,8 +272,8 @@ def test_full_video_keeps_guardrail_output_route() -> None:
 
 def test_terminal_tick_keeps_incremental_path() -> None:
     pipe, state = fake_pipeline()
-    output = pipe.forward(request(chunk_only=True, num_latent_frames=4)).media.video.tensor
-    assert output.shape[2] == 17 and state.next_frame_idx == 5
+    output = pipe.forward(request(chunk_only=True, num_latent_frames=2)).media.video.tensor
+    assert output.shape[2] == 9 and state.next_frame_idx == 3
     assert state.latents == []
     pipe._decode_live_latents.assert_called_once()
 
@@ -294,36 +295,23 @@ def test_failed_decoder_releases_session() -> None:
     assert pipe._states == {}
 
 
-@pytest.mark.parametrize("space", ["raw", "model"])
-def test_action_space_reaches_transformer(space: str) -> None:
+def test_unified_actions_reach_transformer() -> None:
     pipe, state = fake_pipeline()
-    action = torch.arange(16 * 29, dtype=torch.float32).reshape(16, 29) / 100
-    pipe.forward(request(17, action=action, action_space=space, action_mode="forward_dynamics"))
-    expected = pipe.action_normalizers["agibotworld"].normalize(action) if space == "raw" else action
+    action = torch.arange(8 * 59, dtype=torch.float32).reshape(8, 59) / 100
+    pipe.forward(request(9, action=action, action_mode="forward_dynamics"))
     actual = pipe._transformer_forward.call_args.kwargs["action_latents"]
-    torch.testing.assert_close(actual[0, :, :29], expected)
-    assert not actual[0, :, 29:].count_nonzero()
-    assert state.fingerprint.action_space == space
-
-
-def test_action_space_change_rejects_continuation_without_mutation() -> None:
-    pipe, state = fake_pipeline()
-    pipe.forward(request(chunk_only=True, close_session=False, action_space="raw"))
-    pipe._initial_condition_latent.return_value = None
-    decode_count = pipe._decode_live_latents.call_count
-    with pytest.raises(ARDiffusionRequestRejectedError, match="action_space"):
-        pipe.forward(request(chunk_only=True, reset=False, close_session=False, action_space="model"))
-    assert pipe._states["test"] is state and state.next_frame_idx == 5
-    assert pipe._decode_live_latents.call_count == decode_count
+    torch.testing.assert_close(actual[0, :, :59], action)
+    assert not actual[0, :, 59:].count_nonzero()
+    assert state.fingerprint.action_space == "normalized_unified_v1"
 
 
 @pytest.mark.parametrize(
     "extra,match",
     [
         ({"action_space": "unknown"}, "action_space"),
-        ({"action_mode": "forward_dynamics"}, "requires action"),
-        ({"action": [[True] * 29] * 60}, "booleans"),
-        ({"action": [[0.0] * 29] * 16}, "action length"),
+        ({"action_mode": "forward_dynamics", "action": None}, "requires action conditioning"),
+        ({"action": [[True] * 59] * 60}, "booleans"),
+        ({"action": [[0.0] * 59] * 16}, "action length"),
     ],
 )
 def test_invalid_actions_do_not_mutate_session(extra: dict, match: str) -> None:
@@ -335,7 +323,7 @@ def test_invalid_actions_do_not_mutate_session(extra: dict, match: str) -> None:
     pipe._denoise_chunk.assert_not_called()
 
 
-def test_typed_tick_still_uses_raw_actions_and_media_metadata() -> None:
+def test_typed_tick_uses_unified_actions_and_media_metadata() -> None:
     pipe, _ = fake_pipeline()
     tick = ARDiffusionTickRequest(
         session_id="test",
@@ -343,13 +331,40 @@ def test_typed_tick_still_uses_raw_actions_and_media_metadata() -> None:
         chunk_index=0,
         applied_event_ids=(1,),
         reset=True,
-        controls=(build_cosmos3_nano_sim_bimanual_action_control(torch.zeros(16, 29)),),
+        controls=(build_cosmos3_nano_sim_bimanual_action_control(torch.zeros(8, 59)),),
     )
     sp = request().sampling_params
     controls = pipe._request_controls(sp, tick.to_extra_args(), tick)
-    assert controls.action_space == "raw" and controls.action.shape == (16, 29)
-    output = pipe._build_output(torch.zeros(1, 3, 17, 32, 32), sampling_params=sp, typed_tick=tick, stage_durations={})
+    assert tick.controls[0].schema == "robot_action.v2"
+    assert controls.action_space == "normalized_unified_v1" and controls.action.shape == (8, 59)
+    output = pipe._build_output(torch.zeros(1, 3, 9, 32, 32), sampling_params=sp, typed_tick=tick, stage_durations={})
     assert output.media.metadata["ar_diffusion"] == ARDiffusionChunkMetadata.from_tick(tick).to_dict()
-    sp.extra_args["action_space"] = "model"
-    with pytest.raises(ARDiffusionRequestRejectedError, match="typed ticks require raw"):
+    sp.extra_args["action_space"] = "unknown"
+    with pytest.raises(ARDiffusionRequestRejectedError, match="normalized_unified_v1"):
         pipe._request_controls(sp, tick.to_extra_args(), tick)
+
+
+@pytest.mark.parametrize("chunk_index,frame_idx", [(0, 0), (1, 3), (2, 5)])
+def test_typed_tick_chunk_positions(chunk_index, frame_idx):
+    control = build_cosmos3_nano_sim_bimanual_action_control(torch.zeros(8, 59))
+    tick = ARDiffusionTickRequest(session_id="test", request_id="tick", chunk_index=chunk_index, controls=(control,))
+    parsed = parse_cosmos3_nano_sim_bimanual_tick(tick)
+    assert (parsed.frame_idx, parsed.num_latent_frames) == (frame_idx, 2)
+    with pytest.raises(ValueError, match="robot_action.v2"):
+        parse_cosmos3_nano_sim_bimanual_tick(replace(tick, controls=(replace(control, schema="robot_action.v1"),)))
+
+
+@pytest.mark.parametrize("value", [True, "1", float("nan"), float("inf")])
+def test_typed_tick_rejects_invalid_action_values(value):
+    control = build_cosmos3_nano_sim_bimanual_action_control(torch.zeros(8, 59))
+    invalid = [[value] * 59] * 8
+    tick = ARDiffusionTickRequest(
+        session_id="test",
+        request_id="tick",
+        chunk_index=0,
+        controls=(replace(control, data={"values": invalid}),),
+    )
+    with pytest.raises(ValueError):
+        parse_cosmos3_nano_sim_bimanual_tick(tick)
+    with pytest.raises(ValueError):
+        build_cosmos3_nano_sim_bimanual_action_control(invalid)

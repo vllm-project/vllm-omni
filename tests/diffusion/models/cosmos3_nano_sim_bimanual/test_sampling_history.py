@@ -11,7 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from test_cookbook import manifest
+from test_action_schema import manifest
 from test_rollout import SOURCE, fake_pipeline, request
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
@@ -132,9 +132,9 @@ def test_full_history_reaches_dense_paged_and_batched_paths():
     assert pipe.transformer.call_args.kwargs["history_window"] == (0, None)
 
 
-def test_full_rollout_uses_chunk2_without_history_limit():
+def test_full_rollout_uses_checkpoint_chunk_without_history_limit():
     pipe, state = fake_pipeline()
-    pipe.manifest = replace(pipe.manifest, chunk_size=2, window_frames=None, sink_frames=0, t_list=(1.0, 5 / 6))
+    pipe.manifest = replace(pipe.manifest, window_frames=None, sink_frames=0)
     pipe.forward(request(901, output_type="latent"))
     assert state.next_frame_idx == 226
     assert pipe._denoise_chunk.call_count == len(range(1, 226, 2))
@@ -142,10 +142,10 @@ def test_full_rollout_uses_chunk2_without_history_limit():
 
 def test_checkpoint_schedule_changes_session_fingerprint():
     pipe, _ = fake_pipeline()
-    pipe.forward(request(17, output_type="latent", chunk_only=True, num_latent_frames=4, close_session=False))
-    pipe.manifest = replace(pipe.manifest, t_list=(1.0, 5 / 6))
+    pipe.forward(request(9, output_type="latent", chunk_only=True, num_latent_frames=2, close_session=False))
+    pipe.manifest = replace(pipe.manifest, t_list=(1.0, 0.9, 0.8, 0.6))
     with pytest.raises(ARDiffusionRequestRejectedError, match="manifest_id|sampler_id|inference_id"):
-        pipe.forward(request(33, output_type="latent", chunk_only=True, num_latent_frames=4, reset=False))
+        pipe.forward(request(17, output_type="latent", chunk_only=True, num_latent_frames=2, reset=False))
 
 
 @pytest.mark.parametrize("pixels,expected", [(65, 17), (257, 65), (901, 226)])

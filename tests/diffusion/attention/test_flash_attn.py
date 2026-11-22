@@ -123,7 +123,7 @@ def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch)
     assert captured["softmax_scale"] == 0.25
 
 
-@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
 def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     """Exercise the real versioned vLLM dispatcher and its LSE contract."""
@@ -138,8 +138,7 @@ def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     value = torch.randn_like(key)
 
     capability = torch.cuda.get_device_capability(device)
-    expected_version = 3 if capability[0] == 9 else 2
-    assert capability[0] in (8, 9), f"test expects an Ampere/Ada or Hopper GPU, got SM{capability[0]}{capability[1]}"
+    expected_version = 4 if capability[0] >= 10 else 3 if capability[0] == 9 else 2
     assert fa.resolve_vllm_flash_attn_version() == expected_version
 
     output, lse = fa.vllm_flash_attn_dense_with_lse(

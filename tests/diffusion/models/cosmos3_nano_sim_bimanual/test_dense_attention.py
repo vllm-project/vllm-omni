@@ -12,6 +12,7 @@ from tests.diffusion.models.cosmos3_nano_sim_bimanual.test_batched_clean_commit 
     layers,
     run_forward,
 )
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import append_dense_kv_history
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import _dense_clean_kv
@@ -150,7 +151,7 @@ def test_rope_staging_reuses_addresses_and_refreshes_values():
     assert len(cache._rope_buffers) == 1
 
 
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_joint_buffer_preserves_attention_and_history_gpu():
     compare_joint_buffer(torch.device("cuda"), torch.bfloat16)
