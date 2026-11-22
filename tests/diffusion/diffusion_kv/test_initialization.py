@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -245,27 +244,29 @@ def test_hsdp_request_lanes_do_not_change_vllm_model_layout_dp() -> None:
 
 
 @pytest.mark.parametrize(
-    ("is_moe", "lora_backend", "expects_lora"),
+    ("is_moe", "lora_backend", "lora_path", "enable_moe_lora", "expects_lora"),
     [
-        (True, "peft", True),
-        (True, "distill", False),
-        (False, "peft", False),
+        (True, "peft", None, False, False),
+        (True, "peft", None, True, True),
+        (True, "peft", "/adapter", False, True),
+        (True, "distill", None, True, False),
+        (False, "peft", None, True, False),
     ],
 )
-def test_diffusion_config_enables_moe_backend_lora_selection_before_model_load(
+def test_diffusion_config_opts_in_moe_lora_before_model_load(
     is_moe,
     lora_backend,
+    lora_path,
+    enable_moe_lora,
     expects_lora,
-    monkeypatch,
 ) -> None:
-    # The bridge is platform-neutral except on XPU, which builds it only for a
-    # startup adapter (see test_xpu_moe_lora_bridge_requires_a_startup_adapter).
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
         _od_config(
             is_moe=is_moe,
             lora_backend=lora_backend,
+            lora_path=lora_path,
+            enable_moe_lora=enable_moe_lora,
             max_cpu_loras=3,
         ),
     )
@@ -278,27 +279,18 @@ def test_diffusion_config_enables_moe_backend_lora_selection_before_model_load(
 
 
 @pytest.mark.parametrize(
-    ("is_cuda", "is_xpu", "lora_path", "native_mxfp4", "expects_lora"),
+    ("lora_path", "enable_moe_lora", "expects_lora"),
     [
-        (True, False, None, True, False),
-        (True, False, None, False, True),
-        (True, False, "/adapter", True, True),
-        (False, True, None, True, False),
-        (False, True, "/adapter", True, True),
-        (False, False, None, False, True),
+        (None, False, False),
+        (None, True, True),
+        ("/adapter", False, True),
     ],
 )
-def test_online_mxfp4_moe_lora_requires_a_startup_adapter_on_accelerators(
-    is_cuda,
-    is_xpu,
+def test_moe_lora_opt_in_covers_online_mxfp4_without_quant_exceptions(
     lora_path,
-    native_mxfp4,
+    enable_moe_lora,
     expects_lora,
-    monkeypatch,
 ) -> None:
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: is_cuda)
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: is_xpu)
-    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: native_mxfp4)
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
         _od_config(
@@ -306,6 +298,7 @@ def test_online_mxfp4_moe_lora_requires_a_startup_adapter_on_accelerators(
             is_moe=True,
             lora_backend="peft",
             lora_path=lora_path,
+            enable_moe_lora=enable_moe_lora,
             max_cpu_loras=3,
             quantization_config=build_quant_config({"method": "online", "moe": "mxfp4"}),
         ),
@@ -314,51 +307,7 @@ def test_online_mxfp4_moe_lora_requires_a_startup_adapter_on_accelerators(
     assert (config.lora_config is not None) is expects_lora
 
 
-@pytest.mark.parametrize(
-    ("is_xpu", "lora_path", "expects_lora"),
-    [
-        (True, None, False),
-        (True, "/adapter", True),
-        (False, None, True),
-    ],
-)
-def test_xpu_moe_lora_bridge_requires_a_startup_adapter(is_xpu, lora_path, expects_lora, monkeypatch, caplog) -> None:
-    """On XPU a LoRAConfig would push every MoE layer off the native XPU experts onto
-    the EMULATION backend, so the bridge is built only for a startup LoRA. This covers
-    quantization schemes the online-MXFP4 gate does not (online MXFP8, BF16).
-
-    Dropping the bridge also drops runtime MoE LoRA, so it has to be logged."""
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: not is_xpu)
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: is_xpu)
-    with caplog.at_level(logging.INFO, logger="vllm_omni.diffusion.vllm_config"):
-        config = diffusion_vllm_config.create_diffusion_vllm_config(
-            torch.device("cpu"),
-            _od_config(
-                diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
-                is_moe=True,
-                lora_backend="peft",
-                lora_path=lora_path,
-                quantization_config=build_quant_config("mxfp8"),
-            ),
-        )
-
-    assert (config.lora_config is not None) is expects_lora
-    logged_xpu_gate = "Disabling MoE LoRA on XPU" in caplog.text
-    assert logged_xpu_gate is not expects_lora
-
-
-@pytest.mark.parametrize(
-    ("moe_backend", "expects_lora"),
-    [
-        ("auto", False),
-        ("marlin", True),
-    ],
-)
-def test_online_mxfp4_moe_lora_respects_requested_backend(moe_backend, expects_lora, monkeypatch) -> None:
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
-    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: True)
-
+def test_base_moe_without_opt_in_leaves_lora_config_unset() -> None:
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
         _od_config(
@@ -366,13 +315,14 @@ def test_online_mxfp4_moe_lora_respects_requested_backend(moe_backend, expects_l
             is_moe=True,
             lora_backend="peft",
             lora_path=None,
-            moe_backend=moe_backend,
+            enable_moe_lora=False,
+            moe_backend="marlin",
             quantization_config=build_quant_config({"method": "online", "moe": "mxfp4"}),
         ),
     )
 
-    assert config.kernel_config.moe_backend == moe_backend
-    assert (config.lora_config is not None) is expects_lora
+    assert config.kernel_config.moe_backend == "marlin"
+    assert config.lora_config is None
 
 
 @pytest.mark.parametrize(
@@ -418,11 +368,7 @@ def test_online_mxfp4_native_backend_device_gate(
         assert queried_capabilities == []
 
 
-def test_online_non_mxfp4_moe_lora_is_preserved(monkeypatch) -> None:
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
-    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: True)
-
+def test_enable_moe_lora_opts_in_for_non_mxfp4_online_moe() -> None:
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
         _od_config(
@@ -430,6 +376,7 @@ def test_online_non_mxfp4_moe_lora_is_preserved(monkeypatch) -> None:
             is_moe=True,
             lora_backend="peft",
             lora_path=None,
+            enable_moe_lora=True,
             quantization_config=build_quant_config({"method": "online", "moe": "fp8_per_tensor_dynamic"}),
         ),
     )
@@ -437,11 +384,7 @@ def test_online_non_mxfp4_moe_lora_is_preserved(monkeypatch) -> None:
     assert config.lora_config is not None
 
 
-def test_online_mxfp4_moe_lora_gate_is_scoped_to_moe(monkeypatch) -> None:
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
-    monkeypatch.setattr(diffusion_vllm_config, "_supports_native_online_mxfp4_moe", lambda: True)
-
+def test_enable_moe_lora_is_scoped_to_moe() -> None:
     config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),
         _od_config(
@@ -449,6 +392,7 @@ def test_online_mxfp4_moe_lora_gate_is_scoped_to_moe(monkeypatch) -> None:
             is_moe=False,
             lora_backend="peft",
             lora_path=None,
+            enable_moe_lora=True,
             quantization_config=build_quant_config({"method": "online", "moe": "mxfp4"}),
         ),
     )
@@ -476,14 +420,12 @@ def test_moe_lora_token_capacity_uses_effective_diffusion_config(
 ) -> None:
     import vllm_omni.diffusion.worker.diffusion_worker as worker_module
 
-    # XPU builds the MoE LoRA bridge only for a startup adapter; this test is about
-    # the capacity the bridge gets, so keep it on.
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "is_xpu", lambda: False)
     od_config = _od_config(
         diffusion_kv_mode=mode,
         is_moe=True,
         lora_backend=worker_module.LoRABackend.PEFT,
         lora_path=None,
+        enable_moe_lora=True,
         lora_scale=1.0,
         max_cpu_loras=1,
         max_num_batched_tokens=configured_capacity,

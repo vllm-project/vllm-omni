@@ -9,6 +9,17 @@ LoRA adapters are lightweight, model-specific fine-tuning weights that can be ap
 - **PEFT backend** (`--lora-backend peft`, default): Loads a PEFT-format adapter folder via `DiffusionLoRAManager`. Adapters are cached (LRU) and activated per request via `LoRARequest`. It uses a unified LoRA handling mechanisms similar to vLLM with LRU cache management.
 - **Distill backend** (`--lora-backend distill`): Calls `pipeline.load_lora_weights` once at initialization to fuse one or more concrete checkpoint files directly into the base weights. Typically used for distilled few-step LoRAs (e.g. Lightning, LightX2V).
 
+### MoE expert adapters
+
+MoE diffusion stages keep expert LoRA **off by default** so vLLM can select native
+MoE kernels for base-model serving. Expert LoRA is enabled when either:
+
+- a startup `--lora-path` / `lora_path` is set, or
+- `--enable-moe-lora` / `enable_moe_lora: true` is set before model load.
+
+Use the flag when the server starts without an adapter but must accept
+request-time expert `LoRARequest`s later. Dense-only adapters do not need it.
+
 ### Global merged policy
 
 `--lora-application merged` with `--lora-backend peft` merges a single startup

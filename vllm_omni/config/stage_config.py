@@ -675,6 +675,7 @@ class StageDeployConfig:
     lora_backend: str | None = None
     lora_application: str | None = None
     lora_scale: float | None = None
+    enable_moe_lora: bool | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None

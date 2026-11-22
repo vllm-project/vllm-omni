@@ -11,7 +11,6 @@ from typing import Any, cast
 import torch
 from vllm.config import CompilationConfig, DeviceConfig, KernelConfig, KVTransferConfig, VllmConfig
 from vllm.config.lora import LoRAConfig
-from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -20,8 +19,6 @@ from vllm_omni.platforms import current_omni_platform
 
 # Dense diffusion has no native scheduler token budget to inherit.
 DEFAULT_DIFFUSION_MOE_LORA_MAX_TOKENS = 65536
-
-logger = init_logger(__name__)
 
 
 def resolve_diffusion_max_model_len(od_config: OmniDiffusionConfig) -> int:
@@ -237,32 +234,6 @@ def _supports_native_online_mxfp4_moe() -> bool:
     return ops.mxfp4_experts_quant_supported(capability.to_int())
 
 
-def _uses_explicit_lora_capable_moe_backend(od_config: OmniDiffusionConfig) -> bool:
-    """Return whether the requested MoE backend keeps LoRA available."""
-    moe_backend = getattr(od_config, "moe_backend", "auto")
-    moe_backend = getattr(moe_backend, "value", moe_backend)
-    return moe_backend == "marlin"
-
-
-def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
-    """Return whether the model uses online MXFP4 MoE on a native backend."""
-    if not od_config.is_moe:
-        return False
-    if _uses_explicit_lora_capable_moe_backend(od_config):
-        return False
-
-    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
-    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static
-
-    quant_config = getattr(od_config, "quantization_config", None)
-    if not isinstance(quant_config, OnlineQuantizationConfig):
-        return False
-    moe_spec = getattr(getattr(quant_config, "args", None), "moe", None)
-    if moe_spec is None or moe_spec.weight != kMxfp4Static:
-        return False
-    return _supports_native_online_mxfp4_moe()
-
-
 def create_base_diffusion_vllm_config(
     device: torch.device,
     od_config: OmniDiffusionConfig,
@@ -300,27 +271,12 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
     lora_backend = getattr(od_config, "lora_backend", "peft")
     lora_backend = getattr(lora_backend, "value", lora_backend)
-    moe_lora_enabled = od_config.is_moe and lora_backend == "peft"
-    if moe_lora_enabled and not getattr(od_config, "lora_path", None) and _is_accelerator_online_mxfp4_moe(od_config):
-        # vLLM rejects native MXFP4 MoE kernels while LoRA is enabled.
-        # Keep the baseline on those kernels. Startup adapters keep LoRA enabled;
-        # CUDA can fall back to W4A16 MARLIN, while XPU has no LoRA MXFP4 backend.
-        logger.info(
-            "Disabling MoE LoRA for online MXFP4 on a native-capable CUDA/XPU device "
-            "without a startup adapter; "
-            "this enables the native MXFP4 MoE backend."
-        )
-        moe_lora_enabled = False
-    if moe_lora_enabled and current_omni_platform.is_xpu() and not getattr(od_config, "lora_path", None):
-        # vLLM's native XPU MoE experts do not support LoRA; a LoRAConfig would push every
-        # MoE DiT to the EMULATION backend. Build the bridge on XPU only for a startup LoRA.
-        logger.info(
-            "Disabling MoE LoRA on XPU without a startup adapter (--lora-path); "
-            "this keeps the experts on the native XPU MoE backend instead of EMULATION. "
-            "MoE LoRA added after startup will not be applied to the experts on XPU; "
-            "pass a startup adapter if you need it."
-        )
-        moe_lora_enabled = False
+    # MoE LoRA must be decided before model load: vLLM filters expert kernels by
+    # lora_config. Default off restores base-model native kernels; a startup
+    # adapter or --enable-moe-lora opts in for request-time expert adapters.
+    has_startup_adapter = bool(getattr(od_config, "lora_path", None))
+    enable_moe_lora = bool(getattr(od_config, "enable_moe_lora", False))
+    moe_lora_enabled = od_config.is_moe and lora_backend == "peft" and (has_startup_adapter or enable_moe_lora)
     if moe_lora_enabled:
         vllm_config.lora_config = LoRAConfig(
             max_lora_rank=512,

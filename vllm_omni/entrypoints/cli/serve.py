@@ -713,6 +713,17 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--enable-moe-lora",
+            action="store_true",
+            default=None,
+            help=(
+                "Opt in to MoE expert LoRA before model load. Required for "
+                "request-time expert adapters when no startup --lora-path is set; "
+                "keeps LoRA-capable MoE kernels and token capacity ready. "
+                "Default leaves MoE kernel selection to vLLM for base-model serving."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusion-compile-granularity",
             choices=["regional", "full"],
             default=None,

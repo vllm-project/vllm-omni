@@ -1066,6 +1066,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     lora_scale: float = 1.0
     lora_backend: str = "peft"
     lora_application: Literal["runtime", "merged"] = "runtime"
+    # Opt in to MoE expert LoRA before model load when no startup lora_path is set.
+    enable_moe_lora: bool = False
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None

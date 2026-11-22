@@ -1083,9 +1083,9 @@ class LoRAManager:
     def _ensure_moe_lora_context(self) -> None:
         """Wrap MoE runners and publish mapping before the first forward.
 
-        ``configure_diffusion_vllm_config`` sets ``lora_config`` for MoE + PEFT
-        even when no adapter is loaded. TRTLLM LoRA experts then require a
-        context on every apply(), including HunyuanImage3 baseline generate().
+        ``configure_diffusion_vllm_config`` sets ``lora_config`` when MoE PEFT
+        has a startup adapter or ``enable_moe_lora``. TRTLLM LoRA experts then
+        require a context on every apply(), including baseline generate().
 
         Skipped when the pipeline sets ``diffusion_lora_defer_moe_wrap``; its
         runners are then wrapped only when a loaded adapter targets them.

@@ -85,10 +85,12 @@ that implement it.
 ## Diffusion stages
 
 Diffusion LoRA options are fields of `OmniDiffusionConfig`: `lora_path`,
-`lora_scale`, `lora_backend` (`peft` or `distill`) and `max_cpu_loras`. The
-PEFT backend caches adapters and activates one per request from the request's
-`LoRARequest`; the distill backend fuses weights once at initialization. See
-the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
+`lora_scale`, `lora_backend` (`peft` or `distill`), `enable_moe_lora`, and
+`max_cpu_loras`. The PEFT backend caches adapters and activates one per request
+from the request's `LoRARequest`; the distill backend fuses weights once at
+initialization. MoE expert LoRA is opt-in via startup `lora_path` or
+`enable_moe_lora` so base-model MoE kernel selection stays native by default.
+See the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
 supported pipelines and checkpoint name mapping
 ([#8001](https://github.com/vllm-project/vllm-omni/issues/8001)).
 
