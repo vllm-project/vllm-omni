@@ -2952,7 +2952,7 @@ def image_client_with_cli_defaults(test_client: TestClient) -> TestClient:
         },
     )
     test_client.app.state.engine_client.default_sampling_params_list = [
-        OmniDiffusionSamplingParams(**config.stage_by_id(0).model_config.default_sampling_params)
+        OmniDiffusionSamplingParams.from_config(config.stage_by_id(0).model_config.default_sampling_params)
     ]
     return test_client
 
@@ -3086,3 +3086,49 @@ def test_image_routes_inherit_engine_defaults(test_client: TestClient, route: st
         assert params.extra_args["flow_shift"] == 5.0
         params.extra_args["flow_shift"] = 9.0
     assert defaults.extra_args == {"flow_shift": 5.0}
+
+
+@pytest.mark.parametrize("endpoint", ["generations", "edits"])
+def test_image_default_loras_inherit_replace_and_disable(test_client: TestClient, endpoint: str) -> None:
+    engine = test_client.app.state.engine_client
+    config = StageConfigFactory.create_typed_default_diffusion(
+        "test-model",
+        {
+            "default_sampling_params": json.dumps(
+                {
+                    "0": {
+                        "lora_request": [{"lora_name": "default", "lora_int_id": 1, "lora_path": "/models/default"}],
+                        "lora_scale": [0.7],
+                    }
+                }
+            )
+        },
+    )
+    defaults = OmniDiffusionSamplingParams.from_config(config.stage_by_id(0).model_config.default_sampling_params)
+    engine.default_sampling_params_list = [defaults]
+    for lora, expected_names, expected_scales in (
+        (None, ["default"], [0.7]),
+        ({"name": "override", "path": "/models/override", "scale": 0.3}, ["override"], 0.3),
+        ([], [], []),
+        (None, ["default"], [0.7]),
+    ):
+        body = {"prompt": "default adapters"}
+        if lora is not None:
+            body["lora"] = lora
+        if endpoint == "generations":
+            response = test_client.post("/v1/images/generations", json=body)
+        else:
+            data = {"prompt": "default adapters"}
+            if lora is not None:
+                data["lora"] = json.dumps(lora)
+            with io.BytesIO() as image:
+                Image.new("RGB", (16, 16)).save(image, format="PNG")
+                response = test_client.post(
+                    "/v1/images/edits", files={"image": ("input.png", image.getvalue(), "image/png")}, data=data
+                )
+        assert response.status_code == 200, response.text
+        captured = engine.captured_sampling_params_list[0]
+        requests = captured.lora_request if isinstance(captured.lora_request, list) else [captured.lora_request]
+        assert [request.lora_name for request in requests] == expected_names
+        assert captured.lora_scale == expected_scales
+    assert defaults.lora_scale == [0.7]

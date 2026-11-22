@@ -203,6 +203,8 @@ extension point.
 **Rule:** Public protocol values MUST be validated and converted to internal
 request contracts before engine submission.
 
+Diffusion LoRA requests preserve omission versus an explicit empty list and reject malformed overrides with HTTP 400 before generation; see [Diffusion LoRA](../feature/lora.md#diffusion-stages).
+
 ### ENTRY-INV-101: Streaming preserves request identity
 
 **Rule:** Every streamed response MUST remain associated with the request and

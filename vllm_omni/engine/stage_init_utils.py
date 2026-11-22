@@ -636,7 +636,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
     default_params: OmniSamplingParams | PoolingParams
     if stage_type == "diffusion":
-        default_params = OmniDiffusionSamplingParams(**default_sp)
+        default_params = OmniDiffusionSamplingParams.from_config(default_sp)
     elif is_pooling:
         default_params = PoolingParams(**default_pp)
     else:  # generative llm: ar / generation
@@ -738,8 +738,11 @@ def extract_stage_metadata_from_omni_stage_config(
             copy.deepcopy(pooling_config.default_pooling_params) or PoolingParams()
         )
     else:
-        sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-        sampling_params = sampling_params_cls(**(stage_config.model_config.default_sampling_params or {}))
+        defaults = stage_config.model_config.default_sampling_params or {}
+        if stage_type == "diffusion":
+            sampling_params = OmniDiffusionSamplingParams.from_config(defaults)
+        else:
+            sampling_params = SamplingParams(**defaults)
     custom_process_input_func = _resolve_omni_metadata_hook(stage_config.custom_process_input_func)
 
     if stage_type == "diffusion":

@@ -195,3 +195,40 @@ def test_extract_stage_metadata_defaults_missing_engine_input_source():
     metadata = extract_stage_metadata(legacy_config)
 
     assert metadata.engine_input_source == []
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("shape", ["single", "stack", "empty"])
+def test_diffusion_defaults_use_public_lora_format(legacy: bool, shape: str) -> None:
+    pipeline, deploy = _metadata_inputs()
+    adapters = [
+        {"name": "style", "local_path": "/models/style", "scale": 0.4},
+        {"name": "character", "local_path": "/models/character", "scale": 0.9},
+    ]
+    lora: dict[str, object] | list[dict[str, object]]
+    if shape == "single":
+        lora = adapters[0]
+    elif shape == "stack":
+        lora = adapters
+    else:
+        lora = []
+    defaults = {"seed": 7, "lora": lora}
+    original = copy.deepcopy(defaults)
+    deploy.stages[2].default_sampling_params = defaults
+    if legacy:
+        stage = merge_pipeline_deploy(pipeline, deploy)[2].to_omegaconf()
+        params = extract_legacy_stage_metadata(stage).default_sampling_params
+    else:
+        config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+        params = extract_stage_metadata_from_omni_stage_config(config.stage_by_id(2)).default_sampling_params
+    if shape == "single":
+        assert params.lora_request.lora_name == "style"
+        assert params.lora_scale == 0.4
+    elif shape == "stack":
+        assert [request.lora_name for request in params.lora_request] == ["style", "character"]
+        assert params.lora_scale == [0.4, 0.9]
+    else:
+        assert params.lora_request == []
+        assert params.lora_scale == []
+    assert defaults == original
+    assert params.seed == 7
