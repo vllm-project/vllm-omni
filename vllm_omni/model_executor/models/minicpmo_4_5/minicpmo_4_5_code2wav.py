@@ -496,18 +496,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
-            # CUDA FP32 fusion respects the TF32 opt-out. FP16 CFM and NPU
-            # fusion do not depend on TF32. An explicit ``cfm_fused_body``
-            # overrides these defaults.
+            # CUDA FP32 fusion respects the TF32 opt-out. CUDA/ROCm FP16 CFM
+            # and NPU fusion do not depend on TF32. An explicit
+            # ``cfm_fused_body`` overrides these defaults.
             "fused_body": read_bool_flag(
                 extra,
                 "cfm_fused_body",
-                (
-                    current_omni_platform.is_cuda()
+                (current_omni_platform.is_cuda() and self._tf32_mode != "off")
+                or (
+                    (current_omni_platform.is_cuda() or current_omni_platform.is_rocm())
                     and (
-                        self._tf32_mode != "off"
-                        or read_bool_flag(extra, "token2wav_float16", False)
-                        or read_bool_flag(extra, "cfm_float16", False)
+                        read_bool_flag(extra, "token2wav_float16", False) or read_bool_flag(extra, "cfm_float16", False)
                     )
                 )
                 or current_omni_platform.is_npu(),

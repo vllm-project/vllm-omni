@@ -260,6 +260,7 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     if env is not None:
@@ -274,11 +275,37 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     assert model._cfm_graph_config["row_offset_merge"] is False
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({}, False),
+        ({"token2wav_float16": True}, True),
+        ({"cfm_float16": True}, True),
+        ({"cfm_fused_body": True}, True),
+        ({"cfm_fused_body": False, "token2wav_float16": True}, False),
+    ],
+)
+def test_cfm_fused_body_defaults_on_for_rocm_fp16(monkeypatch, extra, expected):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["fused_body"] is expected
+
+
 @pytest.mark.parametrize("extra,expected", [({}, True), ({"cfm_fused_body": False}, False)])
 def test_cfm_fused_body_defaults_on_for_npu(monkeypatch, extra, expected):
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     # NPU fusion does not use TF32, so the TF32 opt-out must not disable it.

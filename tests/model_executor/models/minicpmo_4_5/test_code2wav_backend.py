@@ -92,6 +92,7 @@ def device_platform(monkeypatch, request):
     monkeypatch.setattr(current_omni_platform, "device_type", request.param)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: request.param == "npu")
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: request.param == "cuda")
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
 
 
 def _build_backend(tmp_path, monkeypatch, extra):
@@ -354,12 +355,13 @@ def test_tf32_mode_is_resolved_once_and_reused(tmp_path, monkeypatch, device_pla
     assert model._tf32_mode == "off"
 
 
-@pytest.mark.parametrize("platform", ["cuda", "npu", "cpu"])
+@pytest.mark.parametrize("platform", ["cuda", "rocm", "npu", "cpu"])
 @pytest.mark.parametrize("precision_flag", ["token2wav_float16", "cfm_float16"])
 @pytest.mark.parametrize("value", [True, "true", False, "false"])
 @pytest.mark.parametrize("tf32_source", ["extra", "env"])
 def test_fused_body_default_with_tf32_disabled(tmp_path, monkeypatch, platform, precision_flag, value, tf32_source):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: platform == "cuda")
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: platform == "rocm")
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     extra = {precision_flag: value}
@@ -371,7 +373,7 @@ def test_fused_body_default_with_tf32_disabled(tmp_path, monkeypatch, platform, 
     model, _ = _build_backend(tmp_path, monkeypatch, extra)
 
     assert model._tf32_mode == "off"
-    expected = platform == "npu" or (platform == "cuda" and value in (True, "true"))
+    expected = platform == "npu" or (platform in ("cuda", "rocm") and value in (True, "true"))
     assert model.backend.kwargs["cfm_graph_config"]["fused_body"] is expected
     assert model.backend.kwargs["cfm_tf32"] is False
 
