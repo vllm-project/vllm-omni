@@ -8,11 +8,20 @@ CLI entry point for vLLM-Omni that intercepts vLLM commands.
 import importlib.metadata
 import sys
 
+# Subcommands that only exist in vLLM-Omni. vLLM has no equivalent, so the
+# script must not forward them; they run without the `--omni` marker because
+# they never touch a model.
+OMNI_ONLY_SUBCOMMANDS = frozenset({"doctor"})
+
+
+def wants_omni_cli(argv: list[str]) -> bool:
+    """True when the arguments address a vLLM-Omni command."""
+    return "--omni" in argv or (bool(argv[1:2]) and argv[1] in OMNI_ONLY_SUBCOMMANDS)
+
 
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
-    # Check if --omni flag is present
-    if "--omni" not in sys.argv:
+    if not wants_omni_cli(sys.argv):
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()
@@ -30,12 +39,14 @@ def main():
         from vllm.logger import configure_logging_from_args
 
         import vllm_omni.entrypoints.cli.benchmark.main
+        import vllm_omni.entrypoints.cli.doctor
         import vllm_omni.entrypoints.cli.serve
         from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
             vllm_omni.entrypoints.cli.benchmark.main,
+            vllm_omni.entrypoints.cli.doctor,
         ]
 
         cli_env_setup()

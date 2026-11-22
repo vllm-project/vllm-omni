@@ -13,6 +13,13 @@ that external repository as a reference for structure rather than the place to
 add files for this repo. Use one Markdown file per model and hardware profile,
 named `<model>-<hardware>.md`.
 
+Structured sources under `recipes/models/` declare a per-variant minimum
+device memory. [`docs/models/memory_tiers.md`](../docs/models/memory_tiers.md)
+renders those minimums by consumer tier, and `vllm-omni doctor` reads the same
+index to report which variants fit the machine it runs on. Regenerate both with
+`python tools/gen_memory_tiers.py` after editing a structured source; the
+`--check` flag fails when either artifact is out of date.
+
 > **Note:** The vLLM-Omni TTS recipes (12 models across 8 providers) are also
 > published on the rendered recipes site at
 > [recipes.vllm.ai](https://recipes.vllm.ai) (see

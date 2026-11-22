@@ -1,0 +1,551 @@
+[
+  {
+    "model_id": "OpenMOSS-Team/MOSS-TTS-Nano",
+    "provider": "OpenMOSS",
+    "variant": "default",
+    "minimum_gib": 6,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "provider": "Qwen",
+    "variant": "base-0.6b",
+    "minimum_gib": 8,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "provider": "Qwen",
+    "variant": "customvoice-0.6b",
+    "minimum_gib": 8,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
+  },
+  {
+    "model_id": "black-forest-labs/flux-3-image-klein",
+    "provider": "Black Forest Labs",
+    "variant": "nvfp4",
+    "minimum_gib": 13,
+    "precision": "nvfp4",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/black-forest-labs/flux-3-image-klein.yaml"
+  },
+  {
+    "model_id": "MiniMaxAI/MiniMax-H3-Image",
+    "provider": "MiniMax",
+    "variant": "dlo",
+    "minimum_gib": 16,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml"
+  },
+  {
+    "model_id": "OpenMOSS-Team/MOSS-TTS-Realtime",
+    "provider": "OpenMOSS",
+    "variant": "default",
+    "minimum_gib": 16,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-TTS-Realtime.yaml"
+  },
+  {
+    "model_id": "OpenMOSS-Team/MOSS-VoiceGenerator",
+    "provider": "OpenMOSS",
+    "variant": "default",
+    "minimum_gib": 16,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-VoiceGenerator.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "provider": "Qwen",
+    "variant": "base-1.7b",
+    "minimum_gib": 16,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "provider": "Qwen",
+    "variant": "default",
+    "minimum_gib": 16,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "provider": "Qwen",
+    "variant": "voicedesign-1.7b",
+    "minimum_gib": 16,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
+  },
+  {
+    "model_id": "inclusionAI/Ming-omni-tts-0.5B",
+    "provider": "inclusionAI",
+    "variant": "default",
+    "minimum_gib": 16,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/inclusionAI/Ming-omni-tts-0.5B.yaml"
+  },
+  {
+    "model_id": "black-forest-labs/flux-3-image-klein",
+    "provider": "Black Forest Labs",
+    "variant": "fp8r",
+    "minimum_gib": 17,
+    "precision": "fp8",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/black-forest-labs/flux-3-image-klein.yaml"
+  },
+  {
+    "model_id": "stabilityai/stable-audio-open-1.0",
+    "provider": "Stability AI",
+    "variant": "default",
+    "minimum_gib": 19,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-audio"
+    ],
+    "source": "recipes/models/stabilityai/stable-audio-open-1.0.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen-Image",
+    "provider": "Qwen",
+    "variant": "fp8",
+    "minimum_gib": 24,
+    "precision": "fp8",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/Qwen/Qwen-Image.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen-Image",
+    "provider": "Qwen",
+    "variant": "int8",
+    "minimum_gib": 24,
+    "precision": "int8",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/Qwen/Qwen-Image.yaml"
+  },
+  {
+    "model_id": "black-forest-labs/flux-3-image-klein",
+    "provider": "Black Forest Labs",
+    "variant": "default",
+    "minimum_gib": 24,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/black-forest-labs/flux-3-image-klein.yaml"
+  },
+  {
+    "model_id": "bosonai/higgs-audio-v3-tts-4b",
+    "provider": "Boson AI",
+    "variant": "default",
+    "minimum_gib": 24,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/bosonai/higgs-audio-v3-tts-4b.yaml"
+  },
+  {
+    "model_id": "mistralai/Voxtral-4B-TTS-2603",
+    "provider": "Mistral AI",
+    "variant": "default",
+    "minimum_gib": 24,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/mistralai/Voxtral-4B-TTS-2603.yaml"
+  },
+  {
+    "model_id": "openbmb/VoxCPM2",
+    "provider": "MiniCPM (OpenBMB)",
+    "variant": "default",
+    "minimum_gib": 24,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/openbmb/VoxCPM2.yaml"
+  },
+  {
+    "model_id": "stabilityai/stable-diffusion-3.5-large",
+    "provider": "Stability AI",
+    "variant": "large",
+    "minimum_gib": 24,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml"
+  },
+  {
+    "model_id": "stabilityai/stable-diffusion-3.5-large-turbo",
+    "provider": "Stability AI",
+    "variant": "large_turbo",
+    "minimum_gib": 24,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml"
+  },
+  {
+    "model_id": "zai-org/GLM-TTS",
+    "provider": "GLM (Z-AI)",
+    "variant": "default",
+    "minimum_gib": 24,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/zai-org/GLM-TTS.yaml"
+  },
+  {
+    "model_id": "OpenMOSS-Team/MOSS-SoundEffect",
+    "provider": "OpenMOSS",
+    "variant": "default",
+    "minimum_gib": 32,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Sound"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-SoundEffect.yaml"
+  },
+  {
+    "model_id": "OpenMOSS-Team/MOSS-TTS",
+    "provider": "OpenMOSS",
+    "variant": "default",
+    "minimum_gib": 32,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-TTS.yaml"
+  },
+  {
+    "model_id": "OpenMOSS-Team/MOSS-TTSD-v1.0",
+    "provider": "OpenMOSS",
+    "variant": "default",
+    "minimum_gib": 32,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-TTSD-v1.0.yaml"
+  },
+  {
+    "model_id": "OpenMOSS-Team/MOSS-Image-Base",
+    "provider": "OpenMOSS",
+    "variant": "default",
+    "minimum_gib": 33,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml"
+  },
+  {
+    "model_id": "OpenMOSS-Team/MOSS-Image-SFT",
+    "provider": "OpenMOSS",
+    "variant": "sft",
+    "minimum_gib": 33,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml"
+  },
+  {
+    "model_id": "meituan-longcat/LongCat-Image-Edit",
+    "provider": "LongCat (Meituan)",
+    "variant": "default",
+    "minimum_gib": 36,
+    "precision": "bf16",
+    "tasks": [
+      "Image-to-image"
+    ],
+    "source": "recipes/models/meituan-longcat/LongCat-Image-Edit.yaml"
+  },
+  {
+    "model_id": "zai-org/GLM-Image",
+    "provider": "GLM (Z-AI)",
+    "variant": "default",
+    "minimum_gib": 38,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/zai-org/GLM-Image.yaml"
+  },
+  {
+    "model_id": "nvidia/Cosmos3-Nano",
+    "provider": "NVIDIA",
+    "variant": "default",
+    "minimum_gib": 39,
+    "precision": "bf16",
+    "tasks": [
+      "t2v",
+      "i2v"
+    ],
+    "source": "recipes/models/nvidia/Cosmos3-Nano.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen-Image-2.1",
+    "provider": "Qwen",
+    "variant": "default",
+    "minimum_gib": 40,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/Qwen/Qwen-Image-2.1.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen-Image-2.1",
+    "provider": "Qwen",
+    "variant": "fp8",
+    "minimum_gib": 40,
+    "precision": "fp8",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/Qwen/Qwen-Image-2.1.yaml"
+  },
+  {
+    "model_id": "stabilityai/stable-diffusion-3.5-medium",
+    "provider": "Stability AI",
+    "variant": "default",
+    "minimum_gib": 44,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml"
+  },
+  {
+    "model_id": "Qwen/Qwen-Image",
+    "provider": "Qwen",
+    "variant": "default",
+    "minimum_gib": 48,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/Qwen/Qwen-Image.yaml"
+  },
+  {
+    "model_id": "fishaudio/drama-3",
+    "provider": "Fish Audio",
+    "variant": "default",
+    "minimum_gib": 48,
+    "precision": "fp8",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/fishaudio/drama-3.yaml"
+  },
+  {
+    "model_id": "fishaudio/s2-pro",
+    "provider": "Fish Audio",
+    "variant": "default",
+    "minimum_gib": 48,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/fishaudio/s2-pro.yaml"
+  },
+  {
+    "model_id": "Lightricks/LTX-2.5-Diffusers",
+    "provider": "Lightricks",
+    "variant": "fp8",
+    "minimum_gib": 61,
+    "precision": "fp8",
+    "tasks": [
+      "Full one-stage T2V",
+      "Full one-stage I2V",
+      "Distilled one-stage T2V",
+      "Distilled one-stage I2V",
+      "Distilled two-stage T2V",
+      "Distilled two-stage I2V",
+      "Full two-stage T2V",
+      "Full two-stage I2V"
+    ],
+    "source": "recipes/models/Lightricks/LTX-2.5-Diffusers.yaml"
+  },
+  {
+    "model_id": "Lightricks/LTX-2.5-Diffusers",
+    "provider": "Lightricks",
+    "variant": "default",
+    "minimum_gib": 80,
+    "precision": "bf16",
+    "tasks": [
+      "Full one-stage T2V",
+      "Full one-stage I2V",
+      "Distilled one-stage T2V",
+      "Distilled one-stage I2V",
+      "Distilled two-stage T2V",
+      "Distilled two-stage I2V",
+      "Full two-stage T2V",
+      "Full two-stage I2V"
+    ],
+    "source": "recipes/models/Lightricks/LTX-2.5-Diffusers.yaml"
+  },
+  {
+    "model_id": "adventists-ai/Sophon-Realtime-32B-Tag",
+    "provider": "Adventists AI",
+    "variant": "default",
+    "minimum_gib": 80,
+    "precision": "fp8",
+    "tasks": [
+      "Speech \u2192 Speech (full duplex)"
+    ],
+    "source": "recipes/models/adventists-ai/Sophon-Realtime-32B-Tag.yaml"
+  },
+  {
+    "model_id": "IndexTeam/IndexTTS-2.5",
+    "provider": "IndexTeam",
+    "variant": "default",
+    "minimum_gib": 96,
+    "precision": "bf16",
+    "tasks": [
+      "Text \u2192 Speech"
+    ],
+    "source": "recipes/models/IndexTeam/IndexTTS-2.5.yaml"
+  },
+  {
+    "model_id": "IFM/PAN2",
+    "provider": "IFM",
+    "variant": "default",
+    "minimum_gib": 108,
+    "precision": "bf16",
+    "tasks": [
+      "t2v",
+      "i2v"
+    ],
+    "source": "recipes/models/IFM/PAN2.yaml"
+  },
+  {
+    "model_id": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "provider": "Wan (Alibaba)",
+    "variant": "default",
+    "minimum_gib": 152,
+    "precision": "bf16",
+    "tasks": [
+      "t2v",
+      "i2v",
+      "ti2v"
+    ],
+    "source": "recipes/models/Wan-AI/Wan2.2-T2V-A14B-Diffusers.yaml"
+  },
+  {
+    "model_id": "MiniMaxAI/MiniMax-H3-Image",
+    "provider": "MiniMax",
+    "variant": "default",
+    "minimum_gib": 153,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image",
+      "Image-to-image"
+    ],
+    "source": "recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml"
+  },
+  {
+    "model_id": "nvidia/Cosmos3-Super",
+    "provider": "NVIDIA",
+    "variant": "default",
+    "minimum_gib": 154,
+    "precision": "bf16",
+    "tasks": [
+      "t2v",
+      "i2v"
+    ],
+    "source": "recipes/models/nvidia/Cosmos3-Super.yaml"
+  },
+  {
+    "model_id": "nvidia/Cosmos3-Super-Image2Video",
+    "provider": "NVIDIA",
+    "variant": "default",
+    "minimum_gib": 154,
+    "precision": "bf16",
+    "tasks": [
+      "i2v"
+    ],
+    "source": "recipes/models/nvidia/Cosmos3-Super-Image2Video.yaml"
+  },
+  {
+    "model_id": "nvidia/Cosmos3-Super-Text2Image",
+    "provider": "NVIDIA",
+    "variant": "default",
+    "minimum_gib": 154,
+    "precision": "bf16",
+    "tasks": [
+      "Text-to-image"
+    ],
+    "source": "recipes/models/nvidia/Cosmos3-Super-Text2Image.yaml"
+  },
+  {
+    "model_id": "MiniMaxAI/MiniMax-H3",
+    "provider": "MiniMax",
+    "variant": "default",
+    "minimum_gib": 202,
+    "precision": "bf16",
+    "tasks": [
+      "T2VA - Text",
+      "FL2VA - First Frame",
+      "FL2VA - First + Last",
+      "Ref2VA - Image",
+      "Ref2VA - Image + Audio",
+      "Ref2VA - Video / Mixed"
+    ],
+    "source": "recipes/models/MiniMaxAI/MiniMax-H3.yaml"
+  }
+]

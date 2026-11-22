@@ -207,6 +207,7 @@ include = ["vllm_omni*"]
     "model_executor/models/covo_audio/speaker_prompt/*.npy",
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
+    "utils/memory_tiers.json",
 ]
 "vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 

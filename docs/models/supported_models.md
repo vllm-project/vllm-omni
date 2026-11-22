@@ -8,6 +8,8 @@ If vLLM-Omni natively supports a model, its implementation can be found in <gh-f
 
 For deployment recipes (TTS and multimodal), see [recipes.vllm.ai](https://recipes.vllm.ai) and the in-repo [`recipes/`](https://github.com/vllm-project/vllm-omni/tree/main/recipes) directory.
 
+For the minimum device memory each structured recipe documents, see [Minimum memory tiers](memory_tiers.md). A device below a documented minimum is not yet measured, not unsupported.
+
 ## List of Supported Models
 
 With vLLM 0.34.0, profiles that require Model Runner V1 are unavailable,
