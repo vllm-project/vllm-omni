@@ -11,6 +11,11 @@ documents -- executed as log-sum-exp-merged maskless passes planned on the host
 (:mod:`.causal_plan`). Clean refresh forwards additionally write their K/V into
 the paged pool slots the pipeline allocated for the chunk.
 
+With strict Ulysses (:mod:`.parallel`) the GEN layers run on a token shard and
+the attention sees every token of the chunk for the rank's head group, so the
+plan, the ring geometry and the K/V a forward returns or publishes keep their
+single-GPU token coordinates with ``H_kv / (TP * U)`` heads.
+
 Control tokens never read their chunk's targets and carry no time embedding,
 so their per-layer K/V is the same in every forward of a chunk: the first
 forward can collect it, and later forwards run the target items only, reading
@@ -45,6 +50,7 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
 
 from .config import Cosmos3NanoSimAutoManifest
 from .layout import StreamItem
+from .parallel import SequenceShard, UlyssesGroup, current_ulysses_group
 
 
 @dataclass(frozen=True)
@@ -60,9 +66,10 @@ class CausalMasklessRuntime:
 class Cosmos3NanoSimAutoTransformerOutput:
     #: Velocity (or clean) predictions of the target items, in item order, each ``[1, C, V*T, H, W]``.
     targets: list[torch.Tensor]
-    #: K/V of the forward's tokens per layer (post-norm, post-RoPE K; raw V) when collected for the dense oracle.
+    #: K/V of the forward's tokens per layer (post-norm, post-RoPE K; raw V) when collected for the dense oracle;
+    #: every token of the forward with the rank's ``H_kv / (TP * U)`` heads.
     current_kv: list[tuple[torch.Tensor, torch.Tensor]]
-    #: Control K/V per layer, ``[controls, H_kv, D]`` in packing order, when collected for reuse.
+    #: Control K/V per layer, ``[controls, H_kv, D]`` in packing order (rank heads), when collected for reuse.
     control_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
 
@@ -95,7 +102,14 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
         write_slots: torch.Tensor | None = None,
         key_pool: torch.Tensor | None = None,
         value_pool: torch.Tensor | None = None,
+        shard: SequenceShard | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Attend the current GEN tokens; returns the output and the K/V of every current token.
+
+        With ``shard`` the hidden states, RoPE tables and output are the rank's
+        token shard, while the K/V streams, the pools and the returned K/V hold
+        every token for the rank's head group.
+        """
         if hidden_states.shape[0] != 1:
             raise ValueError(f"Cosmos3-Nano-Sim-Auto attention supports batch_size=1, got {hidden_states.shape[0]}.")
         if und_k.shape != und_v.shape or und_k.ndim != 4 or und_k.shape[0] != 1:
@@ -112,10 +126,15 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
             q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
             k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        local_len = seq_len
+        if shard is not None:
+            q, k, v = shard.heads_from_tokens(q, k, v)
+            seq_len = shard.num_tokens
         if write_slots is not None:
-            # Clean refresh: publish this chunk's K/V (post-norm/RoPE K, raw V)
-            # into the pool pages the pipeline allocated. Padding slots of the
-            # frame unit are zero-filled by the pipeline and never read.
+            # Clean refresh: publish this chunk's K/V (post-norm/RoPE K, raw V;
+            # the rank's head group under Ulysses) into the pool pages the
+            # pipeline allocated. Padding slots of the frame unit are
+            # zero-filled by the pipeline and never read.
             if key_pool is None or value_pool is None:
                 raise ValueError("Committing forwards need the layer's flat key/value pools.")
             if write_slots.numel() != seq_len:
@@ -131,7 +150,9 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
             runtime.num_passes,
             runtime.kernel,
         )
-        return self.to_out(out.reshape(batch, seq_len, -1)), k, v
+        if shard is not None:
+            out = shard.tokens_from_heads(out)
+        return self.to_out(out.reshape(batch, local_len, -1)), k, v
 
 
 class Cosmos3NanoSimAutoGenDecoderLayer(Cosmos3GenDecoderLayer):
@@ -193,6 +214,9 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
 
     _hsdp_forward_methods = ("encode_und_kv",)
     _inductor_cudagraphs = False
+    #: Strict Ulysses group of the worker (``None`` without context parallelism); the
+    #: inherited ``_sp_plan`` hooks target ``gen_sp_prepare``, which this forward never calls.
+    ulysses: UlyssesGroup | None = None
     _gen_layer_cls = Cosmos3NanoSimAutoGenDecoderLayer
     _repeated_blocks = ["Cosmos3NanoSimAutoGenDecoderLayer"]
 
@@ -281,10 +305,31 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
             rig = self.manifest.rig_view_embedding
             self.rig_view_embed = torch.nn.Embedding(int(rig["num_embeddings"]), self.hidden_size)
             self.rig_lidar_id = int(rig["lidar_id"])
+        self.ulysses = current_ulysses_group()
+        if self.ulysses is not None:
+            tp_size = get_tensor_model_parallel_world_size()
+            for name, heads in (("query", self.num_attention_heads), ("KV", self.num_key_value_heads)):
+                if heads % (tp_size * self.ulysses.world_size):
+                    raise ValueError(
+                        f"Cosmos3-Nano-Sim-Auto {name} heads ({heads}) must be divisible by TP x Ulysses "
+                        f"({tp_size} x {self.ulysses.world_size})."
+                    )
 
     @property
     def num_kv_heads_local(self) -> int:
-        return self.num_key_value_heads // get_tensor_model_parallel_world_size()
+        """KV heads of the rank's attention, ring and caption cache: ``H_kv / (TP * U)``."""
+        ulysses = 1 if self.ulysses is None else self.ulysses.world_size
+        return self.num_key_value_heads // (get_tensor_model_parallel_world_size() * ulysses)
+
+    def local_kv_heads(
+        self, layer_kv: list[tuple[torch.Tensor, torch.Tensor]]
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """The rank's Ulysses head group of TP-local ``[1, tokens, H_kv / TP, D]`` K/V (identity without Ulysses)."""
+        if self.ulysses is None:
+            return layer_kv
+        heads = self.ulysses.head_slice(layer_kv[0][0].shape[2])
+        # Copies, so the full TP-local caption K/V is not kept alive by views.
+        return [(key[:, :, heads].contiguous(), value[:, :, heads].contiguous()) for key, value in layer_kv]
 
     @staticmethod
     def pad_text_kv(
@@ -453,6 +498,10 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
         paged pool. ``rig_view_ids`` are the request cameras' physical rig rows
         (``[V]``).
 
+        Under Ulysses every K/V argument and result holds the rank's head group
+        (:meth:`local_kv_heads`, :attr:`num_kv_heads_local`) for every token;
+        only the GEN layers run on a token shard.
+
         ``collect_control_kv`` returns the controls' per-layer K/V. Passing it
         back as ``control_kv`` in a later forward of the same chunk runs the
         non-control items only (control latents are ignored) against a
@@ -489,6 +538,9 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
 
         hidden = self.embed_items(items, latents, timestep=timestep, rig_view_ids=rig_view_ids)
         freqs_cos, freqs_sin = self.chunk_rope(items, text_extent=text_extent, device=hidden.device, dtype=hidden.dtype)
+        shard = None if self.ulysses is None else self.ulysses.shard(hidden.shape[1])
+        if shard is not None:
+            hidden, freqs_cos, freqs_sin = (shard.split(tensor) for tensor in (hidden, freqs_cos, freqs_sin))
         empty_kv = und_kv[0][0].new_empty(0, self.num_kv_heads_local, self.head_dim)
         current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         collected: list[tuple[torch.Tensor, torch.Tensor]] | None = [] if collect_control_kv else None
@@ -512,6 +564,7 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
                     write_slots=write_slots,
                     key_pool=key_pool,
                     value_pool=value_pool,
+                    shard=shard,
                 )
                 if collect_kv:
                     current_kv.append((k, v))
@@ -522,6 +575,8 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
                             torch.cat([v[0, start : start + length] for start, length in control_ranges]),
                         )
                     )
+            if shard is not None:
+                hidden = shard.gather(hidden)
             hidden = self.norm_moe_gen(hidden)
             outputs = []
             for item, latent, part in zip(

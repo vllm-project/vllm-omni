@@ -11,6 +11,10 @@ causal maskless planner and committing each chunk with a clean refresh. On the
 AR-Diffusion engine the ring lives in the runner's paged pool (one padded chunk
 per frame unit, sink 1 / window ``cache_chunks - 1``); on the plain engine a
 model-owned dense ring serves as the numerical oracle.
+
+Tensor parallelism and strict Ulysses split the attention heads: every rank
+runs the whole rollout schedule on identical latents, and its ring, caption
+cache and cached control K/V hold every token for its own head group.
 """
 
 from __future__ import annotations
@@ -731,13 +735,16 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             if sink_tokens:
                 documents.append(CaptionDocument(view_index, sink_tokens, is_sink=True))
             documents.append(CaptionDocument(view_index, length, start_seconds=0.0, end_seconds=horizon_seconds))
-        und_kv = [
-            (
-                torch.cat([per_view_kv[view][layer][0] for view in range(num_views)], dim=1),
-                torch.cat([per_view_kv[view][layer][1] for view in range(num_views)], dim=1),
-            )
-            for layer in range(self.transformer.num_hidden_layers)
-        ]
+        # Every rank runs the caption pass; under Ulysses it keeps only its head group.
+        und_kv = self.transformer.local_kv_heads(
+            [
+                (
+                    torch.cat([per_view_kv[view][layer][0] for view in range(num_views)], dim=1),
+                    torch.cat([per_view_kv[view][layer][1] for view in range(num_views)], dim=1),
+                )
+                for layer in range(self.transformer.num_hidden_layers)
+            ]
+        )
         if bound is not None:
             padded = self.transformer.pad_text_kv(und_kv, max_len=self.manifest.text_cache_max_len)
             bound.populate_cross_attention(self._MAIN_BRANCH, self._TEXT_CACHE, padded)

@@ -94,15 +94,44 @@ def _artifact(**overrides) -> dict:
     return artifact
 
 
-def test_parallel_config_rejects_sp_and_cfg_parallel() -> None:
-    ok = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1))
-    validate_sim_auto_parallel_config(ok)
-    bad = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=2))
-    with pytest.raises(ValueError, match="sequence_parallel_size>1"):
-        validate_sim_auto_parallel_config(bad)
-    bad = SimpleNamespace(parallel_config=SimpleNamespace(cfg_parallel_size=2))
-    with pytest.raises(ValueError, match="cfg_parallel_size>1"):
-        validate_sim_auto_parallel_config(bad)
+def _parallel(heads: tuple[int, int] = (32, 8), **fields) -> SimpleNamespace:
+    transformer = {"num_attention_heads": heads[0], "num_key_value_heads": heads[1]}
+    return SimpleNamespace(parallel_config=SimpleNamespace(**fields), tf_model_config=transformer)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"sequence_parallel_size": 1, "cfg_parallel_size": 1},
+        {"tensor_parallel_size": 8},
+        {"ulysses_degree": 8, "sequence_parallel_size": 8},
+        {"tensor_parallel_size": 2, "ulysses_degree": 4, "sequence_parallel_size": 4, "ulysses_mode": "strict"},
+    ],
+)
+def test_parallel_config_accepts_tp_and_strict_ulysses(fields: dict) -> None:
+    validate_sim_auto_parallel_config(_parallel(**fields))
+
+
+@pytest.mark.parametrize(
+    ("fields", "match"),
+    [
+        ({"cfg_parallel_size": 2}, "cfg_parallel_size>1"),
+        ({"ulysses_degree": 2, "ring_degree": 2, "sequence_parallel_size": 4}, "ring_degree>1"),
+        ({"ulysses_degree": 2, "allgather_degree": 2, "sequence_parallel_size": 4}, "allgather_degree>1"),
+        ({"sequence_parallel_size": 2}, "must equal ulysses_degree"),
+        ({"ulysses_degree": 2, "sequence_parallel_size": 2, "ulysses_mode": "advanced_uaa"}, "ulysses_mode='strict'"),
+        ({"ulysses_degree": 2, "sequence_parallel_size": 2, "ulysses_a2a_permute": True}, "ulysses_a2a_permute"),
+        ({"tensor_parallel_size": 4, "ulysses_degree": 4, "sequence_parallel_size": 4}, r"KV heads \(8\)"),
+    ],
+)
+def test_parallel_config_rejects_unsupported_topologies(fields: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        validate_sim_auto_parallel_config(_parallel(**fields))
+
+
+def test_parallel_config_checks_query_heads_too() -> None:
+    with pytest.raises(ValueError, match=r"query heads \(12\)"):
+        validate_sim_auto_parallel_config(_parallel((12, 8), ulysses_degree=8, sequence_parallel_size=8))
 
 
 def test_rig_table_maps_request_cameras_to_physical_rows() -> None:

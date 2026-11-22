@@ -33,10 +33,18 @@ Use the same YAML and exported checkpoint for these launch settings:
 | 1 | `0` | `--tensor-parallel-size 1` (default) |
 | 2 | `0,1` | `--tensor-parallel-size 2` |
 | 4 | `0,1,2,3` | `--tensor-parallel-size 4` |
+| 2 | `0,1` | `--ulysses-degree 2` |
+| 4 | `0,1,2,3` | `--ulysses-degree 4` |
+| 4 | `0,1,2,3` | `--tensor-parallel-size 2 --ulysses-degree 2` |
+
+Strict Ulysses context parallelism (`--ulysses-degree`) splits the GEN token sequence across ranks
+and exchanges heads for attention; it combines with TP, uses TP x Ulysses GPUs, and requires the
+checkpoint's query and KV head counts to be divisible by TP x Ulysses (checked at load). Unlike TP,
+Ulysses keeps a full weight copy per GPU; the KV ring and caption cache are split by heads in both.
 
 Set `CUDA_VISIBLE_DEVICES` before launching Python. For example, `CUDA_VISIBLE_DEVICES=2,5`
 with `--tensor-parallel-size 2` selects physical GPUs 2 and 5. At least as many GPUs must be
-visible as the requested TP size. A custom `--deploy-config` with an explicit `devices` field
+visible as TP x Ulysses. A custom `--deploy-config` with an explicit `devices` field
 still restricts stage placement; omit that field to retain this behavior.
 
 Fewer GPUs require more memory per GPU for the sharded weights and KV cache. TP1/TP2 memory
@@ -55,8 +63,8 @@ For parity, use the same compatible deduplicated checkpoint, ordered cameras, pr
 horizon and seed on both sides. The reference applies `--seed` unchanged to every sample of an
 input file, so prepared requests carry that one seed and `--seed` here is only the fallback for
 requests without one. Compare RGB with RGB and joint with joint;
-their noise shapes and chunk seed clocks differ. Start at TP1, then repeat at TP4. Reference
+their noise shapes and chunk seed clocks differ. Start at TP1, then repeat at TP4 or Ulysses 4. Reference
 and vLLM outputs can both be loaded with `torch.load(path, map_location="cpu", weights_only=True)[0]`.
-GPU latent parity and TP4 validation remain pending.
+GPU latent parity and TP4/Ulysses validation remain pending.
 The schedule (four SDE steps, guidance 1) and the 0.4 s chunking come from the exported artifact;
 `guidance`, `num_steps` and `shift` in a request are rejected rather than ignored.

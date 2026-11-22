@@ -76,13 +76,18 @@ Start from [`cosmos3_nano_sim_auto.yaml`](../../vllm_omni/deploy/cosmos3_nano_si
 AR-Diffusion engine, eager execution, batch size one, 480p. The KV ring lives in the paged pool with
 one padded chunk per frame unit (7 cameras: 16,384 tokens RGB-only; joint 23,616 with the current
 1x1 LiDAR diffusion patch, 18,208 with 2x2); sink and window come from the artifact and cannot be
-overridden. Tensor parallelism is supported (reference
-parity target: TP4 on 4x GB200, equivalent to the reference's CP4); sequence, CFG, pipeline and
-VAE patch parallelism are rejected.
+overridden. Tensor parallelism and strict Ulysses context parallelism are supported, alone or
+combined (reference parity target: TP4 or Ulysses 4 on 4x GB200, equivalent to the reference's
+CP4); ring and all-gather sequence parallelism, CFG, pipeline and VAE patch parallelism are
+rejected. Both TP and Ulysses split attention heads, so query and KV head counts must be divisible
+by TP x Ulysses. Ulysses runs the GEN layers on a token shard of each chunk and exchanges heads for
+the causal maskless attention, whose plan is unchanged; the paged ring and caption cache hold every
+token for the rank's head group, so the frame unit is the same as on one GPU. Ulysses keeps a full
+weight copy per GPU and replaces TP's per-layer all-reduces with all-to-alls.
 
 The supplied YAML leaves `devices` unset, so the stage inherits `CUDA_VISIBLE_DEVICES`.
-Choose `--tensor-parallel-size 1`, `2`, or `4` in the offline runner and expose at least that
-many GPUs; no deployment copy or checkpoint reconversion is needed. The runner defaults to
+Choose `--tensor-parallel-size` and/or `--ulysses-degree` in the offline runner and expose at least
+TP x Ulysses GPUs; no deployment copy or checkpoint reconversion is needed. The runner defaults to
 TP1. See the [launch settings](../../examples/offline_inference/cosmos3_nano_sim_auto/README.md)
 for examples. Smaller TP sizes increase memory required per GPU; memory fit and GPU inference
 parity remain unvalidated on the target hardware.
@@ -116,7 +121,8 @@ See the [offline runner](../../examples/offline_inference/cosmos3_nano_sim_auto/
 | Rig-view embedding: manifest table, request-order camera rows, LiDAR row, applied before the timestep on controls and targets | validated (CPU tests) |
 | Fixed-step SDE sampler seed arithmetic | validated (CPU tests) |
 | Exporter manifest contract (incl. `rig_view_embedding`) | CPU tests; actual checkpoint export/load pending |
-| Transformer / pipeline on GPU, latent parity vs `--save-latents` goldens, TP4 | not tested |
+| Ulysses (2, 4): padded token shards, packed Q/K/V exchange, head-group control/ring/pool K/V vs one rank | validated (CPU Gloo tests) |
+| Transformer / pipeline on GPU, latent parity vs `--save-latents` goldens, TP4, Ulysses | not tested |
 | Tick sessions over the videos API | not implemented (phase 2) |
 
 The Sim-Auto tests do not require generated JSON reference fixtures. Reference comparisons

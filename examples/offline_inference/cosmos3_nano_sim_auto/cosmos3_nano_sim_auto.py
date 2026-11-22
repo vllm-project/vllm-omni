@@ -14,6 +14,10 @@ then run every request as one causal rollout (RGB-only or joint RGB+LiDAR):
         --model /models/Cosmos3-Nano-Sim-Auto --input /data/sim_auto_rgb/requests.jsonl \
         --output-dir outputs/sim_auto --tensor-parallel-size 4
 
+Strict Ulysses context parallelism (``--ulysses-degree``) combines with TP; the
+stage uses TP x Ulysses GPUs, and the checkpoint's query and KV head counts must
+be divisible by that product (checked at load).
+
 Each sample writes one MP4 per camera (``vision_view{NN}_{camera}.mp4``), the
 numeric LiDAR output as ``lidar.safetensors`` when requested, and
 ``sample_outputs.json``. The student runs its exported four-step schedule with
@@ -276,6 +280,12 @@ def _parse_args() -> argparse.Namespace:
         help="Number of GPUs for tensor parallelism (default: 1). Select GPUs with CUDA_VISIBLE_DEVICES.",
     )
     parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=1,
+        help="Strict Ulysses context-parallel degree (default: 1); the stage uses TP x Ulysses GPUs.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -306,7 +316,9 @@ def main() -> None:
         model_class_name="Cosmos3NanoSimAutoPipeline",
         deploy_config=args.deploy_config,
         enforce_eager=True,
-        parallel_config=DiffusionParallelConfig(tensor_parallel_size=args.tensor_parallel_size),
+        parallel_config=DiffusionParallelConfig(
+            tensor_parallel_size=args.tensor_parallel_size, ulysses_degree=args.ulysses_degree
+        ),
     )
     for index, request in enumerate(requests):
         # imaginaire4 applies --seed unchanged to every sample of an input file.

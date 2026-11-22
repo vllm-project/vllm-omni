@@ -440,12 +440,15 @@ class Cosmos3NanoSimAutoManifest:
 
 
 def validate_sim_auto_parallel_config(config: Any) -> None:
-    """v1 runs TP only: no SP/PP/DP/EP, no VAE patch parallelism, no CFG parallelism."""
+    """v1 runs TP and strict Ulysses: no ring/all-gather SP, PP, DP, EP, VAE patch or CFG parallelism.
+
+    Ulysses splits the TP-local heads of every attention, so the query and KV
+    head counts of ``tf_model_config`` must be divisible by TP x Ulysses.
+    """
     parallel = getattr(config, "parallel_config", None)
     unsupported = {
-        "sequence_parallel_size": "the causal ring and maskless passes are head-parallel only in v1",
-        "ulysses_degree": "the causal ring and maskless passes are head-parallel only in v1",
-        "ring_degree": "ring attention is not supported",
+        "ring_degree": "the causal maskless passes are head-parallel (Ulysses) only",
+        "allgather_degree": "the causal maskless passes are head-parallel (Ulysses) only",
         "cfg_parallel_size": "the distilled student runs guidance 1 with a single branch",
         "pipeline_parallel_size": "all GEN layers execute on every rank",
         "data_parallel_size": "use stage num_replicas for independent workers",
@@ -456,6 +459,27 @@ def validate_sim_auto_parallel_config(config: Any) -> None:
             raise ValueError(f"Cosmos3-Nano-Sim-Auto does not support {name}>1: {reason}.")
     if getattr(parallel, "enable_expert_parallel", False):
         raise ValueError("Cosmos3-Nano-Sim-Auto uses dense MLP blocks; there are no experts to distribute.")
+    ulysses = int(getattr(parallel, "ulysses_degree", 1) or 1)
+    sequence_parallel = int(getattr(parallel, "sequence_parallel_size", None) or ulysses)
+    if sequence_parallel != ulysses:
+        raise ValueError(
+            "Cosmos3-Nano-Sim-Auto sequence parallelism is strict Ulysses only: "
+            f"sequence_parallel_size={sequence_parallel} must equal ulysses_degree={ulysses}."
+        )
+    if ulysses > 1:
+        if getattr(parallel, "ulysses_mode", "strict") != "strict":
+            raise ValueError("Cosmos3-Nano-Sim-Auto requires ulysses_mode='strict'; it pads token shards itself.")
+        if getattr(parallel, "ulysses_a2a_permute", False):
+            raise ValueError("Cosmos3-Nano-Sim-Auto runs its own Ulysses exchange; disable ulysses_a2a_permute.")
+    tensor_parallel = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+    transformer_config = _mapping(getattr(config, "tf_model_config", None))
+    for name, key in (("query", "num_attention_heads"), ("KV", "num_key_value_heads")):
+        heads = transformer_config.get(key)
+        if heads is not None and int(heads) % (tensor_parallel * ulysses):
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Auto {name} heads ({heads}) must be divisible by TP x Ulysses "
+                f"({tensor_parallel} x {ulysses})."
+            )
 
 
 __all__ = [
