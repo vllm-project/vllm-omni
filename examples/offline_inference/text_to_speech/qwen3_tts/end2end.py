@@ -232,7 +232,6 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
                 "language": [language],
                 "instruct": [instruct],
                 "max_new_tokens": [2048],
-                "non_streaming_mode": [True],
                 "full_utterance_decode": [True],
             }
             inputs.append(
@@ -251,7 +250,6 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
             "language": [language],
             "instruct": [instruct],
             "max_new_tokens": [2048],
-            "non_streaming_mode": [True],
             "full_utterance_decode": [True],
         }
         inputs = {

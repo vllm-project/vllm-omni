@@ -699,9 +699,9 @@ def _estimate_tts_prompt_len_from_token_ids(
     prefill by ~100 and causes leading garbage / truncated speech.
     """
 
-    # Official defaults: Base -> streaming, others -> non-streaming.
+    # Default to streaming prompt mode (False) across CustomVoice, VoiceDesign, and Base.
     if non_streaming_mode is None:
-        non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
+        non_streaming_mode = False
 
     instruct_len = _estimate_instruct_prompt_tokens(instruct) if isinstance(instruct, str) else 0
     assistant_len = max(0, len(token_ids))

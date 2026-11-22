@@ -244,8 +244,8 @@ def test_full_utterance_decode_false_keeps_windowed_emit():
 def test_non_streaming_mode_alone_does_not_defer_async_chunk():
     """Prompt-mode non_streaming_mode must not gate Code2Wav emits (#6898).
 
-    VoiceDesign serving defaults non_streaming_mode=True even for streaming
-    responses; those requests still need windowed async-chunk audio for TTFA.
+    Explicit non_streaming_mode=True opt-in requests still need windowed
+    async-chunk audio for TTFA.
     """
     tm = _tm()
     tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(41)]
@@ -260,7 +260,7 @@ def test_non_streaming_mode_alone_does_not_defer_async_chunk():
 
 
 def test_voicedesign_prompt_mode_with_streaming_keeps_windowed_emit():
-    """Streaming VoiceDesign-style defaults: prompt-mode True, decode False."""
+    """Explicit prompt-mode True with streaming decode False stays windowed."""
     tm = _tm()
     tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(41)]
     p = talker2code2wav_async_chunk(
