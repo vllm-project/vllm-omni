@@ -26,7 +26,7 @@ Environment overrides:
 - `MODEL` — HF id of the talker (default `bosonai/higgs-audio-v2-generation-3B-base`).
 - `PORT` — server port (default `8094`).
 - `GPUS` — `CUDA_VISIBLE_DEVICES` value (default `6,7`).
-- `GPU_UTIL` — `--gpu-memory-utilization` (default `0.4`).
+- `GPU_UTIL` — GPU memory utilization for each stage (default `0.4`).
 
 The script also exports `VLLM_USE_DEEP_GEMM=0` / `VLLM_MOE_USE_DEEP_GEMM=0` so the example works on images without the optional `deep_gemm` backend.
 

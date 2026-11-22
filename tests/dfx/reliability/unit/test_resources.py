@@ -15,10 +15,11 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from tests.dfx.reliability import helpers
 from tests.dfx.reliability.unit._loader import RELIABILITY_ROOT, exec_ast_nodes
@@ -287,10 +288,13 @@ def test_sidecar_program_uses_rejection_helper_and_compiles() -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="OOM sidecar pipe polling requires Linux")
-@pytest.mark.parametrize("outcome", ["ready", "error", "eof", "timeout", "partial_line"])
+@pytest.mark.parametrize("outcome", ["ready", "malformed_ready", "error", "eof", "timeout", "partial_line"])
 def test_sidecar_startup_drains_progress_and_reaps_failed_process(monkeypatch, outcome):
     payloads = {
-        "ready": b"STARTING:import_torch\nREADY:fake\n",
+        "ready": (
+            b"STARTING:import_torch\nREADY:free_after=256;max_free_bytes=256;allocator_saturated=0;allocated=1024\n"
+        ),
+        "malformed_ready": b"STARTING:import_torch\nREADY:fake\n",
         "error": b"STARTING:initialize_device\nERROR:allocation failed\n",
         "eof": b"STARTING:import_torch\nimport failed\n",
         "timeout": b"STARTING:initialize_device\n",
@@ -312,8 +316,15 @@ def test_sidecar_startup_drains_progress_and_reaps_failed_process(monkeypatch, o
     monkeypatch.setattr(helpers.subprocess, "Popen", capture_process)
     started = time.monotonic()
     if outcome == "ready":
-        handle = helpers.start_gpu_oom_hog(startup_timeout_sec=2)
+        handle = helpers.start_gpu_oom_hog(startup_timeout_sec=2, max_free_bytes=256)
+        assert handle.state == "ready"
+        assert handle.free_after == 256
+        assert handle.max_free_bytes == 256
+        assert handle.allocated_bytes == 1024
         helpers.stop_gpu_oom_hog(handle)
+    elif outcome == "malformed_ready":
+        with pytest.raises(RuntimeError, match="invalid READY evidence"):
+            helpers.start_gpu_oom_hog(startup_timeout_sec=2)
     else:
         error = TimeoutError if outcome in {"timeout", "partial_line"} else RuntimeError
         with pytest.raises(error, match="STARTING:"):
@@ -323,6 +334,98 @@ def test_sidecar_startup_drains_progress_and_reaps_failed_process(monkeypatch, o
     assert processes[0].poll() is not None
     assert processes[0].stdout is not None
     assert processes[0].stdout.closed
+
+
+class _FakeOomProcess:
+    def __init__(self, exit_code: int | None) -> None:
+        self._exit_code = exit_code
+
+    def poll(self) -> int | None:
+        return self._exit_code
+
+
+def _fake_oom_proc(exit_code: int | None = None) -> subprocess.Popen[Any]:
+    return cast(subprocess.Popen[Any], _FakeOomProcess(exit_code))
+
+
+@pytest.mark.parametrize(
+    ("state", "free_after", "allocated_bytes", "proc_exit_code", "expected"),
+    [
+        ("ready", 256, 1024, None, True),
+        ("starting", 256, 1024, None, False),
+        ("ready", 9 * 1024 * 1024 + 256, 1024, None, False),
+        ("ready", 256, 0, None, False),
+        ("ready", 256, 1024, 6, False),
+    ],
+)
+def test_gpu_oom_pressure_status_requires_live_ready_ceiling_pressure(
+    state,
+    free_after,
+    allocated_bytes,
+    proc_exit_code,
+    expected,
+):
+    handle = helpers.OomHandle(
+        proc=_fake_oom_proc(proc_exit_code),
+        device=0,
+        target_mem_ratio=0.95,
+        start_ts=0.0,
+        max_free_bytes=256,
+        state=state,
+        free_after=free_after,
+        allocated_bytes=allocated_bytes,
+        allocator_saturated=False,
+    )
+
+    verified, diagnostics = helpers.gpu_oom_pressure_status(handle)
+
+    assert verified is expected
+    assert "gpu=0" in diagnostics
+
+
+def test_gpu_oom_pressure_status_requires_every_sidecar() -> None:
+    ready = helpers.OomHandle(
+        proc=_fake_oom_proc(),
+        device=0,
+        target_mem_ratio=0.95,
+        start_ts=0.0,
+        max_free_bytes=256,
+        state="ready",
+        free_after=256,
+        allocated_bytes=1024,
+        allocator_saturated=False,
+    )
+    missed = helpers.OomHandle(
+        proc=_fake_oom_proc(),
+        device=1,
+        target_mem_ratio=0.95,
+        start_ts=0.0,
+        max_free_bytes=256,
+        state="ready",
+        free_after=16 * 1024 * 1024,
+        allocated_bytes=1024,
+        allocator_saturated=True,
+    )
+
+    verified, diagnostics = helpers.gpu_oom_pressure_status([ready, missed])
+
+    assert not verified
+    assert "gpu=0" in diagnostics and "gpu=1" in diagnostics
+
+
+def test_snapshot_server_worker_pids_excludes_root_dead_and_nonworkers(monkeypatch) -> None:
+    monkeypatch.setattr(helpers, "_list_server_process_tree", lambda server: [10, 11, 12, 13])
+    monkeypatch.setattr(helpers, "_resolve_runtime_worker_markers", lambda *args: ("worker",))
+    monkeypatch.setattr(helpers, "_pid_is_dead", lambda pid: pid == 13)
+    monkeypatch.setattr(helpers, "_pid_looks_like_runtime_worker", lambda pid, markers: pid in {11, 13})
+
+    assert helpers.snapshot_server_worker_pids(SimpleNamespace()) == [11]
+
+
+def test_wait_for_worker_pid_death_returns_previously_live_failure(monkeypatch) -> None:
+    monkeypatch.setattr(helpers, "_pid_is_dead", lambda pid: pid == 12)
+
+    assert helpers.wait_for_worker_pid_death([11, 12], timeout_sec=0) == [12]
 
 
 def test_sidecar_program_runs_in_fresh_subprocess(tmp_path: Path) -> None:
@@ -450,18 +553,10 @@ float16 = object()
     assert completed.stdout.rstrip().endswith("DONE")
 
 
-@pytest.mark.parametrize(
-    ("reporting_reserve_mib", "expected_returncode", "expected_status"),
-    [
-        (6, 0, "READY:"),
-        (9, 2, "ERROR:"),
-    ],
-)
-def test_sidecar_bounds_reported_residual_without_allocator_rejection(
+@pytest.mark.parametrize("late_free_mib", [6, 188])
+def test_sidecar_reconciles_memory_freed_during_allocation(
     tmp_path: Path,
-    reporting_reserve_mib: int,
-    expected_returncode: int,
-    expected_status: str,
+    late_free_mib: int,
 ) -> None:
     (tmp_path / "torch.py").write_text(
         f"""
@@ -498,8 +593,8 @@ class _Cuda:
 
     @staticmethod
     def mem_get_info(device):
-        reporting_reserve = {reporting_reserve_mib} * _MIB if _Cuda.allocated else 0
-        return _Cuda.initial_free - _Cuda.allocated + reporting_reserve, 1024 * _MIB
+        late_free = {late_free_mib} * _MIB if _Cuda.allocated else 0
+        return _Cuda.initial_free - _Cuda.allocated + late_free, 1024 * _MIB
 
 
 def empty(shape, **kwargs):
@@ -526,11 +621,12 @@ float16 = object()
         timeout=5,
     )
 
-    expected_free_after = (32 + reporting_reserve_mib) * 1024 * 1024
-    assert completed.returncode == expected_returncode, completed.stderr
-    assert f"free_after={expected_free_after}" in completed.stdout
-    assert expected_status in completed.stdout
-    assert completed.stdout.rstrip().endswith("DONE") is (expected_returncode == 0)
+    expected_allocated = (768 + late_free_mib) * 1024 * 1024
+    assert completed.returncode == 0, completed.stderr
+    assert "free_after=33554432" in completed.stdout
+    assert f"allocated={expected_allocated}" in completed.stdout
+    assert "READY:" in completed.stdout
+    assert completed.stdout.rstrip().endswith("DONE")
 
 
 @pytest.mark.parametrize(
@@ -762,6 +858,116 @@ def test_linux_fd_check_includes_pids_excluded_from_alive_list(tmp_path, monkeyp
     assert helpers._linux_fd_counts([42, 999]) == {42: 1}
     fd.unlink()
     assert helpers._linux_fd_counts([42, 999]) == {}
+
+
+@pytest.mark.parametrize("state", ["zombie", "zombie_with_threads", "gone", "running", "denied"])
+def test_linux_fd_permission_error_requires_confirmed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, state: str
+) -> None:
+    monkeypatch.setattr(helpers.sys, "platform", "linux")
+    monkeypatch.setattr(helpers, "_LINUX_PROC_ROOT", tmp_path)
+    original_iterdir = Path.iterdir
+
+    def denied_fd_table(path):
+        if path == tmp_path / "42" / "fd":
+            raise PermissionError("FD table denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_fd_table)
+    process = mocker.Mock()
+    process.num_threads.return_value = 2 if state == "zombie_with_threads" else 1
+    lookup = mocker.patch.object(helpers.psutil, "Process", return_value=process)
+    if state == "gone":
+        lookup.side_effect = helpers.psutil.NoSuchProcess(42)
+    elif state == "denied":
+        process.status.side_effect = helpers.psutil.AccessDenied(42)
+    else:
+        process.status.return_value = "zombie" if state == "zombie_with_threads" else state
+
+    if state in {"zombie", "gone"}:
+        assert helpers._linux_fd_counts([42]) == {}
+    else:
+        error = helpers.psutil.AccessDenied if state == "denied" else PermissionError
+        with pytest.raises(error):
+            helpers._linux_fd_counts([42])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux zombie process state")
+def test_linux_fd_check_accepts_a_real_unreaped_child() -> None:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while helpers.psutil.Process(child.pid).status() != helpers.psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "Child did not exit"
+            time.sleep(0.01)
+        assert helpers._linux_fd_counts([child.pid]) == {}
+    finally:
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_cleanup_checks_zombie_threads_with_readable_empty_fd_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, num_threads: int
+) -> None:
+    monkeypatch.setattr(helpers.sys, "platform", "linux")
+    monkeypatch.setattr(helpers, "_LINUX_PROC_ROOT", tmp_path)
+    (tmp_path / "42" / "fd").mkdir(parents=True)
+    process = mocker.Mock()
+    process.status.return_value = helpers.psutil.STATUS_ZOMBIE
+    process.num_threads.return_value = num_threads
+    mocker.patch.object(helpers.psutil, "pid_exists", return_value=True)
+    mocker.patch.object(helpers.psutil, "Process", return_value=process)
+    server = mocker.Mock(reliability_fault_snapshot={"tree_pids": [42], "shm_objects": []})
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+
+    if num_threads > 1:
+        with pytest.raises(AssertionError, match="residual server-tree processes remain alive"):
+            helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="zombie", timeout_sec=1)
+    else:
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="zombie", timeout_sec=1)
+
+
+@pytest.mark.parametrize("residual", [None, "fd", "shm"])
+def test_cleanup_retries_transient_fd_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, residual: str | None
+) -> None:
+    owned = tmp_path / "owned"
+    owned.touch()
+    identity = owned.stat()
+    objects = [(str(owned), identity.st_dev, identity.st_ino)] if residual == "shm" else []
+    server = mocker.Mock(reliability_fault_snapshot={"tree_pids": [42], "shm_objects": objects})
+    ticks = iter([0.0, 0.0, 0.5, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "list_alive_pids", lambda _: [])
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+    counts = {42: 1} if residual == "fd" else {}
+    read_fds = mocker.Mock(side_effect=[PermissionError("exiting process"), counts])
+    monkeypatch.setattr(helpers, "_linux_fd_counts", read_fds)
+
+    if residual is None:
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="exit-race", timeout_sec=1)
+    else:
+        message = "file descriptors remain open" if residual == "fd" else "named shared memory/semaphores remain"
+        with pytest.raises(AssertionError, match=message):
+            helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="exit-race", timeout_sec=1)
+    assert read_fds.call_count == 2
+
+
+def test_cleanup_does_not_accept_unreadable_fd_tables(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
+    server = mocker.Mock(reliability_fault_snapshot={"tree_pids": [42]})
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(helpers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(helpers, "list_alive_pids", lambda _: [])
+    monkeypatch.setattr(helpers, "query_gpu_compute_pid_used_memory_mb", lambda: None)
+    monkeypatch.setattr(helpers, "_linux_fd_counts", mocker.Mock(side_effect=PermissionError("still unreadable")))
+
+    with pytest.raises(PermissionError, match="still unreadable"):
+        helpers.assert_no_server_tree_process_residual_and_gpu_release(server, scenario="denied", timeout_sec=1)
 
 
 @pytest.mark.parametrize("resource", ["fd", "shm"])

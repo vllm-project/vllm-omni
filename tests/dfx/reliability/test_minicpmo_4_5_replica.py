@@ -31,8 +31,7 @@ _NATIVE_CHAT_TEMPLATE = (
 
 
 class MiniCPMO45Replica(MiniCPMO45):
-    # Replica fault coverage is intentionally CUDA-only.
-    res = {"cuda": "H100"}
+    res = {"cuda": "H100", "rocm": "MI325"}
     num_cards = 3
     deploy_dir = _DEPLOY_DIR
     scenarios = [
@@ -80,9 +79,6 @@ def test_replica_crash_at_load(omni_server_function, online_client_function) -> 
 
 
 @scenario_params(MODEL, ReplicaCrashAtExit)
-@pytest.mark.skip(
-    reason="Stage1 wakeup FIFO remains after shutdown: https://github.com/vllm-project/vllm-omni/issues/10391"
-)
 def test_replica_crash_at_exit(omni_server_function, online_client_function) -> None:
     """Begin normal shutdown, kill one stage-1 replica, and require timely cleanup of the whole instance."""
     ReplicaCrashAtExit().run(MODEL, omni_server_function, online_client_function)
@@ -99,9 +95,6 @@ def test_replica_crash_at_launch(launch_params) -> None:
 
 
 @scenario_params(MODEL, ReplicaGracefulShutdown)
-@pytest.mark.skip(
-    reason="Stage1 wakeup FIFOs remain after normal shutdown: https://github.com/vllm-project/vllm-omni/issues/10391"
-)
 def test_graceful_shutdown(omni_server_function, online_client_function) -> None:
     """SIGTERM the healthy root; all children and resources must clear within 60s."""
     ReplicaGracefulShutdown().run(MODEL, omni_server_function, online_client_function)

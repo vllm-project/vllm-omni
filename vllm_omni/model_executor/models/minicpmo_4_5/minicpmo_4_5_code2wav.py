@@ -34,7 +34,7 @@ from .batched_token2wav import (
     state_shape_signature,
 )
 from .code2wav_watchdog import Code2WavWatchdog
-from .config_flags import read_bool_flag
+from .config_flags import read_bool_flag, resolve_token2wav_trt_config
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
 if TYPE_CHECKING:
@@ -496,14 +496,21 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
-            # Default on for CUDA and NPU. CUDA uses tiled TF32 attention on
-            # SM80+ and SDPA otherwise, so it respects the TF32 opt-out; NPU
-            # uses packed QKV, in-place KV and ACLNN AddLayerNorm, independent
-            # of TF32. An explicit ``cfm_fused_body`` overrides either default.
+            # CUDA FP32 fusion respects the TF32 opt-out. FP16 CFM and NPU
+            # fusion do not depend on TF32. An explicit ``cfm_fused_body``
+            # overrides these defaults.
             "fused_body": read_bool_flag(
                 extra,
                 "cfm_fused_body",
-                (current_omni_platform.is_cuda() and self._tf32_mode != "off") or current_omni_platform.is_npu(),
+                (
+                    current_omni_platform.is_cuda()
+                    and (
+                        self._tf32_mode != "off"
+                        or read_bool_flag(extra, "token2wav_float16", False)
+                        or read_bool_flag(extra, "cfm_float16", False)
+                    )
+                )
+                or current_omni_platform.is_npu(),
             ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
@@ -1871,7 +1878,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         device_spk = read_bool_flag(
             extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
         )
-        use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
+        # An explicit stage key wins over its legacy MINICPMO_TOKEN2WAV_TRT* env
+        # var (#6232). Keys are validated on every platform; the env vars are
+        # read (and warn) only where they take effect.
+        trt_config = resolve_token2wav_trt_config(extra, cuda=current_omni_platform.is_cuda())
+        use_trt = trt_config.enabled
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
         # when it cannot apply, including explicit overrides that predate it:
@@ -1904,10 +1915,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
-            dtype_name = str(
-                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
-            ).lower()
-            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            dtype_name = trt_config.dtype
+            trt_dtype = torch.float32 if dtype_name == "fp32" else torch.float16
             max_batch = int(extra.get("token2wav_trt_max_batch", 16))
             device = next(token2wav.flow.parameters()).device
             trt_stepper = build_dit_trt_stepper(
@@ -1915,6 +1924,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 device=device,
                 dtype=trt_dtype,
                 max_batch=max_batch,
+                cache_dir=trt_config.cache_dir,
             )
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()

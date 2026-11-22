@@ -100,7 +100,7 @@ def test_npu_platform_defers_patch_until_device_setup(monkeypatch) -> None:
         "apply_minicpmo_4_5_code2wav_patch",
         lambda: None,
     )
-    monkeypatch.setattr(qwen3_tts, "apply_qwen3_tts_patches", lambda: None)
+    monkeypatch.setattr(qwen3_tts, "apply_qwen3_tts_code2wav_patch", lambda: None)
     monkeypatch.setattr(
         qwen3_tts_tokenizer_v2,
         "apply_qwen3_tts_tokenizer_v2_patch",
