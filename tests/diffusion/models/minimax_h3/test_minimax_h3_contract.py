@@ -967,6 +967,133 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     ]
 
 
+def test_pipeline_allows_encoder_only_lifecycle_without_dit_or_vae(monkeypatch, tmp_path):
+    """Encoder-only lifecycle builds no DiT/VAE and emits no DiT weight source.
+
+    With ``transformer=false``, ``vae_decoder=false`` and ``text_encoder=true``
+    the pipeline must leave DiT and the VAEs unconstructed instead of eagerly
+    materializing them (RFC #10943 §enc-dec). The text encoder remains the only
+    declared weight source so the loader never streams the 61 GiB DiT.
+    """
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+        OmniDiffusionConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    for component in ("transformer", "video_vae", "audio_vae"):
+        (tmp_path / "FL2VA" / component).mkdir()
+
+    created: dict[str, list[Any]] = {"dit": [], "video_vae": [], "audio_vae": [], "text_encoder": []}
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeDiT(FakeModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            created["dit"].append((args, kwargs))
+
+    def component_factory(name):
+        def create(path, *args, **kwargs):
+            created[name].append(str(path))
+            return FakeModule()
+
+        return create
+
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3DiTModel", FakeDiT)
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3Qwen3VLEncoder", component_factory("text_encoder"))
+    monkeypatch.setattr(pipeline_module.Qwen2TokenizerFast, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_module.Qwen3VLProcessor, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3VideoVAE", component_factory("video_vae"))
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3AudioVAE", component_factory("audio_vae"))
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        pipeline_module,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+    )
+    od_config.model_loaded["transformer"] = False
+    od_config.model_loaded["text_encoder"] = True
+    od_config.model_loaded["vae_encoder"] = False
+    od_config.model_loaded["vae_decoder"] = False
+
+    pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
+
+    assert pipeline.transformer is None
+    assert pipeline.vae is None
+    assert pipeline.video_vae is None
+    assert pipeline.audio_vae is None
+    assert pipeline._dit_modules == []
+    assert created["dit"] == []
+    assert created["video_vae"] == []
+    assert created["audio_vae"] == []
+    assert created["text_encoder"] == [str(tmp_path / "FL2VA" / "text_encoder")]
+    assert [source.prefix for source in pipeline.weights_sources] == ["text_encoder."]
+
+
+def test_pipeline_still_rejects_vae_decoder_without_vae_encoder(monkeypatch, tmp_path):
+    """The remaining VAE guard must still reject decoder-only requests."""
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+        OmniDiffusionConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+    )
+    od_config.model_loaded["transformer"] = True
+    od_config.model_loaded["vae_encoder"] = True
+    od_config.model_loaded["vae_decoder"] = False
+
+    with pytest.raises(ValueError, match="external decoding requires vae_encoder=false"):
+        pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
+
+
 def test_combined_weight_loader_routes_each_contiguous_partition():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 

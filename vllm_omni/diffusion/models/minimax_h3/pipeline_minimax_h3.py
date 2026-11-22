@@ -1141,18 +1141,22 @@ class MiniMaxH3Pipeline(
                 "latent_refine default."
             )
         self.device = get_local_device()
+        self.load_transformer = od_config.model_loaded.get("transformer", True)
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
+        # Legal ``model_loaded`` sub-keys are independent except one VAE invariant:
+        # ``vae_encoder`` requires ``vae_decoder`` (decoding needs the encoder).
+        # Text-only tasks may set ``transformer=false`` / ``vae_encoder=false`` /
+        # ``vae_decoder=false`` while keeping ``text_encoder=true``; the text
+        # encoder no longer forces VAE loading (RFC #10943 Phase 2).
         if not self.load_vae_decoder and self.load_vae_encoder:
             raise ValueError(
                 "MiniMax H3 external decoding requires vae_encoder=false and external encoder conditioning"
             )
-        if self.load_vae_encoder is False and self.load_text_encoder is True:
-            raise ValueError(
-                "MiniMax H3 does not support local text encoding with external media conditioning; "
-                "set text_encoder=false or enable vae_encoder"
-            )
+        # A standalone text encoder does not need the VAE encoders: only media
+        # (image/video/audio) conditioning paths require ``vae_encoder``, and
+        # those raise at request time when it is disabled (RFC #10943).
         self._encoder_modules = ["text_encoder"] if self.load_text_encoder else []
         self._PROFILER_TARGETS = list(type(self)._PROFILER_TARGETS)
         encoder_block_attrs = dict(self._offload_plan.encoder_block_attrs)
@@ -1298,147 +1302,152 @@ class MiniMaxH3Pipeline(
             else model_path
         )
         transformer_component = self._fasth3_checkpoint.transformer_component if modular else "transformer"
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=str(model_path),
-                subfolder=transformer_component,
-                revision=od_config.revision,
-                prefix="transformer.",
-                fall_back_to_pt=False,
-            )
-        ]
-        if control_path:
+        self.weights_sources = []
+        self._dit_modules: list[str] = []
+        if self.load_transformer:
             self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=str(Path(control_path).parent),
-                    subfolder=None,
-                    revision=None,
-                    prefix="controlnet.",
-                    fall_back_to_pt=False,
-                    allow_patterns_overrides=[Path(control_path).name],
-                )
-            )
-        self._dit_modules = ["transformer"]
-        if ref2va_model_path is not None:
-            self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=str(ref2va_model_path),
-                    subfolder="transformer",
-                    revision=od_config.revision,
-                    prefix="transformers_ref.",
-                    fall_back_to_pt=False,
-                )
-            )
-            self._dit_modules.append("transformers_ref")
-        transformer_quant_config = _resolve_component_quant_config(
-            od_config.quantization_config,
-            "transformer",
-        )
-        from vllm_omni.quantization.fp8_config import SerializedPerChannelFp8Config
-
-        if isinstance(transformer_quant_config, SerializedPerChannelFp8Config):
-            from .checkpoint_quantization import fasth3_fp8_config
-
-            transformer_quant_config = fasth3_fp8_config(model_path / transformer_component)
-        packed_dit = model_path / transformer_component / "nvfp4_weights.safetensors"
-        if packed_dit.is_file():
-            from vllm.distributed import get_tensor_model_parallel_rank
-
-            from .checkpoint_quantization import FastH3NVFP4Config
-            from .vae_nvfp4 import require_nvfp4_linear
-
-            require_nvfp4_linear(self.device)
-            if transformer_quant_config is not None:
-                raise ValueError("FastH3 QAD already contains NVFP4 weights; remove the quantization override")
-            transformer_quant_config = FastH3NVFP4Config.from_dit(packed_dit, rank=get_tensor_model_parallel_rank())
-            self.weights_sources.insert(
-                1,
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=str(model_path),
                     subfolder=transformer_component,
                     revision=od_config.revision,
                     prefix="transformer.",
                     fall_back_to_pt=False,
-                    allow_patterns_overrides=["nvfp4_weights.safetensors"],
-                ),
+                )
             )
-        transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
-        self.transformer = transformer_cls(
-            od_config,
-            quant_config=transformer_quant_config,
-            diffusers_weights=modular,
-        )
-        if self._fasth3_checkpoint is not None:
-            spec = self._fasth3_checkpoint
-            if isinstance(spec, FastH3OmniCheckpointSpec) and self.transformer.arch.pdd_steps != 32:
-                raise ValueError("FastH3 Omni transformer_ref/config.json must declare pdd_steps=32")
-            self.transformer.enable_vsa_gates(
-                sparsity=spec.vsa_sparsity,
-                tile_size=spec.vsa_tile_size,
-                ref_policy=spec.vsa_ref_policy,
-                ref_keep_rate=spec.vsa_ref_keep_rate,
+            if control_path:
+                self.weights_sources.append(
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(Path(control_path).parent),
+                        subfolder=None,
+                        revision=None,
+                        prefix="controlnet.",
+                        fall_back_to_pt=False,
+                        allow_patterns_overrides=[Path(control_path).name],
+                    )
+                )
+            self._dit_modules.append("transformer")
+            if ref2va_model_path is not None:
+                self.weights_sources.append(
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(ref2va_model_path),
+                        subfolder="transformer",
+                        revision=od_config.revision,
+                        prefix="transformers_ref.",
+                        fall_back_to_pt=False,
+                    )
+                )
+                self._dit_modules.append("transformers_ref")
+            transformer_quant_config = _resolve_component_quant_config(
+                od_config.quantization_config,
+                "transformer",
             )
-            logger.info(
-                "%s: 8 forwards, video/audio shifts %s/3, VSA sparsity=%s tile=%s",
-                spec.name,
-                spec.video_shift,
-                spec.vsa_sparsity,
-                spec.vsa_tile_size,
-            )
-        if ref2va_model_path is not None:
-            self.transformers_ref = MiniMaxH3DiTModel(
+            from vllm_omni.quantization.fp8_config import SerializedPerChannelFp8Config
+
+            if isinstance(transformer_quant_config, SerializedPerChannelFp8Config):
+                from .checkpoint_quantization import fasth3_fp8_config
+
+                transformer_quant_config = fasth3_fp8_config(model_path / transformer_component)
+            packed_dit = model_path / transformer_component / "nvfp4_weights.safetensors"
+            if packed_dit.is_file():
+                from vllm.distributed import get_tensor_model_parallel_rank
+
+                from .checkpoint_quantization import FastH3NVFP4Config
+                from .vae_nvfp4 import require_nvfp4_linear
+
+                require_nvfp4_linear(self.device)
+                if transformer_quant_config is not None:
+                    raise ValueError("FastH3 QAD already contains NVFP4 weights; remove the quantization override")
+                transformer_quant_config = FastH3NVFP4Config.from_dit(packed_dit, rank=get_tensor_model_parallel_rank())
+                self.weights_sources.insert(
+                    1,
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(model_path),
+                        subfolder=transformer_component,
+                        revision=od_config.revision,
+                        prefix="transformer.",
+                        fall_back_to_pt=False,
+                        allow_patterns_overrides=["nvfp4_weights.safetensors"],
+                    ),
+                )
+            transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
+            self.transformer = transformer_cls(
                 od_config,
                 quant_config=transformer_quant_config,
                 diffusers_weights=modular,
             )
+            if self._fasth3_checkpoint is not None:
+                spec = self._fasth3_checkpoint
+                if isinstance(spec, FastH3OmniCheckpointSpec) and self.transformer.arch.pdd_steps != 32:
+                    raise ValueError("FastH3 Omni transformer_ref/config.json must declare pdd_steps=32")
+                self.transformer.enable_vsa_gates(
+                    sparsity=spec.vsa_sparsity,
+                    tile_size=spec.vsa_tile_size,
+                    ref_policy=spec.vsa_ref_policy,
+                    ref_keep_rate=spec.vsa_ref_keep_rate,
+                )
+                logger.info(
+                    "%s: 8 forwards, video/audio shifts %s/3, VSA sparsity=%s tile=%s",
+                    spec.name,
+                    spec.video_shift,
+                    spec.vsa_sparsity,
+                    spec.vsa_tile_size,
+                )
+            if ref2va_model_path is not None:
+                self.transformers_ref = MiniMaxH3DiTModel(
+                    od_config,
+                    quant_config=transformer_quant_config,
+                    diffusers_weights=modular,
+                )
 
-        self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
-        if self._vdn is not None:
-            self._vdn.check_serving_contract(partition=self.partition, od_config=od_config)
-            # The hybrid modules must exist before the branch tensors stream in.
-            self.transformer.enable_vdn(self._vdn.config)
-        if self._vdn is None and not modular:
-            self._regenerate = resolve_regenerate_adapter(od_config, self.transformer)
-        if self._regenerate is not None:
-            self._regenerate.check_serving_contract(partition=self.partition, od_config=od_config)
-        self._fasth3 = (
-            resolve_fasth3_fusion(od_config, self.transformer)
-            if self._vdn is None and self._regenerate is None
-            else None
-        )
-        if self._fasth3 is not None and self._fasth3.requires_vsa:
-            # The artifact assigns a compression gate per DiT block, so those
-            # modules have to exist before load_weights streams them in. Only
-            # the ``transformer.`` stream is fused, and ``check_task`` admits
-            # T2VA only, so the Ref2VA DiT would carry 50 gates that nothing
-            # ever fills or reads.
-            self.transformer.enable_vsa_gates()
-        if self._fasth3 is not None:
-            self._fasth3.check_serving_contract(
-                partition=self.partition,
-                od_config=od_config,
-                video_shift=self.default_video_shift,
-                audio_shift=self.default_audio_shift,
+            self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
+            if self._vdn is not None:
+                self._vdn.check_serving_contract(partition=self.partition, od_config=od_config)
+                # The hybrid modules must exist before the branch tensors stream in.
+                self.transformer.enable_vdn(self._vdn.config)
+            if self._vdn is None and not modular:
+                self._regenerate = resolve_regenerate_adapter(od_config, self.transformer)
+            if self._regenerate is not None:
+                self._regenerate.check_serving_contract(partition=self.partition, od_config=od_config)
+            self._fasth3 = (
+                resolve_fasth3_fusion(od_config, self.transformer)
+                if self._vdn is None and self._regenerate is None
+                else None
             )
+            if self._fasth3 is not None and self._fasth3.requires_vsa:
+                # The artifact assigns a compression gate per DiT block, so those
+                # modules have to exist before load_weights streams them in. Only
+                # the ``transformer.`` stream is fused, and ``check_task`` admits
+                # T2VA only, so the Ref2VA DiT would carry 50 gates that nothing
+                # ever fills or reads.
+                self.transformer.enable_vsa_gates()
+            if self._fasth3 is not None:
+                self._fasth3.check_serving_contract(
+                    partition=self.partition,
+                    od_config=od_config,
+                    video_shift=self.default_video_shift,
+                    audio_shift=self.default_audio_shift,
+                )
 
-        self._configure_adaln_sidecar(
-            self.transformer,
-            "minimax_h3_adaln_cache_path",
-            expected_partition,
-            self._fasth3.source if self._fasth3 is not None else None,
-            eligible=transformer_quant_config is None
-            and not modular
-            and self._vdn is None
-            and self._regenerate is None,
-        )
-        if ref2va_model_path is not None:
             self._configure_adaln_sidecar(
-                self.transformers_ref,
-                "minimax_h3_ref_adaln_cache_path",
-                "ref2va",
-                None,
-                eligible=transformer_quant_config is None and not modular,
+                self.transformer,
+                "minimax_h3_adaln_cache_path",
+                expected_partition,
+                self._fasth3.source if self._fasth3 is not None else None,
+                eligible=transformer_quant_config is None
+                and not modular
+                and self._vdn is None
+                and self._regenerate is None,
             )
+            if ref2va_model_path is not None:
+                self._configure_adaln_sidecar(
+                    self.transformers_ref,
+                    "minimax_h3_ref_adaln_cache_path",
+                    "ref2va",
+                    None,
+                    eligible=transformer_quant_config is None and not modular,
+                )
+        else:
+            self.transformer = None
 
         if self.load_text_encoder:
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
