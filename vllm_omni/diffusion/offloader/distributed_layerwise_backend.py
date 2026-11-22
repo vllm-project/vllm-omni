@@ -1954,7 +1954,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             elif host_weight_plan.backing_kind == "checkpoint_mmap":
                 self._load_weights_via_mmap(
                     pipeline,
-                    tuple(resolved.dits)
+                    tuple(component for component in resolved.dits if component.selected)
                     + tuple(component for component in resolved.encoders if self._component_mmap_eligible(component)),
                     host_weight_plan,
                 )
@@ -1988,6 +1988,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             device=self.device,
             staged_components=self._staged_components,
             enable_encoder_blocks=self._try_layerwise_offload_encoder,
+            place_unselected=self.config.components is None,
         )
 
         if any(component.selected for component in resolved.dits):

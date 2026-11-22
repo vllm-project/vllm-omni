@@ -139,11 +139,17 @@ def get_direct_mmap_adapter(pipeline: nn.Module) -> DirectMmapAdapter | None:
     if any(isinstance(module, Magi2PreviewTransformer) for module in pipeline.modules()):
         return _Magi2DirectMmapAdapter()
 
+    # A pipeline may host only the text encoder (component-isolated encoding).
+    # The adapter owns both the DiT and encoder runtime layouts, so select it
+    # from either component instead of requiring a DiT (RFC #10943).
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        MiniMaxH3Qwen3VLEncoder,
+    )
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3DiTModel,
     )
 
-    if any(isinstance(module, MiniMaxH3DiTModel) for module in pipeline.modules()):
+    if any(isinstance(module, (MiniMaxH3DiTModel, MiniMaxH3Qwen3VLEncoder)) for module in pipeline.modules()):
         return _MiniMaxH3DirectMmapAdapter(pipeline)
 
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (

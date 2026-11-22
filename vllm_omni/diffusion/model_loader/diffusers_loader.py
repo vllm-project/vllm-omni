@@ -873,47 +873,55 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 hwr_active = hwr_state is not None
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
+                if distributed_offload and not hwr_active and not self._force_canonical_load:
                     lora_backend = self.od_config.lora_backend
                     has_distilled_lora = lora_backend in (LoRABackend.DISTILL, "distill") and bool(
                         self.od_config.lora_path
                     )
-                    plan_result = build_checkpoint_mmap_plan(
-                        model,
-                        dit_modules=tuple(zip(modules.dit_names, modules.dits)),
-                        sources=weight_sources,
-                        model_path=str(self.od_config.model) or None,
-                        tensor_parallel_size=tensor_parallel_size,
-                        use_hsdp=use_hsdp,
-                        online_quantization=any(self._has_online_quant(dit) for dit in modules.dits),
-                        has_distilled_lora=has_distilled_lora,
-                        encoder_modules=self._mmap_encoder_modules(
-                            modules,
-                            plan,
-                            selected=resolved_offload.offloads(TEXT_ENCODER_COMPONENT),
-                            use_hsdp=use_hsdp,
-                            # The backend transports an AllGather component over
-                            # the data-parallel group, so this gate must use the
-                            # same group size the resolver and the backend see.
-                            # ``dlo_group_size`` falls back to sequence parallel
-                            # when DP is single, which would withhold a
-                            # rank-local encoder the backend can stream.
-                            dp_size=data_parallel_size,
-                            uses_allgather=(
-                                resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
-                                and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
-                            ),
-                            dit_mmap_ready=not dit_uses_allgather or data_parallel_size <= 1,
-                        ),
+                    # Plan only the components the user selected. The encoder
+                    # must not require the DiT to be selected (component
+                    # isolation, RFC #10943).
+                    dit_mmap_modules = (
+                        tuple(zip(modules.dit_names, modules.dits)) if resolved_offload.offloads(DIT_COMPONENT) else ()
                     )
-                    self.host_weight_plan = plan_result.plan
+                    encoder_mmap_modules = self._mmap_encoder_modules(
+                        modules,
+                        plan,
+                        selected=resolved_offload.offloads(TEXT_ENCODER_COMPONENT),
+                        use_hsdp=use_hsdp,
+                        # The backend transports an AllGather component over the
+                        # data-parallel group, so this gate must use the same
+                        # group size the resolver and the backend see.
+                        # ``dlo_group_size`` falls back to sequence parallel when
+                        # DP is single, which would withhold a rank-local encoder
+                        # the backend can stream.
+                        dp_size=data_parallel_size,
+                        uses_allgather=(
+                            resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+                            and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
+                        ),
+                        dit_mmap_ready=not dit_uses_allgather or data_parallel_size <= 1,
+                    )
+                    if dit_mmap_modules or encoder_mmap_modules:
+                        plan_result = build_checkpoint_mmap_plan(
+                            model,
+                            dit_modules=dit_mmap_modules,
+                            sources=weight_sources,
+                            model_path=str(self.od_config.model) or None,
+                            tensor_parallel_size=tensor_parallel_size,
+                            use_hsdp=use_hsdp,
+                            online_quantization=any(self._has_online_quant(dit) for dit in modules.dits),
+                            has_distilled_lora=has_distilled_lora,
+                            encoder_modules=encoder_mmap_modules,
+                        )
+                        self.host_weight_plan = plan_result.plan
 
                 host_weight_plan = self.host_weight_plan
 
                 if host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
-                        "AllGather" if dit_uses_allgather and dlo_group_size > 1 else "rank-local",
+                        "AllGather" if dit_uses_allgather and data_parallel_size > 1 else "rank-local",
                         host_weight_plan.backing_kind,
                         sorted(host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
                     )
@@ -933,7 +941,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             planned_weights=host_weight_plan.bindings,
                         )
                 else:
-                    if dit_distributed_offload and plan_result is not None:
+                    if distributed_offload and plan_result is not None:
                         logger.info(
                             "DLO direct checkpoint mmap unavailable; using ordinary loader: %s",
                             plan_result.fallback_reason,
