@@ -216,6 +216,7 @@ class _UlyssesCtx(ParallelAttentionContext):
     scatter_idx: int
     gather_idx: int
     use_sync: bool
+    rocm_packed: bool = False
     joint_len: int = 0
     joint_strategy: str = "front"
     # UAA (Ulysses Anything Attention) metadata
@@ -250,7 +251,14 @@ class UlyssesParallelAttention:
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
-        self._ulysses_a2a_permute = ulysses_a2a_permute
+        use_rocm = ulysses_a2a_permute and current_omni_platform.is_rocm()
+        self._ulysses_a2a_permute = ulysses_a2a_permute and not use_rocm
+        self._rocm_packed = (
+            use_rocm
+            and (scatter_idx, gather_idx) == (2, 1)
+            and sp_group.ulysses_world_size == 4
+            and sp_group.ring_world_size == sp_group.allgather_world_size == 1
+        )
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -264,7 +272,9 @@ class UlyssesParallelAttention:
                 scatter_idx=scatter_idx,
                 gather_idx=gather_idx,
             )
-            if _a2a_permute_enabled(ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
+            if self._rocm_packed or _a2a_permute_enabled(
+                self._ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size
+            ):
                 ensure_a2a_permute_available()
 
     @property
@@ -300,6 +310,7 @@ class UlyssesParallelAttention:
             validate_a2a_permute_config(ulysses_mode=mode)
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
+        rocm_packed = False
         if attn_metadata is not None:
             candidate = attn_metadata.extra.get("gate_compress")
             if isinstance(candidate, torch.Tensor):
@@ -543,7 +554,17 @@ class UlyssesParallelAttention:
                     )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            if _a2a_permute_enabled(
+            if self._rocm_packed and not is_joint and gate_compress is None:
+                from vllm_omni.diffusion.distributed import rocm_ulysses
+
+                rocm_packed = rocm_ulysses.eligible(query, key, value, ulysses_world_size)
+
+            if rocm_packed:
+                strided = attn_metadata is not None and attn_metadata.extra.get("accepts_strided_ulysses_qkv") is True
+                query, key, value = rocm_ulysses.exchange_qkv(self._ulysses_pg, query, key, value, strided)
+                if self._use_sync:
+                    current_omni_platform.synchronize()
+            elif _a2a_permute_enabled(
                 self._ulysses_a2a_permute,
                 self._scatter_idx,
                 self._gather_idx,
@@ -610,6 +631,7 @@ class UlyssesParallelAttention:
             scatter_idx=self._scatter_idx,
             gather_idx=self._gather_idx,
             use_sync=self._use_sync,
+            rocm_packed=rocm_packed,
             joint_len=joint_len,
             joint_strategy=joint_strategy,
             use_uaa=(mode == "advanced_uaa"),
@@ -723,6 +745,13 @@ class UlyssesParallelAttention:
                 return torch.cat([output_img, output_joint], dim=1)
 
         # Standard Ulysses Reverse
+        if ctx.rocm_packed:
+            from vllm_omni.diffusion.distributed.rocm_ulysses import exchange_output
+
+            output = exchange_output(ctx.ulysses_pg, attn_output)
+            if ctx.use_sync:
+                current_omni_platform.synchronize()
+            return output
         if ctx.use_uaa:
             return _ulysses_all_to_all_any_o(
                 ctx.ulysses_pg,

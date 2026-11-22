@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_sync):
     """Both platforms share attention routing, including joint slicing."""
     calls = []
-    platform = SimpleNamespace(is_npu=lambda: npu, synchronize=lambda: calls.append("sync"))
+    platform = SimpleNamespace(is_npu=lambda: npu, is_rocm=lambda: False, synchronize=lambda: calls.append("sync"))
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
@@ -138,7 +138,9 @@ def test_direct_npu_strategy_validates_initialized_groups(
 
 
 def test_npu_strategy_checks_each_forward_context_mode(monkeypatch):
-    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+    platform = SimpleNamespace(is_npu=lambda: True, is_rocm=lambda: False)
+    monkeypatch.setattr(ulysses, "current_omni_platform", platform)
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
     group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1, allgather_world_size=1)
     monkeypatch.setattr(factory, "get_sp_group", lambda: group)
