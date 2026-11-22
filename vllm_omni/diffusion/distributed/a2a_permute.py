@@ -25,6 +25,8 @@ import ctypes
 import math
 import sys
 import threading
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING, Any
@@ -59,6 +61,7 @@ class _SymmWorkspace:
     # QKV, gate and O each retain their latest layout without evicting one another.
     ce_plans: dict[tuple[bool, int], _CEPlan] = field(default_factory=dict)
     ce_stream: torch.cuda.Stream | None = None
+    ring_credited: bool = False
 
 
 # A single grow-only byte workspace per device/process-group. Shape changes
@@ -167,7 +170,12 @@ def _required_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 
 
 def _get_symm_buffer(
-    symm_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device, group_name: str
+    symm_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    group_name: str,
+    *,
+    setup_context: Callable[[], AbstractContextManager[None]] = nullcontext,
 ) -> torch.Tensor:
     """Get a typed view from a grow-only symmetric-memory workspace.
 
@@ -178,13 +186,16 @@ def _get_symm_buffer(
     device = torch.device(device)
     key = (device, group_name)
     required_bytes = _required_nbytes(symm_shape, dtype)
-    stream_id = torch.cuda.current_stream(device).cuda_stream
     with _WORKSPACE_LOCK:
-        workspace = _SYMM_WORKSPACES.get(key)
-        if workspace is not None and workspace.stream_id != stream_id:
-            raise RuntimeError("a2a_permute workspace must be used from a single CUDA stream")
-        if workspace is None or workspace.capacity_bytes < required_bytes:
-            if torch.cuda.is_current_stream_capturing():
+        # CE supplies a host-side agreement context on setup/growth. Check local
+        # prerequisites before peers enter any collective or rendezvous.
+        with setup_context():
+            stream_id = torch.cuda.current_stream(device).cuda_stream
+            workspace = _SYMM_WORKSPACES.get(key)
+            if workspace is not None and workspace.stream_id != stream_id:
+                raise RuntimeError("a2a_permute workspace must be used from a single CUDA stream")
+            grow = workspace is None or workspace.capacity_bytes < required_bytes
+            if grow and torch.cuda.is_current_stream_capturing():
                 capacity = 0 if workspace is None else workspace.capacity_bytes
                 raise RuntimeError(
                     "a2a_permute: cannot grow the symmetric-memory workspace "
@@ -195,14 +206,19 @@ def _get_symm_buffer(
                 # Initialize the process-group communicator before rendezvous.
                 pg = _resolve_process_group(group_name)
                 warm = torch.ones(1, device=device)
+        if grow:
+            if workspace is None:
+                # NCCL symmetric-memory rendezvous requires the communicator to
+                # exist before the first allocation. Collective errors propagate:
+                # an unhealthy process group cannot safely be used for fallback.
                 dist.all_reduce(warm, group=pg)
-            # Growth is rare and must not release the previous allocation while
-            # an earlier kernel is still consuming it.
-            torch.accelerator.synchronize(device)
-            # Peer pointers must identify this allocation, not the base of
-            # an implicit pool containing it at a nonzero offset.
-            allocation = symm_mem._SymmetricMemory.empty_strided_p2p((required_bytes,), (1,), torch.uint8, device)
-            handle = symm_mem.rendezvous(allocation, group_name)
+            with setup_context():
+                # Do not release an older buffer while kernels still consume it.
+                torch.accelerator.synchronize(device)
+                # Peer pointers must identify this allocation, not a pool base.
+                allocation = symm_mem._SymmetricMemory.empty_strided_p2p((required_bytes,), (1,), torch.uint8, device)
+            with setup_context():
+                handle = symm_mem.rendezvous(allocation, group_name)
             workspace = _SymmWorkspace(
                 allocation=allocation,
                 handle=handle,
@@ -210,21 +226,23 @@ def _get_symm_buffer(
                 stream_id=stream_id,
             )
             _SYMM_WORKSPACES[key] = workspace
-        view_key = (symm_shape, dtype)
-        buffer = workspace.views.get(view_key)
-        if buffer is not None:
+        assert workspace is not None
+        with setup_context():
+            view_key = (symm_shape, dtype)
+            buffer = workspace.views.get(view_key)
+            if buffer is not None:
+                return buffer
+            buffer = workspace.handle.get_buffer(workspace.handle.rank, symm_shape, dtype)
+            # Peer writes target the allocation base; keep the local view aligned
+            # even when the handle exposes a window-relative pointer.
+            if isinstance(buffer, torch.Tensor) and buffer.data_ptr() != workspace.allocation.data_ptr():
+                buffer = workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
+            # Keep at most the forward and reverse views; capacity stays grow-only
+            # without retaining a view for every historical request shape.
+            if len(workspace.views) == 2:
+                workspace.views.clear()
+            workspace.views[view_key] = buffer
             return buffer
-        buffer = workspace.handle.get_buffer(workspace.handle.rank, symm_shape, dtype)
-        # Peer writes target the allocation base; keep the local view aligned
-        # even when the handle exposes a window-relative pointer.
-        if isinstance(buffer, torch.Tensor) and buffer.data_ptr() != workspace.allocation.data_ptr():
-            buffer = workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
-        # Keep at most the forward and reverse views; capacity stays grow-only
-        # without retaining a view for every historical request shape.
-        if len(workspace.views) == 2:
-            workspace.views.clear()
-        workspace.views[view_key] = buffer
-        return buffer
 
 
 def clear_a2a_permute_workspaces() -> None:
