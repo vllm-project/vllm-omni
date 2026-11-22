@@ -47,7 +47,7 @@ vLLM-Omni is fast with:
 
 - State-of-the-art AR support by leveraging efficient KV cache management from vLLM
 - Pipelined stage execution overlapping for high throughput performance
-- Fully disaggregation based on OmniConnector and dynamic resource allocation across stages
+- Full disaggregation based on OmniConnector and dynamic resource allocation across stages
 
 vLLM-Omni is flexible and easy to use with:
 

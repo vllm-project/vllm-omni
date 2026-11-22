@@ -34,6 +34,9 @@ HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
                 #     upstream HiggsAudioModel._sample_audio_tokens override).
                 "stop_token_ids": [128009, 128012],
             },
+            # Audio-code history is folded into decode embeddings and cannot
+            # be reconstructed by replaying only the text-token prefix.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

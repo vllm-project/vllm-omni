@@ -38,14 +38,18 @@ class Yue2ModelRunnerOutput(OmniModelRunnerOutput):
 
 
 class Yue2ForCausalLM(Yue2Backbone):
+    # Request state is prepared outside replay; the captured AR forward only
+    # returns hidden states. Acoustic work runs later on its own stream.
+    mrv2_forward_returns_tensor = True
+
     def __init__(self, *, vllm_config, prefix=""):
         parallel = vllm_config.parallel_config
         if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
             raise ValueError("YuE2 requires TP=PP=1")
         if vllm_config.scheduler_config.async_scheduling:
             raise ValueError("YuE2 requires synchronous scheduling")
-        if vllm_config.model_config.use_v2_model_runner or vllm_config.speculative_config is not None:
-            raise ValueError("YuE2 requires model runner v1 without speculative decoding")
+        if vllm_config.speculative_config is not None:
+            raise ValueError("YuE2 does not support speculative decoding")
         if vllm_config.cache_config.enable_prefix_caching or vllm_config.kv_transfer_config is not None:
             raise ValueError("YuE2 requires APC and external KV connectors disabled")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -69,6 +73,11 @@ class Yue2ForCausalLM(Yue2Backbone):
             self._synthesis = BatchedSynthesisQueue(
                 self, *sizes, batch_wait_ms=batch_wait_ms, batch_max_tokens=batch_max_tokens
             )
+
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        from .model_state import Yue2ModelState
+
+        return Yue2ModelState(vllm_config, self, encoder_cache, device)
 
     def _hold_allowed(self, state):
         return False
@@ -190,10 +199,13 @@ class Yue2SchedulerBase(OmniARScheduler):
             output = OmniCFGARScheduler.schedule(self, throttle_prefills)
         else:
             output = OmniARScheduler.schedule(self, throttle_prefills)
-        acoustic = {rid for rid, r in self.requests.items() if getattr(r, "yue2_acoustic", False)}
+        acoustic = set()
         replaced = set()
-        for rid in output.num_scheduled_tokens:
-            request = self.requests[rid]
+        for rid, request in self.requests.items():
+            if getattr(request, "yue2_acoustic", False):
+                acoustic.add(rid)
+            # A queued semantic pair no longer owns its old ABC slot. Release
+            # it before the runner admits any new rows on this step.
             if getattr(request, "yue2_reset_phase", False):
                 replaced.add(rid)
                 request.yue2_reset_phase = False

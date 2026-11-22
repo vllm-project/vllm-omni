@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -57,10 +57,66 @@ SERVER_SHUTDOWN_TIMEOUT_S = 60
 # Auto-port OmniServer launches can lose the reserved TCP port between the
 # parent's probe close and the child bind under xdist; retry a few times.
 SERVER_PORT_IN_USE_RETRIES = 3
+SERVER_STDERR_DIAGNOSTIC_TAIL_LINES = 100
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
+
+
+class _ServerStderrEvidenceCapture:
+    """Latch the first stderr line containing one of the watched markers."""
+
+    def __init__(
+        self,
+        markers: Iterable[str],
+        *,
+        refresh: Callable[[], Iterable[str]] | None = None,
+    ) -> None:
+        self._markers = tuple(marker.casefold() for marker in markers if marker)
+        if not self._markers:
+            raise ValueError("stderr evidence capture requires at least one non-empty marker")
+        self._refresh = refresh
+        self._condition = threading.Condition()
+        self._line: str | None = None
+        self._closed = False
+
+    def _observe(self, line: str) -> None:
+        normalized = line.casefold()
+        if not any(marker in normalized for marker in self._markers):
+            return
+        with self._condition:
+            if self._closed:
+                return
+            if self._line is None:
+                self._line = line
+                self._condition.notify_all()
+
+    def _close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def wait(self, timeout: float = 2.0) -> str:
+        """Return the latched evidence line, waiting briefly for the reader."""
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            if self._refresh is not None:
+                for line in self._refresh():
+                    self._observe(line)
+                    if self._line is not None:
+                        break
+
+            with self._condition:
+                if self._line is not None or self._closed:
+                    return self._line or ""
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ""
+                # A stage-CLI subprocess writes to a file rather than the API
+                # server's stderr pipe. Poll its bounded incremental reader
+                # while retaining condition wakeups from the ordinary pipe.
+                self._condition.wait(timeout=min(remaining, 0.05))
 
 
 def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
@@ -183,6 +239,7 @@ class OmniServer:
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
         wait_for_device_memory: bool = True,
+        defer_stderr: bool = False,
     ) -> None:
         self.wait_for_device_memory = wait_for_device_memory
         if self.wait_for_device_memory:
@@ -195,14 +252,19 @@ class OmniServer:
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
+        self.defer_stderr = defer_stderr
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded ring buffer of child stderr for early-exit diagnostics.
-        self._server_error_lines: deque[str] = deque(maxlen=100)
+        # Keep a short diagnostic tail. Reliability tests that need durable
+        # evidence register a marker capture before triggering the fault.
+        self._server_error_lines: deque[str] = deque(maxlen=SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
+        self._server_stderr_capture_lock = threading.Lock()
+        self._server_stderr_captures: list[_ServerStderrEvidenceCapture] = []
         self._server_log_thread: threading.Thread | None = None
+        self._server_ready = False
 
     def _reserve_port(self) -> None:
         # bind(0)/close does not reserve a port across concurrent pytest workers.
@@ -263,6 +325,29 @@ class OmniServer:
             )
         )
 
+    def _record_server_stderr_line(self, line: str) -> None:
+        self._server_error_lines.append(line)
+        with self._server_stderr_capture_lock:
+            captures = tuple(self._server_stderr_captures)
+        for capture in captures:
+            capture._observe(line)
+
+    def _make_server_stderr_evidence_capture(self, markers: Iterable[str]) -> _ServerStderrEvidenceCapture:
+        return _ServerStderrEvidenceCapture(markers)
+
+    @contextmanager
+    def capture_stderr_evidence(self, markers: Iterable[str]) -> Generator[_ServerStderrEvidenceCapture, None, None]:
+        """Capture the first future stderr line matching any supplied marker."""
+        capture = self._make_server_stderr_evidence_capture(markers)
+        with self._server_stderr_capture_lock:
+            self._server_stderr_captures.append(capture)
+        try:
+            yield capture
+        finally:
+            with self._server_stderr_capture_lock:
+                self._server_stderr_captures.remove(capture)
+                capture._close()
+
     def _abandon_launch_attempt(self) -> None:
         """Kill a failed child and drop the port lock so a retry can rebind."""
         if self.proc is not None:
@@ -276,7 +361,8 @@ class OmniServer:
         if self._port_lock is not None:
             self._port_lock.release()
             self._port_lock = None
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = deque(maxlen=SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
+        self._server_ready = False
 
     def _start_server(self) -> None:
         attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
@@ -332,12 +418,16 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Inherit stdout; tee stderr to pytest and the startup diagnostic tail.
-        # Request failures after readiness also need the child traceback.
+        # Inherit stdout and retain a bounded stderr diagnostic tail. Reliability
+        # tests can capture durable marker evidence before later tracebacks
+        # displace it. Functional tests also tee each line immediately, while
+        # performance tests can opt into one teardown replay to avoid synchronous
+        # writes during measurement.
         # errors=replace keeps the reader alive on undecodable bytes so a full
         # pipe cannot hang serve.
-        self._server_error_lines = deque(maxlen=100)
+        self._server_error_lines = deque(maxlen=SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
         self._server_log_thread = None
+        self._server_ready = False
         self.proc = subprocess.Popen(
             cmd,
             env=env,
@@ -350,18 +440,18 @@ class OmniServer:
         stderr = getattr(self.proc, "stderr", None)
         # Test doubles may omit a pipe; skip capture rather than asserting.
         if stderr is not None:
-            error_lines = self._server_error_lines
 
             def _drain_stderr() -> None:
                 try:
                     for line in stderr:
-                        error_lines.append(line)
-                        try:
-                            sys.stderr.write(line)
-                            sys.stderr.flush()
-                        except (OSError, ValueError):
-                            # A closed capture must not stop draining the pipe.
-                            pass
+                        self._record_server_stderr_line(line)
+                        if not self.defer_stderr:
+                            try:
+                                sys.stderr.write(line)
+                                sys.stderr.flush()
+                            except (OSError, ValueError):
+                                # A closed capture must not stop draining the pipe.
+                                pass
                 except Exception:
                     pass
 
@@ -391,6 +481,7 @@ class OmniServer:
                             f"Server ready on {self.host}:{self.port} (OmniServer startup took {startup_s:.3f}s)",
                             flush=True,
                         )
+                    self._server_ready = True
                     return
             time.sleep(2)
         raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._server_error_tail()}")
@@ -540,6 +631,17 @@ class OmniServer:
             return ""
         return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
 
+    def _replay_server_error_tail(self) -> None:
+        tail = self._server_error_tail()
+        if not tail:
+            return
+        try:
+            sys.stderr.write(tail)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            # A closed pytest capture must not make teardown fail.
+            pass
+
     def _stop_stderr_reader(self) -> None:
         """Join the drain thread; close stderr only if the reader has stopped.
 
@@ -575,6 +677,9 @@ class OmniServer:
                 self._kill_process_tree(self.proc.pid)
         finally:
             self._stop_stderr_reader()
+            if self.defer_stderr and self._server_ready:
+                self._replay_server_error_tail()
+            self._server_ready = False
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
@@ -739,6 +844,40 @@ class OmniServerStageCli(OmniServer):
             if log_path and log_path.exists():
                 logs[stage_id] = log_path.read_text(encoding="utf-8", errors="replace")
         return logs
+
+    def _make_server_stderr_evidence_capture(self, markers: Iterable[str]) -> _ServerStderrEvidenceCapture:
+        """Also observe future stage-CLI output redirected to per-stage files."""
+        positions: dict[int, int] = {}
+        for stage_id, log_path in self._stage_log_paths.items():
+            try:
+                positions[stage_id] = log_path.stat().st_size
+            except OSError:
+                # A stage path created after registration contains only future
+                # output and will therefore start at byte zero below.
+                pass
+
+        def refresh_stage_logs() -> Iterable[str]:
+            for stage_id, log_path in tuple(self._stage_log_paths.items()):
+                offset = positions.get(stage_id, 0)
+                try:
+                    with log_path.open("rb") as stage_log:
+                        stage_log.seek(offset)
+                        while True:
+                            line_start = stage_log.tell()
+                            line = stage_log.readline()
+                            if not line:
+                                break
+                            if not line.endswith(b"\n"):
+                                # Do not consume a line while the subprocess is
+                                # still writing it; retry it on the next poll.
+                                positions[stage_id] = line_start
+                                break
+                            positions[stage_id] = stage_log.tell()
+                            yield line.decode("utf-8", errors="replace")
+                except OSError:
+                    continue
+
+        return _ServerStderrEvidenceCapture(markers, refresh=refresh_stage_logs)
 
     def _dump_stage_logs_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
         """Tail each stage's subprocess log back to stdout on teardown.
@@ -1083,7 +1222,8 @@ class OmniRunner(_EngineWorkerOwner):
         if is_tts_model and modalities == ["audio"]:
             tts_kw = mm_processor_kwargs or {}
             task_type = tts_kw.get("task_type", "CustomVoice")
-            speaker = tts_kw.get("speaker", "Vivian")
+            # Only CustomVoice needs a built-in speaker; for Base it names a stored voice.
+            speaker = tts_kw.get("speaker", "Vivian" if task_type == "CustomVoice" else None)
             language = tts_kw.get("language", "Auto")
             max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
             ref_audio = tts_kw.get("ref_audio", None)
@@ -1096,9 +1236,10 @@ class OmniRunner(_EngineWorkerOwner):
                     "task_type": [task_type],
                     "text": [text_str],
                     "language": [language],
-                    "speaker": [speaker],
                     "max_new_tokens": [max_new_tokens],
                 }
+                if speaker is not None:
+                    additional_information["speaker"] = [speaker]
                 if ref_audio is not None:
                     additional_information["ref_audio"] = [ref_audio]
                 if ref_text is not None:

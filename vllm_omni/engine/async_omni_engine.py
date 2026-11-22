@@ -951,7 +951,7 @@ class AsyncOmniEngine(OmniEngineBase):
 
     async def add_next_stage_input_async(self, msg: NextStageInputMessage) -> None:
         """Send a next stage input returned by an earlier request to the Orchestrator."""
-        self.request_queue.sync_q.put(msg)
+        await self._put_request_queue(msg)
 
     def add_streaming_update(
         self,
