@@ -116,7 +116,13 @@ graphs by default), and gives stage 1 a 200ms maximum admission window
 queues before starting Stage 1, so lone `c=1` requests pay that settle cost).
 Requests in the same Euler schedule and target bucket share a DiT/VAE pass;
 seeds, reference clips, target lengths, and output ordering remain
-request-local. `AuKPipeline` executes one wave at a time without cooperative
+request-local. DiT loop graphs snap wave sizes up to a power-of-two batch ladder
+(`1, 2, 4, 8, 16, 32, 64, 128`) and reuse warmed graphs up to 2× the active wave
+size; off-ladder waves just above a ladder step can lose efficiency from padding
+(for example, Base NFE=4 at `B=65` pads to the `B=128` DiT graph and measured
+`0.94×` vs serial), so operators should target on-ladder batch sizes or cap
+`max_num_seqs` to the desired ladder step (such as `64`) when serving Base
+workloads at low NFE. `AuKPipeline` executes one wave at a time without cooperative
 mid-wave cancellation (`supports_request_cancellation` is False), so client
 aborts take effect at wave boundaries (bounded by the active wave forward
 duration before aborted replies are dropped without affecting surviving peers). Larger graph buckets cost startup time
