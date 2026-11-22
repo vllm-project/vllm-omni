@@ -1114,7 +1114,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Keep OMNI compatibility args wired while delegating rendering
         # to the upstream async renderer pipeline.
-        default_template_kwargs = merge_kwargs(
+        resolved_template_kwargs = merge_kwargs(
             default_template_kwargs,
             dict(
                 tools=tool_dicts,
@@ -1125,6 +1125,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenize=isinstance(renderer.tokenizer, MistralTokenizer),
             ),
         )
+        # HF templates such as MiMo-Audio's use output modalities to select
+        # model task tokens. Inject the value after merging request kwargs so
+        # clients cannot select a task that disagrees with the public request.
+        # Mistral's renderer does not accept arbitrary template variables.
+        if not isinstance(renderer.tokenizer, MistralTokenizer):
+            resolved_template_kwargs["output_modalities"] = getattr(request, "modalities", None)
 
         tok_params = request.build_tok_params(self.model_config)
         mm_config = self.model_config.multimodal_config
@@ -1132,7 +1138,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             default_template,
             default_template_content_format,
         ).with_defaults(
-            default_template_kwargs,
+            resolved_template_kwargs,
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )

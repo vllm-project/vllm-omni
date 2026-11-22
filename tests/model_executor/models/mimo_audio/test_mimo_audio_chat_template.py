@@ -31,6 +31,61 @@ def test_no_implicit_system_message(content):
     assert rendered == f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n<|sostm|>"
 
 
+def test_text_only_output_uses_reference_dialogue_prompt():
+    rendered = _render(
+        [{"role": "user", "content": "What is the capital of China?"}],
+        output_modalities=["text"],
+    )
+
+    assert rendered == (
+        "<|im_start|>user\nWhat is the capital of China?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
+    )
+
+
+def test_text_only_output_uses_plain_assistant_history():
+    rendered = _render(
+        [
+            {"role": "user", "content": "What is the capital of China?"},
+            {"role": "assistant", "content": "Beijing."},
+            {"role": "user", "content": "Name one landmark."},
+        ],
+        output_modalities=["text"],
+    )
+
+    assert "<|im_start|>assistant\nBeijing.<|im_end|>\n" in rendered
+    assert "<|sostm|>Beijing." not in rendered
+    assert rendered.endswith("<|im_start|>assistant\n<think>\n\n</think>\n")
+
+
+@pytest.mark.parametrize(
+    "output_modalities",
+    [
+        ["audio"],
+        ["text", "audio"],
+    ],
+)
+def test_audio_output_keeps_speech_prompt(output_modalities):
+    rendered = _render(
+        [{"role": "user", "content": "Please read this aloud."}],
+        output_modalities=output_modalities,
+    )
+
+    assert rendered.endswith("<|im_start|>assistant\n<|sostm|>")
+
+
+def test_audio_output_keeps_speech_assistant_history():
+    rendered = _render(
+        [
+            {"role": "user", "content": "Please say hello."},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "user", "content": "Please repeat it."},
+        ],
+        output_modalities=["text", "audio"],
+    )
+
+    assert "<|im_start|>assistant\n<|sostm|>Hello.<|eot|><|eostm|><|im_end|>\n" in rendered
+
+
 def test_explicit_system_message_is_preserved():
     rendered = _render(
         [
