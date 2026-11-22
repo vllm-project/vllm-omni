@@ -60,6 +60,10 @@ def _models(variants: list[dict[str, object]]) -> list[str]:
     return sorted({str(variant["model_id"]) for variant in variants})
 
 
+def _counted(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
 def render_device(device: Device, variants: list[dict[str, object]]) -> list[str]:
     lines = [f"- {device.label}"]
     fitting = fitting_variants(device, variants)
@@ -74,7 +78,9 @@ def render_device(device: Device, variants: list[dict[str, object]]) -> list[str
     shown = ", ".join(f"`{model}`" for model in models[:_MAX_SHOWN_MODELS])
     if len(models) > _MAX_SHOWN_MODELS:
         shown += f", and {len(models) - _MAX_SHOWN_MODELS} more"
-    lines.append(f"  {len(fitting)} documented variants across {len(models)} models fit: {shown}")
+    lines.append(
+        f"  {_counted(len(fitting), 'documented variant')} across {_counted(len(models), 'model')} fit: {shown}"
+    )
     return lines
 
 

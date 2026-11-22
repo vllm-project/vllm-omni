@@ -61,6 +61,13 @@ def test_report_names_the_fitting_models():
     assert "acme/big-video" not in report
 
 
+def test_report_uses_singular_counts():
+    report = doctor.render_report([_device(8 * 1024)], VARIANTS)
+
+    assert "1 documented variant across 1 model fit" in report
+    assert "`acme/tiny-tts`" in report
+
+
 def test_report_caps_the_model_list():
     variants = [
         {"model_id": f"acme/model-{index:02d}", "variant": "default", "minimum_gib": 8, "precision": "bf16"}
