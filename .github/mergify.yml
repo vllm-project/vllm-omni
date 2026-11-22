@@ -107,7 +107,7 @@ pull_request_rules:
   actions:
     label:
       add:
-        - new-model
+        - "new model"
 
 - name: label-npu
   description: Automatically apply npu label
