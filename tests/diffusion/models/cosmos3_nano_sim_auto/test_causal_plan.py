@@ -5,7 +5,7 @@
 The oracle below re-derives the reference replay rules per token in plain
 Python (independently of the vectorised run-level predicate), and the
 hand-written expectations encode specific consequences of those rules read
-from the imaginaire4 predicate and its maskless replay partitions: condition
+from the reference predicate and its maskless replay partitions: condition
 frames read only themselves, their own controls and captions; controls never
 read current targets and read clean history of their own view only (the
 maskless cross-view partition excludes controls); cross-view reads are

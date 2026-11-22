@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Fixed-step SDE/ODE sampler shared by the distilled causal Cosmos3 students.
 
-The imaginaire4 reference runs a few-step student on a flat ``[B, N]`` FP32
+The reference sampler runs a few-step student on a flat ``[B, N]`` FP32
 state: ``x0 = x - sigma * v`` then, for SDE, ``x = (1 - sigma') * x0 + sigma' *
 eps`` where ``eps`` is drawn from a generator reseeded *per step* with
 ``seed + sample_index * 1_000_003 + (step + 1) * 9_176``. The initial noise uses

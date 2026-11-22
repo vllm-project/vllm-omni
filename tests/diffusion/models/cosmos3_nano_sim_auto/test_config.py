@@ -14,7 +14,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_auto.config import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-# The full MADS rig in physical-ID order, as the imaginaire4 exporter writes it.
+# The full MADS rig in physical-ID order.
 _CAMERAS = [
     "camera_front_wide_120fov",
     "camera_cross_right_120fov",

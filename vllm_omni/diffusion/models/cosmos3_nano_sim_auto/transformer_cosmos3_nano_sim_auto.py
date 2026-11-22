@@ -209,7 +209,7 @@ class Cosmos3NanoSimAutoTransformer(Cosmos3VFMTransformer):
         if self.rig_view_embed is None and any(name.endswith("rig_view_embed.weight") for name in loaded):
             raise ValueError(
                 "Cosmos3-Nano-Sim-Auto checkpoint carries rig_view_embed.weight but the artifact declares no "
-                "rig_view_embedding; re-export the checkpoint with the current imaginaire4 exporter."
+                "rig_view_embedding. Use a checkpoint with matching rig_view_embedding metadata."
             )
         required = {name for name, _ in self.named_parameters()}
         missing = sorted(f"transformer.{name}" for name in required - loaded)

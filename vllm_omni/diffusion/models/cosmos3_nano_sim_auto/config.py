@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict schema-v1 artifact contract for Cosmos3-Nano-Sim-Auto.
 
-The imaginaire4 exporter (``export_model.py --cosmos3-nano-sim-auto`` followed
-by ``convert_model_to_diffusers.py``) embeds one ``cosmos3_nano_sim_auto``
-object in ``transformer/config.json``. It records everything the rolling
-causal multiview student needs at inference that is not an architecture field:
+The checkpoint stores a ``cosmos3_nano_sim_auto`` manifest in
+``transformer/config.json``. It records the rolling causal multiview student's
+inference settings beyond the architecture fields:
 the sensor clock and chunk partition, the KV ring, the replay visibility
 policy, the segmented prompt policy, mRoPE constants, the fixed-step student
 schedule, the optional LiDAR tokenizer contract and the optional physical rig
@@ -128,7 +127,7 @@ def _exact_fields(
     if missing or unknown:
         raise ValueError(
             f"Cosmos3-Nano-Sim-Auto artifact {name} field set mismatch: missing={missing}, unknown={unknown}. "
-            "Re-export the checkpoint with the matching imaginaire4 exporter."
+            "Use a checkpoint with a compatible manifest."
         )
     return payload
 
@@ -412,7 +411,7 @@ class Cosmos3NanoSimAutoManifest:
         if artifact is None:
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Auto requires transformer/config.json['{COSMOS3_NANO_SIM_AUTO_ARTIFACT_KEY}']. "
-                "Export the checkpoint through both imaginaire4 stages with --cosmos3-nano-sim-auto."
+                "Use a Sim-Auto checkpoint that includes this manifest."
             )
         if transformer_config.get("backbone_type") != "cosmos3_multiview":
             raise ValueError(
