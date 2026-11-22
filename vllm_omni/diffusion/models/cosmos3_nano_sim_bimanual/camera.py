@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from pathlib import Path
 
 import numpy as np
+import regex as re
 
 _COMMAND = re.compile(r"([a-z]+)-([1-9][0-9]*)(?:-([0-9]+(?:\.[0-9]+)?))?\Z")
 _TRANSLATIONS = {"w": (2, 1), "s": (2, -1), "a": (0, -1), "d": (0, 1), "u": (1, -1), "n": (1, 1)}

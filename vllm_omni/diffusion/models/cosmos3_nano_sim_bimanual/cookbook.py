@@ -41,10 +41,10 @@ def resolve_asset(value: str, *, base_dir: Path, cache_dir: Path) -> Path:
     if url.scheme in ("https", "http"):
         parts = url.path.strip("/").split("/")
         if url.scheme == "https" and url.netloc == "huggingface.co" and len(parts) >= 5 and parts[2] == "resolve":
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
             return Path(
-                hf_hub_download(
+                hf_api().hf_hub_download(
                     repo_id="/".join(parts[:2]),
                     revision=urllib.parse.unquote(parts[3]),
                     filename=urllib.parse.unquote("/".join(parts[4:])),
