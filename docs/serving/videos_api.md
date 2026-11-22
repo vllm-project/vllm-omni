@@ -453,10 +453,11 @@ curl -s http://localhost:8091/v1/videos/sync \
   output canvas and shortened to `5 + 17k` frames (1-4 frames keep the first
   frame); the result must fit in `[start, N)`. Audio starts at the same frame
   and is cropped to the remaining timeline.
-- Guided requests need base H3 weights, `quality=lossless`, and the media
-  encoder in the diffusion stage. Cache acceleration, FastH3, LoRA/Turbo,
-  distilled schedules, continuation, latent refine/upscale, latent-mask editing,
-  and `audio_mode=lock_source` are rejected. With first/last frames, the FL2VA
+- Guided requests need base H3 weights or the FastH3 Omni checkpoint (Ref2VA,
+  on its pinned eight-step schedule), `quality=lossless`, and the media encoder
+  in the diffusion stage. Cache acceleration, FastH3 Preview/V2, LoRA/Turbo,
+  other distilled schedules, continuation, latent refine/upscale, latent-mask
+  editing, and `audio_mode=lock_source` are rejected. With first/last frames, the FL2VA
   keyframes are packed as image guides; with references, references are scaled
   down to the output area.
 

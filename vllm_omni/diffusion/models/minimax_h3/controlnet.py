@@ -269,9 +269,14 @@ class MiniMaxH3ControlNet(nn.Module):
         hidden: torch.Tensor,
         control_rows: torch.Tensor,
         video_indices: torch.Tensor,
-        audio_indices: torch.Tensor,
+        hint_free_indices: torch.Tensor,
         **block_kwargs: Any,
     ) -> dict[int, torch.Tensor]:
+        """Return per-block hints for the packed stream.
+
+        ``video_indices`` are the target-canvas rows the control rows describe.
+        ``hint_free_indices`` (audio, plus any clean condition video rows) get no hint.
+        """
         expected = (video_indices.numel(), 49 * math.prod(self.arch.patch_size))
         if tuple(control_rows.shape) != expected:
             raise ValueError(f"control_rows must be {expected}, got {tuple(control_rows.shape)}")
@@ -284,7 +289,7 @@ class MiniMaxH3ControlNet(nn.Module):
             stream = block(stream, **block_kwargs)
             skip, _ = block.after_proj(stream)
             # Official control_apply_audio=False retains text skips too.
-            hints[place] = skip.index_fill(0, audio_indices, 0)
+            hints[place] = skip.index_fill(0, hint_free_indices, 0)
         return hints
 
     def checkpoint_shapes(self) -> dict[str, tuple[int, ...]]:

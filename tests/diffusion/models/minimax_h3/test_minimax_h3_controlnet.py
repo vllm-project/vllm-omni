@@ -767,3 +767,107 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     assert same_canvas["control_rows"] is rows
     assert same_canvas["latent_upscale"] is target
     assert same_canvas["latent_refine"] is refine
+
+
+def test_control_hints_target_rows_and_skip_reference_rows(cpu_layers):
+    """Ref2VA packs clean reference rows among the video rows; control describes only the target."""
+    arch = tiny_arch()
+    config = SimpleNamespace(
+        tf_model_config=vars(arch),
+        parallel_config=SimpleNamespace(ulysses_degree=1, ring_degree=1),
+        controlnet_model_path=None,
+    )
+    model = h3.MiniMaxH3DiTModel(config)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(0, 0.1)
+    model.controlnet = MiniMaxH3ControlNet(arch, (0, 1))
+    model.controlnet.load_weights(original_weights(arch).items())
+    for module in model.modules():
+        if hasattr(module, "forward_native"):
+            module._forward_method = module.forward_native
+    # Packed rows: text 0, target video 1 and 3, audio 2, reference video 4, text 5.
+    kwargs = {
+        "x": torch.randn(1, 6, 96),
+        "audio_x": torch.randn(1, 6, 32),
+        "img_position_ids": torch.zeros(1, 6, 3, dtype=torch.long),
+        "unique_timesteps": torch.tensor([0.2, 1.0]),
+        "inverse_indices": torch.tensor([0, 0, 0, 0, 1, 0]),
+        "update_mask": torch.tensor([True, True, False]),
+        "token_tags": torch.tensor([1, 0, 2, 0, 0, 1]),
+        "prompt_embeds": torch.randn(2, 8),
+        "img_pos_info": {"position_ids": torch.tensor([1, 3, 4])},
+        "img_pos_for_infer_output_info": {"position_ids": torch.tensor([1, 3, 4])},
+        "audio_pos_info": {"position_ids": torch.tensor([2])},
+        "text_pos_info": {"position_ids": torch.tensor([0, 5])},
+        "packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 6], dtype=torch.int32), "max_seqlen_q": 6},
+        "refiner_packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 2], dtype=torch.int32), "max_seqlen_q": 2},
+    }
+    calls = []
+    original_forward = model.controlnet.forward
+
+    def spy(hidden, control_rows, video_indices, hint_free_indices, **block_kwargs):
+        hints = original_forward(hidden, control_rows, video_indices, hint_free_indices, **block_kwargs)
+        calls.append((video_indices.clone(), hint_free_indices.clone(), hints))
+        return hints
+
+    rows = torch.randn(2, 196)  # one row per target video token, none for the reference
+    with patch.object(model.controlnet, "forward", side_effect=spy):
+        controlled = model(**kwargs, control_rows=rows, control_context_scale=1)
+    ((video_indices, hint_free_indices, hints),) = calls
+    assert video_indices.tolist() == [1, 3]
+    assert sorted(hint_free_indices.tolist()) == [2, 4]
+    for hint in hints.values():
+        assert torch.count_nonzero(hint[[2, 4]]) == 0
+        assert torch.count_nonzero(hint[[1, 3]]) > 0
+    assert not torch.equal(model(**kwargs)[0], controlled[0])
+    # A full target set keeps the original T2VA behavior: every video row is described.
+    with pytest.raises(ValueError, match=r"control_rows must be \(3, 196\)"):
+        model(**{**kwargs, "update_mask": torch.ones(3, dtype=torch.bool)}, control_rows=rows)
+
+
+@pytest.mark.parametrize("omni", [True, False], ids=["fasth3-omni", "fasth3-v2"])
+def test_control_partition_guard_for_fasth3_checkpoints(control_startup, monkeypatch, tmp_path, omni):
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
+        FastH3CheckpointSpec,
+        FastH3OmniCheckpointSpec,
+    )
+
+    pipeline_module, config = control_startup
+    (tmp_path / "fastvideo_inference.json").write_text("{}")
+    config.model = "/unused/FastH3"
+    config.task_type = "auto"
+    spec = FastH3OmniCheckpointSpec() if omni else FastH3CheckpointSpec()
+    monkeypatch.setattr(pipeline_module, "is_minimax_h3_modular", lambda *args: True)
+    monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: spec.partition)
+    monkeypatch.setattr(pipeline_module, "_resolve_minimax_h3_model_root", lambda *args, **kwargs: tmp_path)
+    monkeypatch.setattr(FastH3CheckpointSpec, "from_metadata", classmethod(lambda cls, metadata: spec))
+    monkeypatch.setattr(
+        type(spec),
+        "check_serving_contract",
+        lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("guard accepted")),
+    )
+    if omni:
+        with pytest.raises(RuntimeError, match="guard accepted"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+    else:
+        # FastH3 V2 serves FL2VA, which the control branch already supports.
+        assert spec.partition == "fl2va"
+        with pytest.raises(RuntimeError, match="guard accepted"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+
+
+def test_control_task_follows_the_checkpoint():
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
+        FastH3CheckpointSpec,
+        FastH3OmniCheckpointSpec,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    assert pipeline._control_task() == "t2va"
+    pipeline._fasth3_checkpoint = FastH3CheckpointSpec()
+    assert pipeline._control_task() == "t2va"
+    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    assert pipeline._control_task() == "ref2va"

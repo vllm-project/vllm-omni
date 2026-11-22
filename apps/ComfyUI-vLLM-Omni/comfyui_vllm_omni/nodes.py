@@ -47,8 +47,14 @@ FASTH3_FPS = 24
 # spec has to be named outright rather than recovered from that alias.
 FASTH3_SPEC_MODEL = "MiniMax-H3"
 _FASTH3_GUIDES_ERROR = (
-    "timeline_guides require base MiniMax-H3 weights, not FastH3; disconnect fast_h3 or timeline_guides."
+    "timeline_guides require base MiniMax-H3 weights or a FastH3 Omni deployment; "
+    "disconnect fast_h3 or timeline_guides, or select the Omni variant."
 )
+
+
+def _fast_h3_rejects_guides(fast_h3: dict | None, timeline_guides: list[dict] | None) -> bool:
+    """FastH3 Omni accepts timeline guides; FastH3 Preview (a fused T2VA student) does not."""
+    return fast_h3 is not None and timeline_guides is not None and fast_h3.get("variant", "Preview") != "Omni"
 
 
 def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:
@@ -262,7 +268,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return "Provide either frame or first_frame/last_frame, not both."
         if references is not None and (first_frame is not None or last_frame is not None):
             return "Provide either first_frame/last_frame or references, not both."
-        if fast_h3 is not None and timeline_guides is not None:
+        if _fast_h3_rejects_guides(fast_h3, timeline_guides):
             return _FASTH3_GUIDES_ERROR
         if (
             fast_h3 is not None
@@ -316,7 +322,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         spec_model = model
 
         if fast_h3 is not None:
-            if timeline_guides is not None:
+            if _fast_h3_rejects_guides(fast_h3, timeline_guides):
                 raise ValueError(_FASTH3_GUIDES_ERROR)
             if fast_h3.get("variant", "Preview") == "Preview" and any(
                 value is not None for value in (frame, first_frame, last_frame, references)

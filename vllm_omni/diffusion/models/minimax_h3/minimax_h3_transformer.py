@@ -1588,11 +1588,19 @@ class MiniMaxH3DiTModel(nn.Module):
             # the final head consume the same embedding. Keep the baseline FP32
             # path unchanged when control is absent or has zero strength.
             t_emb = t_emb.to(hidden.dtype)
+            # Control rows describe the target canvas only. Clean condition rows (Ref2VA
+            # references, guides) keep their hidden state and, like audio, get no hint.
+            control_video_pos = img_pos.to(device)
+            hint_free_pos = audio_pos.to(device)
+            target_rows = update_mask.view(-1).to(device=device, dtype=torch.bool)
+            if not bool(target_rows.all()):
+                hint_free_pos = torch.cat((hint_free_pos, control_video_pos[~target_rows]))
+                control_video_pos = control_video_pos[target_rows]
             hints = self.controlnet(
                 hidden,
                 control_rows,
-                img_pos.to(device),
-                audio_pos.to(device),
+                control_video_pos,
+                hint_free_pos,
                 t_emb=t_emb,
                 combined_indices=block_combined,
                 rope_table=block_rope,

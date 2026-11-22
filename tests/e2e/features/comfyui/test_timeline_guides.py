@@ -699,15 +699,26 @@ async def test_generate_video_node_forwards_guides(api_calls):
     assert _value(api_calls, "num_frames") == "124"
 
 
-@pytest.mark.parametrize("variant", [None, "Preview", "Omni"])
+async def test_generate_video_node_forwards_guides_to_fast_h3_omni(api_calls):
+    fast_h3 = {"url": "http://localhost/v1", "model": H3, "variant": "Omni"}
+    chain = _chain((36, {"image": _image()}))
+    assert VLLMOmniGenerateVideo.VALIDATE_INPUTS(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain) is True
+    (result,) = await VLLMOmniGenerateVideo().generate(
+        **_node_inputs(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain)
+    )
+    assert result == b"generated-video"
+    assert json.loads(_value(api_calls, "timeline_guides")) == [{"frame_index": 36, "image": {"upload_index": 0}}]
+
+
+@pytest.mark.parametrize("variant", [None, "Preview"])
 async def test_generate_video_node_rejects_fast_h3_guides_before_upload(api_calls, encoders, variant):
     fast_h3 = {"url": "http://localhost/v1", "model": H3}
     if variant is not None:
         fast_h3["variant"] = variant
     chain = _chain((36, {"image": _image()}))
     validation = VLLMOmniGenerateVideo.VALIDATE_INPUTS(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain)
-    assert isinstance(validation, str) and "not FastH3" in validation
-    with pytest.raises(ValueError, match="not FastH3"):
+    assert isinstance(validation, str) and "FastH3 Omni deployment" in validation
+    with pytest.raises(ValueError, match="FastH3 Omni deployment"):
         await VLLMOmniGenerateVideo().generate(
             **_node_inputs(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain)
         )
