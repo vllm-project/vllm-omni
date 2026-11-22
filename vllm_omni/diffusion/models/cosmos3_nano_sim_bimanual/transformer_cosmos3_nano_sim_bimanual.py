@@ -213,8 +213,11 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         return {"use_und_k_norm_for_gen": bool(self.use_und_k_norm_for_gen)}
 
     def validate_loaded_weights(self, loaded: set[str]) -> None:
-        required = {f"transformer.{name}" for name, _ in self.named_parameters()}
-        missing = sorted(required - loaded)
+        # Pipeline loading reports ``transformer.``-prefixed names; the pre-sharded
+        # HSDP and layerwise-offload loaders pass names relative to this module.
+        loaded = {name.removeprefix("transformer.") for name in loaded}
+        required = {name for name, _ in self.named_parameters()}
+        missing = sorted(f"transformer.{name}" for name in required - loaded)
         if missing:
             preview = ", ".join(missing[:12])
             suffix = "" if len(missing) <= 12 else f" (and {len(missing) - 12} more)"
