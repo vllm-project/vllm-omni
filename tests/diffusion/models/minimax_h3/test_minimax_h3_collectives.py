@@ -6,6 +6,7 @@ import time
 from datetime import timedelta
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -35,9 +36,13 @@ def _collective_worker(rank, rendezvous, backend):
 
         class VisualCodec:
             fail = False
+            device_prep = True
 
             def is_distributed_enabled(self):
                 return True
+
+            def prepares_video_on_device(self):
+                return self.device_prep
 
             def collective(self):
                 value = torch.ones(1, device=device)
@@ -52,6 +57,7 @@ def _collective_worker(rank, rendezvous, backend):
             def encode_video(self, frames):
                 self.collective()
                 assert frames.shape == (4, 32, 32, 3)
+                self.received = frames
                 if self.fail and rank == 1:
                     raise ValueError("codec failed on rank 1")
                 return torch.full((1, 96), 2.0), (1, 2, 2)
@@ -117,6 +123,8 @@ def _collective_worker(rank, rendezvous, backend):
         )
         torch.testing.assert_close(conditioning.audio_condition.cpu(), torch.full((160, 32), 3.0))
         assert conditioning.audio_condition_lengths == (80,)
+        on_device = rank == 1 and backend == "nccl"
+        assert isinstance(model.video_vae.received, torch.Tensor if on_device else np.ndarray)
 
         model.video_vae.fail = True
         with pytest.raises(OmniClientError, match="codec failed on rank 1"):
@@ -125,6 +133,9 @@ def _collective_worker(rank, rendezvous, backend):
             model._prepare_local_conditioning({"prompt": ""}, sampling)
         model.video_vae.fail = False
         assert model._encode_local_media(media).visual_condition_shapes == ((1, 2, 2), (1, 2, 2))
+        model.video_vae.device_prep = False
+        model._encode_local_media(media)
+        assert isinstance(model.video_vae.received, np.ndarray)
     finally:
         dist.destroy_process_group()
 

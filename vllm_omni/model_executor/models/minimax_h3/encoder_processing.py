@@ -1032,7 +1032,10 @@ def encode_media(
                 visual_rows.append(video_vae.encode_image(image))
                 visual_shapes.append((1, image.height // 16, image.width // 16))
             for value in media.videos:
-                frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
+                if value.device.type != "cpu" and value.dtype == torch.uint8:
+                    frames = value.detach().contiguous()
+                else:
+                    frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
                 rows, shape = video_vae.encode_video(frames)
                 visual_rows.append(rows)
                 visual_shapes.append(tuple(int(item) for item in shape))

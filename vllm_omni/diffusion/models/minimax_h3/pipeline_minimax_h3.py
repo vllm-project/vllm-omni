@@ -2965,11 +2965,14 @@ class MiniMaxH3Pipeline(
         header = [(media.to_metadata(), [value.dtype for value in tensors])] if media is not None else [None]
         dist.broadcast_object_list(header, src=0, group=group)
         metadata, dtypes = header[0]
+        on_device = range(0)
+        if rank != 0 and metadata["video_count"] and self.video_vae.prepares_video_on_device():
+            on_device = range(metadata["image_count"], metadata["image_count"] + metadata["video_count"])
         received = []
         for index, dtype in enumerate(dtypes):
             value = _broadcast_tensor(tensors[index] if rank == 0 else None, dtype=dtype, device=self.device)
             if rank != 0:
-                received.append(value.cpu())
+                received.append(value if index in on_device and dtype == torch.uint8 else value.cpu())
             del value
         if rank == 0:
             assert media is not None

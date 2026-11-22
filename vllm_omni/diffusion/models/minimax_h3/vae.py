@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ClassVar
@@ -80,6 +80,16 @@ def _minimax_h3_keyframe_encode_context(
 def _legacy_encode_prep_enabled() -> bool:
     value = os.environ.get(_VAE_ENCODE_LEGACY_PREP_ENV, "0")
     return value.strip().lower() not in ("", "0", "false", "off")
+
+
+def _is_device_uint8_video(frames: object) -> bool:
+    return (
+        isinstance(frames, torch.Tensor)
+        and frames.device.type != "cpu"
+        and frames.dtype == torch.uint8
+        and frames.ndim == 4
+        and frames.shape[-1] == 3
+    )
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -1007,22 +1017,19 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     def _stream_video_prep_metadata(
         self,
-        frames: np.ndarray,
-    ) -> tuple[int, int, Any, Any] | None:
+        frames: np.ndarray | torch.Tensor,
+    ) -> tuple[int, int, Sequence[float], Sequence[float]] | None:
         """Return the shared stream-prep clip, pad, mean, and std metadata."""
-        if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[-1] != 3:
+        uint8 = torch.uint8 if isinstance(frames, torch.Tensor) else np.uint8
+        if frames.dtype != uint8 or frames.ndim != 4 or frames.shape[-1] != 3:
             return None
         if int(frames.shape[0]) == 0:
             return None
         model = self.model
-        clip_length = getattr(model, "clip_length", None)
-        transform = getattr(getattr(model, "processor", None), "transform", None)
-        mean = getattr(transform, "mean", None)
-        std = getattr(transform, "std", None)
-        if not isinstance(clip_length, int) or clip_length <= 0:
+        contract = self._stream_video_prep_contract()
+        if contract is None:
             return None
-        if mean is None or std is None or len(mean) != 3 or len(std) != 3:
-            return None
+        clip_length, mean, std = contract
         # Mirror the checkpoint's temporal alignment so the device-side
         # ``get_suitable_video_length`` trim is a no-op and the
         # ``encode_temporal`` padding ``torch.cat`` never triggers. A
@@ -1052,6 +1059,21 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 pad = max(max(chunks, 1) * clip_length + tail - num_frames, 0)
         return clip_length, pad, mean, std
 
+    def _stream_video_prep_contract(self) -> tuple[int, Sequence[float], Sequence[float]] | None:
+        model = self.model
+        clip_length = getattr(model, "clip_length", None)
+        transform = getattr(getattr(model, "processor", None), "transform", None)
+        mean = getattr(transform, "mean", None)
+        std = getattr(transform, "std", None)
+        if not isinstance(clip_length, int) or clip_length <= 0:
+            return None
+        if mean is None or std is None or len(mean) != 3 or len(std) != 3:
+            return None
+        return clip_length, mean, std
+
+    def prepares_video_on_device(self) -> bool:
+        return not _legacy_encode_prep_enabled() and self._stream_video_prep_contract() is not None
+
     def predict_video_latent_shape(self, frames: np.ndarray) -> tuple[int, int, int]:
         """Predict the checkpoint latent shape for its reference-video input."""
         effective_frames = int(frames.shape[0])
@@ -1068,7 +1090,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     def _stream_prepare_video_tensor(
         self,
-        frames: np.ndarray,
+        frames: np.ndarray | torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor | None:
         """Upload a uint8 ``(T, H, W, 3)`` video as one normalized FP32 tensor.
@@ -1091,10 +1113,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if prep_metadata is None:
             return None
         clip_length, pad, mean, std = prep_metadata
-        num_frames = int(frames.shape[0])
-        if pad:
+        source_frames = int(frames.shape[0])
+        num_frames = source_frames + pad
+        if isinstance(frames, torch.Tensor):
+            frames = frames.to(device=device)
+        elif pad:
             frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)])
-            num_frames += pad
         mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
         std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
         height, width = int(frames.shape[1]), int(frames.shape[2])
@@ -1110,7 +1134,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             # traffic than the legacy FP32 upload) before the in-place
             # normalization chain. permute lands on the checkpoint's
             # (3, T, H, W) layout directly.
-            chunk = torch.from_numpy(frames[start:end]).to(device=device)
+            chunk = frames[start:end]
+            if isinstance(chunk, np.ndarray):
+                chunk = torch.from_numpy(chunk).to(device=device)
+            elif end > source_frames:
+                chunk = torch.cat([chunk, frames[-1:].expand(end - max(start, source_frames), -1, -1, -1)])
             chunk = chunk.permute(3, 0, 1, 2).to(torch.float32).div_(255.0)
             chunk = chunk.sub_(mean_t).div_(std_t)
             out[:, start:end].copy_(chunk)
@@ -1146,13 +1174,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 prepared = None
-                if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
+                resident = _is_device_uint8_video(frames)
+                if (resident or isinstance(frames, np.ndarray)) and not _legacy_encode_prep_enabled():
                     prepared = self._stream_prepare_video_tensor(frames, parameter.device)
                 if prepared is not None:
                     # Tensor inputs already carry the checkpoint's expected
                     # (3, T, H, W) normalized-FP32 contract, so encode_videos
                     # skips its own convert/transform/pad whole-video copies.
                     frames = [prepared]
+                elif resident:
+                    frames = frames.cpu().numpy()
                 latent = self.model.encode_videos(
                     frames,
                     use_fp16_latent=True,
