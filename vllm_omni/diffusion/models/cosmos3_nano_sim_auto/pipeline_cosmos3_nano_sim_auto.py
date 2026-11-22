@@ -401,7 +401,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 self._get_sp_param(sp, "frame_rate", None),
                 self._get_sp_param(sp, "fps", None),
                 self.manifest.default_fps,
-            )
+            ),
+            default_fps=self.manifest.default_fps,
         )
 
     def _maskless_kernel_name(self) -> str:
