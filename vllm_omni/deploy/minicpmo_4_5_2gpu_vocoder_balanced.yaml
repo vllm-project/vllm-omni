@@ -1,0 +1,10 @@
+base_config: minicpmo_4_5_2gpu_vocoder_replicas.yaml
+
+platforms:
+  npu:
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          secondary_vocoder_micro_batch_size: 4
+          generation_min_batch_size: 4
+          generation_max_wait_ms: 25

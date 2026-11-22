@@ -168,6 +168,25 @@ the P95 inter-chunk gap from 1.61 s to 0.98 s. Throughput moved from 8.22 to
 8.00 requests/s and P95 audio TTFP increased from 5.90 s to 9.02 s. The C64
 automatic-routing trial exceeded the secondary device's available memory.
 
+For the balanced two-vocoder profile on two 64 GiB Ascend 910B3 devices, use
+the following launch settings. The profile keeps the five CFM steps and uses
+CFM micro-batches of eight and four. Code2Wav may wait up to 25 ms to form a
+four-request generation batch. New Talker requests are split equally across
+the two replicas. Code2Wav selects a replica based on weighted active and
+reserved requests, with at most 16 secondary bindings from this policy.
+Subsequent chunks remain on the selected replica.
+
+```bash
+unset MAX_NUM_SEQS
+export DEPLOY_CONFIG="$PWD/vllm_omni/deploy/minicpmo_4_5_2gpu_vocoder_balanced.yaml"
+export TALKER_ROUTE=half TALKER_BATCH_MODE=active_fixed_wide
+export VOCODER_ROUTE=adaptive_secondary
+bash recipes/OpenBMB/serve_minicpmo_ascend.sh
+```
+
+The 16-request Talker graph is qualified before active replay. Requests
+outside its eligible short-context shape use the existing decode paths.
+
 The single-vocoder throughput profile uses the same primary settings and
 retains both Talker replicas. Both profiles inherit five-step CFM and the same
 codec chunk sizes.
