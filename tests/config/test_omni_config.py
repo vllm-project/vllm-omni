@@ -172,6 +172,31 @@ def test_nested_stage_override_deep_merges_structured_model_config() -> None:
     assert model_config["policy_server_config"]["action_space"] == "joint_position"
 
 
+def test_global_model_config_override_deep_merges_structured_model_config() -> None:
+    # --no-guardrails emits a global (not stage-scoped) model_config override.
+    config = _from_pipeline_key(
+        "cosmos3_nano_sim_bimanual",
+        deploy_config_path=get_deploy_config_path("cosmos3_nano_sim_bimanual_full_history.yaml"),
+        cli_overrides={"model_config": {"guardrails": False}},
+    )
+
+    model_config = config.stage_by_id(0).diffusion_config.model_config
+    assert model_config["guardrails"] is False
+    assert model_config["inference_overrides"]["history_mode"] == "full"
+    assert model_config["action_gen"] is True
+
+
+def test_global_model_config_override_skips_llm_stages() -> None:
+    overrides = {"model_config": {"guardrails": False}}
+
+    assert "model_config" not in omni_config_module._stage_cli_overrides(
+        0, overrides, execution_type=StageExecutionType.LLM_AR
+    )
+    assert omni_config_module._stage_cli_overrides(0, overrides, execution_type=StageExecutionType.DIFFUSION)[
+        "model_config"
+    ] == {"guardrails": False}
+
+
 def _build_single_diffusion_config(
     *,
     cli_overrides: dict | None = None,
