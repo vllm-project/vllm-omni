@@ -137,8 +137,10 @@ so the cross-domain link itself is healthy.
 unset HCCL_NPU_SOCKET_PORT_RANGE   # eight cards spanning two UB domains
 ```
 
-The same workaround applies to `TP4 + USP2` layouts on these hosts. Reported in
-[#10645](https://github.com/vllm-project/vllm-omni/issues/10645).
+`TP4 + USP2` shows the same failure on these hosts
+([#10645](https://github.com/vllm-project/vllm-omni/issues/10645)), but the
+successful run after unsetting the variable was captured on USP8 only, so treat
+that layout's workaround as expected rather than verified.
 
 ### Ref2VA on a 950PR that reports ~86 GB HBM
 
