@@ -32,6 +32,7 @@ from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy, resolve_deploy_yaml
 from vllm_omni.engine.duplex import commands
+from vllm_omni.engine.duplex import response_judge as rj
 from vllm_omni.engine.duplex.contracts import DuplexOutputAction, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
@@ -47,7 +48,6 @@ from vllm_omni.model_executor.models.aura_omni.duplex.stages import (
 )
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_JUDGED_PIPELINE, AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
-from vllm_omni.engine.duplex import response_judge as rj
 from vllm_omni.model_executor.stage_input_processors.aura_omni import asr2aura, asr2judge, judge2aura
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

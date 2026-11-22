@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, EncodeAudio
+from vllm_omni.engine.duplex.response_judge import judge_rejects
 from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
     AuraDataPlaneContext,
@@ -38,7 +39,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
     is_effectively_silent,
 )
-from vllm_omni.engine.duplex.response_judge import judge_rejects
 
 # AURA v1 (Qwen3-VL) silent / ChatML turn-end ids.
 AURA_SILENT_TOKEN_ID = 151669

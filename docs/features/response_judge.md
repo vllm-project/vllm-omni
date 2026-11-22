@@ -194,6 +194,11 @@ stage 1 with the LAYA pooling judge. Serve
           max_tokens: 1
     ```
 
+The judge module lives in `vllm_omni/engine/duplex/` next to turn detection,
+but it is not duplex-only: turn-based serving uses the same module. The LAYA
+question-type table also lives there because it belongs to the judge; the
+LAYA model class only reads it.
+
 - **Another pooling model:** add a pooling model class that returns one logit
   per option, and a format entry in
   `vllm_omni/engine/duplex/response_judge.py` that

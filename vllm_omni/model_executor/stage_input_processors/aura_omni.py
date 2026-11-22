@@ -15,11 +15,11 @@ import regex as re
 import soundfile as sf
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex.response_judge import after_judge, judge_input
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
-from vllm_omni.engine.duplex.response_judge import after_judge, judge_input
 
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "

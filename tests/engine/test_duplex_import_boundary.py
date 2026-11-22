@@ -199,6 +199,7 @@ if added:
     raise SystemExit("the response judge module pulled in model code: " + ", ".join(added))
 """)
 
+
 def test_stable_engine_does_not_expose_duplex_contract_modules() -> None:
     _assert_isolated_import_succeeds("""
 import importlib.util
