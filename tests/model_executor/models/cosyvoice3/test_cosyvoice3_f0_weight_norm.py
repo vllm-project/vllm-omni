@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.nn.utils import parametrize
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
 
 pytestmark = [
@@ -40,7 +41,7 @@ def fold_context(request):
 @pytest.fixture(
     params=[
         pytest.param("cpu", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=pytest.mark.cuda),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
     ]
 )
 def runtime(request):

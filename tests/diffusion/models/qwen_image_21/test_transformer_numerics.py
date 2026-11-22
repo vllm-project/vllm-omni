@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -13,7 +14,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 @pytest.mark.parametrize(
     "device",
-    [pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu])],
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_qk_norm_matches_diffusers_rounding(monkeypatch, device, dtype):
@@ -33,7 +37,10 @@ def test_qk_norm_matches_diffusers_rounding(monkeypatch, device, dtype):
 
 @pytest.mark.parametrize(
     "device",
-    [pytest.param("meta", marks=pytest.mark.cpu), pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu])],
+    [
+        pytest.param("meta", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ],
 )
 def test_rope_frequencies_do_not_depend_on_loader_device(device):
     reference = transformer.QwenImage21Rope(theta=10000, axes_dim=[16, 56, 56])
@@ -44,8 +51,7 @@ def test_rope_frequencies_do_not_depend_on_loader_device(device):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_scheduler_matches_diffusers_on_latent_device():
     import numpy as np
     from diffusers import FlowMatchEulerDiscreteScheduler
@@ -70,8 +76,7 @@ def test_scheduler_matches_diffusers_on_latent_device():
     assert timesteps.device == sample.device
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_timestep_frequencies_match_cpu_initialization():
     reference = transformer.QwenImage21TemporalTimesteps(timestep_dim=256)
     with torch.device("cuda"):

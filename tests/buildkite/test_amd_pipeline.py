@@ -34,6 +34,21 @@ DIFFUSION_CPU_MARKERS = (
     "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 )
 DIFFUSION_CPU_ARTIFACTS = "artifacts/amd-diffusion-cpu-shards/*.xml"
+DIFFUSION_SLOW_CPU_LABEL = "Simple · Diffusion Slow CPU Test"
+DIFFUSION_SLOW_CPU_ARTIFACTS = "artifacts/amd-diffusion-slow-cpu/pytest.xml"
+DIFFUSION_SLOW_CPU_NODES = [
+    "tests/diffusion/distributed/test_wan_vae_fastpath_install.py"
+    "::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]",
+    "tests/diffusion/distributed/test_wan_vae_fastpath_install.py"
+    "::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]",
+    "tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]",
+    "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
+    "::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]",
+    "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
+    "::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]",
+    "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
+    "::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session",
+]
 OMNI_PROCESSOR_FULL_LABEL = "Simple · Omni Processor Test"
 OMNI_PROCESSOR_SMOKE_LABEL = "Simple · Omni Processor Snapshot Smoke"
 OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
@@ -462,6 +477,9 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
     assert "--ignore=tests/diffusion/cache/test_teacache_extractors.py" in argv
     assert "--ignore=tests/diffusion/models/pi05/test_pi05_units.py" in argv
+    assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
+        DIFFUSION_SLOW_CPU_NODES
+    )
     assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in pytest_command
     assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in pytest_command
     assert "--durations=50" in argv
@@ -470,6 +488,51 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
         "pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml" in argv
     )
     assert "|| true" not in pytest_command
+
+
+@pytest.mark.parametrize(
+    "pipeline_path",
+    [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE],
+    ids=["ready", "merge"],
+)
+def test_diffusion_slow_cpu_cases_have_one_blocking_owner(pipeline_path: Path) -> None:
+    step = _find_step(DIFFUSION_SLOW_CPU_LABEL, pipeline_path)
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+    option_at = next(index for index, arg in enumerate(argv) if arg.startswith("-") and arg != "-sv")
+    nodes = argv[2:option_at]
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == [DIFFUSION_SLOW_CPU_ARTIFACTS]
+    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
+    assert "export VLLM_ROCM_USE_AITER=0" in step["commands"]
+    assert (
+        'export DIFFUSION_SLOW_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-slow-cpu"'
+        in step["commands"]
+    )
+    assert 'mkdir -p "$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR"' in step["commands"]
+    assert argv[:2] == ["pytest", "-sv"]
+    assert nodes == DIFFUSION_SLOW_CPU_NODES
+    assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
+    assert "--durations=20" in argv
+    assert "--junitxml=$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR/pytest.xml" in argv
+    assert "--num-shards" not in pytest_command
+    assert "|| true" not in pytest_command
+
+    shard = _find_diffusion_cpu_shard_step(pipeline_path)
+    shard_argv = split(next(command for command in shard["commands"] if "pytest" in command))
+    shard_nodes = [arg.removeprefix("--deselect=") for arg in shard_argv if arg.startswith("--deselect=")]
+    assert shard_nodes == nodes
+
+
+def test_diffusion_slow_cpu_cases_stay_off_nightly() -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    labels = [step.get("label") for step in _walk_steps(pipeline["steps"])]
+    assert DIFFUSION_SLOW_CPU_LABEL not in labels
 
 
 def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:

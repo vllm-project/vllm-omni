@@ -150,12 +150,14 @@ platforms:
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
+        # Match CUDA's fixed KV budget and leave headroom for Stage 2.
+        kv_cache_memory_bytes: 4294967296  # 4 GiB
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 2
-        # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
-        # estimator kernels through the NPU platform patch.
+        # Stage 2 stays outer-eager; CFM Whole-Euler, HiFT and encoder
+        # graphs use the shared Code2Wav wrappers with NPUGraph.
         additional_config:
           code2wav_enable_npu_graph: true
           code2wav_max_npu_graphs: 32

@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from transformers.models.whisper.modeling_whisper import WhisperConfig
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMForConditionalGeneration,
@@ -92,7 +93,7 @@ def test_graph_build_honors_eager_without_engine_config() -> None:
     assert thinker._duplex_audio_cuda_graph_encoder is None
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_graph_build_captures_on_cuda() -> None:
     thinker = _thinker().cuda()

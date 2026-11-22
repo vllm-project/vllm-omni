@@ -12,17 +12,29 @@ SKU markers (``H100``, ``L4``, … tagged ``[hardware-resource]`` in
 ``pyproject.toml``) must be applied via ``hardware_test(`` / ``hardware_marks(``
 so ``cards_{n}`` is attached. Direct ``pytest.mark.H100`` is rejected.
 
-Platform names allowed as ``pytest.mark.cpu`` / ``cuda`` come from
-``get_supported_platforms()`` (``[hardware-platform]`` in ``pyproject.toml``).
-CI level names come from ``get_level_markers()`` (``[ci-level]``).
+``[hardware-platform]`` marks other than ``cpu`` (``gpu``, ``cuda``, ``rocm``,
+``xpu``, ``npu``, ``musa``) are also rejected. Those tests must use the same
+helpers so a platform SKU and ``cards_{n}`` are attached and CI can select with
+``-m "cuda and L4"`` instead of a bare platform mark. The helper itself is the
+only file allowed to emit those marks.
+
+``pytest.mark.cpu`` stays direct: CPU has no SKU, and ``hardware_test(res=...)``
+rejects ``cpu`` as a res key. ``gpu`` is auto-added for ``[gpu]`` platforms and
+must not be written by hand.
+
+Platform names come from ``get_supported_platforms()`` (``[hardware-platform]``
+in ``pyproject.toml``). CI level names come from ``get_level_markers()``
+(``[ci-level]``).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import re
 import sys
+import tokenize
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -30,8 +42,12 @@ from types import ModuleType
 # Helpers from tests/helpers/mark.py that auto-apply hardware + cards_* marks.
 HARDWARE_HELPERS = ("hardware_test", "hardware_marks")
 
-# The helper implementation is the only file allowed to write pytest.mark.<SKU>.
+# The helper implementation is the only file allowed to write pytest.mark.<SKU>
+# or a non-CPU hardware-platform mark.
 _ALLOWED_DIRECT_SKU_FILES = frozenset({"tests/helpers/mark.py"})
+
+# cpu has no SKU. hardware_test(res=...) rejects it; pytest.mark.cpu stays valid.
+_DIRECT_PLATFORM_ALLOWLIST = frozenset({"cpu"})
 
 # Common diffusion tests receive per-case marks from this parametrization helper.
 _DELEGATED_MARK_SOURCES = {
@@ -46,6 +62,14 @@ HELPER_RE = re.compile(r"(?:" + "|".join(HARDWARE_HELPERS) + r")\s*\(")
 MISSING_LEVEL_MARKER = "Level"
 MISSING_HARDWARE_MARKER = "Hardware"
 DIRECT_SKU_MARKER = "Direct SKU"
+BARE_PLATFORM_MARKER = "Bare platform"
+_DISALLOWED_MARKERS = frozenset({DIRECT_SKU_MARKER, BARE_PLATFORM_MARKER})
+_PROBLEM_TEXT = {
+    DIRECT_SKU_MARKER: "disallowed SKU mark",
+    BARE_PLATFORM_MARKER: "disallowed platform mark",
+    MISSING_LEVEL_MARKER: "missing level mark",
+    MISSING_HARDWARE_MARKER: "missing hardware mark",
+}
 
 # Check if a file is located under tests/ and matches test_<something>.py
 # or <something>_test.py, since pytest technically collects on both.
@@ -87,8 +111,14 @@ def level_markers() -> tuple[str, ...]:
 
 @lru_cache(maxsize=1)
 def platform_markers() -> tuple[str, ...]:
-    """Names tests may apply as ``pytest.mark.cpu`` / ``cuda`` (not SKUs)."""
+    """``[hardware-platform]`` names (``cpu``, ``cuda``, …), not SKUs."""
     return tuple(sorted(_mark_module().get_supported_platforms()))
+
+
+@lru_cache(maxsize=1)
+def bare_platform_markers() -> tuple[str, ...]:
+    """Platform marks that must come from ``hardware_test`` / ``hardware_marks``."""
+    return tuple(sorted(set(platform_markers()) - _DIRECT_PLATFORM_ALLOWLIST))
 
 
 @lru_cache(maxsize=1)
@@ -110,6 +140,11 @@ def _platform_re() -> re.Pattern[str]:
 @lru_cache(maxsize=1)
 def _sku_mark_re() -> re.Pattern[str]:
     return _mark_name_re(sku_markers())
+
+
+@lru_cache(maxsize=1)
+def _bare_platform_re() -> re.Pattern[str]:
+    return _mark_name_re(bare_platform_markers())
 
 
 def is_test_file(path: str) -> bool:
@@ -135,11 +170,67 @@ def has_hardware_marker(contents: str) -> bool:
     return bool(_platform_re().search(contents) or HELPER_RE.search(contents))
 
 
+def _blanked_token_types() -> frozenset[int]:
+    """Token types that are not marker applications."""
+    types = {tokenize.COMMENT, tokenize.STRING}
+    for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):
+        token_type = getattr(tokenize, name, None)
+        if token_type is not None:
+            types.add(token_type)
+    return frozenset(types)
+
+
+def _blank_keeping_newlines(text: str) -> str:
+    return "".join("\n" if char == "\n" else " " for char in text)
+
+
+def _source_for_disallowed_mark_scan(contents: str) -> str:
+    """Blank comments and string literals before searching for ``mark.<name>``.
+
+    A mention in a comment or string is not a marker application. Real
+    ``pytest.mark.cuda`` / ``mark.cuda`` expressions stay in the scanned text.
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(contents).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return contents
+    blanked_token_types = _blanked_token_types()
+    spans = [tok for tok in tokens if tok.type in blanked_token_types and tok.start < tok.end]
+    if not spans:
+        return contents
+    lines = contents.splitlines(keepends=True)
+    for tok in spans:
+        (start_line, start_col), (end_line, end_col) = tok.start, tok.end
+        if start_line == end_line:
+            index = start_line - 1
+            line = lines[index]
+            lines[index] = line[:start_col] + _blank_keeping_newlines(line[start_col:end_col]) + line[end_col:]
+            continue
+        first = lines[start_line - 1]
+        lines[start_line - 1] = first[:start_col] + _blank_keeping_newlines(first[start_col:])
+        for index in range(start_line, end_line - 1):
+            lines[index] = _blank_keeping_newlines(lines[index])
+        lines[end_line - 1] = _blank_keeping_newlines(lines[end_line - 1][:end_col]) + lines[end_line - 1][end_col:]
+    return "".join(lines)
+
+
 def has_direct_sku_marker(path: str, contents: str) -> bool:
     """True when a test applies ``pytest.mark.<SKU>`` instead of the helpers."""
     if _normalize_path(path) in _ALLOWED_DIRECT_SKU_FILES:
         return False
-    return bool(_sku_mark_re().search(contents))
+    return bool(_sku_mark_re().search(_source_for_disallowed_mark_scan(contents)))
+
+
+def has_bare_platform_marker(path: str, contents: str) -> bool:
+    """True when a test writes ``pytest.mark.<platform>`` instead of a SKU helper.
+
+    ``pytest.mark.cpu`` is allowed. ``gpu`` / ``cuda`` / ``rocm`` / ``xpu`` /
+    ``npu`` / ``musa`` must go through ``hardware_test`` / ``hardware_marks``.
+    Comments and string literals that mention those marks are ignored.
+    """
+    if _normalize_path(path) in _ALLOWED_DIRECT_SKU_FILES:
+        return False
+    return bool(_bare_platform_re().search(_source_for_disallowed_mark_scan(contents)))
 
 
 def get_files_missing_markers(
@@ -152,6 +243,8 @@ def get_files_missing_markers(
             missing = []
             if has_direct_sku_marker(path, contents):
                 missing.append(DIRECT_SKU_MARKER)
+            if has_bare_platform_marker(path, contents):
+                missing.append(BARE_PLATFORM_MARKER)
             mark_source = _DELEGATED_MARK_SOURCES.get(_normalize_path(path))
             if mark_source is not None and "get_parametrized_options(" in contents:
                 contents += "\n" + (read_test_file(str(_repo_root() / mark_source)) or "")
@@ -164,21 +257,49 @@ def get_files_missing_markers(
     return results
 
 
+def _format_problem_list(problems: list[str]) -> str:
+    return " and ".join(_PROBLEM_TEXT.get(problem, problem) for problem in problems)
+
+
+def _failure_summary(findings: dict[str, list[str]]) -> tuple[str, str]:
+    """Return the opening sentence and the file-list heading."""
+    kinds = {problem for problems in findings.values() for problem in problems}
+    disallowed = bool(kinds & _DISALLOWED_MARKERS)
+    absent = bool(kinds - _DISALLOWED_MARKERS)
+    if disallowed and absent:
+        return (
+            "test files failed the mark check: some apply marks that are not allowed, "
+            "and some are missing the marks CI uses to collect them.",
+            "The following files failed the mark check:",
+        )
+    if disallowed:
+        return (
+            "test files apply pytest marks that are not allowed. "
+            "Write them with hardware_test(...) / hardware_marks(...).",
+            "The following files apply disallowed marks:",
+        )
+    return (
+        "test files are missing pytest marks required for Buildkite CI collection.",
+        "The following files are missing marks:",
+    )
+
+
 if __name__ == "__main__":
     missing = get_files_missing_markers(sys.argv[1:])
 
     if missing:
-        file_lines = "\n".join(f"  - {path} [{' and '.join(problems)}]" for path, problems in missing.items())
+        file_lines = "\n".join(f"  - {path} [{_format_problem_list(problems)}]" for path, problems in missing.items())
+        summary, heading = _failure_summary(missing)
         sku = ", ".join(sku_markers())
+        platforms = ", ".join(bare_platform_markers())
         print(
-            "\033[91merror:\033[0m test files are missing pytest marks "
-            "required for Buildkite CI collection, or apply SKU marks directly.\n\n"
+            f"\033[91merror:\033[0m {summary}\n\n"
             f"Level marks, e.g.: {', '.join(level_markers()[:4])}\n"
-            f"Hardware marks, e.g.: {', '.join(platform_markers()[:4])}, ...\n"
-            f"  or helpers: {', '.join(HARDWARE_HELPERS)}\n"
-            f"Do not write pytest.mark.<SKU> ({sku}). "
-            "Use hardware_test(...) / hardware_marks(...) so cards_* is attached.\n\n"
-            "The following files are missing marks:\n"
+            f"Hardware: pytest.mark.cpu, or helpers: {', '.join(HARDWARE_HELPERS)}\n"
+            f"Do not write pytest.mark.<platform> ({platforms}) or pytest.mark.<SKU> ({sku}). "
+            "Use hardware_test(...) / hardware_marks(...) so the platform, a SKU, and cards_* are attached. "
+            "pytest.mark.cpu stays direct because CPU has no SKU.\n\n"
+            f"{heading}\n"
             f"{file_lines}\n\n"
             "To skip: SKIP=check-mark git commit ..."
         )

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from pytest_mock import MockerFixture
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     PersonaPlexMimiCodec,
     _MimiStreamingTransformer,
@@ -178,7 +179,7 @@ def test_ring_mixed_offsets_match_singleton_streams() -> None:
     assert not torch.equal(batched.end_offset[0], batched.end_offset[1])
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mimi_transformer_mixed_offsets_match_singletons() -> None:
     batch_size, tokens, dim = 3, 2, 32
@@ -219,7 +220,7 @@ def test_mimi_transformer_mixed_offsets_match_singletons() -> None:
 
 
 @pytest.mark.parametrize("kind", ["conv", "convtr"])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mimi_conv_carries_preserve_inactive_rows(kind: str) -> None:
     if kind == "conv":

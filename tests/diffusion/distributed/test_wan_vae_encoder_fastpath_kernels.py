@@ -14,6 +14,7 @@ from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import AvgDown3D, WanCausalConv3d, WanResample
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     encode_frames,
     install_wan_vae_encoder_fastpath,
@@ -27,7 +28,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 DTYPES = [torch.bfloat16, torch.float16, torch.float32]

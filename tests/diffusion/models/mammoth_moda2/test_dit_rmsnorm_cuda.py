@@ -12,7 +12,6 @@ from vllm_omni.diffusion.layers.norm import RMSNorm
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
 ]
 

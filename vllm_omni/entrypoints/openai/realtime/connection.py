@@ -112,7 +112,6 @@ class OpenAIFullDuplexConnection:
             await self.ws.accept()
             logger.info("[realtime] connection opened, session_id=%s", self.session.session_id)
             await self._send_session_created()
-            await self._send_conversation_created()
 
             while self._connected:
                 try:
@@ -1851,18 +1850,6 @@ class OpenAIFullDuplexConnection:
                 event_id=_gen_id("evt"),
                 type="session.updated",
                 session=session_obj,  # type: ignore[arg-type]
-            )
-        )
-
-    async def _send_conversation_created(self) -> None:
-        await self._send_event(
-            types.ConversationCreatedEvent(
-                event_id=_gen_id("evt"),
-                type="conversation.created",
-                conversation={  # type: ignore[arg-type]
-                    "id": self.session.conversation_id,
-                    "object": "realtime.conversation",
-                },
             )
         )
 

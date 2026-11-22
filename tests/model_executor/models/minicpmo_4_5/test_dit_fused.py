@@ -6,10 +6,11 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import blocks_forward_chunk_fused, supports_fused_body
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 

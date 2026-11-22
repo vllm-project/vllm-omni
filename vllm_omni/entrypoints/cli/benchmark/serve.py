@@ -26,7 +26,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
     """The `serve` subcommand for vllm bench."""
 
     name = "serve"
-    help = "Benchmark online serving. Supports Daily-Omni, OmniInteract, and Seed-TTS datasets."
+    help = "Benchmark online serving. Supports Daily-Omni, OmniInteract, Omni-DuplexEval, and Seed-TTS datasets."
 
     @classmethod
     def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:

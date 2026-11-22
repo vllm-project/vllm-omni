@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
     MiniCPMO45OmniTTSForConditionalGeneration,
@@ -231,7 +232,7 @@ def test_mrv2_turn_end_drain_masks_cadence_eos(mocker, step, turn_start, turn_en
     assert (output.sampled_token_ids.item() != _EOS) is masked
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
     """The real MRv2 sampler pipeline scores the V1 16-frame codec penalty.
 

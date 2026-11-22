@@ -178,6 +178,7 @@ def test_code2wav_runtime_rejects_launch_blocking(monkeypatch):
     ("enabled", "max_graphs", "expected_prepared"),
     [
         (True, 7, 1),
+        (None, 7, 1),  # No NPU override: honor the shared CFM graph config.
         (False, 7, 0),
         (True, 0, 0),
     ],
@@ -197,6 +198,7 @@ def test_code2wav_patch_reads_stage_additional_config(
     model = SimpleNamespace(
         backend=None,
         _extra_config=lambda: {},
+        _cfm_graph_config={"enabled": True, "max_graphs": 32, "enable_whole_euler": True},
         vllm_config=SimpleNamespace(
             additional_config={
                 "code2wav_enable_npu_graph": enabled,
@@ -217,6 +219,11 @@ def test_code2wav_patch_reads_stage_additional_config(
     code2wav_patch._patched_build_backend(model)
 
     assert prepared == expected_prepared
+    assert model._cfm_graph_config == {
+        "enabled": bool(expected_prepared),
+        "max_graphs": max_graphs,
+        "enable_whole_euler": True,
+    }
     if expected_prepared:
         graph_runner = code2wav_patch._backend_graph_runners[model.backend]
         assert isinstance(graph_runner, NPUExactGraphRunner)

@@ -7,9 +7,10 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.boogu_image import BooguImageTurboPipeline
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.cuda, pytest.mark.diffusion]
+pytestmark = [pytest.mark.advanced_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 
 class _CudaDMDPipeline(BooguImageTurboPipeline):

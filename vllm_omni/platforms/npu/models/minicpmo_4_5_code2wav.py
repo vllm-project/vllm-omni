@@ -235,9 +235,18 @@ def _patched_build_backend(self) -> None:
         )
 
     config = _graph_config(self)
-    max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, 32))))
-    graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), False)
-    if graph_enabled:
+    cfm_config = getattr(self, "_cfm_graph_config", {})
+    max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, cfm_config.get("max_graphs", 32)))))
+    graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), bool(cfm_config.get("enabled", False)))
+    # Preserve the NPU stage switches while routing enabled CFM work through
+    # the shared Whole-Euler/step wrappers (including masks and shared arenas).
+    if hasattr(self, "_cfm_graph_config"):
+        self._cfm_graph_config = {**self._cfm_graph_config, "enabled": graph_enabled, "max_graphs": max_graphs}
+    needs_runtime = graph_enabled or any(
+        getattr(self, name, {}).get("enabled", False)
+        for name in ("_hift_graph_config", "_chunk_encoder_graph_config", "_encoder_graph_config")
+    )
+    if needs_runtime:
         # NPUOmniPlatform enables internal format for quantized LLM kernels.
         # Code2Wav uses regular convolution kernels that must remain in the
         # graph-capturable ACLNN path.

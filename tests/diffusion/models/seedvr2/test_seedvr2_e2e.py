@@ -18,7 +18,13 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.local_model, pytest.mark.cuda, pytest.mark.diffusion, pytest.mark.parallel]
+from tests.helpers.mark import hardware_marks, hardware_test
+
+pytestmark = [
+    pytest.mark.local_model,
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+]
 MODEL_DIR_ENV = "VLLM_TEST_SEEDVR2_MODEL_DIR"
 # Two model windows with one four-frame seam, at the smallest legal frame size.
 LONG_FRAMES = 20
@@ -26,6 +32,7 @@ LONG_SIZE = 64
 FPS = 24
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not os.environ.get(MODEL_DIR_ENV), reason=f"set {MODEL_DIR_ENV} to an authorized model directory")
 @pytest.mark.parametrize("method", ["lab", "wavelet", "adain", "none"])
 def test_seedvr2_native_video_e2e(method: str) -> None:
@@ -122,7 +129,13 @@ def _await_status(base: str, job_id: str, timeout: float) -> dict:
 
 
 @pytest.mark.skipif(not os.environ.get(MODEL_DIR_ENV), reason=f"set {MODEL_DIR_ENV} to an authorized model directory")
-@pytest.mark.parametrize("degree", [1, 8])
+@pytest.mark.parametrize(
+    "degree",
+    [
+        pytest.param(1, marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param(8, marks=hardware_marks(res={"cuda": "L4"}, num_cards=8)),
+    ],
+)
 def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
     """Restore a clip spanning two model windows, then cancel a longer job."""
     import av
@@ -190,10 +203,10 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
 
         # Validation must happen before a job is admitted, through model-owned
         # extra_params on both the long route and the common video endpoint.
-        for invalid in ("{", "[]", '{"color_correction_method":"invalid"}'):
-            assert submit(extra_params=invalid).status_code == 400
+        for extra_params in ("{", "[]", '{"color_correction_method":"invalid"}'):
+            assert submit(extra_params=extra_params).status_code == 400
         with source.open("rb") as upload:
-            invalid = requests.post(
+            rejected = requests.post(
                 f"http://{server.host}:{server.port}/v1/videos/sync",
                 data={
                     "prompt": " ",
@@ -205,7 +218,7 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
                 files={"input_references": ("input.mp4", upload, "video/mp4")},
                 timeout=120,
             )
-        assert invalid.status_code == 400, invalid.text
+        assert rejected.status_code == 400, rejected.text
         accepted = submit(extra_params='{"color_correction_method":"wavelet"}')
         assert accepted.status_code == 202, accepted.text
         job_id = accepted.json()["id"]
