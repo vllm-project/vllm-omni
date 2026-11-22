@@ -51,7 +51,7 @@ rejected. Both TP and Ulysses split attention heads, so query and KV head counts
 by TP x Ulysses. Ulysses runs the GEN layers on a token shard of each chunk and exchanges heads for
 the causal maskless attention, whose plan is unchanged; the paged ring and caption cache hold every
 token for the rank's head group, so the frame unit is the same as on one GPU. Ulysses keeps a full
-weight copy per GPU and replaces TP's per-layer all-reduces with all-to-alls.
+weight copy per GPU and replaces TP's per-layer all-reduces with all-to-all collectives.
 
 The supplied YAML leaves `devices` unset, so the stage inherits `CUDA_VISIBLE_DEVICES`.
 Pass `tensor_parallel_size` and `ulysses_degree` to `Omni` and expose at least TP x Ulysses GPUs.
