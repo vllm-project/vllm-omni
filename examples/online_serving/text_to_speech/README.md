@@ -111,7 +111,7 @@ Two-stage AR TTS at 24 kHz mono: a talker generates Mimi codes and the Mimi code
 
 ### Prerequisites
 
-`sesame/csm-1b` is gated. Accept its license on Hugging Face and log in (`hf auth login`, or set `HF_TOKEN`) before the first launch.
+`sesame/csm-1b` is gated. Accept its license on Hugging Face and log in (`hf auth login`, or set `HF_TOKEN`) before the first launch. The first launch downloads the whole repository, about 19 GB.
 
 ### Launch
 
@@ -179,6 +179,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - `temperature`, `top_k` and `top_p` in `extra_params` apply to the first codebook only. The depth decoder (codebooks 1-31) uses the model-wide `subtalker_sampling_params` of the deploy YAML.
 - `voice` is used only when it names an uploaded voice (`POST /v1/audio/voices`), which then supplies the reference turn. There are no preset voices.
 - Unsupported: `instructions`, `language`, `sample_rate`, `ref_audio_2`, `speaker_embedding`, `x_vector_only_mode`, and `extra_params` keys other than the four above. See the [Speech API reference](../../../docs/serving/speech_api.md#csm-1b).
+- A reference recording must be 1 to 30 s long.
+- See [`recipes/sesame/CSM-1B-RTX4090.md`](../../../recipes/sesame/CSM-1B-RTX4090.md) for memory and speed measured on an RTX 4090. Generation there is faster than real time (0.3 to 0.4 s per second of audio with up to 8 concurrent requests).
 
 ---
 

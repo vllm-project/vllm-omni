@@ -1194,7 +1194,7 @@ CSM request fields:
 | `input` | Required. Empty text returns 400, and so does text that contains the tokenizer's special tokens (such as `<\|AUDIO\|>`). |
 | `extra_params.speaker_id` | Non-negative integer, default `0`. It labels the speaker of the turn (`[0]`, `[1]`, ...); it does not select a fixed voice. |
 | `extra_params.temperature` / `top_k` / `top_p` | Sampling of the first codebook only. Other `extra_params` keys return 400. |
-| `ref_audio` + `ref_text` | One recording and its transcript, both required. They form an earlier turn of the same speaker, which the model continues in that voice. The recording is resampled to 24 kHz. |
+| `ref_audio` + `ref_text` | One recording and its transcript, both required. They form an earlier turn of the same speaker, which the model continues in that voice. The recording must be 1 to 30 s long and is resampled to 24 kHz. |
 | `voice` | The name of an uploaded voice supplies `ref_audio` and its stored transcript. Any other value is ignored; there are no preset voices. |
 | `max_new_tokens` | Token budget. One token is one 80 ms frame. A response that ends on its own spends two more tokens, on the end frame and the stop token, so N frames of audio need a budget of N + 2 to finish without being reported as [truncated](#truncated-audio). Default 125 from the deploy YAML (at most 10 s); adapter bounds 1..2048. |
 | `seed` | Optional. Reaches both the first-codebook sampler and the depth decoder. |
@@ -1205,7 +1205,7 @@ Codebooks 1-31 are sampled by the depth decoder with model-wide settings from th
 
 A request whose generated codes the codec cannot decode fails with HTTP 500 (`speech.audio.error` on an SSE stream) instead of returning silent audio. The two stages are always connected by chunks, so `--no-async-chunk` is not supported.
 
-See the [CSM-1B section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#csm-1b) for launch and request examples.
+See the [CSM-1B section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#csm-1b) for launch and request examples, and the [RTX 4090 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/sesame/CSM-1B-RTX4090.md) for measured memory and speed.
 
 ## Error Responses
 
