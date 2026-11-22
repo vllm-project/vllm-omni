@@ -346,16 +346,19 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
 
 
-@pytest.mark.parametrize("case", ["offline", "online", "missing_sdk", "missing_native", "non_int8", "wrapped"])
+@pytest.mark.parametrize("case", ["offline", "online", "missing_sdk", "missing_native", "non_int8", "wrapped", "A3", "A5"])
 def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear, UnquantizedLinearMethod
 
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3MLP
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
     from vllm_omni.quantization.int8_config import (
         DiffusionInt8Config,
         NPUInt8LinearMethod,
         NPUInt8OnlineLinearMethod,
     )
+
+    device_name = case if case in {"A3", "A5"} else "A2"
+    mocker.patch.object(blocks, "_is_ascend_device_type", side_effect=lambda *allowed: device_name in allowed)
 
     input_tensor = torch.zeros(2, 3, 4, dtype=torch.bfloat16)
     x = mocker.Mock(
@@ -379,7 +382,7 @@ def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
     fc1.weight = nn.Parameter(torch.zeros(4, 10, dtype=weight_dtype), requires_grad=False)
     fc1.weight_scale = nn.Parameter(torch.ones(10), requires_grad=False)
     fc1.forward = mocker.Mock(return_value=(linear_output, None))
-    mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
+    mlp = blocks.MiniMaxH3MLP.__new__(blocks.MiniMaxH3MLP)
     nn.Module.__init__(mlp)
     mlp.fc1 = mocker.Mock(wraps=fc1, quant_method=fc1.quant_method) if case == "wrapped" else fc1
     mlp.act_fn = mocker.Mock(return_value=activated)

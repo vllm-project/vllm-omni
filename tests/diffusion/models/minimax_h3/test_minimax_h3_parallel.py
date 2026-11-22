@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
+from enum import Enum
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -147,9 +148,19 @@ def _qkv_inputs():
     return attention, packed, table
 
 
-def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch):
+_AscendDeviceType = Enum("_AscendDeviceType", "A2 A3 A5 UNKNOWN")
+
+
+def _mock_ascend_device(monkeypatch, device_name):
+    utils = None if device_name is None else Mock(get_ascend_device_type=Mock(return_value=_AscendDeviceType[device_name]))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
+
+
+@pytest.mark.parametrize("device_name", ["A2", "A5"])
+def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch, device_name):
     attention, packed, table = _qkv_inputs()
     attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
+    _mock_ascend_device(monkeypatch, device_name)
     q, k, _ = packed.view(7, 6, 128).split(2, dim=1)
     outputs = (object(), object(), object())
     op = Mock(return_value=outputs)
@@ -171,12 +182,23 @@ def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("mode", ["missing_sdk", "missing_native", "no_rope"])
-def test_project_qkv_preserves_fallback(monkeypatch, mode):
+@pytest.mark.parametrize(
+    ("mode", "device_name"),
+    [
+        ("missing_sdk", "A2"),
+        ("missing_native", "A2"),
+        ("no_rope", "A2"),
+        ("unsupported_device", "A3"),
+        ("unsupported_device", "UNKNOWN"),
+        ("missing_device_detection", None),
+    ],
+)
+def test_project_qkv_preserves_fallback(monkeypatch, mode, device_name):
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 
     attention, packed, table = _qkv_inputs()
     attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
+    _mock_ascend_device(monkeypatch, device_name)
     op = Mock(side_effect=ImportError("native QKV unavailable"))
     interface = None if mode == "missing_sdk" else SimpleNamespace(eagle_split_norm_rope_concat=op)
     monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", interface)

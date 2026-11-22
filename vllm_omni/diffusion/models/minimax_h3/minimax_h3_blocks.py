@@ -194,6 +194,16 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm
     return RMSNorm(size, eps=eps, dtype=dtype)
 
 
+def _is_ascend_device_type(*allowed: str) -> bool:
+    try:
+        from vllm_ascend.utils import get_ascend_device_type
+
+        device_type = get_ascend_device_type()
+    except (ImportError, KeyError, RuntimeError):
+        return False
+    return device_type.name in allowed
+
+
 class MiniMaxH3Attention(nn.Module):
     # Full sparse checkpoints pin a ratio; legacy adapters use backend top-k.
     vsa_sparsity: float | None = None
@@ -491,7 +501,8 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
         q_raw, k_raw = q, k
-        if qkv.device.type == "npu" and rope_table is not None:
+        # A5 requires a MindIE-SD native package built for ascend950 with PR #882.
+        if qkv.device.type == "npu" and rope_table is not None and _is_ascend_device_type("A2", "A5"):
             try:
                 from mindiesd.fused_ops import eagle_split_norm_rope_concat
 
@@ -642,7 +653,7 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Wrapped linears (e.g. LoRA) must retain their own forward computation.
-        if x.device.type == "npu" and type(self.fc1) is MergedColumnParallelLinear:
+        if x.device.type == "npu" and type(self.fc1) is MergedColumnParallelLinear and _is_ascend_device_type("A2"):
             from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
 
             if isinstance(self.fc1.quant_method, NPUInt8LinearMethod):
