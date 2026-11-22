@@ -46,7 +46,7 @@ be 0.
 | --- | --- |
 | Video | One clip with exactly `num_frames` frames. Generation pads to the VAE's `4k+1` grid and trims the result. |
 | Frame rate | The decoded source video's FPS when it carries one; otherwise the request FPS (`--fps`), then the deployment `default_fps` (15). |
-| Geometry | `resolution` selects the 256, 480, 704, or 720 bucket (CLI fallback: 480). Without `aspect_ratio`, the source video, else the hint's control clip, selects the nearest aspect. Inputs are resized directly to the bucket without center cropping. |
+| Geometry | `resolution` selects the 256, 480, 704, or 720 bucket; both the deployment (`default_resolution: [720, 1280]`) and the CLI default to 720. Without `aspect_ratio`, the source video, else the hint's control clip, selects the nearest aspect. Inputs are resized directly to the bucket without center cropping. |
 | Latent | `--output-type latent` saves the pre-VAE latent tensor with `torch.save`. |
 
 The deployment's `max_pixels: 921600` (720×1280) bounds every bucket, and the
@@ -113,8 +113,9 @@ python -m vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.offline_transfer 
   --output cosmos3_nano_sim_transfer.mp4
 ```
 
-The window, sink, emphasis, and aspect-ratio options override the same JSON
-fields. Omitted settings come from the deployment, then the checkpoint.
+This example selects the 480 bucket explicitly; omit `--resolution` to use the
+720 default. The window, sink, emphasis, and aspect-ratio options override the
+same JSON fields. Omitted settings come from the deployment, then the checkpoint.
 
 ## Verification
 

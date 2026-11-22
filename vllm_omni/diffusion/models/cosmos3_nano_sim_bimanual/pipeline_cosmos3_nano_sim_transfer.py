@@ -472,17 +472,27 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         return resolve_cosmos3_nano_sim_transfer_geometry(sp, prompt_data, self.resolution_policy)
 
     def _resolve_request_fps(self, sp: Any, prompt_data: Any) -> float:
-        """Prefer the decoded input video's FPS over request FPS fields."""
+        """Prefer the decoded input video's FPS over request FPS fields.
+
+        A missing input FPS falls back to the request and deployment FPS; a
+        present but invalid one is rejected so it cannot change the generated
+        duration or conditioning.
+        """
 
         input_fps = _prompt_value(prompt_data, "transfer_input_fps")
-        if input_fps is not None:
-            try:
-                resolved_input_fps = float(input_fps)
-            except (TypeError, ValueError, OverflowError):
-                resolved_input_fps = 0.0
-            if math.isfinite(resolved_input_fps) and resolved_input_fps > 0:
-                return resolved_input_fps
-        return super()._resolve_request_fps(sp, prompt_data)
+        if input_fps is None:
+            return super()._resolve_request_fps(sp, prompt_data)
+        try:
+            resolved_input_fps = float(input_fps)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos3-Nano-Sim-Transfer transfer_input_fps must be numeric, got {input_fps!r}."
+            ) from exc
+        if not math.isfinite(resolved_input_fps) or resolved_input_fps <= 0:
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos3-Nano-Sim-Transfer transfer_input_fps must be positive and finite, got {input_fps!r}."
+            )
+        return resolved_input_fps
 
     def _validate_conditioning_request(
         self, sp: Any, controls: _RequestControls, *, prompt_data: Any

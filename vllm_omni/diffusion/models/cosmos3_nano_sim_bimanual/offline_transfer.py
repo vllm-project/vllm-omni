@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
         "--resolution",
         choices=("256", "480", "704", "720"),
         default=None,
-        help="Cosmos3 Transfer bucket family; defaults to the JSON record's resolution or 480.",
+        help="Cosmos3 Transfer bucket family; defaults to the JSON record's resolution or 720.",
     )
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
@@ -143,7 +143,7 @@ def main() -> None:
         "session_id": f"transfer-{args.input_json.stem}",
         "reset": True,
         "close_session": True,
-        "resolution": _first_not_none(args.resolution, record.get("resolution"), "480"),
+        "resolution": _first_not_none(args.resolution, record.get("resolution"), "720"),
         hint: hint_config,
     }
     for name in ("aspect_ratio", "kv_cache_inference_size", "attention_sink_size", "emphasize_control_in_prompt"):

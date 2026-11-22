@@ -470,3 +470,19 @@ def test_prompt_file_relative_to_record_and_cli_override(tmp_path: Path) -> None
     override = tmp_path / "caption.txt"
     override.write_text("A different scene.\n")
     assert _load_prompt(record, tmp_path, override) == "A different scene."
+
+
+def test_transfer_input_fps_overrides_request_fps() -> None:
+    p = pipeline()
+    p.default_fps = 15.0
+    sp = SimpleNamespace(extra_args={"fps": 24})
+    assert p._resolve_request_fps(sp, {"additional_information": {"transfer_input_fps": 30.0}}) == 30.0
+    assert p._resolve_request_fps(sp, {"additional_information": {}}) == 24.0
+
+
+@pytest.mark.parametrize("value", ["thirty", 0, -1.0, float("nan"), float("inf")])
+def test_invalid_transfer_input_fps_is_rejected(value) -> None:
+    p = pipeline()
+    p.default_fps = 15.0
+    with pytest.raises(ARDiffusionRequestRejectedError, match="transfer_input_fps"):
+        p._resolve_request_fps(SimpleNamespace(extra_args={}), {"transfer_input_fps": value})
