@@ -272,6 +272,11 @@ class SharedMemoryConnector(OmniConnectorBase):
             return False, 0, None
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
+        # Nearly every poll misses; os.access reports that without building a
+        # FileNotFoundError. A segment published after the probe is read on the
+        # next poll (or wakeup).
+        if not os.access(lock_file, os.F_OK):
+            return None
         consumed = False
         try:
             with open(lock_file, "rb+") as lockf:
