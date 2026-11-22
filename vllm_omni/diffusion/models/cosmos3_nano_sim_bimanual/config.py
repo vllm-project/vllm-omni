@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import Cosmos3NanoSimBimanualActionSchema
@@ -394,7 +394,22 @@ class Cosmos3NanoSimBimanualManifest:
                 "Cosmos3-Nano-Sim-Bimanual schema-v1 artifact fields are invalid: "
                 f"missing={missing}, unknown={unknown}."
             )
-        return cls(**_parse_artifact(artifact))
+        manifest = cls(**_parse_artifact(artifact))
+        cache_size = deploy_option(od_config, "kv_cache_inference_size")
+        sinks = deploy_option(od_config, "attention_sink_size")
+        if cache_size is None:
+            if sinks is not None:
+                raise ValueError("attention_sink_size override requires kv_cache_inference_size")
+            return manifest
+        if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 2:
+            raise ValueError("kv_cache_inference_size must be an integer >= 2")
+        sinks = 0 if sinks is None else sinks
+        if isinstance(sinks, bool) or not isinstance(sinks, int) or not 0 <= sinks < cache_size - 1:
+            raise ValueError("attention_sink_size must leave at least one recent past frame in the cache")
+        # Reference capacity includes the sinks and current frame; Omni's
+        # window_frames counts only recent past frames, separately from sinks.
+        # The effective manifest digest also separates session/cache identities.
+        return replace(manifest, window_frames=cache_size - sinks - 1, sink_frames=sinks)
 
     def require_exported_artifact(self) -> None:
         missing: list[str] = []
