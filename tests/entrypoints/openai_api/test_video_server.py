@@ -2714,9 +2714,9 @@ def test_h3_multipart_maps_pillow_pixel_limit_error(field, test_client, monkeypa
     assert "decoder pixel limit" in response.json()["detail"]
 
 
-def test_cosmos3_multiview_upload_rejects_shared_negative_prompt(test_client):
-    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
-    extra_params = {
+def _cosmos3_single_view_extra_params() -> dict:
+    """WSM transfer manifest for one camera whose control is ``input_references[0]``."""
+    return {
         "multiview": {
             "views": [
                 {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_reference_index": 0}
@@ -2724,6 +2724,11 @@ def test_cosmos3_multiview_upload_rejects_shared_negative_prompt(test_client):
         },
         "wsm": {},
     }
+
+
+def test_cosmos3_multiview_upload_rejects_shared_negative_prompt(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    extra_params = _cosmos3_single_view_extra_params()
 
     response = test_client.post(
         "/v1/videos/sync",
@@ -2746,6 +2751,211 @@ def test_sync_rejects_lidar_output_before_generation(test_client, mocker: Mocker
     assert response.status_code == 400
     assert "requires asynchronous POST /v1/videos" in response.json()["detail"]
     generate.assert_not_called()
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos/sync", "/v1/videos"])
+def test_cosmos3_multiview_uploads_resolve_to_request_files_and_clean_up(test_client, mocker: MockerFixture, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    # Views reference uploads out of order, so paths must be resolved by index, not position.
+    extra_params = {
+        "multiview": {
+            "views": [
+                {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_reference_index": 1},
+                {"camera_key": "camera_cross_right_120fov", "prompt": "A car turns.", "control_reference_index": 0},
+            ]
+        },
+        "wsm": {},
+    }
+    seen_views: list[dict] = []
+    seen_controls: list[bytes] = []
+    reference_kwargs: dict = {}
+
+    async def capture_generation(request, _request_id, **kwargs):
+        views = request.extra_params["multiview"]["views"]
+        seen_views.extend(views)
+        # The pipeline reads the uploads during generation, so they must still exist here.
+        seen_controls.extend(Path(view["control_path"]).read_bytes() for view in views)
+        reference_kwargs.update(kwargs)
+        return EncodedVideoResult(video_bytes=b"mp4", stage_durations={}, peak_memory_mb=0.0)
+
+    mocker.patch.object(handler, "generate_video_bytes", side_effect=capture_generation)
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params)},
+        files=[
+            ("input_references", ("right.mp4", b"right-control", "video/mp4")),
+            ("input_references", ("front.mp4", b"front-control", "video/mp4")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    else:
+        assert response.content == b"mp4"
+    assert [view["camera_key"] for view in seen_views] == ["camera_front_wide_120fov", "camera_cross_right_120fov"]
+    assert all("control_reference_index" not in view for view in seen_views)
+    assert seen_controls == [b"front-control", b"right-control"]
+    # Multiview uploads reach the pipeline only through the manifest.
+    for key in ("reference_image", "reference_video", "reference_audio", "latent_edit_input"):
+        assert reference_kwargs[key] is None
+    _wait_until(lambda: not any(Path(view["control_path"]).exists() for view in seen_views))
+
+
+def test_cosmos3_multiview_rejected_manifest_cleans_persisted_uploads(test_client, monkeypatch, mocker: MockerFixture):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+    persisted: list[str] = []
+    original_persist = video_generation_helpers._persist_uploaded_reference
+
+    async def recording_persist(upload, **kwargs):
+        path = await original_persist(upload, **kwargs)
+        persisted.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_uploaded_reference", recording_persist)
+    extra_params = _cosmos3_single_view_extra_params()
+
+    # The manifest is resolved only after every upload is stored, so the unreferenced upload fails late.
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params)},
+        files=[
+            ("input_references", ("front.mp4", b"front-control", "video/mp4")),
+            ("input_references", ("unused.mp4", b"unused-control", "video/mp4")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert "referenced exactly once" in response.json()["detail"]
+    assert len(persisted) == 2
+    assert not any(Path(path).exists() for path in persisted)
+    generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("model_class_name", "data", "files", "message"),
+    [
+        pytest.param(
+            "WanPipeline",
+            {},
+            [],
+            "does not support multiview uploaded references",
+            id="model-without-multiview",
+        ),
+        pytest.param(
+            "Cosmos3MultiviewPipeline",
+            {"control_type": "wsm"},
+            [("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+            "cannot be combined with generic reference fields",
+            id="generic-control-field",
+        ),
+    ],
+)
+def test_cosmos3_multiview_upload_guards(test_client, mocker: MockerFixture, model_class_name, data, files, message):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = model_class_name
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+    extra_params = _cosmos3_single_view_extra_params()
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params), **data},
+        files=files,
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    generate.assert_not_called()
+
+
+_COSMOS3_T2V_VIEW = {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."}
+
+
+@pytest.mark.parametrize(
+    ("extra_params", "data", "files", "message"),
+    [
+        pytest.param(
+            {"multiview": {"views": [_COSMOS3_T2V_VIEW]}, "resolved_frame_rate": 12},
+            {"fps": "24"},
+            [],
+            "frame rates disagree",
+            id="conflicting-fps-without-uploads",
+        ),
+        pytest.param(
+            {**_cosmos3_single_view_extra_params(), "resolved_frame_rate": 12},
+            {"fps": "24"},
+            [("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+            "frame rates disagree",
+            id="conflicting-fps-with-uploads",
+        ),
+        pytest.param(
+            {"multiview": {"views": [{"camera_key": "camera_front_wide_120fov"}]}},
+            {},
+            [],
+            "requires one prompt per camera",
+            id="missing-caption-without-uploads",
+        ),
+    ],
+)
+def test_cosmos3_multiview_admission_rejects_before_generation(
+    test_client, mocker: MockerFixture, extra_params, data, files, message
+):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params), **data},
+        files=files,
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("allowed", "inside", "message"),
+    [
+        (False, True, "require the server's --allowed-local-media-path"),
+        (True, False, "outside --allowed-local-media-path"),
+        (True, True, None),
+    ],
+    ids=["no-allowlist", "outside-allowlist", "inside-allowlist"],
+)
+def test_cosmos3_multiview_local_paths_require_allowlist(
+    test_client, mocker: MockerFixture, tmp_path, allowed, inside, message
+):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    media = tmp_path / "media"
+    media.mkdir()
+    if allowed:
+        handler.allowed_local_media_path = str(media)
+    control_path = str((media if inside else tmp_path) / "front.mp4")
+    generate = mocker.patch.object(
+        handler,
+        "generate_video_bytes",
+        return_value=EncodedVideoResult(video_bytes=b"mp4", stage_durations={}, peak_memory_mb=0.0),
+    )
+    extra_params = {"multiview": {"views": [{**_COSMOS3_T2V_VIEW, "control_path": control_path}]}, "wsm": {}}
+
+    response = test_client.post(
+        "/v1/videos/sync", data={"prompt": "Driving.", "extra_params": json.dumps(extra_params)}
+    )
+
+    if message is None:
+        assert response.status_code == 200
+        request = generate.call_args.args[0]
+        assert request.extra_params["multiview"]["views"][0]["control_path"] == control_path
+    else:
+        assert response.status_code == 400
+        assert message in response.json()["detail"]
+        generate.assert_not_called()
 
 
 @pytest.mark.asyncio

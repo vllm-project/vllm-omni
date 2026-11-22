@@ -208,6 +208,7 @@ The following tables show which models support each feature:
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **Kandinsky 6 TI2VA**        | ✅* (uncalibrated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (decode) | ✅ (FP8) | ✅ (1 request) |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |     ✅     |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
+| **Cosmos3-Nano-Transfer-Auto**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ❓ | ❌ | ❓ | ❓ | ❌ | ❓ | ❌ |
 | **LingBot-Video**            |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3-Nano-Transfer-Auto**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ❓ | ❌ | ❓ | ❓ | ❌ | ❓ | ❌ |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |

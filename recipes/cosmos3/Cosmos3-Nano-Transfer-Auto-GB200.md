@@ -45,7 +45,7 @@ retain each camera's trained identity.
 | Input | Format and limits |
 | --- | --- |
 | Prompt | A plain-text `prompt` is required per view; runtime camera labels and metadata sentences are rejected. |
-| Camera control / vision | Server-local paths or multipart uploads. MP4, MOV, MKV, WebM, or BMP, GIF, JPEG, PNG, TIFF, WebP. |
+| Camera control / vision | Multipart uploads, or server-local paths under `--allowed-local-media-path`. MP4, MOV, MKV, WebM, or BMP, GIF, JPEG, PNG, TIFF, WebP. |
 | LiDAR control | `lidar.control_path`: a `.safetensors` file holding one float32 tensor `frames` of shape `[3, T, 128, 1800]` (range in metres, intensity and validity in `[0, 1]`) |
 | LiDAR condition (optional) | `lidar.condition_path`, same format; `lidar.num_conditional_sweeps` (default 1) measured sweeps condition the start of the generated LiDAR |
 | Prompt length | `max_sequence_length` may be lowered but not raised above 4096 (see [Prompt length](#prompt-length)) |
@@ -292,7 +292,8 @@ For strict Ulysses CP, set `--num-gpus` to the total GPU count and add
 JSON-encoded `extra_params` form field. The manifest carries `multiview.views`,
 one entry per camera with `camera_key`, `prompt` and, for transfer or view
 completion, `control_path`; I2V or prefix conditioning adds `vision_path`.
-Transfer requests also set exactly one hint (`"wsm": {}`). Set
+Transfer requests also set exactly one hint (`"wsm": {}`). As the only hint,
+its optional `control_weight` always normalizes to 1.0. Set
 `multiview.condition_video_as_image: true` to condition on the first frame only.
 Add a top-level `lidar` object for joint requests:
 
@@ -300,12 +301,13 @@ Add a top-level `lidar` object for joint requests:
 "lidar": {"control_path": "lidar_control.safetensors", "return_output": true}
 ```
 
-Media may be server-local `control_path`/`vision_path` entries or multipart
-`input_references` parts referenced by zero-based
+Media may be multipart `input_references` parts referenced by zero-based
 `control_reference_index`/`vision_reference_index` (LiDAR:
-`control_reference_index`/`condition_reference_index`). Every upload must be
-referenced exactly once, and one camera role cannot have both a path and an
-index.
+`control_reference_index`/`condition_reference_index`), or server-local
+`control_path`/`vision_path` entries. Every upload must be referenced exactly
+once, and one camera role cannot have both a path and an index. Server-local
+paths require starting the server with `--allowed-local-media-path <dir>`, and
+each path must resolve inside that directory.
 
 `/content` returns one camera-major MP4. For joint jobs with
 `lidar.return_output: true`, the completed job carries a `lidar` descriptor and
@@ -395,6 +397,7 @@ count, parallel topology, steps, cold/warm latency and peak memory.
     - Other accelerators, including Hopper, are not qualified by this recipe.
       Hopper resolves to the `maskless` backend when bundled FlashAttention is
       available; its parity and latency against Triton are pending a GPU benchmark.
+      The weekly H100 CI smoke test only checks that a 2-step request is served.
     - LiDAR CUDA parity, memory and latency have not been qualified.
     - Joint checkpoints load the LiDAR decoder even when a request does not ask
     for LiDAR output; such requests skip decoder execution.

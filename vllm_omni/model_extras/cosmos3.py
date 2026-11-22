@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -226,13 +227,56 @@ def path_media_kind(value: Any) -> str:
     return "image" if Path(value).suffix.lower() in MULTIVIEW_IMAGE_EXTENSIONS else "video"
 
 
+# Aliases for the one camera rate that drives generation and MP4 encoding.
+COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS = ("resolved_frame_rate", "frame_rate", "fps")
+
+
+def parse_multiview_frame_rate(value: Any, name: str = "FPS") -> float:
+    """Return a requested camera rate as a finite positive float."""
+    if isinstance(value, bool):
+        raise TypeError(f"Cosmos3 multiview {name} must be a number, not a boolean.")
+    try:
+        frame_rate = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cosmos3 multiview {name} must be a number, got {value!r}.") from exc
+    if not math.isfinite(frame_rate) or frame_rate <= 0:
+        raise ValueError(f"Cosmos3 multiview {name} must be finite and positive, got {value!r}.")
+    return frame_rate
+
+
+def _reject_conflicting_frame_rates(
+    extra: Mapping[str, Any], sampling_frame_rates: Mapping[str, Any] | None = None
+) -> None:
+    """Reject requests whose rate aliases disagree.
+
+    The pipeline would generate at one alias while serving encodes the MP4 at
+    another, so the video would play at the wrong speed against its LiDAR.
+    """
+    supplied = {}
+    for location, source in (("extra_args", extra), ("sampling_params", sampling_frame_rates or {})):
+        for field in COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS:
+            if (value := source.get(field)) is not None:
+                supplied[f"{location}.{field}"] = value
+    rates = {parse_multiview_frame_rate(value, name) for name, value in supplied.items()}
+    if len(rates) > 1:
+        listed = ", ".join(f"{name}={value!r}" for name, value in supplied.items())
+        raise ValueError(f"Cosmos3 multiview frame rates disagree: {listed}. Supply a single camera frame rate.")
+
+
 def validate_multiview_request(
     extra: Mapping[str, Any],
     cameras: Sequence[str] = COSMOS3_MADS_CAMERAS,
     *,
     media_kind: Callable[[Any], str] = path_media_kind,
+    sampling_frame_rates: Mapping[str, Any] | None = None,
 ) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
+    """Validate a multiview manifest.
+
+    ``sampling_frame_rates`` holds rate aliases set outside ``extra``, such as
+    the video API's top-level ``fps``. All supplied rates must agree.
+    """
     reject_multiview_negative_fields(extra, "extra_args")
+    _reject_conflicting_frame_rates(extra, sampling_frame_rates)
     negative = extra.get("per_view_negative_prompt")
     if negative is not None and not isinstance(negative, str):
         raise ValueError("Cosmos3 per_view_negative_prompt must be a string.")
@@ -324,11 +368,15 @@ def validate_multiview_request(
         )
     for hint in selected_hints:
         value = extra[hint]
-        if value is not True and (not isinstance(value, Mapping) or set(value) - {"weight"}):
-            raise ValueError("Cosmos3 multiview controls must be supplied per view; hint must be true or {weight}.")
-        weight = 1.0 if value is True else value.get("weight", 1.0)
+        if value is not True and (not isinstance(value, Mapping) or set(value) - {"control_weight"}):
+            raise ValueError(
+                "Cosmos3 multiview controls must be supplied per view; hint must be true or {control_weight}."
+            )
+        # Same field as single-view transfer. Weights are normalized over the
+        # selected hints, so the single multiview hint always resolves to 1.0.
+        weight = 1.0 if value is True else value.get("control_weight", 1.0)
         if isinstance(weight, bool) or not isinstance(weight, int | float) or not math.isfinite(weight) or weight <= 0:
-            raise ValueError("Cosmos3 multiview control weight must be finite and positive.")
+            raise ValueError("Cosmos3 multiview control_weight must be finite and positive.")
     for field in ("vision", "control"):
         values = [view.get(f"{field}_path", view.get(field)) for view in views]
         present = [value is not None for value in values]
@@ -397,8 +445,16 @@ def has_multiview_upload_indexes(extra: Mapping[str, Any]) -> bool:
     )
 
 
-def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[str]) -> dict[str, Any]:
-    """Copy the manifest, substitute persisted upload paths for indexes, and validate the result."""
+def resolve_multiview_uploads(
+    extra: Mapping[str, Any],
+    upload_paths: Sequence[str],
+    *,
+    sampling_frame_rates: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Copy the manifest, substitute persisted upload paths for indexes, and validate the result.
+
+    ``sampling_frame_rates`` holds request-level rate aliases such as the video API's top-level ``fps``.
+    """
     if len(upload_paths) > MULTIVIEW_MAX_UPLOADS:
         raise ValueError(f"Cosmos3 multiview accepts at most {MULTIVIEW_MAX_UPLOADS} uploaded references.")
     multiview = dict(_mapping(extra.get("multiview"), "extra_params.multiview"))
@@ -445,8 +501,40 @@ def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[s
     # Upload admission has no deployment metadata. The pipeline enforces the
     # checkpoint's exported camera set after references are resolved. Per-camera
     # captions are required here, before the asynchronous generation job begins.
-    validate_multiview_request(resolved)
+    validate_multiview_request(resolved, sampling_frame_rates=sampling_frame_rates)
     return resolved
+
+
+def contain_multiview_local_paths(extra: Mapping[str, Any], allowed_local_media_path: str) -> None:
+    """Keep client-named server files under the server's ``--allowed-local-media-path``.
+
+    Without that flag, HTTP clients upload media as ``input_references`` instead,
+    as for other local media in vLLM. Uploads become server paths after this check.
+    """
+    multiview = extra.get("multiview")
+    views = multiview.get("views") if isinstance(multiview, Mapping) else None
+    named = [
+        view.get(field)
+        for view in (views if isinstance(views, list) else ())
+        if isinstance(view, Mapping)
+        for field in ("control_path", "control", "vision_path", "vision")
+    ]
+    lidar = extra.get("lidar")
+    if isinstance(lidar, Mapping):
+        named += [lidar.get("control_path"), lidar.get("condition_path")]
+    # Validation rejects non-string media values; only strings can name a server file.
+    paths = [path for path in named if isinstance(path, str)]
+    if not paths:
+        return
+    if not allowed_local_media_path:
+        raise ValueError(
+            "Cosmos3 multiview server-local paths require the server's --allowed-local-media-path; "
+            "upload the media as input_references instead."
+        )
+    base = os.path.join(os.path.realpath(allowed_local_media_path), "")
+    for path in paths:
+        if not os.path.realpath(path).startswith(base):
+            raise ValueError(f"Cosmos3 multiview path {path!r} is outside --allowed-local-media-path.")
 
 
 async def admit_multiview_uploads(
@@ -455,17 +543,23 @@ async def admit_multiview_uploads(
     negative_prompt: str | None,
     num_uploads: int,
     persist: Callable[[int, bool], Awaitable[str]],
+    sampling_frame_rates: Mapping[str, Any] | None = None,
+    allowed_local_media_path: str = "",
 ) -> dict[str, Any]:
     """Persist multipart ``input_references`` and resolve the manifest to local paths.
 
     This is the video API's single admission entry point for Cosmos3 multiview
-    uploads. ``persist(index, numeric_lidar)`` stores one upload and returns its
-    path; the caller owns those files, including cleanup when this raises. The
-    LiDAR control and condition are numeric uploads, checked structurally as soon
-    as they are stored. Manifest problems raise ``ValueError`` or ``TypeError``.
+    requests, with or without uploads. ``persist(index, numeric_lidar)`` stores
+    one upload and returns its path; the caller owns those files, including
+    cleanup when this raises. The LiDAR control and condition are numeric
+    uploads, checked structurally as soon as they are stored.
+    ``sampling_frame_rates`` must agree with the manifest's rate aliases.
+    Client-named paths must lie under ``allowed_local_media_path``.
+    Manifest problems raise ``ValueError`` or ``TypeError``.
     """
     extra = extra_params or {}
     reject_multiview_negative_fields({"negative_prompt": negative_prompt}, "request")
+    contain_multiview_local_paths(extra, allowed_local_media_path)
     lidar_indexes = multiview_lidar_upload_indexes(extra)
     paths: list[str] = []
     for index in range(num_uploads):
@@ -474,4 +568,4 @@ async def admit_multiview_uploads(
         paths.append(path)
         if numeric_lidar:
             validate_lidar_header(path)
-    return resolve_multiview_uploads(extra, paths)
+    return resolve_multiview_uploads(extra, paths, sampling_frame_rates=sampling_frame_rates)

@@ -259,13 +259,13 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
     },
-    "Cosmos3NanoSimBimanualPipeline": {
-        "extra_body_params": COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS,
-        "extra_output_params": COSMOS3_NANO_SIM_BIMANUAL_EXTRA_OUTPUT_PARAMS,
-    },
     "Cosmos3MultiviewPipeline": {
         "extra_body_params": COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS,
         "extra_output_params": frozenset(),
+    },
+    "Cosmos3NanoSimBimanualPipeline": {
+        "extra_body_params": COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS,
+        "extra_output_params": COSMOS3_NANO_SIM_BIMANUAL_EXTRA_OUTPUT_PARAMS,
     },
     "Cosmos3NanoSimAutoPipeline": {
         "extra_body_params": COSMOS3_NANO_SIM_AUTO_EXTRA_BODY_PARAMS,
