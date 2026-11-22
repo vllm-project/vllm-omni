@@ -32,10 +32,18 @@ class _FallbackError(Exception):
     pass
 
 
-def _warn_fallback(op: str, error: Exception) -> None:
+def _count_fallback(op: str, error: Exception | None = None) -> int:
     count = _FALLBACK_COUNTS.get(op, 0) + 1
     _FALLBACK_COUNTS[op] = count
-    logger.debug("A5 FFT %s fallback #%d: %s", op, count, error)
+    if error is None:
+        logger.debug("A5 FFT %s fallback #%d", op, count)
+    else:
+        logger.debug("A5 FFT %s fallback #%d: %s", op, count, error)
+    return count
+
+
+def _warn_fallback(op: str, error: Exception) -> None:
+    _count_fallback(op, error)
     if op in _WARNED:
         return
     _WARNED.add(op)
@@ -99,7 +107,8 @@ def _stft_on_cpu(
     pad_mode: str,
     normalized: bool,
     onesided: bool | None,
-    return_complex: bool,
+    return_complex: bool | None,
+    align_to_window: bool | None = None,
 ) -> torch.Tensor:
     device = input.device
     result = _TORCH_STFT(
@@ -113,6 +122,7 @@ def _stft_on_cpu(
         normalized=normalized,
         onesided=onesided,
         return_complex=return_complex,
+        align_to_window=align_to_window,
     )
     return result.to(device)
 
@@ -127,9 +137,12 @@ def _stft_fft(
     pad_mode: str,
     normalized: bool,
     onesided: bool | None,
-    return_complex: bool,
+    return_complex: bool | None,
+    align_to_window: bool | None = None,
 ) -> torch.Tensor:
     if input.dim() not in (1, 2) or torch.is_complex(input) or n_fft <= 0:
+        raise _FallbackError
+    if return_complex is None or align_to_window:
         raise _FallbackError
 
     hop_length = n_fft // 4 if hop_length is None else int(hop_length)
@@ -180,9 +193,10 @@ def stft(
     pad_mode: str = "reflect",
     normalized: bool = False,
     onesided: bool | None = None,
-    return_complex: bool = False,
+    return_complex: bool | None = None,
+    align_to_window: bool | None = None,
 ) -> torch.Tensor:
-    if input.device.type == "cpu":
+    def fallback() -> torch.Tensor:
         return _stft_on_cpu(
             input,
             n_fft,
@@ -194,7 +208,11 @@ def stft(
             normalized,
             onesided,
             return_complex,
+            align_to_window,
         )
+
+    if input.device.type == "cpu":
+        return fallback()
     try:
         return _stft_fft(
             input,
@@ -207,36 +225,16 @@ def stft(
             normalized,
             onesided,
             return_complex,
+            align_to_window,
         )
     except _FallbackError:
-        return _stft_on_cpu(
-            input,
-            n_fft,
-            hop_length,
-            win_length,
-            window,
-            center,
-            pad_mode,
-            normalized,
-            onesided,
-            return_complex,
-        )
+        _count_fallback("STFT")
+        return fallback()
     except torch.OutOfMemoryError:
         raise
     except (RuntimeError, NotImplementedError) as error:
         _warn_fallback("STFT", error)
-        return _stft_on_cpu(
-            input,
-            n_fft,
-            hop_length,
-            win_length,
-            window,
-            center,
-            pad_mode,
-            normalized,
-            onesided,
-            return_complex,
-        )
+        return fallback()
 
 
 def _istft_on_cpu(
@@ -332,11 +330,16 @@ def _istft_fft(
         if input.shape[-1] != 2 or input.dtype not in (torch.float32, torch.float64):
             raise _FallbackError
         input = torch.view_as_complex(input.contiguous())
-    if input.shape[-2] == n_fft // 2 + 1:
-        onesided = True
-    elif input.shape[-2] == n_fft:
-        onesided = False
-    else:
+    if onesided is None:
+        if input.shape[-2] == n_fft // 2 + 1:
+            onesided = True
+        elif input.shape[-2] == n_fft:
+            onesided = False
+        else:
+            raise _FallbackError
+    elif onesided and input.shape[-2] != n_fft // 2 + 1:
+        raise _FallbackError
+    elif not onesided and input.shape[-2] != n_fft:
         raise _FallbackError
 
     real_dtype = torch.float64 if input.dtype == torch.complex128 else torch.float32
@@ -355,7 +358,7 @@ def _istft_fft(
         raise _FallbackError
     expected_len = n_fft + hop_length * (n_frames - 1)
     if length is None:
-        target_len = expected_len - (n_fft if center else 0)
+        target_len = expected_len - (2 * (n_fft // 2) if center else 0)
     else:
         target_len = int(length)
     if target_len < 0:
@@ -395,7 +398,7 @@ def istft(
     length: int | None = None,
     return_complex: bool = False,
 ) -> torch.Tensor:
-    if input.device.type == "cpu":
+    def fallback() -> torch.Tensor:
         return _istft_on_cpu(
             input,
             n_fft,
@@ -408,6 +411,9 @@ def istft(
             length,
             return_complex,
         )
+
+    if input.device.type == "cpu":
+        return fallback()
     try:
         return _istft_fft(
             input,
@@ -422,34 +428,13 @@ def istft(
             return_complex,
         )
     except _FallbackError:
-        return _istft_on_cpu(
-            input,
-            n_fft,
-            hop_length,
-            win_length,
-            window,
-            center,
-            normalized,
-            onesided,
-            length,
-            return_complex,
-        )
+        _count_fallback("ISTFT")
+        return fallback()
     except torch.OutOfMemoryError:
         raise
     except (RuntimeError, NotImplementedError) as error:
         _warn_fallback("ISTFT", error)
-        return _istft_on_cpu(
-            input,
-            n_fft,
-            hop_length,
-            win_length,
-            window,
-            center,
-            normalized,
-            onesided,
-            length,
-            return_complex,
-        )
+        return fallback()
 
 
 def _install() -> None:

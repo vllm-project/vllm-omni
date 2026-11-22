@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -182,6 +183,39 @@ def test_stft_fft_rejects_short_input() -> None:
         module._stft_fft(torch.randn(8), 16, 4, 16, window, False, "reflect", False, None, True)
 
 
+def test_stft_signature_matches_torch() -> None:
+    module = _load_module()
+    params = inspect.signature(module.stft).parameters
+    assert params["return_complex"].default is None
+    assert params["align_to_window"].default is None
+
+
+def test_stft_fft_falls_back_for_implicit_return_complex() -> None:
+    module = _load_module()
+    window = torch.hann_window(16)
+    with pytest.raises(module._FallbackError):
+        module._stft_fft(torch.randn(1, 64), 16, 4, 16, window, True, "reflect", False, None, None)
+
+
+def test_stft_fft_falls_back_for_align_to_window() -> None:
+    module = _load_module()
+    window = torch.hann_window(16)
+    with pytest.raises(module._FallbackError):
+        module._stft_fft(
+            torch.randn(1, 64),
+            16,
+            4,
+            16,
+            window,
+            True,
+            "reflect",
+            False,
+            None,
+            True,
+            True,
+        )
+
+
 def test_stft_fft_falls_back_for_complex_window() -> None:
     module = _load_module()
     torch.manual_seed(8)
@@ -320,6 +354,26 @@ def test_istft_fft_rejects_complex_output_with_full_spectrum() -> None:
         module._istft_fft(spec, 4, 4, 4, torch.ones(4), False, False, False, None, True)
 
 
+@pytest.mark.parametrize("freq_bins,onesided", [(3, False), (4, True)])
+def test_istft_fft_rejects_explicit_onesided_mismatch(freq_bins: int, onesided: bool) -> None:
+    module = _load_module()
+    spec = torch.zeros(1, freq_bins, 1, dtype=torch.complex64)
+    with pytest.raises(module._FallbackError):
+        module._istft_fft(spec, 4, 4, 4, torch.ones(4), False, False, onesided, None, False)
+
+
+def test_istft_fft_odd_n_fft_matches_torch() -> None:
+    module = _load_module()
+    torch.manual_seed(10)
+    audio = torch.randn(1, 5)
+    window = torch.hann_window(5)
+    spec = torch.stft(audio, 5, 2, 5, window=window, return_complex=True)
+    expected = torch.istft(spec, 5, 2, 5, window=window)
+    actual = module._istft_fft(spec, 5, 2, 5, window, True, False, None, None, False)
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_istft_envelope_cache_recomputes_after_window_mutation() -> None:
     module = _load_module()
     torch.manual_seed(7)
@@ -386,6 +440,21 @@ def test_stft_propagates_oom(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "_stft_fft", fail)
     with pytest.raises(torch.OutOfMemoryError):
         module.stft(torch.empty(0, device="meta"), 16, 4, 16)
+
+
+def test_unsupported_signature_counts_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_WARNED", set())
+    monkeypatch.setattr(module, "_FALLBACK_COUNTS", {})
+
+    def fail(*_args, **_kwargs):
+        raise module._FallbackError
+
+    monkeypatch.setattr(module, "_stft_fft", fail)
+    monkeypatch.setattr(module, "_stft_on_cpu", lambda *_args, **_kwargs: torch.empty(0))
+    result = module.stft(torch.empty(0, device="meta"), 16, 4, 16)
+    assert result.numel() == 0
+    assert module.fallback_counts() == {"STFT": 1}
 
 
 def test_fallback_counter_tracks_repeated_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
