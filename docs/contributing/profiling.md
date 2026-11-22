@@ -1,6 +1,56 @@
-# Profiling Diffusion Models
+# Profiling
 
 > **Warning:** Profiling is for development and debugging only. It adds significant overhead and should not be enabled in production.
+
+## Offline Qwen2.5-Omni and CosyVoice3 examples
+
+Both examples accept `--profiler-config` as a JSON object and forward the parsed
+dictionary to `Omni`. Omitting the flag leaves profiling disabled; setting
+`VLLM_TORCH_PROFILER_DIR` alone does not enable it. Invalid JSON and non-object
+values such as `[]` or `null` are rejected by the argument parser before engine
+initialization. Backend-specific fields are validated by the engine configuration.
+
+```bash
+python examples/offline_inference/qwen2_5_omni/end2end.py \
+  --model Qwen/Qwen2.5-Omni-7B \
+  --profiler-config '{"profiler":"torch","torch_profiler_dir":"./perf/qwen2_5"}'
+
+python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
+  --model /path/to/Fun-CosyVoice3-0.5B \
+  --tokenizer /path/to/CosyVoice-BlankEN \
+  --ref-audio /path/to/reference.wav \
+  --profiler-config '{"profiler":"torch","torch_profiler_dir":"./perf/cosyvoice3"}'
+```
+
+The scripts start profiling before generation and stop it after the requested
+outputs have been processed. Qwen2.5-Omni profiles stage 0; CosyVoice3 uses the
+engine's default stage selection. For Nsight Systems, use `{"profiler":"cuda"}`
+and launch the example under `nsys profile` as described below.
+
+### Shared argument-parser API
+
+Example authors can reuse
+[`add_profiler_config_arg`][vllm_omni.utils.profiler.add_profiler_config_arg]:
+
+```python
+import argparse
+
+from vllm_omni.utils.profiler import add_profiler_config_arg
+
+parser = argparse.ArgumentParser()
+add_profiler_config_arg(parser)
+args = parser.parse_args()
+# Forward args.profiler_config to Omni(profiler_config=...).
+```
+
+The option defaults to `None`. When provided, it uses
+[`parse_profiler_config`][vllm_omni.utils.profiler.parse_profiler_config], which
+raises `argparse.ArgumentTypeError` for malformed JSON or non-object values.
+[`parse_json_object`][vllm_omni.utils.profiler.parse_json_object] provides the same
+validation with a caller-supplied flag name. These helpers validate the JSON
+object shape only; they do not replace the engine's profiler configuration.
+
+## Diffusion profiling
 
 Diffusion profiling supports two backends through `profiler_config`:
 
@@ -371,9 +421,9 @@ Each 1-second window records:
 On shutdown the server also logs a short summary (`loop_active_pct`, per-replica queue averages/maxima).
 
 `loop_idle` and `loop_active` count loop iterations, so their absolute scale is
-tied to which orchestration loop is running. Under the default poll loop an idle
-orchestrator records roughly one iteration per millisecond. Under the
-event-driven loop (`VLLM_OMNI_EVENT_DRIVEN_ORCH=1`, see
+tied to which orchestration loop is running. Under the legacy poll loop
+(`VLLM_OMNI_EVENT_DRIVEN_ORCH=0`) an idle orchestrator records roughly one
+iteration per millisecond. Under the default event-driven loop (see
 [Speech API](../serving/speech_api.md#orchestration-loop-experimental)) an idle
 orchestrator wakes only once per 0.5 s reconcile timeout, while a busy one still
 records one iteration per routed output. Window counts and the `loop_active_pct`

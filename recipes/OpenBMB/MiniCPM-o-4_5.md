@@ -218,6 +218,11 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
 
+`--ref-audio` is optional for serving: omitting it uses the model-bundled
+`assets/HT_ref_audio.wav`; pass a WAV path to override the assistant voice.
+The Omni-DuplexEval generation CLI intentionally requires an explicit
+reference WAV to keep the assistant voice fixed across benchmark samples.
+
 The demo prints transcript deltas as they arrive and saves the streamed
 24 kHz audio to WAV files. The same session shape is available from Python
 through `vllm_omni.clients.duplex.DuplexClient` (over the server) or

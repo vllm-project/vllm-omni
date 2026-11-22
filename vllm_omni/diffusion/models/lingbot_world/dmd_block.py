@@ -28,6 +28,11 @@ from vllm_omni.diffusion.models.lingbot_world.transformer import (
     LingBotAttentionCache,
     LingBotTransformerCache,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.first_block import (
+    FirstBlockKVKey,
+    FirstBlockKVStore,
+    fingerprint_first_block_inputs,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.models.lingbot_world.transformer import CausalLingBotWorldTransformer3DModel
@@ -61,13 +66,23 @@ class LingBotDMDBlockRunner:
         device: torch.device,
         enforce_eager: bool,
         reuse_last_step_kv: bool = False,
+        first_block_kv_cpu_limit_bytes: int = 0,
     ) -> None:
         self.transformer = transformer
         self.device = device
         self.enforce_eager = enforce_eager
         # Experimental approximation: cache x_t/t_last features instead of x0/t=0.
         self.reuse_last_step_kv = reuse_last_step_kv
+        self.first_block_kv = (
+            FirstBlockKVStore(max_bytes=first_block_kv_cpu_limit_bytes) if first_block_kv_cpu_limit_bytes else None
+        )
+        self.first_block_projection_revision = 0
         logger.info("LingBot experimental last-step KV reuse: %s", self.reuse_last_step_kv)
+
+    def invalidate_first_block_kv(self) -> None:
+        self.first_block_projection_revision += 1
+        if self.first_block_kv is not None:
+            self.first_block_kv.invalidate()
 
     # ── cache selection ──────────────────────────────────────────────────
 
@@ -204,6 +219,43 @@ class LingBotDMDBlockRunner:
             return
         # Commit K/V only for the final clean block, never for noisy probes.
         cache_input = torch.cat((latents.to(dtype=condition.dtype), condition), dim=1)
+        first_block_key = None
+        build_generation = None
+        store = self.first_block_kv
+        if store is not None and ar is not None and start_frame == 0:
+            kv_cache = ar.state.kv_cache
+            snapshot_bytes = (
+                2
+                * condition.shape[2]
+                * kv_cache.spec.chunk_size
+                * kv_cache.num_layers
+                * kv_cache.num_kv_heads
+                * kv_cache.head_size
+                * kv_cache.dtype.itemsize
+            )
+            if snapshot_bytes > store.max_bytes:
+                store = None
+        if store is not None and ar is not None and start_frame == 0:
+            kv_cache = ar.state.kv_cache
+            first_block_key = FirstBlockKVKey(
+                input_sha256=fingerprint_first_block_inputs(cache_input, prompt_embeds, camera),
+                model_identity=id(self.transformer),
+                model_revision=self.first_block_projection_revision,
+                branch=ar.branch,
+                token_count=condition.shape[2] * kv_cache.spec.chunk_size,
+                num_layers=kv_cache.num_layers,
+                local_heads=kv_cache.num_kv_heads,
+                head_size=kv_cache.head_size,
+                dtype=kv_cache.dtype,
+                device=kv_cache.device,
+            )
+            snapshot = store.lookup(first_block_key)
+            if snapshot is not None:
+                ar.state.restore_first_block(ar.branch, snapshot)
+                store.record_restore(first_block_key)
+                logger.info("LingBot first-block self K/V cache hit: %s", first_block_key.input_sha256[:12])
+                return
+            build_generation = store.begin_build(first_block_key)
         if not self.enforce_eager:
             torch.compiler.cudagraph_mark_step_begin()
         self.transformer(
@@ -218,6 +270,11 @@ class LingBotDMDBlockRunner:
         )
         if ar is not None:
             ar.state.commit_paged_context(ar.branch)
+            if first_block_key is not None and build_generation is not None:
+                assert store is not None
+                layers = ar.state.snapshot_first_block(ar.branch, first_block_key.token_count)
+                if store.publish(build_generation, first_block_key, layers):
+                    logger.info("LingBot first-block self K/V cache published: %s", first_block_key.input_sha256[:12])
 
     def generate_block(
         self,

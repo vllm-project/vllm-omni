@@ -11,7 +11,7 @@ import inspect
 import pytest
 
 from vllm_omni.engine.duplex import events as events_module
-from vllm_omni.engine.duplex.commands import ClearOutputAudio, TruncateItem
+from vllm_omni.engine.duplex.commands import CancelResponse, ClearOutputAudio, DeleteItem, TruncateItem
 from vllm_omni.engine.duplex.events import (
     REALTIME_ERROR_TYPES_BY_CODE,
     AudioDelta,
@@ -43,7 +43,9 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     project_internal_event,
+    resolve_cancel_response,
     resolve_clear_output_audio,
+    resolve_delete_item,
     resolve_truncate_item,
     retrieve_item_events,
 )
@@ -576,3 +578,48 @@ def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
     audio_metrics = audio_delta.to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
     assert audio_metrics["ttft_ms"] == 200.0
     assert audio_metrics["ttfp_ms"] == 400.0
+
+
+@pytest.mark.parametrize("terminal", ["response.done", "audio.cancelled", "audio_end_of_turn"])
+def test_completed_projections_release_buffers_and_reject_late_output(terminal):
+    state = RealtimeProjectionState(session_id="duplex-retention")
+    for index in range(32):
+        response_id = f"finished-{index}"
+        item_id = f"item_{response_id}"
+        project_internal_event(state, {"type": "response.created", "response_id": response_id})
+        project_internal_event(state, {"type": "response.text.delta", "response_id": response_id, "delta": "hello"})
+        project_internal_event(
+            state, {"type": "response.output_audio.delta", "response_id": response_id, "text": "hello"}
+        )
+        ending = (
+            {"type": "response.output_audio.delta", "end_of_turn": True}
+            if terminal == "audio_end_of_turn"
+            else {"type": terminal}
+        )
+        events = project_internal_event(state, {**ending, "response_id": response_id})
+        assert _types(events).count("response.done") == 1
+        assert response_id not in state.response_states
+        assert retrieve_item_events(state, {"item_id": item_id})[0].to_realtime()["item"]["content"]
+        resolve_delete_item(state, DeleteItem(item_id=item_id))
+        for late_type in ("response.done", "response.text.delta", "response.output_audio.delta", "response.speak"):
+            assert (
+                project_internal_event(
+                    state, {"type": late_type, "response_id": response_id, "delta": "late", "text": "late"}
+                )
+                == []
+            )
+        assert item_id not in state.conversation_items
+        assert not state.response_states
+
+    # An arbitrarily old deleted response remains inactive without tombstones.
+    cancelled = resolve_cancel_response(state, CancelResponse(response_id="finished-0"))
+    assert not cancelled.payloads
+    assert cancelled.events[0].code == "response_not_active"
+    # Retiring an older draining reply must preserve the newer live reply.
+    project_internal_event(state, {"type": "response.created", "response_id": "draining"})
+    project_internal_event(state, {"type": "response.created", "response_id": "active"})
+    project_internal_event(state, {"type": "response.done", "response_id": "draining"})
+    assert set(state.response_states) == {"active"}
+    assert state.active_response_id == "active"
+    project_internal_event(state, {"type": "response.done", "response_id": "active"})
+    assert not state.response_states

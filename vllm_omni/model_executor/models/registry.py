@@ -289,6 +289,12 @@ _OMNI_MODELS = {
         "hunyuan_image3",
         "HunyuanImage3ForConditionalGeneration",
     ),
+    ## fish_omni (Fish Audio Drama 3)
+    "FishOmniForConditionalGeneration": (
+        "fish_omni",
+        "fish_omni_model",
+        "FishOmniForConditionalGeneration",
+    ),
     ## fish_speech (Fish Speech S2 Pro)
     "FishSpeechSlowARForConditionalGeneration": (
         "fish_speech",
@@ -316,6 +322,12 @@ _OMNI_MODELS = {
         "audio8_tts",
         "audio8_tts_codec_decoder",
         "Audio8TTSCodecDecoder",
+    ),
+    ## VibeVoice
+    "VibeVoiceForConditionalGeneration": (
+        "vibevoice",
+        "vibevoice",
+        "VibeVoiceForConditionalGeneration",
     ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (

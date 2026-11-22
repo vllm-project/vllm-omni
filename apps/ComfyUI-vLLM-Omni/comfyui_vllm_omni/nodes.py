@@ -24,6 +24,7 @@ from .utils.types import (
     QwenTTSModelSpecificParams,
     VideoReferences,
     WanModelSpecificParams,
+    YuE2ModelSpecificParams,
 )
 from .utils.validators import (
     add_sampling_parameters_to_stage,
@@ -537,10 +538,10 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
 
 
 class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
-    """Generate a song from lyrics and a musical description with MiniMax Music 3."""
+    """Generate music from lyrics and a style caption using a remote vLLM-Omni service."""
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[object, ...]]]:
         return {
             "required": {
                 "url": ("STRING", {"default": "http://localhost:8000/v1"}),
@@ -567,6 +568,7 @@ class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**53 - 1, "control_after_generate": True}),
                 "response_format": (["wav", "mp3", "flac", "opus"],),
             },
+            "optional": {"model_specific_params": ("MUSIC_PARAMS",)},
         }
 
     RETURN_TYPES = ("AUDIO",)
@@ -582,7 +584,11 @@ class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
         response_format: AudioFormat,
         max_duration_seconds: float,
         seed: int = 0,
+        model_specific_params: dict[str, str] | None = None,
     ) -> tuple[AudioInput]:
+        extra = {}
+        if model_specific_params is not None:
+            extra["extra_params"] = dict(model_specific_params)
         audio = await VLLMOmniClient(url.rstrip("/")).generate_speech(
             model=model,
             input=lyrics,
@@ -592,8 +598,43 @@ class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
             response_format=response_format,
             max_new_tokens=int(max_duration_seconds * 25),
             seed=seed,
+            **extra,
         )
         return (audio,)
+
+
+class VLLMOmniYuE2Params:
+    """ABC conditioning for the YuE2 online music adapter."""
+
+    CATEGORY = "vLLM-Omni"
+    RETURN_TYPES = ("MUSIC_PARAMS",)
+    RETURN_NAMES = ("model_specific_params",)
+    FUNCTION = "get_params"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[object, ...]]]:
+        return {
+            "required": {
+                "cot": (["off", "melody", "full"],),
+                "abc": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "ABC score text, not a file path. Required for melody/full; empty for off.",
+                    },
+                ),
+            },
+        }
+
+    def get_params(self, cot: Literal["off", "melody", "full"], abc: str = "") -> tuple[YuE2ModelSpecificParams]:
+        if cot == "off":
+            if abc.strip():
+                raise ValueError("ABC requires cot=melody or full; clear ABC when cot=off.")
+            return (YuE2ModelSpecificParams(cot=cot),)
+        if not abc.strip():
+            raise ValueError("YuE2 melody/full requires supplied ABC score text; online ABC generation is unavailable.")
+        return (YuE2ModelSpecificParams(cot=cot, abc=abc),)
 
 
 class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):

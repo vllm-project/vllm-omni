@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 import websockets
@@ -174,6 +175,13 @@ async def _run_text_only_response_create(
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
 
 
+class _SeededAudioResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
 async def _run_seeded_text_to_audio(
     *,
     url: str,
@@ -183,7 +191,7 @@ async def _run_seeded_text_to_audio(
     modalities: tuple[str, ...] = ("audio", "text"),
     silence_seconds: float = 12.0,
     timeout_s: float = 180.0,
-) -> dict[str, object]:
+) -> _SeededAudioResult:
     """Speak a seeded text: the duplex route's text-to-speech shape.
 
     A model-native session takes its text once, in the session context
@@ -307,10 +315,9 @@ def test_duplex_single_session_response_required(omni_server, tmp_path: Path) ->
         output_dir=tmp_path / "single_session",
     )
     args.turns = 2
-    # Every turn replays the same active-speech window as the first one. The default
-    # shorter follow-up window is a different mid-utterance slice, which the native
-    # duplex model may legitimately answer with "listen" instead of a response.
-    args.turn_duration_ms = [args.first_turn_ms] * args.turns
+    # Require a response to a complete utterance. Cropping this 5.47 s fixture
+    # at 1.4 s can legitimately leave the native model listening on a later turn.
+    args.turn_duration_ms = [0] * args.turns
     result = asyncio.run(run_demo(args))
     assert result["ok"] is True
     _assert_positive_int(result["audio_delta_count"])
@@ -394,14 +401,31 @@ def test_duplex_seeded_text_to_audio(omni_server, locale: str, text: str) -> Non
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> None:
-    """text -> text, the one duplex session that opens without a reference voice.
+def test_duplex_seeded_text_to_audio_uses_model_default_reference_audio(omni_server) -> None:
+    """Audio-output sessions can use the prompt bundled with the model."""
+    result = asyncio.run(
+        _run_seeded_text_to_audio(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            ref_audio=None,
+            text="Please say: the quick brown fox jumps over the lazy dog.",
+        )
+    )
 
-    ``ref_audio`` is required only when the session asks for audio output, so a
-    ``modalities: ["text"]`` session is the duplex equivalent of the deleted
-    turn-based ``text -> text`` case. The model is model-native and still
-    speaks its answer, so this asserts the text side and the absence of the
-    ``ref_audio_required`` rejection, not the absence of audio.
+    assert "response.done" in result["event_types"], result["event_types"]
+    assert int(result["audio_bytes"]) > 0, "seeded text with the model default produced no audio"
+    assert str(result["transcript"]).strip(), "seeded text with the model default produced no transcript"
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> None:
+    """Text-only sessions do not need to load or send a reference voice.
+
+    The model is model-native and may still speak its answer, so this checks the
+    text side and verifies that the text-only configuration skips reference
+    audio loading; it does not assert the absence of audio.
     """
     result = asyncio.run(
         _run_seeded_text_to_audio(

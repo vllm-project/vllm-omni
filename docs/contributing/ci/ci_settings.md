@@ -65,7 +65,7 @@ Canonical layout (prefer these paths for new changes):
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
 | **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
 | **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
-| **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
+| **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml`, `test-amd-weekly.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
 
 ## Platform configuration style
@@ -172,9 +172,9 @@ Canonical layout (prefer these paths for new changes):
 
     **Bootstrap:** [`amd/scripts/bootstrap-amd-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/scripts/bootstrap-amd-omni.sh)—skip-ci, diff filtering, Jinja render, then `buildkite-agent pipeline upload`.
 
-    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and ordinary `main`), and experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or `main` with `NIGHTLY=1`). Multiple PR tier labels combine their suites behind one image build. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, and `nightly` as an explicit override. During nightly burn-in every AMD nightly leaf is non-blocking.
+    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and ordinary `main`), experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or `main` with `NIGHTLY=1`), and `test-amd-weekly.yml` (`reliability` / `weekly-test` or `main` with `WEEKLY=1`). Multiple PR tier labels combine their suites behind one image build. A later suite's step is dropped only when its complete parsed definition equals a step in an earlier suite; distinct definitions and repeated steps within one suite are preserved. The bootstrap logs how many duplicate step definitions and physical jobs were dropped. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, `nightly`, and `weekly` as an explicit override. During nightly burn-in every AMD nightly leaf is non-blocking.
 
-    **Trigger boundary:** AMD label handling has two layers. First, the external `vllm-omni-amd-ci` Buildkite pipeline condition decides whether a GitHub label event creates a build. Only after that build starts does this repository's bootstrap inspect all current PR labels and select the ready, merge, nightly, or combined suites. Repository-side selection therefore cannot start AMD CI by itself. AMD-only nightly validation uses both `amd-test` and `nightly-test`: the external condition should accept an event for either label only when the complete PR label set contains both. `amd-test` admits the AMD pipeline, while `nightly-test` makes the bootstrap select `NIGHTLY_TESTS:test-amd-nightly.yml`. Existing `ready` / `merge-test` behavior and non-PR `main` / scheduled builds remain separate. For PR builds without a `DEBUG_TEST_YAML` override, an unreadable label set fails the bootstrap instead of silently selecting the wrong tier. Debug overrides skip label lookup and are validated directly; invalid values, including whitespace-only values, fail the bootstrap. Until the paired-label condition is configured, use an authorized manual Buildkite build with `DEBUG_TEST_YAML=nightly` and verify that the bootstrap reports only the nightly suite.
+    **Trigger boundary:** AMD label handling has two layers. First, the external `vllm-omni-amd-ci` Buildkite pipeline condition decides whether a GitHub label event creates a build. Only after that build starts does this repository's bootstrap inspect all current PR labels and select the ready, merge, nightly, weekly, or combined suites. Repository-side selection therefore cannot start AMD CI by itself. AMD-only nightly validation uses both `amd-test` and `nightly-test`: the external condition should accept an event for either label only when the complete PR label set contains both. `amd-test` admits the AMD pipeline, while `nightly-test` makes the bootstrap select `NIGHTLY_TESTS:test-amd-nightly.yml`. Existing `ready` / `merge-test` behavior and non-PR `main` / scheduled builds remain separate. For PR builds without a `DEBUG_TEST_YAML` override, an unreadable label set fails the bootstrap instead of silently selecting the wrong tier. Debug overrides skip label lookup and are validated directly; invalid values, including whitespace-only values, fail the bootstrap. Until the paired-label condition is configured, use an authorized manual Buildkite build with `DEBUG_TEST_YAML=nightly` and verify that the bootstrap reports only the nightly suite.
 
     **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd-build` image build and `amd_<agent_pool>` queues. Do **not** hand-edit generated `pipeline.yaml`.
 
@@ -246,7 +246,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs, so an explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff.
+**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs. An explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff. AMD weekly remains runnable for scheduled `main` + `WEEKLY=1`; a PR `weekly-test` selection still honors `skip_all`.
 
 **Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
@@ -263,7 +263,7 @@ Register new files in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `
 | L3 | `.buildkite/cuda/test-merge.yml` | cuda |
 | L3 | `.buildkite/amd/test-amd-merge.yml` | amd |
 | L4/L5 | `.buildkite/cuda/test-nightly.yml`, `test-weekly.yml` | cuda |
-| L4/L5 | `.buildkite/amd/test-amd-nightly.yml` | amd |
+| L4/L5 | `.buildkite/amd/test-amd-nightly.yml`, `test-amd-weekly.yml` | amd |
 | L4/L5 | `.buildkite/npu/test-npu-nightly.yml` | npu |
 
 ##### Yaml-gated category branches
@@ -296,7 +296,7 @@ Docs/skip-mark mixed with any row below follows the same matrix.
 | CUDA ready + AMD merge | G4 | `cuda/l2` + `amd/l3` |
 | CUDA ready + AMD ready | G2 | `cuda/l2` + `amd/l2` |
 | CUDA merge + AMD merge | G3 | `cuda/l3` + `amd/l3` |
-| Only nightly / weekly / amd-nightly / npu-nightly YAML | G1 | (none) |
+| Only nightly / weekly / amd-nightly / amd-weekly / npu-nightly YAML | G1 | (none) |
 | CUDA ready + nightly | G5 | `cuda/l2` |
 | CUDA merge + nightly | G6 | `cuda/l3` |
 | CUDA ready + merge + nightly | G7 | `cuda/l2` + `cuda/l3` |
@@ -428,8 +428,9 @@ loads the model once per mode.
 Before splitting, confirm each half actually collects at least one test under the job's forwarded filters — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
 
 Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
-`_cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
-test asking for more GPUs than the preset provides is silently skipped and its
+The hardware-mark helpers turn `num_cards > 1` into a device-count `skipif` on
+the active CUDA, ROCm, XPU, NPU or MUSA platform, so a test asking for more
+devices than the preset provides is silently skipped and its
 coverage artifact comes back empty. Splitting such a job produces a file that
 looks fine and measures nothing — "Diffusion · Z Image Test" is the current
 example (online tests want 4 cards, the job runs on `l4_1`), which is why it is

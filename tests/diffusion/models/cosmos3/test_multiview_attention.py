@@ -9,6 +9,7 @@ import math
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
     MaskItem,
     MultiviewAttentionContext,
@@ -190,7 +191,7 @@ def test_triton_attention_numerically_matches_dense_on_cpu() -> None:
     _numerical_comparison("cpu", torch.float32)
 
 
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA numerical comparison")
 def test_cuda_attention_numerically_matches_dense() -> None:
     # Triton's production entrypoint compiles the dynamic-shape Flex kernel.

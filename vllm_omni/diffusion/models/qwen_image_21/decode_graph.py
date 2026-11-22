@@ -155,9 +155,17 @@ class QwenImage21DecodeGraphEntry:
         # the tree; entries only keep their *output* alive, whose tiny size
         # makes reuse safe because the caller clones it before any other graph
         # on the pool replays.
-        with torch.inference_mode(False), torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                self.output = body()
+        # Pooled streams recycle, so warm-up may run on the capture stream and
+        # leave its cuBLAS workspace outside the graph pool, where evicting
+        # another graph frees it under survivors. Clear around capture, as
+        # torch cudagraph trees do, so captured workspaces live in the pool.
+        torch._C._cuda_clearCublasWorkspaces()
+        try:
+            with torch.inference_mode(False), torch.no_grad():
+                with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+                    self.output = body()
+        finally:
+            torch._C._cuda_clearCublasWorkspaces()
         self.graph = graph
         self.captures += 1
 

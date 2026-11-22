@@ -58,6 +58,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
         self._diffusion_lora_suspended_slices = None
+        self._diffusion_lora_epilogue_scale: float | None = None
 
     def reset_lora(self, index: int):
         super().reset_lora(index)
@@ -65,6 +66,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
         # The upload is gone, so a saved mask no longer describes the buffers.
         self._diffusion_lora_suspended_slices = None
+        self._diffusion_lora_epilogue_scale = None
 
     def set_lora(
         self,
@@ -173,7 +175,8 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # LoRA shrink & expand as in add_lora_linear():
             #   buffer = (x @ A.T)
             #   y += buffer @ B.T
-            buffer = x_flat @ A.t()
+            epilogue_scale = getattr(self, "_diffusion_lora_epilogue_scale", None)
+            buffer = (x_flat if epilogue_scale is None else x_flat.to(A.dtype)) @ A.t()
             y_slice = y_flat[:, offset : offset + slice_size]
 
             # In inference, accumulate the expand GEMM directly into the base
@@ -181,9 +184,17 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # result of the following elementwise addition. ``out=`` does not
             # support autograd, so training keeps the functional fallback.
             if not torch.is_grad_enabled() and y_slice.dtype == buffer.dtype == B.dtype:
-                torch.addmm(y_slice, buffer, B.t(), out=y_slice)
+                if epilogue_scale is None:
+                    torch.addmm(y_slice, buffer, B.t(), out=y_slice)
+                else:
+                    torch.addmm(y_slice, buffer, B.t(), alpha=epilogue_scale, out=y_slice)
             else:
-                y_slice[:] = y_slice + buffer @ B.t()
+                delta = buffer @ B.t()
+                if epilogue_scale is not None:
+                    if epilogue_scale != 1.0:
+                        delta = delta * epilogue_scale
+                    delta = delta.to(y_slice.dtype)
+                y_slice[:] = y_slice + delta
             offset += slice_size
 
         return y_flat.view(original_shape)

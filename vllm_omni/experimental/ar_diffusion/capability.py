@@ -13,6 +13,8 @@ from vllm_omni.errors import OmniClientError
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext
+    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE = "ARDiffusionRequestRejectedError"
@@ -74,6 +76,44 @@ class ARDiffusionCrossAttentionKVSpec:
 
 
 @dataclass(frozen=True)
+class ARDiffusionSegmentedKVSpec:
+    """Bounds for immutable, independently retained token segments.
+
+    Segments may end partway through a page. Attention consumes their exact
+    valid rows through reusable contiguous staging, never page padding.
+    Retention is supplied by the model as ordered opaque segment handles.
+    ``initial_staging_tokens`` reserves normal forward shapes; longer
+    conditioning can grow staging outside capture after memory admission.
+    """
+
+    block_size: int
+    max_retained_tokens: int
+    max_retained_segments: int
+    max_pending_tokens: int
+    max_pending_segments: int
+    initial_staging_tokens: int
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            if getattr(self, name) <= 0:
+                raise ValueError(f"AR-Diffusion segmented {name} must be positive, got {getattr(self, name)}")
+        if self.initial_staging_tokens < self.max_retained_tokens + self.max_pending_tokens:
+            raise ValueError("AR-Diffusion segmented staging must fit retained and pending tokens together")
+
+    @staticmethod
+    def _blocks(tokens: int, segments: int, block_size: int) -> int:
+        # Every segment has its own final partial page. The bound includes
+        # the worst independent rounding, not just rounding the total once.
+        return (tokens + block_size - 1) // block_size + segments - 1
+
+    def retained_blocks(self, block_size: int) -> int:
+        return self._blocks(self.max_retained_tokens, self.max_retained_segments, block_size)
+
+    def pending_blocks(self, block_size: int) -> int:
+        return self._blocks(self.max_pending_tokens, self.max_pending_segments, block_size)
+
+
+@dataclass(frozen=True)
 class ARDiffusionKVCacheSpec:
     """KV geometry and session policy supplied by an AR-Diffusion pipeline.
 
@@ -87,6 +127,12 @@ class ARDiffusionKVCacheSpec:
     ``frames_per_block``. ``max_scratch_tokens_per_branch`` is the maximum
     additional non-video KV (for example, action/state registers) that must
     coexist with that video span.
+
+    ``segmented`` opts into exact-token segments instead of frame-window
+    retention. Its token bounds govern storage and the model supplies ordered
+    retained segment handles; legacy frame fields are not retention policy
+    for this path.
+
     ``model_owned_state_bytes_per_session`` is a conservative upper bound for
     persistent per-session CUDA state outside runner-owned self/cross-attention
     KV and scratch pools.
@@ -114,6 +160,7 @@ class ARDiffusionKVCacheSpec:
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
     max_scratch_frames_per_branch: int | None = None
+    segmented: ARDiffusionSegmentedKVSpec | None = None
 
     def __post_init__(self) -> None:
         positive_fields = {
@@ -255,6 +302,18 @@ class SupportsARDiffusionWarmup(Protocol):
     def ar_diffusion_warmup_requests(self, session_id: str) -> Iterable[OmniDiffusionRequest]:
         """Yield requests for compiled shapes, each carrying ``session_id``."""
         ...
+
+
+@runtime_checkable
+class SupportsARDiffusionCellPipeline(Protocol):
+    """Cell Self-Forcing/Latest-KV pipeline (vertical slice). Mutually exclusive with tick KV."""
+
+    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec: ...
+
+    def bind_ar_diffusion_cell_context(
+        self,
+        ctx: ARDiffusionCellContext,
+    ) -> AbstractContextManager[None]: ...
 
 
 def supports_chunk_step_grouping(pipeline: object) -> bool:

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState, DuplexTurnEventType
-from vllm_omni.engine.duplex.plugin import PcmAppendReservation
+from vllm_omni.engine.duplex.plugin import PcmAppendReservation, settle_response_runtime
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -64,6 +64,10 @@ class AppendAttempt:
     #: append (a final or response-bound one), so an append that never happens
     #: has to unbind it again.
     owns_request: bool = False
+    #: Exact committed audio part, captured before this task can wait or yield.
+    input_audio_part: dict[str, object] | None = None
+    #: Original item identities for a batch, never accepted from client payloads.
+    input_audio_parts: dict[str, dict[str, object] | None] | None = None
     #: Commits timing state once the runtime accepts the append (before any
     #: returned output event can clear the continuation chain).
     on_append_accepted: Callable[[float], None] | None = None
@@ -192,6 +196,8 @@ class AppendAttempt:
                 ),
                 final=self.final,
                 expected_epoch=self.epoch,
+                input_audio_part=self.input_audio_part,
+                input_audio_parts=self.input_audio_parts,
                 on_append_accepted=self.on_append_accepted,
             )
             if append_ok:
@@ -238,7 +244,11 @@ class AppendAttempt:
 
     def _fail_precreated_response(self, reason: str) -> None:
         session = self.ctx.session
+        failed_response_id = session.active_response_id
         session.end_response(commit_text=False)
+        settle_response_runtime(
+            self.ctx.plugin, session, committed=False, response_id=failed_response_id, release_owner=True
+        )
         self.out.emit(
             {
                 "type": "response.done",

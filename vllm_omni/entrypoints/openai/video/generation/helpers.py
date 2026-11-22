@@ -28,7 +28,7 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import suppress
 from http import HTTPStatus
 from numbers import Integral
@@ -37,6 +37,7 @@ from typing import Any, Literal, cast
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from PIL import Image
+from pydantic import TypeAdapter, ValidationError
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
@@ -48,7 +49,7 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
-    VideoAction,
+    TimelineGuide,
     VideoError,
     VideoGenerationRequest,
     VideoGenerationStatus,
@@ -56,15 +57,15 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import (
-    EncodedVideoResult,
     LatentEditInput,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
+    TimelineGuideInput,
     _stage_diffusion_model_class_name,
 )
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, SaveContext, StorageBaseManager
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video_api_utils import (
@@ -75,12 +76,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_input_reference,
 )
 from vllm_omni.errors import OmniClientError
-from vllm_omni.model_extras.cosmos3 import (
-    has_multiview_upload_indexes,
-    multiview_lidar_upload_indexes,
-    reject_multiview_negative_fields,
-    resolve_multiview_uploads,
-)
+from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads, has_multiview_upload_indexes
 
 logger = init_logger(__name__)
 
@@ -103,15 +99,17 @@ CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", "
 CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 
+TIMELINE_GUIDE_MAX_ENTRIES = 8
+TIMELINE_GUIDE_MAX_FILES = 16
+TIMELINE_GUIDE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3", ".flac"})
+_TIMELINE_GUIDES_ADAPTER = TypeAdapter(list[TimelineGuide])
+
 LATENT_EDIT_SOURCE_MAX_BYTES = 512 * 1024 * 1024
 LATENT_EDIT_MASK_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
+# Scheduling slack on top of the engine abort budget when DELETE waits for a cancelled job.
 VIDEO_DELETE_TIMEOUT_S = 2.0
-_VIDEO_SAVE_CANCEL_GRACE_S = 1.0
-_VIDEO_CLEANUP_TIMEOUT_S = 1.0
-# Keep unfinished storage operations alive after their request stops waiting.
-_VIDEO_STORAGE_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, list[Any] | None]:
@@ -348,7 +346,7 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     if isinstance(exc, OmniClientError):
         return VideoError(code=exc.status_code, message=exc.message)
 
-    if isinstance(exc, EngineGenerateError | EngineDeadError):
+    if isinstance(exc, (EngineGenerateError, EngineDeadError)):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
 
@@ -363,131 +361,27 @@ def _lidar_storage_key(video_id: str) -> str:
 
 
 async def _cleanup_video(video_id: str):
-    tasks = []
     for key in (video_id, _lidar_storage_key(video_id)):
-        task = asyncio.create_task(_cleanup_video_artifact(STORAGE_MANAGER, key))
-        _track_video_storage_task(task, key)
-        tasks.append(task)
-    # Start both deletes even if another cancellation interrupts this cleanup.
-    await asyncio.gather(*(asyncio.shield(task) for task in tasks))
-
-
-async def _cleanup_video_artifact(manager: StorageBaseManager, key: str) -> None:
-    try:
-        await _delete_video_artifact(manager, key)
-    except Exception:
-        logger.warning("Failed to cleanup partial video artifact '%s'", key, exc_info=True)
-
-
-def _track_video_storage_task(task: asyncio.Task[Any], key: str) -> None:
-    _VIDEO_STORAGE_TASKS.add(task)
-
-    def completed(done: asyncio.Task[Any]) -> None:
-        _VIDEO_STORAGE_TASKS.discard(done)
-        if not done.cancelled():
-            try:
-                done.result()
-            except Exception:
-                logger.warning("Deferred video storage operation failed for '%s'", key, exc_info=True)
-
-    task.add_done_callback(completed)
-
-
-async def _delete_video_artifact(manager: StorageBaseManager, key: str) -> None:
-    task = asyncio.create_task(manager.delete(key))
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=_VIDEO_CLEANUP_TIMEOUT_S)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        # Cancelling a coroutine cannot stop its filesystem thread. Retain the
-        # deletion so it can finish without blocking request cancellation.
-        _track_video_storage_task(task, key)
-        raise
-
-
-def _cleanup_late_video_save(task: asyncio.Task[SaveContext], manager: StorageBaseManager, key: str) -> None:
-    _track_video_storage_task(task, key)
-
-    def completed(done: asyncio.Task[SaveContext]) -> None:
-        if not done.cancelled():
-            # A backend may publish a file and then raise. Clean up on either
-            # success or failure, using the manager that performed the save.
-            cleanup = asyncio.create_task(_cleanup_video_artifact(manager, key))
-            _track_video_storage_task(cleanup, key)
-
-    task.add_done_callback(completed)
-
-
-async def _save_video_artifact(data: bytes, key: str, *, cancel_grace_s: float = 0.0) -> SaveContext:
-    manager = STORAGE_MANAGER
-    task = asyncio.create_task(manager.save(data, key))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Only joint video/LiDAR jobs request a grace period. Use one deadline
-        # so repeated DELETEEs cannot extend it; ordinary video cancels at once.
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + cancel_grace_s
-        while not task.done() and (remaining := deadline - loop.time()) > 0:
-            try:
-                await asyncio.wait({task}, timeout=remaining)
-            except asyncio.CancelledError:
-                continue
-        if not task.done():
-            _cleanup_late_video_save(task, manager, key)
-        elif not task.cancelled():
-            task.exception()  # Retrieve errors; the cancelled job cleans up below.
-        raise
-
-
-def _cleanup_video_references(
-    reference_video: ReferenceVideo | None,
-    reference_audio: ReferenceAudio | None,
-    control_path: str | None = None,
-    latent_edit_input: LatentEditInput | None = None,
-) -> None:
-    if reference_video is not None:
-        for path in reference_video.cleanup_paths:
-            if os.path.exists(path):
-                os.unlink(path)
-    if reference_audio is not None:
-        cleanup_paths = reference_audio.cleanup_paths or tuple(_reference_list(reference_audio.path))
-        for path in cleanup_paths:
-            if os.path.exists(path):
-                os.unlink(path)
-    if control_path is not None and os.path.exists(control_path):
-        os.unlink(control_path)
-    if latent_edit_input is not None:
-        for path in latent_edit_input.cleanup_paths:
-            if os.path.exists(path):
-                os.unlink(path)
-
-
-def _unpack_video_generation_result(
-    result: Sequence[object] | EncodedVideoResult,
-) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
-    if isinstance(result, EncodedVideoResult):
-        return result.video_bytes, result.stage_durations, result.peak_memory_mb, result.action, result.video_metadata
-    video_metadata: dict[str, object] = {}
-    if len(result) == 5:
-        video_bytes, stage_durations, peak_memory_mb, action, raw_metadata = result
-        if isinstance(raw_metadata, dict):
-            video_metadata = {str(key): value for key, value in raw_metadata.items()}
-    else:
-        video_bytes, stage_durations, peak_memory_mb, action = result
-    return (
-        cast(bytes, video_bytes),
-        cast(dict[str, float], stage_durations),
-        float(cast(float, peak_memory_mb)),
-        cast(VideoAction | None, action),
-        video_metadata,
-    )
+        try:
+            await STORAGE_MANAGER.delete(key)
+        except Exception:
+            logger.warning("Failed to cleanup partial video artifact '%s'", key)
 
 
 @dataclasses.dataclass
-class VideoUploadResources:
-    """Files owned by this request, never caller-supplied paths from extra_params."""
+class VideoRequestResources:
+    """Temporary files owned by one request, never caller-supplied paths from extra_params.
+
+    Every persisted upload or downloaded reference is registered here as soon
+    as it exists, so one ``cleanup()`` covers every failure and completion path:
+    form parsing errors, the sync route, the async job, and a task cancelled
+    before its first step.
+    """
 
     paths: list[str] = dataclasses.field(default_factory=list)
+
+    def add(self, *paths: str) -> None:
+        self.paths.extend(paths)
 
     def cleanup(self) -> None:
         for path in self.paths:
@@ -496,7 +390,7 @@ class VideoUploadResources:
             except FileNotFoundError:
                 pass
             except OSError:
-                logger.warning("Failed to remove uploaded video reference %s", path, exc_info=True)
+                logger.warning("Failed to remove request file %s", path, exc_info=True)
 
 
 async def _run_video_generation_job(
@@ -506,17 +400,19 @@ async def _run_video_generation_job(
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
     reference_audio: ReferenceAudio | None = None,
-    control_path: str | None = None,
+    *,
+    resources: VideoRequestResources,
     app_state: Any | None = None,
-    upload_resources: VideoUploadResources | None = None,
     latent_edit_input: LatentEditInput | None = None,
 ) -> None:
+    job = await VIDEO_STORE.get(video_id)
+    if job is None:
+        logger.warning("Video job %s missing before generation task started; skipping", video_id)
+        resources.cleanup()
+        return
+
     started_at = time.perf_counter()
     try:
-        job = await VIDEO_STORE.get(video_id)
-        if job is None:
-            logger.warning("Video job %s missing before generation task started; skipping", video_id)
-            return
 
         async def _mark_started() -> None:
             await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
@@ -530,19 +426,17 @@ async def _run_video_generation_job(
             on_started=_mark_started,
             latent_edit_input=latent_edit_input,
         )
-        video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(result)
         lidar = None
-        if isinstance(result, EncodedVideoResult):
+        if result.lidar_bytes is not None:
             lidar = VideoLidarArtifact(
-                url=f"/v1/videos/{video_id}/lidar",
+                url=f"/v1/videos/{video_id}/content?variant=lidar",
                 file_name=_lidar_storage_key(video_id),
                 **result.lidar_metadata,
             )
 
-        cancel_grace_s = _VIDEO_SAVE_CANCEL_GRACE_S if lidar is not None else 0.0
-        save_context = await _save_video_artifact(video_bytes, video_id, cancel_grace_s=cancel_grace_s)
-        if lidar is not None:
-            await _save_video_artifact(result.lidar_bytes, _lidar_storage_key(video_id), cancel_grace_s=cancel_grace_s)
+        save_context = await STORAGE_MANAGER.save(result.video_bytes, video_id)
+        if result.lidar_bytes is not None:
+            await STORAGE_MANAGER.save(result.lidar_bytes, _lidar_storage_key(video_id))
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
         updated_fields = {
@@ -551,12 +445,12 @@ async def _run_video_generation_job(
             "file_name": f"{video_id}.{job.file_extension}",
             "completed_at": save_context.created_at,
             "inference_time_s": time.perf_counter() - started_at,
-            "stage_durations": stage_durations,
-            "peak_memory_mb": peak_memory_mb,
-            "action": action,
+            "stage_durations": result.stage_durations,
+            "peak_memory_mb": result.peak_memory_mb,
+            "action": result.action,
             "lidar": lidar,
         }
-        updated_fields.update({key: value for key, value in video_metadata.items() if value is not None})
+        updated_fields.update({key: value for key, value in result.video_metadata.items() if value is not None})
         if save_context.expires_at is not None:
             updated_fields["expires_at"] = save_context.expires_at
 
@@ -595,34 +489,25 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        try:
-            await _cleanup_video(video_id)
-        finally:
-            await VIDEO_STORE.pop(video_id)
+        await _cleanup_video(video_id)
+        await VIDEO_STORE.pop(video_id)
         raise
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
-        if upload_resources is not None:
-            upload_resources.cleanup()
+        resources.cleanup()
 
 
-async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
+async def _persist_uploaded_video_references(uploads: list[UploadFile], resources: VideoRequestResources) -> list[str]:
     paths: list[str] = []
-    try:
-        for upload in uploads:
-            suffix = Path(upload.filename or "").suffix.lower()
-            if suffix not in {".mkv", ".mov", ".mp4", ".webm"}:
-                suffix = ".mp4"
-            fd, path = tempfile.mkstemp(prefix="vllm_omni_video_reference_", suffix=suffix)
-            paths.append(path)
-            with os.fdopen(fd, "wb") as output:
-                while chunk := await upload.read(1024 * 1024):
-                    output.write(chunk)
-    except Exception:
-        for path in paths:
-            if os.path.exists(path):
-                os.unlink(path)
-        raise
+    for upload in uploads:
+        suffix = Path(upload.filename or "").suffix.lower()
+        if suffix not in {".mkv", ".mov", ".mp4", ".webm"}:
+            suffix = ".mp4"
+        fd, path = tempfile.mkstemp(prefix="vllm_omni_video_reference_", suffix=suffix)
+        resources.add(path)
+        paths.append(path)
+        with os.fdopen(fd, "wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                output.write(chunk)
     return paths
 
 
@@ -762,6 +647,38 @@ def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -
     if not suffix:
         suffix = ".png" if kind == "image" else ".mp4"
     return suffix
+
+
+async def _admit_multiview_uploads(
+    request: VideoGenerationRequest,
+    input_references: list[UploadFile],
+    resources: VideoRequestResources,
+) -> None:
+    """Persist multiview ``input_references`` and rewrite manifest indexes to their paths.
+
+    The model-specific manifest rules live in ``admit_multiview_uploads``; this
+    wrapper only supplies HTTP upload persistence and error mapping.
+    """
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        try:
+            path = await _persist_uploaded_control_reference(
+                input_references[index], max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=numeric_lidar
+            )
+        except HTTPException as exc:
+            raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
+        resources.add(path)
+        return path
+
+    try:
+        request.extra_params = await admit_multiview_uploads(
+            request.extra_params,
+            negative_prompt=request.negative_prompt,
+            num_uploads=len(input_references),
+            persist=persist,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
 
 
 def _validate_control_upload(
@@ -922,6 +839,7 @@ def _validate_minimax_h3_image_payload(
 
 async def _persist_uploaded_media_references(
     uploads: list[UploadFile],
+    resources: VideoRequestResources,
 ) -> tuple[list[Image.Image], list[str], list[str]]:
     """Persist a mixed MiniMax H3 multipart reference list.
 
@@ -932,55 +850,166 @@ async def _persist_uploaded_media_references(
     images: list[Image.Image] = []
     videos: list[str] = []
     audios: list[str] = []
-    paths: list[str] = []
     if len(uploads) > MINIMAX_H3_MAX_REFERENCE_COUNT:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"MiniMax H3 accepts at most {MINIMAX_H3_MAX_REFERENCE_COUNT} total references.",
         )
-    try:
-        for upload in uploads:
-            kind = _uploaded_media_kind(upload)
-            payload = await _read_upload_limited(upload, max_bytes=_minimax_h3_upload_limit(upload))
-            if kind == "image":
-                try:
-                    _validate_minimax_h3_image_payload(payload, filename=upload.filename)
-                    images.append(
-                        _decode_image_bytes(
-                            payload,
-                            source=f"uploaded image reference: {upload.filename}",
-                        )
+    for upload in uploads:
+        kind = _uploaded_media_kind(upload)
+        payload = await _read_upload_limited(upload, max_bytes=_minimax_h3_upload_limit(upload))
+        if kind == "image":
+            try:
+                _validate_minimax_h3_image_payload(payload, filename=upload.filename)
+                images.append(
+                    _decode_image_bytes(
+                        payload,
+                        source=f"uploaded image reference: {upload.filename}",
                     )
-                except InvalidInputReferenceError as exc:
-                    raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
-                continue
-            suffix = Path(upload.filename or "").suffix.lower()
-            if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST.value,
-                    detail="MiniMax H3 reference videos must use an MP4 or MOV file.",
                 )
-            if kind == "audio" and suffix and suffix not in MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES:
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST.value,
-                    detail="MiniMax H3 reference audio must use a WAV or MP3 file.",
-                )
-            if not suffix or len(suffix) > 8:
-                suffix = ".mp3" if kind == "audio" else ".mp4"
-            fd, path = tempfile.mkstemp(prefix="vllm_omni_reference_", suffix=suffix)
-            paths.append(path)
-            with os.fdopen(fd, "wb") as output:
-                output.write(payload)
-            if kind == "audio":
-                audios.append(path)
-            else:
-                videos.append(path)
-    except Exception:
-        for path in paths:
-            if os.path.exists(path):
-                os.unlink(path)
-        raise
+            except InvalidInputReferenceError as exc:
+                raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+            continue
+        suffix = Path(upload.filename or "").suffix.lower()
+        if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="MiniMax H3 reference videos must use an MP4 or MOV file.",
+            )
+        if kind == "audio" and suffix and suffix not in MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="MiniMax H3 reference audio must use a WAV or MP3 file.",
+            )
+        if not suffix or len(suffix) > 8:
+            suffix = ".mp3" if kind == "audio" else ".mp4"
+        fd, path = tempfile.mkstemp(prefix="vllm_omni_reference_", suffix=suffix)
+        resources.add(path)
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
+        if kind == "audio":
+            audios.append(path)
+        else:
+            videos.append(path)
     return images, videos, audios
+
+
+def _parse_timeline_guides(
+    handler: OmniOpenAIServingVideo,
+    timeline_guides: str | None,
+    guide_files: list[UploadFile],
+) -> tuple[list[TimelineGuide], dict[int, str]] | None:
+    """Validate the guide manifest and map each upload index to one modality."""
+    if not timeline_guides and not guide_files:
+        return None
+    if not handler.supports_timeline_guides:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Timeline guides are not supported by this model.",
+        )
+    if not timeline_guides:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="guide_files requires a timeline_guides manifest.",
+        )
+    try:
+        guides = _TIMELINE_GUIDES_ADAPTER.validate_json(timeline_guides)
+    except ValidationError as exc:
+        error = exc.errors()[0]
+        location = ".".join(str(item) for item in error["loc"])
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid timeline_guides{f' at {location}' if location else ''}: {error['msg']}",
+        ) from exc
+    if not guides:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="timeline_guides must not be empty.")
+    if len(guides) > TIMELINE_GUIDE_MAX_ENTRIES:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"timeline_guides accepts at most {TIMELINE_GUIDE_MAX_ENTRIES} entries.",
+        )
+    if len(guide_files) > TIMELINE_GUIDE_MAX_FILES:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"guide_files accepts at most {TIMELINE_GUIDE_MAX_FILES} uploads.",
+        )
+    kinds: dict[int, str] = {}
+    for guide in guides:
+        for kind in ("image", "video", "audio"):
+            source = getattr(guide, kind)
+            if source is None:
+                continue
+            index = source.upload_index
+            if index >= len(guide_files):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=(
+                        f"timeline_guides references guide_files[{index}], but only {len(guide_files)} were uploaded."
+                    ),
+                )
+            if kinds.setdefault(index, kind) != kind:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"guide_files[{index}] cannot be used as both {kinds[index]} and {kind}.",
+                )
+    if len(kinds) != len(guide_files):
+        unused = sorted(set(range(len(guide_files))) - set(kinds))
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"guide_files{unused} are not referenced by timeline_guides.",
+        )
+    return guides, kinds
+
+
+async def _persist_timeline_guides(
+    guides: list[TimelineGuide],
+    kinds: dict[int, str],
+    guide_files: list[UploadFile],
+    resources: VideoRequestResources,
+) -> TimelineGuideInput:
+    """Decode guide images in memory and persist clips and audio as files."""
+    sources: dict[int, Any] = {}
+    for index, kind in sorted(kinds.items()):
+        upload = guide_files[index]
+        field_name = f"guide_files[{index}]"
+        suffix = Path(upload.filename or "").suffix.lower()
+        if kind == "image":
+            payload = await _read_upload_limited(upload, max_bytes=MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES)
+            _validate_minimax_h3_image_payload(payload, filename=upload.filename)
+            try:
+                sources[index] = _decode_image_bytes(payload, source=f"uploaded {field_name}")
+            except InvalidInputReferenceError as exc:
+                raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+            continue
+        if kind == "video":
+            allowed, max_bytes, expected = (
+                MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES,
+                MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES,
+                "an MP4 or MOV file",
+            )
+        else:
+            allowed, max_bytes, expected = (
+                TIMELINE_GUIDE_AUDIO_SUFFIXES,
+                MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES,
+                "a WAV, MP3, or FLAC file",
+            )
+        if suffix not in allowed:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"{field_name} used as a {kind} guide must be {expected}.",
+            )
+        path = await _persist_uploaded_reference(upload, field_name="guide_file", suffix=suffix, max_bytes=max_bytes)
+        resources.add(path)
+        sources[index] = path
+    resolved = []
+    for guide in guides:
+        entry: dict[str, Any] = {"frame_index": guide.frame_index}
+        for kind in ("image", "video", "audio"):
+            source = getattr(guide, kind)
+            if source is not None:
+                entry[kind] = sources[source.upload_index]
+        resolved.append(entry)
+    return TimelineGuideInput(guides=resolved)
 
 
 async def _parse_video_form(
@@ -1027,6 +1056,8 @@ async def _parse_video_form(
     source_audio: UploadFile | None = File(default=None),
     video_noise_mask: UploadFile | None = File(default=None),
     audio_noise_mask: UploadFile | None = File(default=None),
+    timeline_guides: str | None = Form(default=None),
+    guide_files: list[UploadFile] | None = File(default=None),
 ) -> tuple[
     VideoGenerationRequest,
     "OmniOpenAIServingVideo",
@@ -1034,8 +1065,7 @@ async def _parse_video_form(
     ReferenceImage | None,
     ReferenceVideo | None,
     ReferenceAudio | None,
-    str | None,
-    VideoUploadResources,
+    VideoRequestResources,
     LatentEditInput | None,
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
@@ -1140,7 +1170,9 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
-    upload_resources = VideoUploadResources()
+    resources = VideoRequestResources()
+    parsed_timeline_guides = _parse_timeline_guides(handler, timeline_guides, guide_files or [])
+
     has_latent_edit = _validate_latent_edit_inputs(
         handler,
         source_video=source_video,
@@ -1149,228 +1181,173 @@ async def _parse_video_form(
         audio_noise_mask=parsed_audio_noise_mask,
     )
 
-    supports_multiview = bool(getattr(handler, "supports_multiview_reference_inputs", False))
-    has_indexes = has_multiview_upload_indexes(request.extra_params or {})
-    if has_indexes and not supports_multiview:
-        raise HTTPException(400, detail="This model does not support multiview uploaded references.")
-    if supports_multiview and (input_references or has_indexes):
-        if has_latent_edit or any(
-            value is not None
-            for value in (
+    try:
+        supports_multiview = handler.supports_multiview_reference_inputs
+        has_indexes = has_multiview_upload_indexes(request.extra_params or {})
+        if has_indexes and not supports_multiview:
+            raise HTTPException(400, detail="This model does not support multiview uploaded references.")
+        if supports_multiview and (input_references or has_indexes):
+            if has_latent_edit or any(
+                value is not None
+                for value in (
+                    input_reference,
+                    parsed_image_reference,
+                    parsed_video_reference,
+                    parsed_audio_reference,
+                    control_reference,
+                    control_type,
+                )
+            ):
+                raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
+            await _admit_multiview_uploads(request, input_references, resources)
+            return request, handler, effective_model_name, None, None, None, resources, None
+
+        normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
+        if normalized_control_type is not None:
+            # Make the selected transfer mode visible while choosing the model's
+            # reference-video decode policy. The upload itself stays unpersisted
+            # until reference parsing succeeds, preserving failure cleanup.
+            _attach_control_upload(request, normalized_control_type)
+
+        supports_mixed_reference_inputs = handler.supports_mixed_reference_inputs
+        if input_reference is not None:
+            input_reference_bytes = await _read_upload_limited(
                 input_reference,
-                parsed_image_reference,
-                parsed_video_reference,
-                parsed_audio_reference,
-                control_reference,
-                control_type,
+                max_bytes=_minimax_h3_upload_limit(input_reference) if supports_mixed_reference_inputs else None,
             )
-        ):
-            raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
-        try:
-            reject_multiview_negative_fields({"negative_prompt": request.negative_prompt}, "request")
-            # Validate all camera/role mappings and media kinds before creating files.
-            # The LiDAR control and the measured LiDAR condition are numeric uploads.
-            lidar_indexes = multiview_lidar_upload_indexes(request.extra_params or {})
-            resolve_multiview_uploads(
-                request.extra_params or {},
-                [
-                    "reference" + _control_upload_suffix(upload, numeric_lidar=index in lidar_indexes)
-                    for index, upload in enumerate(input_references)
-                ],
-            )
-            for index, upload in enumerate(input_references):
-                try:
-                    path = await _persist_uploaded_control_reference(
-                        upload, max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=index in lidar_indexes
-                    )
-                except HTTPException as exc:
-                    raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
-                upload_resources.paths.append(path)
-                if index in lidar_indexes:
-                    from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
-
-                    validate_lidar_header(path)
-            request.extra_params = resolve_multiview_uploads(request.extra_params or {}, upload_resources.paths)
-            return request, handler, effective_model_name, None, None, None, None, upload_resources, None
-        except (TypeError, ValueError) as exc:
-            upload_resources.cleanup()
-            raise HTTPException(400, detail=str(exc)) from exc
-        except BaseException:
-            upload_resources.cleanup()
-            raise
-
-    normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
-    if normalized_control_type is not None:
-        # Make the selected transfer mode visible while choosing the model's
-        # reference-video decode policy. The upload itself stays unpersisted
-        # until reference parsing succeeds, preserving failure cleanup.
-        _attach_control_upload(request, normalized_control_type)
-
-    supports_mixed_reference_inputs = handler.supports_mixed_reference_inputs
-    if input_reference is not None:
-        input_reference_bytes = await _read_upload_limited(
-            input_reference,
-            max_bytes=_minimax_h3_upload_limit(input_reference) if supports_mixed_reference_inputs else None,
-        )
-        if supports_mixed_reference_inputs:
-            input_reference_kind = _uploaded_media_kind(input_reference)
-            _validate_minimax_h3_image_payload(
-                input_reference_bytes,
-                filename=input_reference.filename,
-                allow_non_image=input_reference_kind != "image",
-            )
-
-    decode_spec = ReferenceVideoDecodeSpec()
-    if not input_references and (parsed_video_reference is not None or input_reference_bytes is not None):
-        stage_configs = (
-            handler.stage_configs
-            or app_stage_configs
-            or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
-        )
-        decode_spec = _reference_video_decode_spec(request, stage_configs)
-    reference_image = None
-    reference_video = None
-    reference_audio: ReferenceAudio | None = None
-    if input_references:
-        if not supports_mixed_reference_inputs:
-            video_paths = await _persist_uploaded_video_references(input_references)
-            reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
-            images, audio_paths = [], []
-        else:
-            images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references)
-        if images:
-            reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
-        if video_paths:
-            reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
-        if audio_paths:
-            reference_audio = ReferenceAudio(path=audio_paths, cleanup_paths=tuple(audio_paths))
-    else:
-        video_paths: list[str] = []
-        try:
-            image_items = _reference_list(request.image_reference)
-            video_items = _reference_list(request.video_reference)
-            image_data = []
-            for item in image_items:
-                media_data = await decode_input_reference(item, None, None)
-                if not isinstance(media_data, Image.Image):
-                    raise InvalidInputReferenceError("image_reference did not decode to an image")
-                image_data.append(media_data)
-
-            video_frames: list[Image.Image] | None = None
-            for item in video_items:
-                media_data = await decode_input_reference(
-                    None,
-                    item,
-                    None,
-                    max_video_frames=decode_spec.max_frames,
-                    video_keep=decode_spec.keep,
-                )
-                if not isinstance(media_data, VideoFrames):
-                    raise InvalidInputReferenceError("video_reference did not decode to a video")
-                if media_data.source_path is not None:
-                    video_paths.append(media_data.source_path)
-                else:
-                    if len(video_items) != 1:
-                        raise InvalidInputReferenceError(
-                            "multiple video URL references must be downloadable source videos"
-                        )
-                    video_frames = list(media_data)
-
-            if input_reference_bytes is not None:
-                media_data = await decode_input_reference(
-                    None,
-                    None,
+            if supports_mixed_reference_inputs:
+                input_reference_kind = _uploaded_media_kind(input_reference)
+                _validate_minimax_h3_image_payload(
                     input_reference_bytes,
-                    max_video_frames=decode_spec.max_frames,
-                    video_keep=decode_spec.keep,
+                    filename=input_reference.filename,
+                    allow_non_image=input_reference_kind != "image",
                 )
-                if isinstance(media_data, Image.Image):
+
+        decode_spec = ReferenceVideoDecodeSpec()
+        if not input_references and (parsed_video_reference is not None or input_reference_bytes is not None):
+            stage_configs = (
+                handler.stage_configs
+                or app_stage_configs
+                or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
+            )
+            decode_spec = _reference_video_decode_spec(request, stage_configs)
+        reference_image = None
+        reference_video = None
+        reference_audio: ReferenceAudio | None = None
+        if input_references:
+            if not supports_mixed_reference_inputs:
+                video_paths = await _persist_uploaded_video_references(input_references, resources)
+                images, audio_paths = [], []
+            else:
+                images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references, resources)
+            if images:
+                reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
+            if video_paths:
+                reference_video = ReferenceVideo(data=video_paths)
+            if audio_paths:
+                reference_audio = ReferenceAudio(path=audio_paths)
+        else:
+            video_paths: list[str] = []
+            try:
+                image_items = _reference_list(request.image_reference)
+                video_items = _reference_list(request.video_reference)
+                image_data = []
+                for item in image_items:
+                    media_data = await decode_input_reference(item, None, None)
+                    if not isinstance(media_data, Image.Image):
+                        raise InvalidInputReferenceError("image_reference did not decode to an image")
                     image_data.append(media_data)
-                elif isinstance(media_data, VideoFrames):
+
+                video_frames: list[Image.Image] | None = None
+                for item in video_items:
+                    media_data = await decode_input_reference(
+                        None,
+                        item,
+                        None,
+                        max_video_frames=decode_spec.max_frames,
+                        video_keep=decode_spec.keep,
+                    )
+                    if not isinstance(media_data, VideoFrames):
+                        raise InvalidInputReferenceError("video_reference did not decode to a video")
                     if media_data.source_path is not None:
+                        resources.add(media_data.source_path)
                         video_paths.append(media_data.source_path)
                     else:
+                        if len(video_items) != 1:
+                            raise InvalidInputReferenceError(
+                                "multiple video URL references must be downloadable source videos"
+                            )
                         video_frames = list(media_data)
 
-            if image_data:
-                reference_image = ReferenceImage(data=image_data if len(image_data) > 1 else image_data[0])
-            if video_paths:
-                reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
-            elif video_frames is not None:
-                reference_video = ReferenceVideo(data=video_frames)
-        except InvalidInputReferenceError as exc:
-            for path in video_paths:
-                if os.path.exists(path):
-                    os.unlink(path)
-            raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
+                if input_reference_bytes is not None:
+                    media_data = await decode_input_reference(
+                        None,
+                        None,
+                        input_reference_bytes,
+                        max_video_frames=decode_spec.max_frames,
+                        video_keep=decode_spec.keep,
+                    )
+                    if isinstance(media_data, Image.Image):
+                        image_data.append(media_data)
+                    elif isinstance(media_data, VideoFrames):
+                        if media_data.source_path is not None:
+                            resources.add(media_data.source_path)
+                            video_paths.append(media_data.source_path)
+                        else:
+                            video_frames = list(media_data)
 
-    audio_paths = [] if reference_audio is None else list(_reference_list(reference_audio.path))
-    if request.audio_reference is not None:
-        try:
-            for audio_reference in _reference_list(request.audio_reference):
-                audio_paths.append(await decode_audio_url(audio_reference.audio_url))
-        except InvalidInputReferenceError as exc:
-            _cleanup_video_references(reference_video, reference_audio)
-            cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
-            for path in audio_paths:
-                if path not in cleanup_paths and os.path.exists(path):
-                    os.unlink(path)
-            raise HTTPException(400, detail=str(exc)) from exc
-    if audio_paths:
-        cleanup_paths = (
-            tuple(audio_paths)
-            if reference_audio is None
-            else reference_audio.cleanup_paths
-            + tuple(path for path in audio_paths if path not in reference_audio.cleanup_paths)
-        )
-        reference_audio = ReferenceAudio(
-            path=audio_paths if len(audio_paths) > 1 else audio_paths[0],
-            cleanup_paths=cleanup_paths,
-        )
+                if image_data:
+                    reference_image = ReferenceImage(data=image_data if len(image_data) > 1 else image_data[0])
+                if video_paths:
+                    reference_video = ReferenceVideo(data=video_paths)
+                elif video_frames is not None:
+                    reference_video = ReferenceVideo(data=video_frames)
+            except InvalidInputReferenceError as exc:
+                raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
 
-    control_path: str | None = None
-    if control_reference is not None and normalized_control_type is not None:
-        try:
+        audio_paths = [] if reference_audio is None else list(_reference_list(reference_audio.path))
+        if request.audio_reference is not None:
+            try:
+                for audio_reference in _reference_list(request.audio_reference):
+                    audio_path = await decode_audio_url(audio_reference.audio_url)
+                    resources.add(audio_path)
+                    audio_paths.append(audio_path)
+            except InvalidInputReferenceError as exc:
+                raise HTTPException(400, detail=str(exc)) from exc
+        if audio_paths:
+            reference_audio = ReferenceAudio(path=audio_paths if len(audio_paths) > 1 else audio_paths[0])
+
+        if control_reference is not None and normalized_control_type is not None:
             control_path = await _persist_uploaded_control_reference(
-                control_reference,
-                max_bytes=CONTROL_REFERENCE_MAX_BYTES,
+                control_reference, max_bytes=CONTROL_REFERENCE_MAX_BYTES
             )
+            resources.add(control_path)
             _attach_control_upload(request, normalized_control_type, control_path)
-        except (asyncio.CancelledError, HTTPException, OSError, TypeError, ValueError):
-            _cleanup_video_references(reference_video, reference_audio, control_path)
-            raise
 
-    latent_edit_input: LatentEditInput | None = None
-    if has_latent_edit:
-        source_paths: list[str] = []
-        try:
+        latent_edit_input: LatentEditInput | None = None
+        if has_latent_edit:
             source_video_path = None
             source_audio_path = None
             if source_video is not None:
-                source_video_path = await _persist_latent_edit_source(
-                    source_video,
-                    field_name="source_video",
-                )
-                source_paths.append(source_video_path)
+                source_video_path = await _persist_latent_edit_source(source_video, field_name="source_video")
+                resources.add(source_video_path)
             if source_audio is not None:
-                source_audio_path = await _persist_latent_edit_source(
-                    source_audio,
-                    field_name="source_audio",
-                )
-                source_paths.append(source_audio_path)
+                source_audio_path = await _persist_latent_edit_source(source_audio, field_name="source_audio")
+                resources.add(source_audio_path)
             latent_edit_input = LatentEditInput(
                 source_video=source_video_path,
                 source_audio=source_audio_path,
                 video_noise_mask=parsed_video_noise_mask,
                 audio_noise_mask=parsed_audio_noise_mask,
-                cleanup_paths=tuple(source_paths),
             )
-        except (asyncio.CancelledError, Exception):
-            for path in source_paths:
-                with suppress(OSError):
-                    os.unlink(path)
-            _cleanup_video_references(reference_video, reference_audio, control_path)
-            raise
+
+        if parsed_timeline_guides is not None:
+            guides, kinds = parsed_timeline_guides
+            request._timeline_guide_input = await _persist_timeline_guides(guides, kinds, guide_files or [], resources)
+    except BaseException:
+        # Any failure after the first file is written must release every file.
+        resources.cleanup()
+        raise
 
     return (
         request,
@@ -1379,7 +1356,6 @@ async def _parse_video_form(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
-        upload_resources,
+        resources,
         latent_edit_input,
     )

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""MiniMax-H3 DLO + DP2 online-serving smoke test."""
+"""MiniMax-H3 official-weight online-serving smoke tests."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ FPS = 24
 NUM_INFERENCE_STEPS = 4
 REQUEST_TIMEOUT_SECONDS = 1800
 H100_TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+MI300_FOUR_CARD_MARKS = hardware_marks(res={"rocm": "MI325"}, num_cards=4)
 
 SERVER_ARGS = [
     "--trust-remote-code",
@@ -63,6 +64,27 @@ SERVER_ARGS = [
         },
         separators=(",", ":"),
     ),
+]
+
+ROCM_SERVER_ARGS = [
+    "--trust-remote-code",
+    "--task-type",
+    "fl2va",
+    "--num-gpus",
+    "4",
+    "--usp",
+    "4",
+    "--ring",
+    "1",
+    "--text-encoder-tp-size",
+    "4",
+    "--vae-patch-parallel-size",
+    "4",
+    "--vae-parallel-mode",
+    "tile",
+    "--vae-use-tiling",
+    "--diffusion-attention-backend",
+    "FLASH_ATTN",
 ]
 
 
@@ -136,3 +158,28 @@ def test_minimax_h3_dlo_dp2_t2va(omni_server: OmniServer, openai_client: OpenAIC
     for video in videos:
         assert_video_valid(video, width=WIDTH, height=HEIGHT, fps=FPS)
         _assert_audio_stream_present(video)
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=ROCM_SERVER_ARGS,
+                stage_init_timeout=1800,
+                init_timeout=1800,
+            ),
+            id="minimax_h3_rocm_t2va",
+            marks=MI300_FOUR_CARD_MARKS,
+        )
+    ],
+    indirect=True,
+)
+def test_minimax_h3_rocm_t2va(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+    """Validate one no-offload ROCm T2VA request with the official checkpoint."""
+    video = _run_t2va_request(openai_client, 1101)
+    assert_video_valid(video, width=WIDTH, height=HEIGHT, fps=FPS)
+    _assert_audio_stream_present(video)

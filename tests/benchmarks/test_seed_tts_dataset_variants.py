@@ -302,3 +302,114 @@ def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch, audio_se
         assert calls["processor_kwargs"] == {}
         assert "return_timestamps" not in calls["generate_kwargs"]
         assert calls["no_timestamps"] is True
+
+
+@pytest.mark.parametrize("audio_seconds", [0.1, 61])
+def test_seed_tts_transcribe_retry_uses_language_task_kwargs(monkeypatch, audio_seconds):
+    """English-only checkpoints: ``get_decoder_prompt_ids`` rejects the
+    language/task kwargs, so the retry sends ``language``/``task`` to generate
+    instead of ``forced_decoder_ids`` — keeping attention_mask (and, for >30s
+    audio, return_timestamps) from the base kwargs."""
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    generate_calls = []
+
+    class FakeTensor:
+        def __init__(self, name: str):
+            self.name = name
+            self.device = None
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    class FakeProcessor:
+        def __call__(self, wav, *, sampling_rate, return_tensors, return_attention_mask=False, **kwargs):
+            return types.SimpleNamespace(
+                input_features=FakeTensor("features"),
+                attention_mask=FakeTensor("mask") if return_attention_mask else None,
+            )
+
+        def get_decoder_prompt_ids(self, **kwargs):
+            raise ValueError("unsupported named arguments")
+
+        def batch_decode(self, predicted_ids, *, skip_special_tokens):
+            assert predicted_ids == [[42]]
+            return ["hello"]
+
+    class FakeModel:
+        def generate(self, input_features, **kwargs):
+            generate_calls.append(kwargs)
+            return [[42]]
+
+    monkeypatch.setattr(seed_tts_eval, "_ensure_en_asr", lambda: None)
+    monkeypatch.setattr(seed_tts_eval, "_en_processor", FakeProcessor())
+    monkeypatch.setattr(seed_tts_eval, "_en_model", FakeModel())
+    monkeypatch.setattr(seed_tts_eval, "_device", "cuda:1")
+
+    text = seed_tts_eval._transcribe_en_f32_16k(np.ones(int(audio_seconds * 16000), dtype=np.float32))
+
+    assert text == "hello"
+    assert len(generate_calls) == 1
+    kwargs = generate_calls[0]
+    assert "forced_decoder_ids" not in kwargs
+    assert kwargs["language"] == "english"
+    assert kwargs["task"] == "transcribe"
+    assert kwargs["attention_mask"].device == "cuda:1"
+    assert kwargs.get("return_timestamps") is (True if audio_seconds > 30 else None)
+
+
+@pytest.mark.parametrize("audio_seconds", [0.1, 61])
+def test_seed_tts_transcribe_retry_falls_back_to_bare_kwargs(monkeypatch, audio_seconds):
+    """Checkpoints rejecting both ``forced_decoder_ids`` and the
+    ``language``/``task`` kwargs: the second retry calls generate with only the
+    base kwargs, attention_mask and return_timestamps still preserved."""
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    generate_calls = []
+
+    class FakeTensor:
+        def __init__(self, name: str):
+            self.name = name
+            self.device = None
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    class FakeProcessor:
+        def __call__(self, wav, *, sampling_rate, return_tensors, return_attention_mask=False, **kwargs):
+            return types.SimpleNamespace(
+                input_features=FakeTensor("features"),
+                attention_mask=FakeTensor("mask") if return_attention_mask else None,
+            )
+
+        def get_decoder_prompt_ids(self, **kwargs):
+            raise ValueError("unsupported named arguments")
+
+        def batch_decode(self, predicted_ids, *, skip_special_tokens):
+            assert predicted_ids == [[42]]
+            return ["hello"]
+
+    class FakeModel:
+        def generate(self, input_features, **kwargs):
+            generate_calls.append(kwargs)
+            if len(generate_calls) == 1:
+                raise ValueError("language not supported")
+            return [[42]]
+
+    monkeypatch.setattr(seed_tts_eval, "_ensure_en_asr", lambda: None)
+    monkeypatch.setattr(seed_tts_eval, "_en_processor", FakeProcessor())
+    monkeypatch.setattr(seed_tts_eval, "_en_model", FakeModel())
+    monkeypatch.setattr(seed_tts_eval, "_device", "cuda:1")
+
+    text = seed_tts_eval._transcribe_en_f32_16k(np.ones(int(audio_seconds * 16000), dtype=np.float32))
+
+    assert text == "hello"
+    assert len(generate_calls) == 2
+    assert generate_calls[0].get("language") == "english"
+    assert generate_calls[0].get("task") == "transcribe"
+    bare = generate_calls[1]
+    assert "language" not in bare and "task" not in bare and "forced_decoder_ids" not in bare
+    assert bare["attention_mask"].device == "cuda:1"
+    assert bare.get("return_timestamps") is (True if audio_seconds > 30 else None)

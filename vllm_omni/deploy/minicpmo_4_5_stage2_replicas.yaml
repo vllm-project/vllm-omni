@@ -1,0 +1,94 @@
+# MiniCPM-o 4.5 profiling overlay: all three stages on one device, with two
+# colocated stage-2 (Code2Wav) replicas. Experimental profiling entrypoint --
+# not a recommended production profile. Validated on NPU only; the CUDA numbers
+# below follow the same sizing logic but have not been exercised.
+#
+# Everything not spelled out here is inherited from minicpmo_4_5.yaml.
+base_config: minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+
+# Stage 0/1 run 4 concurrent sessions instead of 16 to leave device headroom
+# for the second stage-2 replica.
+duplex_session:
+  max_sessions: 4
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      # Cap whole-Euler CFM graphs at the stage-2 batch (4); the base 16-batch
+      # graph arena would cost ~10 GiB shared with the second replica.
+      max_graph_batch: 4
+      # Pin the CFM mel-frame bucket step so the capture pool stays small on
+      # the shared device.
+      cfm_graph_bucket_frames: 16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    # Leave headroom on the shared GPU for Talker KV + the two stage-2
+    # replicas below. The NPU block repeats the stage fields on purpose:
+    # platform stage entries override the platform-shared block at render
+    # time, so without them the base NPU budgets (sized for one stage-2
+    # replica) would win and the two-replica sizing would silently not apply.
+    gpu_memory_utilization: 0.40
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.08
+
+  - stage_id: 2
+    max_num_seqs: 4
+    # Two replicas on the same device: `devices` repeats the card once per
+    # replica (replica r lands on card r), so this needs no extra hardware.
+    num_replicas: 2
+    devices: "0,0"
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
+        # (4 * 4096 = 16384 tokens). Keep the reported CUDA KV token capacity
+        # above that bound because physical-preemption replay is unsupported.
+        # The explicit cap leaves device headroom for concurrent Stage 2.
+        kv_cache_memory_bytes: 2147483648  # 2 GiB
+
+  npu:
+    stages:
+      - stage_id: 0
+        # Two-replica sizing, restated for the NPU render (see the note on the
+        # platform-shared stage above; the base NPU block carries single-replica
+        # budgets 8 / 0.50).
+        max_num_seqs: 4
+        gpu_memory_utilization: 0.40
+        # Explicit KV cap: the auto-computed value does not leave room for the
+        # two stage-2 replicas on this card.
+        kv_cache_memory_bytes: 6442450944
+
+      - stage_id: 1
+        # Two-replica sizing, restated for the NPU render (base NPU: 8 / 0.10).
+        max_num_seqs: 4
+        gpu_memory_utilization: 0.08
+        # Explicit KV cap: the auto-computed value does not leave room for the
+        # two stage-2 replicas on this card.
+        kv_cache_memory_bytes: 2684354560
+
+      - stage_id: 2
+        # Two-replica sizing, restated for the NPU render: the base NPU stage-2
+        # budget is 0.22 for a single replica, which would put both replicas
+        # over the card together (0.50 + 0.10 + 2 x 0.22 > 1.0). Pin the
+        # per-replica budget instead.
+        max_num_seqs: 4
+        gpu_memory_utilization: 0.18
+        # One pool entry per captured shape. With two stage-2 replicas the pool
+        # is per replica. The CFM mel bucketing above
+        # (cfm_graph_bucket_frames: 16) only aligns the mel dimension; batch
+        # shapes enter the capture key, so a busy stage-2 replica can exceed
+        # 32 distinct shapes and fall back to eager for the tail. Holding the
+        # pool at 32 keeps the per-replica graph memory bounded, which matters
+        # because the replicas share one card with the other stages. Both keys
+        # are spelled out: stage fields merge by replacement, so a partial
+        # additional_config would drop the base enable flag.
+        additional_config:
+          code2wav_enable_npu_graph: true
+          code2wav_max_npu_graphs: 32

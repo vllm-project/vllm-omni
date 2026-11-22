@@ -29,6 +29,30 @@ _REQUEST_MEASUREMENT_ORIGIN = {
     "tpot": "Stage-0 engine mean time per output token",
     "rtf": "response.created client receive to last audio packet divided by emitted audio duration",
 }
+_CLIENT_MEASUREMENT_ORIGIN = {
+    "client_ttft": (
+        "response.created client receive to first non-empty text delta; includes server prompt preparation "
+        "and engine submission when they follow response creation, as in Qwen3-Omni"
+    ),
+    "client_ttfp": (
+        "response.created client receive to first audio packet; includes server prompt preparation "
+        "and engine submission when they follow response creation, as in Qwen3-Omni"
+    ),
+}
+_TEXT_DELTA_TYPES = frozenset(
+    {"response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta"}
+)
+_AUDIO_DELTA_TYPE = "response.output_audio.delta"
+
+#: Per-response latencies exported as flat ``mean_/median_/p99_<name>`` keys,
+#: the shape perf baselines read (like ``mean_ttft_ms``). Every response
+#: counts once, however many responses its session had.
+DUPLEX_RESPONSE_LATENCY_FIELDS = (
+    ("ttft_ms", "duplex_response_ttft_ms", "server TTFT"),
+    ("ttfp_ms", "duplex_response_ttfp_ms", "server TTFP"),
+    ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT"),
+    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client TTFP"),
+)
 _STREAM_MEASUREMENT_ORIGIN = {
     "ttft": "input stream start to first non-empty text delta",
     "ttfp": "input stream start to first audio packet",
@@ -55,6 +79,42 @@ def audio_rtf_from_raw_metric(raw_metric: Mapping[str, object]) -> float | None:
     if not isinstance(generation_ms, int | float) or not isinstance(duration_ms, int | float) or duration_ms <= 0:
         return None
     return round(compute_audio_rtf(float(generation_ms) / 1000.0, float(duration_ms) / 1000.0), 6)
+
+
+def _client_response_latencies(
+    collector: EventCollector,
+    response_id: str,
+    *,
+    after_s: float,
+) -> tuple[float | None, float | None]:
+    """Client-observed ``response.created`` to first text and first audio, in ms.
+
+    These timers start when the client learns a response exists. Qwen3-Omni
+    creates the response before prompt preparation and engine submission, so
+    that work is included. Model-native duplex may create the response only
+    with the first output; its earlier preparation is then excluded.
+    """
+    created_at_s: float | None = None
+    first_text_at_s: float | None = None
+    first_audio_at_s: float | None = None
+    for event, received_at_s in zip(collector.events, collector.event_received_at_s, strict=True):
+        if received_at_s < after_s or collector.response_id(event) != response_id:
+            continue
+        event_type = event.get("type")
+        if event_type == "response.created":
+            created_at_s = received_at_s if created_at_s is None else created_at_s
+        elif event_type in _TEXT_DELTA_TYPES and isinstance(event.get("delta"), str) and event["delta"]:
+            first_text_at_s = received_at_s if first_text_at_s is None else first_text_at_s
+        elif event_type == _AUDIO_DELTA_TYPE and isinstance(event.get("delta") or event.get("audio"), str):
+            first_audio_at_s = received_at_s if first_audio_at_s is None else first_audio_at_s
+    if created_at_s is None:
+        return None, None
+    started_at_s = created_at_s
+
+    def elapsed_ms(at_s: float | None) -> float | None:
+        return None if at_s is None else round(max(0.0, at_s - started_at_s) * 1000.0, 3)
+
+    return elapsed_ms(first_text_at_s), elapsed_ms(first_audio_at_s)
 
 
 def collect_duplex_session_metrics(
@@ -91,6 +151,14 @@ def collect_duplex_session_metrics(
         if isinstance(raw_metric, dict):
             metric.update(raw_metric)
             metric["rtf"] = audio_rtf_from_raw_metric(raw_metric)
+            metric["client_ttft_ms"], metric["client_ttfp_ms"] = _client_response_latencies(
+                collector, response_id, after_s=stream_start
+            )
+            origin = metric.get("measurement_origin")
+            metric["measurement_origin"] = {
+                **(origin if isinstance(origin, dict) else {}),
+                **_CLIENT_MEASUREMENT_ORIGIN,
+            }
         copied_stages: dict[str, dict[str, object]] = {}
         if isinstance(stages, dict):
             for stage_id, stage_snapshot in stages.items():
@@ -107,6 +175,11 @@ def collect_duplex_session_metrics(
         request_metrics,
         session_id=session_id,
     )
+    from vllm_omni.clients.duplex import distribution_summary
+
+    for field in ("client_ttft_ms", "client_ttfp_ms"):
+        if (summary := distribution_summary(_finite_nonnegative(request_metrics, field))) is not None:
+            session_metrics[field] = summary
     stream_metrics = collector.global_timing_summary(
         after_s=stream_start,
         window_started_at_s=stream_start,
@@ -129,6 +202,46 @@ def collect_duplex_session_metrics(
         session_metrics=session_metrics,
         output_tokens=output_tokens,
     )
+
+
+def _finite_nonnegative(rows: Sequence[Mapping[str, object]], field: str) -> list[float]:
+    return [
+        float(value)
+        for row in rows
+        if isinstance((value := row.get(field)), int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    ]
+
+
+def duplex_response_latency_metrics(request_metrics: Sequence[Mapping[str, object]]) -> dict[str, float | int]:
+    """Flatten per-response latencies into ``num_/mean_/median_/p99_<name>`` keys."""
+    from vllm_omni.clients.duplex import distribution_summary
+
+    result: dict[str, float | int] = {}
+    for field, name, _ in DUPLEX_RESPONSE_LATENCY_FIELDS:
+        summary = distribution_summary(_finite_nonnegative(request_metrics, field))
+        if summary is None:
+            continue
+        result[f"num_{name}_samples"] = summary["count"]
+        result[f"mean_{name}"] = summary["mean"]
+        result[f"median_{name}"] = summary["p50"]
+        result[f"p99_{name}"] = summary["p99"]
+    return result
+
+
+def print_duplex_response_latency_metrics(metrics: Mapping[str, float | int]) -> None:
+    """Print the per-response latency block of a benchmark summary."""
+    if not metrics:
+        return
+    print("{s:{c}^{n}}".format(s=" Duplex Per-Response Latency ", n=50, c="="))
+    for _, name, label in DUPLEX_RESPONSE_LATENCY_FIELDS:
+        if f"mean_{name}" not in metrics:
+            continue
+        for stat, title in (("mean", "Mean"), ("median", "Median"), ("p99", "P99")):
+            print("{:<40} {:<10.2f}".format(f"{title} {label} (ms):", metrics[f"{stat}_{name}"]))
+    print("=" * 50)
 
 
 def duplex_stream_metrics(session_metrics: Sequence[Mapping[str, object]]) -> dict[str, object]:
@@ -166,6 +279,7 @@ def build_duplex_metrics_report(
         "duplex_session_metrics": [dict(metric) for metric in session_metrics],
     }
     report.update(duplex_stream_metrics(session_metrics))
+    report.update(duplex_response_latency_metrics(request_metrics))
     return report
 
 

@@ -38,7 +38,6 @@ def test_native_block_tables_slot_mapping_handles_non_aligned_tail() -> None:
         max_num_batched_tokens=16,
         max_num_blocks_per_group=[4],
         device=device,
-        kernel_block_sizes=[4],
     )
     block_tables.append_block_ids(0, ([1, 2, 3],), overwrite=True)
     block_tables.apply_staged_writes()

@@ -67,7 +67,14 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "native_text_append_unsupported": "invalid_request_error",
     "invalid_video_frames": "invalid_request_error",
     "invalid_input_modality": "invalid_request_error",
+    "invalid_function_call": "invalid_request_error",
     "invalid_function_call_output": "invalid_request_error",
+    "invalid_tool_result_timeout": "invalid_request_error",
+    "tool_result_timeout": "invalid_request_error",
+    "tool_result_timeout_update_unsupported": "invalid_request_error",
+    "tool_call_registration_failed": "server_error",
+    "tool_call_settlement_failed": "server_error",
+    "tool_result_retirement_failed": "server_error",
     "server_vad_unavailable": "server_error",
 }
 

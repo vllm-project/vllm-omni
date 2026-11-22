@@ -48,11 +48,14 @@ before this reserve existed keeps its previous KV cache size by raising
 `gpu_memory_utilization` by the graph pool's share of the device. The startup log
 prints the value to use when the raised budget still fits in the memory free at
 startup, and otherwise says that no value restores the previous size, for example
-when co-located stages already hold part of the device. Graphs a model captures for
-itself after startup profiling — the talker MTP graphs in
-`GPUARModelRunner.capture_model` and model `capture_auxiliary_graphs` hooks — are
-not part of that estimate. Stages using these graphs need those pools free on top
-of their utilization.
+when co-located stages already hold part of the device. On CUDA and ROCm, the reserve also covers the
+talker MTP graphs, which are profiled with the rest, and, on stages that size a KV
+cache, the graphs of models that implement both `capture_auxiliary_graphs` and
+`release_auxiliary_graphs`, which are captured once while profiling, released, and
+captured again at warmup.
+Graphs a model captures on its own outside these paths, or on a stage without a KV
+cache, are not part of it, and stages using them need those pools free on top of
+their utilization.
 
 ### Example Calculation
 

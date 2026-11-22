@@ -202,7 +202,7 @@ class OmniDuplexSessionHandler:
         try:
             handle = await self._omni.open_session(session_payload)
         except DuplexSessionError as exc:
-            await send_json(envelope.error_payload(exc.code, str(exc)))
+            await send_json(envelope.error_payload(exc.code, str(exc), retryable=exc.retryable))
             return None
         except (TypeError, ValueError) as exc:
             await send_json(envelope.error_payload("invalid_session_config", str(exc)))

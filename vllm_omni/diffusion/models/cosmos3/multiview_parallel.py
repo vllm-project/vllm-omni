@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -12,30 +12,31 @@ import torch.distributed as dist
 from .multiview_attention import multiview_attention
 from .multiview_flex_attention import MultiviewAttentionContext
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
 
 def validate_multiview_parallel_config(
-    parallel_config: Any,
+    parallel_config: DiffusionParallelConfig,
     *,
     num_attention_heads: int,
     num_key_value_heads: int,
     intermediate_size: int,
 ) -> None:
-    """Validate before constructing/loading the transformer or running collectives."""
-    tp = int(getattr(parallel_config, "tensor_parallel_size", 1))
-    cp = int(getattr(parallel_config, "ulysses_degree", 1))
-    cfg = int(getattr(parallel_config, "cfg_parallel_size", 1))
-    if tp < 1 or cp < 1 or cfg not in (1, 2):
-        raise ValueError("Cosmos3 multiview requires positive TP/CP degrees and cfg_parallel_size in (1, 2).")
+    """Validate multiview-only limits before constructing/loading the transformer or running collectives.
+
+    ``DiffusionParallelConfig`` already enforces positive degrees,
+    ``sequence_parallel_size == ulysses * ring * allgather`` and HSDP/TP exclusivity.
+    """
+    tp = parallel_config.tensor_parallel_size
+    cp = parallel_config.ulysses_degree
+    if parallel_config.cfg_parallel_size > 2:
+        raise ValueError("Cosmos3 multiview requires cfg_parallel_size in (1, 2).")
     for name in ("ring_degree", "allgather_degree", "pipeline_parallel_size", "vae_patch_parallel_size"):
-        if int(getattr(parallel_config, name, 1)) != 1:
+        if getattr(parallel_config, name) != 1:
             raise ValueError(f"Cosmos3 multiview requires {name}=1.")
-    sp = getattr(parallel_config, "sequence_parallel_size", None)
-    if sp is not None and int(sp) != cp:
-        raise ValueError("Cosmos3 multiview sequence_parallel_size must equal ulysses_degree.")
-    if cp > 1 and getattr(parallel_config, "ulysses_mode", "strict") != "strict":
+    if cp > 1 and parallel_config.ulysses_mode != "strict":
         raise ValueError("Cosmos3 multiview requires ulysses_mode='strict'.")
-    if bool(getattr(parallel_config, "use_hsdp", False)) and tp > 1:
-        raise ValueError("Cosmos3 multiview HSDP and TP are alternative memory modes and cannot be combined.")
     if num_key_value_heads <= 0 or num_attention_heads <= 0 or num_attention_heads % num_key_value_heads:
         raise ValueError("Cosmos3 multiview requires positive query/KV head counts with an integral GQA ratio.")
     for name, heads in (("query", num_attention_heads), ("KV", num_key_value_heads)):

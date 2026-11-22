@@ -20,6 +20,7 @@ from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
+from vllm_omni.entrypoints.duplex.openai import OpenAIRealtimeHandler
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
@@ -385,6 +386,7 @@ def _turn_based_realtime_app(handler: object | None, mocker) -> FastAPI:
     )
     app.state.engine_client = mocker.Mock()
     app.state.openai_serving_chat = mocker.Mock()
+    app.state.openai_realtime_handler = OpenAIRealtimeHandler()
     return app
 
 

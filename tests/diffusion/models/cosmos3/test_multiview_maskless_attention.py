@@ -10,6 +10,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3 import multiview_maskless_attention as m
 from vllm_omni.diffusion.models.cosmos3.multiview_attention import multiview_attention
 from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
@@ -185,7 +186,7 @@ def test_plan_marks_only_caption_keys_dynamic() -> None:
     spec = layout()
     plan = build_multiview_maskless_plan(spec, sum(spec.caption_lengths), "cpu")
     for attention_pass in plan.passes:
-        dynamic = getattr(attention_pass.k_index, "_dynamo_dynamic_indices", set())
+        dynamic: set[int] = getattr(attention_pass.k_index, "_dynamo_dynamic_indices", set())
         assert dynamic == ({0} if attention_pass.keys_from_und else set())
         assert not getattr(attention_pass.q_index, "_dynamo_dynamic_indices", set())
         assert not getattr(attention_pass.meta, "_dynamo_dynamic_indices", set())
@@ -450,7 +451,7 @@ def test_ulysses_maskless_trims_padding_and_preserves_batch_one(monkeypatch: pyt
 # -- CUDA -----------------------------------------------------------------------------
 
 
-@pytest.mark.gpu
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and vLLM's bundled FlashAttention")
 @pytest.mark.parametrize("fa_version", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

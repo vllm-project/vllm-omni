@@ -8,7 +8,7 @@ function at the ``lossless`` level reproduces the diffusers 0.40 operation
 order exactly and only differs in how the bytes move:
 
 * ``WanRMS_norm``: fp32 ``vector_norm`` straight from the low-precision tensor
-  plus one fused Triton epilogue (see :mod:`.triton_rms_norm`), optionally with
+  plus one fused Triton epilogue (see :mod:`vllm_omni.diffusion.layers.vae_norm_epilogue`), optionally with
   the following SiLU folded in. At the ``channels_last`` level the single-pass
   kernel also absorbs the bias of the ``conv1`` that feeds ``norm2``.
 * ``WanCausalConv3d`` and every cached call site: the ``clone`` + ``cat`` +
@@ -52,9 +52,11 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.layers.vae_rms_norm import kernels_allowed as _kernels_allowed
+from vllm_omni.diffusion.layers.vae_rms_norm import rms_norm_fastpath as shared_rms_norm_fastpath
+
 from . import triton_data_movement as dm
 from . import triton_norm_cache as nc
-from . import triton_rms_norm as rn
 from . import triton_rms_norm_cl as cl
 from . import triton_upsample as up
 from ._utils import suggests_channels_last
@@ -108,46 +110,9 @@ def _has_forward_hooks(*modules: nn.Module | None) -> bool:
     return any(m is not None and (m._forward_pre_hooks or m._forward_hooks) for m in modules)
 
 
-def _kernels_allowed(x: torch.Tensor) -> bool:
-    return x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
-
-
 # --------------------------------------------------------------------------- #
 # WanRMS_norm
 # --------------------------------------------------------------------------- #
-
-
-def _as_rows(
-    x: torch.Tensor, denom: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]] | None:
-    """View ``x``/``denom`` as contiguous ``(N, C, S)`` / ``(N, 1, S)`` without copying.
-
-    Handles the dense layouts the decoder produces: plain contiguous 4D/5D
-    tensors and the frame-major 5D view ``WanResample`` emits
-    (``permute(0, 2, 1, 3, 4)`` of a contiguous ``(b, t, c, h, w)`` buffer).
-    Returns the two views and a function mapping a kernel output back to
-    ``x``'s shape and strides, or ``None`` for any other layout.
-    """
-    if x.dim() == 5:
-        b, c, t, h, w = x.shape
-        if x.is_contiguous():
-            spatial = t * h * w
-            return x.view(b, c, spatial), denom.view(b, 1, spatial), lambda out: out.view(b, c, t, h, w)
-        frame_major = x.permute(0, 2, 1, 3, 4)
-        denom_frame_major = denom.permute(0, 2, 1, 3, 4)
-        if frame_major.is_contiguous() and denom_frame_major.is_contiguous():
-            spatial = h * w
-            return (
-                frame_major.view(b * t, c, spatial),
-                denom_frame_major.view(b * t, 1, spatial),
-                lambda out: out.view(b, t, c, h, w).permute(0, 2, 1, 3, 4),
-            )
-        return None
-    if x.dim() == 4 and x.is_contiguous():
-        n, c, h, w = x.shape
-        spatial = h * w
-        return x.view(n, c, spatial), denom.view(n, 1, spatial), lambda out: out.view(n, c, h, w)
-    return None
 
 
 def _add_channel_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -185,28 +150,7 @@ def rms_norm_fastpath(
         out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias, exact_bf16=cfg.exact_bf16_norm)
         if out is not None:
             return out
-    if bias is not None:
-        x = _add_channel_bias(x, bias)
-
-    # Same reduction kernel as ``F.normalize(x.float(), dim=1)`` runs, reading
-    # the low-precision tensor once instead of materializing an fp32 copy.
-    denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
-
-    if _kernels_allowed(x):
-        rows = _as_rows(x, denom)
-        if rows is not None:
-            x_rows, denom_rows, restore = rows
-            out = rn.rms_norm_scale(x_rows, denom_rows, gamma.reshape(-1), norm.scale, silu=silu)
-            if out is not None:
-                return restore(out)
-
-    # Exact PyTorch restructuring: the divide computes in fp32 opmath and rounds
-    # once on store, exactly like ``(x.float() / denom).to(x.dtype)``; the
-    # epilogue is upstream's own expression.
-    normalized = torch.empty_like(x)
-    torch.div(x, denom, out=normalized)
-    out = normalized * norm.scale * gamma + norm_bias
-    return F.silu(out) if silu else out
+    return shared_rms_norm_fastpath(norm, x, silu=silu, bias=bias)
 
 
 def rms_norm_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:

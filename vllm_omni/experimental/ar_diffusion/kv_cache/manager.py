@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import inspect
 import os
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -33,6 +34,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionSegmentedKVSpec,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
     KV_GATHER_ENV,
@@ -48,6 +50,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     resident_block_ids,
     visible_window_blocks,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import SegmentedStaging
 
 _log = init_logger(__name__)
 
@@ -185,7 +188,8 @@ def estimate_ar_diffusion_kv_cache_memory(
             f"{config.chunk_size} != {spec.tokens_per_frame}"
         )
 
-    block_size = spec.tokens_per_frame if block_size is None else block_size
+    if block_size is None:
+        block_size = spec.segmented.block_size if spec.segmented is not None else spec.tokens_per_frame
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
     blocks_per_frame = -(-spec.tokens_per_frame // block_size)
@@ -202,6 +206,9 @@ def estimate_ar_diffusion_kv_cache_memory(
         scratch_frames * blocks_per_frame + extra_scratch_blocks,
         scratch_blocks_override,
     )
+    if spec.segmented is not None:
+        # Live segmented rows use contiguous staging rather than scratch pages.
+        scratch_blocks_per_local_branch = 0
     scratch_num_blocks = spec.num_local_kv_branches * scratch_blocks_per_local_branch
     scratch_reserved_bytes = scratch_num_blocks * page_size_bytes
     managed_num_blocks = (
@@ -210,6 +217,35 @@ def estimate_ar_diffusion_kv_cache_memory(
         * blocks_per_frame
         + 2 * blocks_per_frame
     )
+    staging_reserved_bytes = 0
+    if spec.segmented is not None:
+        managed_num_blocks = (
+            spec.num_local_kv_branches
+            * (
+                session_capacity * spec.segmented.retained_blocks(block_size)
+                + spec.segmented.pending_blocks(block_size)
+            )
+            + 2
+        )
+        staging_reserved_bytes = int(
+            2
+            * spec.num_layers
+            * spec.num_local_kv_branches
+            * spec.segmented.initial_staging_tokens
+            * spec.num_kv_heads
+            * spec.head_size
+            * dtype.itemsize
+        )
+    elif config.reuse_history_staging and contiguous_kv_gather_enabled():
+        window_blocks = visible_window_blocks(
+            chunk_size=config.chunk_size,
+            block_size=block_size,
+            sink_tokens=config.sink_chunks * config.chunk_size,
+            window_tokens=config.window_chunks * config.chunk_size,
+        )
+        staging_reserved_bytes = int(
+            2 * spec.num_layers * (window_blocks + 1) * block_size * spec.num_kv_heads * spec.head_size * dtype.itemsize
+        )
     cross_attention_bytes_per_session = int(
         2
         * len(spec.kv_branches)
@@ -222,6 +258,7 @@ def estimate_ar_diffusion_kv_cache_memory(
     model_owned_state_reserved_bytes = session_capacity * spec.model_owned_state_bytes_per_session
     required_bytes = (
         scratch_reserved_bytes
+        + staging_reserved_bytes
         + managed_num_blocks * page_size_bytes
         + cross_attention_reserved_bytes
         + model_owned_state_reserved_bytes
@@ -313,6 +350,8 @@ class ARDiffusionKVCache:
         max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
+        segmented: ARDiffusionSegmentedKVSpec | None = None,
+        agree_staging_allocation: Callable[[bool], bool] | None = None,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -335,6 +374,8 @@ class ARDiffusionKVCache:
             )
 
         self.config = config
+        self.segmented_spec = segmented
+        self._agree_staging_allocation = agree_staging_allocation or bool
         self.kv_branches = kv_branches
         self.requested_session_capacity = session_capacity
         self._kv_branch_local_indices = {kv_branch.name: kv_branch.local_index for kv_branch in kv_branches}
@@ -418,6 +459,7 @@ class ARDiffusionKVCache:
             max_scratch_frames_per_branch=max_scratch_frames_per_branch,
             max_scratch_tokens_per_branch=max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=model_owned_state_bytes_per_session,
+            segmented=segmented,
         )
         one_session = estimate_ar_diffusion_kv_cache_memory(
             config,
@@ -450,6 +492,8 @@ class ARDiffusionKVCache:
             for name, length in self.cross_attention_lengths.items()
         )
 
+        resident_frames = config.sink_chunks + config.window_chunks
+
         def _required_managed_blocks(capacity: int) -> int:
             """Managed blocks needed to hold ``capacity`` resident sessions.
 
@@ -463,7 +507,12 @@ class ARDiffusionKVCache:
             the requirement -- it only stops the final block of each term from
             rounding up a whole frame's worth of memory.
             """
-            resident_frames = config.sink_chunks + config.window_chunks
+            if segmented is not None:
+                return (
+                    self.num_local_kv_branches
+                    * (capacity * segmented.retained_blocks(block_size) + segmented.pending_blocks(block_size))
+                    + 2
+                )
             per_session_blocks = resident_frames * self.blocks_per_frame
             in_flight_blocks = self.frames_per_block * self.blocks_per_frame
             headroom_blocks = 2 * self.blocks_per_frame
@@ -478,7 +527,18 @@ class ARDiffusionKVCache:
         # contiguous-gather attention path consumes it.
         self.history_staging_reserved_bytes = 0
         self.history_staging_tokens = 0
-        if config.reuse_history_staging:
+        if segmented is not None:
+            self.history_staging_tokens = segmented.initial_staging_tokens
+            self.history_staging_reserved_bytes = int(
+                2
+                * num_layers
+                * self.num_local_kv_branches
+                * self.history_staging_tokens
+                * num_kv_heads
+                * head_size
+                * dtype.itemsize
+            )
+        elif config.reuse_history_staging:
             if contiguous_kv_gather_enabled():
                 # The same width build_block_table pads to: a sink or window
                 # that is not a whole number of blocks spans one more block.
@@ -579,30 +639,125 @@ class ARDiffusionKVCache:
         self._kv_pools: list[list[torch.Tensor]] = []
         self._k_pools: list[torch.Tensor] = []
         self._v_pools: list[torch.Tensor] = []
-        if device is not None:
-            self._kv_pools, self._k_pools, self._v_pools = allocate_kv_pool_with_views(
-                self.num_blocks_total,
-                block_size,
-                num_layers,
-                num_kv_heads,
-                head_size,
-                dtype,
-                device,
-            )
         # reuse_history_staging: one contiguous (K, V) pair per layer, sized to the padded visible window this
         # cache admits and budgeted above, owned here next to the pools it stages from. Allocated outside any
         # capture and marked static, so compiled regions treat it as a stable input rather than a new tensor.
         self.history_staging: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.history_staging_state = HistoryStagingState()
-        if self.history_staging_tokens and device is not None:
-            for _ in range(num_layers):
-                pair = (
-                    torch.empty((self.history_staging_tokens, num_kv_heads, head_size), device=device, dtype=dtype),
-                    torch.empty((self.history_staging_tokens, num_kv_heads, head_size), device=device, dtype=dtype),
-                )
-                for buffer in pair:
-                    torch._dynamo.mark_static_address(buffer)
-                self.history_staging.append(pair)
+        self.segmented_staging: list[SegmentedStaging] = []
+        error: Exception | None = None
+        try:
+            self._allocate_storage()
+        except Exception as exc:
+            if segmented is None:
+                raise
+            error = exc
+        if segmented is not None and not self._agree_staging_allocation(error is None):
+            self._kv_pools.clear()
+            self._k_pools.clear()
+            self._v_pools.clear()
+            self.segmented_staging.clear()
+            raise RuntimeError("AR-Diffusion segmented KV pool allocation failed on a worker") from error
+
+    def _allocate_storage(self) -> None:
+        if not self._allocate_tensors:
+            return
+        self._kv_pools, self._k_pools, self._v_pools = allocate_kv_pool_with_views(
+            self.num_blocks_total,
+            self.block_size,
+            self.num_layers,
+            self.num_kv_heads,
+            self.head_size,
+            self.dtype,
+            self.device,
+        )
+        if self.history_staging_tokens and self.segmented_spec is None:
+            self.history_staging = self._allocate_staging_layers(self.history_staging_tokens)
+        if self.segmented_spec is not None:
+            self.segmented_staging = [
+                self._allocate_segmented_staging(self.segmented_spec.initial_staging_tokens)
+                for _ in range(self.num_local_kv_branches)
+            ]
+
+    def _allocate_segmented_staging(self, tokens: int) -> SegmentedStaging:
+        return SegmentedStaging(self._allocate_staging_layers(tokens), tokens)
+
+    def _allocate_staging_layers(self, tokens: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        layers = []
+        for _ in range(self.num_layers):
+            shape = (tokens, self.num_kv_heads, self.head_size)
+            pair = (
+                torch.empty(shape, dtype=self.dtype, device=self.device),
+                torch.empty(shape, dtype=self.dtype, device=self.device),
+            )
+            for buffer in pair:
+                torch._dynamo.mark_static_address(buffer)
+            layers.append(pair)
+        return layers
+
+    def ensure_segmented_staging(self, kv_branch: str, tokens: int) -> None:
+        """Grow unpinned conditioning storage outside capture after admission.
+
+        Normal shapes never replace buffers. Growth keeps both old and new
+        allocations alive until every sequence-parallel rank succeeds, so a
+        rejected shape cannot invalidate another rank's committed history.
+        """
+        if not self.segmented_staging:
+            raise RuntimeError("Segmented staging requires a configured pool device")
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Prepare segmented KV staging outside CUDA graph capture")
+        index = self._kv_branch_index(kv_branch)
+        current = self.segmented_staging[index]
+        if tokens <= current.capacity:
+            return
+        from vllm_omni.platforms import current_omni_platform
+
+        per_token = 2 * self.num_layers * self.num_kv_heads * self.head_size * self.dtype.itemsize
+        new_capacity = (tokens + 255) // 256 * 256
+        new_bytes = new_capacity * per_token
+        delta_bytes = (new_capacity - current.capacity) * per_token
+        # The initial available-memory envelope reserves non-KV model state;
+        # the live free-memory check also covers concurrent device allocations.
+        fits = self.memory_budget_bytes + delta_bytes <= self.available_memory_bytes
+        if self.device.type != "cpu":
+            fits = fits and new_bytes <= current_omni_platform.get_free_memory(self.device)
+        if not self._agree_staging_allocation(fits):
+            raise RuntimeError("AR-Diffusion memory budget cannot fit expanded segmented KV staging")
+        replacement = None
+        error: Exception | None = None
+        try:
+            replacement = self._allocate_segmented_staging(new_capacity)
+        except Exception as exc:
+            error = exc
+        if not self._agree_staging_allocation(error is None):
+            del replacement
+            raise RuntimeError("AR-Diffusion segmented KV staging allocation failed on a worker") from error
+        assert replacement is not None
+        self.segmented_staging[index] = replacement
+        self.history_staging_reserved_bytes += delta_bytes
+        self.memory_budget_bytes += delta_bytes
+
+    def begin_segment(self, request_id: str, num_tokens: int) -> ARDiffusionRequestAdapter:
+        """Allocate one immutable segment using the existing vLLM manager.
+
+        Its adapter's whole sequence is the segment. It never advances a frame
+        window: publication and retention are handled by segmented session
+        state, and releasing the segment uses the normal manager free path.
+        """
+        if self.segmented_spec is None:
+            raise RuntimeError("Segment allocations require a segmented KV capability")
+        if num_tokens <= 0 or num_tokens > self.segmented_spec.max_pending_tokens:
+            raise ValueError("Invalid segmented KV token count")
+        if request_id in self._adapters:
+            raise RuntimeError(f"Duplicate segmented KV allocation {request_id!r}")
+        adapter = ARDiffusionRequestAdapter(request_id, chunk_size=num_tokens)
+        self._adapters[request_id] = adapter
+        try:
+            self.allocate_token_slots(adapter, num_tokens)
+        except BaseException:
+            self.end_request(adapter)
+            raise
+        return adapter
 
     # -- cross-attention pool access -------------------------------------------
     # Cross-attn KV is static once populated — write once (from text encoder),
@@ -658,6 +813,8 @@ class ARDiffusionKVCache:
         cache_name: str,
         kv_branch: str,
         layer_kv: Iterable[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        publish_guard: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Atomically populate one logical branch of a named cross-attention cache.
 
@@ -714,10 +871,11 @@ class ARDiffusionKVCache:
                 f"got {populated_layers}"
             )
 
-        if session is None:
-            session = {}
-            self._cross_sessions[session_id] = session
-        session.setdefault(cache_name, {})[kv_branch] = (k_pool, v_pool)
+        with publish_guard() if publish_guard is not None else nullcontext():
+            if session is None:
+                session = {}
+                self._cross_sessions[session_id] = session
+            session.setdefault(cache_name, {})[kv_branch] = (k_pool, v_pool)
 
     def read_cross_attention_kv(
         self,
@@ -750,9 +908,29 @@ class ARDiffusionKVCache:
         """Release every named cross-attention allocation for one session."""
         self._cross_sessions.pop(session_id, None)
 
+    def release_cross_attention_branch(self, session_id: str, cache_name: str, kv_branch: str) -> None:
+        """Release one conditioning branch without touching the other branches."""
+        session = self._cross_sessions.get(session_id)
+        if session is None:
+            return
+        branches = session.get(cache_name)
+        if branches is None:
+            return
+        branches.pop(kv_branch, None)
+        if not branches:
+            session.pop(cache_name, None)
+        if not session:
+            self._cross_sessions.pop(session_id, None)
+
     # -- request lifecycle ---------------------------------------------------
 
+    def _require_current_adapter(self, adapter: ARDiffusionRequestAdapter) -> None:
+        if self._adapters.get(adapter.request_id) is not adapter:
+            raise RuntimeError(f"AR-Diffusion request {adapter.request_id!r} has no matching active adapter")
+
     def begin_request(self, request_id: str, *, prefill_prefix_tokens: int = 0) -> ARDiffusionRequestAdapter:
+        if request_id in self._adapters:
+            raise ValueError(f"AR-Diffusion request ID {request_id!r} is already active")
         adapter = ARDiffusionRequestAdapter(
             request_id,
             chunk_size=self.spec.chunk_size,
@@ -763,6 +941,7 @@ class ARDiffusionKVCache:
         return adapter
 
     def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+        self._require_current_adapter(adapter)
         _log.debug(
             "AR-Diffusion end_request: req=%s chunks=%d free=%d",
             adapter.request_id,
@@ -793,6 +972,7 @@ class ARDiffusionKVCache:
 
     def allocate_token_slots(self, adapter: ARDiffusionRequestAdapter, num_tokens: int) -> list[int]:
         """Allocate managed blocks for an in-flight video span without committing it."""
+        self._require_current_adapter(adapter)
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
         # vLLM clips slot allocation at max_model_len. Admit the entire
@@ -805,6 +985,7 @@ class ARDiffusionKVCache:
         return self.block_table(adapter)
 
     def block_table(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
+        self._require_current_adapter(adapter)
         return list(self.manager.get_block_ids(adapter.request_id)[0])
 
     def block_ids_at(self, adapter: ARDiffusionRequestAdapter, indices: Sequence[int]) -> list[int]:
@@ -814,6 +995,7 @@ class ARDiffusionKVCache:
         the session. :meth:`block_table` reads every entry; this reads only the
         ones asked for, straight from the manager's own block list.
         """
+        self._require_current_adapter(adapter)
         blocks = self.manager.get_blocks(adapter.request_id).blocks[0]
         return [blocks[index].block_id for index in indices]
 
@@ -859,6 +1041,7 @@ class ARDiffusionKVCache:
         advances the adapter only after the forward succeeds. Call once per
         committed chunk, not per denoise step.
         """
+        self._require_current_adapter(adapter)
         _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
         self.manager.remove_skipped_blocks(

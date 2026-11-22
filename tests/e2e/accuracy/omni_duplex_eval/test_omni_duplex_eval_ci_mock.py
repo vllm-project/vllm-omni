@@ -5,12 +5,12 @@
 Runs the *real* ``test_omni_duplex_eval_ci()`` guard function without GPU /
 real model by stubbing the heavy I/O:
 
-  - ``_run_cli`` is replaced by a spy that records argv (verifies the exact
-    ``vllm bench omni-duplex-eval`` argument assembly) and never executes.
+  - ``_run_cli`` is replaced by a spy that records ``vllm bench serve`` argv
+    and writes a benchmark result without executing a model.
   - ``resolve_ref_audio`` is stubbed to a local path.
-  - Fake score files are pre-written under ``tmp_path/scores/<split>/`` using
+  - Fake score files are pre-written under a unique run's evaluation directory using
     the sample IDs from ``omni_duplex_eval_ci_config.json`` (minus excludes),
-    so ``summarize_scores()`` and the Phase-4 assertions run for real.
+    so ``summarize_scores()`` and the guard assertions run for real.
 
 This validates parameter construction, the score-file-count assertion, the
 ``protocol_pin`` check, the RTD/PR ``by_task`` key checks, and the threshold
@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -186,7 +188,12 @@ class _FakeServer:
 
 
 def _call_real_guard(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, judge_url: str = "http://127.0.0.1:8001"
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    judge_url: str = "http://127.0.0.1:8001",
+    *,
+    mutate_result: Callable[[dict], None] | None = None,
+    model: str = "mock-model",
 ) -> list[list[str]]:
     """Call ``test_omni_duplex_eval_ci()`` with stubbed heavy I/O.
 
@@ -194,60 +201,163 @@ def _call_real_guard(
     """
     from tests.e2e.accuracy.omni_duplex_eval import test_omni_duplex_eval_ci as guard
 
-    fake_server = _FakeServer(host="127.0.0.1", port=9999, model="mock-model")
+    fake_server = _FakeServer(host="127.0.0.1", port=9999, model=model)
     calls: list[list[str]] = []
 
     def spy_run_cli(argv: list[str]) -> None:
         calls.append(argv)
+        score_root = tmp_path / "responses" / "run-ci" / "evaluation"
+        summary = summarize_scores(score_root)
+        count = len(_sample_ids(_load_config()))
+        summary.update(
+            status="completed", total=count, evaluated=count, skipped=0, failed=0, errors=[], score_root=str(score_root)
+        )
+        result = {
+            "completed": count,
+            "failed": 0,
+            "omni_duplex_eval": {
+                "response_root": str(score_root.parent),
+                "published": count,
+                "published_with_unfinished_responses": 0,
+                "artifact_errors": [],
+                "accuracy": summary,
+            },
+        }
+        if mutate_result is not None:
+            mutate_result(result)
+        (tmp_path / "bench-result.json").write_text(json.dumps(result), encoding="utf-8")
 
     monkeypatch.setattr(guard, "_run_cli", spy_run_cli)
-    monkeypatch.setattr(guard, "resolve_ref_audio", lambda: tmp_path / "ref.wav")
-    monkeypatch.setattr(guard, "_RESULT_DIR", tmp_path)  # write summary.json to tmp_path, not real results/
+    ref = tmp_path / "ref.wav"
+    ref.touch()
+    monkeypatch.setattr(guard, "resolve_ref_audio", lambda: ref)
+    monkeypatch.setattr(guard, "_RESULT_DIR", tmp_path)  # write accuracy results to tmp_path, not real results/
     guard.test_omni_duplex_eval_ci(fake_server, tmp_path, judge_url)
     return calls
 
 
-def test_real_guard_full_flow_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("model", ["openbmb/MiniCPM-o-4_5", "/models/openbmb/MiniCPM-o-4_5"])
+def test_real_guard_full_flow_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str) -> None:
     """Real guard passes end-to-end with good scores and stubbed CLI."""
     config = _load_config()
     expected = len(_sample_ids(config))
-    written = _write_scores_from_config(tmp_path / "scores", config)
+    written = _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
     assert written == expected, f"test setup: expected {expected} score files, wrote {written}"
-    _call_real_guard(monkeypatch, tmp_path)  # must not raise
+    _call_real_guard(monkeypatch, tmp_path, model=model)  # must not raise
+    result = json.loads((tmp_path / "bench-result.json").read_text())
+    accuracy_paths = list(tmp_path.glob("result_acc_*.json"))
+    assert len(accuracy_paths) == 1
+    accuracy_path = accuracy_paths[0]
+    prefix = "result_acc_MiniCPM-o-4_5_Omni-DuplexEval_"
+    assert accuracy_path.stem.startswith(prefix)
+    timestamp, random_number = accuracy_path.stem.removeprefix(prefix).rsplit("_", 1)
+    datetime.strptime(timestamp, "%Y%m%d-%H%M%S")
+    assert len(random_number) == 8 and random_number.isdecimal()
+    assert json.loads(accuracy_path.read_text()) == result["omni_duplex_eval"]["accuracy"]
 
 
-def test_real_guard_assembles_generate_and_evaluate_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Verify the exact CLI argument assembly for both phases."""
+def test_real_guard_assembles_bench_serve_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Parse the CI command with the real serving-benchmark parser."""
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
     config = _load_config()
-    _write_scores_from_config(tmp_path / "scores", config)
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
     calls = _call_real_guard(monkeypatch, tmp_path)
 
-    assert len(calls) == 2, f"expected generate + evaluate, got {len(calls)} calls"
-    generate, evaluate = calls
-    assert generate[:5] == ["vllm", "bench", "omni-duplex-eval", "--omni", "generate"]
-    assert evaluate[:5] == ["vllm", "bench", "omni-duplex-eval", "--omni", "evaluate"]
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[:4] == ["vllm", "bench", "serve", "--omni"]
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(argv[4:])
+    preprocess_serve_args(args)
+    assert args.backend == "openai-realtime-duplex"
+    assert args.base_url == "http://127.0.0.1:9999"
+    assert args.endpoint == "/v1/realtime"
+    assert args.model == "mock-model"
+    assert args.trust_remote_code
+    assert args.dataset_name == "omni-duplex-eval"
+    assert args.dataset_path == config["dataset"]
+    assert args.duplex_eval_split == "all"
+    assert args.duplex_eval_ids == _sample_ids(config)
+    assert args.num_prompts == 0  # all configured IDs, not the three-sample default
+    assert args.disable_shuffle
+    assert args.max_concurrency == 1
+    assert args.num_warmups == 0
+    assert args.ready_check_timeout_sec == 0  # server fixture already waits for readiness
+    assert Path(args.duplex_eval_ref_audio) == tmp_path / "ref.wav"
+    assert args.duplex_eval_response_root == tmp_path / "responses"
+    assert args.duplex_eval_evaluate
+    assert args.duplex_eval_judge_model == config["judge"]["model"]
+    assert args.duplex_eval_judge_base_url == "http://127.0.0.1:8001"
+    assert args.duplex_eval_judge_video_mode == config["judge"].get("video_mode", "video_url")
+    assert args.duplex_eval_judge_fps == config["judge"].get("fps", 2)
+    assert args.duplex_eval_eval_workers == config["judge"].get("eval_workers", 4)
+    assert args.save_result
+    assert Path(args.result_dir) == tmp_path
+    assert args.result_filename == "bench-result.json"
 
-    # generate: dataset ref, split, ids, url, model, ref-audio, response-root
-    assert generate[generate.index("--dataset") + 1] == config["dataset"]
-    assert generate[generate.index("--split") + 1] == "all"
-    gen_ids = generate[generate.index("--ids") + 1 : generate.index("--url")]
-    assert gen_ids == _sample_ids(config)
-    assert generate[generate.index("--url") + 1] == "ws://127.0.0.1:9999/v1/realtime?duplex=1"
-    assert generate[generate.index("--model") + 1] == "mock-model"
-    assert Path(generate[generate.index("--ref-audio") + 1]).name == "ref.wav"
-    assert generate[generate.index("--response-root") + 1] == str(tmp_path / "responses")
 
-    # evaluate: dataset ref, ids, roots, judge config
-    assert evaluate[evaluate.index("--dataset") + 1] == config["dataset"]
-    eval_ids = evaluate[evaluate.index("--ids") + 1 : evaluate.index("--response-root")]
-    assert eval_ids == _sample_ids(config)
-    assert evaluate[evaluate.index("--response-root") + 1] == str(tmp_path / "responses")
-    assert evaluate[evaluate.index("--score-root") + 1] == str(tmp_path / "scores")
-    assert evaluate[evaluate.index("--judge-model") + 1] == config["judge"]["model"]
-    assert evaluate[evaluate.index("--judge-base-url") + 1] == "http://127.0.0.1:8001"
-    assert evaluate[evaluate.index("--judge-video-mode") + 1] == config["judge"].get("video_mode", "video_url")
-    assert int(evaluate[evaluate.index("--judge-fps") + 1]) == config["judge"].get("fps", 2)
-    assert int(evaluate[evaluate.index("--eval-workers") + 1]) == config["judge"].get("eval_workers", 4)
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("benchmark", "completed", 65, "completed requests"),
+        ("benchmark", "failed", 1, "failed benchmark requests"),
+        ("duplex", "published", 65, "published samples"),
+        ("duplex", "artifact_errors", ["write failed"], "artifact errors"),
+        ("accuracy", "status", "partial", "evaluation did not complete"),
+        ("accuracy", "total", 3, "total samples"),
+        ("accuracy", "evaluated", 65, "evaluated samples"),
+        ("accuracy", "failed", 1, "failed evaluations"),
+        ("accuracy", "skipped", 1, "skipped evaluations"),
+        ("accuracy", "errors", ["judge failed"], "evaluation errors"),
+    ],
+)
+def test_real_guard_rejects_incomplete_benchmark(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, section: str, field: str, value: object, message: str
+) -> None:
+    """A successful CLI exit must not hide incomplete publication or judging."""
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", _load_config())
+
+    def mutate(result: dict) -> None:
+        sections = {
+            "benchmark": result,
+            "duplex": result["omni_duplex_eval"],
+            "accuracy": result["omni_duplex_eval"]["accuracy"],
+        }
+        sections[section][field] = value
+
+    with pytest.raises(AssertionError, match=message):
+        _call_real_guard(monkeypatch, tmp_path, mutate_result=mutate)
+    # Both artifacts remain available to Buildkite after a failing assertion.
+    result = json.loads((tmp_path / "bench-result.json").read_text())
+    accuracy_paths = list(tmp_path.glob("result_acc_*.json"))
+    assert len(accuracy_paths) == 1
+    assert json.loads(accuracy_paths[0].read_text()) == result["omni_duplex_eval"]["accuracy"]
+
+
+def test_real_guard_removes_stale_results_on_early_cli_exit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from tests.e2e.accuracy.omni_duplex_eval import test_omni_duplex_eval_ci as guard
+
+    config = _load_config()
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
+    _call_real_guard(monkeypatch, tmp_path)
+    monkeypatch.setattr(guard, "_run_cli", lambda argv: None)
+    with pytest.raises(AssertionError, match="bench serve exited without writing .*bench-result.json"):
+        guard.test_omni_duplex_eval_ci(_FakeServer("127.0.0.1", 9999, "mock-model"), tmp_path, "http://judge:8001")
+    assert not (tmp_path / "bench-result.json").exists()
+    assert not list(tmp_path.glob("result_acc_*.json"))
+
+
+def test_real_guard_rejects_wrong_sample_with_same_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "responses" / "run-ci" / "evaluation"
+    _write_scores_from_config(root, _load_config())
+    sample = root / "RTD_world_knowledge" / "360.json"
+    sample.rename(sample.with_name("wrong-id.json"))
+    with pytest.raises(AssertionError, match="score sample IDs differ"):
+        _call_real_guard(monkeypatch, tmp_path)
 
 
 def test_real_guard_rejects_unsupported_dataset_revision(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -255,7 +365,7 @@ def test_real_guard_rejects_unsupported_dataset_revision(monkeypatch: pytest.Mon
     from tests.e2e.accuracy.omni_duplex_eval import test_omni_duplex_eval_ci as guard
 
     config = _load_config()
-    _write_scores_from_config(tmp_path / "scores", config)
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
 
     patched = dict(config)
     patched["dataset_revision"] = "abcd1234"
@@ -276,7 +386,9 @@ def test_real_guard_fails_on_low_rtd_content(monkeypatch: pytest.MonkeyPatch, tm
     monkeypatch.setattr(guard, "_MIN_RTD_MEAN_CONTENT_SCORE", 2.0)
     monkeypatch.setattr(guard, "_MIN_RTD_MEAN_TEMPORAL_SCORE", 0.0)
     config = _load_config()
-    _write_scores_from_config(tmp_path / "scores", config, content_score=1.0, temporal_score=3)
+    _write_scores_from_config(
+        tmp_path / "responses" / "run-ci" / "evaluation", config, content_score=1.0, temporal_score=3
+    )
     with pytest.raises(AssertionError, match="RTD content score"):
         _call_real_guard(monkeypatch, tmp_path)
 
@@ -291,7 +403,7 @@ def test_real_guard_fails_on_low_pr_success(monkeypatch: pytest.MonkeyPatch, tmp
 
     monkeypatch.setattr(guard, "_MIN_PR_MEAN_ALL_SUCCESS", 0.5)
     config = _load_config()
-    _write_scores_from_config(tmp_path / "scores", config, pr_success=False)
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config, pr_success=False)
     with pytest.raises(AssertionError, match="PR success rate"):
         _call_real_guard(monkeypatch, tmp_path)
 
@@ -299,9 +411,9 @@ def test_real_guard_fails_on_low_pr_success(monkeypatch: pytest.MonkeyPatch, tmp
 def test_real_guard_fails_on_missing_score_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Real guard raises when score file count does not match sample count."""
     config = _load_config()
-    _write_scores_from_config(tmp_path / "scores", config)
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
     # Add an extra file to break the count assertion
-    extra_dir = tmp_path / "scores" / "RTD_world_knowledge"
+    extra_dir = tmp_path / "responses" / "run-ci" / "evaluation" / "RTD_world_knowledge"
     extra_dir.mkdir(parents=True, exist_ok=True)
     (extra_dir / "extra.json").write_text("{}", encoding="utf-8")
     with pytest.raises(AssertionError, match="expected .* score files"):
@@ -315,7 +427,7 @@ def test_real_guard_fails_on_stale_score_file_protocol_pin(monkeypatch: pytest.M
     from tests.e2e.accuracy.omni_duplex_eval import test_omni_duplex_eval_ci as guard
 
     config = _load_config()
-    _write_scores_from_config(tmp_path / "scores", config)
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
 
     # Force the config pin back to the real value so the config-vs-constant
     # check passes; the per-file check should still fail because one file
@@ -324,7 +436,7 @@ def test_real_guard_fails_on_stale_score_file_protocol_pin(monkeypatch: pytest.M
     monkeypatch.setattr(guard, "_load_ci_config", lambda: config)
 
     # Overwrite one score file with a stale pin
-    rtd_dir = tmp_path / "scores" / "RTD_world_knowledge"
+    rtd_dir = tmp_path / "responses" / "run-ci" / "evaluation" / "RTD_world_knowledge"
     stale = json.loads((rtd_dir / "360.json").read_text(encoding="utf-8"))
     stale["protocol_pin"] = "deadbeef"
     (rtd_dir / "360.json").write_text(json.dumps(stale), encoding="utf-8")
@@ -339,7 +451,7 @@ def test_real_guard_fails_when_config_protocol_pin_drifts(monkeypatch: pytest.Mo
     from tests.e2e.accuracy.omni_duplex_eval import test_omni_duplex_eval_ci as guard
 
     config = _load_config()
-    _write_scores_from_config(tmp_path / "scores", config)
+    _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
 
     patched = dict(config)
     patched["protocol_pin"] = "deadbeef"

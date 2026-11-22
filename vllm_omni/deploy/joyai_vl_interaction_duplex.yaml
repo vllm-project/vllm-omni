@@ -1,0 +1,8 @@
+# Text/video observations with the existing JoyAI -> Qwen3-TTS -> Code2Wav stages.
+base_config: joyai_vl_interaction.yaml
+session_mode: duplex
+duplex_session:
+  max_sessions: 1
+  # All-sync Code2Wav emits the whole waveform in one event. Allow the
+  # 4096-frame TTS budget (~22 MiB of base64 PCM16 at normal playback speed).
+  max_pending_output_bytes_per_session: 33554432

@@ -146,6 +146,10 @@ def load_codec(
     # The v1 quantizer emits FP32 tensors, so its decoder must remain FP32.
     if device.type != "cpu" and isinstance(codec, MossAudioTokenizerV2Model):
         codec.decoder.to(dtype=torch.bfloat16)
+    if device.type == "cuda" and isinstance(codec, MossAudioTokenizerV2Model):
+        from .audio_tokenizer_v2 import enable_gelu_epilogue
+
+        logger.info("MOSS codec GELU GEMM epilogue: %d decoder layers", enable_gelu_epilogue(codec.decoder))
     if attention_backend != "sdpa":
         if attention_backend not in {"triton", "triton_slot"} or device.type != "cuda":
             raise ValueError(f"Unsupported codec attention backend/device: {attention_backend}/{device.type}")
@@ -154,13 +158,15 @@ def load_codec(
 
         if attention_backend == "triton_slot":
             from vllm_omni.model_executor.models.moss_tts.slot_attention import (
-                slot_ring_attention,
-                slot_ring_attention_rows,
+                slot_ring_flash_attention as slot_ring_attention,
+            )
+            from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+                slot_ring_flash_attention_rows as slot_ring_attention_rows,
             )
 
             slot_ring_attention = partial(slot_ring_attention, skip_empty_tiles=True)
             slot_ring_attention_rows = partial(slot_ring_attention_rows, skip_empty_tiles=True)
-            logger.info("MOSS codec slot attention: skipping empty tiles for T <= 32")
+            logger.info("MOSS codec slot attention: single-pass flash ring kernel")
 
         for module in codec.decoder.modules():
             if isinstance(module, MossAudioTokenizerMultiheadAttention):
@@ -214,6 +220,7 @@ class _MossCodecStreamSession:
         gpu_output: bool = False,
         chunk_frames: int = 0,
         ring_headroom: bool = False,
+        packed: bool = False,
     ) -> None:
         self._codec = codec
         self._state_capacity = int(state_capacity)
@@ -242,6 +249,18 @@ class _MossCodecStreamSession:
         scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
         if isinstance(codec, MossAudioTokenizerV2Model):
             scratch_capacity = 1
+        packed_frame_sizes = (
+            sorted({frames for b in batch_sizes for frames in (b, b * self._chunk_frames) if frames > 1})
+            if packed
+            else []
+        )
+        if packed_frame_sizes:
+            # Packed graphs decode every streaming step; no batched graphs.
+            batch_sizes = []
+        # A packed call's segments past its streams own distinct scratch slots.
+        packed_segments = self._state_capacity + 1
+        if packed_frame_sizes:
+            scratch_capacity = max(scratch_capacity, packed_segments)
         self._total_state_capacity = self._state_capacity + scratch_capacity
         self._state_slot_ids = torch.arange(
             self._total_state_capacity,
@@ -258,7 +277,14 @@ class _MossCodecStreamSession:
                     raise ValueError("codec_ring_headroom requires a positive codec chunk frame count.")
                 # Size every attention ring for context + one full chunk so a
                 # chunk write never evicts keys inside its own causal window.
-                initialize_state_pool(self._state_capacity, scratch_capacity, chunk_frames=self._chunk_frames)
+                initialize_state_pool(
+                    self._state_capacity,
+                    scratch_capacity,
+                    chunk_frames=self._chunk_frames,
+                    packed=bool(packed_frame_sizes),
+                )
+            elif isinstance(codec, MossAudioTokenizerV2Model):
+                initialize_state_pool(self._state_capacity, scratch_capacity, packed=bool(packed_frame_sizes))
             else:
                 initialize_state_pool(self._state_capacity, scratch_capacity)
         logger.info(
@@ -292,6 +318,25 @@ class _MossCodecStreamSession:
                 )
             self._cudagraph_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
+        self._packed_wrapper: CUDAGraphPackedDecoderWrapper | None = None
+        if packed_frame_sizes:
+            from vllm_omni.model_executor.models.moss_tts.packed_codec import (
+                CUDAGraphPackedDecoderWrapper,
+                enable_packed_decode,
+            )
+
+            stages = enable_packed_decode(codec, self._chunk_frames)
+            self._packed_wrapper = CUDAGraphPackedDecoderWrapper(
+                codec,
+                frame_sizes=packed_frame_sizes,
+                max_segments=packed_segments,
+                scratch_base=self._state_capacity,
+                num_quantizers=self._n_vq,
+                vllm_config=vllm_config,
+            )
+            self._packed_wrapper.warmup(self._device)
+            self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
+            logger.info("MOSS-TTS packed codec decode: %d decoder transformers", stages)
 
     def acquire(self) -> int | None:
         if not self._free_stream_slots:
@@ -493,6 +538,49 @@ class _MossCodecStreamSession:
         for row, slot in enumerate(slots):
             audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
             out[slot] = audio[row, ..., :audio_length].contiguous()
+        return out
+
+    @torch.no_grad()
+    def step_packed(self, items: list[tuple[int, torch.Tensor, bool]]) -> dict[int, torch.Tensor]:
+        """Decode ``(slot, codes [n_vq, frames], terminal)`` chunks of distinct slots, packed.
+
+        Returns each slot's (channels, samples) fp32 waveform, owned by the
+        caller (a view of one fresh tensor per packed call).
+        """
+        wrapper = self._packed_wrapper
+        assert wrapper is not None
+        if any(slot not in self._leased_slots for slot, _, _ in items):
+            raise RuntimeError("Packed streaming decode references an unleased state slot")
+        out: dict[int, torch.Tensor] = {}
+        batch: list[tuple[int, torch.Tensor, bool]] = []
+        frames = 0
+
+        def flush() -> None:
+            audio, starts, lengths = wrapper.decode([s for s, _, _ in batch], [c for _, c, _ in batch])
+            # Graph replay reuses its output; queued delivery must own this waveform.
+            audio = audio.clone()
+            spf, channels = wrapper.samples_per_frame, wrapper.channels
+            for (slot, _, _), start, length in zip(batch, starts, lengths, strict=True):
+                out[slot] = audio[start * spf * channels : (start + length) * spf * channels].view(channels, -1)
+            terminal = {slot for slot, _, last in batch if last}
+            if terminal:
+                if self._metadata_ring:
+                    _, terminal_ids = self._stage_slot_ids([slot for slot, _, _ in batch], terminal)
+                else:
+                    terminal_ids = torch.tensor(sorted(terminal), dtype=torch.long, device=self._device)
+                self._reset_slot_ids(terminal_ids)
+
+        for slot, codes, terminal in items:
+            n = int(codes.shape[1])
+            if n > wrapper.max_frames:
+                raise ValueError(f"Packed codec chunk of {n} frames exceeds the largest graph ({wrapper.max_frames})")
+            if batch and (len(batch) + 1 >= wrapper.max_segments or frames + n > wrapper.max_frames):
+                flush()
+                batch, frames = [], 0
+            batch.append((slot, codes.to(device=self._device, dtype=torch.long), terminal))
+            frames += n
+        if batch:
+            flush()
         return out
 
 
@@ -825,7 +913,7 @@ class MossTTSCodecDecoder(nn.Module):
         if streaming_work:
             stream_output_slab = None
             stream_output_buffers: dict[int, torch.Tensor] = {}
-            if self._gpu_stream_output and device.type == "cuda":
+            if self._gpu_stream_output and device.type == "cuda" and not self._packed_decode_ready:
                 total_elements = 0
                 for output_index, _, codes_nq_t, _ in streaming_work:
                     samples = int(codes_nq_t.shape[1]) * self._codec.downsample_rate
@@ -926,6 +1014,12 @@ class MossTTSCodecDecoder(nn.Module):
             gpu_output=self._gpu_stream_output,
             chunk_frames=self._stream_max_step_frames,
             ring_headroom=self._stream_ring_headroom,
+            packed=(
+                isinstance(self._codec, MossAudioTokenizerV2Model)
+                and self.vllm_config.device_config.device.type == "cuda"
+                and bool(self._streaming_graph_batch_sizes)
+                and getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa") == "triton_slot"
+            ),
         )
         if self._stream_ring_headroom:
             logger.info(
@@ -943,6 +1037,9 @@ class MossTTSCodecDecoder(nn.Module):
         session = self._ensure_stream_session()
         if session is None:
             return {}
+
+        if session._packed_wrapper is not None:
+            return self._decode_streaming_packed(session, items)
 
         outputs: dict[int, torch.Tensor] = {}
         grouped: dict[int, list[tuple[int, str, int, torch.Tensor, bool]]] = {}
@@ -1016,6 +1113,65 @@ class MossTTSCodecDecoder(nn.Module):
                         state_already_reset=True,
                     )
 
+        return outputs
+
+    @property
+    def _packed_decode_ready(self) -> bool:
+        session = self._stream_session
+        return session is not None and session._packed_wrapper is not None
+
+    def _decode_streaming_packed(
+        self, session: _MossCodecStreamSession, items: list[tuple[int, str, torch.Tensor, bool]]
+    ) -> dict[int, torch.Tensor]:
+        """``_decode_streaming_batch`` through packed calls, for any mix of chunk lengths.
+
+        Items are ``(output_index, request_id, codes [n_vq, frames], finished)``
+        with distinct requests. A chunk longer than one steady chunk is split
+        into steady pieces; round ``r`` packs the ``r``-th piece of every
+        chunk, so each stream's pieces decode in order.
+        """
+        step_frames = max(1, int(self._stream_max_step_frames))
+        pieces: dict[int, list[torch.Tensor]] = {}
+        index_of: dict[int, int] = {}
+        finished_slots: set[int] = set()
+        for output_index, request_id, codes_nq_t, finished in items:
+            slot = self._stream_req_slots.get(request_id)
+            if slot is None:
+                slot = session.acquire()
+                if slot is None:
+                    raise RuntimeError(
+                        "MOSS codec state capacity exhausted; refusing to drop audio codes "
+                        f"(max_num_seqs={self._stream_state_capacity})."
+                    )
+                self._stream_req_slots[request_id] = slot
+            frames = int(codes_nq_t.shape[1])
+            pieces[slot] = [codes_nq_t[:, start : start + step_frames] for start in range(0, frames, step_frames)]
+            index_of[slot] = output_index
+            if finished:
+                finished_slots.add(slot)
+        decoded: dict[int, list[torch.Tensor]] = {slot: [] for slot in pieces}
+        for r in range(max(map(len, pieces.values()), default=0)):
+            plan = [
+                (slot, chunks[r], slot in finished_slots and r == len(chunks) - 1)
+                for slot, chunks in pieces.items()
+                if r < len(chunks)
+            ]
+            for slot, wav in session.step_packed(plan).items():
+                decoded[slot].append(wav)
+        outputs = {
+            index_of[slot]: torch.cat(wavs, dim=-1) if len(wavs) > 1 else wavs[0]
+            for slot, wavs in decoded.items()
+            if wavs
+        }
+        for _, request_id, codes_nq_t, finished in items:
+            if finished:
+                # A terminal piece reset its slot's state; an empty chunk left it to the release.
+                self._finish_stream_request(
+                    request_id,
+                    session,
+                    self._stream_req_slots.get(request_id),
+                    state_already_reset=int(codes_nq_t.shape[1]) > 0,
+                )
         return outputs
 
     def _decode_stream_slot_sequence(
@@ -1131,7 +1287,7 @@ class MossTTSCodecDecoder(nn.Module):
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
         )
-        if device.type == "cuda":
+        if device.type in ("cuda", "npu"):
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
 
             shared = 0

@@ -553,6 +553,102 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("buffer_seconds", [None, 1.25])
+def test_chunk_boundary_defers_only_when_playback_feedback_is_enabled(monkeypatch, mocker, buffer_seconds):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+    pending: list[str] = []
+    applied: list[str] = []
+
+    class InteractivePipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            applied.extend(pending)
+            pending.clear()
+
+        def prepare_next_chunk(self, state):
+            state.latents = torch.tensor([float(len(applied))])
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = InteractivePipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    request = _make_step_request(4)
+    request.sampling_params.streaming_buffer_seconds = buffer_seconds
+    first_wave = _make_scheduler_output(request)
+    if buffer_seconds is not None:
+        from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
+
+        first_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(boundary_at=0.0)
+    runner.execute_stepwise(first_wave)
+    output = runner.execute_stepwise(_make_cached_scheduler_output()).get_request_output("req-1")
+    assert output.result is not None and not output.finished
+    if buffer_seconds is not None:
+        assert output.streaming_next_media_duration == 1.0
+
+    # The transport/RPC loop can receive a key only after execute returns.
+    pending.append("key-release")
+    next_wave = _make_cached_scheduler_output(step_id=2)
+    if buffer_seconds is not None:
+        next_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(
+            boundary_at=1.0, window_opened_at=0.0, window_end_at=1.0
+        )
+    runner.execute_stepwise(next_wave)
+    assert applied == (["key-release"] if buffer_seconds is not None else [])
+    assert runner.input_batch.latents.item() == (1.0 if buffer_seconds is not None else 0.0)
+    if buffer_seconds is not None:
+        assert runner.input_batch.states[0].interaction_boundary == next_wave.interaction_boundaries["req-1"]
+
+
+@pytest.mark.cpu
+def test_playback_window_rejects_oversized_first_chunk_before_denoising(monkeypatch, mocker):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+    class InteractivePipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            pass
+
+        def prepare_next_chunk(self, state):
+            pass
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = InteractivePipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    forward = mocker.spy(runner.pipeline, "denoise_step")
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    request = _make_step_request(4)
+    request.sampling_params.streaming_buffer_seconds = 0.75
+    output = runner.execute_stepwise(_make_scheduler_output(request)).get_request_output("req-1")
+    assert output.finished
+    assert "must fit a complete media chunk" in output.result.error
+    forward.assert_not_called()
+
+
+@pytest.mark.cpu
+def test_cleanup_wave_releases_last_state_and_batch_without_forward(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    runner.execute_stepwise(_make_scheduler_output(_make_step_request()))
+    assert runner.state_cache and runner.input_batch is not None
+    cleanup = _make_cached_scheduler_output(finished_req_ids={"req-1"})
+    cleanup.scheduled_cached_reqs = CachedRequestData.make_empty()
+    output = runner.execute_stepwise(cleanup)
+    assert output.runner_outputs == []
+    assert not runner.state_cache
+    assert runner.input_batch is None
+    assert runner.pipeline.denoise_calls == 1
+
+
+@pytest.mark.cpu
 def test_input_batch_cached_repack_refreshes_state_references_without_prompt_embeds():
     first_state = _make_input_batch_state("req-1", 1.0)
     batch = InputBatch.make_batch([first_state])
@@ -652,8 +748,7 @@ class TestRunner:
     ):
         runner = _make_runner(diffusion_kv_mode)
         cleanup = mocker.patch.object(runner, "remove_diffusion_kv_requests")
-        expected_output = object()
-        mocker.patch.object(runner, "_execute_stepwise_core", return_value=expected_output)
+        execute = mocker.patch.object(runner, "_execute_stepwise_core")
         scheduler_output = DiffusionSchedulerOutput(
             step_id=1,
             scheduled_new_reqs=[],
@@ -665,7 +760,8 @@ class TestRunner:
 
         output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
 
-        assert output is expected_output
+        assert output.runner_outputs == []
+        execute.assert_not_called()
         if should_cleanup:
             cleanup.assert_called_once_with(["finished-request"])
         else:
@@ -734,6 +830,7 @@ class TestRunner:
         assert second.result.error is None
         assert torch.equal(second.result.output, torch.tensor([2.0]))
         assert "req-1" not in runner.state_cache
+        assert runner.input_batch is None
 
         assert runner.pipeline.prepare_calls == 1
         assert runner.pipeline.denoise_calls == 2
@@ -1205,7 +1302,7 @@ class _RecordingLoRAManager:
     def __init__(self) -> None:
         self.calls: list[tuple[object | None, float]] = []
 
-    def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
+    def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
 
 

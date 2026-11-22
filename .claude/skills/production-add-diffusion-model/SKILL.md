@@ -428,6 +428,8 @@ Maintain separate CI gates:
 
 1. Function: strict load, API/offline positive and negative contracts.
 2. Accuracy: fixed reference revision/assets/seed/schedule and scoped tolerance.
+   Reuse [diffusion-accuracy-test](../diffusion-accuracy-test/SKILL.md) for
+   reference alignment, calibration, and CI wiring.
 3. Performance: fixed best deployment plus memory-constrained/DLO row, raw JSON,
    explicit warmup, enough samples for each claimed statistic, and owned
    regression thresholds.

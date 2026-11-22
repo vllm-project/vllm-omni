@@ -318,16 +318,39 @@ async def test_envelope_errors_are_answered_locally_without_touching_the_session
 
 
 @pytest.mark.asyncio
-async def test_open_rejection_is_reported_and_the_socket_ends() -> None:
+@pytest.mark.parametrize(
+    ("code", "retryable", "error_type"),
+    [("resource_exhausted", True, "rate_limit_error"), ("invalid_session_config", False, "invalid_request_error")],
+)
+async def test_open_rejection_reports_retryability_and_handler_returns(
+    code: str, retryable: bool, error_type: str
+) -> None:
     omni = FakeOmni()
-    omni.open_error = DuplexSessionError("no room", code="resource_exhausted", retryable=True)
+    omni.open_error = DuplexSessionError("open rejected", code=code, retryable=retryable)
     handler = _handler(omni)
     ws = FakeWebSocket({"duplex": "1"})
     task = asyncio.create_task(handler.handle_realtime_session(ws))
     ws.feed(_session_update())
     await asyncio.wait_for(task, timeout=2.0)
     assert ws.types() == ["error"]
-    assert ws.sent[0]["error"]["code"] == "resource_exhausted"
+    assert ws.sent[0]["error"] == {
+        "type": error_type,
+        "code": code,
+        "message": "open rejected",
+        "retryable": retryable,
+    }
+
+
+def test_transport_error_without_retryable_preserves_existing_fields() -> None:
+    payload = RealtimeEnvelope.error_payload("bad_event", "invalid input", event_id="client-event", param="audio")
+    assert payload["type"] == "error"
+    assert payload["error"] == {
+        "type": "invalid_request_error",
+        "code": "bad_event",
+        "message": "invalid input",
+        "event_id": "client-event",
+        "param": "audio",
+    }
 
 
 @pytest.mark.asyncio

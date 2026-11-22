@@ -8,9 +8,9 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any, TypeGuard
 
-from vllm_omni.model_extras.cosmos3 import _mapping
+from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS, _mapping
 
-from .lidar import validate_lidar_config
+from .lidar_vae import validate_lidar_config
 
 COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
 
@@ -123,6 +123,8 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
         raise TypeError("Cosmos3 multiview cameras must be a non-empty list of strings.")
     if len(cameras) != len(set(cameras)):
         raise ValueError("Cosmos3 multiview cameras must be unique.")
+    if unknown := sorted(set(cameras) - set(COSMOS3_MADS_CAMERAS)):
+        raise ValueError(f"Cosmos3 multiview cameras must be MADS cameras; unknown: {unknown}.")
     if "lidar" in config:
         validate_lidar_config(dict(_mapping(config["lidar"], "lidar")))
     lidar_patch = _validated_lidar_patch(config)

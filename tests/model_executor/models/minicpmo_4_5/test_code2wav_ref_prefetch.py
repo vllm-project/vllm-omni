@@ -46,11 +46,13 @@ def _prefetch_model(
     setup_cache_size: int = 1,
     ref_prefetch: bool | None = None,
     prefetch_setup: bool | None = None,
+    max_waiters: int = 1,
 ) -> tuple[MiniCPMO45Code2Wav, _FakeToken2Wav]:
     """Code2Wav over the fake Token2wav; ``token2wav.cold_setups`` records the
     prompt key of every setup built on a setup-cache miss."""
     config = _config(runtime_prompt_cache_size=capacity, setup_cache_size=setup_cache_size)
     extra = config.model_config.stage_connector_config["extra"]
+    extra["token2wav_ref_prefetch_max_waiters"] = max_waiters
     if ref_prefetch is not None:
         extra["token2wav_ref_prefetch"] = ref_prefetch
     if prefetch_setup is not None:
@@ -758,3 +760,42 @@ def test_prefetch_phases_run_under_the_stage_matmul_policy(allow_tf32, monkeypat
         torch.backends.cuda.matmul.allow_tf32 = previous
     # Phase A prepares the prompt; phase B prepares it again (cache hit) and builds the setup.
     assert seen == [("prepare_prompt", allow_tf32), ("prepare_prompt", allow_tf32), ("setup_batch", allow_tf32)]
+
+
+def test_configured_waiter_limit_prefetches_one_reference_per_idle_step():
+    model, token2wav = _prefetch_model(max_waiters=4)
+    model.on_requests_added(
+        [
+            _prewarm("req-a", _REF_A),
+            _prewarm("req-b", _REF_B),
+            _prewarm("req-c", _REF_A),
+            _prewarm("req-d", _REF_C),
+        ]
+    )
+    for remaining, cold_prompts in [(3, 1), (2, 2), (1, 2), (0, 3)]:
+        assert model.run_idle_prefetch()
+        assert len(model._prefetch_queue) == remaining
+        assert _cold(token2wav) == (cold_prompts, 0)
+    # Same content shares features; different references remain separate.
+    assert model._prefetch_pins["req-a"] == model._prefetch_pins["req-c"]
+    assert model._prefetch_pins["req-a"] != model._prefetch_pins["req-b"]
+    model.on_requests_finished(["req-a", "req-b", "req-c", "req-d"])
+    _assert_no_prefetch_state(model)
+
+
+def test_configured_waiter_limit_still_defers_above_limit_and_while_busy():
+    model, token2wav = _prefetch_model(max_waiters=2)
+    model.on_requests_added([_prewarm("a"), _prewarm("b"), _prewarm("c")])
+    assert not model.run_idle_prefetch()
+    model.on_requests_finished(["c"])
+    model._states["live"] = object()
+    assert not model.run_idle_prefetch()
+    model._states.clear()
+    assert model.run_idle_prefetch()
+    assert _cold(token2wav) == (1, 0)
+    model.on_requests_finished(["a", "b"])
+
+
+def test_prefetch_waiter_limit_must_be_positive():
+    with pytest.raises(ValueError, match="max_waiters"):
+        _prefetch_model(max_waiters=0)

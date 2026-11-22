@@ -170,9 +170,11 @@ class RealtimeEnvelope:
         *,
         event_id: object | None = None,
         param: object | None = None,
+        retryable: bool | None = None,
     ) -> dict[str, object]:
         """Wire JSON of a transport-level error (derived from the typed ``ErrorEvent``)."""
-        return error_event(code, message, event_id=event_id, param=param).to_realtime()
+        extra = {"retryable": retryable} if retryable is not None else None
+        return error_event(code, message, event_id=event_id, param=param, extra=extra).to_realtime()
 
     @staticmethod
     def command_error_payload(exc: DuplexCommandError) -> dict[str, object]:

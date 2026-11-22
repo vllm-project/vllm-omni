@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
 
 COSMOS3_EXTRA_BODY_PARAMS = frozenset(
     {
@@ -127,19 +129,78 @@ def normalize_multiview_aspect_ratio(value: Any) -> str:
     )
 
 
-COSMOS3_MADS_CAMERAS = (
-    "camera_front_wide_120fov",
-    "camera_cross_right_120fov",
-    "camera_rear_right_70fov",
-    "camera_rear_tele_30fov",
-    "camera_rear_left_70fov",
-    "camera_cross_left_120fov",
-    "camera_front_tele_30fov",
-    "camera_front_fisheye_200fov",
-    "camera_left_fisheye_200fov",
-    "camera_right_fisheye_200fov",
-    "camera_rear_fisheye_200fov",
-)
+# The MADS rig, verbatim from the reference camera attributes.
+# Per-view caption headers quote these values, so a drifted copy still produces
+# well-formed captions that describe the wrong rig.
+COSMOS3_MADS_CAMERA_ATTRIBUTES: dict[str, dict[str, str | int]] = {
+    "camera_front_wide_120fov": {
+        "camera_role": "front",
+        "camera_type": "wide",
+        "facing": "forward",
+        "fov_degrees": 120,
+    },
+    "camera_cross_right_120fov": {
+        "camera_role": "right_side",
+        "camera_type": "wide",
+        "facing": "right",
+        "fov_degrees": 120,
+    },
+    "camera_rear_right_70fov": {
+        "camera_role": "rear_right",
+        "camera_type": "standard",
+        "facing": "rear_right",
+        "fov_degrees": 70,
+    },
+    "camera_rear_tele_30fov": {
+        "camera_role": "rear",
+        "camera_type": "telephoto",
+        "facing": "backward",
+        "fov_degrees": 30,
+    },
+    "camera_rear_left_70fov": {
+        "camera_role": "rear_left",
+        "camera_type": "standard",
+        "facing": "rear_left",
+        "fov_degrees": 70,
+    },
+    "camera_cross_left_120fov": {
+        "camera_role": "left_side",
+        "camera_type": "wide",
+        "facing": "left",
+        "fov_degrees": 120,
+    },
+    "camera_front_tele_30fov": {
+        "camera_role": "front",
+        "camera_type": "telephoto",
+        "facing": "forward",
+        "fov_degrees": 30,
+    },
+    "camera_front_fisheye_200fov": {
+        "camera_role": "front",
+        "camera_type": "fisheye",
+        "facing": "forward",
+        "fov_degrees": 200,
+    },
+    "camera_left_fisheye_200fov": {
+        "camera_role": "left_side",
+        "camera_type": "fisheye",
+        "facing": "left",
+        "fov_degrees": 200,
+    },
+    "camera_right_fisheye_200fov": {
+        "camera_role": "right_side",
+        "camera_type": "fisheye",
+        "facing": "right",
+        "fov_degrees": 200,
+    },
+    "camera_rear_fisheye_200fov": {
+        "camera_role": "rear",
+        "camera_type": "fisheye",
+        "facing": "backward",
+        "fov_degrees": 200,
+    },
+}
+COSMOS3_MADS_CAMERAS = tuple(COSMOS3_MADS_CAMERA_ATTRIBUTES)
 # Control and vision per camera, plus the LiDAR control and measured LiDAR condition.
 MULTIVIEW_MAX_UPLOADS = 2 * len(COSMOS3_MADS_CAMERAS) + 2
 # LiDAR upload index field -> the path field it resolves to.
@@ -337,7 +398,7 @@ def has_multiview_upload_indexes(extra: Mapping[str, Any]) -> bool:
 
 
 def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[str]) -> dict[str, Any]:
-    """Copy the manifest and substitute paths; also usable with suffix-only paths before persistence."""
+    """Copy the manifest, substitute persisted upload paths for indexes, and validate the result."""
     if len(upload_paths) > MULTIVIEW_MAX_UPLOADS:
         raise ValueError(f"Cosmos3 multiview accepts at most {MULTIVIEW_MAX_UPLOADS} uploaded references.")
     multiview = dict(_mapping(extra.get("multiview"), "extra_params.multiview"))
@@ -386,3 +447,31 @@ def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[s
     # captions are required here, before the asynchronous generation job begins.
     validate_multiview_request(resolved)
     return resolved
+
+
+async def admit_multiview_uploads(
+    extra_params: Mapping[str, Any] | None,
+    *,
+    negative_prompt: str | None,
+    num_uploads: int,
+    persist: Callable[[int, bool], Awaitable[str]],
+) -> dict[str, Any]:
+    """Persist multipart ``input_references`` and resolve the manifest to local paths.
+
+    This is the video API's single admission entry point for Cosmos3 multiview
+    uploads. ``persist(index, numeric_lidar)`` stores one upload and returns its
+    path; the caller owns those files, including cleanup when this raises. The
+    LiDAR control and condition are numeric uploads, checked structurally as soon
+    as they are stored. Manifest problems raise ``ValueError`` or ``TypeError``.
+    """
+    extra = extra_params or {}
+    reject_multiview_negative_fields({"negative_prompt": negative_prompt}, "request")
+    lidar_indexes = multiview_lidar_upload_indexes(extra)
+    paths: list[str] = []
+    for index in range(num_uploads):
+        numeric_lidar = index in lidar_indexes
+        path = await persist(index, numeric_lidar)
+        paths.append(path)
+        if numeric_lidar:
+            validate_lidar_header(path)
+    return resolve_multiview_uploads(extra, paths)

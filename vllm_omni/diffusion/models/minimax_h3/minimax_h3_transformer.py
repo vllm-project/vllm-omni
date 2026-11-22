@@ -652,6 +652,36 @@ class MiniMaxH3Attention(nn.Module):
             metadata,
         ).squeeze(0)
 
+    def _project_qkv(
+        self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
+        total = x.shape[0]
+        qkv, _ = self.qkv_proj(x)
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q = q.view(total, self.num_heads, self.head_dim)
+        k = k.view(total, self.num_kv_heads, self.head_dim)
+        v = v.view(total, self.num_kv_heads, self.head_dim)
+        if self.vdn is not None and vdn_window is None:
+            raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
+        # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
+        q_raw, k_raw = q, k
+        if rope_table is None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        else:
+            q, k = fused_qk_norm_rope(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                rope_table,
+                self.q_norm.variance_epsilon,
+            )
+        return q, k, v, q_raw, k_raw
+
     def forward(
         self,
         x: torch.Tensor,
@@ -678,29 +708,7 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
-        q_size = self.num_heads * self.head_dim
-        kv_size = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_kv_heads, self.head_dim)
-        v = v.view(total, self.num_kv_heads, self.head_dim)
-        if self.vdn is not None and vdn_window is None:
-            raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
-        # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
-        q_raw, k_raw = q, k
-        if rope_table is None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        else:
-            q, k = fused_qk_norm_rope(
-                q,
-                k,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                rope_table,
-                self.q_norm.variance_epsilon,
-            )
+        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window)
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
         # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
@@ -997,13 +1005,17 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
+        attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         # The prefix also carries the block index that block-sparse attention
         # backends match against their skip_layers selector.
-        self.attn = MiniMaxH3Attention(
+        # ``attention_cls`` lets a derived model (for example the TaoMate-H3
+        # streaming variant) swap in a subclass of ``MiniMaxH3Attention`` that
+        # keeps the checkpoint layout but changes the attention kernel path.
+        self.attn = attention_cls(
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
@@ -1274,6 +1286,7 @@ class MiniMaxH3DiTModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
         *,
         diffusers_weights: bool | None = None,
+        attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
@@ -1395,6 +1408,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     quant_config,
                     prefix=f"blocks.{i}",
                     adaln_cache=self.adaln_cache,
+                    attention_cls=attention_cls,
                 )
                 for i in range(arch.num_layers)
             ]
@@ -1619,6 +1633,34 @@ class MiniMaxH3DiTModel(nn.Module):
         value = psp.get(field) if isinstance(psp, dict) else getattr(psp, field, None)
         return default if value is None else value
 
+    def _embed_row_indices(
+        self,
+        *,
+        img_pos: torch.Tensor,
+        audio_pos: torch.Tensor,
+        text_pos: torch.Tensor,
+        seq_len: int,
+        local_span: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Select this rank's rows; derived models may reuse a prepared selection."""
+        local_start, local_len = local_span
+        if local_len == seq_len:
+            return img_pos, audio_pos, img_pos, audio_pos, text_pos, None
+        local_end = local_start + local_len
+        img_mask = (img_pos >= local_start) & (img_pos < local_end)
+        audio_mask = (audio_pos >= local_start) & (audio_pos < local_end)
+        text_mask = (text_pos >= local_start) & (text_pos < local_end)
+        img_global_pos = img_pos[img_mask]
+        audio_global_pos = audio_pos[audio_mask]
+        return (
+            img_global_pos,
+            audio_global_pos,
+            img_global_pos - local_start,
+            audio_global_pos - local_start,
+            text_pos[text_mask] - local_start,
+            torch.nonzero(text_mask, as_tuple=False).view(-1),
+        )
+
     def _embed(
         self,
         *,
@@ -1645,26 +1687,12 @@ class MiniMaxH3DiTModel(nn.Module):
         contract) do not silently miss the kwarg. ``forward()`` reads the real
         value from ``packed_seq_params["num_requests"]``.
         """
-        local_start, local_len = local_span
-        local_end = local_start + local_len
-        local_only = local_len != seq_len
-        if local_only:
-            img_mask = (img_pos >= local_start) & (img_pos < local_end)
-            audio_mask = (audio_pos >= local_start) & (audio_pos < local_end)
-            text_mask = (text_pos >= local_start) & (text_pos < local_end)
-            img_global_pos = img_pos[img_mask]
-            audio_global_pos = audio_pos[audio_mask]
-            img_local_pos = img_global_pos - local_start
-            audio_local_pos = audio_global_pos - local_start
-            text_local_pos = text_pos[text_mask] - local_start
-            text_local_indices = torch.nonzero(text_mask, as_tuple=False).view(-1)
-        else:
-            img_global_pos = img_pos
-            audio_global_pos = audio_pos
-            img_local_pos = img_pos
-            audio_local_pos = audio_pos
-            text_local_pos = text_pos
-            text_local_indices = None
+        local_len = local_span[1]
+        img_global_pos, audio_global_pos, img_local_pos, audio_local_pos, text_local_pos, text_local_indices = (
+            self._embed_row_indices(
+                img_pos=img_pos, audio_pos=audio_pos, text_pos=text_pos, seq_len=seq_len, local_span=local_span
+            )
+        )
 
         # Latent embedders stay fp32 in and out; their outputs are cast to the
         # bf16 sequence dtype only during indexed scattering.

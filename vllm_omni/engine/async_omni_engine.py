@@ -21,6 +21,7 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
     apply_omni_final_stage_metadata,
     inject_global_id,
+    scope_stage_replica_mm_uuids,
     upgrade_to_omni_request,
 )
 from vllm_omni.engine.messages import (
@@ -43,14 +44,6 @@ class AsyncOmniEngine(OmniEngineBase):
         return Orchestrator(**orchestrator_kwargs)
 
     # ---- request helpers ----
-
-    @staticmethod
-    def _iter_multimodal_items(value: Any) -> list[Any]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return value
-        return [value]
 
     _DEFAULT_MM_HASHER_ALGORITHM = "blake3"
 
@@ -109,59 +102,13 @@ class AsyncOmniEngine(OmniEngineBase):
         request built from that dict reuse them as user UUIDs and key its new
         media under the old media's hash.
         """
-
-        if not isinstance(prompt, dict):
-            return prompt
-
-        mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, dict) or not mm_data:
-            return prompt
-
-        from vllm.multimodal.hasher import MultiModalHasher
-
-        mm_hasher_algorithm = self._resolve_mm_hasher_algorithm()
-
-        existing_uuids = prompt.get("multi_modal_uuids")
-        if not isinstance(existing_uuids, dict):
-            existing_uuids = {}
-
-        model_id = str(getattr(self, "model", ""))
-        scoped_uuids: dict[str, list[str | None]] = dict(existing_uuids)
-        for modality, raw_items in mm_data.items():
-            items = self._iter_multimodal_items(raw_items)
-            if not items:
-                continue
-
-            modality_existing = existing_uuids.get(modality)
-            if not isinstance(modality_existing, list):
-                modality_existing = [modality_existing] if modality_existing is not None else []
-
-            modality_uuids: list[str | None] = []
-            for idx, item in enumerate(items):
-                user_uuid = modality_existing[idx] if idx < len(modality_existing) else None
-                if user_uuid is not None:
-                    base_uuid = str(user_uuid)
-                elif item is None:
-                    base_uuid = None
-                else:
-                    base_uuid = MultiModalHasher.hash_kwargs(
-                        mm_hasher_algorithm,
-                        model_id=model_id,
-                        **{modality: item},
-                    )
-
-                if base_uuid is None:
-                    modality_uuids.append(None)
-                else:
-                    modality_uuids.append(f"stage{stage_id}:rep{replica_id}:{base_uuid}")
-
-            scoped_uuids[modality] = modality_uuids
-
-        if not scoped_uuids:
-            return prompt
-        scoped_prompt = dict(prompt)
-        scoped_prompt["multi_modal_uuids"] = scoped_uuids
-        return scoped_prompt
+        return scope_stage_replica_mm_uuids(
+            prompt,
+            stage_id=stage_id,
+            replica_id=replica_id,
+            model_id=str(getattr(self, "model", "")),
+            mm_hasher_algorithm=self._resolve_mm_hasher_algorithm(),
+        )
 
     @staticmethod
     def _stage_pool_replica_count(stage_pool: Any) -> int:
@@ -271,6 +218,7 @@ class AsyncOmniEngine(OmniEngineBase):
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
+        entry_stage_id: int = 0,
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
         request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
@@ -303,7 +251,15 @@ class AsyncOmniEngine(OmniEngineBase):
             raise ValueError("kv_hints require an AR/LLM stage with a KV cache")
         output_prompt_text: Any = None
         _preprocess_ms = 0.0
-        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+        if entry_stage_id:
+            # The request bypasses stage 0: its prompt stays raw for the entry
+            # stage's input processor (Orchestrator._build_entry_stage_request).
+            for item in prompt if isinstance(prompt, list) else [prompt]:
+                inject_global_id(item, request_id)
+            output_prompt_text = prompt_text
+            if output_prompt_text is None and isinstance(prompt, dict):
+                output_prompt_text = prompt.get("prompt")
+        elif stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Stage transforms and downstream stages must share the same
             # request identity, including when the transform replaces the
             # prompt object.
@@ -414,6 +370,8 @@ class AsyncOmniEngine(OmniEngineBase):
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
             request_artifact_dirs=request_artifact_dirs or None,
+            entry_stage_id=entry_stage_id,
+            lora_request=lora_request,
         )
 
     def _build_cfg_companions(
@@ -533,6 +491,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
+        entry_stage_id: int = 0,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
 
@@ -557,6 +516,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 data_parallel_rank=data_parallel_rank,
                 reasoning_ended=reasoning_ended,
                 resumable=resumable,
+                entry_stage_id=entry_stage_id,
                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
             )
         except BaseException:
@@ -616,6 +576,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
+        entry_stage_id: int = 0,
     ) -> None:
         """Async add_request API."""
         self.add_request(
@@ -633,6 +594,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            entry_stage_id=entry_stage_id,
             **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
 

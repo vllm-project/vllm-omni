@@ -28,8 +28,9 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+
 from . import forwards
-from . import triton_rms_norm as rn
 
 logger = init_logger(__name__)
 
@@ -40,7 +41,7 @@ _UNDO_ATTR = "_vllm_omni_wan_fastpath_undo"
 ENCODER_REPORT_ATTR = "_vllm_omni_wan_encode_fastpath_report"
 _ENCODER_UNDO_ATTR = "_vllm_omni_wan_encode_fastpath_undo"
 
-_REPLACEMENT_FORWARDS = {
+_REPLACEMENT_FORWARDS: dict[type[nn.Module], Callable[..., torch.Tensor]] = {
     WanDecoder3d: forwards.decoder_forward,
     WanCausalConv3d: forwards.causal_conv_forward,
     WanResidualBlock: forwards.residual_block_forward,
@@ -345,7 +346,7 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
     if len(encoder.down_blocks) != 4 or any(type(block) is not WanResidualDownBlock for block in encoder.down_blocks):
         return skip("requires four diffusers WanResidualDownBlock stages")
 
-    replacements = {
+    replacements: dict[type[nn.Module], Callable[..., torch.Tensor]] = {
         WanEncoder3d: ef.encoder_forward,
         WanResidualDownBlock: ef.residual_down_block_forward,
         WanResample: ef.downsample_forward,

@@ -117,7 +117,20 @@ def _gpu_flash_attn_usable() -> bool:
         driver_major = int(out.splitlines()[0].split(".")[0])
     except Exception:
         return True
-    return driver_major >= 580
+    if driver_major >= 580:
+        return True
+    # nvidia-smi reports only the kernel-mode driver. Data-center images layer
+    # the cuda-compat forward-compatibility package (an NVIDIA data-center-GPU
+    # deployment) over it, so the libcuda.so.1 this process resolves can still
+    # speak CUDA 13. Ask that user-mode driver before declaring the build stuck.
+    try:
+        import ctypes
+
+        usermode = ctypes.CDLL("libcuda.so.1")
+        version = ctypes.c_int(0)
+        return usermode.cuDriverGetVersion(ctypes.byref(version)) == 0 and version.value >= 13000
+    except Exception:
+        return False
 
 
 def _require_gpu_flash_attn() -> None:

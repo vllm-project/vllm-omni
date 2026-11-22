@@ -109,6 +109,17 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._request_condition_states = {}
     talker._deferred_cleanup_ids = set()
     talker._tts_config = ConditionalChatTTSConfig()
+    # Codec sampling contract added by the multi-frame decode work: the fixture
+    # runs the deterministic greedy boundary (argmax over head_code) and never
+    # arms the multi-frame loop.
+    talker._codec_temperature = 0.0
+    talker._codec_top_k = 0
+    talker._codec_top_p = 1.0
+    talker._codec_repetition_penalty = 1.0
+    talker._codec_min_tokens = 0
+    talker._codec_max_tokens = 4032
+    talker._k_step_frames = 0
+    talker.supports_multi_frame_decode = False
     talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
     with torch.no_grad():
         talker.head_code[0].weight.copy_(torch.eye(8, 2))
@@ -770,7 +781,11 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
             "native_duplex": True,
             "duplex": {"epoch": 3, "turn_id": 7},
             "ids": {"tts": [41]},
-            "meta": {"native_duplex_segment_text": "first", "turn_eos_token_id": 99},
+            "meta": {
+                "native_duplex_segment_text": "first",
+                "turn_eos_token_id": 99,
+                "streaming_condition_seq": 11,
+            },
             "codes": {"audio": torch.empty(0)},
         },
         {
@@ -778,7 +793,11 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
             "native_duplex": True,
             "duplex": {"epoch": 4, "turn_id": 8},
             "ids": {"tts": [42, 99]},
-            "meta": {"native_duplex_segment_text": "second", "turn_eos_token_id": 99},
+            "meta": {
+                "native_duplex_segment_text": "second",
+                "turn_eos_token_id": 99,
+                "streaming_condition_seq": 12,
+            },
             "codes": {"audio": torch.empty(0)},
         },
     ]
@@ -793,6 +812,7 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
     assert [value.item() for value in meta["native_duplex"]] == [True, True]
     assert [value.item() for value in meta["duplex_epoch"]] == [3, 4]
     assert [value.item() for value in meta["duplex_turn_id"]] == [7, 8]
+    assert [value.item() for value in meta["streaming_condition_seq"]] == [11, 12]
     assert [bytes(value.tolist()).decode("utf-8") for value in meta["llm_output_text_utf8"]] == [
         "first",
         "second",
@@ -1340,6 +1360,32 @@ def test_request_cleanup_evicts_decode_state() -> None:
 
     assert "req-done" not in talker._request_audio_states
     assert "req-done" not in talker._request_condition_states
+
+
+def test_batch_preprocess_cleans_finished_requests_without_forward() -> None:
+    # Full graph replay never re-enters the Python forward method. Exercise
+    # the runner's host hook with live rows and a finished request together.
+    from unittest.mock import Mock
+
+    talker = _make_talker()
+    talker._device_codec_state = Mock()
+    talker._decode_codec_ids = {"done": torch.tensor([2]), "live": torch.tensor([3])}
+    talker._request_audio_states = {"done": {}, "live": {"step": 4}}
+    talker._request_condition_states = {"done": {}, "live": {"condition_seq": 1}}
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model_stage = "tts"
+    model.talker = talker
+    talker.on_requests_finished(["done"])
+
+    for _ in range(2):
+        model.preprocess_batch(req_ids=["live"], model_intermediate_buffer={}, device=torch.device("cpu"))
+
+    assert talker._request_audio_states == {"live": {"step": 4}}
+    assert talker._request_condition_states == {"live": {"condition_seq": 1}}
+    assert set(talker._decode_codec_ids) == {"live"}
+    assert not talker._deferred_cleanup_ids
+    talker._device_codec_state.release.assert_called_once_with("done")
 
 
 def test_turn_end_drain_masks_only_the_cadence_eos() -> None:

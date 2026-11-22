@@ -91,6 +91,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import sys
 from datetime import datetime
@@ -107,6 +108,8 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     videomme_bench_argv,
 )
 
+logger = logging.getLogger(__name__)
+
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -116,6 +119,49 @@ def _repo_root() -> Path:
 
 def _default_result_dir() -> Path:
     return Path(__file__).resolve().parent / "results" / "qwen_omni_acc"
+
+
+def _accuracy_hardware_label() -> str:
+    """Local device token for the accuracy result, or ``""`` when detection fails.
+
+    The accuracy client can target a remote server, so ``device_count`` /
+    ``get_device_name`` may be unusable on the host that writes the JSON.
+    Dashboard metadata must not abort the run before the accuracy gate.
+    """
+    try:
+        from tests.helpers.hardware import get_runtime_resource_label, hardware_json_value
+
+        return hardware_json_value(get_runtime_resource_label())
+    except Exception:
+        logger.warning("Could not detect Hardware for the accuracy result; writing an empty label", exc_info=True)
+        return ""
+
+
+def _write_accuracy_result_metadata(
+    path: Path,
+    data: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    dataset: str,
+) -> None:
+    """Write dashboard fields into the bench result JSON.
+
+    ``vllm bench serve`` saves measured scores only. The thresholds from the
+    accuracy test (``--min-daily-omni-accuracy``, ``--max-seed-tts-mean-wer``, …)
+    are applied afterwards, so persist them under ``baseline`` before the check.
+    Unset optional gates (``None``) are omitted.
+
+    ``dataset`` is the filename token (``daily_omni``, ``videomme``, ``seed_tts``).
+    Model and dataset names both contain underscores, so the dashboard reads
+    ``dataset`` from this field. ``model_id`` stays as ``vllm bench serve`` wrote it.
+
+    ``Hardware`` uses the same runtime label as ``tests/dfx/perf/scripts/run_benchmark.py``
+    (``H100``, ``A3``, …; empty when the device is unknown or detection fails).
+    """
+    data["dataset"] = dataset
+    data["baseline"] = {key: value for key, value in baseline.items() if value is not None}
+    data["Hardware"] = _accuracy_hardware_label()
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
@@ -248,6 +294,27 @@ def _preserve_benchmark_dataset_env() -> Any:
                 os.environ[key] = value
 
 
+def _acc_model_name(model: str) -> str:
+    """Checkpoint name safe for a result filename.
+
+    ``Qwen/Qwen3-Omni-30B-A3B-Instruct`` becomes ``Qwen3-Omni-30B-A3B-Instruct``.
+    """
+    name = str(model).strip().replace("\\", "/").rstrip("/")
+    name = name.rsplit("/", 1)[-1]
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name).strip("._-")
+    return safe or "model"
+
+
+def _acc_result_filename(model: str, suite: str, when: datetime | None = None) -> str:
+    """``result_acc_{model}_{suite}_{date}_{timestamp}.json``.
+
+    Daily-Omni on Qwen3-Omni and MiniCPM-o 4.5 both use this shape, for example
+    ``result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261014_164800.json``.
+    """
+    when = datetime.now() if when is None else when
+    return f"result_acc_{_acc_model_name(model)}_{suite}_{when.strftime('%Y%m%d')}_{when.strftime('%H%M%S')}.json"
+
+
 def _build_common_args(
     ns: argparse.Namespace,
     *,
@@ -276,8 +343,7 @@ def _build_common_args(
 
 def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
     ns.result_dir.mkdir(parents=True, exist_ok=True)
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"qwen_omni_acc_daily_omni_{tag}.json"
+    result_filename = _acc_result_filename(ns.model, "daily_omni")
     extra = json.loads(ns.daily_extra_body_json)
     argv = (
         _build_common_args(ns, result_filename=result_filename)
@@ -304,8 +370,7 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
 
 def run_videomme(ns: argparse.Namespace, vllm: str) -> Path:
     ns.result_dir.mkdir(parents=True, exist_ok=True)
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"omni_acc_videomme_{tag}.json"
+    result_filename = _acc_result_filename(ns.model, "videomme")
     extra = json.loads(ns.videomme_extra_body_json)
     argv = (
         _build_common_args(ns, result_filename=result_filename)
@@ -344,8 +409,7 @@ def run_videomme(ns: argparse.Namespace, vllm: str) -> Path:
 
 def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
     ns.result_dir.mkdir(parents=True, exist_ok=True)
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"qwen_omni_acc_seed_tts_{tag}.json"
+    result_filename = _acc_result_filename(ns.model, "seed_tts")
     extra = json.loads(ns.seed_extra_body_json)
     argv = (
         _build_common_args(
@@ -653,6 +717,12 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_daily_omni(ns, vllm)
             print(f"\n[Daily-Omni] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
+            _write_accuracy_result_metadata(
+                path,
+                data,
+                {"min_daily_omni_accuracy": ns.min_daily_omni_accuracy},
+                dataset="daily_omni",
+            )
             errs = _validate_daily_omni(data, min_accuracy=ns.min_daily_omni_accuracy)
             if errs:
                 failed.extend([f"[Daily-Omni] {e}" for e in errs])
@@ -667,6 +737,12 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_videomme(ns, vllm)
             print(f"\n[Video-MME] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
+            _write_accuracy_result_metadata(
+                path,
+                data,
+                {"min_videomme_accuracy": ns.min_videomme_accuracy},
+                dataset="videomme",
+            )
             errs = _validate_videomme(data, min_accuracy=ns.min_videomme_accuracy)
             if errs:
                 failed.extend([f"[Video-MME] {e}" for e in errs])
@@ -682,6 +758,16 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_seed_tts(ns, vllm)
             print(f"\n[Seed-TTS] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
+            _write_accuracy_result_metadata(
+                path,
+                data,
+                {
+                    "max_seed_tts_mean_wer": ns.max_seed_tts_mean_wer,
+                    "min_seed_tts_mean_sim": ns.min_seed_tts_mean_sim,
+                    "min_seed_tts_mean_utmos": ns.min_seed_tts_mean_utmos,
+                },
+                dataset="seed_tts",
+            )
             errs = _validate_seed_tts(
                 data,
                 max_mean_wer=ns.max_seed_tts_mean_wer,

@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 from torch import nn
 
-from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_contract
+from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_contract, multiview_lidar_contract
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
@@ -2715,6 +2715,29 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
+@pytest.mark.parametrize("guidance_scale", [0.0, 1.0, 3.0, 5.0])
+@pytest.mark.parametrize("cfg_normalize", [False, True])
+def test_transfer_control_delta_is_independent_of_text_guidance(
+    make_cosmos3_pipeline, guidance_scale, cfg_normalize
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    cond_no_control = torch.tensor([2.0, 4.0])
+    cond_full = torch.tensor([6.0, 10.0])
+    uncond_full = torch.tensor([1.0, 3.0])
+    expected = uncond_full + guidance_scale * (cond_no_control - uncond_full)
+    if guidance_scale != 0.0:
+        expected += 1.5 * (cond_full - cond_no_control)
+    if cfg_normalize:
+        expected = pipeline.cfg_normalize_function(cond_full, expected)
+
+    actual = pipeline.combine_multi_branch_cfg_noise(
+        [cond_full, cond_no_control, uncond_full],
+        {"mode": "cosmos3_transfer", "guidance_scale": guidance_scale, "control_guidance": 1.5},
+        cfg_normalize=cfg_normalize,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -2745,7 +2768,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
-    torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+    torch.testing.assert_close(result, torch.full_like(latents, -46.0))
 
 
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2930,7 +2953,7 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
         (2, False),
         (2, True),
     ]
-    torch.testing.assert_close(result, torch.full_like(latents, 508.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 208.0))
 
 
 @pytest.mark.parametrize(
@@ -3650,11 +3673,15 @@ def test_multiview_rig_view_captions_list_request_cameras_in_order() -> None:
         format_rig_view_captions(["only one"], ["camera_rear_right_70fov", "camera_front_tele_30fov"])
 
 
-def test_multiview_rig_view_attributes_cover_every_mads_camera() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import MADS_CAMERA_ATTRIBUTES
-    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+def test_multiview_control_emphasis_selects_joint_or_single_hint_directive() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import (
+        COSMOS3_AV_JOINT_CONTROL_DIRECTIVE,
+        control_emphasis,
+    )
+    from vllm_omni.diffusion.models.cosmos3.utils import COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE
 
-    assert tuple(MADS_CAMERA_ATTRIBUTES) == COSMOS3_MADS_CAMERAS
+    assert control_emphasis("wsm", joint=True) == COSMOS3_AV_JOINT_CONTROL_DIRECTIVE
+    assert control_emphasis("wsm", joint=False) == COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names="wsm")
 
 
 @pytest.mark.parametrize(("truncate", "expected"), [(False, "6.7"), (True, "6.0")])
@@ -4064,7 +4091,7 @@ def _chunked_lidar_encoder(chunk: int, context: int):
     kept cache plus the causal part of its chunk), so latents change whenever
     the retained history does.
     """
-    from vllm_omni.diffusion.models.cosmos3.lidar import Cosmos3LidarEncoder
+    from vllm_omni.diffusion.models.cosmos3.lidar_vae import Cosmos3LidarEncoder
 
     class CausalMean:
         def forward_stream(self, pixels, coords, cache):
@@ -4076,11 +4103,7 @@ def _chunked_lidar_encoder(chunk: int, context: int):
 
     encoder = object.__new__(Cosmos3LidarEncoder)
     nn.Module.__init__(encoder)
-    encoder.config = {
-        "streaming_chunk_frames": chunk,
-        "streaming_context_frames": context,
-        "range_projection": {"semantic_width": 1800, "model_width": 1808, "min_range_m": 0.0, "max_range_m": 100.0},
-    }
+    encoder.config = multiview_lidar_contract(chunk, context)
     encoder.encoder = CausalMean()
     encoder.quant_conv = nn.Identity()
     encoder.coords = torch.zeros(1)
@@ -4176,3 +4199,148 @@ def test_multiview_uploads_reject_invalid_lidar_condition_reference(lidar, paths
 
     with pytest.raises(ValueError, match=match):
         resolve_multiview_uploads(extra, upload_paths)
+
+
+def test_admit_multiview_uploads_persists_checks_lidar_and_resolves(tmp_path) -> None:
+    import asyncio
+
+    from safetensors.torch import save_file
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    lidar_path = tmp_path / "hdmap.safetensors"
+    save_file({"frames": torch.zeros(3, 2, 128, 1800)}, str(lidar_path))
+    paths = {0: str(tmp_path / "front.mp4"), 1: str(lidar_path)}
+    calls: list[tuple[int, bool]] = []
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        calls.append((index, numeric_lidar))
+        return paths[index]
+
+    resolved = asyncio.run(
+        admit_multiview_uploads(
+            _uploaded_joint_manifest(return_output=True), negative_prompt=None, num_uploads=2, persist=persist
+        )
+    )
+
+    assert calls == [(0, False), (1, True)]
+    assert resolved["multiview"]["views"][0]["control_path"] == paths[0]
+    assert resolved["lidar"] == {"control_path": paths[1], "return_output": True}
+
+
+def test_admit_multiview_uploads_rejects_before_and_after_persisting(tmp_path) -> None:
+    import asyncio
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    persisted: list[int] = []
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        persisted.append(index)
+        path = tmp_path / f"upload{index}{'.safetensors' if numeric_lidar else '.mp4'}"
+        path.write_bytes(b"not a safetensors header")
+        return str(path)
+
+    with pytest.raises(ValueError, match="does not support request.negative_prompt"):
+        asyncio.run(
+            admit_multiview_uploads(
+                _uploaded_joint_manifest(), negative_prompt="Blurry.", num_uploads=2, persist=persist
+            )
+        )
+    assert persisted == []  # rejected before any upload is written
+
+    with pytest.raises(ValueError, match="Invalid LiDAR safetensors input"):
+        asyncio.run(
+            admit_multiview_uploads(_uploaded_joint_manifest(), negative_prompt=None, num_uploads=2, persist=persist)
+        )
+    assert persisted == [0, 1]  # the caller still owns every persisted file
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_diffuse_transfer_releases_unipc_history_on_completion_or_failure(make_cosmos3_pipeline, fail) -> None:
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler = FlowUniPCMultistepScheduler()
+    pipeline.scheduler.set_timesteps(3, device="cpu")
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    original_predict = pipeline.predict_noise
+    calls = 0
+
+    def predict(**kwargs):
+        nonlocal calls
+        calls += 1
+        if fail and calls == 2:
+            assert pipeline.scheduler.last_sample is not None
+            raise RuntimeError("prediction failed")
+        return original_predict(**kwargs)
+
+    pipeline.predict_noise = predict
+    kwargs = dict(
+        latents=latents,
+        timesteps=pipeline.scheduler.timesteps,
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="prediction failed"):
+            pipeline.diffuse_transfer(**kwargs)
+    else:
+        result = pipeline.diffuse_transfer(**kwargs)
+        assert torch.isfinite(result).all()
+
+    assert pipeline.scheduler.model_outputs == [None] * pipeline.scheduler.config.solver_order
+    assert pipeline.scheduler.timestep_list == [None] * pipeline.scheduler.config.solver_order
+    assert pipeline.scheduler.last_sample is None
+    assert pipeline._cosmos3_branch_caches is None
+    # A completed or abandoned solve can start again with the same scheduler.
+    pipeline.scheduler.set_timesteps(3, device="cpu")
+    actual = pipeline.scheduler.step(torch.ones_like(latents), pipeline.scheduler.timesteps[0], latents).prev_sample
+    fresh = FlowUniPCMultistepScheduler()
+    fresh.set_timesteps(3, device="cpu")
+    expected = fresh.step(torch.ones_like(latents), fresh.timesteps[0], latents).prev_sample
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("open_interval", [False, True])
+@pytest.mark.parametrize("guidance,control_guidance", [(3.0, 1.0), (1.0, 3.0), (3.0, 3.0)])
+def test_diffuse_transfer_interval_bounds_and_cfg_normalization(
+    make_cosmos3_pipeline, open_interval, guidance, control_guidance
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    cfg_calls = []
+
+    def predict_cfg(**kwargs):
+        cfg_calls.append(kwargs["cfg_normalize"])
+        return torch.zeros_like(latents)
+
+    pipeline.predict_noise_with_multi_branch_cfg = predict_cfg
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([9, 7, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance,
+        control_guidance=control_guidance,
+        control_guidance_interval=(3, 9),
+        guidance_interval=(3, 9),
+        control_latents=[],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+        normalize_cfg=True,
+        open_guidance_interval=open_interval,
+    )
+    assert cfg_calls == [True] * (1 if open_interval else 3)

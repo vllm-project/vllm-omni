@@ -23,6 +23,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("randomize_inputs", [False, True])
 def test_profile_run_accepts_release_flag_without_running_codec(monkeypatch, randomize_inputs):
     runner = object.__new__(OmniGenerationModelRunner)
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
     runner.model = MagicMock(side_effect=AssertionError("profiling ran codec model"))
     synchronize = MagicMock()
     monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
@@ -47,6 +50,9 @@ class _FakeStagedField:
 
 def _make_runner(model_output, num_reqs=1, prompt_len=10):
     runner = object.__new__(OmniGenerationModelRunner)
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
     runner.device = torch.device("cpu")
     runner.model_config = MagicMock(hf_text_config=None)
     del runner.model_config.eos_token_id
@@ -69,6 +75,9 @@ def _make_runner(model_output, num_reqs=1, prompt_len=10):
 @pytest.mark.parametrize("aux_enabled", [False, True])
 def test_control_only_step_keeps_lifecycle_and_skips_input_construction(aux_enabled):
     runner = object.__new__(OmniGenerationModelRunner)
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
     order = []
     for name in (
         "_prepare_native_data_plane",
@@ -109,6 +118,9 @@ def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
     from vllm_omni.core.sched.output import OmniCachedRequestData
 
     runner = object.__new__(OmniGenerationModelRunner)
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
     runner.model = SimpleNamespace(logits_processor=None)
     runner._remove_request = MagicMock()
     req_id_to_index = MagicMock()

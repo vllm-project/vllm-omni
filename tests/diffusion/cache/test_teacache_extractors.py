@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 import torch.nn as nn
+from vllm.model_executor.layers.linear import LinearBase
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
@@ -61,6 +62,7 @@ def setup_tp_group():
         with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
             mock_tp_group = MagicMock()
             mock_tp_group.world_size = 1
+            mock_tp_group.rank_in_group = 0
             mock_get_tp_group.return_value = mock_tp_group
             yield
 
@@ -161,7 +163,7 @@ class TestMammothModa2Extractor(BaseExtractorTest):
             parallel_config=SimpleNamespace(ring_degree=1),
         )
         with set_current_diffusion_config(od_config):
-            yield MammothModa2Transformer2DModel(
+            model = MammothModa2Transformer2DModel(
                 patch_size=2,
                 in_channels=4,
                 hidden_size=16,
@@ -173,6 +175,14 @@ class TestMammothModa2Extractor(BaseExtractorTest):
                 axes_lens=(16, 16, 16),
                 text_feat_dim=8,
             )
+            # Unlike nn.Linear, vLLM linear layers leave their weights
+            # uninitialized for the checkpoint loader to populate. This tiny
+            # test model is constructed directly, so initialize those weights
+            # before exercising numerical cache behavior.
+            for submodule in model.modules():
+                if isinstance(submodule, LinearBase):
+                    nn.init.normal_(submodule.weight, std=0.02)
+            yield model
 
     def get_module(self, mammoth_module):
         return mammoth_module

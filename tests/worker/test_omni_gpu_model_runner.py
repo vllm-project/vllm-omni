@@ -1282,3 +1282,54 @@ def test_multimodal_embeddings_receive_opt_in_host_request_boundaries(supports_b
         assert received["query_start_loc"] == [0, 6, 7, 11]
     else:
         assert "query_start_loc" not in received
+
+
+class BatchFilledRowsModel:
+    has_preprocess = True
+
+    def __init__(self, filled, *, fills_rows=True):
+        self.filled = set(filled)
+        self.preprocess_batch_fills_rows = fills_rows
+        self.batch_kwargs: dict = {}
+        self.calls = []
+
+    def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device, **layout):
+        self.batch_kwargs = {"req_ids": list(req_ids), **layout}
+        if not layout:
+            return None
+        for i, req_id in enumerate(req_ids):
+            if req_id in self.filled:
+                s = layout["token_offsets"][i]
+                layout["inputs_embeds"][s] = 100.0 + i
+                layout["input_ids"][s] = -i
+        return set(self.filled)
+
+    def preprocess(self, input_ids, input_embeds, **info):
+        self.calls.append(info["request_id"])
+        return input_ids, input_ids.float().view(-1, 1).expand(-1, 4).clone(), {"marker": info["request_id"]}
+
+
+def test_batch_filled_rows_skip_the_per_request_preprocess(monkeypatch):
+    rows = [("live-a", 5, 4, 1), ("prefill", 8, 0, 3), ("live-b", 6, 5, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a", "live-b"})
+    runner.model = model
+
+    ids, embeds, *_ = runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    assert model.calls == ["prefill"]
+    assert model.batch_kwargs["req_ids"] == ["live-a", "prefill", "live-b"]
+    torch.testing.assert_close(embeds[0], torch.full((4,), 100.0))
+    torch.testing.assert_close(embeds[4], torch.full((4,), 102.0))
+    assert ids.tolist() == [0, 1, 2, 3, -2]
+
+
+def test_batch_preprocess_without_fill_opt_in_keeps_the_legacy_hook(monkeypatch):
+    runner, scheduled, _, _ = _make_phase_runner(
+        monkeypatch, [("live-a", 5, 4, 1), ("live-b", 6, 5, 1)], batched_decode=False
+    )
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a"}, fills_rows=False)
+    runner.model = model
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    assert model.batch_kwargs == {"req_ids": ["live-a", "live-b"]} and model.calls == ["live-a", "live-b"]

@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import WebSocket
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
+from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
 from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 
 logger = init_logger(__name__)
@@ -39,35 +42,47 @@ async def _reject_unavailable_realtime_websocket(websocket: WebSocket) -> None:
     await websocket.close()
 
 
-async def dispatch_realtime_websocket(websocket: WebSocket) -> None:
-    """Route a turn-based Realtime session to the OpenAI connection handler."""
-    state = websocket.app.state
-    if (
-        getattr(state, "diffusion_engine", None) is not None
-        or getattr(state, "engine_client", None) is None
-        or getattr(state, "openai_serving_chat", None) is None
-    ):
-        await _reject_unavailable_realtime_websocket(websocket)
-        return
+class OpenAIRealtimeHandler:
+    """App-scoped OpenAI Realtime handler with one shared VAD backend provider."""
 
-    model_name = state.openai_serving_models.base_model_paths[0].name
-    # Some OpenAI-compatible clients always send ``model=`` even when the
-    # caller leaves model selection to this single-model Omni server.
-    requested_model = websocket.query_params.get("model")
-    if requested_model and requested_model != model_name:
-        await reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
-        return
+    def __init__(self, *, model_path: str | None = None) -> None:
+        self._vad_backend_provider = SileroVADBackendProvider(model_path=model_path)
 
-    await wait_for_duplex_warmup(websocket)
+    @classmethod
+    def from_engine_client(cls, engine_client: Any) -> OpenAIRealtimeHandler:
+        backend_engine = getattr(engine_client, "engine", engine_client)
+        duplex_session_config = getattr(backend_engine, "duplex_session_config", None)
+        return cls(model_path=getattr(duplex_session_config, "server_vad_model_path", None))
 
-    from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
+    async def handle_websocket(self, websocket: WebSocket) -> None:
+        state = websocket.app.state
+        if (
+            getattr(state, "diffusion_engine", None) is not None
+            or getattr(state, "engine_client", None) is None
+            or getattr(state, "openai_serving_chat", None) is None
+        ):
+            await _reject_unavailable_realtime_websocket(websocket)
+            return
 
-    connection = OpenAIFullDuplexConnection(
-        websocket=websocket,
-        engine=state.engine_client,
-        model_name=model_name,
-        chat_handler=state.openai_serving_chat,
-        tool_call_parser=getattr(state.args, "tool_call_parser", None),
-        enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
-    )
-    await connection.handle_connection()
+        model_name = state.openai_serving_models.base_model_paths[0].name
+        # Some OpenAI-compatible clients always send ``model=`` even when the
+        # caller leaves model selection to this single-model Omni server.
+        requested_model = websocket.query_params.get("model")
+        if requested_model and requested_model != model_name:
+            await reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
+            return
+
+        await wait_for_duplex_warmup(websocket)
+
+        from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
+
+        connection = OpenAIFullDuplexConnection(
+            websocket=websocket,
+            engine=state.engine_client,
+            model_name=model_name,
+            chat_handler=state.openai_serving_chat,
+            tool_call_parser=getattr(state.args, "tool_call_parser", None),
+            enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
+            vad_backend_provider=self._vad_backend_provider,
+        )
+        await connection.handle_connection()

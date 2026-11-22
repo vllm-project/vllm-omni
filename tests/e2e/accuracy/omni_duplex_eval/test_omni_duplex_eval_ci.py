@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CI guard for Omni-DuplexEval scoring regression.
 
-Pipeline: generate -> evaluate -> summarize -> assert.
+Pipeline: bench serve (generate + evaluate + save) -> assert.
 """
 
 from __future__ import annotations
 
 import json
+import secrets
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -18,11 +20,9 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS as DUPLEX_TEST_PARAMS,
 )
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
-    realtime_url,
     resolve_ref_audio,
 )
 from tests.helpers.mark import hardware_test
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
 
 # Thresholds (hardcoded, community accuracy test pattern).
@@ -64,12 +64,9 @@ _RESULT_DIR = Path(__file__).resolve().parent / "results"
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", _DUPLEX_SERVER_PARAMS, indirect=True)
 def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> None:
-    """CI guard: generate -> evaluate -> summarize -> assert scores."""
+    """CI guard: benchmark serving and assert the saved accuracy results."""
     config = _load_ci_config()
     response_root = tmp_path / "responses"
-    score_root = tmp_path / "scores"
-    response_root.mkdir(parents=True, exist_ok=True)
-    score_root.mkdir(parents=True, exist_ok=True)
 
     all_ids = sorted(set(sid for sids in config["sample_ids_per_split"].values() for sid in sids))
     exclude = set(config.get("exclude_ids", []))
@@ -80,63 +77,95 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
     if dataset_revision:
         raise NotImplementedError(f"dataset_revision pinning is not yet supported (got {dataset_revision!r}).")
 
-    # Phase 1: Generate
-    dataset_ref = config["dataset"]
-    _run_cli(
-        [
-            "vllm",
-            "bench",
-            "omni-duplex-eval",
-            "--omni",
-            "generate",
-            "--dataset",
-            dataset_ref,
-            "--split",
-            "all",
-            "--ids",
-            *sample_ids,
-            "--url",
-            realtime_url(omni_server),
-            "--model",
-            omni_server.model,
-            "--ref-audio",
-            str(resolve_ref_audio()),
-            "--response-root",
-            str(response_root),
-        ]
+    # The integrated benchmark owns generation, judging, and summarization.
+    # Remove previous artifacts so an early CLI failure cannot reuse old results.
+    _RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    benchmark_path = _RESULT_DIR / "bench-result.json"
+    benchmark_path.unlink(missing_ok=True)
+    for old_result in _RESULT_DIR.glob("result_acc_*.json"):
+        old_result.unlink()
+    model_name = Path(omni_server.model).name
+    dataset_name = Path(config["dataset"]).name
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    result_path = _RESULT_DIR / (
+        f"result_acc_{model_name}_{dataset_name}_{timestamp}_{secrets.randbelow(10**8):08d}.json"
     )
-
-    # Phase 2: Evaluate
     judge_cfg = config["judge"]
     _run_cli(
         [
             "vllm",
             "bench",
-            "omni-duplex-eval",
+            "serve",
             "--omni",
-            "evaluate",
-            "--dataset",
-            dataset_ref,
-            "--split",
+            "--backend",
+            "openai-realtime-duplex",
+            "--base-url",
+            f"http://{omni_server.host}:{omni_server.port}",
+            "--endpoint",
+            "/v1/realtime",
+            "--dataset-name",
+            "omni-duplex-eval",
+            "--dataset-path",
+            config["dataset"],
+            "--duplex-eval-split",
             "all",
-            "--ids",
+            "--duplex-eval-ids",
             *sample_ids,
-            "--response-root",
+            "--num-prompts",
+            "0",
+            "--disable-shuffle",
+            "--max-concurrency",
+            "1",
+            "--num-warmups",
+            "0",
+            "--ready-check-timeout-sec",
+            "0",
+            "--model",
+            omni_server.model,
+            "--trust-remote-code",
+            "--duplex-eval-ref-audio",
+            str(resolve_ref_audio()),
+            "--duplex-eval-response-root",
             str(response_root),
-            "--score-root",
-            str(score_root),
-            "--judge-model",
+            "--duplex-eval-evaluate",
+            "--duplex-eval-judge-model",
             judge_cfg["model"],
-            "--judge-base-url",
+            "--duplex-eval-judge-base-url",
             judge_server,
-            "--judge-video-mode",
+            "--duplex-eval-judge-video-mode",
             judge_cfg.get("video_mode", "video_url"),
-            "--judge-fps",
+            "--duplex-eval-judge-fps",
             str(judge_cfg.get("fps", 2)),
-            "--eval-workers",
+            "--duplex-eval-eval-workers",
             str(judge_cfg.get("eval_workers", 4)),
+            "--save-result",
+            "--result-dir",
+            str(_RESULT_DIR),
+            "--result-filename",
+            benchmark_path.name,
         ]
     )
+
+    assert benchmark_path.exists(), f"bench serve exited without writing {benchmark_path}"
+    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    duplex = benchmark["omni_duplex_eval"]
+    summary = duplex["accuracy"]
+    # Export the accuracy artifact for dashboard collection without re-summarizing.
+    # Save before assertions so partial/failed judging remains inspectable in CI.
+    result_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[Omni-DuplexEval] summary saved to {result_path}")
+
+    expected = len(sample_ids)
+    assert benchmark["completed"] == expected, f"expected {expected} completed requests, got {benchmark['completed']}"
+    assert benchmark["failed"] == 0, f"failed benchmark requests: {benchmark['failed']}"
+    assert duplex["published"] == expected, f"expected {expected} published samples, got {duplex['published']}"
+    assert not duplex["artifact_errors"], f"artifact errors: {duplex['artifact_errors']}"
+    assert summary["status"] == "completed", f"evaluation did not complete: {summary}"
+    assert summary["total"] == expected, f"expected {expected} total samples, got {summary['total']}"
+    assert summary["evaluated"] == expected, f"expected {expected} evaluated samples, got {summary['evaluated']}"
+    assert summary["failed"] == 0, f"failed evaluations: {summary['failed']}"
+    assert summary["skipped"] == 0, f"skipped evaluations: {summary['skipped']}"
+    assert not summary["errors"], f"evaluation errors: {summary['errors']}"
 
     # Sanity check: config pin must match the runtime source-of-truth constant.
     config_pin = config.get("protocol_pin")
@@ -144,8 +173,16 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
         f"config protocol_pin {config_pin!r} does not match source of truth {PROTOCOL_PIN!r}"
     )
 
-    score_files = [p for p in Path(score_root).rglob("*.json") if not p.name.endswith("_summary.json")]
+    score_root = Path(summary["score_root"])
+    score_files = [p for p in score_root.rglob("*.json") if not p.name.endswith("_summary.json")]
     assert len(score_files) == len(sample_ids), f"expected {len(sample_ids)} score files, found {len(score_files)}"
+    expected_files = {
+        Path(split) / f"{sid}.json"
+        for split, ids in config["sample_ids_per_split"].items()
+        for sid in ids
+        if sid not in exclude
+    }
+    assert {p.relative_to(score_root) for p in score_files} == expected_files, "score sample IDs differ from CI config"
 
     # Validate each score file is consistent with the configured protocol pin.
     mismatches = []
@@ -156,15 +193,6 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
             mismatches.append(f"{sf.name}: {row_pin!r} != {config_pin!r}")
     assert not mismatches, "protocol_pin mismatch in score files:\n" + "\n".join(mismatches)
 
-    # Phase 3: Summarize + persist result JSON (Buildkite artifact upload pattern)
-    summary = summarize_scores(score_root)
-    _RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    result_path = _RESULT_DIR / "summary.json"
-    result_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n[Omni-DuplexEval] summary saved to {result_path}")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-
-    # Phase 4: Assertions
     assert summary["protocol_pin"] == PROTOCOL_PIN, f"protocol_pin changed: {summary['protocol_pin']} != {PROTOCOL_PIN}"
     assert summary["samples"] == len(sample_ids), f"expected {len(sample_ids)} samples, got {summary['samples']}"
 
@@ -195,14 +223,15 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
     )
 
 
-_CLI_TIMEOUT = 5400
+# One command now includes both phases, previously allowed 5400 seconds each.
+_CLI_TIMEOUT = 10800
 
 
 def _run_cli(argv: list[str]) -> None:
     """Run a CLI command and assert success within timeout.
 
     stdout/stderr are printed in real-time (not captured) so CI logs
-    show full generate / evaluate progress — same pattern as PR#6817
+    show full benchmark / evaluate progress — same pattern as PR#6817
     perf tests (``-s -v`` + ``run_benchmark()``).
     """
     label = " ".join(argv[:3])

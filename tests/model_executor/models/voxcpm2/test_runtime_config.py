@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,6 +10,30 @@ import torch
 from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("uses_v2", [False, True])
+def test_runner_specific_audio_defaults(uses_v2):
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
+    )
+    assert config.enable_incremental_vae is uses_v2
+    assert config.vae_decode_every == (1 if uses_v2 else 3)
+    assert config.audio_emit_every == (3 if uses_v2 else 1)
+
+
+def test_mrv2_explicit_legacy_audio_override():
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                use_v2_model_runner=True,
+                voxcpm2_runtime_config={"enable_incremental_vae": False, "vae_decode_every": 3, "audio_emit_every": 1},
+            )
+        )
+    )
+    assert not config.enable_incremental_vae
+    assert config.vae_decode_every == 3
+    assert config.audio_emit_every == 1
 
 
 @dataclass
@@ -50,6 +75,26 @@ def test_generation_config_defaults() -> None:
     assert config.inference_timesteps == 10
     assert config.cfg_value == 2.0
     assert config.cfg_cutoff_ratio == 1.0
+    assert config.mixed_graph_cache_limit == 0
+
+
+def test_mixed_graph_cache_limit_rejects_negative():
+    with pytest.raises(ValueError, match="mixed_graph_cache_limit"):
+        _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"mixed_graph_cache_limit": -1})))
+
+
+def test_incremental_vae_disables_legacy_batching_without_conflict_warning(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.voxcpm2 import runtime_config
+
+    warnings = []
+    monkeypatch.setattr(runtime_config.logger, "warning", lambda *args: warnings.append(args))
+    config = _VoxCPM2RuntimeConfig(
+        enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3, enable_batched_vae_decode=True
+    )._normalized()
+    assert config.enable_incremental_vae
+    assert not config.enable_batched_vae_decode
+    assert config.audio_emit_every == 3
+    assert not warnings
 
 
 class _CountingEstimator(torch.nn.Module):
@@ -114,3 +159,12 @@ def test_generation_config_runs_estimator(timesteps: int, batch_size: int, cfg_v
         t_span = buffers.get_t_span(config.inference_timesteps)
         expected = noise - cfg_value * (t_span[1] - t_span[-1])
         torch.testing.assert_close(output, expected)
+
+
+def test_exact_patch_batch_requires_incremental_unified_decode():
+    with pytest.raises(ValueError, match="Exact patch batches"):
+        _VoxCPM2RuntimeConfig(enable_exact_patch_batch=True)._normalized()
+    config = _VoxCPM2RuntimeConfig(
+        enable_exact_patch_batch=True, enable_incremental_vae=True, vae_decode_every=1
+    )._normalized()
+    assert config.enable_exact_patch_batch

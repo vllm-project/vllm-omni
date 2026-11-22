@@ -7,7 +7,7 @@ With channels-last activations every spatial position owns a contiguous vector
 of ``C`` channels, so one program can load a ``(BLOCK_P, C)`` tile, reduce over
 the channels in registers and write the normalized (and optionally SiLU'd)
 result: the activation is read once and written once instead of the two-pass
-scheme :mod:`.triton_rms_norm` needs for channels-first layouts.
+scheme :mod:`vllm_omni.diffusion.layers.vae_norm_epilogue` needs for channels-first layouts.
 
 This kernel is only dispatched at the tolerance-based ``channels_last`` level,
 so for FP16/FP32 it uses fast math: one reciprocal per position, ``scale`` folded into

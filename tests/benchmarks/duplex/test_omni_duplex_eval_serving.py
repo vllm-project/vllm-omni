@@ -28,7 +28,7 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
-def _args(tmp_path, *extra):
+def _args(tmp_path, *extra, ref_audio=True):
     ref = tmp_path / "reference.wav"
     ref.write_bytes(b"reference")
     manifest = tmp_path / "samples.json"
@@ -54,8 +54,7 @@ def _args(tmp_path, *extra):
             str(manifest),
             "--endpoint",
             "/v1/realtime",
-            "--duplex-eval-ref-audio",
-            str(ref),
+            *(["--duplex-eval-ref-audio", str(ref)] if ref_audio else []),
             "--duplex-eval-response-root",
             str(tmp_path / "responses"),
             "--disable-shuffle",
@@ -112,6 +111,17 @@ def test_selection_uses_standard_prompt_count(tmp_path, prepared, count, expecte
     assert args.max_concurrency == 1
     assert all(request.ref_audio is requests[0].ref_audio for request in requests)
     assert len({request.request_id for request in requests}) == expected
+
+
+@pytest.mark.parametrize("instructions", [None, "", "Reply briefly."])
+def test_session_instructions_preserve_native_default_or_explicit_override(tmp_path, prepared, instructions):
+    args = _args(
+        tmp_path, *([] if instructions is None else ["--duplex-eval-instructions", instructions]), ref_audio=False
+    )
+    preprocess_serve_args(args)
+    requests = patch.get_samples(args, None)
+    expected = runner.DEFAULT_INSTRUCTIONS if instructions is None else instructions or None
+    assert all(request.instructions == expected and request.ref_audio is None for request in requests)
 
 
 def test_repeated_sweep_runs_keep_artifacts_isolated(tmp_path, prepared):
@@ -405,6 +415,7 @@ async def test_adapter_preserves_metrics_and_forwards_request(tmp_path, prepared
     assert kwargs["additional_headers"]["Authorization"] == "Bearer test-key"
     assert kwargs["additional_headers"]["X-Custom"] == "test"
     assert kwargs["extra_body"] == request.extra_body and kwargs["defer_artifacts"]
+    assert kwargs["turn_detection"] == "none" and kwargs["instructions"] == runner.DEFAULT_INSTRUCTIONS
     assert not expected.output.exists()
     summary = adapter.finalize_duplex_eval([sample], [output])
     assert summary["published"] == 1 and not summary["artifact_errors"]
@@ -516,7 +527,10 @@ async def test_cancelled_request_propagates_and_cleans_up(tmp_path, prepared, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error_code,success", [("playback_ack_too_late", True), ("invalid_session", False)])
+@pytest.mark.parametrize(
+    "error_code,success",
+    [("playback_ack_too_late", True), ("playback_item_not_found", True), ("invalid_session", False)],
+)
 async def test_socket_errors_match_omniinteract_policy(tmp_path, prepared, error_code, success):
     sample = _samples(tmp_path)[0]
 
@@ -737,10 +751,28 @@ def test_artifact_io_failure_preserves_service_results(tmp_path, prepared, monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("judge_status", [None, 200, 503])
-async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, monkeypatch, capsys, judge_status):
-    samples = _samples(tmp_path)
+@pytest.mark.parametrize("turn_detection", ["none", "server_vad"])
+async def test_benchmark_socket_lifecycle_excludes_warmups(
+    tmp_path, prepared, monkeypatch, capsys, judge_status, turn_detection
+):
+    args = _args(
+        tmp_path,
+        "--duplex-eval-turn-detection",
+        turn_detection,
+        "--duplex-eval-instructions",
+        "Reply briefly.",
+        ref_audio=turn_detection == "none",
+    )
+    preprocess_serve_args(args)
+    samples = patch.get_samples(args, None)
+    if turn_detection == "server_vad":
+        assert all(sample.ref_audio is None for sample in samples)
+        monkeypatch.setattr(adapter, "prepare_sample", lambda *args, **kwargs: replace(prepared, ref_audio=None))
+        monkeypatch.setattr(runner, "SERVER_VAD_TAIL_S", 0.02)
+        monkeypatch.setattr(runner, "_SERVER_TURN_SETTLE_S", 0.05)
     configured: list[dict] = []
     judge_calls = []
+    received_types: list[str] = []
 
     class BenchmarkTime:
         offset = 0.0
@@ -779,12 +811,26 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, m
         samples = [replace(sample, evaluation=options) for sample in samples]
 
     async def handler(socket):
+        responded = False
         async for raw in socket:
             event = json.loads(raw)
+            received_types.append(event["type"])
             if event["type"] == "session.update":
                 configured.append(event["session"])
-                await socket.send(json.dumps({"type": "session.created"}))
-            elif event["type"] == "input_audio_buffer.commit":
+                capabilities = (
+                    {
+                        "required_input_modalities": ["audio"],
+                        "optional_input_modalities": [],
+                        "supports_image_input": True,
+                    }
+                    if turn_detection == "server_vad"
+                    else {}
+                )
+                await socket.send(json.dumps({"type": "session.created", "session": {"capabilities": capabilities}}))
+            elif not responded and event["type"] == (
+                "input_audio_buffer.append" if turn_detection == "server_vad" else "input_audio_buffer.commit"
+            ):
+                responded = True
                 for response in [
                     {"type": "response.created", "response": {"id": "r1"}},
                     {"type": "response.output_text.delta", "response_id": "r1", "delta": "Done."},
@@ -833,15 +879,23 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, m
             await judge_server.cleanup()
     assert len(configured) == 5  # one readiness, two warmups, two measured sessions
     assert all(session["extra_body"]["custom"] == "test" for session in configured)
+    assert all(session["instructions"] == "Reply briefly." for session in configured)
+    if turn_detection == "server_vad":
+        assert all(session["turn_detection"] == {"type": "server_vad"} for session in configured)
+        assert all(
+            "ref_audio" not in session and session["extra_body"]["auto_response"] is False for session in configured
+        )
+        assert "input_audio_buffer.commit" not in received_types
+        assert received_types.count("conversation.item.create") == 5
     assert result["completed"] == 2
     assert len(result["duplex_session_metrics"]) == 2
     assert len(result["duplex_request_metrics"]) == 2
     assert result["omni_duplex_eval"]["published"] == 2
     root = samples[0].response_root
     assert len(list(root.glob("*/*.meta.json"))) == 2
-    assert json.loads((root / "PR_correction/0.json").read_text()) == [
-        {"sentence": "Done.", "start": 0.01, "end": 0.01}
-    ]
+    sentence = json.loads((root / "PR_correction/0.json").read_text())[0]
+    assert sentence["sentence"] == "Done."
+    assert sentence["start"] == sentence["end"] == pytest.approx(0.03 if turn_detection == "server_vad" else 0.01)
     report = json.loads((root / "duplex_metrics.json").read_text())
     assert len(report["duplex_session_metrics"]) == 2
     assert 0 <= result["duration"] < 3600

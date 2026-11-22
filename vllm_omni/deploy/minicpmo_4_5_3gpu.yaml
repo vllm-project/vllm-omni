@@ -31,6 +31,9 @@ connectors:
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
+      # Fused CFM DiT body: NPU packed QKV + ACLNN AddLayerNorm +
+      # im2col-GEMM convolutions and a single cache transpose.
+      cfm_fused_body: true
       cfm_max_graphs: 32
 
 stages:

@@ -156,7 +156,7 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         self.lidar_config = _tf_config_get(deployment, "lidar", None)
         self.lidar_patch_hw: tuple[int, int]
         if self.lidar_config is not None:
-            from .lidar import validate_lidar_config
+            from .lidar_vae import validate_lidar_config
 
             self.lidar_config = dict(self.lidar_config)
             validate_lidar_config(self.lidar_config)
