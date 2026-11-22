@@ -194,7 +194,9 @@ GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
 # Session placement families are registered only when the opt-in policy emits.
 DUPLEX_RESERVED_SESSIONS = METRIC_PREFIX + "duplex_reserved_sessions"
 DUPLEX_ADMISSION_REJECTED = METRIC_PREFIX + "duplex_admission_rejected"
-DUPLEX_ADMISSION_REJECT_REASONS = frozenset({"global_capacity_exhausted", "replica_capacity_exhausted", "unknown"})
+DUPLEX_ADMISSION_REJECT_REASONS = frozenset(
+    {"global_capacity_exhausted", "replica_capacity_exhausted", "replica_unavailable", "unknown"}
+)
 
 
 # ============================================================================
