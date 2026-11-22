@@ -55,6 +55,8 @@ export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+# Safe on a single UB domain. Unset it when the server spans two UB domains;
+# see "Eight-card hosts with two UB domains" below.
 export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
@@ -93,6 +95,8 @@ export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+# Safe on a single UB domain. Unset it when the server spans two UB domains;
+# see "Eight-card hosts with two UB domains" below.
 export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
@@ -115,6 +119,26 @@ vllm serve "${MODEL}" \
 
 The recommended lossy configuration uses a **start=8 / end=12** dense-fallback
 window; see below for more aggressive settings.
+
+#### Eight-card hosts with two UB domains
+
+Both configurations above use four cards on one UB domain, where
+`HCCL_NPU_SOCKET_PORT_RANGE=auto` is safe. Some 950PR hosts expose eight NPUs
+as two four-NPU UB domains (check `npu-smi info -t topo`: `UB` inside a domain,
+`SYS` between domains). On those hosts, keep the variable **unset** when the
+server spans both domains, for example `--num-gpus 8 --usp 8`. With `auto`, the
+first video request can fail inside `_broadcast_rank0_exception()` with
+`EI0006 Communication_Error_Get_Socket` / `HcclBroadcast`, after startup and
+`/health` already succeeded; the failing path is the cross-domain pair (for
+example NPU0 to NPU4). Standalone eight-rank collectives on the same host pass,
+so the cross-domain link itself is healthy.
+
+```bash
+unset HCCL_NPU_SOCKET_PORT_RANGE   # eight cards spanning two UB domains
+```
+
+The same workaround applies to `TP4 + USP2` layouts on these hosts. Reported in
+[#10645](https://github.com/vllm-project/vllm-omni/issues/10645).
 
 ### Ref2VA on a 950PR that reports ~86 GB HBM
 
@@ -262,6 +286,10 @@ general throughput guarantee.
   OOM on longer durations.
 - On a 950PR with ~86 GB HBM, USP4 bf16 does not fit; see the
   "Ref2VA on a 950PR that reports ~86 GB HBM" section above.
+- On an eight-card 950PR host split into two UB domains, unset
+  `HCCL_NPU_SOCKET_PORT_RANGE`; with `auto` the first request can fail with
+  `EI0006` / `HcclBroadcast`. See the "Eight-card hosts with two UB domains"
+  section above.
 
 ## Additional resources
 
