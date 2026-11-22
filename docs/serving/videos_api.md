@@ -68,6 +68,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `input_references` | repeated file | null | Ordered reference uploads; supported media types and mapping to model inputs depend on the active model |
 | `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
 | `control_type` | string | null | Model control name associated with `control_reference`; currently Cosmos3 supports `edge`, `blur`, `depth`, `seg`, and `wsm` |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |

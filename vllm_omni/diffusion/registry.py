@@ -371,6 +371,11 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3_nano_sim_bimanual",
         "Cosmos3NanoSimBimanualPipeline",
     ),
+    "Cosmos3MultiviewPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3_multiview",
+        "Cosmos3MultiviewPipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -441,6 +446,8 @@ _NO_CACHE_ACCELERATION = {
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
     # step-skipping hooks.
     "QwenImage21Pipeline",
+    # Cache-DiT has not been validated with the model-local FlexAttention mask.
+    "Cosmos3MultiviewPipeline",
 }
 
 
@@ -727,6 +734,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_post_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
@@ -745,6 +753,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_ir_op_priority_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -781,6 +790,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_pre_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
 }

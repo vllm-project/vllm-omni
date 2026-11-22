@@ -195,7 +195,7 @@ def _transfer_fps_param(extra: Mapping[str, Any], sp: Any, prompt_data: Any) -> 
     return _param_any(extra, sp, prompt_data, _FPS_KEYS)
 
 
-def _as_bool(value: Any, default: bool = False) -> bool:
+def as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
     if isinstance(value, str):
@@ -314,11 +314,11 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             _param(extra, sp, prompt_data, "num_conditional_frames", TRANSFER_SAMPLE_DEFAULTS["num_conditional_frames"])
         ),
         max_frames=int(_param(extra, sp, prompt_data, "max_frames", TRANSFER_SAMPLE_DEFAULTS["max_frames"])),
-        show_control_condition=_as_bool(
+        show_control_condition=as_bool(
             _param(extra, sp, prompt_data, "show_control_condition", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["show_control_condition"]),
         ),
-        show_input=_as_bool(
+        show_input=as_bool(
             _param(extra, sp, prompt_data, "show_input", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["show_input"]),
         ),
@@ -331,11 +331,11 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
                 TRANSFER_SAMPLE_DEFAULTS["num_first_chunk_conditional_frames"],
             )
         ),
-        share_vision_temporal_positions=_as_bool(
+        share_vision_temporal_positions=as_bool(
             _param(extra, sp, prompt_data, "share_vision_temporal_positions", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"]),
         ),
-        emphasize_control_in_prompt=_as_bool(
+        emphasize_control_in_prompt=as_bool(
             _param(extra, sp, prompt_data, "emphasize_control_in_prompt", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"]),
         ),
@@ -525,9 +525,14 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     resize_h = int(np.ceil(scale * orig_h))
     resize_w = int(np.ceil(scale * orig_w))
     frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = F.interpolate(frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False)
-    top = (resize_h - height) // 2
-    left = (resize_w - width) // 2
+    # Match torchvision resize + center_crop, which the reference and training
+    # use: antialiased bilinear (plain bilinear aliases large downscales such
+    # as 1080p WSM to 480p) and offsets rounded half to even.
+    resized = F.interpolate(
+        frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False, antialias=True
+    )
+    top = int(round((resize_h - height) / 2.0))
+    left = int(round((resize_w - width) / 2.0))
     cropped = resized[:, :, top : top + height, left : left + width]
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
 

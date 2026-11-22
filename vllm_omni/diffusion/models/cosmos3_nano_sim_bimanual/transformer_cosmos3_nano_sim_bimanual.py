@@ -201,9 +201,13 @@ class Cosmos3NanoSimBimanualGenDecoderLayer(Cosmos3GenDecoderLayer):
         rms_norm_eps: float,
         quant_config=None,
         mlp_cls,
+        cross_attention_cls=None,
         qk_norm: bool = True,
         prefix: str = "",
     ) -> None:
+        # The base layer builds ``cross_attention_cls`` (its default when None);
+        # this layer always replaces it with the causal joint attention below.
+        base_kwargs = {} if cross_attention_cls is None else {"cross_attention_cls": cross_attention_cls}
         super().__init__(
             layer_idx=layer_idx,
             hidden_size=hidden_size,
@@ -216,6 +220,7 @@ class Cosmos3NanoSimBimanualGenDecoderLayer(Cosmos3GenDecoderLayer):
             mlp_cls=mlp_cls,
             qk_norm=qk_norm,
             prefix=prefix,
+            **base_kwargs,
         )
         self.cross_attention = Cosmos3NanoSimBimanualJointAttention(
             hidden_size=hidden_size,
