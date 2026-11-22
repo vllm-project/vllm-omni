@@ -195,9 +195,10 @@ stage 1 with the LAYA pooling judge. Serve
     ```
 
 The judge module lives in `vllm_omni/engine/duplex/` next to turn detection,
-but it is not duplex-only: turn-based serving uses the same module. The LAYA
-question-type table also lives there because it belongs to the judge; the
-LAYA model class only reads it.
+but it is not duplex-only: turn-based serving uses the same module. The shared
+LAYA question-type configuration lives in
+`vllm_omni/model_executor/models/response_judge/config.py` so the LAYA model
+class and judge bridge share it without model or engine imports.
 
 - **Another pooling model:** add a pooling model class that returns one logit
   per option, and a format entry in

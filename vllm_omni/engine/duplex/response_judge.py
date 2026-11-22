@@ -45,22 +45,6 @@ DEFAULT_CHAT_SYSTEM_PROMPT = (
 )
 DEFAULT_CHAT_USER_TEMPLATE = "对话记录：\n（还没有对话）\n用户刚刚说：「{transcript}」"
 
-LAYA_QTYPES = {"choice": 0, "score": 1, "noul": 2}
-
-
-def laya_question_type(config: object) -> str:
-    model_qtype = getattr(config, "laya_question_type", None)
-    judge = getattr(config, "response_judge", None)
-    judge_qtype = judge.get("question_type") if isinstance(judge, Mapping) else None
-    for value in (model_qtype, judge_qtype):
-        if value is not None and (not isinstance(value, str) or value not in LAYA_QTYPES):
-            raise ValueError("LAYA question_type must be a name: choice, score or noul; integer IDs are not supported")
-    if model_qtype is not None and judge_qtype is not None and model_qtype != judge_qtype:
-        raise ValueError(
-            f"laya_question_type={model_qtype!r} does not match response_judge.question_type={judge_qtype!r}"
-        )
-    return model_qtype or judge_qtype or "choice"
-
 
 @dataclass(frozen=True, slots=True)
 class JudgeSpec:
@@ -115,6 +99,8 @@ class JudgeSpec:
         raw = dict(raw) if isinstance(raw, Mapping) else {}
         fmt = str(raw.pop("format", "chat_yes_no"))
         if fmt == "laya":
+            from vllm_omni.model_executor.models.response_judge.config import laya_question_type
+
             raw["question_type"] = laya_question_type(hf_config)
         return cls(format=fmt, options=raw)
 
@@ -248,6 +234,8 @@ def _laya_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[st
     ``[CLS] <type> question: <instructions> [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]``
     """
     from vllm.tokenizers import cached_tokenizer_from_config
+
+    from vllm_omni.model_executor.models.response_judge.config import laya_question_type
 
     tok = cached_tokenizer_from_config(model_config)
     opts = spec.options
@@ -438,11 +426,9 @@ __all__ = [
     "DEFAULT_CHAT_SYSTEM_PROMPT",
     "RESPONSE_JUDGE_STAGE",
     "JudgeSpec",
-    "LAYA_QTYPES",
     "after_judge",
     "asr2judge",
     "default_transcript",
     "judge_input",
     "judge_rejects",
-    "laya_question_type",
 ]
