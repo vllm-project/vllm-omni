@@ -391,7 +391,7 @@ for composition without entering the adapter cache.
 
 Native v2 FL2VA/Ref2VA exports require request `scale=1.0`, `flow_shift=12`
 and `audio_flow_shift=3`. A zero scale disables the adapter and its sampling
-constraints. See the [MiniMax-H3 recipe](../../../recipes/MiniMaxAI/MiniMax-H3.md#flashgen-native-lora)
+constraints. See the [MiniMax-H3 recipe](gh-file:recipes/MiniMaxAI/MiniMax-H3.md#flashgen-native-lora)
 for base partitions and the validated conditioning scope.
 
 Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
