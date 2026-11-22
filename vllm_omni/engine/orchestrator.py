@@ -60,7 +60,11 @@ from vllm_omni.engine import (
     OmniEngineCoreRequest,
     PayloadSenderInfo,
 )
-from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, scope_stage_replica_mm_uuids
+from vllm_omni.engine.async_engine_utils import (
+    ABORT_TIMEOUT_S,
+    apply_omni_final_stage_metadata,
+    scope_stage_replica_mm_uuids,
+)
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
@@ -77,6 +81,7 @@ from vllm_omni.engine.messages import (
     OutputMessage,
     OutputQueueWriter,
     RegisterRemoteReplicaMessage,
+    RestoreDiffusionStepMessage,
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
@@ -1060,7 +1065,13 @@ class OrchestratorBase:
                     )
                 except Exception as exc:
                     if (
-                        method not in ("pause_scheduler", "resume_scheduler")
+                        method
+                        not in (
+                            "pause_scheduler",
+                            "resume_scheduler",
+                            "restore_runtime_lora",
+                            "export_runtime_lora",
+                        )
                         and method not in StagePool._CACHE_RESET_METHODS
                     ):
                         raise
@@ -4038,6 +4049,9 @@ class Orchestrator(OrchestratorBase):
         if isinstance(msg, NextStageInputMessage):
             await self._handle_next_stage_input(msg)
             return True
+        if isinstance(msg, RestoreDiffusionStepMessage):
+            await self._handle_restore_diffusion_step(msg)
+            return True
         msg_type = getattr(msg, "type")
         if msg_type == "add_request":
             await self._handle_add_request(cast(StageSubmissionMessage, msg))
@@ -4064,6 +4078,70 @@ class Orchestrator(OrchestratorBase):
         else:
             return False
         return True
+
+    async def _handle_restore_diffusion_step(self, msg: RestoreDiffusionStepMessage) -> None:
+        """Bind the original engine ID so output and abort use the regular route."""
+        from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
+
+        if msg.staged.cancelled():
+            return
+        request_id = msg.request_id
+        registered = False
+        try:
+            pool = self.stage_pools[0]
+            client = pool.stage_client
+            if (
+                self.num_stages != 1
+                or self.async_chunk
+                or self.weight_sharing is not None
+                or pool.num_replicas != 1
+                or not pool.final_output
+                or not isinstance(client, InlineStageDiffusionClient)
+            ):
+                raise ValueError("Step restore requires one local inline diffusion output stage")
+            if request_id in self.request_states:
+                raise ValueError(f"Diffusion request {request_id} already exists")
+
+            now = _time.time()
+            req_state = OrchestratorRequestState(
+                request_id=request_id,
+                sampling_params_list=[None],
+                final_stage_id=0,
+                final_output_stage_ids={0},
+                request_timestamp=now,
+                stage_submit_ts={0: now},
+            )
+            pool.bind_request_to_replica(request_id, 0)
+            self.request_states[request_id] = req_state
+            registered = True
+            self._register_running_request(req_state)
+            async with asyncio.timeout(msg.timeout):
+                await client.restore_step_request_async(
+                    request_id,
+                    msg.snapshots,
+                    policy_ref=msg.policy_ref,
+                    max_bytes=msg.max_bytes,
+                    timeout=msg.timeout,
+                )
+        except Exception as exc:
+            if registered:
+                await self._cleanup_request_ids([request_id], trace_error=type(exc).__name__)
+            if msg.staged.set_running_or_notify_cancel():
+                msg.staged.set_exception(exc)
+            return
+
+        if msg.staged.set_running_or_notify_cancel():
+            msg.staged.set_result(None)
+            return
+        try:
+            await client.collective_rpc_async(
+                "weight_sharing_drain",
+                timeout=min(msg.timeout, ABORT_TIMEOUT_S),
+                kwargs={"request_ids": [request_id]},
+            )
+        except TimeoutError:
+            logger.warning("Cancelled diffusion restore %s is still draining after the abort deadline", request_id)
+        await self._cleanup_request_ids([request_id], trace_error="restore_ack_cancelled")
 
     async def _fail_if_cannot_submit(self, req_id: str, stage_id: int, *, is_run_request: bool) -> bool:
         """Fail the request if it can't be submitted to `stage_id`; return whether it failed."""

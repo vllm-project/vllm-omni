@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractAsyncContextManager, aclosing
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -124,28 +126,8 @@ class InlineStageDiffusionClient(StageClientBase):
             self.replica_id,
             request_id,
         )
-        task = asyncio.create_task(
-            self._dispatch_request(
-                request_id,
-                prompt,
-                sampling_params,
-                kv_sender_info,
-                kv_transfer_params=kv_transfer_params,
-                payload_sender_info=payload_sender_info,
-            )
-        )
-        self._tasks[request_id] = task
 
-    async def _dispatch_request(
-        self,
-        request_id: str,
-        prompt: Any,
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[str, Any] | None = None,
-        kv_transfer_params: dict[str, Any] | None = None,
-        payload_sender_info: dict[str, Any] | None = None,
-    ) -> None:
-        try:
+        def open_stream() -> AbstractAsyncContextManager[AsyncIterator[list[OmniRequestOutput]]]:
             request = OmniDiffusionRequest(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -154,42 +136,73 @@ class InlineStageDiffusionClient(StageClientBase):
                 kv_transfer_params=kv_transfer_params,
                 payload_sender_info=payload_sender_info,
             )
+            return aclosing(self._engine.step_streaming(request))
 
-            if self.od_config.streaming_output:
-                async for results in self._engine.step_streaming(request):
-                    result = results[0]
-                    if not result.request_id:
-                        result.request_id = request_id
-                    self._output_queue.put_nowait(result)
-            else:
-                # Non-streaming callers share the streaming engine path but
-                # only publish the final output.
-                result = None
-                async for results in self._engine.step_streaming(request):
-                    output = results[0]
-                    if is_diffusion_request_started_output(output):
-                        if not output.request_id:
-                            output.request_id = request_id
-                        self._output_queue.put_nowait(output)
-                        continue
-                    result = output
-                if result is None:
-                    raise RuntimeError("Diffusion execution finished without output.")
-                if not result.request_id:
-                    result.request_id = request_id
-                self._output_queue.put_nowait(result)
-        except DiffusionRequestAbortedError as e:
-            logger.info("request_id: %s aborted: %s", request_id, str(e))
-            metrics = diffusion_exception_metrics(e)
-            if metrics:
-                self._output_queue.put_nowait(
-                    OmniRequestOutput(
-                        request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
-                        finished=True,
-                        metrics=metrics,
-                    )
-                )
+        self._tasks[request_id] = asyncio.create_task(self._dispatch_request(request_id, open_stream))
+
+    async def restore_step_request_async(
+        self,
+        request_id: str,
+        snapshots: list[dict[str, bytes]],
+        *,
+        policy_ref: str,
+        max_bytes: int,
+        timeout: float,
+    ) -> None:
+        """Stage a saved request on the paused worker and own its output task."""
+        if request_id in self._tasks:
+            raise ValueError(f"Diffusion request {request_id} already has an output task")
+        if not snapshots or snapshots[0].keys() != {request_id}:
+            raise ValueError("Restored diffusion request ID must match its snapshot key")
+
+        ready = asyncio.get_running_loop().create_future()
+        open_stream = partial(
+            self._engine.restore_step_streaming, snapshots, policy_ref=policy_ref, max_bytes=max_bytes, timeout=timeout
+        )
+        task = asyncio.create_task(self._dispatch_request(request_id, open_stream, ready))
+        self._tasks[request_id] = task
+        task.add_done_callback(lambda _: ready.cancel())
+        try:
+            await ready
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if self._tasks.get(request_id) is task:
+                self._tasks.pop(request_id)
+            raise
+
+    async def _dispatch_request(
+        self,
+        request_id: str,
+        open_stream: Callable[[], AbstractAsyncContextManager[AsyncIterator[list[OmniRequestOutput]]]],
+        ready: asyncio.Future[None] | None = None,
+    ) -> None:
+        try:
+            async with open_stream() as stream:
+                if ready is not None:
+                    if ready.cancelled():
+                        return
+                    ready.set_result(None)
+                await self._publish_request_outputs(request_id, stream)
         except Exception as e:
+            if ready is not None:
+                if ready.cancelled():
+                    return
+                if not ready.done():
+                    ready.set_exception(e)
+                    return
+            if isinstance(e, DiffusionRequestAbortedError):
+                logger.info("request_id: %s aborted: %s", request_id, str(e))
+                metrics = diffusion_exception_metrics(e)
+                if metrics:
+                    self._output_queue.put_nowait(
+                        OmniRequestOutput(
+                            request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
+                            finished=True,
+                            metrics=metrics,
+                        )
+                    )
+                return
             logger.exception("Diffusion request %s failed: %s", request_id, e)
             status_code, error_type = client_error_metadata(e)
             error_output = OmniRequestOutput.from_error(
@@ -202,6 +215,24 @@ class InlineStageDiffusionClient(StageClientBase):
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)
+
+    async def _publish_request_outputs(self, request_id: str, stream: AsyncIterator[list[OmniRequestOutput]]) -> None:
+        streaming = self.od_config.streaming_output
+        final = None
+        async for results in stream:
+            output = results[0]
+            if not streaming and not is_diffusion_request_started_output(output):
+                final = output
+                continue
+            if not output.request_id:
+                output.request_id = request_id
+            self._output_queue.put_nowait(output)
+        if not streaming:
+            if final is None:
+                raise RuntimeError("Diffusion execution finished without output.")
+            if not final.request_id:
+                final.request_id = request_id
+            self._output_queue.put_nowait(final)
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         try:
@@ -243,6 +274,22 @@ class InlineStageDiffusionClient(StageClientBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        if method == "weight_sharing_drain":
+            request_ids = (kwargs or {}).get("request_ids")
+            active = (
+                tuple(self._tasks.items())
+                if request_ids is None
+                else tuple((rid, self._tasks[rid]) for rid in request_ids if rid in self._tasks)
+            )
+            for request_id, _ in active:
+                self._engine.abort(request_id)
+            if active:
+                done, pending = await asyncio.wait([task for _, task in active], timeout=timeout)
+                if pending:
+                    raise TimeoutError("Inline diffusion requests did not drain")
+                for task in done:
+                    task.result()
+            return True
         # Playback only updates condition-protected host state. A worker RPC
         # may occupy the single executor thread for a whole GPU chunk.
         if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):

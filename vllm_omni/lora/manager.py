@@ -1896,6 +1896,17 @@ class LoRAManager:
         logger.info("Pinned adapter id=%d (won't be evicted)", adapter_id)
         return True
 
+    def active_runtime_adapter(self, adapter_id: int) -> LoRAModel | None:
+        """Identify the active, ordinary runtime adapter used for a step."""
+        if (
+            self.lora_application != "runtime"
+            or self._fixed_adapter
+            or adapter_id != self._active_adapter_id
+            or adapter_id in self._merged_adapters
+        ):
+            return None
+        return self._registered_adapters[adapter_id]
+
     def installed_runtime_adapter(self, adapter_id: int | None) -> LoRAModel | None:
         """Resolve the current adapter without loading or activating one."""
         if self.lora_application != "runtime" or self._fixed_adapter or adapter_id in self._merged_adapters:

@@ -55,7 +55,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, _StepLoRAState
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.errors import OmniClientError
@@ -1590,6 +1590,9 @@ class _RecordingLoRAManager:
     def set_request_adapters(self, adapters, scales=1.0) -> None:
         self.calls.append((adapters, scales))
 
+    def active_runtime_adapter(self, adapter_id):
+        return None
+
 
 def _make_step_worker(lora_manager=None, *, expected_output=None):
     """Build a bare DiffusionWorker primed for execute_stepwise tests."""
@@ -1679,7 +1682,7 @@ class TestWorker:
         assert manager.calls == [(lora_request, 0.6)]
         assert set(worker._step_lora_state) == {"req-1", "req-2", "req-3"}
         for entry in worker._step_lora_state.values():
-            assert entry == (lora_request, 0.6)
+            assert entry == _StepLoRAState(lora_request, 0.6)
 
     def test_evicts_step_lora_state_for_finished_requests(self):
         from vllm_omni.lora.request import LoRARequest
@@ -1704,7 +1707,7 @@ class TestWorker:
 
         DiffusionWorker.execute_stepwise(worker, next_batch)
         assert "req-1" not in worker._step_lora_state
-        assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
+        assert worker._step_lora_state == {"req-2": _StepLoRAState(lora_request, 1.0)}
 
     @pytest.mark.parametrize("error", [None, "decode failed"])
     def test_terminal_output_retires_lora_state_without_another_wave(self, error):
@@ -1718,12 +1721,12 @@ class TestWorker:
         output = worker.execute_stepwise(scheduled)
 
         assert output is expected
-        assert worker._step_lora_state == {"streaming": (None, 1.0)}
+        assert worker._step_lora_state == {"streaming": _StepLoRAState(None, 1.0)}
         assert torch.equal(chunk.result.output, torch.ones(1))
 
     def test_runner_exception_retires_only_scheduled_lora_state(self):
         worker = _make_step_worker()
-        worker._step_lora_state["unscheduled"] = (None, 0.5)
+        worker._step_lora_state["unscheduled"] = _StepLoRAState(None, 0.5)
 
         def fail(_):
             raise RuntimeError("denoise failed")
@@ -1734,7 +1737,7 @@ class TestWorker:
         with pytest.raises(RuntimeError, match="denoise failed"):
             worker.execute_stepwise(scheduled)
 
-        assert worker._step_lora_state == {"unscheduled": (None, 0.5)}
+        assert worker._step_lora_state == {"unscheduled": _StepLoRAState(None, 0.5)}
 
 
 @pytest.mark.cpu

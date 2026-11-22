@@ -11,6 +11,7 @@ to DiffusionModelRunner.
 from __future__ import annotations
 
 import gc
+import hashlib
 import multiprocessing as mp
 import os
 import queue
@@ -19,6 +20,7 @@ import sys
 import threading
 import traceback
 import uuid
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -74,7 +76,6 @@ from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     payload_carries_typed_media,
 )
-from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.request_streaming import request_chunk_transport
@@ -89,6 +90,7 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.inputs.data import OmniInteractionPrompt
+from vllm_omni.lora.manager import RUNTIME_LORA_FINGERPRINT_SIZE, DiffusionLoRAManager, LoRABackend
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
@@ -99,6 +101,7 @@ if TYPE_CHECKING:
 
     from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
+    from vllm.lora.lora_model import LoRAModel
 
     from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
     from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
@@ -116,6 +119,14 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 _REQUEST_CHUNK_EXECUTE_METHODS = frozenset({"execute_model", "execute_model_batch"})
+
+
+@dataclass(frozen=True)
+class _StepLoRAState:
+    request: LoRARequest | list[LoRARequest] | None
+    scale: float | list[float]
+    adapter_ref: weakref.ReferenceType[LoRAModel] | None = None
+    restore_receipt: tuple[str, int, bytes] | None = None
 
 
 @dataclass
@@ -483,10 +494,10 @@ class DiffusionWorker:
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._owns_sleep_pool = False
         self.lora_manager: DiffusionLoRAManager | None = None
-        # Worker-side cache of (lora_request, lora_scale) per scheduled
+        # Worker-side cache of the LoRA selection per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
-        self._step_lora_state: dict[str, tuple[LoRARequest | list[LoRARequest] | None, float | list[float]]] = {}
+        self._step_lora_state: dict[str, _StepLoRAState] = {}
         self._shutdown_complete = False
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.weight_transfer_engine: WeightTransferEngine | None = None
@@ -1287,6 +1298,11 @@ class DiffusionWorker:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        try:
+            self._check_restored_step_lora(scheduler_output.scheduled_request_ids)
+        except RuntimeError:
+            self.release_step_requests(scheduler_output.scheduled_request_ids)
+            raise
         self._activate_step_lora(scheduler_output)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
@@ -1317,6 +1333,157 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def _step_adapter_fingerprints(self, request_ids: list[str], *, exporting: bool = False) -> dict[str, bytes]:
+        assert self.model_runner is not None, "Model runner not initialized"
+        by_adapter: dict[int | None, bytes] = {}
+        by_request = {}
+        for request_id in request_ids:
+            request = self.model_runner.state_cache[request_id].sampling.lora_request
+            if request is not None and not isinstance(request, LoRARequest):
+                raise ValueError("Step snapshots support one runtime LoRA adapter per request")
+            adapter_id = None if request is None else request.lora_int_id
+            if exporting and adapter_id is not None:
+                selection = self._step_lora_state.get(request_id)
+                original = selection.adapter_ref() if selection is not None and selection.adapter_ref else None
+                if (
+                    original is None
+                    or self.lora_manager is None
+                    or self.lora_manager.installed_runtime_adapter(adapter_id) is not original
+                ):
+                    raise ValueError(f"LoRA changed before export or was never tracked for request {request_id!r}")
+            if adapter_id not in by_adapter:
+                if self.lora_manager is None:
+                    if adapter_id is not None:
+                        raise ValueError(f"Step snapshot requires installed LoRA adapter {adapter_id}")
+                    by_adapter[adapter_id] = bytes(RUNTIME_LORA_FINGERPRINT_SIZE)
+                else:
+                    by_adapter[adapter_id] = self.lora_manager.runtime_adapter_fingerprint(adapter_id)
+            by_request[request_id] = by_adapter[adapter_id]
+        return by_request
+
+    def export_step_requests(
+        self, request_ids: list[str], *, policy_ref: str, max_bytes: int
+    ) -> list[dict[str, bytes]]:
+        """Collect every rank's quiesced state without releasing the live copy.
+
+        ``max_bytes`` bounds each rank's bundle. The caller owns the returned
+        CPU snapshots before issuing a separate release. The worker binds the
+        installed runtime LoRA factors; the caller must verify the frozen base
+        and policy at the request boundary.
+        """
+        runner = self.model_runner
+        assert runner is not None, "Model runner not initialized"
+
+        def export_rank():
+            payloads = runner.export_step_requests(
+                request_ids,
+                policy_ref=policy_ref,
+                max_bytes=max_bytes - RUNTIME_LORA_FINGERPRINT_SIZE * len(request_ids),
+            )
+            fingerprints = self._step_adapter_fingerprints(request_ids, exporting=True)
+            return {key: fingerprints[key] + payload for key, payload in payloads.items()}
+
+        return _run_and_gather_rank_values("Step-state export", export_rank)
+
+    def restore_step_requests(
+        self,
+        snapshots: list[dict[str, bytes]],
+        *,
+        policy_ref: str,
+        max_bytes: int,
+        expected_steps: dict[str, int] | None = None,
+        expected_requests: dict[str, OmniDiffusionRequest] | None = None,
+    ) -> None:
+        """Restore rank-local state, rolling back this operation if any rank fails."""
+        runner = self.model_runner
+        assert runner is not None, "Model runner not initialized"
+        restored = []
+        restored_lora = {}
+
+        def restore_rank():
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            if len(snapshots) != world_size:
+                raise ValueError("Step snapshots do not match the worker topology")
+            if any(bundle.keys() != snapshots[0].keys() for bundle in snapshots[1:]):
+                raise ValueError("Step snapshots must contain the same requests on every rank")
+            local = snapshots[self.rank]
+            if sum(map(len, local.values())) > max_bytes:
+                raise ValueError("Step snapshots exceed their byte budget")
+            payloads = {}
+            digests = {}
+            for key, value in local.items():
+                digest = hashlib.sha256(value).digest()
+                state = runner.state_cache.get(key)
+                if state is not None:
+                    selection = self._step_lora_state.get(key)
+                    if selection is None or selection.restore_receipt != (policy_ref, state.step_index, digest):
+                        raise ValueError(f"Cannot restore a different snapshot for live request {key!r}")
+                    if expected_steps is not None and state.step_index != expected_steps[key]:
+                        raise ValueError(f"Step snapshot does not match scheduler progress for request {key!r}")
+                    if expected_requests is not None and key in expected_requests:
+                        runner._check_step_restore_request(state, expected_requests[key])
+                    continue
+                digests[key] = digest
+                payloads[key] = value[RUNTIME_LORA_FINGERPRINT_SIZE:]
+            runner.restore_step_requests(
+                payloads,
+                policy_ref=policy_ref,
+                max_bytes=max_bytes,
+                expected_steps=expected_steps,
+                expected_requests=expected_requests,
+            )
+            restored.extend(payloads)
+            for key, fingerprint in self._step_adapter_fingerprints(list(local)).items():
+                if local[key][:RUNTIME_LORA_FINGERPRINT_SIZE] != fingerprint:
+                    raise ValueError(f"Step snapshot does not match installed LoRA for request {key!r}")
+                if key not in payloads:
+                    continue
+                state = runner.state_cache[key]
+                sampling = state.sampling
+                adapter_ref = None
+                if sampling.lora_request is not None:
+                    assert self.lora_manager is not None and isinstance(sampling.lora_request, LoRARequest)
+                    adapter = self.lora_manager.installed_runtime_adapter(sampling.lora_request.lora_int_id)
+                    assert adapter is not None
+                    adapter_ref = weakref.ref(adapter)
+                restored_lora[key] = _StepLoRAState(
+                    sampling.lora_request,
+                    sampling.lora_scale,
+                    adapter_ref,
+                    restore_receipt=(policy_ref, state.step_index, digests[key]),
+                )
+
+        try:
+            _run_and_gather_rank_values("Step-state restore", restore_rank)
+        except Exception:
+            runner.release_step_requests(restored)
+            raise
+        self._step_lora_state.update(restored_lora)
+
+    def _check_restored_step_lora(self, request_ids: list[str]) -> None:
+        """Reject a runtime adapter replacement on every rank before denoising."""
+        restored = [
+            (request_id, state)
+            for request_id in request_ids
+            if (state := self._step_lora_state.get(request_id)) is not None
+            and state.restore_receipt
+            and state.adapter_ref
+        ]
+        if not restored:
+            return
+
+        def check_rank():
+            for request_id, state in restored:
+                assert isinstance(state.request, LoRARequest) and state.adapter_ref is not None
+                expected = state.adapter_ref()
+                current = None
+                if self.lora_manager is not None:
+                    current = self.lora_manager.installed_runtime_adapter(state.request.lora_int_id)
+                if expected is None or current is not expected:
+                    raise ValueError(f"LoRA changed after restore for request {request_id!r}")
+
+        _run_and_gather_rank_values("Restored step adapter check", check_rank)
+
     def release_step_requests(self, request_ids: list[str]) -> None:
         """Retire cancelled step state at the serialized worker-call boundary."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -1329,7 +1496,7 @@ class DiffusionWorker:
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
 
-        Newly scheduled requests register their (lora_request, lora_scale)
+        Newly scheduled requests register their LoRA selection
         in ``_step_lora_state`` so cached requests can resolve to the same
         adapter on later ticks. Finished requests are evicted. Batch
         homogeneity is enforced by the scheduler via ``StepBatchSamplingParamsKey``,
@@ -1340,7 +1507,7 @@ class DiffusionWorker:
 
         for new_req in scheduler_output.scheduled_new_reqs:
             sampling = new_req.req.sampling_params
-            self._step_lora_state[new_req.request_id] = (
+            self._step_lora_state[new_req.request_id] = _StepLoRAState(
                 sampling.lora_request,
                 sampling.lora_scale,
             )
@@ -1353,7 +1520,7 @@ class DiffusionWorker:
         for request_id in scheduler_output.scheduled_request_ids:
             entry = self._step_lora_state.get(request_id)
             if entry is not None:
-                lora_request, lora_scale = entry
+                lora_request, lora_scale = entry.request, entry.scale
                 break
 
         try:
@@ -1362,6 +1529,12 @@ class DiffusionWorker:
             if lora_request is not None:
                 raise
             logger.warning("LoRA activation skipped: %s", exc)
+        if scheduler_output.scheduled_new_reqs and isinstance(lora_request, LoRARequest):
+            adapter = self.lora_manager.active_runtime_adapter(lora_request.lora_int_id)
+            if adapter is not None:
+                selection = _StepLoRAState(lora_request, lora_scale, weakref.ref(adapter))
+                for new_req in scheduler_output.scheduled_new_reqs:
+                    self._step_lora_state[new_req.request_id] = selection
 
     def remove_lora(self, adapter_id: int) -> bool:
         if self.lora_manager is None:

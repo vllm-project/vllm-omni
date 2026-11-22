@@ -948,6 +948,268 @@ async def test_keep_pause_retains_waiting_request_and_serves_control_rpcs():
 
 
 @pytest.mark.asyncio
+async def test_step_boundary_pause_publishes_step_progress_before_snapshot_rpc():
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    first_step = threading.Event()
+    advance = threading.Event()
+    steps = []
+
+    def execute(output):
+        request_id = output.scheduled_request_ids[0]
+        steps.append(len(steps) + 1)
+        if len(steps) == 1:
+            first_step.set()
+            assert advance.wait(timeout=5)
+        return RunnerOutput(
+            request_id=request_id, step_index=len(steps), finished=len(steps) == 2, result=DiffusionOutput()
+        )
+
+    engine = _start_paced_engine(execute)
+    pause = None
+    try:
+        request = OmniDiffusionRequest(
+            request_id="snapshot", prompt="image", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2)
+        )
+        engine.add_request(request)
+        await _wait_until(first_step.is_set)
+        pause = asyncio.create_task(
+            engine.async_collective_rpc("pause_scheduler", timeout=3, kwargs={"mode": "step_boundary"})
+        )
+        await _wait_until(lambda: engine._scheduling_paused or pause.done())
+        assert not pause.done()
+        advance.set()
+        await pause
+        await engine.async_collective_rpc("export_step_requests", timeout=3)
+        assert steps == [1]
+        assert request.sampling_params.step_index == 1
+        assert _methods(engine) == ["synchronize_device", "export_step_requests"]
+        assert engine.executor.calls[-1]["kwargs"]["request_ids"] == ["snapshot"]
+        rpc = engine.executor.collective_rpc
+
+        def lose_release_ack(method, **kwargs):
+            result = rpc(method, **kwargs)
+            if method == "release_step_requests":
+                raise TimeoutError("Release ACK lost after worker retired state")
+            return result
+
+        engine.executor.collective_rpc = lose_release_ack
+        with pytest.raises(TimeoutError, match="RPC call to release_step_requests timed out"):
+            await engine.async_collective_rpc("release_step_requests", args=(["snapshot"],), timeout=3)
+        with pytest.raises(RuntimeError, match="awaiting step restore"):
+            await _resume(engine)
+        assert steps == [1]
+
+        engine.executor.collective_rpc = rpc
+        await engine.async_collective_rpc("release_step_requests", args=(["snapshot"],), timeout=3)
+        bundle = [{"snapshot": b"state"}]
+        await engine.async_collective_rpc("restore_step_requests", args=(bundle,), timeout=3)
+        # A caller can retry after losing the reply to a successful restore.
+        await engine.async_collective_rpc("restore_step_requests", args=(bundle,), timeout=3)
+        assert engine.executor.calls[-1]["kwargs"]["expected_steps"] == {"snapshot": 1}
+        with pytest.raises(ValueError, match="awaiting step restore"):
+            await engine.async_collective_rpc("restore_step_requests", args=([{"absent": b"state"}],), timeout=3)
+        assert _methods(engine) == [
+            "synchronize_device",
+            "export_step_requests",
+            "release_step_requests",
+            "release_step_requests",
+            "restore_step_requests",
+            "restore_step_requests",
+        ]
+        await _resume(engine)
+        await _wait_until(lambda: steps == [1, 2])
+    finally:
+        advance.set()
+        if pause is not None:
+            await asyncio.gather(pause, return_exceptions=True)
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_fresh_scheduler_rejoins_snapshot_without_reencoding():
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    scheduled = []
+
+    def execute(output):
+        scheduled.append(output)
+        return RunnerOutput("continued", step_index=2, finished=True, result=DiffusionOutput(finished=True))
+
+    engine = _start_paced_engine(execute)
+    engine.od_config.streaming_output = False
+    request = OmniDiffusionRequest(
+        request_id="continued",
+        prompt="original",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, step_index=1, seed=17),
+    )
+    try:
+        await engine.async_collective_rpc("pause_scheduler", timeout=3, kwargs={"mode": "step_boundary"})
+        assert engine.register_step_restore(request) == "continued"
+        stream = engine.get_output_stream("continued")
+        await engine.async_collective_rpc("export_step_requests", timeout=3)
+        assert engine.executor.calls[-1]["kwargs"]["request_ids"] == []
+        with pytest.raises(RuntimeError, match="awaiting step restore"):
+            await _resume(engine)
+
+        rpc = engine.executor.collective_rpc
+
+        def reject_restore(method, **kwargs):
+            if method == "restore_step_requests":
+                raise ValueError("Snapshot rejected by a worker")
+            return rpc(method, **kwargs)
+
+        engine.executor.collective_rpc = reject_restore
+        bundle = [{"continued": b"snapshot"}]
+        with pytest.raises(ValueError, match="rejected"):
+            await engine.async_collective_rpc("restore_step_requests", args=(bundle,), timeout=3)
+        with pytest.raises(RuntimeError, match="awaiting step restore"):
+            await _resume(engine)
+        assert not scheduled
+
+        engine.executor.collective_rpc = rpc
+        await engine.async_collective_rpc("restore_step_requests", args=(bundle,), timeout=3)
+        assert engine.executor.calls[-1]["kwargs"]["expected_steps"] == {"continued": 1}
+        assert engine.executor.calls[-1]["kwargs"]["expected_requests"] == {"continued": request}
+        assert not scheduled
+        await _resume(engine)
+        assert (await asyncio.wait_for(_consume_final_output(stream), 3)).finished
+        assert len(scheduled) == 1
+        assert not scheduled[0].scheduled_new_reqs
+        assert scheduled[0].scheduled_cached_reqs.request_ids == ["continued"]
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["finish", "reject", "cancel", "unconsumed", "reuse"])
+async def test_restored_step_output_stream_owns_request(outcome):
+    from vllm_omni.diffusion.models.sd3.pipeline_sd3 import get_sd3_pre_process_func
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.lora.manager import RUNTIME_LORA_FINGERPRINT_SIZE
+
+    scheduled = []
+
+    def execute(output):
+        assert "continued" not in output.finished_req_ids
+        scheduled.append(output)
+        result = DiffusionOutput(finished=True, custom_output={"restored": True})
+        return RunnerOutput("continued", step_index=2, finished=True, result=result)
+
+    engine = _start_paced_engine(execute)
+    engine.od_config.streaming_output = False
+    engine.od_config.step_execution = True
+    engine.pre_process_func = get_sd3_pre_process_func(engine.od_config)
+
+    class SnapshotPipeline:
+        @staticmethod
+        def step_request_from_snapshot(payload, *, policy_ref, max_bytes):
+            assert payload == b"snapshot" and policy_ref == "policy-1"
+            assert max_bytes == 100 - RUNTIME_LORA_FINGERPRINT_SIZE
+            return OmniDiffusionRequest(
+                request_id="continued",
+                prompt="original",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2, step_index=1, seed=17, max_sequence_length=64
+                ),
+            )
+
+    engine.od_config.custom_pipeline_args = {"pipeline_class": SnapshotPipeline}
+    payload = bytes(RUNTIME_LORA_FINGERPRINT_SIZE) + b"snapshot"
+    entered = threading.Event()
+    release = threading.Event()
+    rpc = engine.executor.collective_rpc
+
+    def restore_rpc(method, **kwargs):
+        if method == "restore_step_requests":
+            if outcome == "reject":
+                raise ValueError("Snapshot rejected by a worker")
+            if outcome == "cancel":
+                entered.set()
+                assert release.wait(timeout=3)
+        return rpc(method, **kwargs)
+
+    engine.executor.collective_rpc = restore_rpc
+
+    def open_restore():
+        return engine.restore_step_streaming([{"continued": payload}], policy_ref="policy-1", max_bytes=100, timeout=3)
+
+    async def consume(*, finish=False):
+        async with open_restore() as outputs:
+            assert not scheduled
+            state = engine.scheduler.get_request_state("continued")
+            assert state.sampling_params_key.condition_key == (("text", 64), None)
+            if finish:
+                await _resume(engine)
+                final = await asyncio.wait_for(_consume_final_output(outputs), 3)
+                assert final[0].request_id == "continued" and final[0].finished
+                assert final[0].custom_output == {"restored": True}
+                assert "postprocess_time_ms" in final[0].metrics
+
+    task = None
+    try:
+        await engine.async_collective_rpc("pause_scheduler", timeout=3, kwargs={"mode": "step_boundary"})
+        if outcome == "finish":
+            with pytest.raises(ValueError, match="identity does not match"):
+                async with engine.restore_step_streaming(
+                    [{"other": payload}], policy_ref="policy-1", max_bytes=100, timeout=3
+                ):
+                    pytest.fail("Snapshot with the wrong request key was admitted")
+            assert not engine._out_streams and "restore_step_requests" not in _methods(engine)
+        if outcome == "reject":
+            with pytest.raises(ValueError, match="Snapshot rejected"):
+                await consume()
+            await _wait_until(lambda: engine.scheduler.get_request_state("continued") is None)
+            assert not engine._out_streams and "release_step_requests" in _methods(engine)
+            engine.executor.collective_rpc = rpc
+            await consume(finish=True)
+        elif outcome == "cancel":
+            task = asyncio.create_task(consume())
+            await _wait_until(entered.is_set)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            await _wait_until(lambda: engine.scheduler.get_request_state("continued") is None)
+            assert not scheduled
+            assert _methods(engine).count("release_step_requests") == 1
+            await consume(finish=True)
+        elif outcome == "reuse":
+            from contextlib import AsyncExitStack
+
+            async with AsyncExitStack() as replacement:
+                async with open_restore() as outputs:
+                    await _resume(engine)
+                    assert (await asyncio.wait_for(_consume_final_output(outputs), 3))[0].finished
+                    assert "continued" not in engine._out_streams
+                    await engine.async_collective_rpc("pause_scheduler", timeout=3, kwargs={"mode": "step_boundary"})
+                    next_outputs = await replacement.enter_async_context(open_restore())
+                await _resume(engine)
+                assert (await asyncio.wait_for(_consume_final_output(next_outputs), 3))[0].finished
+        else:
+            await consume(finish=outcome == "finish")
+        await _wait_until(lambda: engine.scheduler.get_request_state("continued") is None)
+        assert not engine._out_streams
+        if outcome in ("finish", "reject", "reuse", "cancel"):
+            assert len(scheduled) == (2 if outcome == "reuse" else 1)
+            assert all(not output.scheduled_new_reqs for output in scheduled)
+            assert all(output.scheduled_cached_reqs.request_ids == ["continued"] for output in scheduled)
+        else:
+            assert not scheduled
+            assert "release_step_requests" in _methods(engine)
+            await engine.async_collective_rpc("resume_scheduler", timeout=3)
+    finally:
+        release.set()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
 async def test_keep_pause_acks_after_running_batch_and_freezes_queue():
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop)

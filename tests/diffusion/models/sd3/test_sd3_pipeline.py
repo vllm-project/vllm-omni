@@ -562,6 +562,7 @@ import json, random, sys
 from pathlib import Path
 import torch
 from tests.diffusion.models.sd3.test_sd3_pipeline import _make_step_sd3_pipeline, _advance_step
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 pipeline = _make_step_sd3_pipeline()
 payload = Path(sys.argv[1]).read_bytes()
 random_state = random.getstate()
@@ -569,6 +570,7 @@ request = pipeline.step_request_from_snapshot(payload, policy_ref='served-adapte
 assert random.getstate() == random_state
 state = pipeline.restore_step_state(payload, policy_ref='served-adapter-v7', max_bytes=1 << 20)
 assert request.request_id == state.request_id
+DiffusionModelRunner._check_step_restore_request(state, request)
 assert request.external_req_id == state.external_req_id == 'original-client-request'
 assert request.sampling_params.step_index == state.step_index == 1
 assert request.sampling_params.seed is None and request.sampling_params.generator is None
@@ -674,3 +676,268 @@ def test_snapshot_execution_profile_is_checked_before_tensor_decode(monkeypatch,
     monkeypatch.setattr("vllm_omni.diffusion.models.sd3.step_state._StateDecoder.decode", fail_decode)
     with pytest.raises(ValueError, match="execution profile"):
         pipeline.restore_step_state(payload, policy_ref="stable", max_bytes=1 << 20)
+
+
+def _make_snapshot_worker(rank=0):
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = rank
+    worker._step_lora_state = {}
+    worker.lora_manager = None
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = _make_step_sd3_pipeline()
+    runner.state_cache = {}
+    worker.model_runner = runner
+    return worker
+
+
+def test_runner_snapshot_handoff_releases_batch_and_reconstructs_progress(monkeypatch):
+    import weakref
+
+    worker = _make_snapshot_worker()
+    runner, pipeline = worker.model_runner, worker.model_runner.pipeline
+    monkeypatch.setattr("vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg", lambda *args: None)
+    requests = _make_step_sd3_requests(4.0)
+    fresh_requests = {request.request_id: copy.deepcopy(request) for request in requests}
+    for request in requests:
+        state = StepRequestState(request_id=request.request_id, sampling=request.sampling_params, prompt=request.prompt)
+        pipeline.prepare_encode(state)
+        _advance_step(pipeline, state)
+        runner.state_cache[state.request_id] = state
+    del state, request
+    runner.input_batch = InputBatch.make_batch(list(runner.state_cache.values()))
+    references = [weakref.ref(state) for state in runner.state_cache.values()]
+    rank_snapshots = worker.export_step_requests(list(runner.state_cache), policy_ref="v7", max_bytes=1 << 20)
+    snapshots = rank_snapshots[0]
+    assert all(reference() is not None for reference in references)
+
+    worker.release_step_requests(list(snapshots))
+    assert runner.state_cache == {} and runner.input_batch is None
+    assert all(reference() is None for reference in references)
+    for request in fresh_requests.values():
+        request.sampling_params.step_index = 1
+    expected_steps = dict.fromkeys(fresh_requests, 1)
+    wrong_inputs = copy.deepcopy(fresh_requests)
+    next(iter(wrong_inputs.values())).sampling_params.seed = 1337
+    with pytest.raises(RuntimeError, match="request setting 'seed'"):
+        worker.restore_step_requests(
+            rank_snapshots,
+            policy_ref="v7",
+            max_bytes=1 << 20,
+            expected_steps=expected_steps,
+            expected_requests=wrong_inputs,
+        )
+    assert runner.state_cache == {} and worker._step_lora_state == {}
+    worker.restore_step_requests(
+        rank_snapshots,
+        policy_ref="v7",
+        max_bytes=1 << 20,
+        expected_steps=expected_steps,
+        expected_requests=fresh_requests,
+    )
+    assert all(state.step_index == 1 for state in runner.state_cache.values())
+    expected = pipeline.forward(DiffusionRequestBatch(requests=_make_step_sd3_requests(4.0)))
+    for state, output in zip(runner.state_cache.values(), expected, strict=True):
+        while not state.denoise_completed:
+            _advance_step(pipeline, state)
+        torch.testing.assert_close(pipeline.post_decode(state).output, output.output, rtol=0, atol=0)
+
+
+def test_runner_snapshot_errors_leave_live_and_restored_states_atomic(monkeypatch):
+    worker = _make_snapshot_worker()
+    runner, pipeline = worker.model_runner, worker.model_runner.pipeline
+    monkeypatch.setattr("vllm_omni.diffusion.models.sd3.pipeline_sd3.set_separate_cfg", lambda *args: None)
+    for request in _make_step_sd3_requests(1.0):
+        state = StepRequestState(request_id=request.request_id, sampling=request.sampling_params, prompt=request.prompt)
+        pipeline.prepare_encode(state)
+        runner.state_cache[state.request_id] = state
+    runner.input_batch = InputBatch.make_batch(list(runner.state_cache.values()))
+    batch = runner.input_batch
+    snapshots = runner.export_step_requests(list(runner.state_cache), policy_ref="v7", max_bytes=1 << 20)
+    worker_snapshots = worker.export_step_requests(list(snapshots), policy_ref="v7", max_bytes=1 << 20)
+    budget = sum(map(len, snapshots.values())) - 1
+    with pytest.raises(ValueError, match="byte budget"):
+        runner.export_step_requests(list(snapshots), policy_ref="v7", max_bytes=budget)
+    assert runner.input_batch is batch and len(runner.state_cache) == 2
+
+    runner.release_step_requests(list(snapshots))
+    request_ids = list(snapshots)
+    invalid = {**snapshots, request_ids[-1]: pipeline.export_step_state(state, policy_ref="v8", max_bytes=1 << 20)}
+    wrong_identity = {**snapshots, request_ids[-1]: snapshots[request_ids[0]]}
+    for payload, limit in ((invalid, 1 << 20), (wrong_identity, 1 << 20), (snapshots, budget)):
+        with pytest.raises(ValueError, match="policy|identity|byte budget"):
+            runner.restore_step_requests(payload, policy_ref="v7", max_bytes=limit)
+        assert runner.state_cache == {} and runner.input_batch is None
+    # The second request has the right identity and policy but an obsolete step.
+    expected_steps = dict.fromkeys(request_ids, 0)
+    with pytest.raises(RuntimeError, match="scheduler progress"):
+        worker.restore_step_requests(
+            worker_snapshots, policy_ref="v7", max_bytes=1 << 20, expected_steps={**expected_steps, request_ids[-1]: 1}
+        )
+    assert runner.state_cache == {} and runner.input_batch is None and worker._step_lora_state == {}
+    worker.restore_step_requests(worker_snapshots, policy_ref="v7", max_bytes=1 << 20, expected_steps=expected_steps)
+    with pytest.raises(ValueError, match="already"):
+        runner.restore_step_requests(snapshots, policy_ref="v7", max_bytes=1 << 20)
+    assert list(runner.state_cache) == request_ids
+
+
+def _snapshot_gloo_worker(rank, rendezvous, output_dir):
+    from datetime import timedelta
+    from pathlib import Path
+
+    import torch.distributed as dist
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.lora_weights import LoRALayerWeights
+
+    from vllm_omni.diffusion.models.sd3 import pipeline_sd3
+    from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
+    from vllm_omni.diffusion.worker import diffusion_worker
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.lora.manager import RUNTIME_LORA_FINGERPRINT_SIZE, LoRAManager
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    try:
+        # Supply the real CPU group without initializing a CUDA coordinator.
+        diffusion_worker.get_world_group = lambda: SimpleNamespace(cpu_group=dist.group.WORLD)
+        pipeline_sd3.set_separate_cfg = lambda *args: None
+        worker = _make_snapshot_worker(rank)
+        runner, pipeline = worker.model_runner, worker.model_runner.pipeline
+        request = _make_step_sd3_requests(1.0)[0]
+        request.sampling_params.latents.fill_(rank + 1)
+        request.sampling_params.lora_request = LoRARequest("adapter-v7", 7, "/served/adapter-v7")
+        request.sampling_params.lora_scale = 0.75
+        manager = object.__new__(LoRAManager)
+        manager._fixed_adapter = False
+        manager._merged_adapters = {}
+        weights = LoRALayerWeights("transformer.proj", 1, 1, torch.ones(1, 2), torch.ones(2, 1))
+        manager._registered_adapters = {7: LoRAModel(7, rank=1, loras={weights.module_name: weights})}
+        worker.lora_manager = manager
+        manager.set_request_adapters = lambda *_: setattr(manager, "_active_adapter_id", 7)
+        worker._activate_step_lora(
+            DiffusionSchedulerOutput(
+                step_id=0,
+                scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+                scheduled_cached_reqs=CachedRequestData([]),
+                finished_req_ids=set(),
+                num_running_reqs=1,
+                num_waiting_reqs=0,
+            )
+        )
+        state = StepRequestState(request_id=request.request_id, prompt=request.prompt, sampling=request.sampling_params)
+        pipeline.prepare_encode(state)
+        _advance_step(pipeline, state)
+        runner.state_cache[state.request_id] = state
+        runner.input_batch = InputBatch.make_batch([state])
+        if rank == 1:
+            state.extra["large_history"] = torch.zeros(20_000)
+        with pytest.raises(RuntimeError, match="rank 1.*byte budget"):
+            worker.export_step_requests([state.request_id], policy_ref="v7", max_bytes=1 << 16)
+        assert runner.state_cache[state.request_id] is state and runner.input_batch is not None
+        if rank == 1:
+            del state.extra["large_history"]
+        snapshots = worker.export_step_requests([state.request_id], policy_ref="v7", max_bytes=1 << 20)
+        assert len(snapshots) == 2 and snapshots[0] != snapshots[1]
+        original_adapter = manager._registered_adapters[7]
+        if rank == 1:
+            replacement = LoRALayerWeights(weights.module_name, 1, 1, weights.lora_a, weights.lora_b + 1)
+            manager._registered_adapters[7] = LoRAModel(7, rank=1, loras={weights.module_name: replacement})
+        with pytest.raises(RuntimeError, match="rank 1.*LoRA changed before export"):
+            worker.export_step_requests([state.request_id], policy_ref="v7", max_bytes=1 << 20)
+        assert runner.state_cache[state.request_id] is state
+        manager._registered_adapters[7] = original_adapter
+        worker.release_step_requests([state.request_id])
+
+        incomplete = [snapshots[0], {}]
+        with pytest.raises(RuntimeError, match="same requests"):
+            worker.restore_step_requests(incomplete, policy_ref="v7", max_bytes=1 << 20)
+        assert runner.state_cache == {} and worker._step_lora_state == {}
+
+        bad = copy.deepcopy(snapshots)
+        if rank == 1:
+            digest = bad[rank][state.request_id][:RUNTIME_LORA_FINGERPRINT_SIZE]
+            bad[rank][state.request_id] = digest + pipeline.export_step_state(state, policy_ref="v8", max_bytes=1 << 20)
+        with pytest.raises(RuntimeError, match="rank 1.*policy"):
+            worker.restore_step_requests(bad, policy_ref="v7", max_bytes=1 << 20)
+        assert runner.state_cache == {} and runner.input_batch is None and worker._step_lora_state == {}
+
+        if rank == 1:
+            replacement = LoRALayerWeights(weights.module_name, 1, 1, weights.lora_a, weights.lora_b + 1)
+            manager._registered_adapters[7] = LoRAModel(7, rank=1, loras={weights.module_name: replacement})
+        with pytest.raises(RuntimeError, match="rank 1.*installed LoRA"):
+            worker.restore_step_requests(snapshots, policy_ref="v7", max_bytes=1 << 20)
+        assert runner.state_cache == {} and worker._step_lora_state == {}
+        manager._registered_adapters[7] = LoRAModel(
+            7,
+            rank=1,
+            loras={
+                weights.module_name: LoRALayerWeights(
+                    weights.module_name, 1, 1, weights.lora_a.clone(), weights.lora_b.clone()
+                )
+            },
+        )
+        worker.restore_step_requests(snapshots, policy_ref="v7", max_bytes=1 << 20)
+        restored = runner.state_cache[state.request_id]
+        assert restored.step_index == 1 and torch.equal(restored.latents, state.latents)
+        selection = worker._step_lora_state[state.request_id]
+        assert (selection.request, selection.scale) == (state.sampling.lora_request, 0.75)
+
+        worker.restore_step_requests(snapshots, policy_ref="v7", max_bytes=1 << 20)
+        assert runner.state_cache[state.request_id] is restored
+        assert worker._step_lora_state[state.request_id] is selection
+        with pytest.raises(RuntimeError, match="rank 1.*different snapshot"):
+            worker.restore_step_requests(bad, policy_ref="v7", max_bytes=1 << 20)
+        assert runner.state_cache[state.request_id] is restored
+        assert worker._step_lora_state[state.request_id] is selection
+
+        advanced = []
+        worker._flashinfer_autotune_on = False
+
+        def run_step(output):
+            advanced.extend(output.scheduled_request_ids)
+            return RunnerOutput(state.request_id, step_index=2, finished=False)
+
+        runner.execute_stepwise = run_step
+        wave = DiffusionSchedulerOutput(
+            step_id=1,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData([state.request_id]),
+            finished_req_ids=set(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
+        )
+        if rank == 1:
+            replacement = LoRALayerWeights(weights.module_name, 1, 1, weights.lora_a, weights.lora_b + 1)
+            manager._registered_adapters[7] = LoRAModel(7, rank=1, loras={weights.module_name: replacement})
+        with pytest.raises(RuntimeError, match="rank 1.*LoRA changed after restore"):
+            worker.execute_stepwise(wave)
+        assert not advanced and not runner.state_cache and not worker._step_lora_state
+        Path(output_dir, f"rank{rank}.json").write_text(
+            json.dumps({"rank": rank, "all_rank_snapshots": len(snapshots), "peer_failure_rolled_back": True})
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_worker_snapshot_handoff_and_peer_failure_with_real_gloo(tmp_path):
+    import time
+
+    context = torch.multiprocessing.spawn(
+        _snapshot_gloo_worker, args=(str(tmp_path / "gloo"), str(tmp_path)), nprocs=2, join=False
+    )
+    try:
+        deadline = time.monotonic() + 180
+        while not context.join(timeout=1):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("CPU snapshot collectives did not finish")
+        for rank in range(2):
+            report = json.loads((tmp_path / f"rank{rank}.json").read_text())
+            assert report == {"rank": rank, "all_rank_snapshots": 2, "peer_failure_rolled_back": True}
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)

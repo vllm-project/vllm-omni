@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import Future
 from typing import Literal, Protocol
 
 import msgspec
@@ -57,6 +58,18 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     lora_request: LoRARequest | None = None
     requested_replica_id: int | None = None
     cfg_companion_ids: dict[str, str] | None = None
+
+
+class RestoreDiffusionStepMessage(EngineQueueMessage, kw_only=True):
+    """In-process submission of an already-started, single-stage diffusion request."""
+
+    type: Literal["restore_diffusion_step"] = "restore_diffusion_step"
+    request_id: str
+    snapshots: list[dict[str, bytes]]
+    policy_ref: str
+    max_bytes: int
+    timeout: float
+    staged: Future[None]
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

@@ -16,6 +16,7 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import fields
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
@@ -107,12 +108,28 @@ from vllm_omni.diffusion.worker.utils import (
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.utils import build_lora_batch_key
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
 
 logger = init_logger(__name__)
+
+
+def _same_step_restore_value(left: Any, right: Any) -> bool:
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and left.dtype == right.dtype
+            and torch.equal(left.cpu(), right.cpu())
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_same_step_restore_value(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)) and isinstance(right, type(left)):
+        return len(left) == len(right) and all(_same_step_restore_value(a, b) for a, b in zip(left, right, strict=True))
+    return left == right
 
 
 def _dit_any_rank_failed(local_failed: bool) -> bool:
@@ -1265,6 +1282,78 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def _supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
+
+    def export_step_requests(self, request_ids: Sequence[str], *, policy_ref: str, max_bytes: int) -> dict[str, bytes]:
+        """Copy quiesced requests; retain live state until the owner confirms receipt.
+
+        The caller supplies the verified installed policy. Export does not
+        release state or change scheduling; use ``release_step_requests`` only
+        after every required rank's CPU snapshot has an owner.
+        """
+        export = getattr(self.pipeline, "export_step_state", None)
+        if not callable(export):
+            raise NotImplementedError("This pipeline does not support step-state export")
+        if max_bytes <= 0:
+            raise ValueError("Step snapshots require a positive byte budget")
+        snapshots = {}
+        remaining = max_bytes
+        for request_id in request_ids:
+            payload = export(self.state_cache[request_id], policy_ref=policy_ref, max_bytes=remaining)
+            snapshots[request_id] = payload
+            remaining -= len(payload)
+        return snapshots
+
+    def restore_step_requests(
+        self,
+        snapshots: dict[str, bytes],
+        *,
+        policy_ref: str,
+        max_bytes: int,
+        expected_steps: dict[str, int] | None = None,
+        expected_requests: dict[str, OmniDiffusionRequest] | None = None,
+    ) -> None:
+        """Reconstruct all states before publishing any to the quiesced runner."""
+        restore = getattr(self.pipeline, "restore_step_state", None)
+        if not callable(restore):
+            raise NotImplementedError("This pipeline does not support step-state restore")
+        if max_bytes <= 0 or sum(map(len, snapshots.values())) > max_bytes:
+            raise ValueError("Step snapshots exceed their byte budget")
+        if self.state_cache.keys() & snapshots:
+            raise ValueError("Cannot restore a request that is already in the runner")
+        restored = {}
+        for request_id, payload in snapshots.items():
+            state = restore(payload, policy_ref=policy_ref, max_bytes=max_bytes)
+            if state.request_id != request_id:
+                raise ValueError("Step snapshot request identity does not match")
+            if expected_steps is not None and state.step_index != expected_steps[request_id]:
+                raise ValueError(f"Step snapshot does not match scheduler progress for request {request_id!r}")
+            if expected_requests is not None and request_id in expected_requests:
+                self._check_step_restore_request(state, expected_requests[request_id])
+            restored[request_id] = state
+        if restored:
+            self.state_cache.update(restored)
+            self.input_batch = None
+
+    @staticmethod
+    def _check_step_restore_request(state: StepRequestState, request: OmniDiffusionRequest) -> None:
+        """Match the fresh scheduler envelope against the actual decoded state."""
+        if not _same_step_restore_value(state.prompt, request.prompt) or state.external_req_id != getattr(
+            request, "external_req_id", None
+        ):
+            raise ValueError(f"Step snapshot does not match request inputs for {state.request_id!r}")
+        actual, expected = state.sampling, request.sampling_params
+        if build_lora_batch_key(actual.lora_request, actual.lora_scale) != build_lora_batch_key(
+            expected.lora_request, expected.lora_scale
+        ):
+            raise ValueError(f"Step snapshot does not match request LoRA for {state.request_id!r}")
+        for field in fields(expected):
+            if field.name in ("generator", "step_index"):
+                continue
+            left, right = getattr(actual, field.name), getattr(expected, field.name)
+            if not _same_step_restore_value(left, right):
+                raise ValueError(
+                    f"Step snapshot does not match request setting {field.name!r} for {state.request_id!r}"
+                )
 
     def release_step_requests(self, request_ids: Sequence[str]) -> None:
         """Drop request-owned state after execution/output preparation has returned.

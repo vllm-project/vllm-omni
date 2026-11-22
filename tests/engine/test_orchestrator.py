@@ -28,6 +28,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.data_entry_keys import returns_stage_payload
+from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.distributed.omni_coordinator import (
     ReplicaInfo,
@@ -37,6 +38,8 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import ABORT_TIMEOUT_S
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -90,6 +93,94 @@ class FakeRunningCounter:
 
     def decrement(self) -> None:
         self.value -= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "rejected", "cancelled", "drain_timeout"])
+async def test_restore_diffusion_step_preserves_output_and_binding(outcome):
+    admitted, release = asyncio.Event(), asyncio.Event()
+    draining, drained = asyncio.Event(), asyncio.Event()
+    request_queue, output_queue = asyncio.Queue(), asyncio.Queue()
+    client = MagicMock(spec=InlineStageDiffusionClient)
+    client.final_output = True
+    client.stage_type = "diffusion"
+    client.final_output_type = "image"
+    client.abort_requests_async = AsyncMock()
+    pool = StagePool(0, [client])
+    orch = Orchestrator(
+        request_async_queue=request_queue,
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+    )
+    engine = object.__new__(AsyncOmniEngine)
+    engine.request_queue = SimpleNamespace(async_q=request_queue)
+    request_id = "saved-inner"
+    payload = [{request_id: b"snapshot"}]
+
+    async def stage(*args, **kwargs):
+        assert args == (request_id, payload)
+        assert kwargs == {"policy_ref": "v2", "max_bytes": 128, "timeout": 3}
+        assert pool.get_bound_replica_id(request_id) == 0
+        admitted.set()
+        await release.wait()
+        if outcome == "rejected":
+            raise ValueError("policy mismatch")
+
+    client.restore_step_request_async = AsyncMock(side_effect=stage)
+
+    async def drain(*args, **kwargs):
+        assert args == ("weight_sharing_drain",)
+        assert kwargs == {"timeout": min(3, ABORT_TIMEOUT_S), "kwargs": {"request_ids": [request_id]}}
+        draining.set()
+        await drained.wait()
+        if outcome == "drain_timeout":
+            raise TimeoutError("restore still draining")
+        return True
+
+    client.collective_rpc_async = AsyncMock(side_effect=drain)
+    submit = asyncio.create_task(
+        engine.restore_diffusion_step_async(request_id, payload, policy_ref="v2", max_bytes=128, timeout=3)
+    )
+    msg = await asyncio.wait_for(request_queue.get(), 1)
+    dispatch = asyncio.create_task(orch._dispatch_message(msg))
+    wait_for_drain = None
+    try:
+        await asyncio.wait_for(admitted.wait(), 1)
+        assert not submit.done()
+        assert output_queue.empty()
+        if outcome in ("cancelled", "drain_timeout"):
+            submit.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await submit
+        release.set()
+        if outcome in ("cancelled", "drain_timeout"):
+            wait_for_drain = asyncio.create_task(draining.wait())
+            await asyncio.wait((dispatch, wait_for_drain), timeout=1, return_when=asyncio.FIRST_COMPLETED)
+            assert draining.is_set(), "The request route was released before its restored task drained"
+            assert not dispatch.done() and pool.get_bound_replica_id(request_id) == 0
+            drained.set()
+        assert await asyncio.wait_for(dispatch, 1)
+        if outcome == "success":
+            await asyncio.wait_for(submit, 1)
+            output = OmniRequestOutput.from_diffusion(request_id=request_id, images=[])
+            await orch._handle_processed_outputs(0, 0, [output])
+            message = output_queue.get_nowait()
+            assert isinstance(message, OutputMessage) and message.request_id == request_id and message.finished
+        elif outcome == "rejected":
+            with pytest.raises(ValueError, match="policy mismatch"):
+                await submit
+        else:
+            client.abort_requests_async.assert_not_awaited()
+        assert not orch.request_states and pool.get_bound_replica_id(request_id) is None
+        assert output_queue.empty()
+    finally:
+        release.set()
+        drained.set()
+        if wait_for_drain is not None:
+            wait_for_drain.cancel()
+            await asyncio.gather(wait_for_drain, return_exceptions=True)
+        await asyncio.gather(submit, dispatch, return_exceptions=True)
 
 
 @pytest.mark.asyncio

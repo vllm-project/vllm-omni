@@ -15,9 +15,9 @@ import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 import anyio
 import msgspec
@@ -136,7 +136,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # on wake so sleep → wake → generate keeps working.
         self._hold_admission_until_resume: bool = False
         # Stages whose scheduler pause_generation closed (AR in any mode,
-        # diffusion with mode="keep"); admission stays closed until
+        # diffusion with keep or step-boundary pause); admission stays closed until
         # resume_generation has reopened all of them.
         self._paused_stage_ids: set[int] = set()
         self._sleeping_tags: set[str] = set()
@@ -145,7 +145,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # Paced interaction ingress is stamped before ordered worker delivery.
         self._interaction_reservations: dict[tuple[str, str], float | None] = {}
 
-    # ==================== Generate Method ====================
+    # ==================== Generate Method =============
 
     async def generate(
         self,
@@ -439,6 +439,79 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
     async def _notify_generation_waiters(self) -> None:
         async with self._pause_cond:
             self._pause_cond.notify_all()
+
+    @asynccontextmanager
+    async def restore_diffusion_step_streaming(
+        self,
+        request_id: str,
+        external_request_id: str,
+        snapshots: list[dict[str, bytes]],
+        *,
+        policy_ref: str,
+        max_bytes: int,
+        timeout: float,
+    ) -> AsyncGenerator[AsyncGenerator[OmniRequestOutput, None], None]:
+        """Stage a snapshot while paused, then expose its normal output stream."""
+        async with self._pause_cond:
+            if not self._paused or self._paused_stage_ids != {0} or self._sleeping_tags:
+                raise RuntimeError("Step restore requires a fully awake engine with diffusion scheduling paused")
+            if request_id in self.request_states:
+                raise ValueError(f"Diffusion request {request_id} already exists")
+            self._admitting += 1
+
+        complete = False
+        try:
+            try:
+                start = time.time()
+                metrics = OrchestratorMetrics(
+                    self.num_stages,
+                    self.log_stats,
+                    start,
+                    0,
+                    transfer_emitter=getattr(self, "transfer_metrics", None),
+                    replica_resolver=self._resolve_transfer_replica,
+                )
+                state = ClientRequestState(
+                    request_id=request_id,
+                    external_request_id=external_request_id,
+                    final_stage_id=0,
+                )
+                state.request_arrival_ts = start
+                state.metrics = metrics
+                self.request_states[request_id] = state
+                self._final_output_handler()
+                revoked = await self._submit_tracked(
+                    request_id,
+                    lambda: self.engine.restore_diffusion_step_async(
+                        request_id,
+                        snapshots,
+                        policy_ref=policy_ref,
+                        max_bytes=max_bytes,
+                        timeout=timeout,
+                    ),
+                    hold_admission=False,
+                )
+                if revoked:
+                    raise RuntimeError("Diffusion step restore was revoked")
+            finally:
+                await self._release_generate_admission()
+
+            async def outputs() -> AsyncGenerator[OmniRequestOutput, None]:
+                nonlocal complete
+                stream = self._process_orchestrator_results(request_id, metrics, 0, {request_id: start}, start)
+                async with aclosing(stream):
+                    async for output in stream:
+                        complete = output.finished
+                        yield output
+
+            self._publish_request_gauges(len(self.request_states))
+            async with aclosing(outputs()) as stream:
+                yield stream
+        finally:
+            if not complete:
+                with anyio.CancelScope(shield=True):
+                    await self._abort_internal_requests(request_id)
+            self._log_summary_and_cleanup(request_id)
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""
@@ -843,7 +916,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """
         raise NotImplementedError("AsyncOmni.encode is not implemented.")
 
-    # ==================== Control Methods ====================
+    # ==================== Control Methods =============
 
     async def collective_rpc(
         self,
@@ -1143,10 +1216,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
     async def pause_generation(
         self,
         *,
-        mode: PauseMode = "abort",
+        mode: PauseMode | Literal["step_boundary"] = "abort",
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
         stage_ids: list[int] | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Pause generation, mirroring vLLM AsyncLLM.pause_generation.
 
@@ -1158,15 +1232,25 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
            on every worker; that batch is delivered before any control RPC
            issued after this call runs, so the documented pause -> sleep order
            is safe. Queued requests stay queued until
-           :meth:`resume_generation`. Other modes pause frontend admission
-           only.
+           :meth:`resume_generation`. For step-wise diffusion,
+           ``mode="step_boundary"`` pauses after the current denoise step.
+           This mode must target only diffusion stages. Other modes pause
+           frontend admission only for diffusion stages.
 
         Note: ``sleep()`` already pauses the AR scheduler internally (same as
         vLLM EngineCore.sleep). Call this API when you need pause *without*
         freeing GPU memory (e.g. weight sync).
         """
-        if wait_for_inflight_requests:
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        if mode == "step_boundary":
+            if ar_stage_ids or not diffusion_stage_ids:
+                raise ValueError("Step-boundary pause must target only diffusion stages")
+            if wait_for_inflight_requests:
+                raise ValueError("Step-boundary pause cannot wait for requests to finish")
+        elif wait_for_inflight_requests:
             mode = "wait"
+        if mode not in ("keep", "step_boundary"):
+            diffusion_stage_ids = []
 
         async with self._pause_cond:
             # Keep running EngineCore pause + cache clear even when frontend
@@ -1179,12 +1263,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             if mode == "abort":
                 self._cancel_pending_submits()
 
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
-        if mode != "keep":
-            diffusion_stage_ids = []
         # Recorded before the RPCs so a failed or cancelled pause can still
         # be undone with an explicit resume_generation.
         self._paused_stage_ids.update(ar_stage_ids, diffusion_stage_ids)
+        timeout_kwargs = {"timeout": timeout} if timeout is not None else {}
         if ar_stage_ids:
             logger.info(
                 "[%s] Pausing AR stage(s) %s via EngineCore.pause_scheduler(mode=%s)",
@@ -1198,17 +1280,20 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 "pause_scheduler",
                 stage_ids=ar_stage_ids,
                 kwargs={"mode": mode, "clear_cache": clear_cache},
+                **timeout_kwargs,
             )
         if diffusion_stage_ids:
             logger.info(
-                "[%s] Pausing diffusion stage(s) %s via DiffusionEngine pause_scheduler(mode=keep)",
+                "[%s] Pausing diffusion stage(s) %s via DiffusionEngine pause_scheduler(mode=%s)",
                 self._name,
                 diffusion_stage_ids,
+                mode,
             )
             await self._engine_core_rpc(
                 "pause_scheduler",
                 stage_ids=diffusion_stage_ids,
-                kwargs={"mode": "keep"},
+                kwargs={"mode": mode},
+                **timeout_kwargs,
             )
 
         # Frontend / sender-side cache clear (P0). EngineCore.pause_scheduler
@@ -1216,17 +1301,18 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         if clear_cache and 0 in ar_stage_ids:
             await self._clear_frontend_mm_cache()
 
-    async def resume_generation(self, stage_ids: list[int] | None = None) -> None:
+    async def resume_generation(self, stage_ids: list[int] | None = None, *, timeout: float | None = None) -> None:
         """Resume generation after :meth:`pause_generation`."""
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        timeout_kwargs = {"timeout": timeout} if timeout is not None else {}
         if ar_stage_ids:
             logger.info("[%s] Resuming AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
-            await self._engine_core_rpc("resume_scheduler", stage_ids=ar_stage_ids)
+            await self._engine_core_rpc("resume_scheduler", stage_ids=ar_stage_ids, **timeout_kwargs)
             self._paused_stage_ids.difference_update(ar_stage_ids)
         diffusion_stage_ids = [sid for sid in diffusion_stage_ids if sid in self._paused_stage_ids]
         if diffusion_stage_ids:
             logger.info("[%s] Resuming diffusion stage(s) %s via DiffusionEngine", self._name, diffusion_stage_ids)
-            await self._engine_core_rpc("resume_scheduler", stage_ids=diffusion_stage_ids)
+            await self._engine_core_rpc("resume_scheduler", stage_ids=diffusion_stage_ids, **timeout_kwargs)
             self._paused_stage_ids.difference_update(diffusion_stage_ids)
 
         if self._paused_stage_ids:
@@ -1699,7 +1785,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
         return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
 
-    # ==================== Properties ====================
+    # ==================== Properties =============
 
     async def get_input_preprocessor(self) -> InputProcessor:
         """Get input preprocessor."""

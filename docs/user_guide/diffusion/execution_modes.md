@@ -101,6 +101,20 @@ embeddings affect this grouping. HSDP data parallelism and diffusion cache
 backends remain available through request execution, subject to their
 existing compatibility rules.
 
+Native SD3 exposes per-request scheduler state and pooled conditioning for
+step execution. Internal engine controls support fixed-policy snapshot tests.
+The caller pauses at a step boundary and takes ownership of the CPU snapshot
+before releasing worker state. Released requests remain parked until all ranks
+restore the state or the request is aborted. A fresh engine reconstructs the
+request and its resolved sampling settings from the snapshot after the caller
+installs the original runtime adapter and verifies the frozen base model.
+The worker checks the execution profile before reconstructing tensors.
+Snapshots from earlier formats or with incompatible numeric settings require
+a whole-request retry. These controls are internal to the engine.
+Derived pipelines that replace the denoising algorithm must set
+`supports_step_execution = False` until their step methods preserve that
+algorithm's state and outputs.
+
 Step execution is capability-based, not a generic switch for every diffusion
 model. Qwen-Image supports step-wise continuous batching. BAGEL supports
 step-wise continuous batching for image generation with `bagel.yaml`,

@@ -35,6 +35,7 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     InteractionMessage,
     NextStageInputMessage,
+    RestoreDiffusionStepMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
@@ -942,6 +943,32 @@ class AsyncOmniEngine(OmniEngineBase):
                 request_id,
                 len(companions),
             )
+
+    async def restore_diffusion_step_async(
+        self,
+        request_id: str,
+        snapshots: list[dict[str, bytes]],
+        *,
+        policy_ref: str,
+        max_bytes: int,
+        timeout: float,
+    ) -> None:
+        staged: concurrent.futures.Future[None] = concurrent.futures.Future()
+        try:
+            async with asyncio.timeout(timeout):
+                await self._put_request_queue(
+                    RestoreDiffusionStepMessage(
+                        request_id=request_id,
+                        snapshots=snapshots,
+                        policy_ref=policy_ref,
+                        max_bytes=max_bytes,
+                        timeout=timeout,
+                        staged=staged,
+                    )
+                )
+                await asyncio.wrap_future(staged)
+        finally:
+            staged.cancel()
 
     async def add_next_stage_input_async(self, msg: NextStageInputMessage) -> None:
         """Send a next stage input returned by an earlier request to the Orchestrator."""

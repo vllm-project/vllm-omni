@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from math import inf
 from typing import TYPE_CHECKING, Any, Literal
@@ -121,6 +122,8 @@ class StepScheduler(BaseScheduler):
         return request_id
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
+        if state.status == DiffusionRequestStatus.AWAITING_RESTORE:
+            return False
         if not super()._can_schedule_waiting(state):
             return False
 
@@ -139,6 +142,40 @@ class StepScheduler(BaseScheduler):
             if (self._request_progress[request_id].current_step == 0) != is_first_step:
                 return False
         return True
+
+    def add_restore_request(self, request: OmniDiffusionRequest) -> str:
+        """Reserve scheduler ownership without scheduling a first encode."""
+        if not request.sampling_params.step_index or not request.use_step_execution:
+            raise ValueError("A staged step restore requires a nonzero step index and step execution")
+        if request.diffusion_kv_requests or request.mixfusion_info or request.sampling_params.streaming_buffer_seconds:
+            raise ValueError("A staged step restore does not support KV, streaming or MixFusion requests")
+        request_id = self.add_request(request)
+        # A retry may reuse an ID whose previous execution was already retired
+        # while paused. Its leftover cleanup marker must not reach the new state.
+        self._finished_req_ids.discard(request_id)
+        self._request_states[request_id].status = DiffusionRequestStatus.AWAITING_RESTORE
+        return request_id
+
+    def has_pending_restore(self) -> bool:
+        return any(state.status == DiffusionRequestStatus.AWAITING_RESTORE for state in self._request_states.values())
+
+    def snapshot_request_ids(self) -> list[str]:
+        """Return requests that reached a denoise boundary."""
+        return [request_id for request_id in self._running if self._request_progress[request_id].current_step > 0]
+
+    def mark_step_state_releasing(self, request_ids: list[str]) -> None:
+        """Block rescheduling before workers can drop the request state."""
+        for request_id in reversed(request_ids):
+            state = self._request_states[request_id]
+            if state.status == DiffusionRequestStatus.RUNNING:
+                preempted = self.preempt_request(request_id)
+                assert preempted
+            state.status = DiffusionRequestStatus.AWAITING_RESTORE
+
+    def mark_restored(self, request_ids: Iterable[str]) -> None:
+        """Schedule waiting requests as cached after all workers restore them."""
+        for request_id in request_ids:
+            self._request_states[request_id].status = DiffusionRequestStatus.PREEMPTED
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

@@ -12,7 +12,8 @@ import os
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Mapping, Sequence
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from types import AsyncGeneratorType
@@ -511,7 +512,7 @@ class DiffusionEngine:
             else:
                 self._request_cancellations = RequestCancellationRegistry()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        # pause_scheduler(mode="keep"): no new batch is scheduled while set.
+        # pause_scheduler: no new batch is scheduled while set.
         self._scheduling_paused = False
         self._streaming_playback = {}
         self._request_chunk_states: dict[str, RequestStreamState] = {}
@@ -568,6 +569,21 @@ class DiffusionEngine:
         exec_start_time = time.perf_counter()
         request_id = self._add_prepared_request(request)
         generator = self.get_output_stream(request_id)
+        formatted = self._format_output_stream(
+            request, generator, preprocess_time, diffusion_engine_start_time, exec_start_time
+        )
+        async with aclosing(generator), aclosing(formatted):
+            async for output in formatted:
+                yield output
+
+    async def _format_output_stream(
+        self,
+        request: OmniDiffusionRequest,
+        generator: AsyncGenerator[DiffusionOutput, None],
+        preprocess_time: float,
+        diffusion_engine_start_time: float,
+        exec_start_time: float,
+    ) -> AsyncGenerator[list[OmniRequestOutput], None]:
         async for output in generator:
             output_ready_wait_time = output.output_ready_wait_time
             # The stream now materializes async outputs before yielding. Keep
@@ -1200,13 +1216,20 @@ class DiffusionEngine:
             elif task.method == "resume_scheduler":
                 self._open_scheduling_gate()
             else:
+                kwargs = task.kwargs
+                if task.method in ("export_step_requests", "release_step_requests", "restore_step_requests"):
+                    kwargs = self._prepare_step_state_rpc(task)
                 result = self.executor.collective_rpc(
                     method=task.method,
                     timeout=remaining,
                     args=task.args,
-                    kwargs=task.kwargs,
+                    kwargs=kwargs,
                     unique_reply_rank=task.unique_reply_rank,
                 )
+                if task.method == "restore_step_requests":
+                    assert isinstance(self.scheduler, StepScheduler)
+                    with self._cv:
+                        self.scheduler.mark_restored(kwargs["expected_requests"])
         except BaseException as exc:  # noqa: BLE001 - propagate to caller
             # The future may have been cancelled (e.g. by a sync timeout
             # or asyncio cancellation) while the executor call was
@@ -1234,8 +1257,12 @@ class DiffusionEngine:
 
     def _check_pause_request(self, kwargs: dict | None) -> None:
         mode = (kwargs or {}).get("mode")
+        if mode == "step_boundary":
+            if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
+                raise NotImplementedError("Step-boundary pause requires step execution.")
+            return
         if mode != "keep":
-            raise ValueError(f"DiffusionEngine pause supports mode='keep' only, got {mode!r}.")
+            raise ValueError(f"Unsupported DiffusionEngine pause mode: {mode!r}.")
         if self.execution_mode != DiffusionExecutionMode.REQUEST_BATCH:
             raise NotImplementedError("DiffusionEngine pause supports request-level execution only.")
 
@@ -1243,8 +1270,56 @@ class DiffusionEngine:
         """Return once every worker has finished the device work of the batch that ran."""
         self.executor.collective_rpc("synchronize_device", timeout=timeout, kwargs={"timeout": timeout})
 
+    def _prepare_step_state_rpc(self, task: _RpcTask) -> dict:
+        scheduler = self.scheduler
+        if not isinstance(scheduler, StepScheduler) or not self._scheduling_paused:
+            raise RuntimeError("Step-state RPCs require a paused step scheduler")
+        if task.unique_reply_rank is not None:
+            raise ValueError("Step-state RPCs must run on every worker rank")
+        kwargs = dict(task.kwargs or {})
+        with self._cv:
+            if task.method == "restore_step_requests":
+                return self._step_restore_kwargs(task, kwargs)
+            if task.method == "export_step_requests" and not task.args and "request_ids" not in kwargs:
+                kwargs["request_ids"] = scheduler.snapshot_request_ids()
+            request_ids = task.args[0] if task.args else kwargs["request_ids"]
+            statuses = {DiffusionRequestStatus.RUNNING}
+            if task.method == "release_step_requests":
+                statuses.update((DiffusionRequestStatus.AWAITING_RESTORE, DiffusionRequestStatus.PREEMPTED))
+            for request_id in request_ids:
+                state = scheduler.get_request_state(request_id)
+                if state is None or state.status not in statuses or not state.req.sampling_params.step_index:
+                    raise ValueError(f"Step-state RPC requires a started request in the expected state: {request_id!r}")
+            if task.method == "release_step_requests":
+                # An ACK can be lost after workers relinquish their state.
+                # Leave the request parked until restore or abort in that case.
+                scheduler.mark_step_state_releasing(request_ids)
+        return kwargs
+
+    def _step_restore_kwargs(self, task: _RpcTask, kwargs: dict) -> dict:
+        """Use scheduler-owned step progress and request inputs."""
+        snapshots = task.args[0] if task.args else kwargs["snapshots"]
+        if not snapshots or not snapshots[0]:
+            raise ValueError("Step restore requires a snapshot bundle")
+        expected_steps = {}
+        expected_requests = {}
+        for request_id in snapshots[0]:
+            state = self.scheduler.get_request_state(request_id)
+            if state is None or state.status not in (
+                DiffusionRequestStatus.AWAITING_RESTORE,
+                DiffusionRequestStatus.PREEMPTED,
+            ):
+                raise ValueError(f"Step restore needs a request awaiting step restore: {request_id!r}")
+            expected_steps[request_id] = state.req.sampling_params.step_index
+            expected_requests[request_id] = state.req
+        kwargs["expected_steps"] = expected_steps
+        kwargs["expected_requests"] = expected_requests
+        return kwargs
+
     def _open_scheduling_gate(self) -> None:
         with self._cv:
+            if isinstance(self.scheduler, StepScheduler) and self.scheduler.has_pending_restore():
+                raise RuntimeError("Cannot resume scheduling while requests are awaiting step restore")
             self._scheduling_paused = False
             self._cv.notify_all()
 
@@ -1641,9 +1716,16 @@ class DiffusionEngine:
                 "Reduce the request shape or extend the model's paged-KV profile recipe."
             )
 
-    def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
+    def _add_prepared_request(self, request: OmniDiffusionRequest, *, awaiting_restore: bool = False) -> str:
         """Admit a request whose model-owned preprocessing is complete."""
 
+        if awaiting_restore and (
+            self.od_config.streaming_output
+            or is_scheduler_paged_kv_mode(
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            )
+        ):
+            raise ValueError("Step restore registration is unavailable for streaming or paged KV")
         buffer_seconds = getattr(request.sampling_params, "streaming_buffer_seconds", None)
         if buffer_seconds is not None:
             if (
@@ -1663,7 +1745,12 @@ class DiffusionEngine:
             if self._request_cancellations is not None:
                 request.cancellation_signal = self._request_cancellations.create(request.request_id)
             try:
-                request_id = self.scheduler.add_request(request)
+                if awaiting_restore:
+                    if not self._scheduling_paused or not isinstance(self.scheduler, StepScheduler):
+                        raise RuntimeError("Registering step restore requires a paused step scheduler")
+                    request_id = self.scheduler.add_restore_request(request)
+                else:
+                    request_id = self.scheduler.add_request(request)
             except BaseException:
                 if self._request_cancellations is not None:
                     self._request_cancellations.finish(request.request_id)
@@ -1686,6 +1773,69 @@ class DiffusionEngine:
     def add_request(self, request: OmniDiffusionRequest) -> str:
         request = self._prepare_request_for_admission(request)
         return self._add_prepared_request(request)
+
+    def register_step_restore(self, request: OmniDiffusionRequest) -> str:
+        """Reserve a stream for a text-to-image snapshot before worker restore."""
+        return self._add_prepared_request(self._prepare_request_for_admission(request), awaiting_restore=True)
+
+    @asynccontextmanager
+    async def restore_step_streaming(
+        self,
+        snapshots: list[dict[str, bytes]],
+        *,
+        policy_ref: str,
+        max_bytes: int,
+        timeout: float,
+    ) -> AsyncIterator[AsyncGenerator[list[OmniRequestOutput], None]]:
+        """Recreate a request from its snapshots and own its normal output stream.
+
+        Entering the context waits for the worker restore. The caller controls
+        scheduling and can resume it once all required requests are restored.
+        On rejection, cancellation or early exit, unfinished work is aborted.
+        """
+        from vllm_omni.lora.manager import RUNTIME_LORA_FINGERPRINT_SIZE
+
+        if not snapshots or len(snapshots[0]) != 1 or any(rank.keys() != snapshots[0].keys() for rank in snapshots[1:]):
+            raise ValueError("Restored stream requires exactly one request snapshot per rank")
+        request_id, payload = next(iter(snapshots[0].items()))
+        decode_request = getattr(resolve_pipeline_cls(self.od_config), "step_request_from_snapshot", None)
+        if not callable(decode_request):
+            raise NotImplementedError("The diffusion pipeline cannot reconstruct a request from its snapshot")
+        await self._check_and_start_background_loop()
+        start_time = time.perf_counter()
+        # Workers validate the fingerprint and restore their own tensors only
+        # after the CPU decoder has reconstructed the scheduler inputs.
+        request = await asyncio.to_thread(
+            decode_request,
+            memoryview(payload)[RUNTIME_LORA_FINGERPRINT_SIZE:],
+            policy_ref=policy_ref,
+            max_bytes=max_bytes - RUNTIME_LORA_FINGERPRINT_SIZE,
+        )
+        if request.request_id != request_id:
+            raise ValueError("Step snapshot request identity does not match its key")
+        exec_start_time = time.perf_counter()
+        request_id = self.register_step_restore(request)
+        with self._cv:
+            queue = self._out_streams[request_id]
+        stream = self.get_output_stream(request_id)
+        async with aclosing(stream):
+            try:
+                await self.async_collective_rpc(
+                    "restore_step_requests",
+                    timeout=timeout,
+                    args=(snapshots,),
+                    kwargs={"policy_ref": policy_ref, "max_bytes": max_bytes},
+                )
+                formatted = self._format_output_stream(
+                    request, stream, exec_start_time - start_time, start_time, exec_start_time
+                )
+                async with aclosing(formatted):
+                    yield formatted
+            finally:
+                # An unopened stream still owns its queue and needs an abort.
+                with self._cv:
+                    if self._out_streams.get(request_id) is queue:
+                        self.abort(request_id)
 
     def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
         """Bind a closable stream to the currently registered request queue."""
@@ -2157,6 +2307,8 @@ class DiffusionEngine:
                 # between the outer check and acquiring the lock, in which
                 # case we should use the queued path for proper ordering.
                 if not self._loop_started:
+                    if method in ("export_step_requests", "release_step_requests", "restore_step_requests"):
+                        raise RuntimeError("Step-state RPCs require an active scheduler loop")
                     if method in ("pause_scheduler", "resume_scheduler"):
                         return self._run_engine_control(method, timeout, kwargs)
                     if method == "update_streaming_playback":
