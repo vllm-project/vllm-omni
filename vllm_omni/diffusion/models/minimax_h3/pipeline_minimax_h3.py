@@ -3197,7 +3197,7 @@ class MiniMaxH3Pipeline(
             # The Tier-2 reference KV state is sized per branch at loop
             # start; the mid-loop switch changes the reference row count.
             raise OmniClientError("MiniMax H3 keep_steps does not support reference-KV offload")
-        if self._active_turbo_spec(sampling) is not None or self._has_active_native_lora(sampling):
+        if self._active_turbo_spec(sampling) is not None or self._active_native_spec(sampling) is not None:
             raise OmniClientError("MiniMax H3 keep_steps does not support turbo or native LoRA sampling")
         if self._resolve_latent_refine(extra) is not None or (
             latent_hw is not None

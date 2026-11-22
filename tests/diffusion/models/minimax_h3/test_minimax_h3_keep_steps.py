@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
     minimax_h3_denoise_loop,
     minimax_h3_switch_denoise_branch,
 )
+from vllm_omni.diffusion.models.minimax_h3.npu.lora import NativeDistilledLoRASpec
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence_ref2va_blocks,
 )
@@ -24,6 +25,7 @@ from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
     MINIMAX_H3_SHAPE_PLANNER,
     MiniMaxH3Pipeline,
 )
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
@@ -674,7 +676,7 @@ def _local_pipeline(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(pipeline, "_extract_prompt", lambda raw: ("p", {}))
     monkeypatch.setattr(pipeline, "_active_turbo_spec", lambda sampling: None)
-    monkeypatch.setattr(pipeline, "_has_active_native_lora", lambda sampling: False)
+    monkeypatch.setattr(pipeline, "_active_native_spec", lambda sampling: None)
     monkeypatch.setattr(pipeline, "_resolve_task", lambda task, multi_modal_data=None, **kwargs: "ref2va")
     monkeypatch.setattr(pipeline, "_extract_text_conditioning", lambda raw: None)
     monkeypatch.setattr(pipeline, "_encode_local_media", lambda media: media_conditioning)
@@ -845,8 +847,11 @@ def test_local_turbo_and_native_lora_fail_before_any_encoder_pass(monkeypatch: p
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
     monkeypatch.setattr(pipeline, "_validate_turbo_sampling", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "_validate_native_sampling", lambda *a, **k: None)
-    monkeypatch.setattr(pipeline, "_has_active_native_lora", lambda sampling: True)
-    with pytest.raises(OmniClientError, match="turbo or native LoRA"):
+    native_spec = NativeDistilledLoRASpec(DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0]), task="ref2va")
+    monkeypatch.setattr(pipeline, "_active_native_spec", lambda sampling: native_spec)
+    # A native LoRA always pins its distilled schedule, which keep_steps rejects
+    # before reaching the turbo/native-LoRA check.
+    with pytest.raises(OmniClientError, match="pinned distilled sigma schedules"):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
     assert encode_prompt.call_count == 0
 
