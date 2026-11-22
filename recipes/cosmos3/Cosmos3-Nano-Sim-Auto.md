@@ -88,12 +88,10 @@ See the [offline runner](../../examples/offline_inference/cosmos3_nano_sim_auto/
 | Chunk clock, token geometry, frame unit (297 frames, 7 views, 480p → 26 chunks, 390/228 tokens, 18,208-token unit) | validated (CPU tests) |
 | Dense refresh retains old history until publication; opt-in RGB/LiDAR latent output | CPU regressions pass |
 | Replay visibility planner vs token-level oracle and hand-derived reference rules | validated (CPU tests) |
-| Planner vs imaginaire4-generated visibility fixtures | CPU fixtures cover RGB/joint, conditioning, and eviction (`sim_auto_visibility_fixtures.py`) |
 | Fixed-step SDE sampler seed arithmetic | validated (CPU tests) |
-| Prompt text/token IDs and CPU SDE trajectories | reference fixtures; token-ID check requires the matching local tokenizer |
-| Manifest contract (vLLM-Omni and exporter) | CPU tests pass in an isolated import harness; actual checkpoint export/load pending |
+| Exporter manifest contract | CPU tests previously passed in an isolated import harness; actual checkpoint export/load pending |
 | Transformer / pipeline on GPU, latent parity vs `--save-latents` goldens, TP4 | not tested |
 | Tick sessions over the videos API | not implemented (phase 2) |
 
-Fixture generation and its local validation limits are recorded in
-[`fixtures/README.md`](../../tests/diffusion/models/cosmos3_nano_sim_auto/fixtures/README.md).
+The Sim-Auto tests do not require generated JSON reference fixtures. Reference comparisons
+for replay visibility, prompt text/token IDs, and CPU SDE trajectories are outside this test suite.

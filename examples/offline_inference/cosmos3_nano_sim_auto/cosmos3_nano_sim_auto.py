@@ -28,19 +28,16 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.utils.video_encoding import run_ordered_encoding_jobs, write_imageio_video
-from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
-from vllm_omni.outputs import OmniRequestOutput
+if TYPE_CHECKING:
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 PASSTHROUGH_EXTRAS = ("wsm", "lidar", "aspect_ratio", "resolution")
 
@@ -88,9 +85,7 @@ def _request_metadata(value: Any) -> dict[str, Any]:
 def _extract_payload(value: Any) -> tuple[Any, dict[str, Any]]:
     if isinstance(value, list) and len(value) == 1:
         return _extract_payload(value[0])
-    if isinstance(value, OmniRequestOutput) or (
-        not isinstance(value, dict | list | np.ndarray | torch.Tensor) and hasattr(value, "images")
-    ):
+    if not isinstance(value, dict | list | np.ndarray | torch.Tensor) and hasattr(value, "images"):
         if not value.images:
             raise ValueError("Cosmos3-Nano-Sim-Auto returned no video output.")
         video, metadata = _extract_payload(value.images[0] if len(value.images) == 1 else value.images)
@@ -167,6 +162,10 @@ class _CameraJob:
 def _save_camera_videos(
     frames: list[Any], cameras: list[str], frames_per_view: int, output_dir: Path, fps: float
 ) -> dict[str, str]:
+    import imageio.v2 as imageio
+
+    if not cameras or frames_per_view <= 0:
+        raise ValueError("Camera video output requires cameras and a positive frames_per_view.")
     if len(frames) != len(cameras) * frames_per_view:
         raise ValueError(f"Expected {len(cameras) * frames_per_view} camera-major frames, got {len(frames)}.")
     normalize_negative = any(
@@ -191,18 +190,29 @@ def _save_camera_videos(
                 )
             )
 
-        def encode(job: _CameraJob, encoder_threads: int) -> _CameraJob:
-            write_imageio_video(
-                job.frames,
-                job.temporary,
+        def encode(job: _CameraJob) -> _CameraJob:
+            with imageio.get_writer(
+                str(job.temporary),
                 fps=fps,
-                encoder_threads=encoder_threads,
+                quality=5.0,
                 macro_block_size=16,
-                normalize_negative=job.normalize_negative,
-            )
+                output_params=["-threads", "1"],
+            ) as writer:
+                for source in job.frames:
+                    frame = np.asarray(source)
+                    if np.issubdtype(frame.dtype, np.floating):
+                        if job.normalize_negative:
+                            frame = np.clip(frame, -1.0, 1.0) * 0.5 + 0.5
+                        frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    elif frame.dtype != np.uint8:
+                        frame = frame.astype(np.uint8)
+                    writer.append_data(frame[..., :3])
             return job
 
-        completed, _ = run_ordered_encoding_jobs(jobs, encode, parallel=True)
+        # Bound independent camera encodes and keep one codec thread per worker.
+        # Join all writers before publishing files or cleaning up after a failure.
+        with ThreadPoolExecutor(max_workers=min(len(jobs), os.cpu_count() or 1)) as executor:
+            completed = list(executor.map(encode, jobs))
         for job in completed:
             os.replace(job.temporary, job.destination)
         return {job.camera: str(job.destination) for job in completed}
@@ -215,6 +225,8 @@ def _save_camera_videos(
 def _sampling_params(
     request: dict[str, Any], *, seed: int, fps_override: float | None, num_frames_override: int | None
 ) -> OmniDiffusionSamplingParams:
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
     multiview = dict(request.get("multiview") or request.get("extra_params", {}).get("multiview") or {})
     if not multiview.get("views"):
         raise ValueError("Each request needs multiview.views with per-camera prompt and control_path.")
@@ -270,6 +282,11 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    # Keep output helpers and --help usable without initializing the inference runtime.
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
+
     requests = _load_requests(args.input)[: args.limit]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     omni = Omni(
