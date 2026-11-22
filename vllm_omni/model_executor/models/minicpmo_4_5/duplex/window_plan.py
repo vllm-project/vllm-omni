@@ -161,35 +161,6 @@ class PositionReanchor:
         """Position the retained tail lands on, i.e. the end of the sink."""
         return self.moved_from - self.delta
 
-    @property
-    def rope_angle_shift_tokens(self) -> int:
-        """Signed position offset to rotate retained keys by: ``-delta``.
-
-        RoPE composes, so a token that moves from ``p`` to ``p - delta`` needs
-        its cached key rotated by ``-delta * inv_freq`` and nothing else: the
-        sink did not move, and a uniform translation of the tail leaves every
-        within-tail relative distance untouched.
-        """
-        return -self.delta
-
-
-def reanchor_positions(position: int, plan: PositionReanchor) -> int:
-    """Map one absolute position through a re-anchor.
-
-    The sink keeps its positions, everything from ``moved_from`` translates by
-    ``-delta``, and the span in between ceases to exist.
-    """
-    if int(position) != position:
-        raise ValueError(f"position must be an integer, got {position!r}")
-    position = int(position)
-    if plan.sink_end <= position < plan.moved_from:
-        raise ValueError(
-            f"position {position} was dropped by reanchor plan moved_from={plan.moved_from} delta={plan.delta}"
-        )
-    if position < plan.moved_from:
-        return position
-    return position - plan.delta
-
 
 def plan_position_reanchor(
     geometry: DuplexWindowGeometry,
