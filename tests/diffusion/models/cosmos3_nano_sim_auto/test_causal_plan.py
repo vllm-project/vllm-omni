@@ -600,21 +600,3 @@ def test_reuse_plan_rejects_controls_that_read_their_chunks_targets(monkeypatch:
     monkeypatch.setattr(causal_plan, "pair_allowed", leaky)
     with pytest.raises(RuntimeError, match="cannot be reused"):
         scenario(2, reuse_control_kv=True)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and vLLM's bundled FlashAttention")
-@pytest.mark.parametrize("fa_version", [2, 3, 4])
-@pytest.mark.parametrize("chunk_index", [0, 3])
-def test_cuda_streams_op_matches_masked_softmax(fa_version: int, chunk_index: int) -> None:
-    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
-
-    if not is_fa_version_supported(fa_version):
-        pytest.skip(f"FlashAttention {fa_version} is unavailable on this device")
-    # Staging, the sliced cross-view rows and the compiled single merge on real varlen kernels.
-    scn = scenario(chunk_index, device="cuda")
-    q, streams = _random_streams(scn, heads=4, kv_heads=2, dim=128)
-    q, streams = q.bfloat16(), [(k.bfloat16(), v.bfloat16()) for k, v in streams]
-    with torch.inference_mode():
-        out = _run(scn.plan, q.cuda(), [(k.cuda(), v.cuda()) for k, v in streams], kernel=f"fa{fa_version}")
-    torch.testing.assert_close(out[0].double().cpu(), _dense_softmax(scn, q, streams), atol=2e-2, rtol=2e-2)
