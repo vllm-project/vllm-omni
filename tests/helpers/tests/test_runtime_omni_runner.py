@@ -195,3 +195,26 @@ def test_runner_cleanup_kills_owned_worker_ignoring_terminate(
         assert owned[0].poll() is None
 
     assert owned[0].poll() is not None
+
+
+@pytest.mark.parametrize(
+    "task_type, speaker",
+    [("Base", None), ("VoiceDesign", None), ("CustomVoice", ["Vivian"])],
+)
+def test_qwen3_tts_inputs_default_speaker_only_for_custom_voice(
+    monkeypatch: pytest.MonkeyPatch, task_type: str, speaker: list[str] | None
+) -> None:
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_checks import check_voice_clone_prompt
+
+    runner = object.__new__(OmniRunner)
+    runner.model_name = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    monkeypatch.setattr(runner, "_estimate_prompt_len", lambda *_args: 4, raising=False)
+
+    [prompt] = runner.get_omni_inputs("Hi there.", mm_processor_kwargs={"task_type": task_type}, modalities=["audio"])
+
+    # A Base speaker names a stored voice, which the frontend check lets through
+    # to the Talker, so the harness must not invent one for a reference-less request.
+    assert prompt["additional_information"].get("speaker") == speaker
+    if task_type == "Base":
+        with pytest.raises(ValueError, match="requires 'ref_audio' or 'speaker_embedding'"):
+            check_voice_clone_prompt(prompt, [])

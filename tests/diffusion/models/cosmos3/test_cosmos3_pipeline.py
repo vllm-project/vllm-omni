@@ -1540,6 +1540,102 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     assert additional["condition_frame_indexes_vision"] == [0, 1]
 
 
+def test_preprocess_i2v_center_crops_mismatched_aspect_ratio() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    # Portrait 480x800: red top band, green middle, blue bottom band.
+    image = Image.new("RGB", (480, 800), (0, 255, 0))
+    image.paste((255, 0, 0), (0, 0, 480, 200))
+    image.paste((0, 0, 255), (0, 600, 480, 800))
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "A slow camera push.", "multi_modal_data": {"image": image}},
+        sampling_params=make_sampling_params(height=192, width=320, extra_args={}),
+    )
+
+    preprocessed = preprocess(request).prompt["additional_information"]["preprocessed_image"]
+
+    # Scaled to cover 320x192 and center cropped: only the green middle is
+    # kept, so the red and blue bands do not appear.
+    assert tuple(preprocessed.shape[-2:]) == (192, 320)
+    red, green, blue = preprocessed[0].float().mean(dim=(1, 2)).tolist()
+    assert green > 0.9
+    assert red < -0.9
+    assert blue < -0.9
+
+
+def test_preprocess_action_image_with_explicit_size_is_stretched() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    # 16:9 frame with a red bottom band, requested at 4:3.
+    image = Image.new("RGB", (640, 360), (0, 255, 0))
+    image.paste((255, 0, 0), (0, 300, 640, 360))
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"image": image}},
+        sampling_params=make_sampling_params(
+            height=480, width=640, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    preprocessed = preprocess(request).prompt["additional_information"]["preprocessed_image"]
+
+    # Stretched to 640x480, so the red band stays at the bottom and no
+    # mirrored padding is added below it.
+    assert tuple(preprocessed.shape[-2:]) == (480, 640)
+    bottom_red = preprocessed[0, 0, -40:].float().mean().item()
+    assert bottom_red > 0.9
+
+
+def _action_frame_with_red_bottom_band() -> Image.Image:
+    # 16:10 frame, so the 480p action bucket (832x480) does not match it.
+    image = Image.new("RGB", (640, 400), (0, 255, 0))
+    image.paste((255, 0, 0), (0, 360, 640, 400))
+    return image
+
+
+def test_preprocess_action_image_without_size_is_padded() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"image": _action_frame_with_red_bottom_band()}},
+        sampling_params=make_sampling_params(
+            height=None, width=None, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    result = preprocess(request)
+    preprocessed = result.prompt["additional_information"]["preprocessed_image"]
+
+    # The size comes from the bucket and the frame is padded, not stretched:
+    # the bottom rows mirror the green content above the red band.
+    assert (result.sampling_params.height, result.sampling_params.width) == (480, 832)
+    assert tuple(preprocessed.shape[-2:]) == (480, 832)
+    bottom_red = preprocessed[0, 0, -20:].float().mean().item()
+    assert bottom_red < -0.9
+
+
+def test_preprocess_action_video_with_explicit_size_is_padded() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    frames = [_action_frame_with_red_bottom_band() for _ in range(3)]
+    request = SimpleNamespace(
+        prompt={"prompt": "Move the arm.", "multi_modal_data": {"video": frames}},
+        sampling_params=make_sampling_params(
+            height=480, width=832, extra_args={"action_mode": "forward_dynamics", "domain_name": "umi"}
+        ),
+    )
+
+    preprocessed = preprocess(request).prompt["additional_information"]["preprocessed_image"]
+
+    # The serving layer never resized video frames, so the first frame is
+    # padded like before.
+    bottom_red = preprocessed[0, 0, -20:].float().mean().item()
+    assert bottom_red < -0.9
+
+
 def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
     """Serving may pass multipart uploads as /tmp/...mp4 path lists (#8073)."""
     imageio = pytest.importorskip("imageio.v3")
@@ -3944,6 +4040,15 @@ class TestForwardRouting:
                 ),
                 "cannot be combined with action generation",
             ),
+            (
+                {
+                    "prompt": "x",
+                    "modalities": ["image"],
+                    "additional_information": {"preprocessed_image": torch.zeros(1, 3, 16, 16)},
+                },
+                make_sampling_params(),
+                "image-conditioned image generation is unsupported",
+            ),
         ],
     )
     def test_forward_rejects_invalid_public_requests(
@@ -3955,6 +4060,8 @@ class TestForwardRouting:
     ) -> None:
         pipeline = make_cosmos3_pipeline()
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
+        # Stub generation so a request that passes validation returns instead of failing later.
+        self._install_forward_stubs(pipeline)
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))

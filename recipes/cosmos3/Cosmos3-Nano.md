@@ -25,6 +25,7 @@ mode is selected per request:
   images without offload. Start the server with
   `--additional-config '{"cosmos3_batch_t2i_outputs": false}'` to keep the serial
   loop everywhere.
+  T2I does not accept a reference image; send one as an I2V request instead.
 - **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image/video.
 - **I2V** — `POST /v1/videos/sync` with a reference image (`input_reference` file
   upload, or `image_reference` JSON).
