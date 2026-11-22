@@ -68,9 +68,8 @@ orchestrator.
 ## Contract status
 
 This document describes the current `StageRuntime`, `StagePool`, stage-client,
-and stage-process layout. [Sharing stages between pipelines][shared-stages]
-remains an open design proposal. The earlier [LLM and DiT stage client and
-process refactor][stage-client-refactor] closed without merging.
+and stage-process layout. [Sharing stages between pipelines](https://github.com/vllm-project/vllm-omni/issues/4108)
+remains an open design proposal. The earlier [LLM and DiT stage client and process refactor](https://github.com/vllm-project/vllm-omni/pull/5441) closed without merging.
 
 ## Ownership boundary
 
@@ -101,46 +100,47 @@ transfer semantics, configuration precedence, or public error rendering.
 ## Request-to-replica handoff
 
 In the [two-stage request trace](engine_orchestration.md#two-stage-request-lifecycle),
-[`StageRuntime._assemble_stage_pools`][assemble-pools] provides one pool per
+[`StageRuntime._assemble_stage_pools`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_runtime.py) provides one pool per
 logical stage with its replica clients and, for LLM stages, its output
 processor. The orchestrator chooses when to submit to each pool.
-[`StagePool.submit_initial`][pool-submit] binds an unpinned local request
-through [`select_replica_id`][select-replica], which round-robins across
+[`StagePool.submit_initial`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_pool.py) binds an unpinned local request
+through `select_replica_id`, which round-robins across
 available replicas for new requests. The pool registers the LLM output
-processor before [the selected client sends the request][client-add] to
-EngineCore. In distributed mode, [`StagePool.pick`][pick-replica] reuses
+processor before the selected client's
+[`add_request_async`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_engine_core_client.py) sends the request to EngineCore. In distributed mode, `StagePool.pick` reuses
 serviceable affinity or asks the load balancer to select from attached,
 serviceable replicas.
 
-The binding belongs to the pool. [`StagePool.abort_requests`][pool-abort]
+The binding belongs to the pool. [`StagePool.abort_requests`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_pool.py)
 groups aborts by existing affinity and sends them to the corresponding
 clients. The orchestrator tells the pool to
-[`release_bindings`][release-bindings] when the request is cleaned up. This
+`release_bindings` when the request is cleaned up. This
 frees request routing state and leaves the replica available for later
-requests. See the [round-robin and onward routing test][test-round-robin],
-the [affinity test][test-affinity], and the
-[multi-replica abort routing test][test-abort-routing].
+requests. The [orchestrator tests](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator.py) cover round-robin forwarding
+(`test_multi_replica_round_robin_distribution`), reuse of an existing binding
+(`test_stage_pool_submit_update_reuses_existing_binding`), and abort routing
+(`test_multi_replica_abort_broadcasts_to_all_replicas`).
 
 ### Replica loss
 
 If polling reports `EngineDeadError` for a physical replica,
-[`Orchestrator._handle_dead_replica`][dead-replica] asks the pool to
-[`evict_replica`][evict-replica] before failing stranded requests. For the
+[`Orchestrator._handle_dead_replica`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/orchestrator.py) asks the pool to
+`evict_replica` before failing stranded requests. For the
 ordinary non-shared-weight path, the pool retires the dead replica from
 routing. If another replica survives, orchestration fails requests bound to
 the dead one. With no surviving replica, it fails requests already routed
 through that stage. The frontend observes a fatal error on each affected
-request. See the [replica eviction test][test-eviction] and the
-[last-replica failure test][test-last-replica].
+request. The [orchestrator error tests](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator_error_handling.py) cover both cases in
+`test_engine_dead_error_fails_only_dead_replica_requests` and
+`test_handle_dead_replica_last_replica_fails_all_stage_requests`.
 
-For a coordinator-driven removal, [`MembershipController.handle_unregister`][unregister]
+For a coordinator-driven removal, [`MembershipController.handle_unregister`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/membership_controller.py)
 acts first. It invalidates the address, detaches and shuts down the client,
 then calls the removal and request cleanup callbacks before queuing errors
-for affected requests. The [unregister ordering test][test-unregister]
+for affected requests. The [`test_unregister_awaits_async_removal_handler_before_request_cleanup`](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_membership_controller.py)
 checks that orchestration observes the removal before request cleanup.
 
-Source and test links in this section point to the revision in
-`last_verified_commit`.
+The implementation was checked at the revision in `last_verified_commit`.
 
 ## Candidate invariants
 
@@ -209,22 +209,3 @@ before the upstream engine constructor creates its scheduler and cache
 managers. The default hook is a no-op. The NPU implementation installs its
 Mamba allocator signature compatibility here, so Ascend imports and patches
 remain in the NPU platform and are not applied to other platforms.
-
-[assemble-pools]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_runtime.py#L1478
-[client-add]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_engine_core_client.py#L277
-[dead-replica]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L1859
-[evict-replica]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L2243
-[pick-replica]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L533
-[pool-abort]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L1997
-[pool-submit]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L1546
-[release-bindings]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L917
-[select-replica]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L1070
-[shared-stages]: https://github.com/vllm-project/vllm-omni/issues/4108
-[stage-client-refactor]: https://github.com/vllm-project/vllm-omni/pull/5441
-[test-abort-routing]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator.py#L2156
-[test-affinity]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator.py#L2217
-[test-eviction]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator_error_handling.py#L264
-[test-last-replica]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator_error_handling.py#L638
-[test-round-robin]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator.py#L2086
-[test-unregister]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_membership_controller.py#L245
-[unregister]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/membership_controller.py#L112

@@ -77,12 +77,12 @@ keeping public clients independent from stage processes and transports.
 ## Contract status
 
 This document is a draft description of current behavior. Open proposals
-include [pipeline-configured static transitions][static-transitions] and
-[dynamic, contract-aware routing][dynamic-routing]. The
-[design-doc and review handoff RFC][design-handoff] tracks how contributors
+include [pipeline-configured static transitions](https://github.com/vllm-project/vllm-omni/issues/8740) and
+[dynamic, contract-aware routing](https://github.com/vllm-project/vllm-omni/issues/6302). The
+[design-doc and review handoff RFC](https://github.com/vllm-project/vllm-omni/issues/10923) tracks how contributors
 verify and maintain these contracts.
 
-The orchestration loop is [event-driven by default][event-driven-default].
+The orchestration loop is [event-driven by default](https://github.com/vllm-project/vllm-omni/pull/8675).
 `VLLM_OMNI_EVENT_DRIVEN_ORCH=0` selects the legacy 1 ms poll loop. Both
 loops share the routing and terminal handling described below.
 
@@ -101,71 +101,71 @@ I/O, entrypoint, connector, and error contracts.
 
 Follow a single prompt through `AsyncOmni.generate()` with `async_chunk=False`,
 two local LLM stages, and stage 1 as the only final-output stage. The
-[two-stage orchestration test][test-two-stage] uses fake stage clients and
-output processors to cover the engine portion of this path. Source and test
-links below point to the revision in `last_verified_commit`.
+[`test_run_two_stage_llm`](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator.py) uses fake stage clients and
+output processors to cover the engine portion of this path. The implementation
+was checked at the revision in `last_verified_commit`.
 
-1. **Admission.** [`AsyncOmni.generate`][generate] derives the final stage
+1. **Admission.** [`AsyncOmni.generate`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/entrypoints/async_omni.py) derives the final stage
    from the requested output modalities and registers frontend request state
-   under an internal ID. [`AsyncOmniEngine.add_request_async`][engine-add]
+   under an internal ID. [`AsyncOmniEngine.add_request_async`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/async_omni_engine.py)
    prepares the request and enqueues a `StageSubmissionMessage`.
-   [`Orchestrator._handle_add_request`][orchestrator-add] checks admission,
+   [`Orchestrator._handle_add_request`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/orchestrator.py) checks admission,
    records separate orchestration state, and submits to the stage 0 pool.
-   The [frontend submission test][test-frontend-submit] checks the internal ID
-   handoff, and the [two-stage test][test-two-stage] checks stage 0 dispatch.
+   The [`test_generate_submits_randomized_id_to_engine`](https://github.com/vllm-project/vllm-omni/blob/main/tests/entrypoints/test_async_omni.py) checks the internal ID
+   handoff, and the two-stage test checks stage 0 dispatch.
 2. **Replica selection.** The orchestrator supplies the logical stage ID.
-   [`StagePool.submit_initial`][pool-submit] selects the replica, records
+   [`StagePool.submit_initial`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_pool.py) selects the replica, records
    affinity, registers output-processor state, and submits through that
    replica's client. The [replica handoff](stage_runtime.md#request-to-replica-handoff)
-   describes selection and the [round-robin test][test-round-robin].
+   describes selection and links the replica routing tests.
 3. **Downstream forwarding.** The stage 0 client supplies EngineCore output.
-   [`StagePool.process_llm_raw_outputs`][pool-output] feeds the stage output
-   processor. When stage 0 finishes, [`Orchestrator._route_output`][route-output]
-   decides to advance. [`_forward_to_next_stage_unguarded`][forward] selects
-   logical stage 1 and asks its client to
-   [build stage inputs][process-inputs]. [`_submit_to_stage`][submit-stage]
+   `StagePool.process_llm_raw_outputs` feeds the stage output
+   processor. When stage 0 finishes, [`Orchestrator._route_output`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/orchestrator.py)
+   decides to advance. `_forward_to_next_stage_unguarded` selects
+   logical stage 1 and calls
+   [`StageEngineCoreClientBase.process_engine_inputs`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/stage_engine_core_client.py). `_submit_to_stage`
    hands the resulting request to the stage 1 pool with the same orchestration
-   ID. The [two-stage test][test-two-stage] checks that ID and the new prompt
+   ID. The two-stage test checks that ID and the new prompt
    tokens.
 4. **Final output and cleanup.** When stage 1 finishes, the orchestrator
-   enqueues a finished `OutputMessage`. [`_cleanup_request_ids`][cleanup]
+   enqueues a finished `OutputMessage`. `_cleanup_request_ids`
    releases stage bindings and request transfer resources and removes
-   orchestration state. The frontend [output handler][frontend-dispatch]
+   orchestration state. The frontend output handler `_final_output_handler`
    routes the message to the request queue, and
-   [`_process_orchestrator_results`][frontend-results] restores the external
+   [`_process_orchestrator_results`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/entrypoints/async_omni_base.py) restores the external
    ID and yields the output. The generator's `finally` block cleans up
-   frontend state. See the [terminal output and cleanup assertions][test-two-stage]
-   and the [frontend ID test][test-frontend-id].
+   frontend state. See the two-stage test
+   and the [`test_omni_generate_request_id`](https://github.com/vllm-project/vllm-omni/blob/main/tests/entrypoints/test_async_omni.py).
 
 ### Caller cancellation
 
-On task cancellation or generator close, [`AsyncOmni.generate`][generate]
-acts first. It shields the [bounded abort attempt][frontend-abort] from outer
+On task cancellation or generator close, [`AsyncOmni.generate`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/entrypoints/async_omni.py)
+acts first. It shields the bounded `_abort_internal_requests` call from outer
 ASGI cancellation, settles any pending submit for the internal ID, and sends
-an [abort RPC][engine-abort]. [`Orchestrator._handle_abort`][handle-abort]
+an [abort RPC through `abort_async`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/omni_engine_base.py). [`Orchestrator._handle_abort`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/orchestrator.py)
 asks the stage pools to abort work on the request's bound replicas before it
 releases the bindings and removes orchestration state. It acknowledges a
 successful abort after that cleanup. If cancellation arrives while only
 stage 0 has been submitted, only that replica receives an abort. The
 generator re-raises cancellation or generator close and cleans up its
 frontend state even if the abort attempt times out. See the
-[ASGI cancellation test][test-cancel] and the [orchestration abort test][test-abort].
+[`test_generate_waits_for_abort_inside_cancelled_asgi_scope`](https://github.com/vllm-project/vllm-omni/blob/main/tests/entrypoints/test_async_omni.py) and the [`test_run_abort`](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator.py).
 
 ### Downstream request failure
 
 If stage 1's EngineCore reports `FinishReason.ERROR` for this request, the
-stage reports it first. [`Orchestrator._process_llm_stage_outputs`][llm-output]
+stage reports it first. [`Orchestrator._process_llm_stage_outputs`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/engine/orchestrator.py)
 recognizes the error before normal terminal routing.
-[`_handle_stage_error`][stage-error] queues a request-scoped `ErrorMessage`
+`_handle_stage_error` queues a request-scoped `ErrorMessage`
 with the failed stage ID, then initiates abort and cleanup. The frontend
 dispatches the error to the request queue and raises it in the generator,
 whose exception path attempts cleanup abort before removing frontend state.
-The [raw stage error test][test-stage-error] checks the error message, cleanup
+The [`test_raw_stage_error_reaches_caller_before_normal_terminal_routing`](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator.py) checks the error message, cleanup
 call, and bypass of normal terminal routing. A replica process exit follows
 the [replica loss path](stage_runtime.md#replica-loss). If stage 1 loses
-all replicas before the handoff, [`_forward_to_next_stage_unguarded`][forward]
+all replicas before the handoff, `_forward_to_next_stage_unguarded`
 checks the pool and fails the request before submitting. The
-[unavailable downstream stage test][test-dead-downstream] covers this case.
+[`test_forward_to_dead_downstream_stage_fails_request_not_server`](https://github.com/vllm-project/vllm-omni/blob/main/tests/engine/test_orchestrator_error_handling.py) covers this case.
 
 ## Stage-0 multimodal preprocessing caches
 
@@ -243,33 +243,3 @@ keeps its existing semantics.
   in the cited validation paths.
 - Obtain approval from a technical owner and an independent validation
   reviewer.
-
-[cleanup]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L2133
-[design-handoff]: https://github.com/vllm-project/vllm-omni/issues/10923
-[dynamic-routing]: https://github.com/vllm-project/vllm-omni/issues/6302
-[engine-abort]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/omni_engine_base.py#L858
-[engine-add]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/async_omni_engine.py#L869
-[event-driven-default]: https://github.com/vllm-project/vllm-omni/pull/8675
-[forward]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L3128
-[frontend-abort]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/entrypoints/async_omni_base.py#L547
-[frontend-dispatch]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/entrypoints/async_omni_base.py#L408
-[frontend-results]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/entrypoints/async_omni_base.py#L328
-[generate]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/entrypoints/async_omni.py#L150
-[handle-abort]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L889
-[llm-output]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L1104
-[orchestrator-add]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L4178
-[pool-output]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L1849
-[pool-submit]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_pool.py#L1546
-[process-inputs]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/stage_engine_core_client.py#L482
-[route-output]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L2440
-[stage-error]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L1767
-[static-transitions]: https://github.com/vllm-project/vllm-omni/issues/8740
-[submit-stage]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/vllm_omni/engine/orchestrator.py#L3555
-[test-abort]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator.py#L1932
-[test-cancel]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/entrypoints/test_async_omni.py#L756
-[test-dead-downstream]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator_error_handling.py#L321
-[test-frontend-id]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/entrypoints/test_async_omni.py#L1110
-[test-frontend-submit]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/entrypoints/test_async_omni.py#L105
-[test-round-robin]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator.py#L2086
-[test-stage-error]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator.py#L4360
-[test-two-stage]: https://github.com/vllm-project/vllm-omni/blob/5b764aea027be18e7b1723c84e1a2b7aa1bb8029/tests/engine/test_orchestrator.py#L691
