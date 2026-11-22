@@ -22,6 +22,7 @@ from .latent_cache import trim_decoded_overlap
 from .lightvae import resolve_h3_lightvae_decoder_path
 from .pipeline_minimax_h3 import (
     MiniMaxH3Pipeline,
+    _force_stage_cache_release,
     _MiniMaxH3EncodedOutput,
     _prepare_minimax_h3_video_output,
     get_minimax_h3_post_process_func,
@@ -94,6 +95,7 @@ class MiniMaxH3DecoderPipeline(
             trust_remote_code=od_config.trust_remote_code,
         )
         self.vae = self.video_vae
+        _force_stage_cache_release()
         self.weights_sources = []
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler

@@ -63,6 +63,7 @@ from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
+    offload_enabled,
     offload_streams_blocks,
     resolve_offload,
     resolve_offload_strategy,
@@ -500,6 +501,31 @@ def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any
     for component in components:
         if component is not None:
             component.set_omni_component_cache(cache)
+
+
+MINIMAX_H3_STAGE_CACHE_RELEASE_ENV = "VLLM_OMNI_H3_STAGE_CACHE_RELEASE"
+
+
+def _force_stage_cache_release() -> bool:
+    mode = os.environ.get(MINIMAX_H3_STAGE_CACHE_RELEASE_ENV, "").strip()
+    if mode not in ("", "bounded", "force"):
+        raise ValueError(f"{MINIMAX_H3_STAGE_CACHE_RELEASE_ENV} must be 'bounded' or 'force', got {mode!r}")
+    return mode == "force"
+
+
+def _resident_stage_allocator_cache(
+    od_config: OmniDiffusionConfig, device: torch.device
+) -> BoundedAllocatorCache | None:
+    if (
+        _force_stage_cache_release()
+        or offload_enabled(od_config)
+        or od_config.parallel_config.use_hsdp
+        or device.type != "cuda"
+        or not current_omni_platform.is_cuda()
+        or current_omni_platform.is_integrated_gpu(device.index)
+    ):
+        return None
+    return BoundedAllocatorCache(device, min_free_fraction=0.25)
 
 
 def _device_prefix(continuation: LatentContinuation, device: torch.device) -> LatentPrefix:
@@ -1378,6 +1404,7 @@ class MiniMaxH3Pipeline(
                 )
             elif offloads_text_encoder:
                 _register_dlo_component_cache(self._dlo_component_cache, self.text_encoder)
+        self._stage_allocator_cache = _resident_stage_allocator_cache(od_config, self.device)
 
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
@@ -1907,8 +1934,7 @@ class MiniMaxH3Pipeline(
                 )
                 rows.append(video_rows)
                 shapes.extend(video_shapes)
-        # The latents are extracted; the encode's input/staging pages are idle
-        # and must not stay mapped through the denoise and decode peaks.
+        # The latents are extracted; the encode's input/staging pages are idle.
         if needs_video_vae:
             self._release_stage_cache()
         return (torch.cat(rows) if rows else None), shapes
@@ -2646,6 +2672,10 @@ class MiniMaxH3Pipeline(
             except BaseException:
                 logger.exception("Failed to release retained allocator cache at stage boundary")
             return
+        stage_cache = getattr(self, "_stage_allocator_cache", None)
+        if stage_cache is not None:
+            stage_cache.release_if_needed(force=torch.cuda.get_per_process_memory_fraction(stage_cache.device) < 1.0)
+            return
         current_omni_platform.empty_cache()
 
     def decode(
@@ -2656,9 +2686,8 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Denoise just ended: its freed activation pages must not stay mapped
-        # through the VAE decode peak. Decoding needs only the ViT decoder
-        # half of the VAE, so the CNN encoder stays off the device.
+        # Denoise just ended. Decoding needs only the ViT decoder half of the
+        # VAE, so the CNN encoder stays off the device.
         self._release_stage_cache()
         with self._component_on_device(self.video_vae.decoder_component):
             with current_omni_platform.create_autocast_context(
@@ -4310,8 +4339,7 @@ class MiniMaxH3Pipeline(
                 video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
                 videos.append(video)
                 # The FP32 decoded frames are quantized into the appended uint8
-                # tensor; drop the reference and return the idle pages instead of
-                # holding them through the next output's denoise/decode.
+                # tensor; drop the reference.
                 del video
                 self._release_stage_cache()
                 audios.append(audio)

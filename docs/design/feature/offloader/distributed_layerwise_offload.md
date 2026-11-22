@@ -210,6 +210,12 @@ topologies and platforms receive the same bounded policy but are not claimed
 performance targets; other DLO models remain unchanged unless they explicitly
 adopt it.
 
+A fully resident MiniMax-H3 pipeline (no offload, no HSDP) on a discrete CUDA
+device keeps idle blocks at its stage boundaries while they are at most 25% of
+device capacity and at least 25% of the device is free, trading a higher
+reserved peak for fewer remaps. Other setups, and processes with a per-process
+memory fraction below 1, keep the forced `empty_cache`.
+
 ### Final-layout Host Weight Runtime consumer
 
 > **Status:** PR2 landed in
