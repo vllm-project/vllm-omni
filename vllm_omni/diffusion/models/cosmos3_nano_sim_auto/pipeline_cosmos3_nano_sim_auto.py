@@ -23,7 +23,7 @@ import hashlib
 import json
 import math
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
@@ -62,6 +62,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestAdmission,
     ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
@@ -176,6 +177,7 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
     _MAIN_BRANCH = "main"
     _TEXT_CACHE = "text"
     _SESSION_CAPACITY = 1
+    _ar_diffusion_request_admission: ARDiffusionRequestAdmission | None = None
     _ar_diffusion_kv_state = None
     _bound_session_id: str | None = None
 
@@ -346,6 +348,17 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         return max(specs, key=lambda spec: spec.tokens_per_frame)
 
     @contextmanager
+    def bind_ar_diffusion_request_admission(self, admission: ARDiffusionRequestAdmission) -> Iterator[None]:
+        """Expose the runner's admission callback for this forward."""
+        if self._ar_diffusion_request_admission is not None:
+            raise RuntimeError("Cosmos3-Nano-Sim-Auto AR-Diffusion admission is already bound.")
+        self._ar_diffusion_request_admission = admission
+        try:
+            yield
+        finally:
+            self._ar_diffusion_request_admission = None
+
+    @contextmanager
     def bind_ar_diffusion_state(self, session_id, state):
         if self._ar_diffusion_kv_state is not None:
             raise RuntimeError("Cosmos3-Nano-Sim-Auto AR-Diffusion state is already bound.")
@@ -506,8 +519,9 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         except ARDiffusionRequestRejectedError:
             raise
         except Exception:
-            extra = req.sampling_params.extra_args or {}
-            self._drop_session(str(extra.get("session_id") or self._bound_session_id or "default"))
+            if self._ar_diffusion_request_admission is None or self._ar_diffusion_kv_state is not None:
+                extra = req.sampling_params.extra_args or {}
+                self._drop_session(str(extra.get("session_id") or self._bound_session_id or "default"))
             raise
 
     def _forward_impl(self, req: DiffusionRequestBatch) -> DiffusionOutput:
@@ -573,10 +587,16 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError("Cosmos3-Nano-Sim-Auto supports exactly one measured LiDAR condition sweep.")
         except (TypeError, ValueError) as exc:
             raise _reject(str(exc)) from exc
+        admission = self._ar_diffusion_request_admission
         bound = self._ar_diffusion_kv_state
-        if bound is not None:
+        if admission is None:
+            bound_session_id = self._bound_session_id
+            pool_unit = bound.kv_cache.spec.chunk_size if bound is not None else None
+        else:
+            bound_session_id = admission.session_id
+            pool_unit = admission.tokens_per_frame
+        if pool_unit is not None:
             request_unit = self._frame_unit(num_views=len(views), joint=joint, height=height, width=width, fps=fps)
-            pool_unit = bound.kv_cache.spec.chunk_size
             if request_unit > pool_unit:
                 raise _reject(
                     f"this request needs a KV frame unit of {request_unit} tokens but the pool's is {pool_unit}; "
@@ -586,8 +606,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
 
         session_id = str(extra.get("session_id") or "default")
         reset, close_session = _lifecycle_flags(extra)
-        if self._bound_session_id is not None and session_id != self._bound_session_id:
-            raise _reject(f"request session {session_id!r} does not match bound session {self._bound_session_id!r}.")
+        if bound_session_id is not None and session_id != bound_session_id:
+            raise _reject(f"request session {session_id!r} does not match bound session {bound_session_id!r}.")
         existing = self._states.get(session_id)
         if existing is not None and existing.fingerprint is not None and not reset:
             raise _reject("continuing a live session needs tick requests, which are not supported yet; set reset=true.")
@@ -646,6 +666,9 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         ).hexdigest()
 
         # ---- Side effects begin ---------------------------------------------------
+        if admission is not None:
+            admission.admit()
+            bound = self._ar_diffusion_kv_state
         state = self._begin_rollout(session_id, reset=reset, bound=bound)
         self._prepare_session(
             state,

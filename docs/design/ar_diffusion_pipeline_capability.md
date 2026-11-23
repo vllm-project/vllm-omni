@@ -88,6 +88,13 @@ trusted. Pipelines must therefore complete every fail-closed check (session
 fingerprint, chunk-index ordering, prompt-length, resolution, action coverage)
 before their first side effect.
 
+Paged request-mode pipelines that raise this error during forward implement
+`SupportsARDiffusionRequestAdmission`. The runner exposes the session ID and
+pool frame size for validation. Once all admission checks pass, the pipeline
+calls `admit()` before changing model state. The runner then applies any
+requested reset, obtains and binds KV, and updates LRU order. Validation that
+rejects before `admit()` leaves all resident sessions and their LRU order intact.
+
 ## DreamZero adapter
 
 DreamZero implements the capability directly on `DreamZeroPipeline`. Its adapter

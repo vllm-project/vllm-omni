@@ -6,7 +6,7 @@ import dataclasses
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -25,9 +25,11 @@ from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, StepRequestState
 from vllm_omni.experimental.ar_diffusion.capability import (
     AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestAdmission,
     ARDiffusionRequestRejectedError,
     SupportsARDiffusionNoisyKV,
     SupportsARDiffusionPipeline,
+    SupportsARDiffusionRequestAdmission,
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
@@ -642,20 +644,37 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return super().execute_model(
                 req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
             )
-        if self._ar_diffusion_capability is None:
+        capability = self._ar_diffusion_capability
+        if capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
         session_id, extra_args, tick = self._request_session(req)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-        if reset:
-            self.reset_session(session_id)
         started = time.perf_counter()
-        with self._bound_ar_session(session_id, description="forward"):
+        admitted = False
+        with ExitStack() as stack:
+
+            def admit() -> None:
+                nonlocal admitted
+                if admitted:
+                    raise RuntimeError(f"AR-Diffusion request for session {session_id!r} was already admitted")
+                if reset:
+                    self.reset_session(session_id)
+                stack.enter_context(self._bound_ar_session(session_id, description="forward"))
+                admitted = True
+
+            if isinstance(capability, SupportsARDiffusionRequestAdmission):
+                admission = ARDiffusionRequestAdmission(session_id, self.kv_cache.spec.chunk_size, admit)
+                stack.enter_context(capability.bind_ar_diffusion_request_admission(admission))
+            else:
+                admit()
             output = super().execute_model(
                 req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
             )
         self._perf_e2e_times.append(time.perf_counter() - started)
+        if not admitted:
+            return output
         if getattr(output, "error", None):
             # The base runner serializes OmniClientError into DiffusionOutput,
             # including admission rejections that must retain the session.

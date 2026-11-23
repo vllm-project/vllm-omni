@@ -4,6 +4,7 @@
 
 import functools
 from collections import OrderedDict
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -81,6 +82,7 @@ def _frame_unit_host(*, lidar_fps: float = 10.0) -> _PipelineHost:
         _TEXT_CACHE="text",
         _SESSION_CAPACITY=1,
         _encode_camera_major=encode,
+        _ar_diffusion_request_admission=None,
         _ar_diffusion_kv_state=None,
         _bound_session_id=None,
     )
@@ -187,8 +189,9 @@ class _AdmittedError(Exception):
 @pytest.mark.parametrize(
     ("resolution", "width", "height", "admitted"), [("480", 832, 480, True), ("704", 1280, 704, False)]
 )
+@pytest.mark.parametrize("deferred", [False, True], ids=["bound", "deferred"])
 def test_a_request_larger_than_the_pool_is_rejected_at_admission(
-    monkeypatch, resolution: str, width: int, height: int, admitted: bool
+    monkeypatch, resolution: str, width: int, height: int, admitted: bool, deferred: bool
 ) -> None:
     host = _frame_unit_host()
     pool_unit = host.ar_diffusion_kv_cache_spec().tokens_per_frame
@@ -206,7 +209,6 @@ def test_a_request_larger_than_the_pool_is_rejected_at_admission(
     monkeypatch.setattr(pipeline, "format_rig_view_captions", captions)
     host.manifest.validate_request_cameras = lambda cameras: None
     host.manifest.t_list = (1.0, 0.5)
-    host._ar_diffusion_kv_state = _bound_pool(pool_unit)
     host._states = OrderedDict()
     host._request_fps = lambda sp: 30.0
     host._get_sp_param = lambda sp, name, default: default
@@ -214,17 +216,27 @@ def test_a_request_larger_than_the_pool_is_rejected_at_admission(
     sp = SimpleNamespace(extra_args={"wsm": "control", "session_id": "s"}, num_frames=9, num_inference_steps=None)
     request = SimpleNamespace(prompts=["Driving."], sampling_params=sp)
 
-    if admitted:
-        with pytest.raises(_AdmittedError):
+    def admit():
+        pytest.fail("The pipeline must finish validating before binding KV")
+
+    if deferred:
+        admission = pipeline.ARDiffusionRequestAdmission("s", pool_unit, admit)
+        context = host.bind_ar_diffusion_request_admission(admission)
+    else:
+        host._ar_diffusion_kv_state = _bound_pool(pool_unit)
+        context = nullcontext()
+    with context:
+        if admitted:
+            with pytest.raises(_AdmittedError):
+                host._forward_impl(request)
+            return
+        request_unit = host._frame_unit(num_views=7, joint=False, height=height, width=width, fps=30.0)
+        message = (
+            f"needs a KV frame unit of {request_unit} tokens but the pool's is {pool_unit}; "
+            "the pool is sized at load for the artifact's default resolution '480'"
+        )
+        with pytest.raises(pipeline.ARDiffusionRequestRejectedError, match=message):
             host._forward_impl(request)
-        return
-    request_unit = host._frame_unit(num_views=7, joint=False, height=height, width=width, fps=30.0)
-    message = (
-        f"needs a KV frame unit of {request_unit} tokens but the pool's is {pool_unit}; "
-        "the pool is sized at load for the artifact's default resolution '480'"
-    )
-    with pytest.raises(pipeline.ARDiffusionRequestRejectedError, match=message):
-        host._forward_impl(request)
     assert not host._states
 
 

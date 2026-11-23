@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -251,6 +251,30 @@ class SupportsARDiffusionPipeline(Protocol):
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         """Drop model-owned state after close, eviction, or failed forward."""
+        ...
+
+
+@dataclass(frozen=True)
+class ARDiffusionRequestAdmission:
+    """Read-only runner metadata and the one-time entry point to execution.
+
+    After all checks that can raise ARDiffusionRequestRejectedError, call
+    ``admit`` to apply lifecycle changes and bind KV before mutating model state.
+    """
+
+    session_id: str
+    tokens_per_frame: int
+    admit: Callable[[], None]
+
+
+@runtime_checkable
+class SupportsARDiffusionRequestAdmission(Protocol):
+    """Optional request-mode capability for admission before KV binding."""
+
+    def bind_ar_diffusion_request_admission(
+        self, admission: ARDiffusionRequestAdmission
+    ) -> AbstractContextManager[None]:
+        """Expose request admission for one forward without binding KV yet."""
         ...
 
 
