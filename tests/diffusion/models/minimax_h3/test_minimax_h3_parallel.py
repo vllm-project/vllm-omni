@@ -126,23 +126,23 @@ def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
     torch.testing.assert_close(actual[..., 96:], x[..., 96:], atol=0, rtol=0)
 
 
-def _qkv_inputs():
+def _qkv_inputs(*, head_dim=128, rot_dim=96, eps=1e-6):
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention
 
     attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
     nn.Module.__init__(attention)
     attention.num_heads = attention.num_kv_heads = 2
-    attention.head_dim = 128
-    attention.rot_dim = 96
+    attention.head_dim = head_dim
+    attention.rot_dim = rot_dim
     attention.vdn = None
     attention.qkv_proj = lambda x: (x, None)
     generator = torch.Generator().manual_seed(37)
     for name in ("q_norm", "k_norm"):
-        norm = nn.RMSNorm(128, eps=1e-6, dtype=torch.bfloat16)
+        norm = nn.RMSNorm(head_dim, eps=eps, dtype=torch.bfloat16)
         norm.variance_epsilon = norm.eps
         setattr(attention, name, norm)
-    packed = torch.randn(7, 3 * 2 * 128, generator=generator, dtype=torch.bfloat16)
-    angles = torch.randn(7, 48, generator=generator)
+    packed = torch.randn(7, 3 * attention.num_heads * head_dim, generator=generator, dtype=torch.bfloat16)
+    angles = torch.randn(7, rot_dim // 2, generator=generator)
     table = torch.cat((angles.cos(), angles.sin()), dim=-1).to(packed.dtype)
     return attention, packed, table
 
@@ -203,6 +203,19 @@ def test_project_qkv_eagle_numel_limit(monkeypatch, rows, use_eagle):
 
     assert eagle.called == use_eagle
     assert fallback.called != use_eagle
+
+
+@pytest.mark.parametrize(("head_dim", "rot_dim", "eps"), [(128, 48, 1e-6), (96, 96, 1e-6), (128, 96, 0.0)])
+def test_project_qkv_falls_back_for_unsupported_eagle_config(monkeypatch, head_dim, rot_dim, eps):
+    attention, packed, table = _qkv_inputs(head_dim=head_dim, rot_dim=rot_dim, eps=eps)
+    expected = attention._project_qkv(packed, table)
+    _mock_npu_qkv(monkeypatch, attention, "A2")
+    eagle = Mock(side_effect=AssertionError("Eagle does not support this configuration"))
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=eagle))
+
+    actual = attention._project_qkv(packed, table)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

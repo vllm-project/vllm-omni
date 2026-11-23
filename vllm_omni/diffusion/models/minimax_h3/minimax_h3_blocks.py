@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+_FP32_INFO = torch.finfo(_FP32_DTYPE)
 
 
 # AdaLN modality count: token tags carry -1 for padding and 0/1/2 for
@@ -504,6 +505,9 @@ class MiniMaxH3Attention(nn.Module):
         if (
             qkv.device.type == "npu"
             and rope_table is not None
+            and self.head_dim == 128
+            and self.rot_dim in (32, 64, 96, 128)
+            and _FP32_INFO.tiny <= self.q_norm.variance_epsilon <= _FP32_INFO.max
             and 0 < qkv.numel() <= torch.iinfo(torch.int32).max
             and _is_ascend_device_type("A2", "A5")
         ):
