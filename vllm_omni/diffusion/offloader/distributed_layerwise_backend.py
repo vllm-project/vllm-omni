@@ -1654,10 +1654,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.dp_size = coord.world_size
 
         if self.device.type == "npu":
-            from vllm_omni.diffusion import envs
-
             # AllGather shards must use the same physical layout on every rank.
-            mode = envs.VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE.strip().lower()
+            mode = npu_int8_weight_nz.configured_weight_nz_mode()
             modes: list[str | None] = [None] * self.dp_size
             torch.distributed.all_gather_object(modes, mode, group=coord.cpu_group)
             if len(set(modes)) != 1:

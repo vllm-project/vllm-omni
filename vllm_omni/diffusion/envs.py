@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     LOCAL_RANK: int = 0
     VLLM_OMNI_PACKED_QKV: bool = False
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
-    VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE: str = "off"
     VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -40,8 +39,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" = always fuse; unset = each consumer's own measured default. Raw
     # string or None; validated by fused_qk_norm_rope_min_tokens().
     "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS": lambda: os.environ.get("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", None),
-    # Select FRACTAL_NZ storage for eligible NPU INT8 linear weights.
-    "VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE": lambda: os.environ.get("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "off"),
     # On ROCm, run the shared diffusion RMSNorm and SiluAndMul in PyTorch instead
     # of vLLM's precompiled kernels. Opt-in for runtimes whose vLLM build lacks
     # kernels for the GPU arch (hipErrorInvalidImage); off by default.

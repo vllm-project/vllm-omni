@@ -7,6 +7,7 @@ weights are cast after device placement; offload owners use the packing and
 view helpers to preserve NZ across their own storage transitions.
 """
 
+import os
 from collections.abc import Sequence, Set
 
 import torch
@@ -20,13 +21,15 @@ _COL_BLOCK = 32
 _verified_view_devices: set[torch.device] = set()
 
 
+def configured_weight_nz_mode() -> str:
+    return os.getenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "off").strip().lower()
+
+
 def get_weight_nz_mode() -> str | None:
     """Return the explicit layout mode on NPU, or None when disabled."""
-    from vllm_omni.diffusion import envs
-
     if not current_omni_platform.is_npu():
         return None
-    mode = envs.VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE.strip().lower()
+    mode = configured_weight_nz_mode()
     if mode == "off":
         return None
     if mode not in ("cast", "reactor"):
