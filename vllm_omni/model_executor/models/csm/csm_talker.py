@@ -248,14 +248,15 @@ class CsmTalkerForConditionalGeneration(nn.Module):
             is_prefill = input_ids.shape[0] != 1
         if is_prefill:
             waveform = info.get(REFERENCE_AUDIO_KEY)
-            if waveform is not None:
+            # The speech adapter attaches the recording as a tensor; a request body cannot carry one.
+            if isinstance(waveform, torch.Tensor):
                 input_embeds = self._embed_reference_audio(input_ids, input_embeds, waveform, info)
             return input_ids, input_embeds, {}
         # CSM adds nothing to the frame embedding on decode steps.
         return input_ids, input_embeds, {"mtp_inputs": (self._zero_text_step, self._zero_text_step)}
 
     def _embed_reference_audio(
-        self, input_ids: torch.Tensor, input_embeds: torch.Tensor, waveform: Any, info: Mapping[str, Any]
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor, waveform: torch.Tensor, info: Mapping[str, Any]
     ) -> torch.Tensor:
         """Put the reference recording's frame embeddings on this prompt span's audio placeholders.
 
@@ -266,7 +267,7 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         req_id = info.get("req_id")
         frames, start = self._references.get(req_id, (None, None))
         if frames is None:
-            samples = torch.as_tensor(waveform, dtype=torch.float32).to(input_embeds.device).reshape(1, 1, -1)
+            samples = waveform.to(device=input_embeds.device, dtype=torch.float32).reshape(1, 1, -1)
             codes = self.codec_model.encode(samples).audio_codes[0].T
             audio_eos = codes.new_full((1, self.num_codebooks), self.codebook_eos_token_id)
             frames = self.embed_audio_frames(torch.cat((codes, audio_eos)))

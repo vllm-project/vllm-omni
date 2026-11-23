@@ -31,8 +31,6 @@ from vllm_omni.model_executor.stage_input_processors.csm import DEFAULT_CHUNK_FR
 
 logger = init_logger(__name__)
 
-_DUMMY_PROFILE_KEY = "csm_dummy_profile"
-
 
 def _split_by_request(ids: torch.Tensor, seq_token_counts: Sequence[int] | None) -> list[torch.Tensor]:
     if seq_token_counts is None or len(seq_token_counts) <= 1:
@@ -100,10 +98,6 @@ class CsmCode2Wav(nn.Module):
         """Return None; this stage does not sample."""
         return None
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
-        """Mark profiling rows, whose token ids are not audio codes."""
-        return [{"meta": {_DUMMY_PROFILE_KEY: True}} for _ in range(num_reqs)]
-
     def _validate_codes(self, flat: torch.Tensor) -> None:
         """Reject codes Mimi has no embedding for; CSM's codebook vocabulary is larger than Mimi's."""
         if flat.numel() % self.num_codebooks != 0:
@@ -149,11 +143,7 @@ class CsmCode2Wav(nn.Module):
         failed = [False] * len(segments)
         for index, segment in enumerate(segments):
             info = infos[index] if index < len(infos) else None
-            meta = info.get("meta") if isinstance(info, Mapping) else None
-            meta = meta if isinstance(meta, Mapping) else {}
             request_id = request_ids[index] if index < len(request_ids) else None
-            if meta.get(_DUMMY_PROFILE_KEY):
-                continue
             if request_id in self._failed:
                 failed[index] = True
                 continue

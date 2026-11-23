@@ -17,6 +17,7 @@ import vllm.distributed.parallel_state as parallel_state
 from transformers import CsmConfig, CsmForConditionalGeneration
 from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
 
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmAdapter
 from vllm_omni.model_executor.models.csm.csm_mimi import CODEC_PREFIX, codec_weight_name
@@ -25,6 +26,7 @@ from vllm_omni.model_executor.models.csm.csm_talker import (
     CsmTalkerForConditionalGeneration,
     stop_frame_mask,
 )
+from vllm_omni.worker_v2.model_states.intermediate_buffer import _resolve_additional_information
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
@@ -466,6 +468,32 @@ def test_prompt_that_does_not_match_the_recording_is_rejected(
             **{REFERENCE_AUDIO_KEY: _waveform(1920 * 6)},
         )
     assert talker._references == {}
+
+
+@pytest.mark.parametrize("value", [[0.0, 0.0, 0.0], "x", {"samples": [0.0]}], ids=["list", "string", "dict"])
+def test_reference_key_in_a_request_body_is_not_taken_as_a_recording(
+    loaded: tuple[CsmTalkerForConditionalGeneration, set[str]], value
+) -> None:
+    """A chat request's ``additional_information`` reaches preprocess; JSON cannot carry the adapter's tensor."""
+    talker, _ = loaded
+    info = _resolve_additional_information(serialize_additional_information({REFERENCE_AUDIO_KEY: value}))
+    assert not isinstance(info[REFERENCE_AUDIO_KEY], torch.Tensor)
+    input_ids = torch.tensor([100, 101, 102])
+    with torch.no_grad():
+        _, embeds, update = talker.preprocess(
+            input_ids,
+            None,
+            req_id="a",
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=input_ids.shape[0],
+            **info,
+        )
+    torch.testing.assert_close(embeds, talker.embed_input_ids(input_ids))
+    assert update == {} and talker._references == {}
+
+    sent = _resolve_additional_information(serialize_additional_information({REFERENCE_AUDIO_KEY: _waveform(8)}))
+    assert isinstance(sent[REFERENCE_AUDIO_KEY], torch.Tensor)
 
 
 def _adapter_prompt(config: CsmConfig, recording: np.ndarray, sample_rate: int) -> tuple[torch.Tensor, torch.Tensor]:

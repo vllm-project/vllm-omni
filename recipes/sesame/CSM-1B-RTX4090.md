@@ -179,7 +179,9 @@ bounded runs.
   with a reference recording. All 336 compared frames (10,752 codes) were
   identical and the waveforms differed by at most 1.09 steps of 16-bit PCM;
   the codes also equalled those of the earlier revisions, eager and with the
-  graphs. This used a diagnostic configuration, not the packaged profile: FP32
+  graphs. The prompt with the reference recording reached the 160-frame limit
+  on both sides, so its 160 frames were compared but not the end of that
+  turn. This used a diagnostic configuration, not the packaged profile: FP32
   talker on the `FLEX_ATTENTION` backend
   (`--stage-overrides '{"0":{"attention_backend":"FLEX_ATTENTION"}}'`),
   sampling turned off in the request and in the deploy YAML, and cuDNN TF32

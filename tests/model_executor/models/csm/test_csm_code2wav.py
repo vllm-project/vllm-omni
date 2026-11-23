@@ -313,23 +313,21 @@ def test_codes_outside_the_codec_vocabulary_are_rejected(model: CsmCode2Wav, val
         model._validate_codes(torch.zeros(5, dtype=torch.long))
 
 
-def test_bad_rows_and_profiling_rows_are_skipped(model: CsmCode2Wav, reference: MimiModel) -> None:
+def test_a_malformed_row_is_skipped(model: CsmCode2Wav, reference: MimiModel) -> None:
     codes = _codes(frames=2, seed=13)
     malformed = torch.zeros(5, dtype=torch.long)
-    profile = torch.zeros(7, dtype=torch.long)
-    segments = [_flat(codes), malformed, profile]
-    infos = [{}, {}, *model.get_dummy_runtime_additional_information(1)]
+    segments = [_flat(codes), malformed]
 
     output = model(
         input_ids=torch.cat(segments),
-        runtime_additional_information=infos,
+        runtime_additional_information=[{}, {}],
         seq_token_counts=[segment.numel() for segment in segments],
     )
 
     audios = _audios(output)
-    assert len(audios) == 3 and len(output.multimodal_outputs["sr"]) == 3
+    assert len(audios) == 2 and len(output.multimodal_outputs["sr"]) == 2
     _assert_same_audio(audios[0], _reference_audio(reference, codes))
-    assert audios[1].numel() == 0 and audios[2].numel() == 0
+    assert audios[1].numel() == 0
 
 
 def test_connector_payload_takes_precedence_over_token_ids(model: CsmCode2Wav, reference: MimiModel) -> None:
