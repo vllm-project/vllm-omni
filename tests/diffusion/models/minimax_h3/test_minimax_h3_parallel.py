@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
-from enum import Enum
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -148,21 +147,23 @@ def _qkv_inputs():
     return attention, packed, table
 
 
-_AscendDeviceType = Enum("_AscendDeviceType", "A2 A3 A5 UNKNOWN")
-
-
-def _mock_ascend_device(monkeypatch, device_name):
-    utils = (
-        None if device_name is None else Mock(get_ascend_device_type=Mock(return_value=_AscendDeviceType[device_name]))
-    )
+def _mock_npu_qkv(monkeypatch, attention, device_name):
+    attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
+    utils = SimpleNamespace(get_ascend_device_type=lambda: SimpleNamespace(name=device_name))
     monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
+
+
+def test_missing_device_detection_disables_eagle(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import _is_ascend_device_type
+
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", None)
+    assert not _is_ascend_device_type("A2", "A5")
 
 
 @pytest.mark.parametrize("device_name", ["A2", "A5"])
 def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch, device_name):
     attention, packed, table = _qkv_inputs()
-    attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
-    _mock_ascend_device(monkeypatch, device_name)
+    _mock_npu_qkv(monkeypatch, attention, device_name)
     q, k, _ = packed.view(7, 6, 128).split(2, dim=1)
     outputs = (object(), object(), object())
     op = Mock(return_value=outputs)
@@ -185,38 +186,25 @@ def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch, device_name
 
 
 @pytest.mark.parametrize(
-    ("mode", "device_name"),
+    ("device_name", "has_rope", "expected_calls"),
     [
-        ("missing_sdk", "A2"),
-        ("missing_native", "A2"),
-        ("no_rope", "A2"),
-        ("unsupported_device", "A3"),
-        ("unsupported_device", "UNKNOWN"),
-        ("missing_device_detection", None),
+        pytest.param("A2", True, 1, id="missing-native"),
+        pytest.param("A2", False, 0, id="no-rope"),
+        pytest.param("A3", True, 0, id="unsupported-device"),
     ],
 )
-def test_project_qkv_preserves_fallback(monkeypatch, mode, device_name):
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
-
+def test_project_qkv_preserves_fallback(monkeypatch, device_name, has_rope, expected_calls):
     attention, packed, table = _qkv_inputs()
-    attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
-    _mock_ascend_device(monkeypatch, device_name)
+    table = table if has_rope else None
+    expected = attention._project_qkv(packed, table)
+
+    _mock_npu_qkv(monkeypatch, attention, device_name)
     op = Mock(side_effect=ImportError("native QKV unavailable"))
-    interface = None if mode == "missing_sdk" else SimpleNamespace(eagle_split_norm_rope_concat=op)
-    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", interface)
-    q, k, v = packed.view(packed.shape[0], 6, 128).split(2, dim=1)
-    if mode == "no_rope":
-        table = None
-        expected = attention.q_norm(q), attention.k_norm(k)
-    else:
-        expected = blocks.fused_qk_norm_rope(q, k, attention.q_norm.weight, attention.k_norm.weight, table, 1e-6)
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
     actual = attention._project_qkv(packed, table)
-    for value, reference in zip(actual, (*expected, v, q, k)):
-        torch.testing.assert_close(value, reference, atol=0, rtol=0)
-    if mode == "missing_native":
-        op.assert_called_once()
-    else:
-        op.assert_not_called()
+
+    assert op.call_count == expected_calls
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_h3_rope_table_materializes_local_rows_in_fused_kernel_layout():

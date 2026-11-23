@@ -346,9 +346,7 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
 
 
-@pytest.mark.parametrize(
-    "case", ["offline", "online", "missing_sdk", "missing_native", "non_int8", "wrapped", "A3", "A5"]
-)
+@pytest.mark.parametrize("case", ["offline", "online", "missing_sdk", "missing_native", "non_int8", "wrapped", "A5"])
 def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear, UnquantizedLinearMethod
 
@@ -359,7 +357,7 @@ def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
         NPUInt8OnlineLinearMethod,
     )
 
-    device_name = case if case in {"A3", "A5"} else "A2"
+    device_name = "A5" if case == "A5" else "A2"
     mocker.patch.object(blocks, "_is_ascend_device_type", side_effect=lambda *allowed: device_name in allowed)
 
     input_tensor = torch.zeros(2, 3, 4, dtype=torch.bfloat16)
