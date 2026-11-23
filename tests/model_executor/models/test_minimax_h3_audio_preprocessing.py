@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Event, get_ident
 
 import numpy as np
@@ -168,17 +168,7 @@ def test_native_rate_references_do_not_start_worker(monkeypatch: pytest.MonkeyPa
         pytest.fail("native-rate references need no preparation worker")
 
     monkeypatch.setattr(processing, "ThreadPoolExecutor", unexpected_pool)
-    media = _media()
-    media = MiniMaxH3EncoderMediaInput(
-        task=media.task,
-        height=media.height,
-        width=media.width,
-        num_frames=media.num_frames,
-        latent_t=media.latent_t,
-        audio_t=media.audio_t,
-        videos=media.videos,
-        video_audios=((_waveform(32000), 32000),),
-    )
+    media = replace(_media(), video_audios=((_waveform(32000), 32000),), audios=())
     audio = _AudioVAE(Event(), Event(), get_ident())
     assert processing.encode_media(media, video_vae=_VideoVAE(), audio_vae=audio, emit_conditioning=True) is not None
     assert audio.received[0][1] == 32000
@@ -189,16 +179,7 @@ def test_audio_only_keeps_synchronous_adapter_contract(monkeypatch: pytest.Monke
         pytest.fail("audio-only input has no visual overlap window")
 
     monkeypatch.setattr(processing, "ThreadPoolExecutor", unexpected_pool)
-    source = _media()
-    media = MiniMaxH3EncoderMediaInput(
-        task=source.task,
-        height=source.height,
-        width=source.width,
-        num_frames=source.num_frames,
-        latent_t=source.latent_t,
-        audio_t=source.audio_t,
-        audios=source.audios,
-    )
+    media = replace(_media(), videos=(), video_audios=())
     audio = _AudioVAE(Event(), Event(), get_ident())
     assert processing.encode_media(media, video_vae=None, audio_vae=audio, emit_conditioning=True) is not None
     assert audio.received[0][1] == 16000
