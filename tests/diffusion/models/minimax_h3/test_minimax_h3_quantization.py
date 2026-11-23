@@ -346,7 +346,9 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
 
 
-@pytest.mark.parametrize("case", ["offline", "online", "missing_sdk", "missing_native", "non_int8", "wrapped", "A3", "A5"])
+@pytest.mark.parametrize(
+    "case", ["offline", "online", "missing_sdk", "missing_native", "non_int8", "wrapped", "A3", "A5"]
+)
 def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear, UnquantizedLinearMethod
 

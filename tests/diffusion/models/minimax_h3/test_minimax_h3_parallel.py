@@ -152,7 +152,9 @@ _AscendDeviceType = Enum("_AscendDeviceType", "A2 A3 A5 UNKNOWN")
 
 
 def _mock_ascend_device(monkeypatch, device_name):
-    utils = None if device_name is None else Mock(get_ascend_device_type=Mock(return_value=_AscendDeviceType[device_name]))
+    utils = (
+        None if device_name is None else Mock(get_ascend_device_type=Mock(return_value=_AscendDeviceType[device_name]))
+    )
     monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
 
 
