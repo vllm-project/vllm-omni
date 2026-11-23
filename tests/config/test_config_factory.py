@@ -3364,22 +3364,6 @@ class TestPlatformOverrides:
         raw_rocm["codec_left_context_frames"] = 99
         assert raw_xpu["codec_left_context_frames"] == 25
 
-    @pytest.mark.parametrize(
-        "filename",
-        [
-            "higgs_multimodal_qwen3_high_throughput.yaml",
-            "higgs_multimodal_qwen3_low_latency.yaml",
-        ],
-    )
-    def test_higgs_audio_v3_legacy_profiles_fail_at_config_load(self, filename):
-        """Historical V1 profiles fail before worker initialization on vLLM 0.34."""
-        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
-        assert deploy.model_runner == "v1"
-
-        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
-        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-            merge_pipeline_deploy(pipeline, deploy)
-
         # The v2 default path keeps the graph-coupled chunk shape.
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
         extra = cuda.connectors["connector_of_shared_memory"]["extra"]
@@ -3407,6 +3391,22 @@ class TestPlatformOverrides:
         assert xpu.stages[0].gpu_memory_utilization == 0.4
         assert xpu.stages[1].gpu_memory_utilization == 0.15
         assert xpu.stages[1].enforce_eager is True
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+            "higgs_multimodal_qwen3_low_latency.yaml",
+        ],
+    )
+    def test_higgs_audio_v3_legacy_profiles_fail_at_config_load(self, filename):
+        """Historical V1 profiles fail before worker initialization on vLLM 0.34."""
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        assert deploy.model_runner == "v1"
+
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+            merge_pipeline_deploy(pipeline, deploy)
 
     def test_platform_connector_overrides_merge_with_base_config(self):
         from vllm_omni.config.stage_config import _merge_platforms
