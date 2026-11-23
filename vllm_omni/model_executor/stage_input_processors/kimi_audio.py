@@ -76,17 +76,9 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
     if unsupported:
         raise OmniClientError(f"Kimi-Audio sampling does not yet support: {', '.join(unsupported)}")
 
-    overrides = (params.extra_args or {}).get("kimi_audio", {})
-    if not isinstance(overrides, dict):
-        raise OmniClientError("SamplingParams.extra_args.kimi_audio must be a parameter dictionary")
-    values = dict(
-        text_temperature=params.temperature,
-        text_top_k=params.top_k,
-        text_repetition_penalty=params.repetition_penalty,
-    )
-    values.update(overrides)
     try:
-        KimiAudioSamplingParams(**values)
+        # The AR stage resolves the same per-request settings when it samples.
+        KimiAudioSamplingParams.from_sampling_params(params)
     except (TypeError, ValueError) as exc:
         raise OmniClientError(str(exc)) from None
 

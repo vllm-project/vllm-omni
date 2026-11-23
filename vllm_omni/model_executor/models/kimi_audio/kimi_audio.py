@@ -17,7 +17,6 @@ from .processor import KimiAudioDummyInputsBuilder, KimiAudioMultiModalProcessor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.sample.metadata import SamplingMetadata
 
     from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -56,21 +55,18 @@ class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
                 hf_config=self.config,
                 architectures=["KimiAudioARStage"],
             )
-            # Preserve the existing AR runner contract without copying its
+            # Expose the AR stage's runner contract without copying its
             # sampling context or implementing another sampler in this entry.
             for name in (
-                "prefer_model_sampler",
                 "requires_request_sample_eligibility",
-                "skips_model_sampler_output_token_history",
                 "omni_pooler_payload_include_hidden",
-                "omni_client_multimodal_output_keys",
+                "mm_outputs_fresh_per_step",
                 "requires_full_prefix_cached_hidden_states",
             ):
                 setattr(self, name, getattr(self.model, name))
             self.preprocess = self.model.preprocess
-            self.preprocess_batch = self.model.preprocess_batch
             self.make_omni_output = self.model.make_omni_output
-            self.sample = self.model.sample
+            self.mrv2_custom_sampler = self.model.mrv2_custom_sampler
         elif self.model_stage == "kimi_audio_decoder":
             self.model = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -136,11 +132,9 @@ class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
             return tuple(output.tensors.values())
         return output
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor, sampling_metadata: "SamplingMetadata | None" = None
-    ) -> torch.Tensor | None:
+    def compute_logits(self, hidden_states: torch.Tensor, *args: Any) -> torch.Tensor | None:
         if self.model_stage == "kimi_audio_ar":
-            return self.model.compute_logits(hidden_states, sampling_metadata)
+            return self.model.compute_logits(hidden_states)
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

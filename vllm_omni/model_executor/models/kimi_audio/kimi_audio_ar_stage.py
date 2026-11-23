@@ -12,6 +12,10 @@ import torch
 from vllm.distributed import get_pp_group
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 from .audio_processing import CHUNK_SAMPLES, SAMPLE_RATE, SAMPLES_PER_TOKEN, KimiAudioWhisperInputs
 from .prompt import KimiAudioEncodedAudio, KimiAudioPreparedInput, KimiAudioSpecialTokens
@@ -21,8 +25,7 @@ if TYPE_CHECKING:
     from transformers import WhisperFeatureExtractor
     from vllm.config import VllmConfig
     from vllm.model_executor.models.kimi_audio import KimiAudioWhisperEncoder
-    from vllm.v1.outputs import SamplerOutput
-    from vllm.v1.sample.metadata import SamplingMetadata
+    from vllm.v1.worker.gpu.input_batch import InputBatch
 
     from vllm_omni.model_executor.models.common.whisper_vq import WhisperVQEncoder
     from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -239,8 +242,8 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
     """Own both output branches and load all three input/model checkpoints.
 
     Decoder layers use vLLM's Qwen2 implementation and follow Kimi's shared
-    trunk and text/audio branches. PP partitions the 28 decoder depths: after
-    the shared trunk, each depth owns both its text and audio decoder layer.
+    trunk and text/audio branches. Model Runner V2 samples both streams
+    through ``mrv2_custom_sampler``.
 
     ``additional_config["kimi_audio"]["glm_tokenizer_path"]`` can point to an
     existing local GLM snapshot; otherwise loading resolves the pinned source.
@@ -249,13 +252,10 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
 
     has_preprocess = True
     have_multimodal_outputs = True
-    prefer_model_sampler = True
     requires_request_sample_eligibility = True
-    skips_model_sampler_output_token_history = True
     omni_pooler_payload_include_hidden = False
-    # Text reaches the client through native detokenization of the scheduler
-    # IDs. Non-async stage bridging consumes RequestOutput, so retain audio.
-    omni_client_multimodal_output_keys = ("codes.audio", "meta.finished")
+    # make_omni_output allocates each step's payload and sampling fills it.
+    mm_outputs_fresh_per_step = True
     # The packed branch states are only needed for current-step logits. They
     # are not downstream conditioning and have width 2H, unlike the H-wide
     # model activations stored by Omni's full-prefix hidden-state cache.
@@ -273,12 +273,9 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
 
         pp = get_pp_group()
         if pp.world_size > 1:
-            if vllm_config.scheduler_config.async_scheduling:
-                raise ValueError("Kimi-Audio PP currently requires async_scheduling=False")
-            if vllm_config.parallel_config.distributed_executor_backend != "mp":
-                raise ValueError("Kimi-Audio PP currently requires distributed_executor_backend='mp'")
-            if vllm_config.compilation_config.pass_config.enable_sp:
-                raise ValueError("Kimi-Audio dual-stream PP does not support sequence parallel residuals")
+            # The last rank's sampled text/audio history must reach every rank
+            # before its next preprocess; Model Runner V2 has no such hook.
+            raise ValueError("Kimi-Audio does not support pipeline parallelism on Model Runner V2")
         if getattr(vllm_config, "speculative_config", None) is not None:
             raise ValueError("Kimi-Audio dual-stream speculative decoding is not implemented")
         if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
@@ -367,8 +364,6 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         # histories themselves belong to the runner's per-request buffers.
         self._sampling_context = None
         self._audio_logits = None
-        self._pp_request_ids = ()
-        self._pp_feedback = None
         if config.use_whisper_feature:
             # Preserve official VQAdaptor indices, SiLU, and LayerNorm epsilon.
             self.vq_adaptor = (
@@ -458,33 +453,27 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         mimo_hidden_states, _ = self.mimo_norm(mimo_hidden_states, mimo_residual)
         return torch.cat((hidden_states, mimo_hidden_states), dim=-1)
 
-    def make_omni_output(
-        self, model_outputs: torch.Tensor | tuple[torch.Tensor, ...], **kwargs: Any
-    ) -> "OmniOutput | tuple[IntermediateTensors]":
-        """Bind request context outside the compiled/CUDA-graph forward."""
+    def make_omni_output(self, model_outputs: torch.Tensor, **kwargs: Any) -> "OmniOutput":
+        """Bind this step's request context outside the compiled forward."""
         from vllm_omni.model_executor.models.output_templates import OmniOutput
+        from vllm_omni.worker_v2.warmup import is_warmup_request
 
         infos = kwargs.get("model_intermediate_buffer")
-        if isinstance(model_outputs, tuple):
-            keys = ["hidden_states", "residual"]
-            if self.end_layer > self.branch_layer:
-                keys += ["mimo_hidden_states", "mimo_residual"]
-            carrier = IntermediateTensors(dict(zip(keys, model_outputs, strict=True)))
-            self._exchange_pipeline_state([info["kimi_audio_generation"] for info in infos])
-            # The unchanged runner unwraps tuple[0] for real execution, then
-            # hands this native IntermediateTensors to the PP worker transport.
-            return (carrier,)
         if not infos:
             return OmniOutput(text_hidden_states=model_outputs)
         if self._sampling_context is not None:
             raise RuntimeError("Kimi-Audio previous sampling context has not been consumed")
-        extras = kwargs.get("sampling_extra_args", ())
         eligible = kwargs.get("request_sample_eligible", ())
-        if len(infos) != len(extras) or len(infos) != len(eligible):
-            raise ValueError("Kimi-Audio needs aligned request buffers, sampling_extra_args and eligibility")
+        if len(infos) != len(eligible):
+            raise ValueError("Kimi-Audio needs aligned request buffers and sample eligibility")
 
         context = []
-        for info, extra, can_sample in zip(infos, extras, eligible, strict=True):
+        for info, can_sample in zip(infos, eligible, strict=True):
+            req_id = info.get("req_id")
+            if not isinstance(req_id, str) or is_warmup_request(req_id):
+                # Runner warmup requests bypass admission and preprocess.
+                context.append(None)
+                continue
             if not info.get("kimi_audio_request_validated"):
                 raise ValueError("Kimi-Audio requires prepare_kimi_audio_request before engine admission")
             state = info.get("kimi_audio_generation")
@@ -495,11 +484,14 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
                 raise ValueError("Kimi-Audio scheduler blank must not be a checkpoint EOS")
             if state["max_tokens"] is None:
                 raise ValueError("Kimi-Audio needs the runner's _omni_max_tokens for final output delivery")
-            context.append((state, extra, special, bool(can_sample)))
-        # The runner retains this mapping through compute_logits/sample, then
-        # snapshots it for output. sample fills ONLY this step's deltas before
-        # that snapshot; a later batch gets a new mapping. Per-request lists
-        # prevent token-span slicing from confusing batch rows with prefill.
+            params = KimiAudioSamplingParams.from_sampling_params(info["sampling_params"])
+            if max(params.text_top_k, params.audio_top_k) > self.config.vocab_size:
+                raise ValueError("Kimi-Audio top_k exceeds the checkpoint vocabulary")
+            context.append((state, params, special, bool(can_sample)))
+        # compute_logits and the registered sampler consume this mapping in the
+        # same step. Sampling fills ONLY this step's deltas; the runner copies
+        # the payload afterwards (mm_outputs_fresh_per_step). Per-request lists
+        # keep token-span slicing from confusing batch rows with prefill.
         outputs = {
             "codes": {"audio": [torch.empty(0, dtype=torch.long) for _ in context]},
             "meta": {"finished": [torch.tensor(False) for _ in context]},
@@ -511,9 +503,7 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         eos = getattr(self.config, "eos_token_ids", None) or getattr(self.config, "eos_token_id", None) or ()
         return (eos,) if isinstance(eos, int) else tuple(eos)
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor, sampling_metadata: "SamplingMetadata | None" = None
-    ) -> torch.Tensor | None:
+    def compute_logits(self, hidden_states: torch.Tensor, *args: Any) -> torch.Tensor | None:
         """Expose normal [requests, vocab] text logits to the runner.
 
         The aligned audio logits are retained only until sample() consumes the
@@ -529,40 +519,41 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         if text_logits is None or audio_logits is None:
             self._sampling_context = None
             return None
-        # Native sampler profiling calls compute_logits without a request
-        # handoff and uses its own sampler. Exercise both heads for peak memory,
+        # Sampler warmup calls compute_logits without a request handoff and
+        # uses the native sampler. Exercise both heads for peak memory,
         # but do not leave audio logits pending for the first real request.
         if self._sampling_context is not None:
             self._audio_logits = audio_logits
         return text_logits
 
-    def sample(self, logits: torch.Tensor, sampling_metadata: "SamplingMetadata") -> "SamplerOutput":
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple["_KimiAudioSampler", None]:
+        return _KimiAudioSampler(sampler, self), None
+
+    def sample(self, logits: torch.Tensor) -> torch.Tensor | None:
         """Sample once per eligible request and retain its actual dual-stream IDs.
 
-        Scheduler IDs are the visible text, blanks elsewhere, then msg_end,
-        declared as a stop token at admission. Native detokenization therefore
-        yields the text. Audio deltas and the end marker go into this step's
-        OmniOutput, including the final code on stop or length limit.
+        Return one scheduler ID per request: the visible text, blanks elsewhere,
+        then msg_end, declared as a stop token at admission. Native
+        detokenization therefore yields the text. Audio deltas and the end
+        marker go into this step's OmniOutput, including the final code on stop
+        or length limit. Without a request handoff (sampler warmup), return None.
         """
-        from vllm.v1.outputs import SamplerOutput
-
         handoff, audio_logits = self._sampling_context, self._audio_logits
         self._sampling_context = self._audio_logits = None
-        if handoff is None or audio_logits is None:
-            raise ValueError("Kimi-Audio sample requires the matching request context and both logits")
+        if handoff is None:
+            return None
         context, outputs = handoff
-        if logits.shape != audio_logits.shape or len(context) != len(logits):
+        if audio_logits is None or logits.shape != audio_logits.shape or len(context) != len(logits):
             raise ValueError("Kimi-Audio sample requires the matching request context and both logits")
 
-        resolved = [
-            KimiAudioSamplingParams.from_sampling_metadata(sampling_metadata, row, extra)
-            for row, (_, extra, _, _) in enumerate(context)
-        ]
-        if any(max(params.text_top_k, params.audio_top_k) > self.config.vocab_size for params in resolved):
-            raise ValueError("Kimi-Audio top_k exceeds the checkpoint vocabulary")
         pending, scheduler_tokens = [], []
         checkpoint_eos = self._checkpoint_eos_ids()
-        for row, ((state, _, special, eligible), params) in enumerate(zip(context, resolved, strict=True)):
+        for row, entry in enumerate(context):
+            if entry is None:
+                # Warmup rows carry no request state; their tokens are discarded.
+                scheduler_tokens.append(int(logits[row].argmax()))
+                continue
+            state, params, special, eligible = entry
             if not eligible:
                 # Partial prefill/recomputation has no accepted output token.
                 # In particular, it must not advance either history or RNG.
@@ -570,11 +561,10 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
                 continue
             if state["finished"]:
                 raise ValueError("Kimi-Audio cannot sample an already finished request")
-            generator = sampling_metadata.generators.get(row)
-            own_generator = generator is None and state["seed"] is not None
-            if own_generator:
-                # Native text-greedy requests have no seeded sampler generator,
-                # even when their audio override enables random sampling.
+            generator = None
+            if state["seed"] is not None:
+                # Both streams draw from one per-request generator, resumed
+                # from the previous step, so seeded requests are reproducible.
                 generator = torch.Generator(device=logits.device).manual_seed(state["seed"])
                 if state.get("rng_state") is not None:
                     generator.set_state(state["rng_state"])
@@ -601,7 +591,7 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
                 stop_token_ids=(*checkpoint_eos, special.msg_end),
             )
             scheduler_tokens.append(token)
-            pending.append((row, state, result, token, generator.get_state() if own_generator else None))
+            pending.append((row, state, result, token, None if generator is None else generator.get_state()))
 
         # Commit only after the whole batch sampled successfully.
         for row, state, result, token, rng_state in pending:
@@ -625,77 +615,7 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
             outputs["meta"]["finished"][row] = torch.tensor(state["finished"])
             if rng_state is not None:
                 state["rng_state"] = rng_state
-        if get_pp_group().world_size > 1:
-            self._exchange_pipeline_state([state for state, _, _, _ in context])
-        return SamplerOutput(
-            sampled_token_ids=torch.tensor(scheduler_tokens, device=logits.device, dtype=torch.int32).reshape(-1, 1),
-            logprobs_tensors=None,
-        )
-
-    def _exchange_pipeline_state(self, states: list[dict]) -> None:
-        """Post a receive after forward, or publish after last-rank sampling.
-
-        Non-last ranks must return without waiting so the worker can send the
-        current activations. The last rank can only sample AFTER those sends.
-        Use the existing PP CPU group, independently of CUDA activation traffic.
-        """
-        pp = get_pp_group()
-        # All PP ranks execute the same scheduled request set. Canonical order
-        # keeps the small tensor independent of each rank's local batch rows.
-        requests = sorted(zip(self._pp_request_ids, states, strict=True))
-        if not requests or self._pp_feedback is not None:
-            raise RuntimeError("Kimi-Audio PP requires one matched forward/sampling exchange per batch")
-        if pp.is_last_rank:
-            rows = []
-            for _, state in requests:
-                count = len(state["scheduler_history"])
-                rows.append(
-                    [
-                        count,
-                        state["text_history"][-1] if count else 0,
-                        state["audio_history"][-1] if count else 0,
-                        state["scheduler_history"][-1] if count else 0,
-                        state["text_finished"],
-                        state["finished"],
-                    ]
-                )
-            updates = torch.tensor(rows, dtype=torch.int64, device="cpu")
-        else:
-            updates = torch.empty((len(requests), 6), dtype=torch.int64, device="cpu")
-        work = torch.distributed.broadcast(updates, src=pp.ranks[-1], group=pp.cpu_group, async_op=True)
-        self._pp_request_ids = ()
-        if pp.is_last_rank:
-            work.wait()
-        else:
-            self._pp_feedback = (work, updates, requests)
-
-    def preprocess_batch(self, *, req_ids: list[str], model_intermediate_buffer: dict[str, dict], **kwargs) -> None:
-        """Apply the previous accepted pair before constructing the next input.
-
-        One outstanding CPU transfer holds references to its original request
-        states, not copies of histories or RNG. Removed/replaced requests are
-        ignored; the next real batch drains the transfer even after an idle gap.
-        Dummy forwards never post transfers or create request context.
-        """
-        if get_pp_group().world_size == 1:
-            return
-        if self._pp_feedback is not None:
-            work, updates, requests = self._pp_feedback
-            work.wait()
-            self._pp_feedback = None
-            for (req_id, state), row in zip(requests, updates.tolist(), strict=True):
-                if model_intermediate_buffer.get(req_id, {}).get("kimi_audio_generation") is not state:
-                    continue
-                count, text, audio, scheduler_token, text_finished, finished = row
-                local_count = len(state["scheduler_history"])
-                if count == local_count + 1:
-                    state["text_history"].append(text)
-                    state["audio_history"].append(audio)
-                    state["scheduler_history"].append(scheduler_token)
-                elif count != local_count:
-                    raise ValueError("Kimi-Audio PP dual-stream history is out of sync")
-                state["text_finished"], state["finished"] = bool(text_finished), bool(finished)
-        self._pp_request_ids = tuple(req_ids)
+        return torch.tensor(scheduler_tokens, device=logits.device, dtype=torch.long).reshape(-1, 1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         from vllm.model_executor.models.qwen2 import Qwen2Model
@@ -869,4 +789,33 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
             torch.tensor(ids, device=input_ids.device, dtype=input_ids.dtype),
             torch.cat(embeds),
             update,
+        )
+
+
+class _KimiAudioSampler(OmniSampler):
+    """Report Kimi's scheduler IDs through the Model Runner V2 sampler contract."""
+
+    def __init__(self, sampler: Any, model: KimiAudioARStage):
+        super().__init__(sampler)
+        self.model = model
+
+    def __call__(self, logits: torch.Tensor, input_batch: "InputBatch") -> SamplerOutput:
+        tokens = self.model.sample(logits)
+        if tokens is None:
+            return self.base_sampler(logits, input_batch)
+        # As in the native sampler: one token per request, except rows still
+        # in chunked prefill, which produce none.
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=tokens,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
         )

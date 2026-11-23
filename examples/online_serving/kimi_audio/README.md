@@ -205,9 +205,11 @@ failure was observed from that warning in these runs; it remains unfixed.
 The retained CPU tests are component reference checks.
 `tests/e2e/online_serving/test_kimi_audio.py` defines single-request,
 concurrent-request and SSE tests against one real server; this automated suite
-was not run as part of the manual validation. Multi-GPU PP, raw-byte speech
-streaming, real-time player buffering, graph capture, performance tuning and
-fault-injection recovery remain outside that validation scope.
+was not run as part of the manual validation. Raw-byte speech streaming,
+real-time player buffering, graph capture, performance tuning and
+fault-injection recovery remain outside that validation scope. Pipeline
+parallelism is not supported: Model Runner V2 has no hook that shares the
+sampled text/audio history with the other ranks before their next step.
 
 Decoder validation and acoustic computation share batch failure cleanup. If a
 forward fails, it releases acoustic state for that batch's known request IDs,

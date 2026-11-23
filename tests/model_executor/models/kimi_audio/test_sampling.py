@@ -121,3 +121,16 @@ def test_scheduler_token_reports_visible_text_or_blank(special_tokens, text_toke
     sample = KimiAudioSample(text_token, special_tokens.kimia_text_blank, text_finished, finished)
     token = scheduler_token_id(sample, special_tokens, text_vocab_size=12, stop_token_ids=(9, special_tokens.msg_end))
     assert token == expected
+
+
+def test_request_settings_apply_stream_overrides():
+    from vllm.sampling_params import SamplingParams
+
+    params = SamplingParams(
+        temperature=0.7, top_k=5, extra_args={"kimi_audio": {"audio_temperature": 0.8, "audio_top_k": 10}}
+    )
+    resolved = KimiAudioSamplingParams.from_sampling_params(params)
+    assert (resolved.text_temperature, resolved.text_top_k) == (0.7, 5)
+    assert (resolved.audio_temperature, resolved.audio_top_k) == (0.8, 10)
+    with pytest.raises(ValueError, match="parameter dictionary"):
+        KimiAudioSamplingParams.from_sampling_params(SamplingParams(extra_args={"kimi_audio": 1}))

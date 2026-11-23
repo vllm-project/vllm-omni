@@ -10,14 +10,11 @@ own history, including forced blanks and the first text EOS.
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from math import isfinite
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import torch
 
 from .prompt import KimiAudioSpecialTokens
-
-if TYPE_CHECKING:
-    from vllm.v1.sample.metadata import SamplingMetadata
 
 
 @dataclass(frozen=True)
@@ -32,21 +29,19 @@ class KimiAudioSamplingParams:
     text_repetition_window_size: int = 16
 
     @classmethod
-    def from_sampling_metadata(
-        cls, metadata: "SamplingMetadata", row: int, extra_args: dict[str, Any]
-    ) -> "KimiAudioSamplingParams":
-        """Read the native batch row and apply per-request stream overrides.
+    def from_sampling_params(cls, params: Any) -> "KimiAudioSamplingParams":
+        """Read one request's native text settings and its stream overrides.
 
-        vLLM may omit temperature/top-k tensors for an all-greedy or unfiltered
-        batch. Repetition still uses Kimi's generated-token window semantics.
+        ``extra_args["kimi_audio"]`` overrides either stream. Repetition still
+        uses Kimi's generated-token window semantics.
         """
-        overrides = extra_args.get("kimi_audio", {})
+        overrides = (params.extra_args or {}).get("kimi_audio", {})
         if not isinstance(overrides, dict):
             raise ValueError("SamplingParams.extra_args.kimi_audio must be a parameter dictionary")
         values = dict(
-            text_temperature=(0.0 if metadata.all_greedy else float(metadata.temperature[row])),
-            text_top_k=0 if metadata.top_k is None else int(metadata.top_k[row]),
-            text_repetition_penalty=(1.0 if metadata.no_penalties else float(metadata.repetition_penalties[row])),
+            text_temperature=params.temperature,
+            text_top_k=params.top_k,
+            text_repetition_penalty=params.repetition_penalty,
         )
         values.update(overrides)
         return cls(**values)
