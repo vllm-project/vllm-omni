@@ -221,55 +221,21 @@ The following sections list only the **increment or replacement** relative to
 the recommended lossless configuration; environment variables and the
 remaining flags stay unchanged.
 
-#### Qwen3-VL vision sequence parallelism (experimental SP8)
+#### Qwen3-VL vision sequence parallelism
 
-This experimental option is specific to MiniMax-H3's Qwen3-VL encoder on
-Ascend NPU. Attention heads are sharded over the existing encoder TP8 group;
-row-wise operations retain SP1 batch shapes and row positions for numerical
-stability, repeating projection work. Weights, final embeddings, and DeepStack
-outputs remain replicated. Vision SP is independent of DiT `--usp` / `--ring`
-and does not add devices.
+MiniMax-H3 supports vision SP8 on Ascend NPU using the existing text encoder
+TP8 group. It is independent of DiT `--usp` / `--ring` and adds no devices.
 
 Append to the serving command above:
 
 ```bash
-  --text-encoder-tp-size 8 --text-encoder-vision-sp-size 8
+  --text-encoder-vision-sp-size 8
 ```
 
-For Python callers:
-
-```python
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-parallel_config = DiffusionParallelConfig(
-    ulysses_degree=8,
-    text_encoder_tp_size=8,
-    text_encoder_vision_sp_size=8,
-)
-```
-
-Deployment YAML uses the same fields under the diffusion stage's
-`parallel_config`. Only `1` (replicated, default) and `8` are accepted; `8`
-requires TP8 and a local text encoder. Unsupported models or parallel
-configurations are rejected. Restart the server after changing this setting;
-set `1` to disable SP8. The startup log reports `text_encoder_vision_sp_size`.
-The former `VLLM_OMNI_H3_VISION_SP_SIZE` environment variable is no longer read.
-
-**Validation:** original-row alignment passes 35 bytewise checks on the real
-case01 input and the full 27-block vision checkpoint on one Ascend 910B4 NPU.
-On eight cards the whole model is also bit-identical to SP1: 720 tensor pairs
-across five strict comparisons with zero differences, and identical media bytes
-for both settings in every measured request. Because the encoder output is
-unchanged, DiT and VAE work is unchanged by construction. The short-segment
-attention path, used when a frame has at most 1024 tokens, is also bitwise: 93 of
-93 comparisons at 784, 512, and 128 tokens.
-
-The encoder itself is faster: the vision tower drops from 229.2 ms to 167.4 ms
-and 228.4 ms to 167.0 ms in two independent windows (about 27%, 61-66 ms), with
-the full encoder span falling from 545 ms to 479 ms. That saving is about 0.1%
-of a 61.6 s case01 request, which is below the run-to-run noise of this
-end-to-end measurement, so no end-to-end speedup is claimed here. See
-[PR #10168](https://github.com/vllm-project/vllm-omni/pull/10168).
+Only `1` (default) and `8` are supported. SP8 requires
+`--text-encoder-tp-size 8` and a locally loaded text encoder. Python and deployment
+YAML use `text_encoder_vision_sp_size` in the diffusion `parallel_config`.
+Set the value to `1` and restart the server to disable vision SP8.
 
 #### Cache-DiT
 
