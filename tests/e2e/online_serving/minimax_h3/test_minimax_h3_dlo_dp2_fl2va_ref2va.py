@@ -75,8 +75,13 @@ def _partition_params() -> OmniServerParams:
             "--stage-overrides",
             '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
         ],
-        stage_init_timeout=1800,
-        init_timeout=1800,
+        # A cold B200 nightly (#10660, build #20135) spent 664 s downloading
+        # weights, ~710 s loading, then a silent DLO shard-and-pin phase and
+        # hit the previous 1800 s cap mid-work. Match the 60-minute budget the
+        # official-reference accuracy test already uses for the same class of
+        # cold multi-stage load.
+        stage_init_timeout=3600,
+        init_timeout=3600,
     )
 
 
