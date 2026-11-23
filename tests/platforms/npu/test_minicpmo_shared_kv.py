@@ -39,6 +39,7 @@ def config(monkeypatch):
             hf_text_config=SimpleNamespace(model_type="qwen3"),
         ),
         speculative_config=MagicMock(spec=SpeculativeConfig, method="dspark"),
+        attention_config=SimpleNamespace(hisparse_config=None),
         cache_config=MagicMock(
             spec=CacheConfig,
             cache_dtype="auto",
