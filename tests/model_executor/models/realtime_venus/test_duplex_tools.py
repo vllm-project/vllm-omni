@@ -112,6 +112,10 @@ def test_client_cannot_inject_server_owned_tool_state(plugin, key):
 
 
 def test_stage0_places_result_after_media_and_caches_one_prefill():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
     runtime = stage0_vision_runtime()
     state = _MiniCPMO45Stage0SessionState(session_id="tools", window_enabled=True)
     output = runtime._stage_prefill_embeddings_only(
@@ -120,13 +124,26 @@ def test_stage0_places_result_after_media_and_caches_one_prefill():
     assert output["input_token_ids"] == [1, 11, 200, 201, 202]
     assert state.pending_window_unit.token_ids == output["input_token_ids"]
     assert state.pending_speech_context is True
+    assert state.current_turn_ended is False
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model._minicpmo45_duplex_state_for_row = lambda _: state
+    model._minicpmo45_duplex_payload_for_row = lambda _: {"is_speech": False}
+    tokens = {"listen_token_id": 10, "tts_bos_token_id": 11, "turn_eos_token_id": 12}
+    assert model._finalize_minicpmo45_native_duplex_sample(0, 10, tokens) == 11
+    model._record_minicpmo45_duplex_terminator(0, 11, tokens)
+    model._record_minicpmo45_duplex_terminator(0, 200, tokens)
+    assert state.pending_speech_context is False
+    model._record_minicpmo45_duplex_terminator(0, 12, tokens)
+    assert state.current_turn_ended is True
     again = runtime._stage_prefill_embeddings_only(
         state, np.zeros(4, dtype=np.float32), seq=1, text_token_ids=[200, 201, 202]
     )
     assert again["inputs_embeds"] is output["inputs_embeds"]
     assert state.audio_chunk_idx == 1
+    assert state.current_turn_ended is True  # A replay cannot reopen the answer.
     later = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=2)
     assert 200 not in later["input_token_ids"]
+    assert state.current_turn_ended is True
 
 
 def test_data_plane_emits_one_call_across_units_and_preserves_turn_end(monkeypatch):

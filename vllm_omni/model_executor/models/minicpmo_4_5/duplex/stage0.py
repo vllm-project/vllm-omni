@@ -590,6 +590,12 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.pending_window_unit.token_ids.extend(text_token_ids)
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
+            # A server-owned result resumes the assistant after delegation,
+            # even if the model already ended that turn. Match a seeded
+            # response's open-turn state so silence advances the answer until
+            # its next turn_eos instead of leaving it in the listening loop.
+            state.current_turn_ended = False
+            state.pending_speech_response_open = True
         # Match official streaming_prefill: a unit carries media and optional text.
         # The assistant turn opens once at session init; re-emitting its prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
