@@ -35,3 +35,7 @@ triage, CI admission, and merge decisions.
 Before code changes, issue triage or PR reviews, read relevant
 [review and issue lessons](docs/contributing/ci/lessons.md) and verify their
 evidence against the current revision.
+
+Before changing a documented subsystem, use the [design index](docs/design/index.md)
+to find its owning page. Verify the affected behavior against the source and
+tests listed on that page at the current revision.
