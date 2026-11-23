@@ -40,13 +40,20 @@ _TURBO_NAME_RE = re.compile(
 # the base model's.
 _TURBO_VIDEO_SHIFT_768P = 6.0
 _TURBO_VIDEO_SHIFT_544P = 12.0
-# The name does not record the shift, and ``8step_v1.2`` breaks the rule above:
-# LightX2V's reference configs moved from ``8step_v1.0_768p`` at shift 6 to this
-# artifact at the base model's shift in one change
-# (``configs/minimax_h3/distill/8steps`` in ModelTC/LightX2V).
+# The name does not record the shift, and some 768p artifacts break the rule
+# above: LightX2V's reference configs moved ``8step`` from ``v1.0_768p`` at
+# shift 6 to ``8step_v1.2_768p`` at the base model's shift, and the later
+# ``8step_v1.1`` / ``4step_v1.3`` 768p retrains kept that base shift
+# (``configs/minimax_h3/distill`` in ModelTC/LightX2V). Keying by exact
+# filename keeps the 544p and older 768p artifacts on the rule their name
+# implies.
 _TURBO_V1_2_8STEP_FILENAME = "minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors"
+_TURBO_V1_1_8STEP_FILENAME = "minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors"
+_TURBO_V1_3_4STEP_FILENAME = "minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors"
 _TURBO_VIDEO_SHIFT_BY_NAME = {
     _TURBO_V1_2_8STEP_FILENAME: 12.0,
+    _TURBO_V1_1_8STEP_FILENAME: 12.0,
+    _TURBO_V1_3_4STEP_FILENAME: 12.0,
 }
 _TURBO_AUDIO_SHIFT = 3.0
 # Only ``4step_v0.1`` declares no alpha. LightX2V's reference script never reads
