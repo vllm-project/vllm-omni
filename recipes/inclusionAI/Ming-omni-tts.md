@@ -10,6 +10,8 @@
 - Mode: Online serving via the OpenAI-compatible `/v1/audio/speech` API
 - Maintainer: Community
 
+The single-frame `inclusionAI/Ming-3.0-tts-0.5b` checkpoint also uses `vllm_omni/deploy/ming_tts.yaml`. To stream PCM on CUDA, pass this checkpoint ID in place of `inclusionAI/Ming-omni-tts-0.5B` in the dense serving command.
+
 ## References
 
 - [Huggingface: inclusionAI/Ming-omni-tts-16.8B-A3B](https://huggingface.co/inclusionAI/Ming-omni-tts-16.8B-A3B)

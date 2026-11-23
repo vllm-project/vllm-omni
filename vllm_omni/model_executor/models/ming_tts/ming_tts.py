@@ -270,7 +270,7 @@ def _request_id(info_dict: dict[str, Any]) -> str | None:
 
 
 def _copy_runtime_controls(update: dict[str, Any], info_dict: dict[str, Any]) -> None:
-    for key in (KEY_CFG, KEY_SIGMA, KEY_TEMPERATURE, KEY_MAX_DECODE_STEPS, KEY_MIN_DECODE_STEPS):
+    for key in (KEY_CFG, KEY_SIGMA, KEY_TEMPERATURE, KEY_MAX_DECODE_STEPS, KEY_MIN_DECODE_STEPS, "tts_local_seed"):
         if key in info_dict:
             update[key] = info_dict[key]
 

@@ -69,6 +69,7 @@ class MingLLMModel(nn.Module):
     stop_reason_key = KEY_STOP_REASON
     stop_probability_key = "ming_stop_prob"
     stop_reason_codes = STOP_REASON_CODES
+    _dense_single_frame = False
     vectorize_cfm_decode = False
     # Drop the tensor on purpose, otherwise upstream vLLM would reject.
     # The vendor never reaches them either (audio_gate/image_gate never fire)
@@ -117,6 +118,8 @@ class MingLLMModel(nn.Module):
         self.linear_proj_audio.to(dtype=self.fm_dtype)
         self.stop_head.to(dtype=self.fm_dtype)
         self.spk_head.to(dtype=self.fm_dtype)
+        self._request_generators: dict[str, torch.Generator] = {}
+        self._dense_single_frame = self.ming_config.model_variant == "dense" and self.ming_config.patch_size == 1
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids: list[int] | None = None
         self._last_text_mode = False
@@ -323,14 +326,44 @@ class MingLLMModel(nn.Module):
     def _resolve_stop_decision(self, **kwargs: Any) -> tuple[str, bool, bool, int, int]:
         return _resolve_ming_stop_decision(**kwargs)
 
-    def _get_request_generator(self, req_info: dict[str, Any], device: torch.device) -> torch.Generator | None:
-        """Return a request-scoped RNG; No-op for this base MingLLMModel - use the default RNG."""
-        del req_info, device
+    @staticmethod
+    def _generator_key(req_info: dict[str, Any]) -> str | None:
+        # Prefer the runner's req_id so on_requests_finished always evicts aborted requests.
+        for key in ("req_id", KEY_REQUEST_ID, "request_id"):
+            value = req_info.get(key)
+            if isinstance(value, str) and value:
+                return value
         return None
 
+    def _get_request_generator(self, req_info: dict[str, Any], device: torch.device) -> torch.Generator | None:
+        if not self._dense_single_frame:
+            return None
+        request_id = self._generator_key(req_info)
+        if request_id is None:
+            return None
+        generator = self._request_generators.get(request_id)
+        if generator is not None:
+            return generator
+        raw_seed = req_info.get("tts_local_seed")
+        if raw_seed is None:
+            # An unseeded request cannot be replayed, so a randomly seeded
+            # generator would only force per-request RNG calls each step.
+            return None
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(raw_seed))
+        self._request_generators[request_id] = generator
+        return generator
+
     def _on_stop_decision(self, req_info: dict[str, Any], stop_reason: str) -> None:
-        """Handle stop-related cleanup; No-op for this base MingLLMModel."""
-        del req_info, stop_reason
+        if stop_reason != "continue":
+            request_id = self._generator_key(req_info)
+            if request_id is not None:
+                self._request_generators.pop(request_id, None)
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            self._request_generators.pop(request_id, None)
+            self._pending_postprocess_updates.pop(request_id, None)
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor | None:
         del sampling_metadata
@@ -446,7 +479,7 @@ class MingLLMModel(nn.Module):
                             self.ming_config.latent_dim,
                         ),
                         device=device,
-                        dtype=torch.float32,
+                        dtype=self.fm_dtype if self._dense_single_frame else torch.float32,
                     )
                     solver_noise = torch.zeros(
                         (
@@ -456,7 +489,7 @@ class MingLLMModel(nn.Module):
                             self.ming_config.latent_dim,
                         ),
                         device=device,
-                        dtype=torch.float32,
+                        dtype=self.fm_dtype if self._dense_single_frame else torch.float32,
                     )
                     self._decode_one_step(
                         hidden_states=hidden_states,
@@ -569,6 +602,15 @@ class MingLLMModel(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
+        if self._dense_single_frame:
+            # Reproduce the release's two BF16 draws per frame, independently per request.
+            initial, solver = [], []
+            for generator in generators:
+                initial.append(torch.randn(shape, device=device, dtype=self.fm_dtype, generator=generator))
+                solver.append(
+                    torch.randn((DEFAULT_CFM_STEPS, *shape), device=device, dtype=self.fm_dtype, generator=generator)
+                )
+            return torch.cat(initial), torch.cat(solver, dim=1)
         if all(generator is None for generator in generators):
             # Unseeded rows share the global RNG, so one draw serves them all.
             count = len(generators)
@@ -649,7 +691,9 @@ class MingLLMModel(nn.Module):
                     logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
             graph_exec = CFMGraphExecutor(
-                CFMSampler(self.flowloss.cfm.model, steps=DEFAULT_CFM_STEPS),
+                CFMSampler(
+                    self.flowloss.cfm.model, steps=DEFAULT_CFM_STEPS, include_final_noise=self._dense_single_frame
+                ),
                 self.linear_proj_audio,
                 self.stop_head,
                 patch_size=self.ming_config.patch_size,
@@ -704,6 +748,14 @@ class MingLLMModel(nn.Module):
         # cfg < 1e-5 disables CFG; the eager flow head handles this with a
         # dedicated unconditional branch (c=zeros) that the captured graph does
         # not replicate, so fall back to eager there to match FlowLoss.sample.
+        if self._dense_single_frame and (initial_noise is None or solver_noise is None):
+            drawn_initial, drawn_solver = self._draw_request_cfm_noises(
+                [generator] * z_diff_cond.shape[0], z_diff_cond.device
+            )
+            if initial_noise is None:
+                initial_noise = drawn_initial
+            if solver_noise is None:
+                solver_noise = drawn_solver
         graph_exec = self._maybe_build_cfm_graph(z_diff_cond) if cfg_scale >= 1e-5 else None
         if graph_exec is not None:
             try:
@@ -742,6 +794,7 @@ class MingLLMModel(nn.Module):
                 generator=generator,
                 initial_noise=initial_noise,
                 solver_noise=solver_noise,
+                include_final_noise=self._dense_single_frame,
             )
             # Aggregator expects [Batch, Time, Dimension] = [B, 4, 64] and returns [B, 1, H].
             next_embeds = self.linear_proj_audio(sampled_token_latent)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline inference demo for Ming-omni-tts via vLLM Omni."""
 
 import json
@@ -10,7 +10,7 @@ import soundfile as sf
 import torch
 import torchaudio
 import yaml
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PretrainedConfig
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     KEY_TEMPERATURE,
     SAMPLE_RATE,
 )
+from vllm_omni.model_executor.models.ming_tts.constants import PATCH_SIZE
 from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_ming_dense_prompt
 
 try:
@@ -164,6 +165,8 @@ def _build_prompt_payload(tokenizer, args):
     instruction = (
         json.loads(args.instruction_json) if args.instruction_json else (args.instructions or case.get("instruction"))
     )
+    hf_config, _ = PretrainedConfig.get_config_dict(args.model)
+    patch_size = hf_config.get("ditar_config", {}).get("patch_size", PATCH_SIZE)
     return build_ming_dense_prompt(
         tokenizer,
         prompt=args.prompt or case["prompt"],
@@ -173,7 +176,8 @@ def _build_prompt_payload(tokenizer, args):
         prompt_text=prompt_text,
         prompt_waveform=prompt_waveform,
         speaker_embedding=speaker_embedding,
-        use_zero_spk_emb=use_zero_spk_emb,
+        use_zero_spk_emb=use_zero_spk_emb and patch_size != 1,
+        patch_size=patch_size,
     )
 
 

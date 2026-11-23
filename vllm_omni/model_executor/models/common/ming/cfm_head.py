@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
-from vllm_omni.model_executor.models.common.ming.cfm_solver import DEFAULT_CFM_STEPS, Solver, build_timesteps
+from vllm_omni.model_executor.models.common.ming.cfm_solver import (
+    DEFAULT_CFM_STEPS,
+    Solver,
+    build_timesteps,
+    integrate_cfm_steps,
+)
 
 
 class FlowLoss(nn.Module):
@@ -19,6 +24,21 @@ class FlowLoss(nn.Module):
         # keeping the inference-only CFM sampling logic local to FlowLoss.
         self.cfm = nn.Module()
         self.cfm.add_module("model", DiT(in_channels=z_channels, llm_cond_dim=llm_cond_dim, **kwargs))
+        self._timesteps_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+    def _timesteps(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device, dtype)
+        timesteps = self._timesteps_cache.get(key)
+        if timesteps is None:
+            timesteps = build_timesteps(
+                DEFAULT_CFM_STEPS,
+                device=device,
+                dtype=dtype,
+                use_epss=True,
+                sway_sampling_coef=-1.0,
+            )
+            self._timesteps_cache[key] = timesteps
+        return timesteps
 
     @torch.no_grad()
     def sample(
@@ -32,6 +52,7 @@ class FlowLoss(nn.Module):
         generator=None,
         initial_noise=None,
         solver_noise=None,
+        include_final_noise=False,
     ):
         # z: [Batch, Time=1, Dimension]
         # latent_history: [Batch, History_Time, Dimension]
@@ -60,13 +81,7 @@ class FlowLoss(nn.Module):
             expected = (z.shape[0], patch_size, self.z_channels)
             if tuple(noise.shape) != expected:
                 raise ValueError(f"Initial noise shape mismatch: got {tuple(noise.shape)}, expected {expected}")
-        t = build_timesteps(
-            DEFAULT_CFM_STEPS,
-            device=noise.device,
-            dtype=noise.dtype,
-            use_epss=True,
-            sway_sampling_coef=-1.0,
-        )
+        t = self._timesteps(noise.device, noise.dtype)
         if solver_noise is not None:
             expected = (len(t) - 1, z.shape[0], patch_size, self.z_channels)
             if tuple(solver_noise.shape) != expected:
@@ -79,13 +94,23 @@ class FlowLoss(nn.Module):
                 if t.ndim == 0:
                     t = t.repeat(x.shape[0])
                 pred = self.cfm.model(x=x, t=t, c=torch.zeros_like(z), latent_history=latent_history)
-                return pred[:, -patch_size:, :].float()
+                return pred[:, -patch_size:, :].to(noise.dtype)
 
             pred_cfg = self.cfm.model.forward_with_cfg(
                 x=x, t=t, c=z, latent_history=latent_history, cfg_scale=cfg, patch_size=patch_size
             )
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
-            return (pred + (pred - null_pred) * cfg).float()
+            return (pred + (pred - null_pred) * cfg).to(noise.dtype)
+
+        if include_final_noise:
+            sde_rnd = (
+                solver_noise
+                if solver_noise is not None
+                else torch.randn(
+                    (len(t) - 1, *noise.shape), device=noise.device, dtype=noise.dtype, generator=generator
+                )
+            )
+            return integrate_cfm_steps(fn, noise, t, (cfg, sigma, temperature), sde_rnd, len(t) - 1).to(dtype)
 
         return (
             Solver(

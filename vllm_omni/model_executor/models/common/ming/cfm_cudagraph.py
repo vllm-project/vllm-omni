@@ -27,20 +27,17 @@ class CFMSampler(nn.Module):
     """Unrolled CFM ODE solver, graph-capturable (no ``torch.randn``/``.item()``).
 
     All randomness (``y0``, ``sde_rnd``) and the timestep schedule ``t`` are
-    passed in as float32 tensors so the loop is deterministic during replay and
-    the integration matches the eager float32 path. Equivalent to eager
-    ``Solver.integrate`` for ``temperature==0``.
+    explicit inputs. Integration follows the dtype of the checkpoint's noise.
     """
 
-    def __init__(self, dit_model: nn.Module, steps: int = DEFAULT_CFM_STEPS):
+    def __init__(self, dit_model: nn.Module, steps: int = DEFAULT_CFM_STEPS, *, include_final_noise: bool = False):
         super().__init__()
         self.model = dit_model
         self.steps = steps
+        self.include_final_noise = include_final_noise
 
     @torch.no_grad()
     def forward(self, llm_cond, lat_cond, y0, t, sde_args, sde_rnd):
-        # y0 / t / sde_rnd / sde_args are float32; integrate in float32 and cast
-        # only the DiT inputs to the model dtype, mirroring eager FlowLoss.sample.
         model_dtype = llm_cond.dtype
         for step in range(self.steps):
             dt = t[step + 1] - t[step]
@@ -53,9 +50,9 @@ class CFMSampler(nn.Module):
                 patch_size=y0.shape[1],
             )
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
-            flow = (pred + (pred - null_pred) * sde_args[0]).float()
+            flow = (pred + (pred - null_pred) * sde_args[0]).to(y0.dtype)
             y0 = y0 + flow * dt
-            if step < self.steps - 1:
+            if self.include_final_noise or step < self.steps - 1:
                 y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
         return y0
 
@@ -90,19 +87,18 @@ class CFMGraphExecutor:
         self.num_warmups = max(1, int(num_warmups))
         self.initialized = False
         self.graph: torch.cuda.CUDAGraph | None = None
-        self._timesteps_cache: dict[torch.device, torch.Tensor] = {}
+        self._timesteps_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
         self._last_sde_args: tuple[float, float, float] | None = None
 
-    def _timesteps(self, device):
-        # Raw EPSS schedule + sway in float32, identical to eager build_timesteps.
+    def _timesteps(self, device, dtype=torch.float32):
+        # Raw EPSS schedule + sway in the checkpoint solver dtype.
         # The schedule is constant; building it from a Python list is a
         # pageable H2D copy that blocks the host, so build it once per device.
-        timesteps = self._timesteps_cache.get(device)
+        key = (device, dtype)
+        timesteps = self._timesteps_cache.get(key)
         if timesteps is None:
-            timesteps = build_timesteps(
-                self.steps, device=device, dtype=torch.float32, use_epss=True, sway_sampling_coef=-1.0
-            )
-            self._timesteps_cache[device] = timesteps
+            timesteps = build_timesteps(self.steps, device=device, dtype=dtype, use_epss=True, sway_sampling_coef=-1.0)
+            self._timesteps_cache[key] = timesteps
         return timesteps
 
     def _pad_batch(self, tensor: torch.Tensor, *, dim: int = 0) -> torch.Tensor:
@@ -131,7 +127,7 @@ class CFMGraphExecutor:
             return None
         actual_batch_size = int(llm_cond.shape[0])
         device = llm_cond.device
-        # ODE state / noise / timesteps are float32 to match the eager path.
+        # Legacy checkpoints integrate in float32.
         y0 = (
             initial_noise
             if initial_noise is not None
@@ -142,7 +138,7 @@ class CFMGraphExecutor:
                 generator=generator,
             )
         )
-        t = self._timesteps(device)
+        t = self._timesteps(device, y0.dtype)
         sde_rnd = (
             solver_noise
             if solver_noise is not None
@@ -182,6 +178,7 @@ class CFMGraphExecutor:
             self._last_sde_args = sde_args
         self._sde_rnd_ph[:, :actual_batch_size].copy_(sde_rnd)
 
+        assert self.graph is not None
         self.graph.replay()
 
         return (
@@ -194,10 +191,10 @@ class CFMGraphExecutor:
         model_dtype = llm_cond.dtype
         self._llm_cond_ph = torch.empty_like(llm_cond)
         self._his_lat_ph = torch.empty_like(his_lat)
-        self._y0_ph = torch.empty_like(y0)  # float32
-        self._t_ph = torch.empty_like(t)  # float32
-        self._sde_args_ph = torch.empty(3, device=llm_cond.device, dtype=torch.float32)
-        self._sde_rnd_ph = torch.empty_like(sde_rnd)  # float32
+        self._y0_ph = torch.empty_like(y0)
+        self._t_ph = torch.empty_like(t)
+        self._sde_args_ph = torch.empty(3, device=llm_cond.device, dtype=y0.dtype)
+        self._sde_rnd_ph = torch.empty_like(sde_rnd)
 
         self._llm_cond_ph.copy_(llm_cond)
         self._his_lat_ph.copy_(his_lat)
@@ -207,7 +204,7 @@ class CFMGraphExecutor:
         self._sde_rnd_ph.copy_(sde_rnd)
 
         def _run():
-            # Solver runs in float32; cast the final latent to the model dtype
+            # Cast the final latent to the model dtype
             # for the Aggregator / stop head (matches eager ``.to(dtype)``).
             gen_lat = self.cfm_sampler(
                 self._llm_cond_ph, self._his_lat_ph, self._y0_ph, self._t_ph, self._sde_args_ph, self._sde_rnd_ph

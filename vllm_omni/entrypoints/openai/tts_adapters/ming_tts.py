@@ -12,12 +12,17 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
-from vllm_omni.model_executor.models.ming_tts.constants import KEY_SPEAKER_AUDIO_KEYS, SPEAKER_EMBEDDING_DIM
+from vllm_omni.model_executor.models.ming_tts.constants import KEY_SPEAKER_AUDIO_KEYS, PATCH_SIZE, SPEAKER_EMBEDDING_DIM
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
+
+
+def _ditar_patch_size(hf_config: Any) -> int:
+    ditar_cfg = getattr(hf_config, "ditar_config", None)
+    return int(ditar_cfg.get("patch_size", PATCH_SIZE)) if isinstance(ditar_cfg, dict) else PATCH_SIZE
 
 
 def parse_ming_instruction_fields(server, request, *, include_voice=False, plain_text_passthrough=False):
@@ -122,10 +127,13 @@ class MingTTSAdapter(ARTTSAdapter):
         if request.max_new_tokens is not None:
             runtime_controls[KEY_MAX_DECODE_STEPS] = request.max_new_tokens
 
+        model_config = getattr(self.ctx.engine_client, "model_config", None)
+        patch_size = _ditar_patch_size(getattr(model_config, "hf_config", None))
         prompt_dict = build_ming_dense_prompt(
             self.ctx.server._tts_tokenizer,
             # bgm / music-prompt mode not supported online;
             # requires prompt_mode API extension (deferred).
+            patch_size=patch_size,
             prompt=MING_DEFAULT_PROMPT,
             text=request.input,
             runtime_controls=runtime_controls or None,
@@ -134,7 +142,7 @@ class MingTTSAdapter(ARTTSAdapter):
             prompt_waveform=prompt_waveform,
             speaker_embedding=speaker_embedding,
             speaker_count=len(reference_waveforms) if pending_speaker_extraction else None,
-            use_zero_spk_emb=use_zero_spk_emb,
+            use_zero_spk_emb=use_zero_spk_emb and patch_size != 1,
         )
         additional_information = prompt_dict["additional_information"]
         if pending_speaker_extraction:
@@ -236,6 +244,8 @@ class MingTTSAdapter(ARTTSAdapter):
         )
 
         hf_config = server.engine_client.model_config.hf_config
+        if prompt is not None and request.seed is not None and _ditar_patch_size(hf_config) == 1:
+            prompt["additional_information"]["tts_local_seed"] = int(request.seed)
         is_moe = getattr(hf_config, "model_type", "") == "bailingmm"
         stop_token_id = MOE_TEXT_EOS_TOKEN_ID if is_moe else TEXT_EOS_TOKEN_ID
 
