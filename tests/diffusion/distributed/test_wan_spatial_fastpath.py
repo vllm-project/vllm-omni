@@ -435,3 +435,37 @@ def test_padded_upsample_reuses_kernel_across_resolutions(monkeypatch):
         out = x.new_empty((2, 16, 2 * h + 2, 2 * w + 2)).contiguous(memory_format=torch.channels_last)
         assert up.upsample_nearest_2x_padded(x, out)
     assert len(kernels) == 3 and kernels[0] is not None and all(k is kernels[0] for k in kernels)
+
+
+@torch.inference_mode()
+def test_registry_preserves_lingbot_streaming_spatial_decoder(mocker):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.entry import WAN_FAMILY_FAST_PATH
+    from vllm_omni.diffusion.registry import _apply_vae_fast_paths_if_enabled
+    from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+
+    torch.manual_seed(173)
+    vae = (
+        OmniAutoencoderKLWan(
+            base_dim=8, decoder_base_dim=8, z_dim=4, dim_mult=[1, 2], num_res_blocks=1, temperal_downsample=[True]
+        )
+        .eval()
+        .cuda()
+    )
+    install_wan_spatial_shard_decode(vae, dist.group.WORLD, split_dim="width", dst=None)
+    latents = torch.randn(1, 4, 2, 6, 10, device="cuda")
+
+    def stream():
+        decoder = WanStreamingDecoder(vae)
+        state = decoder.new_decode_state("session")
+        return [decoder.decode_chunk(chunk, state) for chunk in latents.split(1, dim=2)]
+
+    expected = stream()
+    pipeline = torch.nn.Module()
+    pipeline.vae = vae
+    install = mocker.spy(WAN_FAMILY_FAST_PATH, "install")
+    _apply_vae_fast_paths_if_enabled(pipeline, SimpleNamespace(vae_encode_fast_path="off"))
+    assert install.call_args.args[:3] == (vae, "decoder", "lossless")
+    assert not is_installed(vae)
+    for actual, reference in zip(stream(), expected, strict=True):
+        assert actual.numel() > 0 and torch.equal(actual, reference)
