@@ -194,7 +194,7 @@ class StageEngineCoreProc(EngineCoreProc):
         # run-request ingestion) never see the omni wire field.
         return_hidden_states = bool(getattr(request, "return_hidden_states", False))
         if not return_hidden_states:
-            extra_args = getattr(request.sampling_params, "extra_args", None)
+            extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", None)
             return_hidden_states = bool(isinstance(extra_args, dict) and extra_args.get("return_hidden_states"))
         scheduler_request.return_hidden_states = return_hidden_states
         return scheduler_request, current_wave
