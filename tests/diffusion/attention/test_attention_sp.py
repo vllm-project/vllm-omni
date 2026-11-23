@@ -241,6 +241,57 @@ def test_allgather_joint_key_mask_reaches_sdpa(rank, joint_strategy, mask_image,
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("backend", ["FlashAttentionHubImpl", "FlashAttention3HubImpl"])
+@pytest.mark.parametrize(("sp_size", "rank"), [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("joint_strategy", ["front", "rear"])
+def test_allgather_joint_key_mask_reaches_flash_hub(monkeypatch, backend, sp_size, rank, joint_strategy):
+    from vllm_omni.diffusion.attention.backends import flash_attn_hub
+
+    def varlen_sdpa(q, k, v, *, cu_seqlens_q, cu_seqlens_k, softmax_scale, **kwargs):
+        outputs = []
+        for qs, qe, ks, ke in zip(cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_k[:-1], cu_seqlens_k[1:]):
+            outputs.append(
+                torch.nn.functional.scaled_dot_product_attention(
+                    q[qs:qe].transpose(0, 1),
+                    k[ks:ke].transpose(0, 1),
+                    v[ks:ke].transpose(0, 1),
+                    scale=softmax_scale,
+                ).transpose(0, 1)
+            )
+        output = torch.cat(outputs)
+        return (output, None) if backend == "FlashAttention3HubImpl" else output
+
+    monkeypatch.setattr(
+        flash_attn_hub, "_get_hub_module", lambda _: SimpleNamespace(flash_attn_varlen_func=varlen_sdpa)
+    )
+    query = torch.zeros(2, 2, 1, 8)
+    keys = [torch.zeros_like(query) for _ in range(sp_size)]
+    values = [torch.ones_like(query) for _ in range(sp_size)]
+    joint = torch.zeros(2, 4, 1, 8)
+    joint_mask = torch.tensor([[True, True, True, False], [True, False, False, False]])
+    metadata = AttentionMetadata(
+        joint_attn_mask=joint_mask,
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint_mask[:, :, None, None].expand_as(joint).float(),
+        joint_strategy=joint_strategy,
+    )
+    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=rank, gather_chunks=[keys, values]))
+    q, k, v, metadata, _ = strategy.pre_attention(query, keys[rank], values[rank], metadata)
+    impl = getattr(flash_attn_hub, backend)(num_heads=1, head_size=8, softmax_scale=1.0)
+    output = impl.forward_cuda(q, k, v, metadata)
+    expected = SDPAImpl(num_heads=1, head_size=8, softmax_scale=1.0)._forward_impl(q, k, v, metadata)
+    image_valid = torch.ones(2, 2, dtype=torch.bool)
+    valid_queries = torch.cat(
+        [joint_mask, image_valid] if joint_strategy == "front" else [image_valid, joint_mask], dim=1
+    )
+    torch.testing.assert_close(output[valid_queries], expected[valid_queries])
+    if sp_size == 1:
+        # Equal Q/K lengths retain the existing query-padding behavior.
+        torch.testing.assert_close(output[~valid_queries], torch.zeros_like(output[~valid_queries]))
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("mask_shape", [(2, 4), (1, 6), (1, 2, 6)])
 def test_allgather_preserves_existing_full_mask(mask_shape):
     query = torch.zeros(1, 2, 1, 1)
