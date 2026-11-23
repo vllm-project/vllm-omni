@@ -269,6 +269,26 @@ def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
     assert ready == []
 
 
+def test_qwen_image_21_docs_run_the_three_one_card_examples() -> None:
+    step = _find_step("Qwen-Image 2.1 Text-to-Image Documentation", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["source_file_dependencies"] == ["diffusion_text_to_image_doc", "rocm_diffusion_nightly_runner"]
+    assert split(step["commands"][-1]) == [
+        "bash",
+        ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh",
+        "1",
+        "3",
+        "75m",
+        "rocm-qwen-image-21-docs",
+        "tests/examples/offline_inference/test_text_to_image.py::test_text_to_image[more_cli_examples_001]",
+        "tests/examples/online_serving/test_text_to_image.py::test_api_calls_001[omni_server0]",
+        "tests/examples/online_serving/test_text_to_image.py::test_api_calls_002[omni_server0]",
+        "-m",
+        "full_model and example and rocm and MI325 and cards_1",
+    ]
+
+
 def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
     """MERGE runs the default node with SDPA. Nightly keeps the AITER smoke."""
     step = _find_step("MERGE · Qwen-Image Online Smoke", AMD_MERGE_PIPELINE)
