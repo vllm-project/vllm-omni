@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 guardrail hooks for vllm-omni.
 
 Thin adapter around the ``cosmos_guardrail`` package's ``CosmosSafetyChecker``
@@ -168,16 +168,16 @@ def check_video_safety(video_tensor: torch.Tensor) -> torch.Tensor:
         return video_tensor
 
     v = video_tensor.detach().cpu().float()
-    if v.dim() == 5:
-        v = v[0]
-    v = v.clamp(-1, 1) * 0.5 + 0.5
-    frames_np = (v.permute(1, 2, 3, 0).numpy() * 255).round().astype(np.uint8)
+    # Check each video of a [B, C, T, H, W] batch separately.
+    samples = v if v.dim() == 5 else v.unsqueeze(0)
+    results = []
+    for sample in samples:
+        sample = sample.clamp(-1, 1) * 0.5 + 0.5
+        frames_np = (sample.permute(1, 2, 3, 0).numpy() * 255).round().astype(np.uint8)
 
-    frames_np = _video_guardrail(frames_np)
+        frames_np = _video_guardrail(frames_np)
 
-    # Convert back to [-1, 1] to match the VAE output range.
-    result = torch.from_numpy(frames_np.copy()).float() / 127.5 - 1.0
-    result = result.permute(3, 0, 1, 2)
-    if video_tensor.dim() == 5:
-        result = result.unsqueeze(0)
+        # Convert back to [-1, 1] to match the VAE output range.
+        results.append((torch.from_numpy(frames_np.copy()).float() / 127.5 - 1.0).permute(3, 0, 1, 2))
+    result = torch.stack(results) if video_tensor.dim() == 5 else results[0]
     return result.to(video_tensor.device)

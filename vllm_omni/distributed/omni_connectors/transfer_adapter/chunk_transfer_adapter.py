@@ -6,6 +6,7 @@ import importlib
 import inspect
 import threading
 import time
+from array import array
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, cast
@@ -16,7 +17,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.core.sched.duplex_stage_work import parse_perf_chunk, request_perf_chunk, set_request_perf_chunk
-from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY, MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
@@ -251,9 +252,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
+        if value is None:
+            return False
         if isinstance(value, torch.Tensor):
             return value.numel() == 1 and bool(value.item())
-        return bool(value) if value is not None else False
+        # Wire decode of a 0-d bool tensor can land as a 1-element list.
+        # ``bool([False])`` is True, so recurse instead of treating any
+        # non-empty container as finished. Producers never send ``finished`` as
+        # a multi-element list/tuple; ``len != 1`` is not a scalar.
+        if isinstance(value, (list, tuple)):
+            return len(value) == 1 and OmniChunkTransferAdapter._is_truthy_scalar(value[0])
+        return bool(value)
 
     @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
@@ -297,8 +306,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             ("_output_token_ids", "output_token_ids"),
         ):
             token_ids = getattr(request, private_name, None)
-            if isinstance(token_ids, list):
-                frozen_ids = token_ids.copy()
+            # vLLM 0.34 keeps token ids in array-backed TokenBuffers, which are
+            # not list instances; freeze them exactly like the list form or the
+            # snapshot would alias live storage.
+            if isinstance(token_ids, (list, array)):
+                frozen_ids = token_ids.copy() if isinstance(token_ids, list) else list(token_ids)
                 setattr(snapshot, private_name, frozen_ids)
                 setattr(snapshot, public_name, ConstantList(frozen_ids))
                 if public_name == "output_token_ids":
@@ -311,7 +323,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # scheduled as a fresh prefill. Keep the canonical request token
         # mirrors synchronized at the replacement point so every downstream
         # consumer observes the current prompt, regardless of its length.
-        request._all_token_ids.clear()
+        del request._all_token_ids[:]
         request._all_token_ids.extend(request.prompt_token_ids)
         request._output_token_ids.clear()
         request.num_prompt_tokens = len(request.prompt_token_ids)
@@ -730,7 +742,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            # Incremental chunks keep an earlier meta.finished
+                            # (diffusion and generation tests rely on this).
+                            # A request-terminal generation chunk must publish
+                            # finished=True: Code2Wav reads it from
+                            # additional_information, not from the adapter flag.
+                            if (
+                                key == "meta"
+                                and sk == "finished"
+                                and not (payload_finished and self.model_mode == "generation")
+                            ):
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub
@@ -749,6 +770,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if not has_new_ids and payload_segment_finished:
                     # Preserve an explicit scheduler boundary even when it
                     # contains no new codec frames.
+                    request.prompt_token_ids = [0]
+                elif (
+                    not has_new_ids
+                    and payload_finished
+                    and not use_tensor_codes
+                    and self._is_truthy_scalar(meta.get(JOYAI_FINISH_ON_NEXT_STOP_KEY))
+                ):
+                    # Last-sentence empty finished marker after frames were
+                    # already sent. The Talker processor stamps this on meta;
+                    # leaving prompt_token_ids=[] parks Code2Wav in
+                    # WAITING_FOR_CHUNK. Independent Qwen3 never stamps it, so
+                    # it keeps [] and the existing pending_finish path. 2-D
+                    # empty windows (Fish Omni / Drama 3) stay [] via
+                    # use_tensor_codes.
                     request.prompt_token_ids = [0]
                 if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and

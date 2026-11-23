@@ -397,11 +397,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         use_multithread = (
             use_safetensors
             and source.weight_name_patterns is None
-            and getattr(self.od_config, "enable_multithread_weight_load", False)
+            and self.od_config.enable_multithread_weight_load
             and self.load_config.safetensors_load_strategy != "torchao"
         )
         if use_multithread:
-            num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
+            num_threads = self.od_config.num_weight_load_threads
             # Keep deterministic shard order before passing to vLLM helper.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = multi_thread_safetensors_weights_iterator(
@@ -590,16 +590,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
     def _maybe_fuse_distilled_lora(self, model: nn.Module) -> None:
         """Fuse distilled LoRA weights into the model before sharding or quantization."""
-        if self.od_config is None:
-            return
-        lora_backend = getattr(self.od_config, "lora_backend", None)
+        lora_backend = self.od_config.lora_backend
         if lora_backend != LoRABackend.DISTILL and lora_backend != "distill":
             return
 
         if getattr(model, "lora_is_fused", False):
             return
 
-        lora_path = getattr(self.od_config, "lora_path", None)
+        lora_path = self.od_config.lora_path
         if not lora_path:
             return
 
@@ -607,7 +605,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             lora_path = lora_path[0]
 
         if hasattr(model, "load_lora_weights"):
-            lora_scale = getattr(self.od_config, "lora_scale", 1.0)
+            lora_scale = self.od_config.lora_scale
             if any(scale > 1.0 for scale in (lora_scale if isinstance(lora_scale, list) else [lora_scale])):
                 logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
             logger.info("Fusing distilled LoRA weights from %s into %s", lora_path, model.__class__.__name__)
@@ -798,10 +796,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
                 dit_distributed_offload = distributed_offload and resolved_offload.offloads(DIT_COMPONENT)
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
-                tensor_parallel_size = int(getattr(self.parallel_config, "tensor_parallel_size", 1))
-                use_hsdp = bool(getattr(self.parallel_config, "use_hsdp", False))
-                data_parallel_size = int(getattr(self.parallel_config, "data_parallel_size", 1))
-                sequence_parallel_size = int(getattr(self.parallel_config, "sequence_parallel_size", 1))
+                tensor_parallel_size = int(self.parallel_config.tensor_parallel_size)
+                use_hsdp = bool(self.parallel_config.use_hsdp)
+                data_parallel_size = int(self.parallel_config.data_parallel_size)
+                sequence_parallel_size = int(self.parallel_config.sequence_parallel_size)
                 dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
                 modules = ModuleDiscovery.discover(model)
                 plan = get_offload_plan(model)
@@ -831,14 +829,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     if unsupported_methods:
                         raise ValueError(
                             "DLO+AllGather supports online quantization only for "
-                            "per-tensor FP8, INT8, and MXFP8 linears "
+                            "per-tensor FP8, INT8, MXFP8, and MXFP4 linears "
                             "(host-loaded unquantized fallback layers are also allowed); "
                             f"unsupported online methods: {', '.join(sorted(unsupported_methods))}. "
                             "Use rank-local transfer for the affected component or "
                             "disable online quantization."
                         )
                     logger.info(
-                        "Validated online methods (per-tensor FP8, INT8, MXFP8) for every component using DLO+AllGather"
+                        "Validated online methods (per-tensor FP8, INT8, MXFP8, MXFP4) "
+                        "for every component using DLO+AllGather"
                     )
 
                 plan_result = None
@@ -857,7 +856,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     except _HWRCommitError:
                         from vllm_omni.host_weight_runtime import RuntimeMode
 
-                        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                        mode = RuntimeMode(self.od_config.host_weight_runtime_mode)
                         if mode is not RuntimeMode.PREFERRED:
                             raise
                         logger.warning(
@@ -871,15 +870,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
                 if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
-                    lora_backend = getattr(self.od_config, "lora_backend", None)
+                    lora_backend = self.od_config.lora_backend
                     has_distilled_lora = lora_backend in (LoRABackend.DISTILL, "distill") and bool(
-                        getattr(self.od_config, "lora_path", None)
+                        self.od_config.lora_path
                     )
                     plan_result = build_checkpoint_mmap_plan(
                         model,
                         dit_modules=tuple(zip(modules.dit_names, modules.dits)),
                         sources=weight_sources,
-                        model_path=str(getattr(self.od_config, "model", "")) or None,
+                        model_path=str(self.od_config.model) or None,
                         tensor_parallel_size=tensor_parallel_size,
                         use_hsdp=use_hsdp,
                         online_quantization=any(self._has_online_quant(dit) for dit in modules.dits),
@@ -962,7 +961,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     carrier.close()
                 from vllm_omni.host_weight_runtime import RuntimeMode
 
-                mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                mode = RuntimeMode(self.od_config.host_weight_runtime_mode)
                 if mode is RuntimeMode.PREFERRED:
                     logger.warning(
                         "HWR warm finalization failed; discarding the model and retrying a fresh canonical load",
@@ -1038,8 +1037,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
     def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
         """Return unsupported online-quant methods for DLO AllGather.
 
-        Per-tensor online FP8, online INT8, and online MXFP8 are safe after
-        the ordinary loader has finalized their weight and scale parameters.
+        Per-tensor online FP8, online INT8, online MXFP8, and the vLLM XPU
+        MXFP4 online method are safe after the ordinary loader has finalized
+        their weight and scale parameters.
         DLO shards those runtime tensors by dtype and reconstructs their
         recorded shapes and strides before the kernel consumes them. They all
         keep plain transportable 1-byte dtypes over ordinary strided views:
@@ -1050,6 +1050,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
           (NPU: (K, N) weight with (K_groups/2, N, 2) scale) or with the
           scale stored as a transposed view (vLLM kernel, .t() over a
           contiguous (K/32, N) buffer).
+        - online MXFP4 (vLLM XPU kernel): packed float4_e2m1fn_x2 weight plus
+          a uint8/e8m0 block scale, both one-byte transport dtypes.
 
         Both shape families are already covered by the physical-order packing
         that online FP8 requires. Other online methods may create different
@@ -1087,12 +1089,23 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             # as absent when the module cannot be imported.
             mxfp8_online_methods = ()
 
+        try:
+            from vllm_omni.quantization.mxfp4_config import (
+                VllmMxfp4OnlineLinearMethod,
+            )
+
+            mxfp4_online_methods: tuple[type, ...] = (VllmMxfp4OnlineLinearMethod,)
+        except ImportError:
+            # MXFP4 requires a vLLM build with Mxfp4OnlineLinearMethod support.
+            mxfp4_online_methods = ()
+
         allowed_online_methods: tuple[type, ...] = (
             Fp8PerTensorOnlineLinearMethod,
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
             UnquantizedHostLinearMethod,
             *mxfp8_online_methods,
+            *mxfp4_online_methods,
         )
 
         unsupported: set[str] = set()
@@ -1105,10 +1118,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         return tuple(sorted(unsupported))
 
     def _apply_skip_softmax_calibration(self, model: nn.Module) -> None:
-        cfg = getattr(self.od_config, "diffusion_attention_config", None)
+        cfg = self.od_config.diffusion_attention_config
         # A schedule profile can be the only spec carrying calibration, so discovery has to
         # look past the baseline config or that candidate would stay dense at runtime.
-        schedule = getattr(self.od_config, "diffusion_attention_schedule", None)
+        schedule = self.od_config.diffusion_attention_schedule
         apply_skip_softmax_calibration(cfg, model, schedule=schedule)
 
     def _validate_attention_schedule_candidates(self, model: nn.Module) -> None:
@@ -1117,7 +1130,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         The traversal resolves the same per-candidate calibration dict that stamping uses. It does
         not read stamped impl state. Without a schedule it walks nothing.
         """
-        if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
+        if self.od_config.diffusion_attention_schedule is None:
             return
         validated = validate_attention_schedule_candidates(model, self.od_config)
         logger.debug("Attention schedule: %d prepared candidate(s) passed startup checks.", validated)
@@ -1408,7 +1421,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             raise ValueError("shared-backbone loading does not support quantization in v1")
         if self.parallel_config.use_hsdp:
             raise ValueError("shared-backbone loading does not support HSDP in v1")
-        if getattr(self.od_config, "lora_application", None) == "merged":
+        if self.od_config.lora_application == "merged":
             # Merged adapters copy adapted values into the base parameter in
             # place, which would write into provider-backed IPC views.
             raise ValueError("shared-backbone loading does not support merged LoRA adapters")
@@ -1560,7 +1573,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             targets,
         )
 
-        thread_count = int(getattr(self.od_config, "num_weight_load_threads", 4))
+        thread_count = int(self.od_config.num_weight_load_threads)
         if _is_distributed_rank_zero():
             directory_label = "directory" if len(checkpoint_states) == 1 else "directories"
             logger.info(
@@ -1826,8 +1839,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             model,
             dit_modules=tuple(zip(outer_dit_names, outer_dits)),
             sources=sources,
-            model_path=str(getattr(self.od_config, "model", "")) or None,
-            tensor_parallel_size=int(getattr(self.parallel_config, "tensor_parallel_size", 1)),
+            model_path=str(self.od_config.model) or None,
+            tensor_parallel_size=int(self.parallel_config.tensor_parallel_size),
             online_quantization=False,
         )
         if plan_result.plan is None:
@@ -1994,7 +2007,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # mapping (QKV fusion, etc.).
         if load_format == "diffusers":
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
-        strategy = getattr(self.od_config, "hsdp_weight_load_strategy", "full")
+        strategy = self.od_config.hsdp_weight_load_strategy
         if strategy == "pre_sharded":
             if load_format != "default":
                 raise ValueError(
@@ -2002,7 +2015,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 )
             if self.quant_config is not None:
                 raise ValueError(f"hsdp_weight_load_strategy={strategy!r} does not support quantization yet")
-            if getattr(self.od_config, "lora_path", None):
+            if self.od_config.lora_path:
                 raise ValueError(f"hsdp_weight_load_strategy={strategy!r} does not support LoRA yet")
         elif strategy != "full":
             raise ValueError(f"Unknown hsdp_weight_load_strategy: {strategy!r}")
@@ -2040,7 +2053,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             has_online_quant = self._has_online_quant(model) or (
                 self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
             )
-            enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
+            enable_broadcast = bool(self.od_config.enable_broadcast_weight_load) and world_size > 1
 
             if enable_broadcast and has_online_quant:
                 logger.info(
@@ -2057,8 +2070,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
                 if (
                     rank != 0
-                    and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
-                    and getattr(self.od_config, "lora_path", None)
+                    and self.od_config.lora_backend in (LoRABackend.DISTILL, "distill")
+                    and self.od_config.lora_path
                     and hasattr(model, "load_lora_weights")
                 ):
                     setattr(model, "lora_is_fused", True)

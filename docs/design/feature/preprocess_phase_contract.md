@@ -33,9 +33,9 @@ documentation and regression coverage; no hot-path allocation is added.
 
 ```text
 Scheduler / current input batch
-  prompt_token_ids + num_computed_tokens_cpu (before this step)
+  prompt length + computed-token count (before this step)
                          |
-            OmniGPUModelRunner._preprocess
+            OmniModelState.run_preprocess
                          |
             per-request phase metadata
                   /                 \
@@ -48,12 +48,11 @@ Scheduler / current input batch
                     model forward
 ```
 
-The producer is `OmniGPUModelRunner._preprocess` in
-`vllm_omni/worker/gpu_model_runner.py`. `GPUARModelRunner` and
-`GPUGenerationModelRunner` inherit it. The current `OmniNPUModelRunner` also
-inherits this method; device-specific execution still needs its own hardware
-validation. A plugin runner that overrides preprocessing is responsible for
-preserving this interface.
+The producer is `OmniModelState.run_preprocess` in
+`vllm_omni/worker_v2/model_states/omni_model_state.py`, called by the V2 runner.
+The model state gathers current prompt lengths and computed-token counts from
+native request state and the input batch. Platform-specific model states must
+preserve this interface; device-specific execution needs its own validation.
 
 ### Stable model-facing fields
 

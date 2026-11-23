@@ -38,7 +38,7 @@ _H3_ATTENTION_DTYPE = torch.bfloat16
 
 def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, AttentionSpec]]:
     """The self-attention spec of each schedule profile that selects FASTVIDEO_VSA, with its name."""
-    schedule = getattr(od_config, "diffusion_attention_schedule", None)
+    schedule = od_config.diffusion_attention_schedule
     if schedule is None:
         return []
     specs = []
@@ -204,7 +204,7 @@ class FastH3CheckpointSpec:
                 raise OmniClientError(f"{self.name} step execution does not support custom timesteps or sigmas")
         if sampling.timesteps is not None or sampling.sigmas is not None:
             raise OmniClientError(f"{self.name} does not support custom timesteps or sigmas")
-        if sampling.lora_request is not None:
+        if sampling.lora_request is not None and not isinstance(self, FastH3OmniCheckpointSpec):
             raise OmniClientError(f"{self.name} does not support per-request LoRA adapters")
         steps = sampling.num_inference_steps
         if steps is not None and steps != FASTH3_V2_BASE_SCHEDULE.num_inference_steps:

@@ -13,7 +13,7 @@ from enum import Enum
 
 import torch
 
-from .tensor_utils import flatten_physical_storage, physical_storage_numel
+from .tensor_utils import flatten_physical_storage, physical_storage_numel, zero_tensor_storage
 
 
 def dtype_element_size(dtype: torch.dtype) -> int:
@@ -123,7 +123,7 @@ def pack_local_shard(
         local = allocator(dm.local_numel, dm.dtype)
         if local.device.type != "cpu":
             raise ValueError(f"shard allocator returned non-CPU tensor: {local.device}")
-        local.zero_()
+        zero_tensor_storage(local)
         for tensor_meta in dm.tensors:
             tensor_begin = tensor_meta.offset
             tensor_end = tensor_begin + tensor_meta.numel

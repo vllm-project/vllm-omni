@@ -238,6 +238,8 @@ def _post_commit_definitive_refusal(
 def _post_commit_refusal_indexes(
     events: list[dict[str, object]],
     committed_index: int | None,
+    *,
+    end_index: int | None = None,
 ) -> frozenset[int]:
     """Positions of the refusal errors that answered the forced create.
 
@@ -249,7 +251,7 @@ def _post_commit_refusal_indexes(
         return frozenset()
     return frozenset(
         index
-        for index in range(committed_index + 1, len(events))
+        for index in range(committed_index + 1, len(events) if end_index is None else end_index)
         if events[index].get("type") == "error" and ErrorEvent(events[index]).code in DEFINITIVE_REFUSAL_CODES
     )
 
@@ -383,6 +385,34 @@ def _event_count_after(
     if index is None:
         return 0
     return sum(event.get("type") == event_type for event in events[index + 1 :])
+
+
+def _replay_tail_window(
+    total_samples: int,
+    total_frames: int,
+    replay_seconds: float,
+    sample_rate: int,
+    video_fps: float,
+) -> tuple[int, int] | None:
+    """Return tail sizes aligned to a common source frame boundary.
+
+    Skip windows rounding to zero, which would otherwise slice with ``[-0:]``.
+    For video, round the start back to the preceding sampled frame so the
+    first audio unit and frame share the same source timestamp.
+    """
+    if not math.isfinite(replay_seconds) or replay_seconds <= 0:
+        return None
+    replay_seconds = min(replay_seconds, total_samples / sample_rate)
+    samples = int(round(replay_seconds * sample_rate))
+    if samples <= 0:
+        return None
+    if total_frames <= 0:
+        return samples, 0
+    if round(min(replay_seconds, total_frames / video_fps) * video_fps) <= 0:
+        return None
+    start_frame = min(math.floor((total_samples - samples) * video_fps / sample_rate), total_frames - 1)
+    start_sample = round(start_frame * sample_rate / video_fps)
+    return total_samples - start_sample, total_frames - start_frame
 
 
 #: How long a forced final commit may take to open its response before the
@@ -890,6 +920,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     if input_wav is not None and not input_pcm16:
         raise ValueError("input WAV has no audio")
 
+    source_pcm16 = input_pcm16
     collector = _StreamingEventCollector(stream_writer)
     client = _TimedInputClient(
         args.url,
@@ -1064,6 +1095,102 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         except TimeoutError as exc:
             wait_error = str(exc)
         forced_response_fallback_sent = forced_response_fallback_sent or fallback_progress["sent"]
+        forced_response_windows: list[tuple[int, int]] = []
+        if final_create_response and committed_index is not None:
+            forced_response_windows.append((committed_index, len(collector.events)))
+        # Native duplex can end the model's own answer mid-sentence: the
+        # model samples <|turn_eos|> between units and the sentence never
+        # finishes, and the forced post-commit response then answers the
+        # trailing silence by listening instead of speaking, so whatever
+        # the cut sentence never said is lost for good. Re-asking through
+        # the protocol's text channels is refused for speech-native
+        # duplex models (text_only_turn_unsupported), so the one recovery
+        # path that stays inside supported protocol is to replay the tail
+        # of the input -- audio and the matching video frames -- and let
+        # a fresh forced response answer fresh, answerable input.
+        post_commit_replay_seconds = float(getattr(args, "post_commit_replay_seconds", 0.0) or 0.0)
+        post_commit_replay_triggered = False
+        post_commit_replay_error: str | None = None
+        post_commit_replay_frames_sent = 0
+        if (
+            post_commit_replay_seconds > 0
+            and final_create_response
+            and committed_index is not None
+            and not wait_error
+            and _event_count_after(collector.events, "response.output_audio_transcript.delta", committed_index) == 0
+        ):
+            transcript_so_far = "".join(
+                str(event.get("delta", ""))
+                for event in collector.events
+                if event.get("type") in {"response.output_audio_transcript.delta", "response.output_text.delta"}
+            )
+            # Trailing-silence answers can legitimately be listen-only, so
+            # only a transcript that stops mid-sentence marks the lost tail
+            # as a truncated answer rather than a finished one. Both ASCII
+            # and fullwidth CJK sentence-final marks are listed, because
+            # speech-native models answer with fullwidth punctuation.
+            SENTENCE_FINAL_MARKS = ".!?;。！？；…"
+            if transcript_so_far and transcript_so_far[-1] not in SENTENCE_FINAL_MARKS:
+                replay_window = _replay_tail_window(
+                    len(source_pcm16) // PCM16_BYTES_PER_SAMPLE,
+                    len(video_frames),
+                    post_commit_replay_seconds,
+                    PCM16_SAMPLE_RATE,
+                    args.video_fps,
+                )
+                if replay_window is None:
+                    # A positive duration that rounds to zero samples or
+                    # frames would slice with seq[-0:] and replay the
+                    # whole stream; skip instead of misaligned windows.
+                    post_commit_replay_error = f"replay window rounds to zero for {post_commit_replay_seconds}s"
+                else:
+                    replay_committed_index = None
+                    try:
+                        replay_samples = replay_window[0]
+                        # Slice audio and frames from the original clip, before
+                        # synthetic tail silence was appended to the input stream.
+                        replay_pcm = source_pcm16[-replay_samples * PCM16_BYTES_PER_SAMPLE :]
+                        replay_frames = None
+                        replay_stacked = None
+                        if video_frames:
+                            replay_frame_count = replay_window[1]
+                            replay_frames = video_frames[-replay_frame_count:]
+                            replay_stacked = stacked_video_frames[-replay_frame_count:]
+                        post_commit_replay_triggered = True
+                        post_commit_replay_frames_sent = await client.stream_pcm(
+                            replay_pcm,
+                            chunk_ms=args.chunk_ms,
+                            realtime=not args.no_realtime_pacing,
+                            video_frames=replay_frames,
+                            stacked_video_frames=replay_stacked,
+                            # Frame selection restarts locally; append_audio
+                            # keeps the session's wire media clock monotonic.
+                        )
+                        replay_commit_cursor = len(collector.events)
+                        await _commit_input_after_playback_checkpoint(client, collector, create_response=True)
+                        await wait_for_condition(
+                            lambda: _input_committed_index(collector.events, replay_commit_cursor) is not None,
+                            timeout_s=args.timeout_s,
+                            label="replay input_audio_buffer.committed",
+                        )
+                        replay_committed_index = _input_committed_index(collector.events, replay_commit_cursor)
+                        await _drain_forced_post_commit_response(
+                            client,
+                            collector,
+                            committed_index=replay_committed_index,
+                            timeout_s=args.timeout_s,
+                            create_timeout_s=min(_FORCED_RESPONSE_CREATE_TIMEOUT_S, float(args.timeout_s)),
+                            # Same deferral reading as the first drain: the
+                            # session still auto-responds and still carries
+                            # video frames.
+                            commit_may_defer_create=(not client.config.auto_response or bool(video_frames)),
+                        )
+                    except TimeoutError as exc:
+                        post_commit_replay_error = str(exc)
+                        wait_error = f"Post-commit replay failed: {exc}"
+                    finally:
+                        if replay_committed_index is not None:
+                            forced_response_windows.append((replay_committed_index, len(collector.events)))
         await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
         await client.close(timeout_s=args.timeout_s)
@@ -1123,10 +1250,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         # refusals that arrived after the commit are forgiven: an earlier one
         # came from some other ask and still fails the run, as does every
         # other error.
-        forgiven_indexes = (
-            _post_commit_refusal_indexes(collector.events, committed_index)
-            if final_create_response and committed_index is not None
-            else frozenset()
+        forgiven_indexes = frozenset(
+            index
+            for start, end in forced_response_windows
+            for index in _post_commit_refusal_indexes(collector.events, start, end_index=end)
         )
         errors = collector.errors(exclude_indexes=forgiven_indexes)
         if wait_error:
@@ -1169,6 +1296,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "tail_video_frames_sent": tail_frames_sent,
             "post_commit": {
                 "input_committed_event_index": committed_index,
+                "forced_response_windows": forced_response_windows,
                 "decision": post_commit_decision,
                 "decision_required": wait_for_post_commit_decision,
                 "final_create_response": final_create_response,
@@ -1191,6 +1319,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     "response.done",
                     committed_index,
                 ),
+                "replay_seconds": post_commit_replay_seconds,
+                "replay_triggered": post_commit_replay_triggered,
+                "replay_frames_sent": post_commit_replay_frames_sent,
+                "replay_error": post_commit_replay_error,
             },
             "input_video": args.input_video,
             "input_wav": args.input_wav,
@@ -1312,7 +1444,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-previous-max-tokens", type=int, default=500)
     parser.add_argument(
         "--tail-silence-s",
-        type=int,
+        type=float,
         default=0,
         help="Additional silent seconds holding the last frame to allow the final answer to finish.",
     )
@@ -1325,10 +1457,24 @@ def parse_args() -> argparse.Namespace:
             "without this the last user turn can stay unanswered."
         ),
     )
+    parser.add_argument(
+        "--post-commit-replay-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "When the post-commit forced response stays silent and the "
+            "transcript stops mid-sentence, replay this many seconds of the "
+            "input (audio plus the matching video frames), commit again and "
+            "drain one more forced response. Video replay starts at the preceding "
+            "sampled-frame boundary. 0 disables the replay."
+        ),
+    )
     parser.add_argument("--require-audio", action="store_true")
     args = parser.parse_args()
     if args.tail_silence_s < 0:
         parser.error("--tail-silence-s must be nonnegative")
+    if not math.isfinite(args.post_commit_replay_seconds) or args.post_commit_replay_seconds < 0:
+        parser.error("--post-commit-replay-seconds must be finite and nonnegative")
     if not 0 < args.basic_window_low_tokens < args.basic_window_high_tokens:
         parser.error("window watermarks must satisfy 0 < low < high")
     if args.context_max_units <= 0 or args.context_previous_max_tokens <= 0:

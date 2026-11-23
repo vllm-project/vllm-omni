@@ -13,6 +13,7 @@ from weakref import WeakKeyDictionary
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.minicpmo_4_5.config import stage_connector_extra
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 logger = init_logger(__name__)
@@ -53,12 +54,19 @@ def _pad_rows(value: torch.Tensor, target_batch: int) -> torch.Tensor:
     return torch.cat((value, value.new_zeros((missing, *value.shape[1:]))), dim=0)
 
 
-def _pad_cache_rows(value: torch.Tensor, target_batch: int) -> torch.Tensor:
-    """Append all-zero request slots to a packed cache (batch is dim 1)."""
-    missing = target_batch - int(value.shape[1])
+def _pad_cache_rows(value: torch.Tensor, target_batch: int, *, batch_dim: int = 1) -> torch.Tensor:
+    """Append all-zero request slots to a packed cache along ``batch_dim``.
+
+    The CNN cache is ``(depth, rows, ...)``, while the estimator attention
+    cache keeps the K/V half on dim 1 (``(depth, 2, rows, heads, frames,
+    head_dim)``), so its request slots sit on dim 2.
+    """
+    missing = target_batch - int(value.shape[batch_dim])
     if missing <= 0:
         return value
-    return torch.cat((value, value.new_zeros((value.shape[0], missing, *value.shape[2:]))), dim=1)
+    shape = list(value.shape)
+    shape[batch_dim] = missing
+    return torch.cat((value, value.new_zeros(shape)), dim=batch_dim)
 
 
 def _parse_batch_buckets(raw: object) -> tuple[int, ...]:
@@ -140,15 +148,27 @@ def _graphable_estimator_step(
     cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
     old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
     old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+    # Upstream walks the layers itself and needs ``[K | V]`` packed per layer,
+    # while the buffers kept across steps split K/V on a leading axis: pack on
+    # the way in and unpack the result back into ``att_out``, so the graph's
+    # output placeholder stays on the split layout the next step expects.
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
+        _pack_att_cache,
+        _packed_att_buffer,
+        _unpack_att_cache,
+    )
+
+    packed_out = _packed_att_buffer(att_out)
     result = estimator.blocks_forward_chunk(
         estimator_input,
         time_embedding,
         attn_mask,
         old_cnn,
-        old_att,
+        _pack_att_cache(old_att),
         cnn_out,
-        att_out,
+        packed_out,
     )
+    _unpack_att_cache(packed_out, att_out)
     return result, cnn_out, att_out
 
 
@@ -244,13 +264,15 @@ def _patched_estimator_step(
                 mask_inputs = (attn_mask,)
             if cnn_cache is not None:
                 cnn_cache = _pad_cache_rows(cnn_cache, padded_batch)
-                att_cache = _pad_cache_rows(att_cache, padded_batch)
+                # The attention cache splits K/V on dim 1, so its request rows
+                # are one axis further out than the CNN cache's.
+                att_cache = _pad_cache_rows(att_cache, padded_batch, batch_dim=2)
 
     def _unpad(outputs):
         if padded_batch == live_batch:
             return outputs
         result, new_cnn, new_att = outputs
-        return (result[:live_batch], new_cnn[:, :live_batch], new_att[:, :live_batch])
+        return (result[:live_batch], new_cnn[:, :live_batch], new_att[:, :, :live_batch])
 
     if cnn_cache is None:
         return _unpad(
@@ -338,7 +360,7 @@ def _patched_build_backend(self) -> None:
     if self.backend is not None:
         return
 
-    extra = self._extra_config()
+    extra = stage_connector_extra(self.vllm_config)
     if bool(extra.get(_BF16_ATTENTION_CACHE_KEY, False)):
         raise ValueError(
             "MiniCPM-o Code2Wav code2wav_bfloat16_attention_cache is "
@@ -346,6 +368,12 @@ def _patched_build_backend(self) -> None:
         )
 
     config = _graph_config(self)
+    if "code2wav_fused_qkv_norm" in config:
+        logger.warning_once(
+            "MiniCPM-o NPU additional_config.code2wav_fused_qkv_norm has been removed and is ignored, "
+            "including false. Eligible FP32 inputs automatically use fused QKV normalization; "
+            "unsupported inputs use the native fallback. Remove the stale key from your deployment or overlay YAML."
+        )
     cfm_config = getattr(self, "_cfm_graph_config", {})
     max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, cfm_config.get("max_graphs", 32)))))
     graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), bool(cfm_config.get("enabled", False)))
@@ -355,7 +383,11 @@ def _patched_build_backend(self) -> None:
     # Preserve the NPU stage switches while routing enabled CFM work through
     # the shared Whole-Euler/step wrappers (including masks and shared arenas).
     if hasattr(self, "_cfm_graph_config"):
-        self._cfm_graph_config = {**self._cfm_graph_config, "enabled": graph_enabled, "max_graphs": max_graphs}
+        self._cfm_graph_config = {
+            **self._cfm_graph_config,
+            "enabled": graph_enabled,
+            "max_graphs": max_graphs,
+        }
     needs_runtime = graph_enabled or any(
         getattr(self, name, {}).get("enabled", False)
         for name in ("_hift_graph_config", "_chunk_encoder_graph_config", "_encoder_graph_config")
@@ -415,7 +447,7 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     if _PATCHED:
         return
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
         BatchedToken2Wav,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (

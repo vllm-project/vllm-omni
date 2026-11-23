@@ -69,6 +69,7 @@ from .tensor_utils import (
     restore_tensor_storage,
     set_tensor_storage,
     tensor_storage_metadata,
+    zeros_for_storage,
 )
 from .tensor_utils import (
     dtype_size as _dtype_size,
@@ -82,6 +83,23 @@ logger = init_logger(__name__)
 # retry removes the pair before closing the lease.
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
+
+# Collective backends do not support E8M0 scales or packed FP4 as element
+# types. Both are byte-addressable and bit-preserving under a uint8 view, so
+# collect the underlying bytes and view the output back to the original dtype.
+_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu, torch.float4_e2m1fn_x2})
+
+
+def _all_gather_shard(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+    group: torch.distributed.ProcessGroup | None,
+) -> None:
+    """All-gather a shard, using byte storage for unsupported dtypes."""
+    if input_tensor.dtype in _BYTE_VIEW_ALLGATHER_DTYPES:
+        output = output.view(torch.uint8)
+        input_tensor = input_tensor.view(torch.uint8)
+    torch.distributed.all_gather_into_tensor(output, input_tensor, group=group)
 
 
 def _retain_active_hwr_registration(
@@ -465,12 +483,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
             # Allocate ONLY the shard (1/dp_size), zero-padded to ceil.
             # Avoids materialising the full block on CPU.
-            shard = torch.zeros(
-                shard_size,
-                dtype=dtype,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
+            shard = zeros_for_storage(shard_size, dtype, pin_memory=pin_memory)
 
             current_offset = 0
             for spec in specs:
@@ -662,10 +675,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 with current_omni_platform.stream(self.comm_stream):
                     for dtype, local_shard in gpu_shards.items():
                         gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                        torch.distributed.all_gather_into_tensor(
+                        _all_gather_shard(
                             gw,
                             local_shard,
-                            group=self.dp_group,
+                            self.dp_group,
                         )
                     evt.record(self.comm_stream)
             else:
@@ -692,10 +705,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                             full_out = gpu_weights[dtype_manifest.dtype][
                                 chunk.full_offset : chunk.full_offset + chunk.padded_numel
                             ]
-                            torch.distributed.all_gather_into_tensor(
+                            _all_gather_shard(
                                 full_out,
                                 local_input,
-                                group=self.dp_group,
+                                self.dp_group,
                             )
                             self._ag_done_events[input_slot].record(self.comm_stream)
                         self._chunk_reuse_events[input_slot] = self._ag_done_events[input_slot]
