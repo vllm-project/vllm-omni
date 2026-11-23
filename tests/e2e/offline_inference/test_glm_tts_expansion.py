@@ -23,6 +23,8 @@ pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = os.environ.get("GLM_TTS_MODEL_PATH", "zai-org/GLM-TTS")
 REF_TEXT = "他当时还跟线下其他的站姐吵架，然后，打架进局子了。"
+TRANSCRIPT_LANGUAGE = "zh"
+TRANSCRIPT_ESCALATION_MODEL = "large-v3"
 
 DEPLOY_CONFIG = get_deploy_config_path("glm_tts.yaml")
 REFERENCE_PROMPT_WAV_PATH = get_asset_path("glm_tts/jiayan_zh.wav")
@@ -126,7 +128,7 @@ def test_offline_voice_clone_zh(async_chunk: bool) -> None:
 
         with tempfile.NamedTemporaryFile(suffix=".wav") as out_file:
             sf.write(out_file.name, audio, samplerate=_extract_sample_rate(audio_mm), format="WAV")
-            transcript = convert_audio_file_to_text(out_file.name)
+            transcript = convert_audio_file_to_text(out_file.name, language=TRANSCRIPT_LANGUAGE)
             audio_bytes = open(out_file.name, "rb").read()
 
         assert_audio_speech_response(
@@ -136,6 +138,11 @@ def test_offline_voice_clone_zh(async_chunk: bool) -> None:
                 audio_content=transcript,
                 audio_format="audio/wav",
             ),
-            {"input": synth_text, "response_format": "wav"},
+            {
+                "input": synth_text,
+                "response_format": "wav",
+                "transcript_language": TRANSCRIPT_LANGUAGE,
+                "transcript_escalation_model": TRANSCRIPT_ESCALATION_MODEL,
+            },
             run_level="full_model",
         )

@@ -16,6 +16,13 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts
     Qwen3TTSTokenizerV2Encoder,
 )
 
+# Reference frames the encoder is compiled for at warmup. Mimi's quantizer calls
+# ``torch.cdist``, which checks whether its input has more than 25 rows (batch
+# times frames), so the compiled graph is guarded on that. A reference of 25
+# frames (2 s) or fewer, encoded alone, would compile again inside its request.
+# Shorter references are padded up to this, as a short row in a batch already is.
+_WARMUP_FRAMES = 32
+
 
 class BreezeReferenceEncoder(nn.Module):
     def __init__(self, vllm_config: VllmConfig) -> None:
@@ -60,7 +67,8 @@ class BreezeReferenceEncoder(nn.Module):
     def encode_batch(self, waveforms: list[torch.Tensor], frame_counts: list[int]) -> list[torch.Tensor]:
         device = next(self.encoder.parameters()).device
         waveform = nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
-        waveform = nn.functional.pad(waveform, (0, -waveform.shape[1] % 1920))
+        frames = max(-(-waveform.shape[1] // 1920), _WARMUP_FRAMES)
+        waveform = nn.functional.pad(waveform, (0, frames * 1920 - waveform.shape[1]))
         waveform_frames = waveform.reshape(len(waveforms), -1, 1920).to(device=device, dtype=torch.float32)
         lengths = torch.tensor([waveform.numel() for waveform in waveforms], device=device, dtype=torch.long)
         with torch.backends.cudnn.flags(allow_tf32=False):
@@ -74,8 +82,8 @@ class BreezeReferenceEncoder(nn.Module):
         device = next(self.encoder.parameters()).device
         with torch.backends.cudnn.flags(allow_tf32=False):
             for batch in range(1, max_batch_size + 1):
-                waveform_frames = torch.zeros((batch, 32, 1920), device=device, dtype=torch.float32)
-                lengths = torch.full((batch,), 32 * 1920, device=device, dtype=torch.long)
+                waveform_frames = torch.zeros((batch, _WARMUP_FRAMES, 1920), device=device, dtype=torch.float32)
+                lengths = torch.full((batch,), _WARMUP_FRAMES * 1920, device=device, dtype=torch.long)
                 # Initialize the codec's normalized codebooks before tracing.
                 self._encode_impl(waveform_frames, lengths)
                 self._compiled_encode(waveform_frames, lengths)

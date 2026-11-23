@@ -108,6 +108,13 @@ top-k/top-p masking before the model's categorical draw with request-local Torch
 Unseeded and greedy rows keep upstream sampling. When mixed rows have already
 been masked, their upstream call disables repeated masking and fused sampling.
 
+Residual codebooks use a second request-owned generator that persists across
+frames and is independent of batch ordering. An explicit `tts_local_seed`
+takes precedence; otherwise the Talker stage seed is domain-separated from
+codebook 0. Seedless requests retain global-RNG sampling. Qwen3-Omni keeps the
+outer MTP uniform buffer disabled, so explicitly seeded rows execute that
+wrapper eagerly while the code predictor's inner device graphs remain usable.
+
 Custom samplers register their selected JIT kernels while the runner's startup
 registry is active. The Talker's seeded stream uses native top-k/top-p
 masking even when unseeded sampling selects FlashInfer, so it registers those

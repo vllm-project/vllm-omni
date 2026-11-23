@@ -26,6 +26,7 @@ AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
+R2_01_EXPECTED_COUNT = 1456
 AMD_SOURCE_DEPENDENCIES = Path(".buildkite/common/ci_source_file_dependencies.yml")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
@@ -826,7 +827,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1454,
+        R2_01_EXPECTED_COUNT,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -2532,6 +2533,287 @@ def test_qwen_image_weekly_jobs_are_exact_blocking_owners() -> None:
     assert autoround_step["commands"][0].startswith("export QWEN_IMAGE_AUTOROUND_ARTIFACT_DIR=")
 
 
+_LONGCAT_WEEKLY_1GPU_NODES = (
+    "tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[default]",
+    "tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[single_card_001]",
+    "tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[default]",
+    "tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[single_card_001]",
+)
+_LONGCAT_WEEKLY_2GPU_NODES = (
+    "tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[parallel_001]",
+    "tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[parallel_001]",
+)
+_BOOGU_WEEKLY_1GPU_NODES = (
+    "tests/e2e/online_serving/test_boogu_image.py::test_text_to_image_001[default]",
+    "tests/e2e/online_serving/test_boogu_image.py::test_batch_001[default]",
+    "tests/e2e/online_serving/test_boogu_image_edit.py::test_single_image_to_image_001[edit]",
+    "tests/e2e/online_serving/test_boogu_image_edit.py::test_single_image_to_image_001[edit-turbo-hotfix-1k]",
+    "tests/e2e/online_serving/test_boogu_image_edit.py::test_double_guidance_001[default]",
+    "tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_001[edit]",
+    "tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_001[edit-turbo-hotfix-1k]",
+    "tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_double_guidance_001[default]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[default]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[vae_slicing_tiling]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[default]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[vae_slicing_tiling]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[default]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[vae_slicing_tiling]",
+    "tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_image_only_guidance[default]",
+    "tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_align_res_output_size[edit]",
+    "tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_align_res_output_size[edit-turbo-hotfix-1k]",
+)
+_BOOGU_WEEKLY_2GPU_NODES = (
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[cfg_parallel_2]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[cfg_parallel_2]",
+    "tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[cfg_parallel_2]",
+    "tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_image_only_guidance[cfg_parallel_2]",
+    "tests/e2e/online_serving/test_boogu_image_edit_expansion.py::"
+    "test_double_guidance_cfg_parallel[cfg_parallel_2_round_robin]",
+    "tests/e2e/online_serving/test_boogu_image_edit_expansion.py::"
+    "test_cfg_off_on_cfg_parallel_server[cfg_parallel_2_cfg_off]",
+)
+_BOOGU_WEEKLY_3RANK_NODES = (
+    "tests/e2e/online_serving/test_boogu_image_edit_expansion.py::"
+    "test_double_guidance_cfg_parallel[cfg_parallel_3_full]",
+)
+_FLUX_WEEKLY_1GPU_NODES = (
+    *(
+        f"tests/e2e/online_serving/test_flux_2_dev_expansion.py::{test_name}[{case}]"
+        for test_name in ("test_flux_2_dev", "test_flux_2_dev_batched_chat_completions")
+        for case in ("cpu_offload", "layerwise_offload")
+    ),
+    "tests/e2e/offline_inference/test_flux1_schnell_expansion.py::test_flux_schnell_text_to_image",
+)
+_FLUX_WEEKLY_2GPU_NODES = (
+    *(
+        f"tests/e2e/online_serving/test_flux_2_dev_expansion.py::{test_name}[{case}]"
+        for test_name in ("test_flux_2_dev", "test_flux_2_dev_batched_chat_completions")
+        for case in ("parallel_cfg_2", "ulysses_2", "ring_2", "vae_patch_parallel_2")
+    ),
+    "tests/e2e/offline_inference/test_flux1_kontext_expansion.py::test_flux_kontext_text_to_image",
+    "tests/e2e/offline_inference/test_flux1_kontext_expansion.py::test_flux_kontext_image_edit",
+)
+_KREA2_WEEKLY_1GPU_NODES = (
+    "tests/e2e/online_serving/test_krea2_expansion.py::test_krea2[single_card_basic]",
+    "tests/e2e/online_serving/test_krea2_expansion.py::test_krea2[single_card_layerwise_offload]",
+    "tests/e2e/online_serving/test_krea2_expansion.py::test_krea2_lora[single_card_lora]",
+    "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_text_to_image_001",
+    "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_layerwise_offload",
+    "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_cache_dit",
+    "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_lora",
+)
+_KREA2_WEEKLY_2GPU_NODES = (
+    "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_hsdp",
+    "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_vae_patch_parallel",
+)
+_AMD_DIFFUSION_PARITY_WEEKLY_JOBS = (
+    (
+        "LongCat online · 1-GPU",
+        "mi300_1",
+        "1",
+        "rocm-longcat-weekly-1gpu",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "diffusion_longcat_weekly",
+        _LONGCAT_WEEKLY_1GPU_NODES,
+    ),
+    (
+        "LongCat online · 2-GPU",
+        "mi300_2",
+        "2",
+        "rocm-longcat-weekly-2gpu",
+        "slow and diffusion and rocm and MI325 and cards_2",
+        "diffusion_longcat_weekly",
+        _LONGCAT_WEEKLY_2GPU_NODES,
+    ),
+    (
+        "Boogu online · 1-GPU",
+        "mi300_1",
+        "1",
+        "rocm-boogu-weekly-1gpu",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "diffusion_boogu_weekly",
+        _BOOGU_WEEKLY_1GPU_NODES,
+    ),
+    (
+        "Boogu online · 2-GPU",
+        "mi300_2",
+        "2",
+        "rocm-boogu-weekly-2gpu",
+        "slow and diffusion and rocm and MI325 and cards_2",
+        "diffusion_boogu_weekly",
+        _BOOGU_WEEKLY_2GPU_NODES,
+    ),
+    (
+        "Boogu Edit CFG · 3-rank on 4-GPU",
+        "mi300_4",
+        "4",
+        "rocm-boogu-edit-cfg-weekly-3rank",
+        "slow and diffusion and rocm and MI325 and cards_3",
+        "diffusion_boogu_weekly",
+        _BOOGU_WEEKLY_3RANK_NODES,
+    ),
+    (
+        "Flux online and offline · 1-GPU",
+        "mi300_1",
+        "1",
+        "rocm-flux-weekly-1gpu",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "diffusion_flux_weekly",
+        _FLUX_WEEKLY_1GPU_NODES,
+    ),
+    (
+        "Flux online and offline · 2-GPU",
+        "mi300_2",
+        "2",
+        "rocm-flux-weekly-2gpu",
+        "slow and diffusion and rocm and MI325 and cards_2",
+        "diffusion_flux_weekly",
+        _FLUX_WEEKLY_2GPU_NODES,
+    ),
+    (
+        "Krea2 online and offline · 1-GPU",
+        "mi300_1",
+        "1",
+        "rocm-krea2-weekly-1gpu",
+        "slow and diffusion and rocm and MI325 and cards_1",
+        "diffusion_krea2_weekly",
+        _KREA2_WEEKLY_1GPU_NODES,
+    ),
+    (
+        "Krea2 offline · 2-GPU",
+        "mi300_2",
+        "2",
+        "rocm-krea2-weekly-2gpu",
+        "slow and diffusion and rocm and MI325 and cards_2",
+        "diffusion_krea2_weekly",
+        _KREA2_WEEKLY_2GPU_NODES,
+    ),
+)
+_AMD_DIFFUSION_PARITY_WEEKLY_LABELS = {job[0] for job in _AMD_DIFFUSION_PARITY_WEEKLY_JOBS}
+
+
+def test_longcat_boogu_flux_krea2_weekly_jobs_are_exact_blocking_rocm_owners() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
+    runner = ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh"
+    runner_dependency = "rocm_diffusion_nightly_runner"
+    weekly_group = _find_group("Diffusion E2E Weekly", AMD_WEEKLY_PIPELINE)
+    matching_steps = [step for step in weekly_group["steps"] if step["label"] in _AMD_DIFFUSION_PARITY_WEEKLY_LABELS]
+    assert len(matching_steps) == len(_AMD_DIFFUSION_PARITY_WEEKLY_JOBS)
+
+    for (
+        label,
+        agent_pool,
+        expected_gpus,
+        artifact_name,
+        marker,
+        dependency_key,
+        nodes,
+    ) in _AMD_DIFFUSION_PARITY_WEEKLY_JOBS:
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        assert step["grade"] == "Blocking"
+        assert step["agent_pool"] == agent_pool
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 300
+        assert step["source_file_dependencies"] == [dependency_key, runner_dependency]
+        assert step["env"] == {
+            "VLLM_ROCM_USE_AITER": "0",
+            "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
+        }
+        assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
+        assert "retry" not in step
+
+        assert len(step["commands"]) == 1
+        tokens = [token for token in split(step["commands"][0]) if token.strip()]
+        runner_index = tokens.index(runner)
+        args = tokens[runner_index + 1 :]
+        assert args[:4] == [expected_gpus, str(len(nodes)), "285m", artifact_name]
+        marker_index = args.index("-m")
+        assert args[marker_index + 1] == marker
+        assert tuple(args[4:marker_index]) == nodes
+
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+    dependency_contracts = {
+        "diffusion_longcat_weekly": {
+            "vllm_omni/diffusion/models/longcat_image/",
+            "tests/e2e/online_serving/test_longcat_image_expansion.py",
+            "tests/e2e/online_serving/test_longcat_image_edit_expansion.py",
+        },
+        "diffusion_boogu_weekly": {
+            "vllm_omni/diffusion/models/boogu_image/",
+            "tests/e2e/online_serving/test_boogu_image.py",
+            "tests/e2e/online_serving/test_boogu_image_edit.py",
+            "tests/e2e/online_serving/test_boogu_image_expansion.py",
+            "tests/e2e/online_serving/test_boogu_image_edit_expansion.py",
+        },
+        "diffusion_flux_weekly": {
+            "vllm_omni/diffusion/models/flux/",
+            "vllm_omni/diffusion/models/flux2/",
+            "tests/e2e/online_serving/test_flux_2_dev_expansion.py",
+            "tests/e2e/offline_inference/test_flux1_schnell_expansion.py",
+            "tests/e2e/offline_inference/test_flux1_kontext_expansion.py",
+        },
+        "diffusion_krea2_weekly": {
+            "vllm_omni/diffusion/models/krea2/",
+            "vllm_omni/diffusion/lora/",
+            "vllm_omni/lora/",
+            "tests/e2e/online_serving/test_krea2_expansion.py",
+            "tests/e2e/offline_inference/test_krea2_expansion.py",
+        },
+    }
+    for dependency_key, required_paths in dependency_contracts.items():
+        assert required_paths <= flatten_paths(dependencies[dependency_key])
+    assert {runner, ".buildkite/amd/scripts/assert-pytest-collection.sh"} <= flatten_paths(
+        dependencies[runner_dependency]
+    )
+
+    single_mark = 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})'
+    parallel_2_mark = 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)'
+    parallel_3_mark = 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3)'
+    for source_path in (
+        "tests/e2e/online_serving/test_longcat_image_expansion.py",
+        "tests/e2e/online_serving/test_longcat_image_edit_expansion.py",
+        "tests/e2e/online_serving/test_boogu_image_expansion.py",
+        "tests/e2e/online_serving/test_flux_2_dev_expansion.py",
+    ):
+        source = Path(source_path).read_text(encoding="utf-8")
+        assert single_mark in source
+        assert parallel_2_mark in source
+    for source_path in (
+        "tests/e2e/online_serving/test_boogu_image.py",
+        "tests/e2e/online_serving/test_boogu_image_edit.py",
+        "tests/e2e/online_serving/test_krea2_expansion.py",
+    ):
+        assert single_mark in Path(source_path).read_text(encoding="utf-8")
+    boogu_edit_source = Path("tests/e2e/online_serving/test_boogu_image_edit_expansion.py").read_text(encoding="utf-8")
+    assert single_mark in boogu_edit_source
+    assert parallel_2_mark in boogu_edit_source
+    assert parallel_3_mark in boogu_edit_source
+
+    flux_schnell_source = Path("tests/e2e/offline_inference/test_flux1_schnell_expansion.py").read_text(
+        encoding="utf-8"
+    )
+    assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)' in flux_schnell_source
+    flux_kontext_source = Path("tests/e2e/offline_inference/test_flux1_kontext_expansion.py").read_text(
+        encoding="utf-8"
+    )
+    assert flux_kontext_source.count('@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)') == 2
+    krea2_offline_source = Path("tests/e2e/offline_inference/test_krea2_expansion.py").read_text(encoding="utf-8")
+    assert krea2_offline_source.count('@hardware_test(res={"cuda": "H100", "rocm": "MI325"})') == 4
+    assert krea2_offline_source.count('@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)') == 2
+
+
 _COSMOS3_WEEKLY_NODES = (
     "test_text_to_image_001",
     "test_video_generation_modes_001",
@@ -2966,6 +3248,9 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "count": 5,
             "artifact_name": "rocm-glm-tts-weekly",
             "dependency": "tts_glm_weekly",
+            "env": {
+                "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "artifacts/rocm-glm-tts-weekly",
+            },
             "files": (
                 "tests/e2e/offline_inference/test_glm_tts_expansion.py",
                 "tests/e2e/online_serving/test_glm_tts_expansion.py",
@@ -3145,6 +3430,19 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     assert indextts_source.count('"transcript_escalation_model": "large-v3"') == 1
     assert "SAMPLE_RATE = 22050" in indextts_source
     assert '"expected_sample_rate": SAMPLE_RATE' in indextts_source
+
+    glm_offline_source = Path("tests/e2e/offline_inference/test_glm_tts_expansion.py").read_text(encoding="utf-8")
+    assert 'TRANSCRIPT_LANGUAGE = "zh"' in glm_offline_source
+    assert 'TRANSCRIPT_ESCALATION_MODEL = "large-v3"' in glm_offline_source
+    assert "language=TRANSCRIPT_LANGUAGE" in glm_offline_source
+    assert glm_offline_source.count('"transcript_language": TRANSCRIPT_LANGUAGE') == 1
+    assert glm_offline_source.count('"transcript_escalation_model": TRANSCRIPT_ESCALATION_MODEL') == 1
+
+    glm_online_source = Path("tests/e2e/online_serving/test_glm_tts_expansion.py").read_text(encoding="utf-8")
+    assert 'TRANSCRIPT_LANGUAGE = "zh"' in glm_online_source
+    assert 'TRANSCRIPT_ESCALATION_MODEL = "large-v3"' in glm_online_source
+    assert glm_online_source.count('"transcript_language": TRANSCRIPT_LANGUAGE') == 2
+    assert glm_online_source.count('"transcript_escalation_model": TRANSCRIPT_ESCALATION_MODEL') == 2
 
     cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
     assert 'id="sync"' in cosy_source
@@ -5423,7 +5721,8 @@ _WORKER_ONE_CARD_NODES = (
 def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
-    The V2/shared one-card cases retain their exact IDs after V1 removal. R2-01 still collects 1454 model-executor nodes and does not run them.
+    The V2/shared cases retain their exact IDs after V1 removal and run in
+    the dedicated worker job.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5473,7 +5772,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1454" in r2_01_command
+    assert f"assert-pytest-collection.sh {R2_01_EXPECTED_COUNT}" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -5580,8 +5879,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
     """READY blocks on the remaining one-card copy cases.
 
     The marker selects both intermediate-buffer residency rows and the three
-    device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1454 model-executor nodes.
+    device-copy GPU tests. #9552's worker files stay on the other job.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -5635,7 +5933,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1454" in r2_01_command
+    assert f"assert-pytest-collection.sh {R2_01_EXPECTED_COUNT}" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
@@ -6222,6 +6520,6 @@ def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 43
-    assert sum(step["grade"] == "Blocking" for step in steps) == 41
+    assert len(steps) == 52
+    assert sum(step["grade"] == "Blocking" for step in steps) == 50
     assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS

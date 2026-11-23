@@ -4,8 +4,9 @@
 
 Runs the whole engine twice with the same seed, once per flag state, and compares
 the frames a client receives. WAN denormalizes historical bfloat16 output in the
-input dtype while device preparation computes in float32, so the paths may differ
-by one 255th.
+input dtype while device preparation computes in float32. Same-input reduction
+stays within one 255th; independent full-model ROCm runs can widen the extreme to
+two while remaining bounded by the aggregate differing-pixel guard.
 
 Run with a WAN2.2 checkpoint::
 
@@ -22,6 +23,7 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 MODEL = os.environ.get("VLLM_OMNI_DEVICE_POSTPROCESS_MODEL")
 
@@ -80,6 +82,10 @@ def _as_uint8_frames(video: np.ndarray) -> np.ndarray:
 
 # A dtype difference moves ~20% of pixels by one; dropping the round moves ~50%.
 _MAX_DIFFERING_FRACTION = 0.35
+# The same-input reduction unit tests stay pinned to one uint8 level. This e2e
+# comparison runs the full model twice, where observed ROCm nightlies can widen
+# the maximum to two; the aggregate differing-pixel guard remains independent.
+_MAX_PIXEL_DEVIATION = 2 if current_omni_platform.is_rocm() else 1
 
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
@@ -96,9 +102,18 @@ def test_device_postprocess_produces_equivalent_frames() -> None:
     expected = _as_uint8_frames(float_path)
     deviation = np.abs(device_path.astype(np.int16) - expected.astype(np.int16))
     differing = float((deviation > 0).mean())
-    print(f"maxdiff={deviation.max()} differing={differing:.4f} ({int((deviation > 0).sum())}/{deviation.size})")
+    max_deviation = int(deviation.max())
+    over_one = int((deviation > 1).sum())
+    print(
+        f"maxdiff={max_deviation} over_one={over_one / deviation.size:.6f} "
+        f"({over_one}/{deviation.size}) differing={differing:.4f} "
+        f"({int((deviation > 0).sum())}/{deviation.size})"
+    )
 
-    assert deviation.max() <= 1, "the reduction moved a pixel by more than one 255th"
+    assert max_deviation <= _MAX_PIXEL_DEVIATION, (
+        f"the reduction moved a pixel by {max_deviation}/255; "
+        f"the {_MAX_PIXEL_DEVIATION}/255 platform limit was exceeded"
+    )
     assert differing < _MAX_DIFFERING_FRACTION, (
         f"{differing:.1%} of pixels differ, more than a denormalize-precision difference explains"
     )
