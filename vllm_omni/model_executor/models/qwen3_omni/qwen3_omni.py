@@ -395,11 +395,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             # Codebook 0 uses V1's per-request CUDA generator (see
             # Qwen3OmniTalkerSampler). Residual codebooks receive their own
-            # request-local generator through get_mtp_seed. Keep the external
-            # uniform buffer disabled: explicit generators bypass the outer MTP
-            # graph while the predictor's inner graphs remain available, and
-            # switching to whole-span uniforms would change the sampling stream.
-            self.mtp_sample_uniforms = False
+            # request-local generator through get_mtp_seed. Feed their noise
+            # through a static tensor so seeded requests can still replay the
+            # whole-MTP graph. Preserve the eager predictor's per-step draw
+            # shapes so enabling that graph does not change any RNG stream.
+            self.mtp_sample_uniforms = True
+            self.mtp_sample_uniforms_preserve_eager_stream = True
             self.mrv2_custom_sampler = mrv2_talker_sampler
             self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
             self.mtp_sample_vocab_size = self._codec_codebook_size
@@ -522,6 +523,10 @@ class Qwen3OmniMoeForConditionalGeneration(
     @property
     def mtp_output_key(self) -> tuple[str, str]:
         return getattr(self, "talker_mtp_output_key", ("codes", "audio"))
+
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return bool(getattr(self, "talker_mtp_accepts_per_row_generators", False))
 
     @property
     def mtp_graph_safe(self) -> bool:
