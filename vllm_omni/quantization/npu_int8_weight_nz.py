@@ -127,7 +127,8 @@ def _cast_a5_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
 def _probe_a5_resident_nz(device: torch.device) -> bool:
     import torch_npu
 
-    if not _internal_format_enabled() or not all(
+    # Ascend 950 can support explicit NZ casts with ALLOW_INTERNAL_FORMAT disabled.
+    if not all(
         callable(getattr(torch_npu, name, None)) for name in ("npu_format_cast", "get_npu_format", "npu_quant_matmul")
     ):
         logger.info("A5 resident INT8 NZ unavailable on %s; keeping ND", device)

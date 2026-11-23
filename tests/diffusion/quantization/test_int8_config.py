@@ -580,7 +580,7 @@ def test_a5_resident_nz_auto_startup(mocker, monkeypatch, case):
     npu = mocker.Mock()
     mocker.patch.dict("sys.modules", {"torch_npu": npu})
     npu.npu.get_device_name.return_value = "Ascend950" if case == "supported" else "Ascend950DT"
-    npu._C._npu_getOption.return_value = b"enable"
+    npu._C._npu_getOption.return_value = b"disable"
     mock_device = mocker.Mock(type="npu")
     nz_weights = {}
 
