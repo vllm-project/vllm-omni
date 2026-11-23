@@ -19,6 +19,8 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
+            # Keep this benchmark ungated while the known performance issue is evaluated:
+            # https://github.com/vllm-project/vllm-omni/issues/10055
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
@@ -36,10 +38,36 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
+            # Keep this benchmark ungated while the known performance issue is evaluated:
+            # https://github.com/vllm-project/vllm-omni/issues/10055
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
+      - label: ":full_moon: Omni · Qwen3-Omni · Duplex Omni-DuplexEval Accuracy and Perf Test"
+        key: nightly-omni-performance-qwen3-omni-duplex-omni-duplex-eval
+        source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_npu, omni_v2_runtime]
+        timeout_in_minutes: 120
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/*.json
+        commands:
+          # The wheel bundles the CPU VAD weights used when the ONNX cache is empty.
+          - >-
+            python3 -m pip install --no-deps silero-vad==6.2.3
+            --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+            --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
+          - >-
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline
+            --test-config-file tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json
+            -m "full_model and npu and A3 and omni and cards_4" --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Test"
         source_file_dependencies: omni_minicpmo_4_5_function
         mirror_hardwares: a3_npu_2
@@ -118,20 +146,85 @@ steps:
           # runner cache and no A3 MOS baseline exists yet, so the test skips the
           # MOS floor on NPU. Re-enable both once the asset is cached.
           - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and npu and A3" --run-level full_model
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Default Seed-TTS Accuracy and Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
-        key: nightly-omni-performance-minicpmo-4-5-npu
-        timeout_in_minutes: 180
+        key: nightly-omni-minicpmo-4-5-npu-default-seed-tts
+        timeout_in_minutes: 240
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_UTMOS_EVAL=0
+          - export SEED_TTS_EVAL_DEVICE=npu:1
+          - export SEED_TTS_SIM_DEVICE=npu:1
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+              -k test_minicpmo_4_5_npu_default \
+              -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Duplex Omni-DuplexEval Accuracy and Perf Test"
+        source_file_dependencies: omni_duplex_eval_ci
+        key: nightly-omni-minicpmo-4-5-npu-async-duplex-eval
+        timeout_in_minutes: 240
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/*.json
+        commands:
+          # The wheel bundles the CPU VAD weights used when the ONNX cache is empty.
+          - >-
+            python3 -m pip install --no-deps silero-vad==6.2.3
+            --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+            --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json \
+              -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Async Prefix Seed-TTS Accuracy and Perf Test"
+        source_file_dependencies: omni_minicpmo_4_5_perf
+        key: nightly-omni-minicpmo-4-5-npu-async-prefix
+        timeout_in_minutes: 360
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_UTMOS_EVAL=0
+          - export SEED_TTS_EVAL_DEVICE=npu:1
+          - export SEED_TTS_SIM_DEVICE=npu:1
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+              -k test_minicpmo_4_5_npu_async_prefix \
+              -m "full_model and npu and A3 and omni and cards_2" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -149,31 +242,14 @@ steps:
           - tests/dfx/perf/results/minicpmo-4-5-a3-2card/pytest.log
         commands:
           - |
-            set -euo pipefail
-            export BENCHMARK_DIR=tests/dfx/perf/results/minicpmo-4-5-a3-2card
-            mkdir -p "$$BENCHMARK_DIR"
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_a3_2card.json \
-              -m "full_model and omni and npu and A3 and cards_2" \
-              --run-level full_model 2>&1 | tee "$$BENCHMARK_DIR/pytest.log"
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test (A2)"
-        source_file_dependencies: omni_minicpmo_4_5_perf
-        key: nightly-omni-performance-minicpmo-4-5-npu-a2
-        timeout_in_minutes: 180
-        mirror_hardwares: a2b3_npu_1
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          HF_TOKEN: "${HF_TOKEN}"
-          HF_HUB_OFFLINE: "1"
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A2" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+            bash -e -o pipefail -c '
+              export BENCHMARK_DIR=tests/dfx/perf/results/minicpmo-4-5-a3-2card
+              mkdir -p "$$BENCHMARK_DIR"
+              pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
+                --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_a3_2card.json \
+                -m "full_model and omni and npu and A3 and cards_2" \
+                --run-level full_model 2>&1 | tee "$$BENCHMARK_DIR/pytest.log"
+            '
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
     depends_on: upload-nightly-pipeline
@@ -202,7 +278,7 @@ steps:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_tts.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m npu --test-config-file tests/dfx/perf/tests/test_tts.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -231,17 +307,6 @@ steps:
             -m "full_model and diffusion and npu and A3 and cards_1"
             --run-level full_model
             --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
-      - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
-        source_file_dependencies: diffusion_hunyuan_image3_accuracy
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_4
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
-          HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and A3" --run-level full_model
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 CFGP=2"
         source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
@@ -254,7 +319,7 @@ steps:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --assert-baseline -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -271,7 +336,7 @@ steps:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --assert-baseline -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -288,11 +353,28 @@ steps:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --assert-baseline -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
+      - label: ":full_moon: HunyuanImage3 Accuracy (4 NPU)"
+        key: nightly-hunyuan-image3-accuracy-npu
+        source_file_dependencies: diffusion_hunyuan_image3_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - tests/e2e/accuracy/results/result_acc_*.json
+        commands:
+          - >-
+            pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py
+            -m "full_model and diffusion and npu and A3 and cards_4"
+            --run-level full_model
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-NPU"
         source_file_dependencies: diffusion_qwen_image_21_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-21-single-npu
@@ -306,7 +388,7 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3 and cards_1" --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m "npu and A3 and cards_1" --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -323,7 +405,7 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3 and cards_4" --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m "npu and A3 and cards_4" --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -352,7 +434,7 @@ steps:
             [ -z "$${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}" ] && [ -d "$${VLLM_TEST_MINIMAX_H3_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_FL2VA_MODEL="$$VLLM_TEST_MINIMAX_H3_MODEL/FL2VA" || true
             export BENCHMARK_DIR=tests/dfx/perf/results
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -k "not test_minimax_h3_ref2va_rainfusion_laser_4npu_a3" -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -k "not test_minimax_h3_ref2va_rainfusion_laser_4npu_a3" -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
             exit $$?
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 Ref2VA RainFusion Laser Test"
         key: nightly-diffusion-x2v-minimax-h3-ref2va-rainfusion
@@ -376,7 +458,7 @@ steps:
             export BENCHMARK_DIR=tests/dfx/perf/results
             pytest -s -v tests/diffusion/attention/test_rainfusion_plan.py -k "test_ref2va_sparse_execution_guard or test_ref2va_video_request_includes_num_frames" -m "core_model and npu and A3 and diffusion and cards_1" --run-level core_model
             pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_ref2va_rainfusion_npu.py -m "full_model and npu and A3 and diffusion and cards_4" --run-level full_model 2>&1 | python3 -u tests/e2e/online_serving/minimax_h3/rainfusion_trace.py
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -k test_minimax_h3_ref2va_rainfusion_laser_4npu_a3 -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json --run-level full_model
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -k test_minimax_h3_ref2va_rainfusion_laser_4npu_a3 -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json --run-level full_model
             '
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 Timeline Guide Accuracy Test"
         key: nightly-diffusion-x2v-timeline-minimax-h3
@@ -431,7 +513,7 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -459,7 +541,56 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline -m npu --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
+      - label: ":full_moon: Diffusion X2V · LingBot World Perf Test · A2 4-NPU"
+        key: lingbot-npu-nightly-performance
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_perf
+        timeout_in_minutes: 60
+        mirror_hardwares: a2b3_npu_4
+        artifact_paths:
+          - "tests/dfx/perf/results/*.json"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          # Fetch the pinned snapshot like the accuracy-data capture; serving then resolves it offline.
+          - HF_HUB_OFFLINE=0 hf download robbyant/lingbot-world-v2-14b-causal-fast-diffusers --revision 59cccf49f2d2dd27418ae7a04b82b10868d455c2 --quiet
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline --test-config-file tests/dfx/perf/tests/test_lingbot_world_realtime.json -m "full_model and diffusion and npu and A2 and cards_4" --run-level full_model
+      - label: "Build CUDA test image for LingBot NPU accuracy"
+        key: lingbot-npu-accuracy-ci-image
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_accuracy
+        timeout_in_minutes: 90
+        agents:
+          queue: medium_cpu_queue_premerge
+        commands:
+          - bash .buildkite/cuda/scripts/build-ci-image.sh
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Test · NPU Data"
+        key: lingbot-npu-nightly-accuracy-data
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_accuracy
+        timeout_in_minutes: 90
+        mirror_hardwares: a2b3_npu_4
+        artifact_paths:
+          - "tests/e2e/accuracy/results/lingbot_world/npu-capture/**/*"
+        commands:
+          - python -m tests.e2e.accuracy.lingbot_world.prepare capture --profile tests/e2e/accuracy/lingbot_world/configs/npu.json --output tests/e2e/accuracy/results/lingbot_world/npu-capture
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Test · NPU Outputs"
+        key: lingbot-npu-nightly-accuracy
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_accuracy
+        depends_on:
+          - step: lingbot-npu-nightly-accuracy-data
+            allow_failure: true
+          - lingbot-npu-accuracy-ci-image
+        timeout_in_minutes: 45
+        mirror_hardwares: h100_2
+        artifact_paths:
+          - "tests/e2e/accuracy/results/result_acc_*.json"
+          - "tests/e2e/accuracy/results/lingbot_world/npu/**/*"
+        commands:
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/results
+          - buildkite-agent artifact download "tests/e2e/accuracy/results/lingbot_world/npu-capture/**" . --step lingbot-npu-nightly-accuracy-data || echo "Accuracy data download failed; each test will validate its required inputs"
+          - pytest -sv tests/e2e/accuracy/lingbot_world/test_precision.py tests/e2e/accuracy/lingbot_world/test_wbench.py tests/e2e/accuracy/lingbot_world/test_vbench.py --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/npu.json --lingbot-generation=tests/e2e/accuracy/results/lingbot_world/npu-capture --lingbot-output=tests/e2e/accuracy/results/lingbot_world/npu --run-level full_model

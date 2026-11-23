@@ -2,10 +2,14 @@
 
 ## Status and target
 
-PersonaPlex (`nvidia/personaplex-7b-v1`, a Moshi finetune) is served by the
+On vLLM 0.34, use the [PersonaPlex MRv2 duplex profile](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/personaplex_duplex_mrv2.yaml).
+Stage 0 MRv2 requires duplex mode with `async_chunk` enabled. The default
+V1 profile is retained for historical reference.
+
+PersonaPlex (`nvidia/personaplex-7b-v1`, a Moshi finetune) was served by the
 [Unified Full-Duplex Framework](fullduplex.md) through one model plugin,
 `PersonaPlexDuplexPlugin` (`vllm_omni/model_executor/models/personaplex/duplex/plugin.py`),
-selected by `PipelineConfig.duplex_plugin`. The serving path is:
+selected by `PipelineConfig.duplex_plugin`. The historical serving path was:
 
 ```text
 /v1/realtime?duplex=1
@@ -260,12 +264,13 @@ conversational turn boundary.
   validation, fixed-frame buffer, cumulative data plane, request-output
   readers).
 
-### GPU validation
+### Historical GPU validation
 
 `tests/e2e/online_serving/personaplex_realtime_duplex.py` (wrapped by
 `tests/e2e/online_serving/test_personaplex_duplex.py` when
-`PERSONAPLEX_MODEL_PATH` is set) drives the default `personaplex.yaml`
-deployment and requires:
+`PERSONAPLEX_MODEL_PATH` is set) defined the earlier default `personaplex.yaml`
+validation contract below. It does not establish readiness with vLLM 0.34;
+use the MRv2 duplex profile for current deployments.
 
 1. the server reaches ready without a local eager override; `/health` is 200;
 2. `/v1/realtime?duplex=1` reports `model_native_duplex`, `chunk_period_ms=80`

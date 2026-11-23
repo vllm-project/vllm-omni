@@ -57,6 +57,9 @@ vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va --kv-isolate
 | Only `--kv-isolate` | Isolation, one-time capture, Host INT8 and asynchronous prefetch |
 | Both flags | Same as isolation alone; the entire offload configuration is ignored |
 
+Reference isolation requires a fixed reference layout and rejects `keep_steps`
+reference-layout switching.
+
 This option defaults to off and does not use an environment-variable switch. **Isolation changes the learned model computation. It is not a lossless optimization.**
 
 #### Diffusion KV Prefix Caching
@@ -229,6 +232,7 @@ The following tables show which models support each feature:
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **Kandinsky 6 TI2VA**        | ✅* (uncalibrated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (decode) | ✅ (FP8) | ✅ (1 request) |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |     ✅     |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
+| **Cosmos3-Nano-Transfer-Auto**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ❓ | ❌ | ❓ | ❓ | ❌ | ❓ | ❌ |
 | **LingBot-Video**            |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
@@ -238,7 +242,11 @@ The following tables show which models support each feature:
 | **[Hy-Nomas](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md)** (Diffusers-format weights) | ❌ | ❌ | ✅ (Ulysses only) | ❌ | ❌ | ❌ | ❌ | ✅ (module only) | ❌ | ❌ | ❌ |
 
 > Notes:
-> 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
+> Cosmos3-Nano-Transfer-Auto runs CFGP and strict Ulysses CP on GB200; HSDP and TP are configuration-only;
+> see the [Cosmos3-Nano-Transfer-Auto recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md).
+> HSDP and TP are alternative memory modes and cannot be combined.
+>
+> 5\. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
 > recurrence carries state across frames, so a rank cannot denoise a slice of
 > the token sequence in isolation. Doing so would need a distributed scan or
 > an all-gather before every GDN block. The remaining ❌ columns are simply

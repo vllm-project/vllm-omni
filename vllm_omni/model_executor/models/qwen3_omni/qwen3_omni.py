@@ -3,6 +3,8 @@
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from functools import cached_property
@@ -41,12 +43,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
 from vllm_omni.metrics import definitions as defs
@@ -75,6 +76,10 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, 
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 # Voice used when a request names no speaker. Matches the reference
 # ``Qwen3OmniMoeForConditionalGeneration.generate(speaker="Ethan")``; the
@@ -82,12 +87,33 @@ from vllm_omni.utils.device_copy import to_device_nonblocking
 # first key would silently switch the default to a different (female) voice.
 DEFAULT_SPEAKER = "ethan"
 
+# Keep the residual-codebook RNG independent from codebook 0 when both are
+# derived from the Talker stage seed. The value is the ASCII tag ``QWEN3MTP``.
+_QWEN3_OMNI_MTP_SEED_DOMAIN = 0x5157_454E_334D_5450
+_TORCH_SEED_MASK = 0x7FFF_FFFF_FFFF_FFFF
+
 
 def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
     """Return the speaker key used for requests that do not name one."""
     if DEFAULT_SPEAKER in speaker_token_ids:
         return DEFAULT_SPEAKER
     return next(iter(speaker_token_ids))
+
+
+def get_qwen3_omni_mtp_seed(sampling_params: SamplingParams | None) -> int | None:
+    """Resolve the request-local RNG seed for residual codec codebooks.
+
+    ``tts_local_seed`` is already an explicit model-local stream selector and
+    therefore takes precedence. Otherwise the Talker stage seed, which owns
+    codebook 0 sampling, is domain-separated before it seeds codebooks 1..N.
+    """
+    local_seed = get_tts_local_seed(sampling_params)
+    if local_seed is not None:
+        return local_seed
+    stage_seed = getattr(sampling_params, "seed", None) if sampling_params is not None else None
+    if stage_seed is None:
+        return None
+    return (int(stage_seed) ^ _QWEN3_OMNI_MTP_SEED_DOMAIN) & _TORCH_SEED_MASK
 
 
 # Special token IDs for Qwen3 Omni MoE
@@ -201,10 +227,13 @@ class Qwen3OmniMoeForConditionalGeneration(
     eager_frames_active = False
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False
+    # Residual codebooks must not consume the process-global RNG: otherwise
+    # identical seeded Talker requests diverge with batch order or scheduling.
+    get_mtp_seed = staticmethod(get_qwen3_omni_mtp_seed)
 
     def create_omni_model_state(
-        self, vllm_config: VllmConfig, encoder_cache: "EncoderCache | None", device: torch.device
-    ) -> "OmniModelState":
+        self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
+    ) -> OmniModelState:
         from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
         if current_omni_platform.is_npu() and self.model_stage in ("thinker", "talker"):
@@ -318,6 +347,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
         elif self.model_stage == "talker":
+            # forward returns a tensor; multimodal outputs are attached after replay.
+            self.mrv2_forward_returns_tensor = True
             # The outer wrapper exposes talker_mtp for every stage, but only
             # the talker stage owns the module that the method invokes.
             self.talker_mtp_graph_safe = current_omni_platform.supports_talker_mtp_graph_capture()
@@ -358,11 +389,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             # Codebook 0 uses V1's per-request CUDA generator (see
-            # Qwen3OmniTalkerSampler). Residual codebooks draw inside talker_mtp,
-            # which is also what V1 captures: replay advances Philox, so each
-            # step gets a fresh stream. An external uniform buffer is a different
-            # stream and, together with MRv2's murmur3 codebook-0 sampler, raises
-            # Seed-TTS word error by about 0.4 percentage points.
+            # Qwen3OmniTalkerSampler). Residual codebooks receive their own
+            # request-local generator through get_mtp_seed. Keep the external
+            # uniform buffer disabled: explicit generators bypass the outer MTP
+            # graph while the predictor's inner graphs remain available, and
+            # switching to whole-span uniforms would change the sampling stream.
             self.mtp_sample_uniforms = False
             self.mrv2_custom_sampler = mrv2_talker_sampler
             self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
@@ -576,6 +607,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     @cached_property
     def sampler(self):
         """Get sampler from active model."""
+        from vllm.v1.sample.sampler import Sampler
+
         if hasattr(self.model, "sampler"):
             return self.model.sampler
         return Sampler()
@@ -1482,8 +1515,19 @@ class Qwen3OmniMoeForConditionalGeneration(
                 continue
             else:
                 raise AssertionError("Expect role id after <|im_start|> (assistant, user, system)")
-        talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
-        talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
+        if talker_input_embeds:
+            talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
+            talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
+        else:
+            # A projected chatml with no user/assistant segments (e.g. system-only
+            # prompt) leaves both lists empty, and torch.cat([]) raises. Return empty
+            # talker inputs shaped consistently with _get_talker_user_parts.
+            talker_input_embed = torch.empty(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=input_ids.device,
+                dtype=torch.bfloat16,
+            )
+            talker_input_id = torch.empty((0,), dtype=torch.long, device=input_ids.device)
 
         return talker_input_id, talker_input_embed, trailing_text_hidden_all
 
@@ -1882,6 +1926,40 @@ class Qwen3OmniMoeForConditionalGeneration(
             return []
         return ramp_decode_windows(ramp, int(extra.get("codec_left_context_frames", 25) or 0))
 
+    # load_weights defers the first Code2Wav capture to capture_auxiliary_graphs.
+    # A weight reload after that recaptures at once: it rebinds the SnakeBeta
+    # caches the graphs read.
+    _code2wav_capture_pending: bool = False
+    _code2wav_warmup_done: bool = False
+
+    def capture_auxiliary_graphs(self) -> None:
+        """Capture the Code2Wav CUDA graphs the stage's load deferred.
+
+        The worker calls this once ``load_model`` has returned, before the stage
+        serves. vLLM's ``load_model`` limits the caching allocator to
+        ``max_split_size_mb:20``; graphs captured under it cannot reuse the
+        blocks an earlier capture freed in their shared pool, so each capture
+        grows the pool. Stages without Code2Wav have nothing to capture.
+        """
+        self._code2wav_warmup_done = True
+        if self._code2wav_capture_pending:
+            self._code2wav_capture_pending = False
+            self._capture_code2wav_graphs()
+
+    def _capture_code2wav_graphs(self) -> None:
+        """Capture the Code2Wav graphs, or fall back to eager outside NPU."""
+        try:
+            self._maybe_enable_code2wav_cudagraph()
+        except Exception:
+            if current_omni_platform.is_npu():
+                # A failed NPUGraph capture can leave torch-npu allocator
+                # state invalid, so eager fallback in this process is unsafe.
+                raise
+            logger.warning(
+                "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
+                exc_info=True,
+            )
+
     def _maybe_enable_code2wav_cudagraph(self) -> None:
         """Enable the inner Code2Wav CUDA graph unless this stage runs in eager mode."""
         if not self.code2wav or not hasattr(self.code2wav, "enable_cudagraph"):
@@ -1969,20 +2047,22 @@ class Qwen3OmniMoeForConditionalGeneration(
             code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
             loaded_weights.update(code2wav_loaded)
 
-            # Precompute SnakeBeta caches; Code2Wav CUDA graph follows the stage's
-            # enforce_eager setting, the same switch vLLM uses for outer graphs.
             try:
                 self.code2wav.precompute_snake_caches()
-                self._maybe_enable_code2wav_cudagraph()
             except Exception:
                 if current_omni_platform.is_npu():
-                    # A failed NPUGraph capture can leave torch-npu allocator
-                    # state invalid, so eager fallback in this process is unsafe.
                     raise
                 logger.warning(
-                    "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
+                    "Failed to precompute Code2Wav SnakeBeta caches; not capturing Code2Wav CUDA graphs.",
                     exc_info=True,
                 )
+            else:
+                # NPU keeps capturing while the stage loads; vLLM's allocator
+                # split limit does not apply there.
+                if current_omni_platform.is_npu() or self._code2wav_warmup_done:
+                    self._capture_code2wav_graphs()
+                else:
+                    self._code2wav_capture_pending = True
 
         if first_frame_decoder is not None and code2wav_weights:
             decoder_loaded = first_frame_decoder.load_weights(code2wav_weights)

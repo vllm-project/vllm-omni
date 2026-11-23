@@ -6,11 +6,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeConfig,
+    Qwen3OmniMoeTalkerConfig,
+)
+from vllm.config.compilation import CUDAGraphMode
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_omni.data_entry_keys import OmniPayload, to_dict
+from vllm_omni.model_executor.models.qwen3_omni import qwen3_omni as model_module
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
 from vllm_omni.model_executor.stage_input_processors.qwen3_omni import thinker2talker_async_chunk
+from vllm_omni.worker_v2 import staged_writes
+from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -43,6 +55,68 @@ def _talker(*, async_chunk: bool = True) -> Qwen3OmniMoeForConditionalGeneration
     return model
 
 
+def _mtp_state() -> MTPState:
+    owner = object.__new__(OmniModelState)
+    owner.model = _talker()
+    owner.model.has_talker_mtp = False
+    owner.device = torch.device("cpu")
+    owner._embed_dim = 0
+    return MTPState(owner)
+
+
+def test_mtp_seed_prefers_explicit_tts_local_seed():
+    params = SamplingParams(seed=42, extra_args={"tts_local_seed": 7})
+    assert model_module.get_qwen3_omni_mtp_seed(params) == 7
+    assert Qwen3OmniMoeForConditionalGeneration.get_mtp_seed(params) == 7
+
+
+def test_mtp_seed_falls_back_to_domain_separated_talker_seed():
+    residual_seed = model_module.get_qwen3_omni_mtp_seed(SamplingParams(seed=42))
+    assert residual_seed == 0x5157_454E_334D_547A
+    assert residual_seed != 42
+    assert model_module.get_qwen3_omni_mtp_seed(SamplingParams()) is None
+
+
+def test_identical_seeded_requests_own_equivalent_independent_mtp_streams():
+    state = _mtp_state()
+    params = SamplingParams(seed=42)
+    first = state._get_mtp_generator("first", params, torch.device("cpu"))
+    second = state._get_mtp_generator("second", params, torch.device("cpu"))
+
+    assert first is not None and second is not None and first is not second
+    assert first.initial_seed() == second.initial_seed()
+    assert torch.equal(torch.rand(16, generator=first), torch.rand(16, generator=second))
+
+
+def test_mtp_generator_state_persists_across_frames_and_batch_order():
+    params = {
+        "a": SamplingParams(seed=11),
+        "b": SamplingParams(seed=29),
+    }
+
+    def draw(order: tuple[str, str]) -> tuple[dict[str, list[torch.Tensor]], dict[str, torch.Generator]]:
+        state = _mtp_state()
+        streams: dict[str, list[torch.Tensor]] = {req_id: [] for req_id in params}
+        generators: dict[str, torch.Generator] = {}
+        for frame_order in (order, order[::-1]):
+            for req_id in frame_order:
+                generator = state._get_mtp_generator(req_id, params[req_id], torch.device("cpu"))
+                assert generator is not None
+                if req_id in generators:
+                    assert generator is generators[req_id]
+                generators[req_id] = generator
+                streams[req_id].append(torch.rand(8, generator=generator))
+        return streams, generators
+
+    forward, forward_generators = draw(("a", "b"))
+    reversed_, reversed_generators = draw(("b", "a"))
+    for req_id in params:
+        assert forward_generators[req_id] is not reversed_generators[req_id]
+        assert len(forward[req_id]) == len(reversed_[req_id]) == 2
+        for expected, actual in zip(forward[req_id], reversed_[req_id], strict=True):
+            assert torch.equal(expected, actual)
+
+
 def _rows(*values: float) -> torch.Tensor:
     return torch.tensor([[value] * _H for value in values])
 
@@ -58,6 +132,52 @@ def _step(model, payload: dict) -> torch.Tensor:
 def test_mtp_frame_valid_rejects_codec_eos_and_special_ids():
     layer0 = torch.tensor([0, 2047, 2048, 2150, -1])
     assert _talker().mtp_frame_valid(layer0).tolist() == [True, True, False, False, False]
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("profile_only", [False, True])
+def test_talker_tensor_forward_keeps_full_graph_capture(async_chunk, profile_only, monkeypatch, mocker):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=Qwen3OmniMoeConfig(),
+            multimodal_config=SimpleNamespace(),
+            model_stage="talker",
+            use_v2_model_runner=True,
+            async_chunk=async_chunk,
+        ),
+        additional_config={},
+        with_hf_config=lambda *args, **kwargs: None,
+    )
+    talker = _Talker()
+    hidden = _rows(1)
+    mocker.patch.object(talker, "forward", return_value=hidden)
+    monkeypatch.setattr(model_module, "init_vllm_registered_model", lambda **kwargs: talker)
+    mocker.patch.object(Qwen3OmniMoeForConditionalGeneration, "_init_special_tokens_embeddings", return_value=set())
+    model = Qwen3OmniMoeForConditionalGeneration(vllm_config=config)
+    assert model.have_multimodal_outputs is True
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    runner.model = model
+    runner.use_aux_hidden_state_outputs = False
+    runner.model_state = SimpleNamespace()
+    runner._configure_cudagraph_output_contract()
+    full = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, None)
+    piecewise = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 1, None)
+    runner.cudagraph_manager = SimpleNamespace(
+        _capture_descs={CUDAGraphMode.FULL: [full], CUDAGraphMode.PIECEWISE: [piecewise]},
+        _candidates={(1, 0): [full, piecewise]},
+    )
+
+    def capture(_runner, *, profile_only=False):
+        # Check the candidates that the real Omni capture entrypoint hands to vLLM.
+        assert runner.cudagraph_manager._capture_descs[CUDAGraphMode.FULL] == [full]
+        assert full in runner.cudagraph_manager._candidates[(1, 0)]
+        assert model.forward(torch.zeros(1, dtype=torch.long), torch.zeros(1), inputs_embeds=hidden) is hidden
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    assert runner.capture_model(profile_only=profile_only) == 0
 
 
 @pytest.mark.parametrize("v2", [True, False])
