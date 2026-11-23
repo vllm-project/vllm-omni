@@ -34,7 +34,8 @@ CosyVoice3 is intentionally absent: no online example exists for it yet. See its
 
 ## Common Quick Start
 
-Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):
+Launch the server with the desired port. For multi-stage models, tune each
+stage's memory budget in the deploy YAML or via `--stage-overrides`.
 
 ```bash
 vllm serve <hf-repo-or-local-path> --omni --port 8091
@@ -536,7 +537,8 @@ Equivalent manual command:
 vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
     --host 0.0.0.0 --port 8091 \
-    --enforce-eager --omni
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
+    --omni
 ```
 
 ### Sending requests
@@ -805,6 +807,12 @@ Three model variants exposed via separate checkpoints:
 | Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Voice cloning from a reference audio |
 
 Each variant ships smaller `0.6B` companions where available.
+
+For the three 1.7B variants on a single Ascend 910B3 64GB, see the
+[Ascend 910B3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md).
+It records the tested vLLM-Omni 0.28.0 commit, image environment, unchanged
+deployment configuration, and verification scope; its measurements do not
+qualify current main.
 
 ### Launch
 

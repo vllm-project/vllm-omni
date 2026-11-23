@@ -20,7 +20,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 def test_flux_schnell_text_to_image(offline_client: OfflineOmniClient):
     """Test FLUX.1-schnell text-to-image generation."""
     request_config = {
