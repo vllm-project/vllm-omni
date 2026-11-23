@@ -153,43 +153,39 @@ def test_visual_failure_cancels_queued_work_and_joins_worker(monkeypatch: pytest
         shutdown(wait=True, cancel_futures=True)
 
 
-def test_nonleader_keeps_collectives_without_audio_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture
+def no_audio_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     def unexpected_pool(**_kwargs):
-        pytest.fail("nonleader must not create an audio worker")
+        pytest.fail("this path must not create an audio preparation worker")
 
     monkeypatch.setattr(processing, "ThreadPoolExecutor", unexpected_pool)
+
+
+@pytest.mark.usefixtures("no_audio_worker")
+def test_nonleader_keeps_collectives_without_audio_worker() -> None:
     video = _VideoVAE()
     assert processing.encode_media(_media(), video_vae=video, audio_vae=None, emit_conditioning=False) is None
     assert video.calls == 1
 
 
-def test_native_rate_references_do_not_start_worker(monkeypatch: pytest.MonkeyPatch) -> None:
-    def unexpected_pool(**_kwargs):
-        pytest.fail("native-rate references need no preparation worker")
-
-    monkeypatch.setattr(processing, "ThreadPoolExecutor", unexpected_pool)
+@pytest.mark.usefixtures("no_audio_worker")
+def test_native_rate_references_do_not_start_worker() -> None:
     media = replace(_media(), video_audios=((_waveform(32000), 32000),), audios=())
     audio = _AudioVAE(Event(), Event(), get_ident())
     assert processing.encode_media(media, video_vae=_VideoVAE(), audio_vae=audio, emit_conditioning=True) is not None
     assert audio.received[0][1] == 32000
 
 
-def test_audio_only_keeps_synchronous_adapter_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    def unexpected_pool(**_kwargs):
-        pytest.fail("audio-only input has no visual overlap window")
-
-    monkeypatch.setattr(processing, "ThreadPoolExecutor", unexpected_pool)
+@pytest.mark.usefixtures("no_audio_worker")
+def test_audio_only_keeps_synchronous_adapter_contract() -> None:
     media = replace(_media(), videos=(), video_audios=())
     audio = _AudioVAE(Event(), Event(), get_ident())
     assert processing.encode_media(media, video_vae=None, audio_vae=audio, emit_conditioning=True) is not None
     assert audio.received[0][1] == 16000
 
 
-def test_cpu_autocast_keeps_preparation_on_calling_thread(monkeypatch: pytest.MonkeyPatch) -> None:
-    def unexpected_pool(**_kwargs):
-        pytest.fail("CPU autocast is thread-local and must retain synchronous preparation")
-
-    monkeypatch.setattr(processing, "ThreadPoolExecutor", unexpected_pool)
+@pytest.mark.usefixtures("no_audio_worker")
+def test_cpu_autocast_keeps_preparation_on_calling_thread() -> None:
     audio = _AudioVAE(Event(), Event(), get_ident())
     with torch.autocast("cpu", dtype=torch.bfloat16):
         assert (
