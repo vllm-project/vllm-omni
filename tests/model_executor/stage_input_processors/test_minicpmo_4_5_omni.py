@@ -1063,3 +1063,42 @@ def test_venus_delegation_only_turn_is_silent_and_new_request_resets_mask():
     source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
     info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
     assert info["ids"]["tts"] == [21]
+
+
+@pytest.mark.parametrize("muted_units", [1, 2])
+def test_venus_first_speech_after_initial_delegation_starts_fresh(muted_units: int) -> None:
+    """Initial silent units must not turn the first speech into a continuation."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _native_duplex_chunk_budget,
+    )
+
+    context = StreamingInputState(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}})
+    cumulative: list[int] = []
+
+    def handoff(content: list[int]):
+        unit = [9304, *content, 9308]
+        cumulative.extend(unit)
+        source, _ = _native_source([101], list(cumulative), [101, *unit])
+        source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+        return llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    for index in range(muted_units):
+        muted = handoff([9400, 31] if index == 0 else [31])
+        assert muted["ids"]["tts"] == []
+        assert muted["meta"]["speech_muted"] is True
+        assert muted["meta"]["speech_flush"] is False
+
+    first = handoff([9401, 21])
+    assert first["ids"]["tts"] == [21]
+    assert first["meta"]["turn_start"] is True
+    assert first["meta"]["replace_streaming_prompt"] is True
+    assert first["meta"]["speech_flush"] is False
+    assert first["meta"]["speech_muted"] is False
+    assert _native_duplex_chunk_budget(first["meta"]) == (26, 0)
+
+    following = handoff([22])
+    assert following["ids"]["tts"] == [22]
+    assert following["meta"]["turn_start"] is False
+    assert not following["meta"].get("replace_streaming_prompt", False)
+    assert _native_duplex_chunk_budget(following["meta"]) == (26, 26)
+    assert context.bridge_states["duplex"]["model_turn_id"] == 0

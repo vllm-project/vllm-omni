@@ -1833,8 +1833,11 @@ is explicitly false on subsequent units; it cannot stick through metadata merge.
 
 Repeated muted units and a bare turn terminator after the flush produce no new
 codec tokens. Speech resuming in the same dialogue turn replaces the Talker
-prompt/KV and starts a fresh vocoder stream. A new turn or request resets all
-delegation state. This keeps speech lifecycle independent of dialogue lifecycle.
+prompt/KV and starts a fresh vocoder stream. The first speech after initial
+delegation-only units also starts with fresh Talker prompt/KV and a zero minimum
+codec-token budget, even though there was no earlier speech to flush. Subsequent
+speech units continue normally. A new turn or request resets all delegation
+state. This keeps speech lifecycle independent of dialogue lifecycle.
 
 `meta.speech_muted` carries intentionally silent text units through Talker and
 Code2Wav. The codec bridge consumes their pending text even when no audio frames

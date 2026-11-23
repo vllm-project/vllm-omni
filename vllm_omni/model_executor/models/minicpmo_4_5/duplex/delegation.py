@@ -59,11 +59,14 @@ def delegate_speech_boundary(
     content starts with fresh Talker and vocoder state.
     """
     preflushed = bool(state.get("delegate_preflushed", False))
+    speech_active = bool(state.get("delegate_speech_active", False))
     fully_muted = bool(token_ids) and not speech_ids
     bare_end = bool(speech_ids) and all(token == turn_end_id for token in speech_ids)
-    flush = fully_muted and bool(state.get("delegate_speech_active", False))
+    flush = fully_muted and speech_active
     skip = fully_muted or (preflushed and bare_end)
-    restart = preflushed and not skip and bool(speech_ids)
+    # Initial delegated units have no speech to flush, but their first audible
+    # unit still needs a fresh prompt and the initial-chunk EOS budget.
+    restart = not speech_active and not skip and bool(speech_ids)
     if flush:
         state["delegate_preflushed"] = True
         state["delegate_speech_active"] = False
