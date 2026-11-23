@@ -542,6 +542,8 @@ def _reuse_prepared_reference_videos(
     if len(prepared) != expected_count:
         raise OmniClientError("MiniMax H3 prepared-reference-video count does not match the request")
     for item in prepared:
+        if ("prepared_path" in item) == ("rgb_path" in item):
+            raise OmniClientError("MiniMax H3 prepared-reference-video descriptor must contain exactly one media path")
         if "rgb_path" not in item and not os.path.isfile(item["prepared_path"]):
             raise OmniClientError(f"MiniMax H3 prepared reference video is unavailable: {item['prepared_path']}")
     return prepared
@@ -790,7 +792,7 @@ def prepare_encoder_inputs(
                         for item in prepared_videos
                     ]
                     for item, audio_future in zip(prepared_videos, audio_futures):
-                        # Reused descriptors may come from a producer with a different switch setting.
+                        # The descriptor identifies the already-prepared media format.
                         full_frames = (
                             load_prepared_rgb_frames(item)
                             if "rgb_path" in item

@@ -24,7 +24,6 @@ class _Sampling:
 def _descriptor_item(tmp_path):
     return {
         "original_path": "source.mp4",
-        "prepared_path": "prepared.mp4",
         "input_has_audio": False,
         "width": 2,
         "height": 2,
@@ -36,19 +35,39 @@ def _descriptor_item(tmp_path):
     }
 
 
-def test_prepared_reference_descriptor_round_trips_rgb_sidecar(tmp_path):
+@pytest.mark.parametrize("has_sidecar", [False, True])
+def test_prepared_reference_descriptor_round_trips_exclusive_format(tmp_path, has_sidecar):
+    item = _descriptor_item(tmp_path)
+    if not has_sidecar:
+        del item["rgb_path"], item["frame_count"]
+        item["prepared_path"] = "prepared.mp4"
+    encoded = reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
+    assert reference_video.deserialize_prepared_reference_videos(encoded) == (str(tmp_path), [item])
+
+    if has_sidecar:
+        payload = json.loads(encoded)
+        del payload["videos"][0]["frame_count"]
+        with pytest.raises(ValueError, match="invalid MiniMax H3"):
+            reference_video.deserialize_prepared_reference_videos(json.dumps(payload))
+
+
+def test_prepared_reference_descriptor_rejects_mixed_format(monkeypatch, tmp_path):
     item = _descriptor_item(tmp_path)
     encoded = reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
-    assert reference_video.deserialize_prepared_reference_videos(encoded) == (str(tmp_path), [item])
-
+    item["prepared_path"] = "prepared.mp4"
+    with pytest.raises(ValueError, match="exactly one media path"):
+        reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
     payload = json.loads(encoded)
-    del payload["videos"][0]["frame_count"]
+    payload["videos"][0]["prepared_path"] = "prepared.mp4"
     with pytest.raises(ValueError, match="invalid MiniMax H3"):
         reference_video.deserialize_prepared_reference_videos(json.dumps(payload))
-
-    del item["prepared_path"]
-    encoded = reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
-    assert reference_video.deserialize_prepared_reference_videos(encoded) == (str(tmp_path), [item])
+    monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (32, 32, 96, 27, 160))
+    with pytest.raises(OmniClientError, match="exactly one media path"):
+        encoder_processing.prepare_encoder_inputs(
+            {"prompt": "reference clip", "multi_modal_data": {"video": "source.mp4"}},
+            _Sampling({"task": "ref2va"}),
+            prepared_reference_videos=[item],
+        )
 
 
 def test_prepared_rgb_sidecar_validates_exact_size(tmp_path):
@@ -68,17 +87,16 @@ def test_prepared_rgb_sidecar_validates_exact_size(tmp_path):
 def test_reused_descriptor_selects_frames_independently_of_request_option(
     monkeypatch, tmp_path, has_sidecar, request_override
 ):
-    """Old descriptors remain usable; an existing sidecar is always consumed."""
+    """Each supported format is consumed without re-preparing the source."""
     item = _descriptor_item(tmp_path)
-    item["prepared_path"] = str(tmp_path / "prepared.mp4")
-    Path(item["prepared_path"]).touch()
     rgb = np.arange(24, dtype=np.uint8).reshape(2, 2, 2, 3)
     decoded = np.full_like(rgb, 123)
     if has_sidecar:
         rgb.tofile(item["rgb_path"])
-        del item["prepared_path"]
     else:
         del item["rgb_path"], item["frame_count"]
+        item["prepared_path"] = str(tmp_path / "prepared.mp4")
+        Path(item["prepared_path"]).touch()
     monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: decoded)
     monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (32, 32, 96, 27, 160))
     extra_args: dict[str, object] = {"task": "ref2va"}
@@ -97,8 +115,6 @@ def test_reused_descriptor_selects_frames_independently_of_request_option(
 
 def test_reused_descriptor_does_not_fall_back_from_a_truncated_sidecar(monkeypatch, tmp_path):
     item = _descriptor_item(tmp_path)
-    item["prepared_path"] = str(tmp_path / "prepared.mp4")
-    Path(item["prepared_path"]).touch()
     Path(item["rgb_path"]).write_bytes(b"truncated")
     monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: np.zeros((2, 2, 2, 3), dtype=np.uint8))
     monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (32, 32, 96, 27, 160))

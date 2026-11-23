@@ -30,6 +30,8 @@ def resolve_reference_video_decode_reuse(extra_args: Mapping[str, object]) -> bo
 
 
 def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
+    if any(("prepared_path" in item) == ("rgb_path" in item) for item in items):
+        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor: require exactly one media path")
     required_fields = (
         "original_path",
         "input_has_audio",
@@ -75,7 +77,7 @@ def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[st
         not isinstance(item, dict)
         or not required.issubset(item)
         or not set(item).issubset(required | optional)
-        or not (isinstance(item.get("prepared_path"), str) or "rgb_path" in item)
+        or (("prepared_path" in item) == ("rgb_path" in item))
         or ("prepared_path" in item and not isinstance(item["prepared_path"], str))
         or (("rgb_path" in item) != ("frame_count" in item))
         or ("rgb_path" in item and not isinstance(item["rgb_path"], str))
