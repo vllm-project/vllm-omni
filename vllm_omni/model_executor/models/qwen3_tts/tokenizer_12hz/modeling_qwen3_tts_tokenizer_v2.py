@@ -19,7 +19,7 @@
 import copy
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +40,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
@@ -1752,16 +1753,39 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return [padded[row, :, : length * self.total_upsample] for row, length in enumerate(lengths)]
 
 
+# Speech checkpoints retain Mimi's flat names; Transformers 5.22 groups the
+# SEANet, transformer and downsample under the encoder.
+_NESTED_MIMI_ENCODER_MAPPER = WeightsMapper(
+    orig_to_new_prefix={
+        "encoder.layers.": "encoder.encoder_seanet.layers.",
+        "encoder_transformer.": "encoder.encoder_transformer.",
+        "downsample.": "encoder.downsample.",
+    }
+)
+
+
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
     def __init__(self, config: MimiConfig):
+        config = copy.deepcopy(config)
+        config.decoder_config = None
         super().__init__(config)
-        self.config = config
+        if not hasattr(self.encoder, "encoder_seanet"):
+            # Flat Mimi constructs the unused decoder unconditionally.
+            self.decoder = None
+            self.decoder_transformer = None
+            self.upsample = None
 
-        self.upsample = None
-        self.decoder_transformer = None
-        self.decoder = None
+    def flat_checkpoint_mapper(self) -> WeightsMapper:
+        return _NESTED_MIMI_ENCODER_MAPPER if hasattr(self.encoder, "encoder_seanet") else WeightsMapper()
 
-        self.post_init()
+    def encoder_stages(self) -> tuple[nn.Module, nn.Module, nn.Module]:
+        """SEANet, transformer and downsample, without 5.22's deprecated aliases."""
+        if hasattr(self.encoder, "encoder_seanet"):
+            return self.encoder.encoder_seanet, self.encoder.encoder_transformer, self.encoder.downsample
+        return self.encoder, self.encoder_transformer, self.downsample
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return AutoWeightsLoader(self).load_weights(weights, mapper=self.flat_checkpoint_mapper())
 
 
 @auto_docstring

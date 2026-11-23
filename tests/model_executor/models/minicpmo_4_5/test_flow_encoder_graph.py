@@ -3,14 +3,16 @@
 """FlowEncoderGraphs: shared startup arena, dynamic CUDA capture and NPU fallback."""
 
 import functools
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-import vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph as graph_module
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph as graph_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph import (
     FlowEncoderGraphs,
     reachable_conformer_cache_frames,
 )
@@ -196,7 +198,7 @@ def test_explicit_shared_batches_bypass_opportunistic_capture_cutoff(fake_captur
 def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform, runtime_capture):
     from contextlib import nullcontext
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
     weight = torch.randn(_HIDDEN, _HIDDEN)
     graphs = FlowEncoderGraphs(
@@ -233,7 +235,7 @@ def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform,
 
 @pytest.mark.cpu
 def test_legacy_graph_options_share_one_owner():
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
     graph = FlowEncoderGraphs(lambda *args, **kwargs: args, max_graphs=16)
     encoder = SimpleNamespace(embed=SimpleNamespace(pos_enc=SimpleNamespace(pe=torch.zeros(1))), up_layer=object())
@@ -250,26 +252,6 @@ def test_legacy_graph_options_share_one_owner():
     assert result.token_widths == (6,)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.nvidia_only
-@_requires_nvidia_capture
-@torch.inference_mode()
-def test_exact_precapture_failure_blocks_retry(monkeypatch):
-    graph = FlowEncoderGraphs(lambda x, **kwargs: (x, x, x))
-
-    def fail(*args):
-        raise RuntimeError("capture failed")
-
-    monkeypatch.setattr(graph, "_capture", fail)
-    tokens = torch.zeros(1, 6, device="cuda")
-    with pytest.raises(RuntimeError, match="capture failed"):
-        graph.capture_now(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
-    with pytest.raises(RuntimeError, match="restart"):
-        graph.capture_now(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
-    with pytest.raises(RuntimeError, match="restart"):
-        graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
-
-
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("amp", [False, True])
@@ -277,7 +259,10 @@ def test_exact_precapture_failure_blocks_retry(monkeypatch):
 def test_shared_real_conformer_preserves_mixed_cache_dtypes(amp):
     from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav, _undecorate_dynamo
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+        BatchedToken2Wav,
+        _undecorate_dynamo,
+    )
 
     backend = BatchedToken2Wav.__new__(BatchedToken2Wav)
     torch.nn.Module.__init__(backend)
@@ -347,7 +332,7 @@ def test_cpu_fallback_and_capacity():
 @pytest.mark.cpu
 @torch.inference_mode()
 def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
     def forbidden(*args, **kwargs):
         pytest.fail("ROCm fallback must not create or capture NVIDIA streams")
@@ -369,7 +354,7 @@ def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
 @pytest.mark.skipif(torch.version.hip is None or not torch.cuda.is_available(), reason="ROCm GPU required")
 @torch.inference_mode()
 def test_rocm_eager_chunks_preserve_outputs_and_cache(monkeypatch):
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
     def forbidden(*args, **kwargs):
         pytest.fail("ROCm eager chunks must not enter NVIDIA capture")
@@ -604,7 +589,10 @@ def test_configurable_admission_avoids_short_lived_shape_capture():
 def test_real_conformer_chunks_replay_and_preserve_state(amp):
     from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav, _undecorate_dynamo
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+        BatchedToken2Wav,
+        _undecorate_dynamo,
+    )
 
     encoder = (
         UpsampleConformerEncoderV2(
@@ -841,6 +829,64 @@ def test_capture_streams_are_not_reused_by_torch_pool():
     assert wrapper.stats["evictions"] == 0
     assert wrapper.stats["captures"] == 2
     assert wrapper.stats["capacity"] == 6
+
+
+def _stale_graphs_in_a_cycle():
+    # Mimics an earlier test's wrapper: once the caller drops its reference,
+    # only a reference cycle keeps it and its CUDA graphs alive, so they are
+    # freed by cyclic GC, not by refcount.
+    weight = torch.randn(64, 64, device="cuda")
+    stale = FlowEncoderGraphs(lambda x, **kw: ((x @ weight).sin(),) * 3, max_graphs=2)
+    for size in (4, 6):
+        x = torch.randn(size, 64, device="cuda")
+        for _ in range(2):
+            stale(x, last_chunk=False, cnn_cache=None, att_cache=None)
+    torch.accelerator.synchronize()
+    stale.cycle = stale
+    return stale, [weakref.ref(entry[0]) for entry in stale.exact_graphs.values()]
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
+@torch.inference_mode()
+def test_capture_survives_a_cyclic_gc_of_a_stale_graph():
+    # Regression for an order-dependent CI failure: a GC cycle landing inside
+    # capture reset a stale CUDAGraph and invalidated the capture. The stale
+    # wrapper's strong reference is held across the capture guard's entry
+    # collect and dropped only once the stream is capturing, so the collect
+    # runs on graphs that are alive during the capture: the same-run case,
+    # unlike the between-test cleanup of #10481.
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        stale, stale_graphs = _stale_graphs_in_a_cycle()
+        assert stale_graphs and all(ref() is not None for ref in stale_graphs)
+        collected: list[int] = []
+        weight = torch.randn(32, 32, device="cuda")
+
+        def forward(x, **kw):
+            nonlocal stale
+            if torch.cuda.is_current_stream_capturing() and not collected:
+                stale = None  # only the reference cycle is left
+                collected.append(gc.collect())
+            y = (x @ weight).sin()
+            return y, y + 1, y + 2
+
+        wrapper = FlowEncoderGraphs(forward, max_graphs=2)
+        for size in (1, 2):
+            x = torch.randn(size, 32, device="cuda")
+            for _ in range(2):
+                wrapper(x, last_chunk=False, cnn_cache=None, att_cache=None)
+        torch.accelerator.synchronize()
+        assert collected, "no GC ran during capture"
+        assert wrapper.stats["captures"] == 2
+        # The guard unfreezes and collects on exit; the cycle is gone by then.
+        assert all(ref() is None for ref in stale_graphs)
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

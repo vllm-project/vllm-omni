@@ -2,6 +2,13 @@
 
 > Text-to-music: style + lyrics (optionally an ABC score) in, a 48 kHz stereo song out
 
+The default profile uses Model Runner V2 on CUDA with vLLM 0.34. Its
+model-owned sampler preserves ABC and semantic sampling, request-local seeds
+and paired CFG. Model-state lifecycle hooks retain acoustic jobs after releasing AR slots,
+so audio completion, truncation/error metadata and cancellation survive the
+handoff. TP/PP, asynchronous scheduling, prefix caching, external KV transfer
+and speculative decoding remain unsupported.
+
 ## Summary
 
 - Vendor: m-a-p (Multimodal Art Projection)
@@ -95,7 +102,7 @@ request instead of waiting forever. Set deployment capacity for the expected
 request lengths; four AR slots allow at most two guided semantic songs.
 Ordinary CFG=1 songs retain native AR admission and support one-slot servers.
 
-This implementation requires one GPU (`TP=PP=1`), model runner v1,
+This implementation requires one GPU (`TP=PP=1`), Model Runner V2,
 synchronous FCFS scheduling, prefix caching disabled, and no external KV
 connector or speculative decoding. Chunked prefill remains available for
 ordinary requests; CFG requests require it disabled. The default config
@@ -104,9 +111,9 @@ chunked prefill disabled. Existing two-call ABC/semantic clients and external
 scores remain supported; pipeline, architecture and HTTP endpoint names stay
 `yue2`, `Yue2ForCausalLM` and `/v1/audio/speech`.
 
-The deploy YAML explicitly selects `model_runner: v1`. Selecting V2 raises
-an error before backbone initialization. A V2-only runtime requires a YuE2
-runner migration; changing the YAML to V2 does not provide compatibility.
+The deploy YAML selects `model_runner: v2` and uses the standard AR worker and
+`OmniARModelRunner`. `Yue2ModelState` supplies request transitions and acoustic
+completion through the shared runner's lifecycle hooks, including idle steps.
 
 ### Acoustic batching and memory
 
