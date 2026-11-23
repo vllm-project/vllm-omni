@@ -1338,6 +1338,249 @@ steps:
             tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py::test_qwen_image_autoround_w4a16_generate
             -m 'slow and diffusion and rocm and MI325 and cards_1'
 
+      # Exact MI325 owners for the CUDA weekly LongCat contracts, promoted
+      # after these selectors passed on AMD hardware without skips or retries.
+      - label: "LongCat online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_longcat_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-longcat-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 4 285m rocm-longcat-weekly-1gpu
+            'tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[default]'
+            'tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[single_card_001]'
+            'tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[default]'
+            'tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[single_card_001]'
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LongCat online · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_longcat_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-longcat-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 2 285m rocm-longcat-weekly-2gpu
+            'tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[parallel_001]'
+            'tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[parallel_001]'
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      # Boogu has distinct one-card, two-card CFG, and full three-rank CFG
+      # contracts. The three-rank case uses a four-card allocation because the
+      # AMD weekly fleet has no dedicated three-card queue; the fourth GPU idles.
+      - label: "Boogu online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_boogu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-boogu-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 17 285m rocm-boogu-weekly-1gpu
+            'tests/e2e/online_serving/test_boogu_image.py::test_text_to_image_001[default]'
+            'tests/e2e/online_serving/test_boogu_image.py::test_batch_001[default]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_single_image_to_image_001[edit]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_single_image_to_image_001[edit-turbo-hotfix-1k]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_double_guidance_001[default]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_001[edit]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_001[edit-turbo-hotfix-1k]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_double_guidance_001[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[vae_slicing_tiling]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[vae_slicing_tiling]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[vae_slicing_tiling]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_image_only_guidance[default]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_align_res_output_size[edit]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_align_res_output_size[edit-turbo-hotfix-1k]'
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Boogu online · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_boogu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-boogu-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 6 285m rocm-boogu-weekly-2gpu
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_image_only_guidance[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_double_guidance_cfg_parallel[cfg_parallel_2_round_robin]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_cfg_off_on_cfg_parallel_server[cfg_parallel_2_cfg_off]'
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      - label: "Boogu Edit CFG · 3-rank on 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_boogu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-boogu-edit-cfg-weekly-3rank/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 1 285m rocm-boogu-edit-cfg-weekly-3rank
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_double_guidance_cfg_parallel[cfg_parallel_3_full]'
+            -m 'slow and diffusion and rocm and MI325 and cards_3'
+
+      # Preserve the CUDA Flux weekly split: FLUX.2-dev plus FLUX.1 Schnell on
+      # one card, and FLUX.2-dev plus FLUX.1 Kontext on two cards.
+      - label: "Flux online and offline · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_flux_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-flux-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 5 285m rocm-flux-weekly-1gpu
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[cpu_offload]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[layerwise_offload]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[cpu_offload]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[layerwise_offload]'
+            tests/e2e/offline_inference/test_flux1_schnell_expansion.py::test_flux_schnell_text_to_image
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Flux online and offline · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_flux_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-flux-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 10 285m rocm-flux-weekly-2gpu
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[parallel_cfg_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[ulysses_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[ring_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[vae_patch_parallel_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[parallel_cfg_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[ulysses_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[ring_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[vae_patch_parallel_2]'
+            tests/e2e/offline_inference/test_flux1_kontext_expansion.py::test_flux_kontext_text_to_image
+            tests/e2e/offline_inference/test_flux1_kontext_expansion.py::test_flux_kontext_image_edit
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      # Krea2 keeps online and offline single-card coverage together, while the
+      # HSDP and VAE-patch contracts stay isolated on the two-card owner.
+      - label: "Krea2 online and offline · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_krea2_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-krea2-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 7 285m rocm-krea2-weekly-1gpu
+            'tests/e2e/online_serving/test_krea2_expansion.py::test_krea2[single_card_basic]'
+            'tests/e2e/online_serving/test_krea2_expansion.py::test_krea2[single_card_layerwise_offload]'
+            'tests/e2e/online_serving/test_krea2_expansion.py::test_krea2_lora[single_card_lora]'
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_text_to_image_001
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_layerwise_offload
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_cache_dit
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_lora
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Krea2 offline · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_krea2_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-krea2-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 2 285m rocm-krea2-weekly-2gpu
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_hsdp
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_vae_patch_parallel
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
       # Probe the exact CUDA-owned Wan2.1 VACE nodes on ROCm before adding
       # MI325 source marks. Exact node invocation avoids claiming support until
       # both resource shapes have clean hardware evidence.
