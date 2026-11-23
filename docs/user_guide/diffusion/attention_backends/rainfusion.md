@@ -18,7 +18,10 @@ globally.
 | `sparsity` | finite, `[0, 1]` | Nominal dropped-key-block fraction; default `0.8`; `0` disables sparsity |
 | `start_step` | integer, `>= 0` | Number of early denoise steps kept dense |
 | `end_step` | integer, `>= 0` | Number of final denoise steps kept dense (tail fallback) |
-| `precision` | `"bf16"`, `"fp8"`, `"mix"` | Kernel precision mode; default `"bf16"`. Requires MindIE-SD with `sparse_attention(precision=...)` |
+| `precision` | `"bf16"`, `"fp16"`, `"fp8"`, `"mix"`, `"mxfp8"` | Kernel precision mode; default `"bf16"`. The distributed executor supports only the combinations below |
+| `sparse_type` | `"rf_v2"`, `"rf_v3"` | BF16 sparse algorithm; default `"rf_v2"`; quantized modes use `"rf_v3"` |
+| `bsa_backend` | `"cann"`, `"eagle"`, optional | Sparse provider; the distributed executor resolves and validates it from algorithm and precision |
+| `parallel` | typed object, optional | MiniMax-H3 full MindIE-SD distributed executor controls |
 | `skip_layers` | selector such as `"0-3,38"` | DiT blocks kept dense |
 
 ```bash
@@ -78,6 +81,16 @@ Protected video tails require a compatible MindIE-SD release.
 For common configuration and selector behavior, see the
 [attention backend overview](../attention_backends.md) and the
 [backend selection design](../../../design/feature/attention_backend_selection.md).
+
+## MiniMax-H3 distributed sparse attention
+
+Set `block_sparse.parallel` to use the MiniMax-H3 MindIE-SD executor with
+RF-v2 BF16/FP16 CANN, RF-v3 BF16/FP16 Eagle, RF-v3 mix Eagle, or RF-v3 MXFP8 CANN.
+Communication/compute overlap and RF reorder hoist default to enabled.
+Linear-layer int8 quantization does not select attention precision;
+existing sparse step/layer gates still apply. See the
+[parallel attention guide](../parallelism/mindiesd.md) for configuration,
+supported layouts, request-level reorder and state ownership.
 
 ## Wan2.2 T2V quantization on Ascend
 

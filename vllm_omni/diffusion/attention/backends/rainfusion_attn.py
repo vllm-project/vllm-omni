@@ -21,6 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.data import MindIEParallelConfig, resolve_mindie_sparse_backend
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_METRICS
 
@@ -106,16 +107,30 @@ class RainFusionConfig:
     start_step: int = 0
     end_step: int = 0
     precision: str = "bf16"
+    sparse_type: str = "rf_v2"
+    bsa_backend: str | None = None
+    parallel: MindIEParallelConfig | None = None
     skip_layers: frozenset[int] = frozenset()
 
     @classmethod
     def from_backend_kwargs(cls, backend_kwargs: dict | None) -> RainFusionConfig:
         bk = backend_kwargs or {}
+        sparse_type = bk.get("sparse_type", "rf_v2")
+        if sparse_type not in ("rf_v2", "rf_v3"):
+            raise ValueError("RainFusion sparse_type must be rf_v2 or rf_v3")
+        precision = str(bk.get("precision", "bf16"))
+        parallel = MindIEParallelConfig(**bk["parallel"]) if bk.get("parallel") is not None else None
+        backend = bk.get("bsa_backend")
+        if parallel is not None:
+            backend = resolve_mindie_sparse_backend(sparse_type, precision, backend)
         return cls(
             sparsity=float(bk.get("sparsity", 0.0)),
             start_step=int(bk.get("start_step", 0)),
             end_step=int(bk.get("end_step", 0)),
-            precision=str(bk.get("precision", "bf16")),
+            precision=precision,
+            sparse_type=sparse_type,
+            bsa_backend=backend,
+            parallel=parallel,
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
 
@@ -233,7 +248,15 @@ class RainFusionAttentionImpl(AttentionImpl):
         config = get_current_diffusion_config_or_none()
         parallel_config = getattr(config, "parallel_config", None)
         if getattr(parallel_config, "allgather_degree", 1) > 1:
-            raise ValueError("RAINFUSION_ATTN requires full Q/K/V sequences; AllGather-KV SP is unsupported.")
+            if self.rainfusion.parallel is None:
+                raise ValueError("RAINFUSION_ATTN with AllGather-KV requires block_sparse.parallel")
+            if getattr(parallel_config, "ulysses_degree", 1) not in (4, 8) or getattr(
+                parallel_config, "allgather_degree", 1
+            ) not in (
+                2,
+                4,
+            ):
+                raise ValueError("MindIE CP x Ulysses requires Ulysses degree 4 or 8 and CP degree 2 or 4")
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if ring_degree > 1:
             # Ring gives each rank a slice of the sequence, so block selection
@@ -639,6 +662,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             raise ValueError(_INCOMPATIBLE_MINDIESD)
         extra = attn_metadata.extra if attn_metadata else {}
         requested = extra.get("kv_cache_dtype", self.rainfusion.precision)
+        if requested in ("float", "bf16") and self.rainfusion.precision == "fp16":
+            requested = "fp16"
         reason = None
         if requested in ("float", "bf16"):
             precision = "bf16"
@@ -665,20 +690,24 @@ class RainFusionAttentionImpl(AttentionImpl):
         # empty tail when the sequence needs no padding.
         q, q_pad = torch.split(query, [used, query.shape[1] - used], dim=1)
         k, v = key[:, :used], value[:, :used]
+        if precision == "fp16":
+            q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
         # Ulysses has already gathered the full sequence onto this rank and split
         # the heads, so read the head count off the tensor rather than num_heads.
         common_kwargs: dict[str, object] = {
             # rf_v2 ignores precision on non-A5 devices. Route all quantized
             # layouts through rf_v3 and let MindIE validate their block geometry.
-            "sparse_type": "rf_v3" if precision != "bf16" else "rf_v2",
+            "sparse_type": "rf_v3" if precision in ("mix", "fp8", "mxfp4", "mxfp8") else self.rainfusion.sparse_type,
             "scale": self.softmax_scale,
             "head_num": query.shape[-2],
             "input_layout": _INPUT_LAYOUT,
-            "inner_precise": 4 if precision != "bf16" else _INNER_PRECISE,
+            "inner_precise": 4 if precision in ("mix", "fp8", "mxfp4", "mxfp8") else _INNER_PRECISE,
             "block_size": _BLOCK_SIZE,
             "sparsity": self.rainfusion.sparsity,
-            "precision": precision,
+            "precision": "bf16" if precision == "fp16" else precision,
         }
+        if common_kwargs["sparse_type"] == "rf_v3" and self.rainfusion.bsa_backend is not None:
+            common_kwargs["bsa_backend"] = self.rainfusion.bsa_backend
         if plan.video_spans is not None:
             out = sparse_attention(
                 q,
@@ -695,6 +724,8 @@ class RainFusionAttentionImpl(AttentionImpl):
                 latent_shape_k=plan.latent_shape,
             )
             out = sparse_attention(q, k, v, **common_kwargs)
+        if precision == "fp16":
+            out = out.to(query.dtype)
         if used == query.shape[1]:
             return out
         # Only the first ``used`` rows are read back downstream, so the padding

@@ -140,6 +140,10 @@ missing-kernel errors remain startup failures, not runtime fallbacks.
 Use a new backend for a new provider/capability contract. `custom_attention`
 instead owns communication and requires `skip_sequence_parallel=True`.
 
+MiniMax-H3's [MindIE-SD executor](../../user_guide/diffusion/parallelism/mindiesd.md) reuses the effective sparse plan and caller-owned Ulysses/CP groups, owning both A2A directions and BSA before shared dispatch.
+The SP coordinator owns State per group/device/algorithm/precision/provider and drains it before group teardown. Invalid combinations fail before allocation; declined original-order calls retain native dispatch, while admitted errors propagate without collective retry.
+The guide defines the four provider paths, RF-only CP input contract, configuration and complete integration flow.
+
 ## Adding or changing a backend
 
 An implementation change is complete only when it:

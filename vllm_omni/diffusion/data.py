@@ -2432,8 +2432,38 @@ class RainFusionPrecision(str, Enum):
     """
 
     BF16 = "bf16"
+    FP16 = "fp16"
     FP8 = "fp8"
     MIX = "mix"
+    MXFP8 = "mxfp8"
+
+
+def resolve_mindie_sparse_backend(sparse_type: str, precision: str, backend: str | None = None) -> str:
+    """Validate the four distributed sparse paths before allocating SDK resources."""
+    if sparse_type == "rf_v2" and precision in ("bf16", "fp16"):
+        required = "cann"
+    elif sparse_type == "rf_v3" and precision in ("bf16", "fp16", "mix", "mxfp8"):
+        required = "cann" if precision == "mxfp8" else "eagle"
+    else:
+        raise ValueError(f"Unsupported MindIE parallel sparse_type={sparse_type!r}, precision={precision!r}")
+    if backend is not None and backend != required:
+        raise ValueError(f"MindIE parallel {sparse_type}/{precision} requires bsa_backend={required!r}")
+    return required
+
+
+@dataclass(frozen=True)
+class MindIEParallelConfig:
+    """Controls for the complete MindIE-SD executor and request-level RF reorder."""
+
+    overlap_comm: bool = True
+    reorder_hoist: bool = True
+    optimize_attention_pipeline: bool = True
+    quantized_comm: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("overlap_comm", "reorder_hoist", "optimize_attention_pipeline", "quantized_comm"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"MindIE parallel {name} must be a boolean and agree across ranks")
 
 
 @dataclass
@@ -2453,8 +2483,15 @@ class BlockSparseSpec:
     precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
+    sparse_type: str = "rf_v2"
+    bsa_backend: str | None = None
+    parallel: dict | None = None
 
     def __post_init__(self) -> None:
+        if self.sparse_type not in ("rf_v2", "rf_v3"):
+            raise ValueError("block_sparse.sparse_type must be rf_v2 or rf_v3")
+        if self.parallel is not None:
+            MindIEParallelConfig(**self.parallel)
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
@@ -2465,6 +2502,10 @@ class BlockSparseSpec:
         if precision not in valid:
             raise ValueError(f"block_sparse.precision must be one of {sorted(valid)}; got {self.precision!r}.")
         self.precision = precision
+        if self.bsa_backend not in (None, "cann", "eagle"):
+            raise ValueError("block_sparse.bsa_backend must be cann or eagle")
+        if self.parallel is not None:
+            self.bsa_backend = resolve_mindie_sparse_backend(self.sparse_type, precision, self.bsa_backend)
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -2582,6 +2623,12 @@ class AttentionSpec:
             kw["start_step"] = bs.start_step
             kw["end_step"] = bs.end_step
             kw["precision"] = bs.precision
+            if bs.sparse_type != "rf_v2":
+                kw["sparse_type"] = bs.sparse_type
+            if bs.bsa_backend is not None:
+                kw["bsa_backend"] = bs.bsa_backend
+            if bs.parallel is not None:
+                kw["parallel"] = dict(bs.parallel)
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 
