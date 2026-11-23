@@ -61,21 +61,23 @@ def pair_key_tiles(block_map: torch.Tensor, block_sizes: torch.Tensor) -> tuple[
     return block_map.unflatten(-1, (-1, 2)).any(dim=-1), block_sizes.view(-1, 2).sum(dim=-1)
 
 
-def pad_rows_with_a_valid_key(key: torch.Tensor, tile_sizes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fill every padded key row with a valid key from its own 128-token block.
+def padded_key_sources(tile_sizes: torch.Tensor, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Index that fills every padded key row from its own 128-token block.
 
-    Returns the rebuilt key and the row index of each block's representative.
-    Blocks without a valid key keep their rows and get index 0; the caller
-    drops them from the map, so that index is never used.
+    Returns a gather index over all ``rows`` key rows -- a valid row maps to
+    itself, a padded row to one of its block's valid keys -- and the row index
+    of each block's representative. This is index arithmetic only: the caller
+    applies it in whichever layout it already has to build, so filling the
+    padded rows costs no pass of its own. Blocks without a valid key get index
+    0; the caller drops them from the map, so that index is never used.
     """
-    rows = key.shape[1]
+    device = tile_sizes.device
     blocks = rows // KEY_BLOCK
-    row = torch.arange(rows, device=key.device)
+    row = torch.arange(rows, device=device)
     valid = (row % TILE) < tile_sizes[row // TILE]
     low_tile_has_a_key = tile_sizes.view(blocks, 2)[:, 0] > 0
-    representative = torch.arange(blocks, device=key.device) * KEY_BLOCK + torch.where(low_tile_has_a_key, 0, TILE)
-    source = torch.where(valid, row, representative[row // KEY_BLOCK])
-    return key.index_select(1, source), representative
+    representative = torch.arange(blocks, device=device) * KEY_BLOCK + torch.where(low_tile_has_a_key, 0, TILE)
+    return torch.where(valid, row, representative[row // KEY_BLOCK]), representative
 
 
 def npu_tile64_block_sparse_attention(
@@ -117,10 +119,17 @@ def npu_tile64_block_sparse_attention(
     # with. Dropping it cannot change the result and keeps every selected block
     # supplied with a representative.
     pair_map = pair_map & (pair_valid > 0)
-    key, representative = pad_rows_with_a_valid_key(key, tile_sizes)
+    source, representative = padded_key_sources(tile_sizes, key.shape[1])
+    # The operator wants BNSD, so the keys have to be laid out again anyway.
+    # Gathering the padded rows during that pass costs nothing extra, while
+    # filling them in BSHD first and transposing afterwards walks the keys
+    # twice. The query is laid out once here and reused by the correction
+    # below for the same reason.
+    query_bnsd = query.transpose(1, 2).contiguous()
+    key_bnsd = key.transpose(1, 2).index_select(2, source)
     output, lse = torch_npu.npu_block_sparse_attention(
-        query.transpose(1, 2).contiguous(),
-        key.transpose(1, 2).contiguous(),
+        query_bnsd,
+        key_bnsd,
         value.transpose(1, 2).contiguous(),
         pair_map.to(torch.int8),
         [TILE, KEY_BLOCK],
@@ -137,10 +146,8 @@ def npu_tile64_block_sparse_attention(
     # a value that can sit at its 1/(1+P) floor, so an error here is amplified
     # by 1/real_mass, and bfloat16 would not survive it.
     lse = lse.float().reshape(batch, heads, rows, 1)
-    representative_key = key.index_select(1, representative).transpose(1, 2)
-    pad_mass = torch.matmul(query.transpose(1, 2).float(), representative_key.float().transpose(-1, -2)).mul_(
-        softmax_scale
-    )
+    representative_key = key_bnsd.index_select(2, representative)
+    pad_mass = torch.matmul(query_bnsd.float(), representative_key.float().transpose(-1, -2)).mul_(softmax_scale)
     # ``lse`` covers the blocks a query selected, so only their representatives
     # are bounded by it. An unselected block's can sit far above, where ``exp``
     # overflows fp32 and a zero mask applied afterwards turns the infinity into
