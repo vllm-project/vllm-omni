@@ -11,6 +11,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
 )
 from vllm.config.compilation import CUDAGraphMode
+from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -19,6 +20,8 @@ from vllm_omni.model_executor.models.qwen3_omni import qwen3_omni as model_modul
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
 from vllm_omni.model_executor.stage_input_processors.qwen3_omni import thinker2talker_async_chunk
 from vllm_omni.worker_v2 import staged_writes
+from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -50,6 +53,68 @@ def _talker(*, async_chunk: bool = True) -> Qwen3OmniMoeForConditionalGeneration
     model.tts_pad_embed = torch.full((_H,), -2.0)
     model._codec_codebook_size = 2048
     return model
+
+
+def _mtp_state() -> MTPState:
+    owner = object.__new__(OmniModelState)
+    owner.model = _talker()
+    owner.model.has_talker_mtp = False
+    owner.device = torch.device("cpu")
+    owner._embed_dim = 0
+    return MTPState(owner)
+
+
+def test_mtp_seed_prefers_explicit_tts_local_seed():
+    params = SamplingParams(seed=42, extra_args={"tts_local_seed": 7})
+    assert model_module.get_qwen3_omni_mtp_seed(params) == 7
+    assert Qwen3OmniMoeForConditionalGeneration.get_mtp_seed(params) == 7
+
+
+def test_mtp_seed_falls_back_to_domain_separated_talker_seed():
+    residual_seed = model_module.get_qwen3_omni_mtp_seed(SamplingParams(seed=42))
+    assert residual_seed == 0x5157_454E_334D_547A
+    assert residual_seed != 42
+    assert model_module.get_qwen3_omni_mtp_seed(SamplingParams()) is None
+
+
+def test_identical_seeded_requests_own_equivalent_independent_mtp_streams():
+    state = _mtp_state()
+    params = SamplingParams(seed=42)
+    first = state._get_mtp_generator("first", params, torch.device("cpu"))
+    second = state._get_mtp_generator("second", params, torch.device("cpu"))
+
+    assert first is not None and second is not None and first is not second
+    assert first.initial_seed() == second.initial_seed()
+    assert torch.equal(torch.rand(16, generator=first), torch.rand(16, generator=second))
+
+
+def test_mtp_generator_state_persists_across_frames_and_batch_order():
+    params = {
+        "a": SamplingParams(seed=11),
+        "b": SamplingParams(seed=29),
+    }
+
+    def draw(order: tuple[str, str]) -> tuple[dict[str, list[torch.Tensor]], dict[str, torch.Generator]]:
+        state = _mtp_state()
+        streams: dict[str, list[torch.Tensor]] = {req_id: [] for req_id in params}
+        generators: dict[str, torch.Generator] = {}
+        for frame_order in (order, order[::-1]):
+            for req_id in frame_order:
+                generator = state._get_mtp_generator(req_id, params[req_id], torch.device("cpu"))
+                assert generator is not None
+                if req_id in generators:
+                    assert generator is generators[req_id]
+                generators[req_id] = generator
+                streams[req_id].append(torch.rand(8, generator=generator))
+        return streams, generators
+
+    forward, forward_generators = draw(("a", "b"))
+    reversed_, reversed_generators = draw(("b", "a"))
+    for req_id in params:
+        assert forward_generators[req_id] is not reversed_generators[req_id]
+        assert len(forward[req_id]) == len(reversed_[req_id]) == 2
+        for expected, actual in zip(forward[req_id], reversed_[req_id], strict=True):
+            assert torch.equal(expected, actual)
 
 
 def _rows(*values: float) -> torch.Tensor:
