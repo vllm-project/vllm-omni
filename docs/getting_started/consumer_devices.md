@@ -7,25 +7,9 @@ All numbers below come from one machine and one run: **1× RTX 3060 Laptop, 6 Gi
 device memory, driver 617.42, vLLM 0.34.0**. Treat them as an upper bound on what 8 GiB cards can do,
 not as a guarantee on different hardware.
 
-## Check what fits before installing anything
-
-```bash
-vllm-omni doctor
-```
-
-`doctor` reads the minimum-memory field of every structured recipe under `recipes/models/` and prints
-the variants whose documented minimum fits each attached device, then the smallest documented tiers
-that nothing reaches yet:
-
-```text
-Devices:
-- NVIDIA GeForce RTX 3060 Laptop GPU (cuda, 6.0 GiB dedicated)
-  1 documented variant across 1 model fit: `OpenMOSS-Team/MOSS-TTS-Nano`
-```
-
-`vllm-omni doctor --json` produces the same data for scripts and CI. Recipes that have never been
-measured on a small device are absent by design. For the full ladder: 3 variants fit 8 GiB, none
-documents a minimum in the 12 GiB band, and 11 fit 16 GiB at the time of writing.
+Structured recipes record a minimum device memory per variant, and this page keeps to what one such
+machine was measured to do. Anything a recipe does not bound is *not yet measured*, not unsupported,
+so the absence of a number below is not evidence either way.
 
 ## A verified 6 GiB speech stack
 
@@ -65,8 +49,8 @@ curl -X POST http://localhost:8123/v1/audio/speech \
        \"response_format\": \"wav\"}" --output reply.wav
 ```
 
-See [`recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml)
-for the recipe with the same numbers and a longer usage guide.
+The recipe `recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml` records the same numbers once it is in
+your checkout; it is the authoritative source for flags.
 
 ### 2. Speech to text
 
@@ -102,8 +86,7 @@ together, and prefer `--max-num-seqs 1` on cards this small.
 ## What does not fit
 
 - **Image and video generation** is documented from 13 GiB up (the lowest entry is
-  `flux-3-image-klein` in nvfp4), which no 6 GiB card can hold. Nothing below that has been measured,
-  so `doctor` reports the smaller bands as unmeasured rather than guessing.
+  `flux-3-image-klein` in nvfp4), which no 6 GiB card can hold. Nothing below that has been measured.
 - **Multi-stage audio models** need per-stage budgets. Qwen3-TTS-0.6B, for example, only starts on
   6 GiB when both stages are pinned explicitly, because the default single value cannot be shared
   across stages:
@@ -122,8 +105,8 @@ together, and prefer `--max-num-seqs 1` on cards this small.
 
 ## Reporting your own numbers
 
-`vllm-omni doctor` and the memory ladder only know what recipes declare. If you measure a model on a
-small card, add `vram_minimum_gb` to its variant in `recipes/models/<vendor>/<model>.yaml` and
-regenerate the artifacts with `python tools/gen_memory_tiers.py`. The TTS numbers on this page are the
-ones recorded in the MOSS-TTS-Nano recipe; the speech-to-text numbers were measured for this page only
-and are not yet a recipe.
+The numbers above are measurements, not recipe bounds. If you measure a model on a small card, record
+it by adding `vram_minimum_gb` to its variant in `recipes/models/<vendor>/<model>.yaml`, and say what
+the machine was so the next reader can tell whether it applies to them. The TTS numbers on this page
+are the ones recorded in the MOSS-TTS-Nano recipe; the speech-to-text numbers were measured for this
+page only and are not yet a recipe.
