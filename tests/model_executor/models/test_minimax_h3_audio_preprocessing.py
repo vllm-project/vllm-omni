@@ -80,8 +80,10 @@ class _VideoVAE:
     started: Event | None = None
     release: Event | None = None
     fail: bool = False
+    calls: int = 0
 
     def encode_video(self, frames: np.ndarray) -> tuple[torch.Tensor, tuple[int, int, int]]:
+        self.calls += 1
         if self.started is not None:
             assert self.started.wait(10), "CPU preparation did not overlap visual encoding"
         if self.release is not None:
@@ -155,7 +157,9 @@ def test_nonleader_keeps_collectives_without_audio_worker(monkeypatch: pytest.Mo
         pytest.fail("nonleader must not create an audio worker")
 
     monkeypatch.setattr(processing, "ThreadPoolExecutor", unexpected_pool)
-    assert processing.encode_media(_media(), video_vae=_VideoVAE(), audio_vae=None, emit_conditioning=False) is None
+    video = _VideoVAE()
+    assert processing.encode_media(_media(), video_vae=video, audio_vae=None, emit_conditioning=False) is None
+    assert video.calls == 1
 
 
 def test_native_rate_references_do_not_start_worker(monkeypatch: pytest.MonkeyPatch) -> None:
