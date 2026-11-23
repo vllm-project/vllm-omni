@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage transfer processors for the NemotronVoiceChat 3-stage pipeline.
 
 thinker (0) -> talker (1): token path only. The thinker's frame-locked text
@@ -245,6 +245,8 @@ def thinker2talker_async_chunk(
     return OmniPayloadStruct(
         ids=IdsStruct(all=timeline, prompt=[0]),
         meta=MetaStruct(
+            # Every chunk (including EOF) carries the full text timeline.
+            override_keys=[("ids", "all")],
             finished=torch.tensor(bool(is_finished and not is_duplex), dtype=torch.bool),
             num_processed_tokens=logical_prompt_len,
             # Vendored talker: one placeholder position per chunk (it drains
@@ -256,6 +258,10 @@ def thinker2talker_async_chunk(
             expected_total_tokens=expected_total,
         ),
     )
+
+
+# Turn-based streaming sends the cumulative text timeline to the talker.
+setattr(thinker2talker_async_chunk, "_requires_full_token_history", True)
 
 
 def talker2code2wav_async_chunk(
@@ -296,6 +302,12 @@ def talker2code2wav_async_chunk(
         codes = nested.get("audio") if isinstance(nested, dict) else None
         if codes is None:
             codes = multimodal_output.get("codes.audio")
+    pending_prompt_len = None
+    if (not isinstance(codes, torch.Tensor) or codes.numel() == 0) and stream_finished and isinstance(state, dict):
+        # Native MRv2 delivers EOF separately from the last model output.
+        # Recover the held prefix and its matching prompt trim for the tail.
+        codes = state.get("nvc_pending_codes")
+        pending_prompt_len = state.get("nvc_prompt_len")
     if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
         if not stream_finished:
             # Returning ``None`` at a resumable segment boundary makes the
@@ -318,7 +330,11 @@ def talker2code2wav_async_chunk(
     # request-level additional_information is overwritten both by arriving
     # thinker chunks and by talker info updates, so it races. Cache the first
     # sighting in the transfer-manager state as a fallback.
-    prompt_len = _info_get(multimodal_output if isinstance(multimodal_output, dict) else None, "nvc_logical_prompt_len")
+    prompt_len = pending_prompt_len
+    if prompt_len is None:
+        prompt_len = _info_get(
+            multimodal_output if isinstance(multimodal_output, dict) else None, "nvc_logical_prompt_len"
+        )
     if prompt_len is None and isinstance(multimodal_output, dict):
         prompt_len = multimodal_output.get("meta.nvc_logical_prompt_len")
     if prompt_len is None:
@@ -384,6 +400,13 @@ def talker2code2wav_async_chunk(
                 "nvc_pending_codes": trimmed,
             }
             return _empty_streaming_payload(request_id=request_id)
+        # Prefix decoding needs the whole timeline, including its prompt
+        # region. Retain only the latest unsent prefix until emission/cleanup.
+        transfer_manager.request_payload[request_id] = {
+            "nvc_frames_sent": frames_sent,
+            "nvc_prompt_len": int(prompt_len),
+            "nvc_pending_codes": codes.detach(),
+        }
         return None
     if new_frames <= 0 and stream_finished and frames_sent > 0:
         # Everything already shipped; emit a terminal empty chunk so the

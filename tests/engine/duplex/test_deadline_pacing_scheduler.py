@@ -113,7 +113,8 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
         h.runner.model_state.last_native_submit_monotonic = 100.0
         clock.value = 100.4
 
-        # First continuation: due at 101.0, so only 0.6 s of sleep remains.
+        # First continuation includes a 0.25 s input jitter margin: due at
+        # 101.25, so only 0.85 s of sleep remains.
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
@@ -123,12 +124,12 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
         assert first_task is not None
         assert await first_task
         # The accepted unit re-anchored the chain to its own submission time
-        # (101.0) and stored the following deadline (102.0).
-        assert h.runner.model_state.last_native_submit_monotonic == pytest.approx(101.0)
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(102.0)
+        # (101.25) and stored the following deadline (102.25).
+        assert h.runner.model_state.last_native_submit_monotonic == pytest.approx(101.25)
+        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(102.25)
 
         # Model produces the continuation's audio; the next unit is planned
-        # from the stored deadline (no drift): the following deadline is 103.0.
+        # from the stored deadline without another margin: next is 103.25.
         clock.value = 101.3
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
@@ -138,7 +139,7 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
         second_task = h.runner.tasks.append_tail
         assert second_task is not None
         assert await second_task
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(103.0)
+        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(103.25)
     finally:
         await close_harness(h)
 
@@ -184,8 +185,8 @@ async def test_in_flight_real_append_skips_outdated_silence(monkeypatch: pytest.
         await entered.wait()
         assert not real_append_task.done()
 
-        # At t+1.0 the silence is planned using the existing anchor; its append
-        # task waits behind the real append.
+        # At t+1.0 the silence is planned using the existing anchor. After
+        # the jitter margin, its append task waits behind the real append.
         clock.value = 201.0
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
@@ -196,8 +197,8 @@ async def test_in_flight_real_append_skips_outdated_silence(monkeypatch: pytest.
         assert silence_task is not None
         assert not silence_task.done()
 
-        # At t+1.1 the real append is released; both appends finish.
-        clock.value = 201.1
+        # At t+1.35 the real append is released; both appends finish.
+        clock.value = 201.35
         release.set()
         assert await real_append_task
         assert await silence_task
@@ -210,9 +211,8 @@ async def test_in_flight_real_append_skips_outdated_silence(monkeypatch: pytest.
         assert state.last_native_submit_monotonic == pytest.approx(200.8)
         assert state.silence_deadline_monotonic is None
 
-        # A fresh continuation uses the new anchor. The clock is left at t+1.1:
-        # the scheduler sleeps the remaining 0.7 s (deadline t+1.8), which
-        # verifies re-anchoring controls the wait. Following deadline t+2.8.
+        # A fresh continuation uses the new anchor plus the jitter margin.
+        # At t+1.35, 0.7 s remains until t+2.05; the next deadline is t+3.05.
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
@@ -221,8 +221,8 @@ async def test_in_flight_real_append_skips_outdated_silence(monkeypatch: pytest.
         fresh_task = h.runner.tasks.append_tail
         assert fresh_task is not None
         assert await fresh_task
-        assert state.last_native_submit_monotonic == pytest.approx(201.8)
-        assert state.silence_deadline_monotonic == pytest.approx(202.8)
+        assert state.last_native_submit_monotonic == pytest.approx(202.05)
+        assert state.silence_deadline_monotonic == pytest.approx(203.05)
     finally:
         release.set()
         await close_harness(h)
@@ -244,9 +244,8 @@ async def test_long_stall_saves_future_deadline_from_actual_submission(
     h = await _active_response_harness()
     state = h.runner.model_state
     try:
-        # Plan a continuation whose deadline is 1.0 s in the future. The wake
-        # is delayed 2 s past the planned submission (anchor + 3.0 during the
-        # scheduler's sleep), so the append accepts 2 s late.
+        # Plan a continuation 1.25 s ahead, including the jitter margin.
+        # The wake is delayed 2 s past that deadline, accepting 2 s late.
         anchor = clock.value
         state.last_native_submit_monotonic = anchor
         state.silence_deadline_monotonic = None
@@ -259,10 +258,10 @@ async def test_long_stall_saves_future_deadline_from_actual_submission(
         append_task = h.runner.tasks.append_tail
         assert append_task is not None
         assert await append_task
-        # anchor + 3.0 > anchor + 2.0 (planned deadline + period) -> save
-        # submit_time + period = anchor + 4.0.
-        assert state.last_native_submit_monotonic == pytest.approx(anchor + 3.0)
-        assert state.silence_deadline_monotonic == pytest.approx(anchor + 4.0)
+        # anchor + 3.25 > anchor + 2.25 (planned deadline + period) -> save
+        # submit_time + period = anchor + 4.25, without another jitter margin.
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + 3.25)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 4.25)
     finally:
         await close_harness(h)
 
@@ -296,10 +295,10 @@ async def test_small_wakeup_delay_preserves_planned_deadline(
         assert append_task is not None
         assert await append_task
 
-        # Submitted at anchor + period + 0.2 (within one period): the planned
-        # following deadline is kept.
-        assert state.last_native_submit_monotonic == pytest.approx(anchor + CHUNK_PERIOD_S + 0.2)
-        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
+        # Submitted 0.2 s after the initial deadline (including its margin):
+        # the planned following deadline is kept.
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + CHUNK_PERIOD_S + 0.25 + 0.2)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S + 0.25)
     finally:
         await close_harness(h)
 
@@ -334,8 +333,8 @@ async def test_exact_one_period_late_preserves_planned_deadline(
         assert await append_task
 
         # Submitted exactly at the planned following deadline: kept.
-        assert state.last_native_submit_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
-        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S + 0.25)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S + 0.25)
     finally:
         await close_harness(h)
 

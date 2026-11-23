@@ -11,13 +11,94 @@ This page is the endpoint overview. For the complete wire contract, the
 `vllm_omni.clients.duplex.DuplexClient` Python library, and the per-model
 capability gates, see the [Realtime Duplex API guide](realtime_duplex_api.md).
 
+## Run the duplex runtime in a separate process
+
+The default `DuplexOmni` backend runs the orchestrator on a background thread
+in the frontend process. Use `--duplex-engine-backend-as-process` to give the
+native runtime its own Python process and GIL:
+
+```bash
+vllm serve "$MODEL" --omni \
+  --deploy-config "$DEPLOY_CONFIG" \
+  --duplex-engine-backend-as-process
+```
+
+Set `MODEL` to the checkpoint and `DEPLOY_CONFIG` to its deployment YAML.
+The deployment must resolve to `session_mode: duplex`. The option is independent
+of the model plugin, stage count, and stage worker backend.
+
+Enabling this option makes the deployment **session-only**, including when the
+model also supports chat. It serves the duplex WebSocket routes, `/v1/models`,
+`/health`, and metrics. Chat and other generation routes are unavailable.
+The model's reported `DuplexCapabilities` remain unchanged. Keep the default
+`duplex_engine_backend_as_process=False` to serve chat alongside sessions.
+
+For embedded Python use, pass `duplex_engine_backend_as_process=True` to
+`DuplexOmni`. Protect the program entrypoint for Python's `spawn` start method:
+
+```python
+import asyncio
+import os
+
+from vllm_omni.entrypoints.duplex_omni import DuplexOmni
+
+
+async def main():
+    omni = DuplexOmni(
+        model=os.environ["MODEL"],
+        deploy_config=os.environ["DEPLOY_CONFIG"],
+        duplex_engine_backend_as_process=True,
+    )
+    try:
+        async with await omni.open_session() as session:
+            # Use the same session.submit(), session.events(), and resume APIs.
+            await session.heartbeat()
+    finally:
+        await omni.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Process mode currently requires a POSIX host and an importable program
+entrypoint. Model registrations must be available in the child through the
+normal `vllm.general_plugins` mechanism; parent-only registry mutations are
+not inherited. Startup options must be compatible with `spawn`, and session
+commands/configuration must contain MessagePack-compatible data. The frontend
+receives stage IDs, types, and effective context limits, not full stage
+configurations or processors. Generation, tokenization, profiling, sleep/wake,
+and weight-transfer administration are outside this session-only interface.
+
+`DuplexOmni` retains session handles and lifecycle behavior;
+`ProcessDuplexEngineClient` owns spawning, IPC, and child teardown. The child
+owns the native orchestrator thread and stage clients. The processes exchange
+MessagePack data over a private socketpair using asyncio, without reader or
+writer threads. Both backends share the frontend output pump and engine-death
+handling.
+
+Each process keeps bounded per-session output buffers. Each IPC direction
+admits at most 2048 queued messages and 16 MiB of encoded queued data; larger
+individual messages are rejected. The active write and socket buffers are
+additional to this budget. Frontend output overflow closes the affected session;
+worker or transport failure fails pending controls and closes local buffers.
+`await omni.aclose()` requests graceful worker cleanup; synchronous `shutdown()`
+provides bounded process-group termination. Serialization and buffering add
+costs, so benchmark the target workload.
+
+Invalidations share the event stream: the frontend removes matching queued
+audio and rejects stale epochs, but cannot revoke audio committed while the
+notification was in transit. Resume leases and replay control IDs remain owned
+by the native engine; process mode adds no cross-frontend session ownership or
+resume support.
+
 ## Choose an Endpoint
 
 | Endpoint | Protocol | Recommended use |
 | --- | --- | --- |
 | `WS /v1/realtime?duplex=1` | OpenAI Realtime-style events (the normative contract) | Applications and browser clients |
 | `WS /v1/duplex` | Alias of `/v1/realtime?duplex=1` (same protocol, same handler) | Clients that prefer a dedicated path |
-| Python: `DuplexOmni` / `InlineDuplexClient` | Typed commands and events in-process | Embedding the model without a server |
+| Python: `DuplexOmni` / `InlineDuplexClient` | Typed commands and events through local session handles | Embedding the model without a server |
 
 ## Enable Full Duplex
 

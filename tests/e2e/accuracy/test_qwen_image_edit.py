@@ -265,7 +265,7 @@ def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image
 
 @pytest.mark.slow
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
@@ -306,7 +306,7 @@ def test_qwen_image_edit_single_matches_diffusers(
 
 @pytest.mark.slow
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 def test_qwen_image_edit_2511_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _edit_2511_model_name()
     output_dir = model_output_dir(accuracy_artifact_root, EDIT_2511_MODEL)

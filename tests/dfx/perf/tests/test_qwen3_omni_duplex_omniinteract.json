@@ -20,7 +20,11 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/qwen3_omni_duplex.yaml"
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml",
+        "--stage-init-timeout",
+        "1200",
+        "--init-timeout",
+        "1800"
       ],
       "update": {
         "model_runner": "v2",
@@ -69,7 +73,14 @@
           "duplex_client_ttft_ms",
           "duplex_busy_rtf",
           "duplex_stall_ratio"
-        ]
+        ],
+        "baseline": {
+          "H100": {
+            "mean_duplex_busy_rtf": [
+              0.1262
+            ]
+          }
+        }
       }
     ],
     "judge_server_params": {
