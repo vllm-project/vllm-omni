@@ -20,8 +20,9 @@ from tests.diffusion.offloader.helpers import (
 from vllm_omni.diffusion.offloader import layerwise_backend as layerwise_backend_module
 from vllm_omni.diffusion.offloader import plan_resolver as plan_resolver_module
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.config import validate_disk_backing
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
-from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+from vllm_omni.diffusion.offloader.offload_plan import BackingKind, OffloadPlan
 from vllm_omni.diffusion.offloader.plan_resolver import resolve_offload_plan
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -391,6 +392,62 @@ class TestValidation:
 
         assert resolved.dits[0].stacks == ()
         assert resolved.encoders[0].stacks == ()
+
+
+class TestBackingResolution:
+    """Disk-streaming backing declarations fail closed per component."""
+
+    def test_disk_backing_is_reserved_even_when_one_shot_and_rank_local(self):
+        # one_shot + single-rank + non-HSDP is the combination the reserved
+        # DISK kind used to slip through; it must still report a reason.
+        reason = validate_disk_backing(
+            backing=BackingKind.DISK,
+            one_shot=True,
+            use_hsdp=False,
+            dp_size=1,
+            uses_allgather=False,
+        )
+        assert reason is not None
+        assert "reserved" in reason
+
+    def test_checkpoint_mmap_still_serves_rank_local_one_shot(self):
+        assert (
+            validate_disk_backing(
+                backing=BackingKind.CHECKPOINT_MMAP,
+                one_shot=True,
+                use_hsdp=False,
+                dp_size=1,
+                uses_allgather=False,
+            )
+            is None
+        )
+
+    def test_one_shot_disk_encoder_degrades_to_pinned_with_reason(self):
+        class Pipeline(nn.Module):
+            _dit_modules: ClassVar[list[str]] = ["transformer"]
+            _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+            _vae_modules: ClassVar[list[str]] = []
+            _resident_modules: ClassVar[list[str]] = []
+            _offload_plan = OffloadPlan(
+                encoder_component_types={"text_encoder": "text_encoder"},
+                encoder_block_attrs={"text_encoder": ("encoder.block",)},
+                one_shot_component_paths=frozenset({"text_encoder"}),
+                component_backing={"text_encoder": BackingKind.DISK},
+            )
+
+            def __init__(self):
+                super().__init__()
+                self.transformer = _SingleBlockModel(num_blocks=2)
+                self.text_encoder = _PlainEncoder()
+
+        resolved = resolve_offload_plan(Pipeline(), _config({"text_encoder"}))
+
+        encoder = resolved.encoders[0]
+        assert encoder.selected
+        assert encoder.one_shot
+        assert encoder.backing is BackingKind.PINNED
+        assert encoder.backing_fallback_reason is not None
+        assert "reserved" in encoder.backing_fallback_reason
 
 
 class TestPurity:

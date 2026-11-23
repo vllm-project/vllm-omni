@@ -459,22 +459,23 @@ def validate_disk_backing(
 ) -> str | None:
     """Return a fail-closed reason when a disk-streaming backing cannot be served.
 
-    Disk streaming needs a single-rank, rank-local, HSDP-free, one-shot
+    Checkpoint-mmap streaming needs a single-rank, rank-local, HSDP-free
     configuration. ``dp_size > 1`` with AllGather transport means the loader
     re-assembles shards through a collective, which has no sequential mmap
     source; ``PINNED`` (the loader fallback) is the only safe answer. The
     loader-side preflight in ``build_checkpoint_mmap_plan`` separately rejects
     TP>1 and online quantization, so those constraints do not surface here.
 
-    ``DISK`` additionally requires one-shot sequential access because it has no
-    random-access backing store in this release.
+    ``DISK`` is a reserved declaration kind in this release: no backend can
+    serve it yet, so it always reports a reason and callers degrade to
+    ``PINNED``.
     """
     if backing not in (BackingKind.CHECKPOINT_MMAP, BackingKind.DISK):
         return None
+    if backing is BackingKind.DISK:
+        return "DISK backing is reserved and not servable in this release"
     if use_hsdp:
         return "HSDP requires the ordinary loader"
     if dp_size > 1 and uses_allgather:
         return "disk backing requires rank-local transfer"
-    if backing is BackingKind.DISK and not one_shot:
-        return "DISK backing requires one-shot sequential access"
     return None

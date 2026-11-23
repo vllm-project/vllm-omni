@@ -161,10 +161,10 @@ def _resolve_component_backing(
     """Resolve a component's one-shot flag and host backing, failing closed.
 
     The declaration supplies the requested backing; any request the resolver
-    can see as unservable (HSDP, multi-rank AllGather, random-access DISK
-    without one-shot) degrades to ``PINNED`` here, before a backend touches the
-    mmap path. TP>1 and online quantization are loader-side preflights and are
-    not visible at resolution time.
+    can see as unservable (HSDP, multi-rank AllGather, reserved DISK) degrades
+    to ``PINNED`` here, before a backend touches the mmap path. TP>1 and online
+    quantization are loader-side preflights and are not visible at resolution
+    time.
     """
     one_shot = declaration is not None and path in declaration.one_shot_component_paths
     requested = declaration.component_backing.get(path, default_backing) if declaration is not None else default_backing
