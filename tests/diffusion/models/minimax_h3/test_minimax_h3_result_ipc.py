@@ -11,7 +11,7 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _send_h3_output(result_queue, num_outputs):
+def _send_h3_output(result_queue):
     try:
         from vllm_omni.diffusion.data import DiffusionOutput
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
@@ -19,39 +19,37 @@ def _send_h3_output(result_queue, num_outputs):
             get_minimax_h3_post_process_func,
         )
 
-        encoded = [b"encoded-video"] * num_outputs
-        output = _MiniMaxH3EncodedOutput(video=encoded, frame_counts=[7] * num_outputs) if num_outputs else (b"", None)
-        result_queue.put(
-            DiffusionOutput(output=output, post_process_func=get_minimax_h3_post_process_func(SimpleNamespace()))
-        )
+        for num_outputs in (0, 1, 2):
+            encoded = [b"encoded-video"] * num_outputs
+            output = (
+                _MiniMaxH3EncodedOutput(video=encoded, frame_counts=[7] * num_outputs) if num_outputs else (b"", None)
+            )
+            result_queue.put(
+                DiffusionOutput(output=output, post_process_func=get_minimax_h3_post_process_func(SimpleNamespace()))
+            )
     except Exception:
         result_queue.put({"error": traceback.format_exc()})
 
 
-@pytest.mark.parametrize("num_outputs", [0, 1, 2], ids=["peer", "single-output", "two-outputs"])
-def test_h3_result_crosses_spawned_worker_queue(num_outputs):
+@pytest.fixture(scope="module")
+def h3_worker_results():
+    """Collect all output shapes through one real spawned worker and queue."""
     from vllm_omni.diffusion.data import DiffusionOutput
-    from vllm_omni.diffusion.output_formatter import normalize_diffusion_postprocess_output
 
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue(maxsize=1)
-    worker = context.Process(target=_send_h3_output, args=(result_queue, num_outputs))
+    worker = context.Process(target=_send_h3_output, args=(result_queue,))
     try:
         worker.start()
-        result = result_queue.get(timeout=90)
+        results = []
+        for _ in range(3):
+            result = result_queue.get(timeout=90)
+            assert isinstance(result, DiffusionOutput), result
+            results.append(result)
         worker.join(timeout=30)
         assert not worker.is_alive(), "H3 result worker did not exit after sending its result"
         assert worker.exitcode == 0
-        assert isinstance(result, DiffusionOutput), result
-        normalized = normalize_diffusion_postprocess_output(result.post_process_func(result.output))
-        assert normalized.outputs["video"] == ([b"encoded-video"] * num_outputs if num_outputs else [b""])
-        assert normalized.outputs["audio"] == [None] * max(1, num_outputs)
-        assert normalized.metadata["video"]["fps"] == 24
-        assert normalized.metadata["audio"]["sample_rate"] == 32000
-        if num_outputs:
-            assert normalized.metadata["video"]["frame_counts"] == [7] * num_outputs
-        else:
-            assert "frame_counts" not in normalized.metadata["video"]
+        return results
     finally:
         if worker.is_alive():
             worker.terminate()
@@ -61,3 +59,21 @@ def test_h3_result_crosses_spawned_worker_queue(num_outputs):
                 worker.join(timeout=5)
         result_queue.close()
         result_queue.join_thread()
+
+
+@pytest.mark.parametrize("num_outputs", [0, 1, 2], ids=["peer", "single-output", "two-outputs"])
+def test_h3_result_crosses_spawned_worker_queue(num_outputs, h3_worker_results):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.output_formatter import normalize_diffusion_postprocess_output
+
+    result = h3_worker_results[num_outputs]
+    assert isinstance(result, DiffusionOutput), result
+    normalized = normalize_diffusion_postprocess_output(result.post_process_func(result.output))
+    assert normalized.outputs["video"] == ([b"encoded-video"] * num_outputs if num_outputs else [b""])
+    assert normalized.outputs["audio"] == [None] * max(1, num_outputs)
+    assert normalized.metadata["video"]["fps"] == 24
+    assert normalized.metadata["audio"]["sample_rate"] == 32000
+    if num_outputs:
+        assert normalized.metadata["video"]["frame_counts"] == [7] * num_outputs
+    else:
+        assert "frame_counts" not in normalized.metadata["video"]

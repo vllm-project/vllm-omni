@@ -69,6 +69,7 @@ from .tensor_utils import (
     restore_tensor_storage,
     set_tensor_storage,
     tensor_storage_metadata,
+    zeros_for_storage,
 )
 from .tensor_utils import (
     dtype_size as _dtype_size,
@@ -83,10 +84,10 @@ logger = init_logger(__name__)
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 
-# XCCL and NCCL reject E8M0 scales as a collective element type. E8M0 is one
-# byte wide and bit-preserving under a uint8 reinterpretation, so collect the
-# underlying byte storage and view the output back as E8M0.
-_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu})
+# Collective backends do not support E8M0 scales or packed FP4 as element
+# types. Both are byte-addressable and bit-preserving under a uint8 view, so
+# collect the underlying bytes and view the output back to the original dtype.
+_BYTE_VIEW_ALLGATHER_DTYPES = frozenset({torch.float8_e8m0fnu, torch.float4_e2m1fn_x2})
 
 
 def _all_gather_shard(
@@ -482,12 +483,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
             # Allocate ONLY the shard (1/dp_size), zero-padded to ceil.
             # Avoids materialising the full block on CPU.
-            shard = torch.zeros(
-                shard_size,
-                dtype=dtype,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
+            shard = zeros_for_storage(shard_size, dtype, pin_memory=pin_memory)
 
             current_offset = 0
             for spec in specs:

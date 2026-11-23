@@ -45,6 +45,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoTokenizer
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
 from vllm.sequence import IntermediateTensors
@@ -216,6 +217,7 @@ COSMOS3_EDGE_VIDEO_DEFAULT_FLOW_SHIFT = 3.0
 COSMOS3_EDGE_T2I_DEFAULT_HEIGHT = 640
 COSMOS3_EDGE_T2I_DEFAULT_WIDTH = 640
 
+COSMOS3_BATCH_T2I_OUTPUTS_KEY = "cosmos3_batch_t2i_outputs"
 COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 
 # Truncation cap on the prompt token count (shared by T2I and T2V).  Prompts
@@ -275,6 +277,31 @@ def _cosmos3_pp_size(od_config: Any) -> int:
     return int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
 
 
+def _cosmos3_gen_parallel_size(od_config: OmniDiffusionConfig) -> int:
+    """GPUs that cooperate on each denoising step: SP x TP x CFG-parallel (DP excluded)."""
+    parallel_config = getattr(od_config, "parallel_config", None)
+    size = 1
+    for name in ("sequence_parallel_size", "tensor_parallel_size", "cfg_parallel_size"):
+        size *= int(getattr(parallel_config, name, 1) or 1)
+    return size
+
+
+def _cosmos3_hsdp_active(od_config: OmniDiffusionConfig) -> bool:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    return bool(getattr(parallel_config, "use_hsdp", False))
+
+
+def _cosmos3_batch_t2i_outputs_enabled(od_config: OmniDiffusionConfig) -> bool:
+    """Read ``additional_config["cosmos3_batch_t2i_outputs"]`` (default True)."""
+    additional_config = getattr(od_config, "additional_config", None) or {}
+    value = additional_config.get(COSMOS3_BATCH_T2I_OUTPUTS_KEY, True)
+    if not isinstance(value, bool):
+        raise TypeError(
+            f"additional_config[{COSMOS3_BATCH_T2I_OUTPUTS_KEY!r}] must be a bool, got {type(value).__name__}"
+        )
+    return value
+
+
 def _validate_cosmos3_pp_model_offload(od_config: Any, strategy: OffloadStrategy) -> None:
     """Reject Cosmos3 model-level CPU offload together with pipeline parallelism.
 
@@ -291,6 +318,12 @@ def _validate_cosmos3_pp_model_offload(od_config: Any, strategy: OffloadStrategy
         )
 
 
+def _cosmos3_cache_backend_active(od_config: Any) -> bool:
+    """Whether a diffusion cache backend (Cache-DiT, SeaCache, ...) is configured."""
+    cache_backend = getattr(od_config, "cache_backend", None)
+    return cache_backend is not None and str(cache_backend).lower() not in ("", "none")
+
+
 def _validate_cosmos3_pp_cache_backend(od_config: Any) -> None:
     """Reject diffusion cache backends together with pipeline parallelism.
 
@@ -302,13 +335,10 @@ def _validate_cosmos3_pp_cache_backend(od_config: Any) -> None:
     Fail at startup instead of on the first request.
     """
     pp_size = _cosmos3_pp_size(od_config)
-    if pp_size <= 1:
-        return
-    cache_backend = getattr(od_config, "cache_backend", None)
-    if cache_backend is None or str(cache_backend).lower() in ("", "none"):
+    if pp_size <= 1 or not _cosmos3_cache_backend_active(od_config):
         return
     raise ValueError(
-        f"Cosmos3 does not support cache_backend={cache_backend!r} together with pipeline parallelism "
+        f"Cosmos3 does not support cache_backend={od_config.cache_backend!r} together with pipeline parallelism "
         f"(pipeline_parallel_size={pp_size}). Remove --cache-backend or set --pipeline-parallel-size 1."
     )
 
@@ -670,6 +700,12 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
         raw_image = multi_modal_data.get("image")
         raw_video = multi_modal_data.get("video")
         sp = request.sampling_params
+        # Recorded before missing sizes are filled in below: only an action
+        # reference image with an explicit size used to be resized by the
+        # serving layer.
+        stretch_action_image = (
+            action_mode is not None and raw_image is not None and sp.height is not None and sp.width is not None
+        )
         crop_image = crop_action_image and raw_image is not None and sp.height is None and sp.width is None
         if crop_image:
             if raw_video is not None:
@@ -765,6 +801,11 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
         target_w = request.sampling_params.width
         target_h = request.sampling_params.height
         if action_mode is not None:
+            if stretch_action_image and image.size != (int(target_w), int(target_h)):
+                # Action reference images with an explicit size are stretched
+                # to it, as the serving layer did before Cosmos3 received them
+                # unresized.
+                image = image.resize((int(target_w), int(target_h)), PIL.Image.Resampling.LANCZOS)
             prompt["additional_information"]["preprocessed_image"] = _preprocess_action_image(
                 image,
                 int(target_h),
@@ -1159,6 +1200,8 @@ class Cosmos3OmniDiffusersPipeline(
         super().__init__()
         self.od_config = od_config
         _validate_cosmos3_pp_cache_backend(od_config)
+        # Reject a non-bool batching switch at startup, not on the first request.
+        _cosmos3_batch_t2i_outputs_enabled(od_config)
         resolved_offload = resolve_offload(od_config)
         if resolved_offload.public is not None and resolved_offload.strategy is OffloadStrategy.MODEL_LEVEL:
             raise ValueError(
@@ -1747,6 +1790,35 @@ class Cosmos3OmniDiffusersPipeline(
         """
         return self._cache_dit_requires_paired_cfg
 
+    def _can_batch_t2i_outputs(self) -> bool:
+        """Whether T2I ``num_outputs_per_prompt > 1`` can run as one B=N denoising loop.
+
+        Batched bf16 math is not bitwise equal to the serial loop.
+        ``additional_config["cosmos3_batch_t2i_outputs"] = False`` is the
+        dedicated opt-out that keeps the serial loop; ``VLLM_BATCH_INVARIANT``
+        still forces it as well. The serial loop also runs when batching cannot
+        reproduce it or is not validated: the distilled SDE scheduler draws
+        per-step noise from the shared generator, so the serial draw order
+        cannot be reproduced; cache backends make one skip decision per batch
+        (and Cache-DiT counts forwards for CFG parity); PP forwards the UND
+        cache across stages; TP, SP, CFG-parallel and HSDP are not validated
+        with a broadcast UND cache yet. DP replicas each run the whole GEN
+        forward on one GPU, so they stay batched. Layerwise offload stays
+        batched too: in eager mode it is bitwise equal to batching without
+        offload. Under torch.compile it can start a rounding-level difference,
+        from an op not yet identified, that grows into slightly different
+        images.
+        """
+        return (
+            _cosmos3_batch_t2i_outputs_enabled(self.od_config)
+            and not envs.VLLM_BATCH_INVARIANT
+            and not self.is_distilled_model
+            and not _cosmos3_cache_backend_active(self.od_config)
+            and not self._pp_parallel_active()
+            and _cosmos3_gen_parallel_size(self.od_config) == 1
+            and not _cosmos3_hsdp_active(self.od_config)
+        )
+
     @staticmethod
     def _get_sp_param(sp: OmniDiffusionSamplingParams, key: str, default: Any = None) -> Any:
         """Read a runtime control from sampling params.
@@ -2185,6 +2257,13 @@ class Cosmos3OmniDiffusersPipeline(
         for name, value in vars(self.scheduler).items():
             if isinstance(value, torch.Tensor) and value.device.type != "cpu":
                 setattr(self.scheduler, name, value.cpu())
+
+    @property
+    def diffusion_lora_defer_moe_wrap(self) -> bool:
+        # The LoRA MoE wrapper replaces the expert quant method, dropping the
+        # mixed-precision apply override, so skip the eager no-adapter wrap.
+        runtime = getattr(self.transformer, "mixed_precision_runtime", None)
+        return runtime is not None and runtime.has_routed_experts
 
     @property
     def guidance_scale(self):
@@ -4339,8 +4418,8 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # --- Format prompts & tokenize (B=1; reused across loop iterations
-        # for T2I num_outputs_per_prompt > 1) ---
+        # --- Format prompts & tokenize (B=1; shared by every T2I output when
+        # num_outputs_per_prompt > 1) ---
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
             prompt,
             negative_prompt,
@@ -4357,10 +4436,8 @@ class Cosmos3OmniDiffusersPipeline(
         # --- Prepare latents (T2I, T2V, or I2V) ---
         # T2I shares _prepare_latents with T2V; the math collapses cleanly
         # at num_frames=1 ((1-1)//4 + 1 = 1 latent frame).  For T2I with
-        # ``num_outputs_per_prompt > 1`` we loop the diffusion below;
-        # batching B=N together would require expanding text K/V (UND
-        # pathway is text-only and cached) and is left as a future
-        # optimization.
+        # ``num_outputs_per_prompt > 1`` the outputs are denoised below, as
+        # one B=N batch when ``_can_batch_t2i_outputs()`` allows it.
         action_latents = None
         action_velocity_mask = None
         action_condition_latents = None
@@ -4506,14 +4583,19 @@ class Cosmos3OmniDiffusersPipeline(
                 generator=generator,
             )
 
-        if is_t2i and batch_size > 1:
-            # Generate N independent images by re-running the full diffusion
-            # loop with different noise seeds.  The first sample reuses
-            # ``latents`` already drawn from ``generator``; subsequent
-            # samples draw fresh noise from the same generator (state
-            # advances per call), giving distinct outputs from a single
-            # user-provided seed.  Batched B=N would be more efficient but
-            # requires expanding cached UND text K/V to match.
+        if is_t2i and batch_size > 1 and self._can_batch_t2i_outputs():
+            # Generate N independent images in one denoising loop. The first
+            # sample reuses ``latents``; the others are drawn one at a time
+            # from the same generator, matching the serial loop's draws. The
+            # transformer broadcasts the batch-1 UND text K/V to B=N.
+            samples = [latents]
+            for _ in range(batch_size - 1):
+                samples.append(self._prepare_latents(height, width, num_frames, generator))
+            latents = _run_diffusion(torch.cat(samples, dim=0))
+        elif is_t2i and batch_size > 1:
+            # Serial fallback: re-run the full diffusion loop per output,
+            # drawing each latent just before its loop so stochastic
+            # schedulers keep the generator order.
             samples = [_run_diffusion(latents)]
             for _ in range(batch_size - 1):
                 next_latents = self._prepare_latents(height, width, num_frames, generator)
