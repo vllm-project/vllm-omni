@@ -5,6 +5,7 @@ import threading
 import weakref
 from concurrent.futures import Future
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,7 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers.models.autoencoders import AutoencoderKLQwenImage
 
-from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
+from vllm_omni.diffusion.distributed.autoencoders import qwen_spatial_shard, wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeExecutor
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor, _ExecutorShutdownCleaner
@@ -167,22 +168,37 @@ def test_spatial_preparation_oom_propagates_to_all_ranks(tmp_path):
     )
 
 
-def _halo_failure_worker(rank, path, ready, start):
+def _spatial_failure_worker(rank, path, ready, start, failure_stage, injected):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo", init_method=f"file://{path}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
     )
     vae = _model()
     vae.distributed_executor = _executor("spatial_shard_height", group=dist.group.WORLD)
-    with torch.no_grad():
-        vae.decode(torch.randn(1, 2, 1, 3, 3))
+    if failure_stage == "halo":
+        with torch.no_grad():
+            vae.decode(torch.randn(1, 2, 1, 3, 3))
 
     original_ensure_recv_buf = wan_spatial_shard._ensure_recv_buf
 
     def fail_allocation(buf, reference):
         if rank == 1 and (buf is None or buf.shape != reference.shape):
+            injected.set()
             raise torch.OutOfMemoryError("injected halo allocation OOM")
         return original_ensure_recv_buf(buf, reference)
+
+    original_patch_modules = qwen_spatial_shard._patch_modules
+
+    def fail_installation(module, group, split_dim):
+        original_patch_modules(module, group, split_dim)
+        if rank == 1 and any(
+            isinstance(child, wan_spatial_shard.WanDistConv2d) and any(child._non_split_padding)
+            for child in module.children()
+        ):
+            # Fail after a padded convolution has actually been replaced.
+            assert not getattr(vae, "_qwen_spatial_shard_config", None)
+            injected.set()
+            raise torch.OutOfMemoryError("injected partial installation OOM")
 
     class DecodeWorker:
         def execute_method(self, method, *args, **kwargs):
@@ -192,13 +208,16 @@ def _halo_failure_worker(rank, path, ready, start):
 
     try:
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(wan_spatial_shard, "_ensure_recv_buf", fail_allocation)
+            if failure_stage == "install":
+                patch.setattr(qwen_spatial_shard, "_patch_modules", fail_installation)
+            else:
+                patch.setattr(wan_spatial_shard, "_ensure_recv_buf", fail_allocation)
             ready[rank].set()
             assert start.wait(60)
             proc = WorkerProc.__new__(WorkerProc)
             proc.worker = DecodeWorker()
             proc.gpu_id = rank
-            proc.od_config = None
+            proc.od_config = SimpleNamespace(step_execution=True)
             proc.result_mq = object()
             proc._running = True
             proc._return_result = lambda *args, **kwargs: None
@@ -221,12 +240,18 @@ def _halo_failure_worker(rank, path, ready, start):
         raise SystemExit(2) from error
 
 
-def test_spatial_halo_oom_closes_worker_group(tmp_path):
+@pytest.mark.parametrize("failure_stage", ["halo", "install"])
+def test_spatial_oom_closes_worker_group(tmp_path, failure_stage):
     ctx = mp.get_context("spawn")
     ready = [ctx.Event(), ctx.Event()]
     start = ctx.Event()
+    injected = ctx.Event()
     processes = [
-        ctx.Process(target=_halo_failure_worker, args=(rank, str(tmp_path / "gloo"), ready, start)) for rank in range(2)
+        ctx.Process(
+            target=_spatial_failure_worker,
+            args=(rank, str(tmp_path / "gloo"), ready, start, failure_stage, injected),
+        )
+        for rank in range(2)
     ]
     executor = MultiprocDiffusionExecutor.__new__(MultiprocDiffusionExecutor)
     executor._closed = False
@@ -248,15 +273,18 @@ def test_spatial_halo_oom_closes_worker_group(tmp_path):
     try:
         for process in processes:
             process.start()
-        assert all(event.wait(60) for event in ready), "warmup did not complete"
+        assert all(event.wait(60) for event in ready), "workers did not become ready"
         executor._start_worker_monitor()
         start.set()
         # Well below the 60s process-group timeout: a rank failure must reach
         # the executor and close its peers, even when rank 1 is not the output rank.
         assert failed.wait(10), "worker group survived a spatial decode failure"
+        assert injected.is_set(), "failure did not reach the intended injection point"
         assert executor.is_dead
         assert all(not process.is_alive() for process in processes)
         assert processes[1].exitcode == 1
+        if failure_stage == "install":
+            assert all(process.exitcode == 1 for process in processes)
         with pytest.raises(RuntimeError, match="shut down"):
             pending_request.result(timeout=1)
         with pytest.raises(RuntimeError, match="closed"):

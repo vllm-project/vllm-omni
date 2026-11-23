@@ -65,13 +65,24 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
                     f"Qwen spatial-shard vae_patch_parallel_size={size} must match executor group size={world_size}."
                 )
         try:
+            installed = getattr(self, "_qwen_spatial_shard_config", None)
+            # The config is set only after installation succeeds. Skip the
+            # installation all_reduce on subsequent decode calls.
+            if size > 1 and installed is None:
+                try:
+                    with executor._sync_errors("spatial decode installation"):
+                        install_qwen_spatial_shard_decode(
+                            self, executor.group, executor.parallel_mode.removeprefix("spatial_shard_")
+                        )
+                except Exception as error:
+                    # Installation mutates the decoder in place; no rank may
+                    # reuse the group if a peer has a partially patched decoder.
+                    raise DistributedExecutionError(
+                        "Qwen spatial decode installation failed; the worker group must be restarted."
+                    ) from error
             with executor._sync_errors("spatial decode preparation") if size > 1 else nullcontext():
                 if z.shape[2] == 0:
                     raise ValueError("Qwen spatial-shard decode requires at least one latent frame.")
-                if size > 1:
-                    install_qwen_spatial_shard_decode(
-                        self, executor.group, executor.parallel_mode.removeprefix("spatial_shard_")
-                    )
                 self.clear_cache()
                 x = self.post_quant_conv(z)
             try:
