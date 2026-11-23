@@ -9,7 +9,7 @@ Uses ``hunyuan_image3_dit.yaml`` (single diffusion stage, TP=4 across 4 devices,
 no AR / Mooncake connector) so this stays a cheap ready-path smoke. The DiT is
 sharded across 4 cards on both CUDA and NPU (see the ``platforms.npu`` block in the
 deploy yaml); heavier multi-config / parallel coverage lives in the perf
-(``tests/dfx/perf/tests/test_hunyuan_image_tp*.json``) and reliability
+(``tests/dfx/perf/tests/test_hunyuan_image3_*.json``) and reliability
 (``tests/dfx/reliability/test_hunyuan_image.py``) suites.
 
 From ``tests/``::
@@ -31,8 +31,7 @@ MODEL = "tencent/HunyuanImage-3.0-Instruct"
 PROMPT = "A simple red apple on a white background."
 
 # HunyuanImage-3 DiT-only deploy shards the DiT across 4 devices (TP=4) on both
-# CUDA and NPU (see hunyuan_image3_dit.yaml). This mirrors the hardware marks used
-# by the perf suite (test_hunyuan_image_tp4.json).
+# CUDA and NPU (see hunyuan_image3_dit.yaml).
 FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=4)
 
 

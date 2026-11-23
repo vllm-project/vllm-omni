@@ -29,14 +29,14 @@ omni:
     - t2i
 
 dependencies:
-  - note: "Pin vllm==0.12.0 for Stable Diffusion 3.5"
-    command: "uv pip install vllm==0.12.0"
+  - note: "Pin vllm==0.33.0 for Stable Diffusion 3.5"
+    command: "uv pip install --torch-backend=cu130 vllm==0.33.0"
     brand: NVIDIA
   - note: "vllm-omni provides the image generation backend"
     command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
     brand: NVIDIA
-  - note: "AMD ROCm: install vLLM for ROCm and vLLM-Omni from source"
-    command: "VLLM_OMNI_TARGET_DEVICE=rocm uv pip install git+https://github.com/vllm-project/vllm-omni.git vllm==0.20.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721"
+  - note: "AMD ROCm: build the frozen vLLM 0.33.0 source runtime; native validation pending"
+    command: "git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source ."
     brand: AMD
 
 features: {}
@@ -83,7 +83,7 @@ guide: |
 
   ## Prerequisites
 
-  - vLLM-Omni on top of vLLM 0.12.0
+  - vLLM-Omni on top of vLLM 0.33.0
   - `diffusers` library
 
   ## Installation
@@ -91,36 +91,44 @@ guide: |
   ```bash
   uv venv
   source .venv/bin/activate
-  uv pip install vllm==0.12.0
+  uv pip install --torch-backend=cu130 vllm==0.33.0
   uv pip install git+https://github.com/vllm-project/vllm-omni.git
   ```
 
   ### AMD ROCm (MI300X, MI325X, MI355X)
 
-  > **Note:** The vLLM wheel for ROCm requires Python 3.12, ROCm 7.2.1, and glibc >= 2.35.
-  > If your environment does not meet these requirements, please use the Docker-based setup.
+  > The Dockerfile builds the frozen vLLM 0.33.0 source over its published
+  > bootstrap image. ROCm build and native model validation remain pending;
+  > this is not a claim that a final ROCm wheel is available.
 
   ```bash
   uv venv --python 3.12
   source .venv/bin/activate
-  VLLM_OMNI_TARGET_DEVICE=rocm uv pip install git+https://github.com/vllm-project/vllm-omni.git vllm==0.20.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721
+  git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
   ```
 
   ## Python Usage
 
   ```python
   from vllm_omni.entrypoints.omni import Omni
+  from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
   omni = Omni(model="stabilityai/stable-diffusion-3.5-medium")
 
-  images = omni.generate(
-      prompt="a cat wearing sunglasses, cyberpunk style",
-      negative_prompt="blurry, low quality",
-      height=1024, width=1024,
-      num_inference_steps=28,
-      guidance_scale=7.5,
-      num_outputs_per_prompt=2,
+  outputs = omni.generate(
+      {
+          "prompt": "a cat wearing sunglasses, cyberpunk style",
+          "negative_prompt": "blurry, low quality",
+      },
+      OmniDiffusionSamplingParams(
+          height=1024,
+          width=1024,
+          num_inference_steps=28,
+          guidance_scale=7.5,
+          num_outputs_per_prompt=2,
+      ),
   )
+  images = outputs[0].images
   ```
 
   ## CLI Usage

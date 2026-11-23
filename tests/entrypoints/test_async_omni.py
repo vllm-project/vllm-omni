@@ -4,6 +4,7 @@
 import asyncio
 import re
 from types import SimpleNamespace
+from typing import Any
 
 import anyio
 import pytest
@@ -17,9 +18,11 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import AsyncOmniParams
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
@@ -88,6 +91,8 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni.log_stats = False
     omni.request_states = {}
     omni._final_output_handler = lambda: None
+    omni._check_frontend_admission = lambda: None
+    omni._frontend_shutting_down = False
     omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
     omni._compute_final_stage_id = lambda output_modalities: 0
     omni._compute_final_output_stage_ids = lambda output_modalities: [0]
@@ -554,6 +559,66 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("priority", [None, 0, -7, 7], ids=["default", "zero", "negative", "positive"])
+@pytest.mark.parametrize("input_kind", ["ordinary", "stream", "empty_stream"])
+def test_generate_forwards_priority(mocker, input_kind, priority):
+    """Preserve request priority on every stage-0 ADD path."""
+
+    async def run():
+        add_request = mocker.AsyncMock()
+        omni = get_async_omni_instance(fake_add_request=add_request)
+        omni.engine.add_streaming_update_async = mocker.AsyncMock()
+        omni.engine.model_config = object()
+        mocker.patch(
+            "vllm_omni.entrypoints.async_omni.extract_prompt_components",
+            return_value=(None, None, None),
+        )
+
+        async def input_stream():
+            if input_kind == "stream":
+                yield StreamingInput(prompt={"prompt_token_ids": [1, 2]})
+                yield StreamingInput(prompt={"prompt_token_ids": [3, 4]})
+
+        async def process_results(request_id, *args):
+            state = omni.request_states[request_id]
+            if state.input_stream_task is not None:
+                await state.input_stream_task
+            assert state.queue.empty(), "unexpected streaming input failure"
+            async for output in fake_process_results(request_id, *args):
+                yield output
+
+        omni._process_orchestrator_results = process_results
+        prompt = {"prompt_token_ids": [1, 2]} if input_kind == "ordinary" else input_stream()
+        priority_kwargs = {} if priority is None else {"priority": priority}
+        outputs = [
+            output
+            async for output in omni.generate(
+                prompt=prompt,
+                request_id="priority-test",
+                sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.DELTA)],
+                output_modalities=["text"],
+                **priority_kwargs,
+            )
+        ]
+
+        assert len(outputs) == 1
+        add_request.assert_awaited_once()
+        submitted = add_request.await_args.kwargs
+        if input_kind == "stream":
+            assert submitted["resumable"] is True
+            assert submitted["prompt"] == {"prompt_token_ids": [1, 2]}
+            assert omni.engine.add_streaming_update_async.await_count == 2
+        elif input_kind == "empty_stream":
+            assert submitted["resumable"] is False
+            assert submitted["prompt"] == {"prompt_token_ids": [0]}
+            omni.engine.add_streaming_update_async.assert_not_awaited()
+        assert omni.request_states == {}
+        assert submitted.get("priority", 0) == (0 if priority is None else priority)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5.0))
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("has_chunk", [False, True])
 @pytest.mark.parametrize("input_fails", [False, True])
 def test_streaming_input_terminal_submit_failure_reaches_generate(mocker, has_chunk, input_fails):
@@ -636,7 +701,13 @@ def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1.0)
+            # Harness bound only - it guards against a wedged cleanup, while the
+            # semantic bound is the monkeypatched ABORT_TIMEOUT_S=0.05 asserted
+            # via seen_timeouts below. CI scheduling stalls (CPU throttling, GC
+            # pauses) can delay the cleanup chain for ~1s before the inner bound
+            # arms (issue #10165), so keep generous headroom here instead of
+            # matching the inner bound's magnitude.
+            await asyncio.wait_for(task, timeout=5.0)
         assert seen_timeouts
         assert seen_timeouts[-1] == 0.05
         assert omni.request_states == {}
@@ -872,6 +943,113 @@ def test_qwen_video_sampling_keeps_all_three_stages_delta(input_kind):
     asyncio.run(run())
 
 
+def _next_stage_input(request_id: str) -> NextStageInputMessage:
+    return NextStageInputMessage(
+        request_id=request_id,
+        source_stage_id=0,
+        receiver_stage_id=1,
+        requests=[],
+        submit_kwargs=None,
+        stage_output=None,
+        prompt={"prompt": "hi"},
+        sampling_params_list=[],
+    )
+
+
+@pytest.mark.cpu
+def test_run_entry_stage_yields_at_entry_stage():
+    """Ensure the entry stage call yields at stage 0 with FINAL_ONLY params and returns the next stage input."""
+
+    async def run():
+        omni = get_async_omni_instance()
+        omni.engine.num_stages = 2
+        submitted: dict[str, Any] = {}
+
+        async def fake_add_request_async(*, request_id, **kwargs):
+            submitted.update(kwargs, request_id=request_id)
+            omni.request_states[request_id].queue.put_nowait(_next_stage_input(request_id))
+
+        omni.engine.add_request_async = fake_add_request_async
+        delta_params = SamplingParams(output_kind=RequestOutputKind.DELTA)
+
+        response = await omni.run_entry_stage(
+            {"prompt": "hi"},
+            [delta_params, SamplingParams()],
+            request_id="entry-call",
+            requested_replica_id=1,
+        )
+
+        assert isinstance(response, NextStageInputMessage)
+        assert re.fullmatch(r"entry-call-[0-9a-f]{8}-0", submitted["request_id"])
+        assert submitted["requested_replica_id"] == 1
+        assert (submitted["final_stage_id"], submitted["yield_stage_id"]) == (1, 0)
+        assert all(params.output_kind == RequestOutputKind.FINAL_ONLY for params in submitted["sampling_params_list"])
+        assert omni.request_states == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_run_downstream_stage_resubmits_and_returns_finished_output():
+    """Ensure a downstream stage call resubmits under a fresh id and returns the finished output, not a partial one."""
+
+    async def run():
+        omni = get_async_omni_instance()
+        stage_input = _next_stage_input("earlier-call")
+        submitted = []
+        next_stage_id = 1
+
+        async def fake_add_next_stage_input_async(msg):
+            submitted.append(msg)
+            # A decoding final stage emits an output per step; only the last is finished.
+            for finished in (False, True):
+                output = OutputMessage(
+                    request_id=msg.request_id,
+                    stage_id=next_stage_id,
+                    engine_outputs=SimpleNamespace(),
+                    finished=finished,
+                )
+                omni.request_states[msg.request_id].queue.put_nowait(output)
+
+        omni.engine.add_next_stage_input_async = fake_add_next_stage_input_async
+
+        response = await omni.run_downstream_stage(
+            stage_input,
+            request_id="downstream-call",
+            requested_replica_id=0,
+        )
+
+        assert isinstance(response, OutputMessage)
+        assert response.finished is True
+        assert re.fullmatch(rf"downstream-call-[0-9a-f]{{8}}-{next_stage_id}", submitted[0].request_id)
+        assert response.request_id == submitted[0].request_id
+        assert submitted[0].requested_replica_id == 0
+        assert omni.request_states == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_run_entry_stage_raises_error_response():
+    """Ensure an error response for the call is raised and the call's state is cleaned up."""
+
+    async def run():
+        omni = get_async_omni_instance()
+        omni.engine.num_stages = 2
+
+        async def fake_add_request_async(*, request_id, **kwargs):
+            error = ErrorMessage(error="bad stage input", status_code=400, request_id=request_id)
+            omni.request_states[request_id].queue.put_nowait(error)
+
+        omni.engine.add_request_async = fake_add_request_async
+
+        with pytest.raises(OmniClientError, match="bad stage input"):
+            await omni.run_entry_stage({"prompt": "hi"}, [SamplingParams(), SamplingParams()], request_id="entry-call")
+        assert omni.request_states == {}
+
+    asyncio.run(run())
+
+
 # End to end tests for ensuring internal manipulation of request ID
 # in diffusion / Omni models don't leak back to the user.
 #
@@ -893,7 +1071,7 @@ _DIFFUSION_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 _OMNI_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -921,7 +1099,7 @@ async def test_diffusion_generate_request_id(async_omni_runner_function):
         assert output.request_id != ""
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

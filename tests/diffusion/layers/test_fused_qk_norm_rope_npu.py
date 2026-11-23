@@ -85,7 +85,6 @@ def test_npu_qk_norm_rope_uses_torch_npu_fused_primitives_without_mindiesd(
         "torch_npu",
         types.SimpleNamespace(npu_rms_norm=npu_rms_norm, npu_rotary_mul=npu_rotary_mul),
     )
-    monkeypatch.setattr(fused, "find_spec", lambda _: None)
     q, k, q_weight, k_weight, rope_table = _inputs()
 
     actual_q, actual_k = fused._npu_qk_norm_rope(
@@ -105,29 +104,26 @@ def test_npu_qk_norm_rope_uses_torch_npu_fused_primitives_without_mindiesd(
 
 
 @pytest.mark.cpu
-def test_npu_qk_norm_rope_uses_mindiesd_and_normalizes_packed_layout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_npu_qk_norm_rope_ignores_installed_mindiesd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the #4042 contract: MindIE-SD stays unused even when importable.
+
+    The NPU path always composes torch_npu's own fused primitives; a
+    mindiesd install must never route ``_npu_apply_rope_table`` back to
+    ``mindiesd.rotary_position_embedding``.
+    """
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
-    calls: dict[str, int] = {"rms_norm": 0, "mindiesd_rope": 0}
+    calls: dict[str, int] = {"rms_norm": 0, "rotary_mul": 0, "mindiesd_rope": 0}
 
     def npu_rms_norm(x: torch.Tensor, gamma: torch.Tensor, epsilon: float):
         calls["rms_norm"] += 1
         return (F.rms_norm(x, (_HEAD_DIM,), gamma, epsilon),)
 
-    def rotary_position_embedding(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **kwargs):
-        calls["mindiesd_rope"] += 1
-        assert x.dim() == 4
-        assert x.shape[0] == 1
+    def npu_rotary_mul(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        calls["rotary_mul"] += 1
         assert x.shape[-1] == _ROTARY_DIM
         assert cos.shape == (1, x.shape[1], 1, _ROTARY_DIM)
         assert sin.shape == cos.shape
-        assert kwargs == {
-            "rotated_mode": "rotated_half",
-            "head_first": False,
-            "fused": True,
-        }
         half = _ROTARY_DIM // 2
         return torch.cat(
             (
@@ -137,13 +133,20 @@ def test_npu_qk_norm_rope_uses_mindiesd_and_normalizes_packed_layout(
             dim=-1,
         )
 
-    monkeypatch.setitem(sys.modules, "torch_npu", types.SimpleNamespace(npu_rms_norm=npu_rms_norm))
+    def rotary_position_embedding(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **kwargs):
+        calls["mindiesd_rope"] += 1
+        return x
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        types.SimpleNamespace(npu_rms_norm=npu_rms_norm, npu_rotary_mul=npu_rotary_mul),
+    )
     monkeypatch.setitem(
         sys.modules,
         "mindiesd",
         types.SimpleNamespace(rotary_position_embedding=rotary_position_embedding),
     )
-    monkeypatch.setattr(fused, "find_spec", lambda _: object())
     q, k, q_weight, k_weight, rope_table = _inputs()
 
     actual_q, actual_k = fused._npu_qk_norm_rope(
@@ -157,7 +160,7 @@ def test_npu_qk_norm_rope_uses_mindiesd_and_normalizes_packed_layout(
     )
     expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
 
-    assert calls == {"rms_norm": 2, "mindiesd_rope": 2}
+    assert calls == {"rms_norm": 2, "rotary_mul": 2, "mindiesd_rope": 0}
     torch.testing.assert_close(actual_q, expected_q, atol=0, rtol=0)
     torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
 

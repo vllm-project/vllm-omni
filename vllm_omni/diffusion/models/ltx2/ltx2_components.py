@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -53,6 +54,7 @@ from .vae.decoder import (
     LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
     LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
     LTX2VideoVaeNeighborhoodNattenProcessor,
+    LTX2VideoVaeNeighborhoodTritonProcessor,
 )
 from .vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
 
@@ -322,8 +324,18 @@ def resolve_ltx_artifact(
         ) from exc
 
 
-def _create_ltx25_natten_processor() -> LTX2VideoVaeNeighborhoodNattenProcessor:
-    """Create the required production attention backend with an actionable error."""
+def _create_ltx25_neighborhood_processor() -> (
+    LTX2VideoVaeNeighborhoodNattenProcessor | LTX2VideoVaeNeighborhoodTritonProcessor
+):
+    """Select NATTEN on CUDA and the bundled Triton ``na3d`` on ROCm."""
+    if current_omni_platform.is_rocm():
+        try:
+            return LTX2VideoVaeNeighborhoodTritonProcessor()
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            raise RuntimeError(
+                "LTX-2.5 DiffVAE on ROCm requires the bundled Triton neighborhood-attention backend. "
+                "Install a working ROCm PyTorch and Triton stack."
+            ) from exc
     try:
         return LTX2VideoVaeNeighborhoodNattenProcessor()
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
@@ -779,11 +791,11 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             dtype=dtype,
             revision=revision,
         )
-        # The canonical decoder is trained and validated with NATTEN. Its
-        # portable FlexAttention fallback materializes an impractically large
-        # block mask at production video sizes, so fail early if the matching
-        # Hub kernel cannot be loaded instead of failing later during decode.
-        pipeline.diffusion_decoder.set_attn_processor(_create_ltx25_natten_processor())
+        # The canonical decoder uses inward-shifted 3D neighborhood attention.
+        # FlexAttention materializes an impractically large block mask at
+        # production video sizes, so select NATTEN on CUDA and bounded Triton
+        # na3d on ROCm before decode begins.
+        pipeline.diffusion_decoder.set_attn_processor(_create_ltx25_neighborhood_processor())
         vae_patch_parallel_size = int(
             getattr(getattr(od_config, "parallel_config", None), "vae_patch_parallel_size", 1)
         )

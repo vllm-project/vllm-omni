@@ -42,7 +42,7 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
-    def supports_multi_doc_packed_varlen(cls) -> bool:
+    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
         """Whether this backend keeps N-document packed boundaries isolated.
 
         When True, the backend consumes ``AttentionMetadata.extra`` cu_seqlens
@@ -55,6 +55,12 @@ class AttentionBackend(ABC):
         cu_seqlens outright, will silently attend across request boundaries.
         Backends whose kernel selection is platform-dependent must consult
         ``current_omni_platform``.
+
+        ``kv_cache_dtype`` is the layer's effective quantization policy for
+        the forward in question (None/"float" = dequantized, e.g. "fp8").
+        Backends whose quantized kernel cannot consume packed cu_seqlens
+        metadata must report False for a non-float dtype so the caller can
+        fall back to per-document dense forwards.
         """
         return False
 
@@ -389,6 +395,8 @@ class AttentionImpl(ABC, Generic[T]):
             return self.forward_xpu(query, key, value, attn_metadata)
         elif current_omni_platform.is_musa():
             return self.forward_musa(query, key, value, attn_metadata)
+        elif current_omni_platform.is_out_of_tree():
+            return self.forward_oot(query, key, value, attn_metadata)
         else:
             raise NotImplementedError(f"No forward implementation for platform: {current_omni_platform}")
 
@@ -450,3 +458,15 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> torch.Tensor:
         # By default, MUSA ops are compatible with CUDA ops.
         return self.forward_cuda(query, key, value, attn_metadata)
+
+    def forward_oot(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement forward_oot for out-of-tree platforms; "
+            "select a diffusion attention backend that does, such as TORCH_SDPA."
+        )

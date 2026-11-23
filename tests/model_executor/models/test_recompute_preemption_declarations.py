@@ -29,6 +29,10 @@ from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPEL
 from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
+from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_ASR_PIPELINE,
+    JOYAI_VL_INTERACTION_PIPELINE,
+)
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
@@ -47,6 +51,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # (pipeline, stage that cannot replay)
 _FAIL = [
+    (JOYAI_VL_INTERACTION_PIPELINE, "qwen3_tts"),
+    (JOYAI_VL_INTERACTION_ASR_PIPELINE, "qwen3_tts"),
     (QWEN3_OMNI_PIPELINE, "talker"),
     (VOXCPM2_PIPELINE, "latent_generator"),
     (GEPARD_PIPELINE, "gepard"),

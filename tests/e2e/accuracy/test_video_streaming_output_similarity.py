@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.helpers import assert_video_similarity_metrics, probe_video
+from tests.e2e.accuracy.helpers import (
+    assert_video_similarity_metrics,
+    measure_video_similarity_metrics,
+    probe_video,
+    write_accuracy_result,
+)
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import DiffusionResponse, OmniServer, OnlineOmniClient, get_model_prefix
 
@@ -134,12 +139,30 @@ def test_helios_streaming_output_matches_non_streaming(
         f"non_streaming_path={non_streaming_path}"
     )
 
-    ssim, psnr = assert_video_similarity_metrics(
+    ssim, psnr = measure_video_similarity_metrics(
+        label="helios_streaming_output",
+        online_path=streaming_path,
+        offline_path=non_streaming_path,
+    )
+    write_accuracy_result(
+        model_id="helios_streaming_output",
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": MIN_SSIM, "psnr": MIN_PSNR_DB},
+        extra={
+            "label": "helios_streaming_output",
+            "online_video": str(streaming_path),
+            "offline_video": str(non_streaming_path),
+        },
+    )
+    assert_video_similarity_metrics(
         label="helios_streaming_output",
         online_path=streaming_path,
         offline_path=non_streaming_path,
         ssim_threshold=MIN_SSIM,
         psnr_threshold=MIN_PSNR_DB,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
     record_property("helios_streaming_vs_non_streaming_psnr_db", psnr)
     record_property("helios_streaming_vs_non_streaming_ssim_percent", ssim * 100.0)

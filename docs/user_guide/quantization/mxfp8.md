@@ -4,13 +4,14 @@
 
 W8A8 MXFP8 (Microscaling FP8) quantizes both weights and activations to FP8
 using the OCP MX format: groups of 32 K-dimension elements share a single
-`float8_e8m0fnu` exponent scale. This gives better accuracy than channel-wise
-FP8 while keeping the same 8-bit weight footprint.
+`float8_e8m0fnu` exponent scale. The finer scaling can reduce quantization error
+relative to coarser FP8 scaling; validate accuracy on the intended workload.
+Weights use eight bits per element plus block-scale storage.
 
 This method supports three modes:
 
 | Mode | Description |
-|------|-------------|
+| ------ | ------------- |
 | **Online** | BF16 weights are quantized to MXFP8 at load time — no pre-processing needed |
 | **Offline (Native)** | msModelSlim-exported MXFP8 weights converted to diffusers format via `merge_mxfp8_checkpoint.py` — weights and scales are loaded directly from the preprocessed checkpoint |
 | **Offline (AutoRound)** | AutoRound MXFP8 checkpoints with `data_type="mx_fp"` — auto-detected from `config.json` |
@@ -18,10 +19,10 @@ This method supports three modes:
 ## Hardware Support
 
 | Device | Online | Offline (Native) | Offline (AutoRound) |
-|--------|--------|------------------|---------------------|
-| NVIDIA Blackwell GPU (SM 100+) | ⭕ | ⭕ | ⭕ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ | ⭕ | ⭕ |
-| NVIDIA Ampere GPU (SM 80+) | ⭕ | ⭕ | ⭕ |
+| -------- | -------- | ------------------ | --------------------- |
+| NVIDIA Blackwell/Rubin GPU (SM 100, 103, 107) | ✅ | ❌ | ⭕ |
+| NVIDIA Ada/Hopper GPU (SM 89/90) | ❌ | ❌ | ⭕ |
+| NVIDIA Ampere GPU (SM 80/86) | ❌ | ❌ | ⭕ |
 | AMD ROCm | ⭕ | ⭕ | ⭕ |
 | Intel XPU | ✅ | ❌ | ✅ |
 | Ascend NPU (Atlas 950 A5) | ✅ | ✅ | ⭕ |
@@ -30,12 +31,37 @@ Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 
 **Note**: Intel XPU only supports AutoRound MXFP8 for offline mode. Use AutoRound quantized checkpoints or online mode for XPU.
 
+CUDA online mode reuses vLLM's MXFP8 online linear method and kernel selection.
+It requires a vLLM build with CUDA MXFP8 support and its FlashInfer CuTe-DSL
+dependencies. Other CUDA compute capabilities are rejected explicitly. This
+path handles diffusion linear layers; it does not add CUDA MXFP8 MoE support.
+Native serialized MXFP8 checkpoints are not supported on CUDA.
+
+CUDA validation covers SM107 on Vera Rubin: BF16/FP16 input, 2D/3D and strided
+activations, bias, fused QKV/MLP loading, row-parallel weight loading, and an
+H3-Image SP4 serving run. SM100/SM103 are enabled through the upstream kernel
+path but were not included in that MXFP8 hardware validation.
+
 ## Model Type Support
+
+### Image Model (MiniMax-H3-Image)
+
+Online MXFP8 was validated on four Rubin GPUs with DiT TP1, Ulysses SP4, encoder
+TP4 and the released six-step schedule: six generation/editing workloads and
+160 diverse 4096×4096 requests. The image pipeline applies the global
+quantization setting to the DiT; the encoder and VAE retain native precision.
+These checks establish serving functionality, not a universal quality bound.
+
+```bash
+vllm serve MiniMaxAI/MiniMax-H3-Image --omni \
+  --num-gpus 4 --usp 4 --tensor-parallel-size 1 \
+  --text-encoder-tp-size 4 --quantization mxfp8
+```
 
 ### Diffusion Model (Wan2.2)
 
 | Model | Mode | Notes |
-|-------|------|-------|
+| ------- | ------ | ------- |
 | Wan2.2-T2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
 | Wan2.2-I2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
 | Wan2.2-TI2V-5B | Online + Offline | Single transformer |
@@ -43,14 +69,14 @@ Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Status | Notes |
-|-------|--------|-------|
+| ------- | -------- | ------- |
 | Qwen3-Omni | Not validated | — |
 | Qwen3-TTS | Not validated | — |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Status | Notes |
-|-------|--------|-------|
+| ------- | -------- | ------- |
 | BAGEL | Not validated | — |
 | GLM-Image | Not validated | — |
 
@@ -132,7 +158,7 @@ python vllm_omni/quantization/tools/merge_mxfp8_checkpoint.py \
 ```
 
 | Argument | Description |
-|----------|-------------|
+| ---------- | ------------- |
 | `--model-type` | Model variant: `Wan2.2-T2V-A14B`, `Wan2.2-I2V-A14B`, or `Wan2.2-TI2V-5B` |
 | `--original-model` | Root directory of the original BF16 diffusers model |
 | `--quant-path` | Root directory of the msModelSlim quantized output |
@@ -199,16 +225,17 @@ omni = Omni(model="<autoround-mxfp8-model>")
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
 
 ## Validation and Notes
 
-1. Online mode quantizes BF16 weights at load time using
-   `npu_dynamic_mx_quant`. This adds a one-time overhead on the first load
-   but requires no checkpoint preparation.
+1. Online mode quantizes BF16/FP16 weights at load time using the selected
+   platform's implementation (`npu_dynamic_mx_quant` on NPU, vLLM's online
+   MXFP8 path on CUDA/XPU). This adds a one-time loading overhead but requires
+   no checkpoint preparation.
 2. Offline mode loads FP8 weights directly from the checkpoint. Scales are
    stored as `uint8` bytes in safetensors (same bit layout as
    `float8_e8m0fnu`) and are reinterpreted at load time without a dtype

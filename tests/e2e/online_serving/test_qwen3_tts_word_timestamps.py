@@ -42,18 +42,23 @@ _PARAMS = [
             "--trust-remote-code",
             "--forced-aligner",
             "Qwen/Qwen3-ForcedAligner-0.6B",
-            "--kv-cache-memory-bytes",
-            str(512 * 1024**2),
-            "--max-num-seqs",
-            "4",
-            "--max-num-batched-tokens",
-            "2048",
+            "--stage-overrides",
+            json.dumps(
+                {
+                    stage_id: {
+                        "max_num_seqs": 4,
+                        "max_num_batched_tokens": 2048,
+                        "kv_cache_memory_bytes": 512 * 1024**2,
+                    }
+                    for stage_id in (0, 1, 2)
+                }
+            ),
         ],
     )
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_async_chunk_word_timestamps(omni_server, online_client):
     online_client.send_audio_speech_request(
@@ -71,7 +76,7 @@ def test_async_chunk_word_timestamps(omni_server, online_client):
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_async_chunk_speech_without_timestamps(omni_server, online_client):
     online_client.send_audio_speech_request(
@@ -89,7 +94,7 @@ def test_async_chunk_speech_without_timestamps(omni_server, online_client):
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_async_chunk_streaming_word_timestamps(omni_server):
     text = "The weather is nice today, perfect for a walk in the park."

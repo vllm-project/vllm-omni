@@ -9,7 +9,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import categorical_sample, nucleus_sample
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
+pytestmark = [pytest.mark.core_model]
 
 
 def _torch_sample(probs, generators):
@@ -22,6 +22,7 @@ def _torch_sample(probs, generators):
     return (probs / noise).argmax(dim=-1)
 
 
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "vocab,rows,seeding",
@@ -62,6 +63,7 @@ def test_categorical_matches_tokens_and_generator_states(vocab, rows, seeding):
             assert torch.equal(g.get_state(), after[key]), (step, seeding, key)
 
 
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "vocab,top_k,seeded,window",
@@ -103,3 +105,13 @@ def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, win
         assert torch.equal(actual_repeated, repeated)
         for g, state in zip(owned, after):
             assert torch.equal(g.get_state(), state)
+
+
+@pytest.mark.cpu
+def test_cosyvoice_cpu_categorical_fallback_keeps_request_rng():
+    probs = torch.arange(1, 22, dtype=torch.float32).reshape(3, 7).softmax(-1)
+    actual_gens = {i: torch.Generator().manual_seed(42 + i) for i in range(3)}
+    expected_gens = {i: torch.Generator().manual_seed(42 + i) for i in range(3)}
+    for _ in range(4):
+        assert torch.equal(categorical_sample(probs.clone(), actual_gens), _torch_sample(probs, expected_gens))
+        assert all(torch.equal(actual_gens[i].get_state(), expected_gens[i].get_state()) for i in actual_gens)

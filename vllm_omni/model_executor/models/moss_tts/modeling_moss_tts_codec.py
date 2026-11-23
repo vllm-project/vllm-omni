@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -656,9 +657,14 @@ class MossTTSCodecDecoder(nn.Module):
         self._initial_stream_chunk_frames: int = self._connector_int("initial_codec_chunk_frames", default=0)
         self._stream_chunk_frames: int = self._connector_int("codec_chunk_frames", default=0)
         self._stream_max_step_frames: int = self._stream_chunk_frames or 100
-        # Opt-in: size codec attention rings as context + one chunk so chunked
-        # streaming reproduces whole-sequence decoding (costs ring memory).
-        self._stream_ring_headroom: bool = bool(self._connector_int("codec_ring_headroom", default=0))
+        # Local continuation must retain the whole causal window while a
+        # reference chunk is written. The existing headroom path reserves
+        # context + one decode step, without increasing the step size.
+        self._stream_ring_headroom: bool = bool(
+            self._connector_int(
+                "codec_ring_headroom", default=int(getattr(cfg, "model_type", None) == "moss_tts_local")
+            )
+        )
         self._stream_req_slots: dict[str, int] = {}
         self._stream_first_audio_requests: set[str] = set()
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
@@ -779,7 +785,9 @@ class MossTTSCodecDecoder(nn.Module):
                 },
             )
 
-        if self._async_chunk and runtime_additional_information is None:
+        # MRv2 OmniModelState.prepare_dummy_inputs and empty dummy slots pass {}
+        # without _is_dummy; real scheduled requests always carry req_id / meta.
+        if self._async_chunk and all(not info or info.get("_is_dummy") for info in info_list):
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -837,7 +845,7 @@ class MossTTSCodecDecoder(nn.Module):
 
         offsets = [0]
         first_audio_flags = self._first_audio_flags(info_list)
-        trim_first: set[int] = set()
+        trim_frames: dict[int, int] = {}
         for n in token_counts:
             offsets.append(offsets[-1] + int(n))
 
@@ -876,8 +884,9 @@ class MossTTSCodecDecoder(nn.Module):
             req_key = self._runtime_request_key(info, meta, i)
 
             if streaming_enabled:
+                trim_frames[i] = left_ctx
                 if first_audio_flags[i] and req_key not in self._stream_req_slots:
-                    trim_first.add(i)
+                    trim_frames[i] += 1
                 streaming_work.append((i, req_key, codes_nq_t, finished))
                 continue
 
@@ -931,8 +940,9 @@ class MossTTSCodecDecoder(nn.Module):
                 streaming_work,
                 output_buffers=stream_output_buffers or None,
             ).items():
-                if i in trim_first:
-                    wav = wav[..., int(self._codec.downsample_rate) :]
+                # Decode the reference to advance causal state, then remove
+                # only its PCM (and any already delivered first frame).
+                wav = wav[..., trim_frames[i] * int(self._codec.downsample_rate) :]
                 audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
 
         payload = {"model_outputs": audios, "sr": srs, **self._first_audio_metadata(first_audio_flags)}
@@ -1287,7 +1297,10 @@ class MossTTSCodecDecoder(nn.Module):
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
         )
+        # Reference encoding belongs to the API process.
+        codec.encoder = None
         if device.type in ("cuda", "npu"):
+            current_omni_platform.empty_cache()
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
 
             shared = 0
@@ -1343,6 +1356,13 @@ class MossTTSCodecDecoder(nn.Module):
                 self._streaming_graph_batch_sizes,
                 self._streaming_graph_frame_sizes,
             )
+            return
+
+        if isinstance(self._codec, MossAudioTokenizerV2Model):
+            # The legacy offline graph wrapper calls the v1-only _decode API.
+            # V2 whole-sequence decode uses batch_decode; streaming retains
+            # its existing stateful graph path above.
+            logger.info("MOSS Audio Tokenizer v2 uses eager whole-sequence decode.")
             return
 
         self._enable_non_streaming_decoder_cudagraph(device)

@@ -287,7 +287,6 @@ kernel's fp16 workspace cannot overflow on outlier activations. Measured on
 the FastH3 four-step Dense configuration below, T2VA 15 s at 1344x768, this
 kernel reduced end-to-end latency from ~73 s to ~57 s (about 22%).
 
-
 ## FastH3 four-step on A3
 
 [FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
@@ -459,8 +458,8 @@ These describe the validated shapes rather than a general throughput guarantee.
 > through the offload backend's per-tensor transform hook, but is left as future
 > work pending upstream design discussion.
 
+## FastH3 HTTP API examples
 
-## HTTP API examples
 Switch tasks via `extra_params.task` (`t2va` / `fl2va` / `ref2va`); FL2VA and
 Ref2VA additionally pass `input_references` (first-frame image, reference
 video/audio). The full parameter table lives in the GPU recipe.
@@ -483,6 +482,62 @@ then on top of the recommended configuration above:
 T2VA only; FL2VA and Ref2VA are not supported, and neither
 `--enable-cpu-offload` nor `--enable-layerwise-offload` may be combined with
 it.
+
+## Optional LiteVAE video decoder
+
+Add the following to select the standard non-INT8 Lite decoder:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+See the [LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for
+checkpoint requirements and decoder selection rules.
+
+### LiteVAE measurements: 8 Ascend 910B4 NPUs
+
+The following exploratory measurements compare LiteVAE enabled against main
+on **8 Ascend 910B4 NPUs**. They cover T2VA with these fixed settings:
+
+- FlashGen online LoRA, PEFT backend, scale 1, four inference steps, seed 1101.
+- 124 frames at 24 FPS, five-second request duration, flow shift 12, audio shift 3.
+- USP8, ring1, text encoder TP8, VAE tile mode with tiling and patch parallel size 8.
+- Distributed layerwise offload, DiT INT8, RainFusion sparsity 0.8 starting at step 0.
+- `preencode_mp4=false`, `video_vae_decoder=null`; only the LiteVAE-enabled arm sets `lightvae_decoder_path`.
+
+This measured FlashGen/RainFusion combination differs from the dense FlashGen
+configuration above. To reproduce it, use the same LoRA and eight-card serving
+flags, replace the attention configuration with the following (do not also
+select the dense backend), and keep the pipeline profiler disabled:
+
+```bash
+--diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"start_step":0}}}'
+```
+
+Five prompts cover cats playing brass instruments, a freckled portrait,
+floating balloons, embossed book titles, and piano hands.
+
+Each prompt/resolution/configuration combination includes one warmup and three
+measured requests. For each configuration, average the five per-prompt hot-run
+medians, then divide the main latency by the LiteVAE latency for speedup.
+
+| Case | Requested resolution | Output resolution | E2E speedup | E2E latency reduction | Video VAE decode speedup | VAE latency reduction |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 854 x 480 | 832 x 480 | 1.186x | 15.7% | 2.603x | 61.6% |
+| 2 | 864 x 480 | 864 x 480 | 1.175x | 14.9% | 2.694x | 62.9% |
+| 3 | 1280 x 720 | 1280 x 704 | 1.217x | 17.8% | 2.619x | 61.8% |
+| 4 | 1344 x 768 | 1344 x 768 | 1.182x | 15.4% | 2.640x | 62.1% |
+
+Video VAE timing uses current-stream NPU Events around `decode_latent()` and
+takes the maximum duration across eight ranks as a stage critical-path
+estimate. It excludes DiT denoising, audio decode, MP4 encoding, and HTTP
+delivery. Current-stream Events do not independently measure unrelated streams.
+
+The main, PR-off, and PR-on matrix completed 240 requests including warmups.
+PR-off MP4 hashes match main for all 20 prompt/resolution combinations.
+Manual visual review found some visually noticeable quality degradation with
+LiteVAE enabled compared with the original decoder. The speedup comes with a
+visual-quality trade-off.
 
 ## CPU MP4 response encoding (Atlas A2)
 

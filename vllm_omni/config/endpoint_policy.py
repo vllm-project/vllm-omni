@@ -31,6 +31,7 @@ class OmniServingCapability(Enum):
     INVOCATIONS = RouteTarget("/invocations", frozenset({"POST"}))
     GENERATE_TOKENS = RouteTarget("/inference/v1/generate", frozenset({"POST"}))
     IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
+    RUN = RouteTarget("/v1/run", frozenset({"POST"}))
 
     @property
     def path(self) -> str:

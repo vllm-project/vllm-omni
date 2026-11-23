@@ -23,11 +23,14 @@ from copy import deepcopy
 
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex.commands import CancelFunctionCall
 from vllm_omni.engine.duplex.config import DuplexConfigError, realtime_item_to_history_message
-from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.contracts import ToolCallAbandonReason
+from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, validate_session_tools
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter, session_auto_responds
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported, check_input_clock_unchanged
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallRejection, ToolCallState
@@ -45,6 +48,10 @@ from vllm_omni.engine.duplex.turn_detection import (
 from vllm_omni.protocol.duplex.events import error_event
 
 logger = init_logger(__name__)
+
+
+class TurnDetectionAudioError(ValueError):
+    """Turn detection could not read an append's audio: the runner refuses the append (``bad_audio``)."""
 
 
 class SessionControl:
@@ -120,13 +127,16 @@ class SessionControl:
         if detector is None:
             return [(event, None)]
         audio = event.get("audio")
-        if not isinstance(audio, str) or not audio:
+        if not isinstance(audio, str | bytes) or not audio:
             return [(event, None)]
-        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm_f32le"
+        fmt_raw = event.get("format")
+        fmt = fmt_raw if isinstance(fmt_raw, str) else "pcm_f32le"
         sample_rate_hz = event.get("sample_rate_hz")
         try:
-            segments = await self._ctx.services.offload(
-                detector.process_segments,
+            # The manager's batcher scores this session's Silero frames together
+            # with every other session's, instead of one pool task per append.
+            segments = await self._ctx.manager.turn_detection_batcher.process_segments(
+                detector,
                 audio,
                 fmt=fmt,
                 sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int) else None,
@@ -140,8 +150,10 @@ class SessionControl:
             self._detector = None
             return [(event, None)]
         except ValueError as exc:
-            self._out.emit_error("bad_audio", str(exc))
-            return []
+            # The runner refuses the append (error ``bad_audio`` with the
+            # client's event id; an input-clocked session also acknowledges it
+            # as rejected), like audio that failed to decode.
+            raise TurnDetectionAudioError(str(exc)) from exc
         detected: list[tuple[dict[str, object], TurnDetectionResult | None]] = []
         for index, segment in enumerate(segments):
             payload = dict(event, audio=segment.audio, format="pcm_f32le", sample_rate_hz=16000)
@@ -320,6 +332,13 @@ class SessionControl:
             # error means nothing was applied, including a staged detector.
             self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
             return
+        try:
+            # Top-level tools reach the config here, past the extra_body check above.
+            self._ctx.plugin.validate_client_extra_body(candidate_config.extra_body)
+            validate_session_tools(session.capabilities, candidate_config.extra_body)
+        except (DuplexRuntimeConfigError, DuplexConfigError) as exc:
+            self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
+            return
         # Also when the update only turns auto_response on under a live semantic_vad.
         unsupported = self._semantic_vad_unsupported(
             pending_turn_detection.config if pending_turn_detection is not None else self._config,
@@ -327,6 +346,14 @@ class SessionControl:
         )
         if unsupported is not None:
             self._out.emit_error("unsupported_turn_detection", unsupported, event_id=realtime_event_id)
+            return
+        try:
+            check_input_clock_supported(self._ctx.plugin, candidate_config.extra_body)
+            # The clock mode and its timeouts are fixed at creation, like the
+            # acknowledgements they decide.
+            check_input_clock_unchanged(session.config.extra_body, candidate_config.extra_body)
+        except DuplexRuntimeConfigError as exc:
+            self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
             return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
             self._out.emit_error(
@@ -510,8 +537,12 @@ class SessionControl:
                     nested_url = image_url.get("url") if isinstance(image_url, dict) else None
                     if isinstance(nested_url, str):
                         existing.append(nested_url)
-            if len(existing) + len(urls) > 8 or sum(map(len, existing + urls)) > 4 * 1024 * 1024:
-                self._out.emit_error("input_backpressure", "Image context exceeds 8 images or 4 MiB; delete old items")
+            max_images, max_image_bytes = self._ctx.plugin.image_history_limits()
+            if len(existing) + len(urls) > max_images or sum(map(len, existing + urls)) > max_image_bytes:
+                self._out.emit_error(
+                    "input_backpressure",
+                    f"Image context exceeds {max_images} images or {max_image_bytes} encoded bytes; delete old items",
+                )
                 return
         message = realtime_item_to_history_message(item)
         item_id = item.get("id") if isinstance(item, dict) else None
@@ -520,7 +551,7 @@ class SessionControl:
             session.register_history_item(item_id if isinstance(item_id, str) else None, message)
             if message.get("role") == "user":
                 # A later response.create may answer this without any audio.
-                session.notify_new_user_item()
+                session.notify_new_user_item(message)
         self._out.emit(
             {
                 "type": "conversation.item.created",
@@ -650,6 +681,23 @@ class SessionControl:
                 ),
                 name="duplex-continue",
             )
+
+    def on_function_call_cancel(self, command: CancelFunctionCall) -> None:
+        """End one pending call for the client. Any tool output stays with the client."""
+        reason = (
+            ToolCallAbandonReason.CLIENT_FAILED
+            if command.reason == "failed"
+            else ToolCallAbandonReason.CLIENT_CANCELLED
+        )
+        rejection = self._ctx.tool_calls.cancel(command.call_id, reason=reason, epoch=self._ctx.session.epoch)
+        if rejection is None:
+            return
+        message = (
+            f"function_call.cancel requires a function call this session exposed, got {command.call_id}"
+            if rejection is ToolCallRejection.UNKNOWN
+            else f"function call {command.call_id} has already settled"
+        )
+        self._out.emit_error("invalid_function_call_cancel", message, event_id=command.event_id)
 
     def _reject_function_call_output(self, reason: ToolCallRejection, call_id: object, *, event_id: object) -> None:
         """Report a refused result with the wire shape the public contract kept.

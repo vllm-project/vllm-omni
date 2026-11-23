@@ -6,16 +6,26 @@ import os
 import types
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, get_args, get_origin
 
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.config_factory import with_trust_remote_code_override
+from vllm_omni.config.stage_config import SERVE_CLI_SCOPE_KEY
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 
+if TYPE_CHECKING:
+    from vllm_omni.utils.tracking_parser import TrackingNamespace
+
 logger = init_logger(__name__)
+
+
+def mark_serve_cli_args(args: "TrackingNamespace") -> None:
+    """Carry serving CLI provenance through the same namespace as explicit flags."""
+    setattr(args, SERVE_CLI_SCOPE_KEY, True)
+    args.explicit_keys = args.explicit_keys | {SERVE_CLI_SCOPE_KEY}
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
@@ -58,8 +68,8 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
         logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
-def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
-    """Parse and validate the shape of per-stage JSON overrides."""
+def parse_stage_overrides(value: Any, *, filter_deploy_fields: bool = True) -> dict[str, dict[str, Any]] | None:
+    """Validate per-stage overrides and optionally drop known deploy-only fields."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -75,17 +85,39 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             "--stage-overrides must be a JSON object mapping stage_id -> overrides, "
             f"got {type(parsed).__name__}: {parsed!r}"
         )
+    from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS
+
+    filtered: dict[str, dict[str, Any]] = {}
     for stage_id, overrides in parsed.items():
         if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
             raise ValueError(
                 f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id!r}"
             )
+        stage_id = stage_id.lstrip("0") or "0"
+        if stage_id in filtered:
+            raise ValueError(f"--stage-overrides contains more than one key for stage {stage_id}.")
         if not isinstance(overrides, dict):
             raise ValueError(
                 f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
             )
+        if not filter_deploy_fields:
+            filtered[stage_id] = overrides
+            continue
+        kept_overrides = {}
+        for key, override in overrides.items():
+            config_key = str(key).partition(".")[0]
+            if config_key in NON_STAGE_OVERRIDE_FIELDS:
+                logger.warning(
+                    "Ignoring --stage-overrides[%r][%r]: set %r in the deploy config instead.",
+                    stage_id,
+                    key,
+                    config_key,
+                )
+                continue
+            kept_overrides[key] = override
+        filtered[stage_id] = kept_overrides
 
-    return parsed
+    return filtered
 
 
 @dataclass(frozen=True)

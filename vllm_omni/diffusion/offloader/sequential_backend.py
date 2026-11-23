@@ -9,12 +9,13 @@ import torch
 from torch import nn
 from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from vllm.logger import init_logger
+from vllm.utils.platform_utils import is_pin_memory_available
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
-from .module_residency import PinnedModuleStager
+from .module_residency import PinnedModuleStager, _move_module_to_packed_pinned_cpu
 from .plan_resolver import resolve_offload_plan
 
 logger = init_logger(__name__)
@@ -120,11 +121,20 @@ class SequentialOffloadHook(ModelHook):
         refer to
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
+        pin = pin_memory and target_device.type == "cpu" and is_pin_memory_available()
+        if pin and not buffers_only and current_omni_platform.is_rocm():
+            moved = _move_module_to_packed_pinned_cpu(module, non_blocking=non_blocking)
+            if moved is not None:
+                return moved
+
         moved = False
         for tensor in chain(() if buffers_only else module.parameters(), module.buffers()):
-            if tensor.device != target_device:
+            # Modules built on host start pageable; pin them on the first offload
+            # so later loads do not stage the whole module through pageable memory.
+            unpinned = pin and not isinstance(tensor.data, DTensor) and not tensor.data.is_pinned()
+            if tensor.data.device != target_device or unpinned:
                 data = tensor.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                if pin and not isinstance(data, DTensor) and not data.is_pinned():
                     data = data.pin_memory()
                 tensor.data = data
                 moved = True
@@ -421,6 +431,11 @@ class ModelLevelOffloadBackend(OffloadBackend):
         all_modules = [*dits, *encoders, *vaes, *residents]
         initial_devices = _capture_tensor_devices(all_modules)
         try:
+            # Unselected DiTs stay resident, including projections called
+            # directly before their top-level forward hook (e.g. AR KV setup).
+            for component in resolved.dits:
+                if not component.selected:
+                    SequentialOffloadHook._move_params(component.module, self.device)
             for encoder in encoders:
                 encoder.to(self.device)
             for vae in vaes:

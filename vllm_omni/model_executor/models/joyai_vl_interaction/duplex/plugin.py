@@ -17,12 +17,17 @@ import numpy as np
 import pybase64
 from PIL import Image
 from vllm.config import ModelConfig
-from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexFence, DuplexOutputAction, DuplexOutputDecision
+from vllm_omni.engine.duplex.contracts import (
+    DuplexAppendPlan,
+    DuplexFence,
+    DuplexOutputAction,
+    DuplexOutputDecision,
+    ToolCallAbandonReason,
+)
 from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
@@ -30,8 +35,18 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
     DuplexRuntimeConfigError,
+    PartialStageForward,
     duplex_history_digest,
     duplex_text_history,
+)
+from vllm_omni.engine.duplex.text_folding import fit_text_excerpt
+from vllm_omni.engine.duplex.visual_memory import (
+    EncodedVisualImage,
+    VisualClosureReason,
+    VisualFrame,
+    VisualMemoryCapacityError,
+    VisualMemorySource,
+    VisualSummary,
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
@@ -67,27 +82,37 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
     SUMMARY_MAX_TOKENS,
-    EncodedVisualImage,
     TextSummaryChunk,
     TextSummaryLimit,
     TextSummaryProgress,
-    VisualClosureReason,
-    VisualFrame,
-    VisualMemoryCapacityError,
-    VisualMemorySource,
-    VisualSummary,
+)
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.prompt import (
+    drop_oldest_visual_frame,
+    interleave_history,
+    visual_response_refs,
 )
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,
     _extract_completed_action_text,
     render_joyai_memory_prefix,
 )
+from vllm_omni.worker.sampling_utils import apply_fixed_seed_to_sampling_params
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
 
 class JoyAIDuplexPlugin(DuplexModelPlugin):
+    #: A cancelled turn's question must not resurface on its own. If the model
+    #: asks it again, that repeat is current, and the refusal is the notice.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+            ToolCallAbandonReason.SUPPRESSED,
+        }
+    )
     plugin_id = "joyai-vl-interaction"
     supports_auxiliary_requests = True
     joyai_stage_id = 0
@@ -115,6 +140,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._timestamp_tokens = 0
         self._processor_lock = asyncio.Lock()
         self._memory_budget_error: str | None = None
+        # Deploy-level ``async_chunk``: the single switch for everything this
+        # plugin streams (JoyAI text deltas, per-sentence Talker handoff, Talker
+        # DELTA parks, output-stage draining). Default on so a plugin built
+        # without the engine hook keeps the streaming profile.
+        self._async_chunk_streaming = True
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         stages = {stage.model_stage: stage.stage_id for stage in pipeline_config.stages}
@@ -123,6 +153,36 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.audio_stage_id = stages["code2wav"]
         self.data_plane.joyai_stage_id = self.joyai_stage_id
         self.data_plane.audio_stage_id = self.audio_stage_id
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        """Follow the deploy's ``async_chunk`` for every streaming behavior.
+
+        ``async_chunk: false`` is the off switch for this profile, not just for
+        the Talker→Code2Wav edge. Sentence TTS, Talker DELTA parks and live text
+        projection all assume a prewarmed Code2Wav fed by connector chunks; with
+        the edge off, the one-shot path needs a ``finished`` Talker output and
+        would silently produce no audio, so the plugin reverts to it entirely.
+        """
+        self._async_chunk_streaming = bool(enabled)
+
+    def resumable_downstream_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Sentence TTS reuses Talker and Code2Wav across each turn's sentences."""
+        if not self._async_chunk_streaming:
+            return frozenset()
+        return frozenset(
+            stage_id for stage_id in (self.joyai_stage_id + 1, self.audio_stage_id) if stage_id < stage_count
+        )
+
+    def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Talker and Code2Wav keep running after JoyAI has finished the action."""
+        if not self._async_chunk_streaming:
+            # The one-shot path submits each output stage once per turn, so
+            # nothing of a previous turn is still draining.
+            return frozenset()
+        talker_stage_id = self.joyai_stage_id + 1
+        if talker_stage_id >= stage_count:
+            return frozenset()
+        return frozenset(range(talker_stage_id, stage_count))
 
     def input_stage_id(self, payload: object) -> int:
         if isinstance(payload, Mapping) and payload.get("audio"):
@@ -156,6 +216,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             supports_reencode_context=True,
             supports_turn_commit_only=True,
             supports_core_resumable_request=False,
+            tool_mode="delegate_only",
+            function_call_output_continuation="next_observation",
+            max_tools=1,
             required_input_modalities=frozenset(),
             optional_input_modalities=frozenset({"video", "audio"} if self.asr_stage_id is not None else {"video"}),
             supports_independent_io_streams=True,
@@ -172,6 +235,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             stage_handoff_transport="stage_connector",
             target_barge_in_latency_ms=None,
         )
+
+    def prewarms_downstream_stages(self, request_id: str) -> bool:
+        # A turn without audio output always ends at JoyAI (decide_output answers
+        # it directly), so the Talker and Code2Wav never run. Prewarming Code2Wav
+        # for it would only create a request that the turn end aborts.
+        observation = self.data_plane.requests.get(request_id)
+        return observation is None or "audio" in observation.modalities
 
     def create_session_state(self) -> JoyAISessionState:
         return JoyAISessionState(audio_buffer=JoyAIFrameBuffer(accepts_audio=self.asr_stage_id is not None))
@@ -251,7 +321,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "max_tokens": config.max_tokens,
             **{
                 key: extra.get(key, default)
-                for key, default in (("tts_speaker", "Vivian"), ("tts_language", "Auto"), ("tts_instruct", ""))
+                for key, default in (
+                    ("tts_speaker", "Vivian"),
+                    ("tts_language", "Auto"),
+                    ("tts_instruct", ""),
+                    ("joyai_system_prompt", ""),
+                )
             },
         }
         # Delegation and chunk state are per-session bookkeeping, not session
@@ -274,15 +349,60 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for index, params in enumerate(defaults):
             if isinstance(params, SamplingParams):
                 params = params.clone()
-                params.output_kind = RequestOutputKind.FINAL_ONLY
+                # Code2Wav streams each decoded chunk once (DELTA). With
+                # async_chunk on, JoyAI also streams its action text and the
+                # Talker is DELTA so a 2150 park is visible and the next queued
+                # sentence can be submitted without aborting the current one.
+                # With it off, this is the one-shot profile: only Code2Wav is
+                # DELTA and every upstream stage completes before the next runs.
+                talker_stage_id = self.joyai_stage_id + 1
+                streaming_stages = {self.audio_stage_id}
+                if self._async_chunk_streaming:
+                    streaming_stages.update((self.joyai_stage_id, talker_stage_id))
+                params.output_kind = (
+                    RequestOutputKind.DELTA if index in streaming_stages else RequestOutputKind.FINAL_ONLY
+                )
                 if index == self.joyai_stage_id:
                     params.detokenize = True
                     params.skip_special_tokens = False
                     for key in ("temperature", "max_tokens"):
                         if runtime_config.get(key) is not None:
                             setattr(params, key, runtime_config[key])
+                elif index == talker_stage_id:
+                    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+                        JOYAI_TTS_SEED,
+                        JOYAI_TTS_TEMPERATURE,
+                    )
+
+                    # This plugin only loads for session_mode: duplex
+                    # (joyai_vl_interaction_duplex.yaml). Unseeded Talker (and
+                    # MTP) is why each turn sounded like a different speaker.
+                    # Pin seed/temperature on both async_chunk on and off so a
+                    # WER A/B measures chunking, not YAML 0.9 sampler drift.
+                    # The turn YAML never reaches this method.
+                    apply_fixed_seed_to_sampling_params(params, JOYAI_TTS_SEED, seed_talker_mtp=True)
+                    params.temperature = JOYAI_TTS_TEMPERATURE
             configured.append(params)
         return tuple(configured)
+
+    @staticmethod
+    def _system_prompt(runtime_config: Mapping[str, object]) -> str:
+        """Session system prompt: persona, then the delegate action, then instructions.
+
+        The persona is the optional extra_body override, else the silence persona.
+        Session instructions come last, after the delegate action they may refer to.
+        """
+        override = runtime_config.get("joyai_system_prompt")
+        if isinstance(override, str) and override.strip():
+            system = override.strip()
+        else:
+            system = SILENT_SYSTEM_PROMPT
+        if JoyAIDuplexPlugin.delegation_enabled(runtime_config):
+            system += "\n\n" + delegation_system_section()
+        instructions = runtime_config.get("instructions")
+        if instructions:
+            system += "\n\n" + str(instructions)
+        return system
 
     @staticmethod
     def _sync_visual_history(state: JoyAISessionState, history: Sequence[dict[str, object]]) -> tuple[str, ...]:
@@ -404,15 +524,19 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # Append each conversation image once, alongside newly committed camera
         # frames, so retained camera history cannot displace a newer user image.
         frames = [*state.frames, *new_images][-4:]
+        working_frames = tuple(frame for frame in state.visual_memory.pending if frame.id > state.closed_frame_id)
+        if payload.get("audio") and not new_images and not working_frames:
+            # A spoken follow-up still needs the latest scene while its closed
+            # source awaits consolidation. Preserve the original visual turn;
+            # summarized or deleted sources are no longer in pending.
+            working_frames = tuple(state.visual_memory.pending[-1:])
         return {
             **config,
             "joyai_state": state,
             "joyai_frames": frames,
             "joyai_conversation_images": images,
             "joyai_new_frames": new_images,
-            "joyai_pending_frames": tuple(
-                frame for frame in state.visual_memory.pending if frame.id > state.closed_frame_id
-            ),
+            "joyai_pending_frames": working_frames,
             "joyai_observations": tuple(state.observations),
             "joyai_queries": tuple(state.queries),
             "joyai_closed_frame_id": state.closed_frame_id,
@@ -549,58 +673,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # bounded excerpts into private progress; publish coverage only
             # after the entire Q&A has been consumed.
             offset = continuation.offset if continuation else 0
-            low = offset + 1
-            high = min(len(transcript), offset + limit.max_chars) if limit else len(transcript)
-            # max_chars caps raw transcript progress. If it ends within a
-            # label, extend to the first evidence character so the fold can
-            # advance. Labels are rendered whole; fits() still enforces the
-            # model token budget, including the reserved summary output.
-            first_text = next((max(offset, text_start) for _, text_start, end, _ in spans if end > offset), offset)
-            high = max(high, first_text + 1)
-
-            def excerpt_prompt(stop: int) -> str | None:
-                fragments = []
-                for start, text_start, end, label in spans:
-                    if stop <= start or offset >= end:
-                        continue
-                    first, last = max(offset, text_start), min(stop, end)
-                    if first < last:
-                        continued = "(continued) " if offset > text_start else ""
-                        fragments.append(label + continued + transcript[first:last])
-                if not fragments:
-                    return None
-                excerpt = f"[Conversation excerpt {offset}:{stop} of {len(transcript)} characters]\n" + "\n".join(
-                    fragments
-                )
-                return render(excerpt, target)
-
-            candidate = None
-            while low <= high:
-                stop = (low + high) // 2
-                prompt = excerpt_prompt(stop)
-                if prompt is None:
-                    low = stop + 1
-                elif fits(prompt):
-                    candidate = request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
-                    low = stop + 1
-                else:
-                    high = stop - 1
-            if candidate is None:
+            fitted = fit_text_excerpt(
+                transcript,
+                spans,
+                offset=offset,
+                max_chars=limit.max_chars if limit else None,
+                render=lambda excerpt: render(excerpt, target),
+                fits=fits,
+            )
+            if fitted is None:
                 return None
-            candidate_source = candidate.model_source
-            assert isinstance(candidate_source, TextSummaryChunk)
-            if not candidate_source.complete:
-                stop = candidate_source.end_offset
-                window = transcript[offset:stop]
-                boundary = window.rfind("\n")
-                if boundary <= 0:
-                    boundary = max(window.rfind(" "), window.rfind("\t"))
-                if boundary > 0:
-                    stop = offset + boundary
-                    prompt = excerpt_prompt(stop)
-                    if prompt is not None and fits(prompt):
-                        candidate = request(prompt, target, TextSummaryChunk(partial, stop, False))
-            return candidate
+            prompt, stop = fitted
+            return request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
 
         return await asyncio.to_thread(prepare)
 
@@ -984,7 +1068,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return query, query_index
 
     def _working_messages(
-        self, session_config: Mapping[str, object], runtime_config: Mapping[str, object]
+        self,
+        session_config: Mapping[str, object],
+        runtime_config: Mapping[str, object],
+        *,
+        awaiting_transcript: bool = False,
     ) -> tuple[list[dict[str, object]], list[Image.Image], list[int]]:
         """Render retained visual observations in order, without owning played Q&A."""
         pending = {frame.id: frame for frame in session_config.get("joyai_pending_frames", ())}
@@ -1012,7 +1100,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", [])))
             if role == "user" and text
         }
-        query, query_index = self._current_query(session_config, runtime_config)
+        query, query_index = ("", -1) if awaiting_transcript else self._current_query(session_config, runtime_config)
         current_query_key = (
             (item_ids[query_index] if 0 <= query_index < len(item_ids) and item_ids[query_index] else query_index)
             if query
@@ -1041,7 +1129,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     "role": "user",
                     "content": content,
                     "_query_key": included_query_key,
-                    "_history_anchors": observation.history_anchor_item_ids,
+                    "_history_anchors": list(observation.history_anchor_item_ids),
                     "_response_item_id": observation.response_item_id,
                 }
             )
@@ -1063,7 +1151,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             content.extend([{"type": "text", "text": f"<{time_s:.1f} seconds>"}, {"type": "image"}])
             images.append(image)
             counts.append(tokens)
-        if not content:
+        if not content and not awaiting_transcript:
             content.append(
                 {"type": "text", "text": "Observe the current scene and choose whether to speak or stay silent."}
             )
@@ -1118,80 +1206,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return "\n".join(lines), active_query, prefix_keys
 
     @staticmethod
-    def _interleave_history(
-        history: list[dict[str, object]], working_messages: list[dict[str, object]], prefix_keys: set
-    ) -> list[dict[str, object]]:
-        """Place committed Q&A at its visual source, resolving item references anew."""
-        by_key = {message["_item_key"]: message for message in history}
-        positions = {message["_item_key"]: index for index, message in enumerate(history)}
-        current_query_key = working_messages[-1].get("_query_key")
-        query_has_position = current_query_key in by_key and any(
-            current_query_key in message.get("_history_anchors", ()) for message in working_messages[:-1]
-        )
-        claimed = {
-            key
-            for message in working_messages
-            for key in (message.get("_query_key"), message.get("_response_item_id"))
-            if key is not None and not (message.get("_current") and query_has_position and key == current_query_key)
-        }
-        messages = []
-        cursor = 0
-
-        def append_history(end: int) -> None:
-            nonlocal cursor
-            while cursor < end:
-                message = history[cursor]
-                if message["_item_key"] not in claimed:
-                    content = message["content"]
-                    if message["role"] == "user":
-                        content = [{"type": "text", "text": f"{USER_QUERY_HEADER}\n{content}"}]
-                    messages.append({"role": message["role"], "content": content})
-                cursor += 1
-
-        for source in working_messages:
-            if source.get("_current"):
-                append_history(len(history))
-            else:
-                anchor = next(
-                    (positions[key] for key in reversed(source.get("_history_anchors", ())) if key in positions), -1
-                )
-                append_history(anchor + 1)
-            content = source["content"]
-            query_key = source.get("_query_key")
-            if isinstance(content, list) and query_key is not None:
-                # Budget-trimmed or deleted historical queries stay removed.
-                # The current instruction remains available with its images.
-                if (
-                    query_key in prefix_keys
-                    or (source.get("_current") and query_has_position)
-                    or (query_key not in by_key and query_key != current_query_key)
-                ):
-                    content = [part for part in content if not part.get("text", "").startswith(USER_QUERY_HEADER)]
-            messages.append({"role": source["role"], "content": content})
-            response = by_key.get(source.get("_response_item_id"))
-            if response is not None and response["role"] == "assistant":
-                messages.append({"role": "assistant", "content": response["content"]})
-        return messages
-
-    @staticmethod
-    def _drop_oldest_visual_frame(messages: list[dict[str, object]]) -> None:
-        """Trim one frame and its timestamp at an explicit model-context boundary."""
-        for index, message in enumerate(messages):
-            content = message["content"]
-            if message["role"] != "user" or not isinstance(content, list):
-                continue
-            for part_index, part in enumerate(content):
-                if part.get("type") == "image":
-                    del content[part_index - 1 : part_index + 1]
-                    if not content:
-                        del messages[index]
-                        if index < len(messages) and messages[index]["role"] == "assistant":
-                            del messages[index]
-                    return
-
-    @staticmethod
     def _bounded_text_history(
-        session_config: dict[str, object], runtime_config: dict[str, object]
+        session_config: dict[str, object], runtime_config: dict[str, object], *, response_refs: set[str]
     ) -> tuple[list[dict[str, object]], dict[str, object] | None, str]:
         """Select unsummarized recent turns and retain the latest instruction."""
         history = []
@@ -1204,11 +1220,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", []))):
             if role not in {"user", "assistant"}:
                 continue
-            if text:
+            item_key = item_ids[index] if index < len(item_ids) and item_ids[index] else index
+            # An unheard visual reply still separates observations after cancellation.
+            # Retain its empty Session item without inventing speech or restoring a deletion.
+            if text or (role == "assistant" and item_key in response_refs):
                 message = {
                     "role": role,
-                    "content": ("</response> " if role == "assistant" else "") + text,
-                    "_item_key": item_ids[index] if index < len(item_ids) and item_ids[index] else index,
+                    "content": ("</response> " if role == "assistant" and text else "") + text,
+                    "_item_key": item_key,
                 }
                 if role == "user":
                     query = text
@@ -1223,8 +1242,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # current conversation even when summaries or the history bound cover it.
         if latest_instruction is not None and latest_instruction not in history:
             history = [latest_instruction, *history[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES - 1) :]]
-        response_refs = {item.response_item_id for item in session_config.get("joyai_observations", ())}
-        while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in response_refs:
+        # Empty replies were already filtered against rendered frames. Played
+        # replies keep their ledger association even when those frames close.
+        boundary_refs = response_refs | {item.response_item_id for item in session_config.get("joyai_observations", ())}
+        while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in boundary_refs:
             history.pop(0)
         return history, latest_instruction, query
 
@@ -1273,25 +1294,22 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         if payload.get("audio"):
             return self._plan_speech_append(session_config, runtime_config, payload, sampling_params)
-        history, latest_instruction, query = self._bounded_text_history(session_config, runtime_config)
-        # Rendering attaches fresh queries to their visual observation and
-        # leaves already-observed items at their committed history position.
-        unsummarized_history = history.copy()
         working_messages, images, image_token_counts = self._working_messages(session_config, runtime_config)
         while len(images) > self.max_images:
-            self._drop_oldest_visual_frame(working_messages)
+            drop_oldest_visual_frame(working_messages)
             images.pop(0)
             image_token_counts.pop(0)
-        system = SILENT_SYSTEM_PROMPT
+        history, latest_instruction, query = self._bounded_text_history(
+            session_config, runtime_config, response_refs=visual_response_refs(working_messages)
+        )
+        unsummarized_history = history.copy()
+        system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
-            system += "\n\n" + delegation_system_section()
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
-        if runtime_config.get("instructions"):
-            system += "\n\n" + runtime_config["instructions"]
         summary = session_config.get("joyai_summary")
         visual_summaries = [
             f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
@@ -1307,7 +1325,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             )
             messages = [
                 {"role": "system", "content": system},
-                *self._interleave_history(
+                *interleave_history(
                     [message for message in history if message["_item_key"] not in prefix_keys],
                     working_messages,
                     prefix_keys,
@@ -1352,7 +1370,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 visual_summaries.pop(0)
                 rebudget_history = True
             elif len(images) > 1:
-                self._drop_oldest_visual_frame(working_messages)
+                drop_oldest_visual_frame(working_messages)
                 images.pop(0)
                 image_token_counts.pop(0)
             else:
@@ -1370,30 +1388,27 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     def _plan_speech_append(self, session_config, runtime_config, payload, sampling_params) -> DuplexAppendPlan:
         """Keep ASR handoff budgeting deferred until the transcript is available."""
-        history, _, _ = self._bounded_text_history(session_config, runtime_config)
-        # The new spoken query is not known yet. Keep the initial standing
-        # instruction separate from evictable history until ASR supplies it.
+        working_messages, images, image_token_counts = self._working_messages(
+            session_config, runtime_config, awaiting_transcript=True
+        )
+        while len(images) > self.max_images:
+            drop_oldest_visual_frame(working_messages)
+            images.pop(0)
+            image_token_counts.pop(0)
+        history, _, _ = self._bounded_text_history(
+            session_config, runtime_config, response_refs=visual_response_refs(working_messages)
+        )
+        # Keep the standing instruction pinned until ASR supplies the new query.
         instruction = runtime_config.get("initial_user_text") or ""
-        history = [{"role": item["role"], "content": item["content"]} for item in history if item["_item_key"] != -1]
-        images = []
-        for encoded in session_config.get("joyai_frames", [])[-4:]:
-            if encoded.startswith("data:"):
-                encoded = encoded.split(",", 1)[1]
-            with open_image(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
-                image.thumbnail((448, 448))
-                images.append(image.convert("RGB").copy())
-        system = SILENT_SYSTEM_PROMPT
+        history = [item for item in history if item["_item_key"] != -1]
+        system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
-            system += "\n\n" + delegation_system_section()
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
-        if runtime_config.get("instructions"):
-            system += "\n\n" + runtime_config["instructions"]
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
-        image_token_counts = self._image_token_counts(images)
         prompt_data = {
             "additional_information": {
                 key: runtime_config[key] for key in ("tts_speaker", "tts_language", "tts_instruct")
@@ -1408,6 +1423,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             joyai_prompt_context={
                 "system": system,
                 "history": history,
+                "working_messages": working_messages,
                 "instruction": instruction,
                 "summary": session_config.get("joyai_summary") or "",
                 "visual_summaries": [
@@ -1463,8 +1479,59 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return DuplexOutputDecision(action=DuplexOutputAction.DIRECT_RESPONSE)
         return None
 
+    def plan_partial_stage_output(
+        self,
+        orchestrator: object,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: object,
+    ) -> PartialStageForward | None:
+        """Hand confirmed spoken sentences to Talker while JoyAI still generates.
+
+        Only one Talker sentence is in flight. Later sentences wait for a 2150
+        park, which this plugin sees because Talker uses DELTA output. The park
+        returns a plan whose ``source_stage_id`` is JoyAI; the orchestrator
+        submits it onto Talker after this poll's Code2Wav routing.
+
+        Requires the streaming profile: with ``async_chunk: false`` the Talker is
+        one-shot, its segment stops are not visible, and Code2Wav is not
+        prewarmed, so per-sentence handoff would strand the audio.
+        """
+        if not self._async_chunk_streaming:
+            return None
+        from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+            plan_partial_stage_output,
+        )
+
+        request_id = getattr(output, "request_id", None)
+        observation = self.data_plane.requests.get(request_id) if isinstance(request_id, str) else None
+        return plan_partial_stage_output(
+            orchestrator,
+            stage_id,
+            replica_id,
+            output,
+            req_state,
+            joyai_stage_id=self.joyai_stage_id,
+            observation=observation,
+        )
+
     def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
-        return stage_id == self.joyai_stage_id and context.segment_finished
+        """Project JoyAI action text to the client while it is generated.
+
+        With ``async_chunk`` on, every JoyAI output is projected so DELTA text
+        reaches the client live; Code2Wav still owns the terminal audio event,
+        this only adds the assistant transcript ahead of it.
+
+        With it off, this is the one-shot profile: the whole action is projected
+        once at the segment boundary, exactly as before live text existed.
+        """
+        del output
+        if stage_id != self.joyai_stage_id:
+            return False
+        if not self._async_chunk_streaming:
+            return bool(getattr(context, "segment_finished", False))
+        return True
 
     # ---- delegation: the shared tool-call lifecycle, model side ---------- #
 

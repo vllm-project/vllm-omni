@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""ABot evidence: public typed sessions, stepwise, and offline controls.
+"""ABot evidence: stepwise and offline controls.
 
 Run each phase in a fresh process. Baselines do not enable a torch profiler or
 stage synchronizations. RPC snapshots run outside measured next_chunk calls.
@@ -160,8 +160,6 @@ async def main(args):
     }
     result["input_sha256"] = hashlib.sha256(Path(args.image).read_bytes()).hexdigest()
     engine = None
-    manager = None
-    active = set()
 
     def save():
         (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -201,7 +199,7 @@ async def main(args):
         assert [v["pool_storages"] for v in worker_values] == [v["pool_storages"] for v in initial], (
             f"KV pool storage grew or moved at {label}"
         )
-        if label.endswith("closed") or label.startswith("after_run_"):
+        if label.startswith("after_run_"):
             assert all(not value["decode_states"] for value in worker_values), f"VAE state leaked: {label}"
         return values
 
@@ -220,163 +218,50 @@ async def main(args):
                 "ar_diffusion_kv_config": {"gpu_memory_fraction": 0.15, "warmup_cudagraph": False},
             },
         }
-        if args.phase != "offline":
-            kwargs["engine_backend"] = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
         if args.phase == "stepwise":
+            kwargs["engine_backend"] = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
             kwargs.update(step_execution=True, diffusion_streaming_output=True)
         engine = AsyncOmni(**kwargs)
         await snapshot("engine_ready")
         prompt = {"prompt": PROMPT, "multi_modal_data": {"image": args.image}}
-        if args.phase in {"stepwise", "offline"}:
-            ticks = args.ticks if args.phase == "stepwise" else 10
-            result["runs"] = []
-            for rep in range(args.repeats + 1):
-                start = last = time.perf_counter()
-                deliveries = []
-                async for output in engine.generate(prompt, sampling(ticks), request_id=f"{args.phase}-{rep}"):
-                    if not output.images and output.multimodal_output.get("video") is None:
-                        continue
-                    frames = frames_of(output)
-                    now = time.perf_counter()
-                    deliveries.append((frames, (now - last) * 1000))
-                    last = now
-                total_ms = (time.perf_counter() - start) * 1000
-                if args.phase == "offline":
-                    assert len(deliveries) == 1
-                    clip = deliveries[0][0]
-                    assert clip.shape == (117, 3, 512, 832), clip.shape
-                    assert torch.isfinite(clip).all()
-                    assert clip.min() >= 0 and clip.max() <= 1
-                    torch.save(clip, out / f"clip-{rep}.pt")
-                    rows = [{"tick": 0, "wall_ms": deliveries[0][1], "frames": 117}]
-                else:
-                    assert len(deliveries) == ticks, len(deliveries)
-                    rows = [
-                        {"tick": i, "wall_ms": ms, **validate_frames(frames, i)}
-                        for i, (frames, ms) in enumerate(deliveries)
-                    ]
-                    if rep == 1:
-                        for i, (frames, _) in enumerate(deliveries[:10]):
-                            torch.save(frames, out / f"tick-{i:03d}.pt")
-                result["runs"].append(
-                    {"warmup": rep == 0, "rows": rows, "total_ms": total_ms, "summary": summarize(rows)}
-                )
-                await snapshot(f"after_run_{rep}")
-                print(json.dumps({"phase": args.phase, "rep": rep, "summary": summarize(rows)}), flush=True)
-        else:
-            from vllm_omni.diffusion.models.abot_world.actions import ABotCameraControlReducer
-            from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
-            from vllm_omni.experimental.ar_diffusion.session import (
-                ARDiffusionSessionEvent,
-                ARDiffusionSessionManager,
-                ARDiffusionWorkerLifecycle,
-            )
-            from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionControlInput
-
-            consumer = ARDiffusionOmniTickConsumer(
-                engine,
-                prompt_provider=lambda tick: {**prompt, "prompt": tick.prompt},
-                sampling_params_list=[sampling()],
-                diffusion_stage_id=0,
-            )
-            manager = ARDiffusionSessionManager(
-                tick_consumer=consumer,
-                lifecycle=ARDiffusionWorkerLifecycle(engine, stage_ids=[0], timeout=120),
-                max_pending_events=8,
-                control_reducer_factory=ABotCameraControlReducer,
-            )
-
-            async def create(sid):
-                value = await manager.create_session(sid)
-                active.add(sid)
-                return value
-
-            async def close(sid):
-                await manager.close_session(sid)
-                active.remove(sid)
-
-            async def tick(session, index, action=False):
-                controls = (
-                    ARDiffusionControlInput(
-                        track="camera",
-                        schema="abot.camera_actions.v1",
-                        data={"mode": "script", "frames": [["a"], [], []] if action else [[], [], []]},
-                    ),
-                )
-                start = time.perf_counter()
-                await session.accept_event(
-                    ARDiffusionSessionEvent(
-                        event_id=index,
-                        prompt=PROMPT if index == 0 else None,
-                        controls=controls,
-                    )
-                )
-                output = await session.next_chunk()
+        ticks = args.ticks if args.phase == "stepwise" else 10
+        result["runs"] = []
+        for rep in range(args.repeats + 1):
+            start = last = time.perf_counter()
+            deliveries = []
+            async for output in engine.generate(prompt, sampling(ticks), request_id=f"{args.phase}-{rep}"):
+                if not output.images and output.multimodal_output.get("video") is None:
+                    continue
                 frames = frames_of(output)
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                assert consumer.chunk_metadata(output).chunk_index == index
-                return frames, {
-                    "tick": index,
-                    "wall_ms": elapsed_ms,
-                    "finished": bool(output.finished),
-                    "runtime_events": [],
-                    "event_stall_ms": None,
-                }
-
-            if args.phase == "typed":
-                result["runs"] = []
-                for rep in range(args.repeats + 1):
-                    sid = f"typed-{rep}"
-                    session = await create(sid)
-                    rows, tensors = [], []
-                    for index in range(args.ticks):
-                        frames, row = await tick(session, index)
-                        rows.append(row)
-                        tensors.append(frames)
-                    # Validation, IO, and memory RPCs are deliberately outside timing.
-                    for index, frames in enumerate(tensors):
-                        rows[index].update(validate_frames(frames, index))
-                        if rep == 1 and index < 10:
-                            torch.save(frames, out / f"tick-{index:03d}.pt")
-                    await snapshot(f"run_{rep}_live")
-                    await close(sid)
-                    await snapshot(f"run_{rep}_closed")
-                    result["runs"].append({"warmup": rep == 0, "rows": rows, "summary": summarize(rows)})
-                    print(json.dumps({"phase": "typed", "rep": rep, "summary": summarize(rows)}), flush=True)
-                    save()
+                now = time.perf_counter()
+                deliveries.append((frames, (now - last) * 1000))
+                last = now
+            total_ms = (time.perf_counter() - start) * 1000
+            if args.phase == "offline":
+                assert len(deliveries) == 1
+                clip = deliveries[0][0]
+                assert clip.shape == (117, 3, 512, 832), clip.shape
+                assert torch.isfinite(clip).all()
+                assert clip.min() >= 0 and clip.max() <= 1
+                torch.save(clip, out / f"clip-{rep}.pt")
+                rows = [{"tick": 0, "wall_ms": deliveries[0][1], "frames": 117}]
             else:
-                result["comparisons"] = []
-                controls = {}
-                for name in ("a", "b"):
-                    session = await create(f"solo-{name}")
-                    controls[name] = [(await tick(session, i, action=name == "b"))[0] for i in range(3)]
-                    await close(f"solo-{name}")
-                a, b = await create("a"), await create("b")
-                for index in range(3):
-                    for name, session in (("a", a), ("b", b)):
-                        frames, row = await tick(session, index, action=name == "b")
-                        exact = torch.equal(frames, controls[name][index])
-                        row.update(
-                            session=name,
-                            exact_vs_solo=exact,
-                            max_abs_error=(frames - controls[name][index]).abs().max().item(),
-                            **validate_frames(frames, index),
-                        )
-                        result["comparisons"].append(row)
-                        await snapshot(f"{name}{index}")
-                        assert exact, row
-                await close("a")
-                await snapshot("a_closed_b_live")
-                await close("b")
-                await snapshot("both_closed")
+                assert len(deliveries) == ticks, len(deliveries)
+                rows = [
+                    {"tick": i, "wall_ms": ms, **validate_frames(frames, i)}
+                    for i, (frames, ms) in enumerate(deliveries)
+                ]
+                if rep == 1:
+                    for i, (frames, _) in enumerate(deliveries[:10]):
+                        torch.save(frames, out / f"tick-{i:03d}.pt")
+            result["runs"].append({"warmup": rep == 0, "rows": rows, "total_ms": total_ms, "summary": summarize(rows)})
+            await snapshot(f"after_run_{rep}")
+            print(json.dumps({"phase": args.phase, "rep": rep, "summary": summarize(rows)}), flush=True)
         result["status"] = "passed"
     except BaseException as exc:
         result.update(status="failed", error=f"{type(exc).__name__}: {exc}")
         raise
     finally:
-        if manager is not None:
-            for sid in tuple(active):
-                await manager.close_session(sid)
         if engine is not None:
             engine.shutdown()
         save()
@@ -388,7 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--vae", choices=("wan", "taew2_2"), required=True)
-    parser.add_argument("--phase", choices=("typed", "dual", "stepwise", "offline"), required=True)
+    parser.add_argument("--phase", choices=("stepwise", "offline"), required=True)
     parser.add_argument("--ticks", type=int, default=35)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()

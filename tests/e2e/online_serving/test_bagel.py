@@ -46,7 +46,11 @@ test_params = [
     OmniServerParams(
         model=MODEL,
         stage_config_path=STAGE_CONFIGS_PATH,
-        stage_init_timeout=300,
+        # Cold ROCm AITER compilation has now exhausted the former 1800-second
+        # stage deadline in both the online and offline weekly owners. Keep the
+        # same bounded headroom for every BAGEL fixture that can run on MI325.
+        stage_init_timeout=2400,
+        init_timeout=2700,
     ),
 ]
 

@@ -29,12 +29,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn as nn
+import vllm.v1.worker.gpu.buffer_utils as buffer_utils
 from torch.cuda import CUDAGraph
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu import buffer_utils
 
 logger = init_logger(__name__)
 
