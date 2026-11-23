@@ -31,7 +31,7 @@ class VAERMSNorm(RMSNorm):
 
 
 class QKRMSNorm(RMSNorm):
-    """Preserve functional Q/K normalization outside the fused NPU path."""
+    """Use F.rms_norm on native paths and fused RMSNorm on NPU."""
 
     def forward_native(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         if residual is not None:
