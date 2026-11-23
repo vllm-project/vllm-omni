@@ -298,6 +298,20 @@ def test_next_duplex_sentence_chunk_holds_think_silent_and_flushes(monkeypatch: 
     assert next_duplex_sentence_chunk(state, "你好。", finished=True) == "你好。"
 
 
+def test_next_duplex_sentence_chunk_replaces_a_diverged_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS", raising=False)
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS_MIN_CHARS", "1")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    state: dict[str, object] = {}
+    first = next_duplex_sentence_chunk(state, "甲甲甲甲甲甲甲甲甲甲。", finished=False)
+    assert first is not None
+    rewritten = next_duplex_sentence_chunk(state, "乙乙乙乙乙乙乙乙乙乙。", finished=False)
+    assert rewritten == "乙乙乙乙乙乙乙乙乙乙。"
+
+
 def test_next_duplex_sentence_chunk_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "0")
     from vllm_omni.model_executor.stage_input_processors.aura_omni import (

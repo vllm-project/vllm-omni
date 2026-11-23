@@ -6,15 +6,19 @@ default, and captures on the second call with the same shape and CUDA stream.
 Startup profiling can consume slots. Graphs are never evicted: once the cache
 is full, other shapes run eagerly for the lifetime of the model.
 
-Use `--hf-overrides` to configure both encoders:
+The following `--stage-overrides` JSON configures both encoders on stage 0.
 
 ```json
 {
-  "encoder_cuda_graph": true,
-  "encoder_cuda_graph_max_graphs": 4,
-  "encoder_cuda_graph_min_capture_calls": 2,
-  "encoder_cuda_graph_min_free_bytes": 1073741824,
-  "encoder_cuda_graph_share_pools": true
+  "0": {
+    "hf_overrides": {
+      "encoder_cuda_graph": true,
+      "encoder_cuda_graph_max_graphs": 4,
+      "encoder_cuda_graph_min_capture_calls": 2,
+      "encoder_cuda_graph_min_free_bytes": 1073741824,
+      "encoder_cuda_graph_share_pools": true
+    }
+  }
 }
 ```
 
@@ -32,6 +36,11 @@ only transient capture allocations share the pool. Returned outputs remain
 cloned. A late capture waits for earlier replay work and output clones before
 reusing the pool. Set `encoder_cuda_graph_share_pools` to `false` for an A/B
 comparison with a separate pool and capture stream per graph.
+
+By default, capture uses vLLM's garbage-collection guard so finalizers cannot
+release older CUDA graphs or kernels while a new graph is being recorded. The
+guard restores the previous GC enabled state on exit, including when capture
+raises.
 
 The graph count is **not a byte limit**. Sharing pools reuses intermediate
 storage but does not eliminate per-shape static input and output buffers.

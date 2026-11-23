@@ -16,6 +16,7 @@ from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     AppendText,
     BargeIn,
+    CancelFunctionCall,
     CancelInput,
     CancelResponse,
     ClearInput,
@@ -27,6 +28,7 @@ from vllm_omni.engine.duplex.commands import (
     DeleteItem,
     DuplexCommand,
     DuplexCommandError,
+    GetSessionStats,
     Heartbeat,
     SignalTurn,
     TruncateItem,
@@ -57,10 +59,12 @@ _MINIMAL_PAYLOADS: dict[str, tuple[dict[str, object], type[DuplexCommand]]] = {
     "session.update": ({"session": {"instructions": "hi"}}, UpdateSession),
     "playback.ack": ({"played_ms": 10}, AckPlayback),
     "session.heartbeat": ({}, Heartbeat),
+    "session.stats.get": ({}, GetSessionStats),
     "session.close": ({}, CloseSession),
     "turn.signal": ({"event": "user_started"}, SignalTurn),
     "input.text.append": ({"text": "hello"}, AppendText),
     "input.cancel": ({}, CancelInput),
+    "function_call.cancel": ({"call_id": "call_1"}, CancelFunctionCall),
     "barge_in": ({}, BargeIn),
 }
 

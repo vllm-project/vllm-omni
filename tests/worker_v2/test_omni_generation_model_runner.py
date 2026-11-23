@@ -52,6 +52,10 @@ def _make_runner(model_output, num_reqs=1, prompt_len=10):
     runner = object.__new__(OmniGenerationModelRunner)
     runner._retains_state_across_chunks = False
     runner._remove_request = MagicMock()
+    # The pin's GPUModelRunner.__init__ always builds a DraftTokensHandler and
+    # its _remove_request discards through it; tests that bind the real method
+    # need the attribute on this bypass-__init__ stub.
+    runner.draft_tokens_handler = SimpleNamespace(discard=MagicMock())
     from vllm_omni.worker_v2.staged_writes import StagedWrites
 
     runner._staged_writes = StagedWrites()
@@ -80,6 +84,9 @@ def test_control_only_step_keeps_lifecycle_and_skips_input_construction(aux_enab
     from vllm_omni.worker_v2.staged_writes import StagedWrites
 
     runner._staged_writes = StagedWrites()
+    runner._prev_step_idle = False
+    runner._failed_optional_model_hooks = set()
+    runner.model = SimpleNamespace()
     order = []
     for name in (
         "_prepare_native_data_plane",
@@ -146,9 +153,7 @@ def test_cached_chunk_updates_request_and_model_state_with_or_without_slot(slot_
     )
     cached = OmniCachedRequestData(
         req_ids=["req"],
-        resumed_req_ids=set(),
         new_token_ids=[[]],
-        all_token_ids={"req": [1]},
         new_block_ids=[()],
         num_computed_tokens=[0],
         num_output_tokens=[0],
@@ -162,7 +167,6 @@ def test_cached_chunk_updates_request_and_model_state_with_or_without_slot(slot_
         total_num_scheduled_tokens=1,
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[0],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
@@ -285,7 +289,7 @@ def test_sample_tokens_cpu_sync_owns_outputs_and_runs_connector_last():
     result = OmniGenerationModelRunner.sample_tokens(runner)
     assert isinstance(result, OmniModelRunnerOutput)
     # Reserve precedes finalize; connector runs after token state is applied.
-    runner._reserve_native_data_plane_outputs.assert_called_once_with(["req-0"])
+    runner._reserve_native_data_plane_outputs.assert_called_once_with(result)
     runner.kv_connector.post_forward.assert_called_once_with({"finished"})
     waveform.fill_(-1)
     assert torch.equal(result.multimodal_outputs[0]["codes.audio"], torch.arange(4, dtype=torch.float32))
@@ -347,7 +351,7 @@ def test_generation_aux_output_copies_and_materializes_without_sampling(monkeypa
     monkeypatch.setattr(torch.cuda, "Event", lambda **kw: CopyEvent())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(module, "_async_copy_mm", lambda *a, **kw: {})
-    output = OmniModelRunnerOutput(["req-0"], {"req-0": 0}, [[]])
+    output = OmniModelRunnerOutput(req_ids=["req-0"], sampled_token_ids=[[]])
     result = module.OmniGenerationAsyncOutput(
         model_runner_output=output,
         multimodal_outputs={},
@@ -399,3 +403,125 @@ def test_exact_input_shape_models_reject_padded_batches(exact):
             check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
     else:
         check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_pending_generation_reruns_its_unit_and_keeps_its_slot(retained):
+    output = OmniOutput(
+        text_hidden_states=torch.empty(0),
+        multimodal_outputs={"audio": [torch.zeros(2), torch.ones(2)]},
+    )
+    runner = _make_runner(output, num_reqs=2)
+    runner._retains_state_across_chunks = retained
+    runner.model = SimpleNamespace(get_pending_generation_request_ids=lambda: {"req-1", "other"})
+    runner.model_config.async_chunk = True
+    runner._remove_request = MagicMock()
+    runner._reserve_native_data_plane_outputs = MagicMock()
+    runner._finalize_native_data_plane_output = MagicMock(side_effect=lambda value: value)
+
+    result = OmniGenerationModelRunner.sample_tokens(runner)
+
+    assert result.pending_generation_req_ids == {"req-1"}
+    # The finished unit is marked computed; the pending one is re-run.
+    assert runner.req_states.num_computed_tokens.np.tolist() == [10, 0]
+    if retained:
+        runner._remove_request.assert_not_called()
+    else:
+        runner._remove_request.assert_called_once_with("req-0")
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_prewarm_runs_after_finish_and_only_on_consecutive_idle_steps(cached):
+    from vllm.v1.core.sched.output import CachedRequestData
+
+    from vllm_omni.core.sched.output import OmniRequestPrewarm, OmniSchedulerOutput
+
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.encoder_cache = None
+    runner._prev_step_idle = False
+    runner._failed_optional_model_hooks = set()
+    events = []
+    runner.model = SimpleNamespace(
+        on_requests_added=lambda payload: events.append(("added", payload)),
+        run_idle_prefetch=lambda: events.append(("prefetch", torch.is_inference_mode_enabled())),
+    )
+    runner.finish_requests = lambda s: events.append(("finished", s.finished_req_ids))
+    for name in (
+        "_prepare_native_data_plane",
+        "free_states",
+        "_handle_async_chunk_updates",
+        "add_requests",
+        "update_requests",
+        "_sync_native_data_plane_payloads",
+        "_apply_block_table_staged_writes_if_available",
+    ):
+        setattr(runner, name, MagicMock())
+    runner.aux_output_connector = None
+    output = object()
+    runner.kv_connector = SimpleNamespace(no_forward=lambda s: output)
+    runner._merge_ec_connector_no_forward = lambda s, value: value
+    runner._attach_native_data_plane_signals = lambda value: value
+    cached_reqs = CachedRequestData.make_empty()
+    if cached:
+        cached_reqs.req_ids = ["req"]
+    prewarms = [OmniRequestPrewarm(request_id="req", payload={})]
+    scheduler = OmniSchedulerOutput(
+        total_num_scheduled_tokens=0,
+        num_scheduled_tokens={},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached_reqs,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        finished_req_ids={"req"},
+        free_encoder_mm_hashes=[],
+        pending_request_prewarms=prewarms,
+    )
+    assert runner.execute_model(scheduler) is output
+    assert events == [("finished", {"req"}), ("added", prewarms)]
+    scheduler.finished_req_ids = set()
+    scheduler.pending_request_prewarms = []
+    assert runner.execute_model(scheduler) is output
+    assert events[-2:] == [("finished", set()), ("prefetch", True)]
+    # Stop immediately before input construction to exercise the busy/dummy
+    # transition without allocating CUDA buffers in this CPU lifecycle test.
+    scheduler.total_num_scheduled_tokens = 1
+    scheduler.num_scheduled_tokens = {"req": 1}
+    runner.gather_batch_req_state = MagicMock(side_effect=LookupError("before forward"))
+    events.clear()
+    with pytest.raises(LookupError, match="before forward"):
+        runner.execute_model(scheduler, dummy_run=True)
+    assert events == []
+    assert not runner._prev_step_idle
+    scheduler.total_num_scheduled_tokens = 0
+    scheduler.num_scheduled_tokens = {}
+    runner.execute_model(scheduler)
+    assert events == [("finished", set())]
+    runner.execute_model(scheduler)
+    assert events[-2:] == [("finished", set()), ("prefetch", True)]
+    scheduler.total_num_scheduled_tokens = 1
+    scheduler.num_scheduled_tokens = {"req": 1}
+    with pytest.raises(LookupError, match="before forward"):
+        runner.execute_model(scheduler)
+    assert not runner._prev_step_idle
+    scheduler.total_num_scheduled_tokens = 0
+    scheduler.num_scheduled_tokens = {}
+    events.clear()
+    runner.execute_model(scheduler)
+    assert events == [("finished", set())]
+
+
+def test_optional_prefetch_failure_is_logged_once_and_can_retry(monkeypatch):
+    from vllm_omni.worker_v2 import omni_generation_model_runner as module
+
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner._failed_optional_model_hooks = set()
+    hook = MagicMock(side_effect=[RuntimeError("cold cache"), RuntimeError("cold cache"), None])
+    runner.model = SimpleNamespace(run_idle_prefetch=hook)
+    log = MagicMock()
+    monkeypatch.setattr(module, "logger", log)
+    for _ in range(3):
+        runner._call_optional_model_hook("run_idle_prefetch")
+    assert hook.call_count == 3
+    assert log.warning.call_count == 1
+    assert log.debug.call_count == 1
+    runner._call_optional_model_hook("absent")

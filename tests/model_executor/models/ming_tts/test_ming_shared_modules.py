@@ -136,6 +136,19 @@ def test_audio_vae_samples_softplus_posterior_with_request_rng():
     assert torch.equal(generator.get_state(), expected_generator.get_state())
 
 
+@torch.inference_mode()
+def test_feed_forward_fused_gelu_is_cuda_only():
+    from vllm_omni.model_executor.models.common.ming.dit_blocks import FeedForward
+
+    torch.manual_seed(0)
+    module = FeedForward(16, mult=4, approximate="tanh").eval()
+    x = torch.randn(2, 3, 16)
+    expected = module(x)
+    module.fused_gelu = True
+    # CPU addmm activations use the exact GELU, so the flag keeps the module path.
+    torch.testing.assert_close(module(x), expected, rtol=0, atol=0)
+
+
 def test_ming_tts_cfm_solver_uses_common_implementation():
     """Ming dense imports the shared solver implementation directly."""
     assert Solver.__module__ == "vllm_omni.model_executor.models.common.ming.cfm_solver"

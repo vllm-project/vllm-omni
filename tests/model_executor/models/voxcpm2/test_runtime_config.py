@@ -1,25 +1,84 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 
-from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
+import vllm_omni
+from vllm_omni.config.stage_config import resolve_deploy_yaml
+from vllm_omni.model_executor.models.voxcpm2.runtime_config import (
+    _VoxCPM2RuntimeConfig,
+    reject_outer_full_cudagraph,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("uses_v2", [False, True])
-def test_runner_specific_audio_defaults(uses_v2):
+class _FakeOmniPlatform:
+    """Deterministic platform stand-in so cadence defaults are assertable on any runner.
+
+    Also counts ``is_cuda()`` calls so the tests can assert the fake was
+    actually consulted: from_vllm_config resolves the platform at call time
+    today, and these guards fail loudly if it ever switches to a module-level
+    import that would silently bypass the faked platform.
+    """
+
+    def __init__(self, is_cuda: bool) -> None:
+        self._is_cuda = is_cuda
+        self.is_cuda_calls = 0
+
+    def is_cuda(self) -> bool:
+        self.is_cuda_calls += 1
+        return self._is_cuda
+
+
+@pytest.mark.parametrize(
+    ("uses_v2", "is_cuda", "expected"),
+    [
+        (False, False, (2, 1)),
+        (False, True, (2, 1)),
+        (True, False, (2, 1)),
+        (True, True, (1, 3)),
+    ],
+)
+def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected):
+    # Incremental VAE is a CUDA-only per-patch feature: CUDA v2 gets the MRV2
+    # audio profile (1/3); every other combination keeps the v1 cadence (2/1).
+    # These are runtime defaults when no deploy YAML supplies cadence keys.
+    # The shipped base YAML explicitly pins its v1 cadence to (3, 1), so
+    # changing these defaults only affects configurations that leave them unset.
+    import vllm_omni.platforms as platforms_mod
+
+    # Patch the backing global, not the lazy attribute: assigning
+    # current_omni_platform writes a real module attribute that permanently
+    # shadows the lazy __getattr__ after monkeypatch restores it.
+    # An earlier test in the same process may have resolved the real platform
+    # into a module attribute (a direct assignment); delete that residue so
+    # the from-import falls back to the lazy __getattr__ and consults the
+    # fake below. Without this, the real CUDA platform answers and the fake
+    # records zero is_cuda() calls (buildkite 18587).
+    monkeypatch.delitem(vars(platforms_mod), "current_omni_platform", raising=False)
+    fake_platform = _FakeOmniPlatform(is_cuda)
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
-    assert config.enable_incremental_vae is uses_v2
-    assert config.vae_decode_every == (1 if uses_v2 else 3)
-    assert config.audio_emit_every == (3 if uses_v2 else 1)
+    assert config.enable_incremental_vae is (uses_v2 and is_cuda)
+    assert (config.vae_decode_every, config.audio_emit_every) == expected
+    if uses_v2:
+        # The v2 cadence depends on the platform read at call time; assert the
+        # fake was consulted so a module-level import can't silently bypass it.
+        assert fake_platform.is_cuda_calls >= 1
+    else:
+        # The v1 cadence must stay platform-independent: from_vllm_config
+        # should not consult the platform on the legacy path at all.
+        assert fake_platform.is_cuda_calls == 0
 
 
 def test_mrv2_explicit_legacy_audio_override():
@@ -34,6 +93,73 @@ def test_mrv2_explicit_legacy_audio_override():
     assert not config.enable_incremental_vae
     assert config.vae_decode_every == 3
     assert config.audio_emit_every == 1
+
+
+def _runtime_config_from_deploy_yaml(yaml_path: Path, use_v2_model_runner: bool) -> _VoxCPM2RuntimeConfig:
+    merged = resolve_deploy_yaml(yaml_path)
+    runtime_dict = next(
+        stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
+        for stage in merged["stages"]
+        if "voxcpm2_runtime_config" in stage.get("engine_extras", {}).get("hf_overrides", {})
+    )
+    return _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(use_v2_model_runner=use_v2_model_runner, voxcpm2_runtime_config=runtime_dict)
+        )
+    )
+
+
+def test_deploy_yaml_resolves_effective_audio_defaults():
+    # The base yaml pins the legacy cadence; CUDA's platform overlay selects
+    # the MRV2 cadence.
+    deploy_dir = Path(vllm_omni.__file__).resolve().parent / "deploy"
+    deploy_yaml = deploy_dir / "voxcpm2.yaml"
+    v1 = _runtime_config_from_deploy_yaml(deploy_yaml, use_v2_model_runner=False)
+    assert v1.vae_decode_every == 3
+    assert v1.audio_emit_every == 1
+
+    merged = resolve_deploy_yaml(deploy_yaml)
+    cuda_runtime_dict = merged["platforms"]["cuda"]["stages"][0]["engine_extras"]["hf_overrides"][
+        "voxcpm2_runtime_config"
+    ]
+    v2 = _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(use_v2_model_runner=True, voxcpm2_runtime_config=cuda_runtime_dict)
+        )
+    )
+    assert v2.vae_decode_every == 1
+    assert v2.audio_emit_every == 3
+
+
+@pytest.mark.parametrize(
+    ("is_cuda", "expected"),
+    [
+        (False, (3, 1)),  # non-CUDA v2 retains the base yaml's configured cadence
+        (True, (3, 1)),  # explicit base yaml cadence overrides runner defaults
+    ],
+)
+def test_v2_overlay_on_base_yaml_preserves_explicit_audio_cadence(monkeypatch, tmp_path, is_cuda, expected):
+    # A thin overlay with no cadence keys inherits the explicit audio cadence
+    # from the base yaml, regardless of platform.
+    import vllm_omni.platforms as platforms_mod
+
+    # An earlier test in the same process may have resolved the real platform
+    # into a module attribute (a direct assignment); delete that residue so
+    # the from-import falls back to the lazy __getattr__ and consults the
+    # fake below. Without this, the real CUDA platform answers and the fake
+    # records zero is_cuda() calls (buildkite 18587).
+    monkeypatch.delitem(vars(platforms_mod), "current_omni_platform", raising=False)
+    fake_platform = _FakeOmniPlatform(is_cuda)
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
+    deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
+    overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
+    overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
+
+    config = _runtime_config_from_deploy_yaml(overlay, use_v2_model_runner=True)
+    assert (config.vae_decode_every, config.audio_emit_every) == expected
+    # Same call-time guard as the defaults test: the fake platform must be
+    # the one from_vllm_config consults.
+    assert fake_platform.is_cuda_calls >= 1
 
 
 @dataclass
@@ -72,10 +198,18 @@ def test_generation_config(key: str, value: object, expected: int | float) -> No
 def test_generation_config_defaults() -> None:
     config = _VoxCPM2RuntimeConfig()
 
+    assert config.enable_torch_compile
     assert config.inference_timesteps == 10
     assert config.cfg_value == 2.0
     assert config.cfg_cutoff_ratio == 1.0
     assert config.mixed_graph_cache_limit == 0
+
+
+@pytest.mark.parametrize(("value", "expected"), [(False, False), (True, True), ("false", False), ("true", True)])
+def test_torch_compile_switch_is_configurable(value: object, expected: bool) -> None:
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"enable_torch_compile": value})))
+
+    assert config.enable_torch_compile is expected
 
 
 def test_mixed_graph_cache_limit_rejects_negative():
@@ -109,7 +243,13 @@ class _CountingEstimator(torch.nn.Module):
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_cfg_value_rejects_nonfinite(value: str) -> None:
-    with pytest.raises(ValueError, match="cfg_value must be finite"):
+    # Pin the yaml key AND the raw value (the way the env-var test at the
+    # bottom of this file does): a bare "must be finite" match would pass
+    # even if the message stopped naming the key or echoed a wrong value.
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"voxcpm2_runtime_config.cfg_value={value!r}") + ".*must be finite",
+    ):
         _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": value})))
 
 
@@ -168,3 +308,98 @@ def test_exact_patch_batch_requires_incremental_unified_decode():
         enable_exact_patch_batch=True, enable_incremental_vae=True, vae_decode_every=1
     )._normalized()
     assert config.enable_exact_patch_batch
+
+
+def _graph_config(mode, *, uses_v2=False):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(use_v2_model_runner=uses_v2),
+        compilation_config=SimpleNamespace(cudagraph_mode=mode),
+    )
+
+
+@pytest.mark.parametrize("mode_name", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+def test_mrv1_rejects_outer_full_cudagraph(mode_name):
+    with pytest.raises(ValueError, match=f"cudagraph_mode={mode_name}.*PIECEWISE"):
+        reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name]))
+
+
+@pytest.mark.parametrize(
+    ("mode_name", "uses_v2"),
+    [("NONE", False), ("PIECEWISE", False), ("FULL_AND_PIECEWISE", True)],
+)
+def test_supported_graph_modes_pass(mode_name, uses_v2):
+    reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name], uses_v2=uses_v2))
+
+
+def test_cfg_value_env_overrides_yaml(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "3.0")
+    assert talker_mod._resolve_cfg_value(2.0) == 3.0
+
+
+def test_cfg_value_unset_falls_back_to_config(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    assert talker_mod._resolve_cfg_value(2.0) == 2.0
+    assert talker_mod._resolve_cfg_value(3.5) == 3.5
+
+
+def test_cfg_value_empty_is_unset(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "  ")
+    assert talker_mod._resolve_cfg_value(2.5) == 2.5
+
+
+def test_cfg_value_non_numeric_names_the_variable(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "abc")
+    with pytest.raises(ValueError, match="VLLM_OMNI_SPEECH_CFG_VALUE='abc' is not a valid float"):
+        talker_mod._resolve_cfg_value(2.0)
+
+
+@pytest.mark.parametrize("bad", ["-1", "0", "nan", "inf"])
+def test_cfg_value_non_positive_names_the_source(monkeypatch, bad):
+    import re
+
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", bad)
+    # Match the full source attribution — the raw env-string repr, not just
+    # the variable name: the message always carries the "(env ... overrides
+    # ...)" tail, so a bare name match would pass even if the error blamed
+    # the yaml instead of this env var.
+    with pytest.raises(ValueError, match=re.escape(f"VLLM_OMNI_SPEECH_CFG_VALUE={bad!r}")):
+        talker_mod._resolve_cfg_value(2.0)
+
+
+def test_cfg_value_invalid_yaml_value_blames_the_yaml_source(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value=0"):
+        talker_mod._resolve_cfg_value(0)
+
+
+def test_cfg_value_non_float_yaml_value_names_the_yaml_source(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value='fast' is not a valid float"):
+        talker_mod._resolve_cfg_value("fast")
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_cfg_value_yaml_boolean_rejected(monkeypatch, bad):
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    # yaml's cfg_value: true would float()-coerce to 1.0 (CFG effectively
+    # off); the coercion entry must reject it before the helper sees it.
+    # Pattern built from the parameter so both arms pin their own value.
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"voxcpm2_runtime_config.cfg_value={bad!r}") + ".*not a boolean",
+    ):
+        _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": bad})))

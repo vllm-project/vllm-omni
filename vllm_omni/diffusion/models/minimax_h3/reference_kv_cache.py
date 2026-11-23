@@ -391,7 +391,8 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         else:
             storage_dtype = torch.float8_e4m3fn
 
-        shape = (2, self.num_layers, *reference_k.shape)
+        # Keep each layer's K/V contiguous for the layerwise H2D copy.
+        shape = (self.num_layers, 2, *reference_k.shape)
         self._host_pool = self._empty_host_tensor(
             shape,
             dtype=storage_dtype,
@@ -399,7 +400,7 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             device_type=self.device.type,
         )
         if mode == "int8":
-            scale_shape = (2, self.num_layers, int(reference_k.shape[-2]))
+            scale_shape = (self.num_layers, 2, int(reference_k.shape[-2]))
             self._host_scale_pool = self._empty_host_tensor(
                 scale_shape,
                 dtype=torch.float32,
@@ -465,11 +466,11 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             )
         encoded, scales = self._encode_reference_pair(reference_k, reference_v)
         with record_function("minimax_h3.ref_kv_tier2.populate_post_ulysses"):
-            self._host_pool[:, layer_index].copy_(encoded, non_blocking=False)
+            self._host_pool[layer_index].copy_(encoded, non_blocking=False)
             if scales is not None:
                 if self._host_scale_pool is None:
                     raise RuntimeError("INT8 host scale pool is missing")
-                self._host_scale_pool[:, layer_index].copy_(scales, non_blocking=False)
+                self._host_scale_pool[layer_index].copy_(scales, non_blocking=False)
         self.stats.captured_layers += 1
         self._layers_seen.add(layer_index)
 
@@ -529,7 +530,7 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         if self._host_scale_pool is not None:
             scale_shape = (
                 self.ring_size,
-                self._host_scale_pool.shape[0],
+                self._host_scale_pool.shape[1],
                 *self._host_scale_pool.shape[2:],
             )
             self._device_scale_ring = torch.empty(
@@ -565,9 +566,9 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             raise RuntimeError("Tier2 prefetch requested before pool allocation")
         slot = layer_index % self.ring_size
         consumed = self._consumed_events[slot]
-        host_layer = self._host_pool[:, layer_index]
+        host_layer = self._host_pool[layer_index]
         device_slot = self._device_ring[slot]
-        host_scales = self._host_scale_pool[:, layer_index] if self._host_scale_pool is not None else None
+        host_scales = self._host_scale_pool[layer_index] if self._host_scale_pool is not None else None
         device_scales = self._device_scale_ring[slot] if self._device_scale_ring is not None else None
 
         with record_function("minimax_h3.ref_kv_tier2.prefetch"):

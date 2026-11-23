@@ -22,6 +22,7 @@ See ``images/README.md`` (utils vs helpers, no overlap).
 """
 
 import io
+import json
 from http import HTTPStatus
 from numbers import Integral
 from typing import Any
@@ -29,12 +30,17 @@ from typing import Any
 import httpx
 import numpy as np
 import pybase64 as base64
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, UploadFile
 from PIL import Image
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
+from vllm_omni.entrypoints.openai.protocol.images import (
+    ImageSegmentationInstance,
+    SegmentationMaskFormat,
+    SegmentationRLE,
+)
 
 logger = init_logger(__name__)
 
@@ -252,3 +258,74 @@ def _choose_output_format(output_format: str | None, background: str | None) -> 
         return "png"
     # Default
     return "jpeg"
+
+
+def _supports_segmentation(raw_request: Request, engine_client: Any) -> bool:
+    """Whether the served diffusion model declares ``/v1/images/segmentations`` support."""
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    od_config = _get_diffusion_od_config(raw_request, engine_client)
+    model_class_name = getattr(od_config, "model_class_name", None)
+    return isinstance(model_class_name, str) and get_diffusion_model_metadata(model_class_name).supports_segmentation
+
+
+def _parse_json_list_form(value: str | None, field: str) -> list[Any] | None:
+    """Decode a JSON-array multipart form field, or ``None`` when absent."""
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=f"'{field}' must be a JSON array") from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=f"'{field}' must be a JSON array")
+    return parsed
+
+
+async def _load_uploaded_image(upload: UploadFile) -> Image.Image:
+    """Decode one uploaded image as RGB. Unlike ``_load_input_images`` it never fetches a URL."""
+    try:
+        return open_image(io.BytesIO(await upload.read())).convert("RGB")
+    except Exception as e:
+        raise ValueError(f"Failed to open uploaded file: {e}") from e
+
+
+def _coco_rle(mask: np.ndarray) -> SegmentationRLE:
+    """COCO uncompressed RLE: column-major runs, the first counting background pixels."""
+    height, width = mask.shape
+    flat = mask.flatten(order="F").astype(np.uint8)
+    boundaries = np.concatenate([[0], np.flatnonzero(np.diff(flat)) + 1, [flat.size]])
+    counts = np.diff(boundaries).tolist()
+    if flat.size and flat[0]:
+        counts.insert(0, 0)
+    return SegmentationRLE(size=[height, width], counts=counts)
+
+
+def _png_mask(mask: np.ndarray) -> str:
+    buffer = io.BytesIO()
+    Image.fromarray(mask.astype(np.uint8) * 255, mode="L").save(buffer, format="PNG", optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _extract_segmentation_instances(
+    result: Any, mask_format: SegmentationMaskFormat
+) -> list[ImageSegmentationInstance]:
+    """Decode the pipeline's bit-packed ``segmentation`` payload into response instances."""
+    multimodal_output = getattr(result, "multimodal_output", None)
+    payload = multimodal_output.get("segmentation") if isinstance(multimodal_output, dict) else None
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="The served model returned no segmentation output.",
+        )
+    count, height, width = (int(value) for value in np.asarray(payload["mask_shape"]).tolist())
+    # An explicit row width keeps a zero-instance payload decodable; ``-1`` cannot be inferred from 0 elements.
+    packed = np.asarray(payload["masks"], dtype=np.uint8).reshape(count, (height * width + 7) // 8)
+    masks = np.unpackbits(packed, axis=1, count=height * width).reshape(count, height, width).astype(bool)
+    boxes = np.asarray(payload["boxes"], dtype=np.float32).reshape(count, 4)
+    scores = np.asarray(payload["scores"], dtype=np.float32).reshape(count)
+    encode = _png_mask if mask_format == SegmentationMaskFormat.PNG else _coco_rle
+    return [
+        ImageSegmentationInstance(score=float(scores[index]), box=boxes[index].tolist(), mask=encode(masks[index]))
+        for index in np.argsort(-scores, kind="stable")
+    ]

@@ -24,9 +24,11 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.cosmos3 import (
+    COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS,
     COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS,
     COSMOS3_TRANSFER_HINT_KEYS,
     normalize_multiview_aspect_ratio,
+    parse_multiview_frame_rate,
     path_media_kind,
     reject_multiview_negative_fields,
     validate_multiview_request,
@@ -40,7 +42,6 @@ from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
     MaskItem,
     MultiviewLayout,
-    expand_multiview_condition_frame_indexes,
     validate_multiview_backend,
 )
 from .multiview_packing import pack_state, patch_grid, unpack_state
@@ -220,14 +221,7 @@ def _resolve_multiview_frame_rate(value: Any, default_fps: float) -> float:
     temporal mRoPE, the prompt metadata, and the mask timestamps. Rates outside
     the recommended range are allowed with a warning.
     """
-    if isinstance(value, bool):
-        raise TypeError("Cosmos3 multiview FPS must be a number, not a boolean.")
-    try:
-        frame_rate = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"Cosmos3 multiview FPS must be a number, got {value!r}.") from exc
-    if not math.isfinite(frame_rate) or frame_rate <= 0:
-        raise ValueError(f"Cosmos3 multiview FPS must be finite and positive, got {value!r}.")
+    frame_rate = parse_multiview_frame_rate(value)
     low, high = COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE
     if not low <= frame_rate <= high:
         logger.warning(
@@ -421,8 +415,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         if lengths_by_text is not None:
             kwargs["caption_lengths"] = lengths_by_text[kwargs["text_ids"].data_ptr()]
         # The shared transfer loop passes these to every branch. Captions are
-        # already compacted, hints carry no per-control weight, and the LiDAR
-        # condition prefix is applied by _apply_transfer_condition.
+        # already compacted, the single hint's normalized weight is always 1.0,
+        # and the LiDAR condition prefix is applied by _apply_transfer_condition.
         for key in ("text_mask", "control_weights", "lidar_condition_latents"):
             kwargs.pop(key, None)
         return super().predict_noise(**kwargs)
@@ -519,6 +513,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             extra,
             self.multiview_cameras,
             media_kind=_media_kind,
+            sampling_frame_rates={field: getattr(sp, field, None) for field in COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS},
         )
 
     @staticmethod
@@ -782,7 +777,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             )
 
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-        latent_t = num_views * latent_frames_per_view
         raw_indexes = multiview.get("condition_frame_indexes_vision")
         if raw_indexes is None:
             if not has_vision:
@@ -802,7 +796,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         else:
             if any(index < 0 or index >= latent_frames_per_view for index in local_indexes):
                 raise ValueError("Camera condition frame index is outside the generated latent clip.")
-            condition_indexes = expand_multiview_condition_frame_indexes(local_indexes, num_views, latent_t)
+            condition_indexes = [
+                view * latent_frames_per_view + frame for view in range(num_views) for frame in local_indexes
+            ]
 
         generator = sp.generator
         seed = self._resolve_seed(sp, generator)
@@ -854,10 +850,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH)
             or COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
         )
-        if max_sequence_length > COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH:
+        if not 1 <= max_sequence_length <= COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH:
             raise ValueError(
-                "Cosmos3 multiview max_sequence_length cannot exceed the variant ceiling the sparse "
-                f"attention is sized for: requested={max_sequence_length}, "
+                "Cosmos3 multiview max_sequence_length must be positive and within the variant ceiling the "
+                f"sparse attention is sized for: requested={max_sequence_length}, "
                 f"ceiling={COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH}."
             )
         patch_h, patch_w, _, _ = self.transformer._pad_to_patch_size(latents.shape[3], latents.shape[4])
@@ -1095,6 +1091,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "payload": payload,
                 "metadata": {
                     **lidar_metadata,
+                    # Serving encodes the MP4 at video.fps; without it the
+                    # camera clip would play at the generic fallback rate.
+                    "video": {"fps": frame_rate},
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,

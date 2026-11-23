@@ -5,8 +5,10 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,6 +32,48 @@ def test_sdpa_gqa_custom_op_returns_contiguous_bshd(value_dim, masked):
     assert output.is_contiguous()
     assert output.flatten(2).untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
     torch.testing.assert_close(output, expected)
+
+
+def test_sdpa_npu_packed_padding_matches_dense_mask():
+    generator = torch.Generator().manual_seed(7)
+    query = torch.randn(1, 9, 2, 8, generator=generator)
+    key = torch.randn(1, 11, 2, 8, generator=generator)
+    value = torch.randn(1, 11, 2, 8, generator=generator)
+    # Inflated padding so that wrongly reading the suffix changes the result.
+    value[:, 7:] += 100
+    metadata = AttentionMetadata(
+        packed_padding=PackedPaddingMetadata(
+            q_length=7,
+            kv_length=7,
+            cu_seqlens_q=torch.tensor([0, 7], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 7], dtype=torch.int32),
+        )
+    )
+    impl = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.5)
+    actual = impl.forward_npu(query, key, value, metadata)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query.permute(0, 2, 1, 3),
+        key.permute(0, 2, 1, 3),
+        value.permute(0, 2, 1, 3),
+        attn_mask=(torch.arange(11) < 7)[None, None, None],
+        scale=0.5,
+    ).permute(0, 2, 1, 3)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.cpu
+def test_sdpa_packed_mask_free_gate_is_npu_only(monkeypatch):
+    """H3 skips the padding mask only behind this gate: on for NPU, off elsewhere.
+
+    A revert of SDPABackend.supports_packed_mask_free to the base False would
+    silently restore the Q x K padding mask on NPU while the forward_npu test
+    above stays green, so pin the gate itself.
+    """
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    assert SDPABackend.supports_packed_mask_free() is True
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    assert SDPABackend.supports_packed_mask_free() is False
 
 
 def test_sdpa_expands_kv_when_native_gqa_kernel_is_unavailable(monkeypatch):
@@ -93,3 +137,36 @@ def test_sdpa_contract_does_not_claim_cuda_support_for_cpu_tensors():
     result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, query, query, None)
 
     assert result.support.status is SupportStatus.UNMIGRATED
+
+
+def test_sdpa_dispatches_out_of_tree_platforms_to_torch_sdpa(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.attention.backends import abstract
+
+    platform = SimpleNamespace(
+        **{name: lambda: False for name in ("is_rocm", "is_cuda", "is_npu", "is_xpu", "is_musa")},
+        is_out_of_tree=lambda: True,
+    )
+    monkeypatch.setattr(abstract, "current_omni_platform", platform)
+    query, key, value = torch.randn(3, 1, 5, 2, 8).unbind(0)
+
+    output = SDPAImpl(num_heads=2, num_kv_heads=2, head_size=8, softmax_scale=8**-0.5).forward(query, key, value)
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), scale=8**-0.5
+    ).transpose(1, 2)
+    torch.testing.assert_close(output, expected)
+
+
+def test_out_of_tree_platforms_reject_backends_without_forward_oot():
+    from vllm_omni.platforms.interface import OmniPlatformEnum, UnspecifiedOmniPlatform
+
+    class OutOfTreePlatform(UnspecifiedOmniPlatform):
+        _omni_enum = OmniPlatformEnum.OOT
+
+    OutOfTreePlatform.validate_diffusion_attn_backend("TORCH_SDPA")
+    with pytest.raises(ValueError, match="FLASH_ATTN diffusion attention backend does not implement forward_oot"):
+        OutOfTreePlatform.validate_diffusion_attn_backend("FLASH_ATTN")
+    with pytest.raises(ValueError, match=r"such as TORCH_SDPA\.$"):
+        OutOfTreePlatform.validate_diffusion_attn_backend("RAINFUSION_ATTN")

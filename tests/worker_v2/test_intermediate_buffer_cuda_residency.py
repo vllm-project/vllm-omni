@@ -11,7 +11,10 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [
+    pytest.mark.core_model,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
+]
 
 
 @pytest.mark.parametrize("key,dtype", [(("embed", "prefill"), torch.float32), (("codes", "ref"), torch.long)])

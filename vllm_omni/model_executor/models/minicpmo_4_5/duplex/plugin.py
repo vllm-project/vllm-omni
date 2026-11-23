@@ -18,6 +18,7 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,7 @@ from vllm_omni.engine.duplex.contracts import (
 )
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
+    DefaultDuplexModelSessionState,
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
     EncodeAudio,
@@ -52,15 +54,12 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
-    MiniCPMO45DataPlaneContext,
     MiniCPMO45DataPlaneSession,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
-    MiniCPMO45ServingSessionState,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     load_default_prompt_audio,
@@ -69,6 +68,18 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
+
+
+@dataclass(slots=True)
+class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
+    """Mutable model-owned state of one MiniCPM duplex session (owned by the session runner).
+
+    The runner-facing flag contract lives on ``DefaultDuplexModelSessionState``;
+    MiniCPM-o only binds its ~1 s PCM unit buffer.
+    """
+
+    audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
+
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
@@ -416,8 +427,8 @@ def _stage0_stop_token_ids(tokenizer: PreTrainedTokenizerBase | None) -> list[in
         "chunk_tts_eos_token_id",
         "listen_token_id",
     )
-    for field in stop_token_fields:
-        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
+    for field_name in stop_token_fields:
+        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field_name]
         token_id = _convert_token_to_id(tokenizer, token)
         if token_id is not None and token_id not in out:
             out.append(token_id)
@@ -818,12 +829,9 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             wav_np, sr = default_ref_audio
         # torchaudio resampling is CPU work: keep it off the orchestrator loop.
         wav_np = await asyncio.to_thread(normalize_ref_audio, wav_np, int(sr), target_sr=16000)
-        # Trim to a whole number of pooled audio embeddings (100 ms frames) so
-        # the first-append scheduler reserve can count them exactly.
-        usable = (len(wav_np) // MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN) * (
-            MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
-        )
-        wav_np = wav_np[:usable]
+        # Preserve the reference waveform used by the checkpoint's prepare().
+        # Its final samples still condition the encoder even when pooling does
+        # not produce another token. Budget the actual encoder output below.
         ref_audio_bytes = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         runtime_config["ref_audio_data"] = base64.b64encode(ref_audio_bytes).decode("ascii")
         runtime_config["ref_audio_format"] = "pcm_f32le"
@@ -896,29 +904,6 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             return MiniCPMO45DuplexWindowConfig.from_mapping(provided)
         except ValueError as exc:
             raise MiniCPMO45ClientRuntimeConfigError(str(exc), code="invalid_sliding_window_config") from exc
-
-    def data_plane_context(
-        self,
-        *,
-        epoch: int,
-        turn_id: int,
-        active_response_turn_id: int | None,
-        active_response_id: str | None,
-        auto_responds: bool,
-        response_format: str,
-        speed: float | None,
-        modalities: tuple[str, ...],
-    ) -> MiniCPMO45DataPlaneContext:
-        return MiniCPMO45DataPlaneContext(
-            epoch=epoch,
-            turn_id=turn_id,
-            active_response_turn_id=active_response_turn_id,
-            active_response_id=active_response_id,
-            auto_responds=auto_responds,
-            response_format=response_format,
-            speed=speed,
-            modalities=modalities,
-        )
 
 
 __all__ = [

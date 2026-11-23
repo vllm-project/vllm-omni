@@ -110,7 +110,11 @@ def test_hunyuan_attention_fused_matches_eager(_dist_env):
     attn = attn.to(torch.bfloat16).eval()
     with torch.no_grad():
         for p in attn.parameters():
-            p.copy_((0.02 * torch.randn(p.shape, device="cuda")).to(p.dtype) if p.dim() > 1 else p)
+            if p.dim() > 1:
+                p.copy_((0.02 * torch.randn(p.shape, device="cuda")).to(p.dtype))
+            else:
+                # vLLM linear biases are allocated with torch.empty.
+                p.zero_()
         for n in (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k):
             n.weight.uniform_(0.5, 1.5)
     batch, video, txt = 2, 256, 40

@@ -162,6 +162,21 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 
 Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` on `vllm serve` to switch to the legacy synchronous path.
 
+### Packed Flow precision
+
+The opt-in packed profiles (`cosyvoice3_full_response.yaml` and
+`cosyvoice3_packed_streaming.yaml`) disable BF16 reduced-precision GEMM
+reductions during each packed Flow solve, including eager solves, graph warmup,
+capture and replay. The previous setting is restored after every solve, so other
+models in the worker keep their own. Batch composition and graph padding can
+otherwise select a different GEMM with larger intermediate rounding errors.
+
+FlashInfer graph plans can choose different attention tiles from eager plans,
+so bitwise graph/eager equivalence is not guaranteed. Validate audio quality
+and performance using the same hardware, software and final deployment settings.
+This precision setting does not change streaming position noise or chunk-causal
+attention semantics.
+
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
@@ -358,7 +373,7 @@ Override the default text per case with `--text`, write to a custom path with `-
 
 ### Notes
 
-- Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../../ming_flash_omni/).
+- Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../ming_flash_omni/).
 - Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single GPU, `enforce_eager`, `max_num_seqs: 1`).
 - Decode defaults from the Ming cookbook: `max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
 
@@ -637,11 +652,22 @@ Single-stage native AR TTS at 48 kHz. Pipeline: `feat_encoder → MiniCPM4 → F
 
 ### Prerequisites
 
+The native model requires `voxcpm==2.0.3`, including its Gradio dependency.
+After the matching vLLM and Omni source installation, run from the repository
+root using the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies):
+
 ```bash
-pip install voxcpm
-# or, for a local source checkout:
-pip install -e /path/to/voxcpm
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+uv pip install 'voxcpm==2.0.3' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+# Alternatively, add an editable VoxCPM checkout with matching 2.0.3 metadata:
+uv pip install 'voxcpm==2.0.3' -e /path/to/voxcpm \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
 ```
+
+The selected CPU dependency/serialization checks do not establish native
+VoxCPM inference or output acceptance.
 
 ### Quick start
 

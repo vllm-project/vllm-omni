@@ -10,7 +10,7 @@ the training implementation is used as a behavioral oracle, not as source.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -212,28 +212,6 @@ class PaddedAttentionGeometry:
     padded_q_len: int
     real_und_len: int
     padded_und_len: int
-
-
-def expand_multiview_condition_frame_indexes(
-    indexes: Sequence[int] | int | None,
-    num_views: int,
-    latent_t: int,
-) -> list[int]:
-    """Expand per-view-local latent frame indexes into camera-major indexes."""
-    if num_views <= 0 or latent_t <= 0 or latent_t % num_views:
-        raise ValueError(
-            "Cosmos3 multiview expansion requires latent_t divisible by num_views: "
-            f"latent_t={latent_t}, num_views={num_views}."
-        )
-    if indexes is None:
-        local_indexes: Sequence[int] = ()
-    elif isinstance(indexes, int):
-        local_indexes = (indexes,)
-    else:
-        local_indexes = indexes
-    frames_per_view = latent_t // num_views
-    filtered = sorted({int(index) for index in local_indexes if 0 <= int(index) < frames_per_view})
-    return [view * frames_per_view + frame for view in range(num_views) for frame in filtered]
 
 
 def build_multiview_flex_metadata(

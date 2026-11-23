@@ -99,7 +99,9 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         user_message: dict[str, Any],
         response_text: str,
     ) -> None:
-        message_history.append(user_message)
+        # Prompts only read history as text. Keeping the frames and audio would
+        # hold every queried frame's PIL image for the whole session.
+        message_history.append(self._text_only_message(user_message))
         message_history.append({"role": "assistant", "content": response_text})
 
     _build_messages = build_engine_prompt

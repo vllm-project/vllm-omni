@@ -41,6 +41,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import resolve_component_quant_config as _resolve_component_quant_config
@@ -359,6 +360,9 @@ class Flux2Pipeline(
 
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
 
+    # Both CFG branches share latents and timestep; prompts are padded to a
+    # fixed length and the position ids are batched like the latents.
+    supports_cfg_batching = True
     support_image_input = True
 
     def __init__(
@@ -804,17 +808,23 @@ class Flux2Pipeline(
         width,
         prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
+        num_inference_steps=None,
     ):
-        if (
-            height is not None
-            and height % (self.vae_scale_factor * 2) != 0
-            or width is not None
-            and width % (self.vae_scale_factor * 2) != 0
-        ):
+        if num_inference_steps is not None and num_inference_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}")
+
+        multiple_of = self.vae_scale_factor * 2
+        for name, size in (("height", height), ("width", width)):
+            if size is not None and size < multiple_of:
+                raise OmniClientError(
+                    f"`{name}` must be at least {multiple_of} to produce a non-empty latent grid, got {size}."
+                )
+
+        if any(size is not None and size % multiple_of for size in (height, width)):
             logger.warning(
                 "`height` and `width` have to be divisible by %s but are %s and %s. "
                 "Dimensions will be resized accordingly",
-                self.vae_scale_factor * 2,
+                multiple_of,
                 height,
                 width,
             )
@@ -836,6 +846,10 @@ class Flux2Pipeline(
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
+        elif isinstance(prompt, str) and not prompt.strip():
+            raise ValueError("`prompt` cannot be empty or whitespace-only.")
+        elif isinstance(prompt, list) and any(isinstance(p, str) and not p.strip() for p in prompt):
+            raise ValueError("`prompt` cannot contain empty or whitespace-only strings.")
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
@@ -916,9 +930,11 @@ class Flux2Pipeline(
         else:
             image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        height = req.sampling_params.height if req.sampling_params.height is not None else height
+        width = req.sampling_params.width if req.sampling_params.width is not None else width
+        if req.sampling_params.num_inference_steps is not None:
+            num_inference_steps = req.sampling_params.num_inference_steps
+
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
@@ -957,6 +973,7 @@ class Flux2Pipeline(
             width=width,
             prompt_embeds=prompt_embeds,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            num_inference_steps=num_inference_steps,
         )
 
         self._guidance_scale = guidance_scale

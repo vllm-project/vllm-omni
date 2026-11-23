@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline E2E smoke test for Audex (Nemotron-Labs-Audex-2B) TTS.
 
 Passes the HF repo ROOT and verifies the 2-stage pipeline (thinker →
@@ -13,6 +13,7 @@ import os
 
 import numpy as np
 import pytest
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import concat_audio
@@ -58,7 +59,7 @@ pytestmark = [
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_audex_offline_tts_smoke(omni_runner: OmniRunner, run_level: str) -> None:
     """Audex TTS from the repo root should produce sane 16 kHz audio per prompt.
 
@@ -95,15 +96,13 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
     """Stage sampling params carrying the CFG pair contract for one request."""
     import copy
 
-    from transformers import AutoTokenizer
-
-    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot, load_audex_tokenizer
     from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
 
     # Resolve the ACTIVE param's model (2B or 30B), not the module default:
     # the null prompt must be built with the same tokenizer the engine uses.
     root = ensure_audex_snapshot(runner.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"), trust_remote_code=True)
+    tokenizer = load_audex_tokenizer(os.path.join(root, "checkpoint_folder_audiogen"))
     params = copy.deepcopy(runner.omni.resolve_sampling_params_list(None))
     stage0 = params[0]
     if stage0.extra_args is None:
@@ -120,7 +119,7 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_level: str) -> None:
     """A guided request must yield exactly ONE audio stream (companion suppressed)."""
     prompt = build_cond_prompt(SYNTH_TEXTS[0])
@@ -138,8 +137,8 @@ def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_lev
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, run_level: str) -> None:
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+def test_audex_offline_cfg_disabled_matches_baseline(omni_runner: OmniRunner, run_level: str) -> None:
     """cfg_scale=1.0 must be indistinguishable from not passing cfg at all."""
     prompt = build_cond_prompt(SYNTH_TEXTS[1])
 
@@ -158,4 +157,10 @@ def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, r
     assert base_audio.shape == disabled_audio.shape, (
         f"cfg_scale=1.0 changed output length: {base_audio.shape} vs {disabled_audio.shape}"
     )
-    np.testing.assert_array_equal(base_audio, disabled_audio)
+    if current_platform.is_rocm():
+        # Repeated ROCm decoding can differ by a few float32 rounding units.
+        # Keep the bound below -120 dBFS while preserving the byte-identical
+        # CUDA contract.
+        np.testing.assert_allclose(base_audio, disabled_audio, rtol=0.0, atol=1e-6)
+    else:
+        np.testing.assert_array_equal(base_audio, disabled_audio)

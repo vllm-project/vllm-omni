@@ -34,13 +34,16 @@ def test_selected_profile_defaults_reach_talker_without_request_overrides():
     assert resolve_generation_params(info, MingFlashOmniTalkerConfig()).tn_mode == "legacy"
 
 
-@pytest.mark.parametrize("profile", ["ming3_audio_flash.yaml", "ming3_audio_tiny.yaml"])
-def test_ming3_profiles_keep_legacy_audio_collection(profile):
+@pytest.mark.parametrize(
+    ("profile", "low_latency"),
+    [("ming3_audio_flash.yaml", True), ("ming3_audio_tiny.yaml", False)],
+)
+def test_ming3_profiles_select_their_audio_collection_policy(profile, low_latency):
     root = Path(__file__).resolve().parents[4]
     deploy = load_deploy_config(root / "vllm_omni/deploy" / profile)
     overrides = deploy.stages[1].engine_extras["hf_overrides"]
-    assert overrides["low_latency_streaming"] is False
-    assert MingFlashOmniTalkerConfig.from_dict({}, **overrides).low_latency_streaming is False
+    assert overrides["low_latency_streaming"] is low_latency
+    assert MingFlashOmniTalkerConfig.from_dict({}, **overrides).low_latency_streaming is low_latency
     # Shared Ming2 and strict checkpoint loading retain their polling default.
     assert MingFlashOmniTalkerConfig().low_latency_streaming is False
     assert MingFlashOmniTalkerConfig(strict_weight_loading=True).low_latency_streaming is False

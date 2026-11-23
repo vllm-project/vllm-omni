@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
@@ -199,22 +201,20 @@ def install_into_ascend_aclgraph() -> None:
                     return self.runnable(*args, **kwargs)
             return original_call(self, *args, **kwargs)
         captured_here = _is_static_shape_graph_here(capacity)
-        # A runtime step the capture passes never covered has no fixed graph to
-        # replay. Neither fallback is survivable: swapping in the per-capacity
-        # dict leaves the stock wrapper nothing to find, and passing through to
-        # the stock call hits its "no entry -> capture now" branch -- both end
-        # in capturing a new graph mid-request, which vLLM forbids (engine
-        # -fatal, "CUDA graph capturing detected at an inappropriate time").
-        # Call the wrapped runnable directly instead: that is exactly how the
-        # stock wrapper dispatches when the runtime mode is NONE (profile /
-        # warmup / eager), so the step runs eagerly with none of the graph
-        # machinery. The runner's ``is_static_shape_graph`` checks key on the
-        # same (num_tokens, capacity), so both sides agree on which steps are
-        # static-shape; capture passes always run under ``capturing_bucket``,
-        # so only runtime steps are screened.
+        # A runtime step may miss the optimized static-shape capture while
+        # still having the ordinary per-capacity ACL graph captured by vLLM.
+        # Replay that graph (including its normal attention-parameter updates)
+        # before falling back to eager. If no entry exists, calling the stock
+        # wrapper would try to capture during a request, which vLLM forbids.
         if _capture_bucket is None and not captured_here:
-            _log_declined_once(capacity)
-            return self.runnable(*args, **kwargs)
+            descriptor = get_forward_context().batch_descriptor
+            entries = self.concrete_aclgraph_entries
+            by_capacity = getattr(entries, "by_capacity", {})
+            capacity_entries = by_capacity.get(capacity, {})
+            entry = capacity_entries.get(descriptor)
+            if entry is None or entry.aclgraph is None:
+                _log_declined_once(capacity)
+                return self.runnable(*args, **kwargs)
         entries = self.concrete_aclgraph_entries
         if not isinstance(entries, _CapacityEntries):
             entries = _CapacityEntries(entries)
@@ -479,6 +479,8 @@ def captured_slot_mapping(num_tokens: int) -> torch.Tensor | None:
     the other one is not.
     """
     capacity = current_capacity()
+    if capacity is None:
+        return None
     return _captured_slot_mappings.get((num_tokens, capacity))
 
 
@@ -491,6 +493,8 @@ def captured_seq_lens(num_tokens: int) -> torch.Tensor | None:
     rebuilding attention metadata.
     """
     capacity = current_capacity()
+    if capacity is None:
+        return None
     captured = _captured_inputs.get((num_tokens, capacity))
     return None if captured is None else captured[0]
 
@@ -511,6 +515,8 @@ def sync_captured_inputs(num_tokens: int, seq_lens_device: torch.Tensor, block_t
     """
     global _warned_moved_inputs
     capacity = current_capacity()
+    if capacity is None:
+        return
     captured = _captured_inputs.get((num_tokens, capacity))
     if captured is None:
         return

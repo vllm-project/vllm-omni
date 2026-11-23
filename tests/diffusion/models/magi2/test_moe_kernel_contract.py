@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from vllm.platforms.interface import DeviceCapability
 
-import vllm_omni.diffusion.models.magi2.fused_moe_kernels as kernels
+import vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels as kernels
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -121,3 +124,158 @@ def test_rejects_invalid_route_metadata(argument, replacement, message):
     args[argument] = replacement
     with pytest.raises(ValueError, match=message):
         kernels.invoke_fused_moe_bf16(*args[:-1], top_k=args[-1], config=CONFIG, fuse_swiglu=True)
+
+
+@pytest.fixture
+def expert_launch(monkeypatch):
+    class ResourceError(Exception):
+        pass
+
+    # vLLM's CPU-only Triton placeholder has no runtime error module.
+    monkeypatch.setattr(
+        kernels,
+        "triton",
+        SimpleNamespace(runtime=SimpleNamespace(errors=SimpleNamespace(OutOfResources=ResourceError))),
+    )
+    monkeypatch.setattr(kernels, "_RESOLVED_BLOCK_CONFIG", {})
+    monkeypatch.setattr(
+        kernels.current_omni_platform, "get_device_capability", lambda device_id: DeviceCapability(10, 0)
+    )
+    probe = _LaunchProbe()
+    monkeypatch.setattr(kernels, "_mh_moe_kernel", probe)
+    return probe, ResourceError
+
+
+def _expert_inputs(tokens=65, d_head=256, d_expert=1280, dtype=torch.bfloat16):
+    return (
+        torch.zeros(tokens, 1, d_head, dtype=dtype),
+        torch.arange(tokens, dtype=torch.int32),
+        torch.ones(tokens),
+        torch.tensor([0, tokens]),
+        torch.zeros(1, d_head, d_expert, dtype=dtype),
+        torch.zeros(1, d_head, d_expert, dtype=dtype),
+        torch.zeros(1, d_expert, d_head, dtype=dtype),
+    )
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_expert_tile_fallback_rebuilds_metadata_and_caches(monkeypatch, expert_launch, deterministic):
+    probe, resource_error = expert_launch
+
+    class OversizedTile:
+        def __getitem__(self, grid):
+            record = probe[grid]
+
+            def launch(*args, **kwargs):
+                record(*args, **kwargs)
+                if args[29] == 128:
+                    raise resource_error("tensor memory requires 528 columns, limit 512")
+                args[4].fill_(1)
+
+            return launch
+
+    monkeypatch.setattr(kernels, "_mh_moe_kernel", OversizedTile())
+    for tokens in (65, 129):
+        output = kernels.triton_mh_moe_forward(*_expert_inputs(tokens), deterministic=deterministic)
+        torch.testing.assert_close(output, torch.ones_like(output))
+
+    assert [args[29] for _, args, _ in probe.calls] == [128, 64, 64]
+    assert [grid for grid, _, _ in probe.calls] == [(2,), (3,), (4,)]
+    assert [args[8].tolist() for _, args, _ in probe.calls] == [[0, 1], [0, 2], [0, 3]]
+    key = (torch.device("cpu"), torch.bfloat16, 256, 1280, deterministic)
+    assert kernels._RESOLVED_BLOCK_CONFIG[key] == (64, 64, 32, 2, 8)
+
+
+@pytest.mark.parametrize(
+    ("d_head", "d_expert", "dtype", "deterministic"),
+    [(256, 1280, torch.bfloat16, True), (64, 96, torch.bfloat16, False), (256, 1280, torch.float16, False)],
+)
+def test_expert_tile_cache_is_scoped(expert_launch, d_head, d_expert, dtype, deterministic):
+    probe, _ = expert_launch
+    kernels._RESOLVED_BLOCK_CONFIG[(torch.device("cpu"), torch.bfloat16, 256, 1280, False)] = (64, 64, 32, 2, 8)
+    kernels.triton_mh_moe_forward(*_expert_inputs(1, d_head, d_expert, dtype), deterministic=deterministic)
+    assert probe.calls[0][1][29] == 128
+
+
+def test_expert_tile_cache_is_device_specific(expert_launch):
+    probe, _ = expert_launch
+    kernels._RESOLVED_BLOCK_CONFIG[(torch.device("cuda", 1), torch.bfloat16, 256, 1280, False)] = (64, 64, 32, 2, 8)
+    kernels.triton_mh_moe_forward(*_expert_inputs(1))
+    assert probe.calls[0][1][29] == 128
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_expert_tile_exhaustion_propagates(monkeypatch, expert_launch, cached):
+    probe, resource_error = expert_launch
+    cache_key = (torch.device("cpu"), torch.bfloat16, 256, 1280, False)
+    if cached:
+        kernels._RESOLVED_BLOCK_CONFIG[cache_key] = (64, 64, 32, 2, 8)
+
+    class UnsupportedTiles:
+        def __getitem__(self, grid):
+            record = probe[grid]
+
+            def launch(*args, **kwargs):
+                record(*args, **kwargs)
+                raise resource_error("insufficient resources")
+
+            return launch
+
+    monkeypatch.setattr(kernels, "_mh_moe_kernel", UnsupportedTiles())
+    with pytest.raises(resource_error, match="insufficient resources"):
+        kernels.triton_mh_moe_forward(*_expert_inputs(1))
+    assert [kwargs["num_warps"] for _, _, kwargs in probe.calls] == ([8, 4] if cached else [8, 8, 4])
+    assert cache_key not in kernels._RESOLVED_BLOCK_CONFIG
+
+
+def test_expert_tile_rejects_cached_tile_and_retries(monkeypatch, expert_launch):
+    probe, resource_error = expert_launch
+    cache_key = (torch.device("cpu"), torch.bfloat16, 256, 1280, False)
+    kernels._RESOLVED_BLOCK_CONFIG[cache_key] = (128, 64, 32, 2, 8)
+
+    class RejectCachedThenSucceed:
+        def __getitem__(self, grid):
+            record = probe[grid]
+
+            def launch(*args, **kwargs):
+                record(*args, **kwargs)
+                if args[29] == 128:
+                    raise resource_error("tensor memory requires 528 columns, limit 512")
+                args[4].fill_(1)
+
+            return launch
+
+    monkeypatch.setattr(kernels, "_mh_moe_kernel", RejectCachedThenSucceed())
+    output = kernels.triton_mh_moe_forward(*_expert_inputs(1))
+    torch.testing.assert_close(output, torch.ones_like(output))
+    repeated = kernels.triton_mh_moe_forward(*_expert_inputs(1))
+    torch.testing.assert_close(repeated, torch.ones_like(repeated))
+
+    assert [args[29] for _, args, _ in probe.calls] == [128, 64, 64]
+    assert kernels._RESOLVED_BLOCK_CONFIG[cache_key] == (64, 64, 32, 2, 8)
+
+
+def test_expert_tile_propagates_other_errors(monkeypatch, expert_launch):
+    class BrokenKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                raise RuntimeError("compiler bug")
+
+            return launch
+
+    monkeypatch.setattr(kernels, "_mh_moe_kernel", BrokenKernel())
+    with pytest.raises(RuntimeError, match="compiler bug"):
+        kernels.triton_mh_moe_forward(*_expert_inputs(1))
+    assert not kernels._RESOLVED_BLOCK_CONFIG
+
+
+@pytest.mark.parametrize("major", [None, 8, 9, 10])
+def test_expert_tile_candidates_use_requested_device(monkeypatch, major):
+    def capability(device_id):
+        assert device_id == 3
+        return None if major is None else DeviceCapability(major, 0)
+
+    monkeypatch.setattr(kernels.current_omni_platform, "get_device_capability", capability)
+    candidates = kernels._block_config_candidates(3)
+    assert candidates[-1] == (64, 64, 32, 2, 4)
+    assert len(candidates) == (3 if major == 10 else 1)

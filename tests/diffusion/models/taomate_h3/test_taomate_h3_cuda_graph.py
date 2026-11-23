@@ -12,6 +12,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.cuda_graph import (
+    GraphedForward,
+    clone_static,
+    copy_into,
+    kwargs_signature,
+)
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
 from vllm_omni.diffusion.models.taomate_h3.audio_teacher import (
     TEACHER_SLOT_REFERENCE,
@@ -19,12 +25,6 @@ from vllm_omni.diffusion.models.taomate_h3.audio_teacher import (
     TEACHER_SLOT_TEXT,
     attach_teacher_timestep_slots,
     teacher_forward_kwargs,
-)
-from vllm_omni.diffusion.models.taomate_h3.cuda_graph import (
-    GraphedForward,
-    clone_static,
-    copy_into,
-    kwargs_signature,
 )
 from vllm_omni.diffusion.models.taomate_h3.packed import (
     taomate_audio_only_frozen_prefix_packed_layout,

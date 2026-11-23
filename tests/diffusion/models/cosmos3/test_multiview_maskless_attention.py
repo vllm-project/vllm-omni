@@ -10,6 +10,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from tests.helpers.distributed import start_collective_workers
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3 import multiview_maskless_attention as m
 from vllm_omni.diffusion.models.cosmos3.multiview_attention import multiview_attention
@@ -379,38 +380,51 @@ def test_prompt_lengths_do_not_recompile() -> None:
     assert counter.frame_count == 1
 
 
+def _run_ulysses_matches_dense(rank: int, world_size: int, views: int, controls: bool, store: str) -> None:
+    import torch.distributed as dist
+
+    from vllm_omni.diffusion.models.cosmos3.multiview_parallel import multiview_ulysses_attention
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world_size)
+    try:
+        spec = layout(views=views, controls=controls)
+        num_und = sum(spec.caption_lengths)
+        q, k, v, k_und, v_und = tensors(spec, num_und, heads=2 * world_size, kv_heads=world_size)
+        length = -(-spec.gen_tokens // world_size)
+        pad = length * world_size - spec.gen_tokens
+        assert pad, "the layout must leave a CP padding remainder"
+        local = slice(rank * length, (rank + 1) * length)
+        local_qkv = [torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))[:, local] for x in (q, k, v)]
+        with torch.inference_mode():
+            result = multiview_ulysses_attention(
+                *local_qkv,
+                k_und,
+                v_und,
+                prepared_context(spec, num_und),
+                group=dist.group.WORLD,
+                rank=rank,
+                world_size=world_size,
+            )
+        expected = torch.nn.functional.pad(dense_reference(spec, q, k, v, k_und, v_und), (0, 0, 0, 0, 0, pad))
+        torch.testing.assert_close(result, expected[:, local], atol=1e-6, rtol=1e-5)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.cpu
-def test_ulysses_maskless_trims_padding_and_preserves_batch_one(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import multiview_parallel as parallel
-
-    spec = layout(views=1)
-    num_und = sum(spec.caption_lengths)
-    q, k, v, k_und, v_und = tensors(spec, num_und)
-    cp = 2
-    length = (spec.gen_tokens + cp - 1) // cp
-    padded = [torch.nn.functional.pad(x, (0, 0, 0, 0, 0, length * cp - x.shape[1])) for x in (q, k, v)]
-    for rank in range(cp):
-        full = [x[:, :, rank * (x.shape[2] // cp) : (rank + 1) * (x.shape[2] // cp)] for x in padded]
-        calls = iter(full)
-
-        def exchange(x, group, scatter, gather):
-            assert x.shape[0] == 1
-            if scatter == 2:
-                return next(calls)
-            assert x.shape[1] == length * cp
-            return x[:, rank * length : (rank + 1) * length]
-
-        monkeypatch.setattr(parallel, "_all_to_all", exchange)
-        local_qkv = [x[:, rank * length : (rank + 1) * length] for x in padded] + [k_und, v_und]
-        head_qkv = [x[:, : spec.gen_tokens] for x in full] + [
-            k_und[:, :, rank : rank + 1],
-            v_und[:, :, rank : rank + 1],
-        ]
-        context = prepared_context(spec, num_und)
-        result = parallel.multiview_ulysses_attention(*local_qkv, context, group=object(), rank=rank, world_size=cp)
-        expected = multiview_attention(*head_qkv, context)
-        expected = torch.nn.functional.pad(expected, (0, 0, 0, 0, 0, length * cp - spec.gen_tokens))
-        torch.testing.assert_close(result, expected[:, rank * length : (rank + 1) * length])
+@pytest.mark.parametrize(
+    ("world_size", "views", "controls"), [(2, 1, False), (4, 2, True)], ids=["cp2_pad1", "cp4_pad2"]
+)
+def test_ulysses_matches_dense_reference_over_real_all_to_all(
+    tmp_path, world_size: int, views: int, controls: bool
+) -> None:
+    """Real Gloo exchanges: head scatter/gather order, per-rank UND KV heads and CP padding trim."""
+    start_collective_workers(
+        _run_ulysses_matches_dense,
+        args=(world_size, views, controls, str(tmp_path / "store")),
+        nprocs=world_size,
+        device_kind="cpu",
+    )
 
 
 # -- CUDA -----------------------------------------------------------------------------

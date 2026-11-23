@@ -154,6 +154,60 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --ring 2
 ```
 
+### MixFusion (Mixed-Resolution Step Batching)
+
+Best for: **Serving Qwen-Image with concurrent requests at different resolutions**
+
+MixFusion packs mixed-resolution requests into a single denoise step batch
+(ragged latents) instead of splitting them into separate resolution groups,
+raising throughput when traffic mixes resolutions.
+
+```bash
+# Server-level enablement
+vllm serve Qwen/Qwen-Image --omni --port 8091 \
+  --enable-mixfusion \
+  --mixfusion-min-chunk-tokens 256 \
+  --mixfusion-max-chunks 128
+```
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--enable-mixfusion` / `--no-enable-mixfusion` | off | Let the scheduler pack mixed-resolution requests into one step batch |
+| `--mixfusion-min-chunk-tokens` | 256 | Minimum packed-chunk token count below which a candidate is not packed |
+| `--mixfusion-max-chunks` | 128 | Maximum number of chunks in one packed forward |
+
+MixFusion requires a pipeline that declares `supports_mixfusion` (currently
+Qwen-Image only). On any other pipeline, server-level `--enable-mixfusion`
+fails at startup; a request-level `extra_args={"enable_mixfusion": True}` is a
+safe no-op and requests keep batching by resolution.
+
+MixFusion only mixes resolutions in step execution. When server-level
+`--enable-mixfusion` is set, step execution is enabled automatically (a
+warning is logged if it was off), so the command above works without
+`--step-execution`. Request-level `extra_args` in request mode remain a no-op.
+
+Constraints on the packed path:
+
+- **Model configuration**: the loaded model must expose a packing plan and
+  a request-layout declaration. SP, CFG parallel and conflicting forward
+  hooks keep requests on ordinary dense scheduling; the engine reports the
+  reason at initialization.
+- **Request inputs**: currently Qwen-Image text-to-image requests are eligible.
+  Other inputs keep the ordinary pipeline's support and compatibility limits.
+- **Chunk policy**: the scheduler checks the full candidate batch. Requests
+  that cannot join it remain waiting; a request that cannot meet the limits
+  alone uses dense execution. Dense batches retain resolution constraints.
+- **CFG**: sequential true-CFG is supported; CFG parallel is not packed.
+- **Attention backend**: native multi-document varlen is optional. Dense
+  backends use attention-only buckets (equal image lengths with text masks,
+  or exact joint lengths without masks). Mixed-resolution scheduling remains
+  enabled, including on NPU; there is no varlen-kernel speedup on this path.
+- **Runtime validation**: the worker builds a layout for the scheduler's
+  selected batch using actual prepared tensors. Chunk size is recomputed when
+  the layout changes, including removal of requests that fail preparation.
+  Unexpected token-count or runtime-capability changes fail explicitly rather than
+  silently splitting the denoise batch.
+
 ## Limitations
 
 ### Incompatibilities

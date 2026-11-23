@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -16,6 +18,8 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_media import (
     _ffmpeg_q_to_pil_quality,
     _video_thread_type,
     extract_jpeg,
+    iter_av_units,
+    iter_jpegs,
     materialize_media,
     mix_pcm16,
     read_audio_pcm16,
@@ -26,12 +30,59 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_media import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("unit_ms", [32, 1000])
+def test_av_units_keep_all_frames_in_their_capture_interval(unit_ms):
+    unit_samples = 16 * unit_ms
+    pcm = np.arange(2 * unit_samples + 5, dtype=np.int16).tobytes()
+    frames = [(index * unit_ms / 2000, str(index).encode()) for index in range(5)]
+    units = list(iter_av_units(pcm, iter(frames), unit_ms=unit_ms))
+    assert [frame for _, frame in units] == [[b"0", b"1"], [b"2", b"3"], b"4"]
+    assert [len(audio) for audio, _ in units] == [unit_samples * 2, unit_samples * 2, 10]
+    assert b"".join(audio for audio, _ in units) == pcm
+
+
+def test_av_units_put_boundary_frame_in_the_following_unit():
+    units = list(iter_av_units(bytes(2 * 32000), iter([(1.0, b"boundary")])))
+    assert [frame for _, frame in units] == [None, b"boundary"]
+
+
+@pytest.mark.parametrize("samples", [0, 5, 16000, 20005])
+def test_av_units_preserve_audio_without_video(samples):
+    pcm = b"\x01\x00" * samples
+    units = list(iter_av_units(pcm, iter(())))
+    assert b"".join(audio for audio, _ in units) == pcm
+    assert all(frame is None for _, frame in units)
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        [-0.1],
+        [float("nan")],
+        [float("inf")],
+        [0.5, 0.25],
+        [1.25],  # A frame at the end is outside the final partial interval.
+        [1.3],
+        [0.0, 0.1, 0.2],  # The native wire accepts at most two frames per append.
+    ],
+)
+def test_av_units_reject_frames_that_cannot_be_delivered(timestamps):
+    with pytest.raises(ValueError):
+        list(iter_av_units(bytes(40000), iter((timestamp, b"frame") for timestamp in timestamps)))
+
+
+@pytest.mark.parametrize("pcm,unit_ms", [(b"x", 1000), (b"\0\0", 0), (b"\0\0", -1)])
+def test_av_units_reject_invalid_pcm_or_unit_size(pcm, unit_ms):
+    with pytest.raises(ValueError):
+        list(iter_av_units(pcm, iter(()), unit_ms=unit_ms))
+
+
 # ---------------------------------------------------------------------------
 # Helpers: synthetic test media generated with PyAV (no external files)
 # ---------------------------------------------------------------------------
 
 
-def _make_synthetic_mp4(duration: float = 1.0, fps: int = 30) -> bytes:
+def _make_synthetic_mp4(duration: float = 1.0, fps: int = 30, width: int = 64, height: int = 64) -> bytes:
     """Return an MP4 byte blob with a solid-color pattern.
 
     Uses the built-in ``mpeg4`` encoder — available everywhere PyAV's bundled
@@ -41,11 +92,13 @@ def _make_synthetic_mp4(duration: float = 1.0, fps: int = 30) -> bytes:
     total_frames = int(duration * fps)
     with av.open(buf, mode="w", format="mp4") as container:
         stream = container.add_stream("mpeg4", rate=fps)
-        stream.width = 64
-        stream.height = 64
+        stream.width = width
+        stream.height = height
         stream.pix_fmt = "yuv420p"
         for i in range(total_frames):
-            frame = av.VideoFrame.from_ndarray(np.full((64, 64, 3), (i * 8) % 256, dtype=np.uint8), format="rgb24")
+            frame = av.VideoFrame.from_ndarray(
+                np.full((height, width, 3), (i * 8) % 256, dtype=np.uint8), format="rgb24"
+            )
             for pkt in stream.encode(frame):
                 container.mux(pkt)
         for pkt in stream.encode():
@@ -82,11 +135,38 @@ def _make_synthetic_ogg(duration: float = 1.0, sample_rate: int = 16000) -> byte
         stream = container.add_stream(codec_name, rate=sample_rate, layout="mono")
         frame = av.AudioFrame.from_ndarray(samples[np.newaxis, :], format="fltp", layout="mono")
         frame.sample_rate = sample_rate
+        frame.pts = 0
+        frame.time_base = Fraction(1, sample_rate)
         for pkt in stream.encode(frame):
             container.mux(pkt)
         for pkt in stream.encode():
             container.mux(pkt)
     return buf.getvalue()
+
+
+def test_iter_jpegs_fractional_fps_excludes_clip_endpoint(tmp_path):
+    path = tmp_path / "fractional.mp4"
+    path.write_bytes(_make_synthetic_mp4(duration=4.0))
+    frames = list(iter_jpegs(path, fps=1.5, duration=4.0))
+    assert [timestamp for timestamp, _ in frames] == pytest.approx([0, 2 / 3, 4 / 3, 2, 8 / 3, 10 / 3])
+    assert all(jpeg.startswith(b"\xff\xd8") for _, jpeg in frames)
+
+
+def test_iter_jpegs_c8_concurrent_prepare_does_not_deadlock(tmp_path):
+    """C8 duplex prepare used to hang in concurrent PyAV open/seek on aarch64."""
+    paths = []
+    for i in range(8):
+        path = tmp_path / f"c8_{i}.mp4"
+        path.write_bytes(_make_synthetic_mp4(duration=2.0, fps=30))
+        paths.append(path)
+
+    def _pull(path: Path) -> int:
+        return len(list(iter_jpegs(path, fps=1.0, duration=2.0)))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_pull, path) for path in paths]
+        counts = [future.result(timeout=30) for future in as_completed(futures, timeout=30)]
+    assert counts == [2] * 8
 
 
 class TestVideoThreadType:
@@ -167,6 +247,24 @@ class TestExtractJpeg:
         path.write_bytes(mp4)
         jpeg = extract_jpeg(path, timestamp=-1.0, quality=3)
         assert jpeg.startswith(b"\xff\xd8")
+
+    @staticmethod
+    def test_max_side_scales_down_keeping_aspect_ratio(tmp_path: Path) -> None:
+        from PIL import Image
+
+        path = tmp_path / "wide.mp4"
+        path.write_bytes(_make_synthetic_mp4(duration=0.5, fps=10, width=320, height=180))
+        full = Image.open(io.BytesIO(extract_jpeg(path, timestamp=0.0)))
+        scaled = Image.open(io.BytesIO(extract_jpeg(path, timestamp=0.0, max_side=160)))
+        assert full.size == (320, 180)
+        assert scaled.size == (160, 90)
+
+    @staticmethod
+    @pytest.mark.parametrize("max_side", [320, 640], ids=["equal", "larger"])
+    def test_max_side_leaves_frames_within_limit_unchanged(tmp_path: Path, max_side: int) -> None:
+        path = tmp_path / "small.mp4"
+        path.write_bytes(_make_synthetic_mp4(duration=0.5, fps=10, width=320, height=180))
+        assert extract_jpeg(path, timestamp=0.0, max_side=max_side) == extract_jpeg(path, timestamp=0.0)
 
     @staticmethod
     def test_raises_value_error_for_no_video(tmp_path: Path) -> None:
