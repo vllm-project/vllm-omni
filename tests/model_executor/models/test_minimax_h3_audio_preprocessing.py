@@ -38,7 +38,8 @@ def _media() -> MiniMaxH3EncoderMediaInput:
 @pytest.mark.parametrize("channels", [1, 2, 3])
 def test_waveform_preparation_preserves_existing_order_and_samples(rate: int, channels: int) -> None:
     torchaudio = pytest.importorskip("torchaudio")
-    value = _waveform(rate).repeat(channels, 1).double()
+    # Distinct per-channel amplitudes catch swapped or wrongly selected channels.
+    value = torch.cat([_waveform(rate) * (index + 1) / channels for index in range(channels)]).double()
     if channels == 1:
         value = value[0]
     expected = value.float()
