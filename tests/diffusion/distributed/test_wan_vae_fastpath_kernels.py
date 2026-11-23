@@ -57,6 +57,43 @@ ALL_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 # that the fast path is bit-exact on XPU, including the XPU-specific divide and conv-bias
 # rules. Every test still runs on XPU when invoked directly.
 _XPU_CI = hardware_test(res={"xpu": "B60"}, num_cards=1)
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="Spatial assembly fusion requires CUDA")
+@torch.no_grad()
+@pytest.mark.parametrize("axis", ["height", "width"])
+def test_spatial_cat_pad_requires_installed_fastpath(monkeypatch, axis):
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    monkeypatch.setattr(spatial, "_rank_world", lambda group: (0, 1))
+    conv = spatial.WanDistCausalConv3d(
+        WanCausalConv3d(2, 2, 3, padding=1).to(device=DEVICE), group=None, split_dim=axis
+    )
+    x = torch.randn(1, 2, 2, 4, 5, device="cuda")
+    history = torch.randn_like(x)
+    calls = []
+    cat_pad = dm.cat_pad_5d
+
+    def tracked(*args, **kwargs):
+        result = cat_pad(*args, **kwargs)
+        assert result is not None
+        calls.append(True)
+        return result
+
+    monkeypatch.setattr(dm, "cat_pad_5d", tracked)
+    expected, extent = conv._assemble_input(x, history)
+    assert not calls
+    setattr(conv, fp.CFG_ATTR, fp.FastPathConfig())
+    actual, actual_extent = conv._assemble_input(x, history)
+    assert calls == [True]
+    assert actual_extent == extent
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    delattr(conv, fp.CFG_ATTR)
+    actual, _ = conv._assemble_input(x, history)
+    assert calls == [True]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # Cosmos3 720p decoder stages, spatially scaled down so the suite stays fast.
 NORM_SHAPES = [
     (1, 1024, 1, 45, 80),
@@ -1351,6 +1388,33 @@ def test_channels_last_decoder_keeps_layout_and_stays_close(
     mse = (difference**2).mean().item()
     psnr = float("inf") if mse == 0 else 10 * torch.log10(torch.tensor(4.0 / mse)).item()
     assert error <= tolerance and psnr >= 45.0, f"max_abs_diff={error:.3e} psnr={psnr:.2f} dB tolerance={tolerance}"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("input_channels_last,output_channels_last", [(False, True), (True, False)])
+def test_cat_pad_reuses_spatial_input_buffer(input_channels_last, output_channels_last):
+    """A halo buffer chooses its layout independently of the local activation."""
+    dtype = torch.bfloat16
+    x = torch.randn(2, 8, 1, 7, 9, device=DEVICE, dtype=dtype)
+    if input_channels_last:
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    # Exercise narrowed views as emitted by shard boundary trimming.
+    x = x[:, :, :, 1:-1, 1:-1]
+    out = torch.empty(
+        (2, 8, 3, 7, 9),
+        device=DEVICE,
+        dtype=dtype,
+        memory_format=torch.channels_last_3d if output_channels_last else torch.contiguous_format,
+    )
+    pointer = out.data_ptr()
+    for cache_frames in (0, 2, 1, 0):
+        cache = torch.randn(2, 8, cache_frames, 5, 7, device=DEVICE, dtype=dtype) if cache_frames else None
+        source = torch.cat([cache, x], dim=2) if cache is not None else x
+        expected = F.pad(source, (1, 1, 1, 1, 2 - cache_frames, 0))
+        out.fill_(float("nan"))
+        actual = dm.cat_pad_5d(x, cache, (1, 1, 1, 1, 2, 0), out=out)
+        assert actual is out and actual.data_ptr() == pointer
+        assert _bits_equal(actual, expected)
 
 
 @torch.no_grad()
