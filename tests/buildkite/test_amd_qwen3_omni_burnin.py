@@ -192,6 +192,7 @@ def test_qwen3_omni_async_perf_uses_default_v2_profile_and_cold_start_timeout() 
     assert "stage_config_name" not in async_server
     assert async_server["extra_cli_args"] == [
         "--async-chunk",
+        "--enable-orch-monitor",
         "--stage-init-timeout",
         "900",
     ]

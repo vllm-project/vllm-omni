@@ -43,6 +43,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
@@ -75,6 +76,7 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, 
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -85,12 +87,33 @@ if TYPE_CHECKING:
 # first key would silently switch the default to a different (female) voice.
 DEFAULT_SPEAKER = "ethan"
 
+# Keep the residual-codebook RNG independent from codebook 0 when both are
+# derived from the Talker stage seed. The value is the ASCII tag ``QWEN3MTP``.
+_QWEN3_OMNI_MTP_SEED_DOMAIN = 0x5157_454E_334D_5450
+_TORCH_SEED_MASK = 0x7FFF_FFFF_FFFF_FFFF
+
 
 def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
     """Return the speaker key used for requests that do not name one."""
     if DEFAULT_SPEAKER in speaker_token_ids:
         return DEFAULT_SPEAKER
     return next(iter(speaker_token_ids))
+
+
+def get_qwen3_omni_mtp_seed(sampling_params: SamplingParams | None) -> int | None:
+    """Resolve the request-local RNG seed for residual codec codebooks.
+
+    ``tts_local_seed`` is already an explicit model-local stream selector and
+    therefore takes precedence. Otherwise the Talker stage seed, which owns
+    codebook 0 sampling, is domain-separated before it seeds codebooks 1..N.
+    """
+    local_seed = get_tts_local_seed(sampling_params)
+    if local_seed is not None:
+        return local_seed
+    stage_seed = getattr(sampling_params, "seed", None) if sampling_params is not None else None
+    if stage_seed is None:
+        return None
+    return (int(stage_seed) ^ _QWEN3_OMNI_MTP_SEED_DOMAIN) & _TORCH_SEED_MASK
 
 
 # Special token IDs for Qwen3 Omni MoE
@@ -204,6 +227,9 @@ class Qwen3OmniMoeForConditionalGeneration(
     eager_frames_active = False
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False
+    # Residual codebooks must not consume the process-global RNG: otherwise
+    # identical seeded Talker requests diverge with batch order or scheduling.
+    get_mtp_seed = staticmethod(get_qwen3_omni_mtp_seed)
 
     def create_omni_model_state(
         self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
@@ -275,6 +301,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 if spec_config.method in ("eagle3", "extract_hidden_states"):
                     raise ValueError("Qwen3-Omni auxiliary hidden-state speculation only supports DFlash")
                 if spec_config.use_dflash():
+                    if getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
+                        raise ValueError(
+                            "Qwen3-Omni DFlash does not support session_mode=duplex; "
+                            "use session_mode=turn or disable DFlash"
+                        )
                     if vllm_config.parallel_config.pipeline_parallel_size > 1:
                         raise ValueError(
                             "Qwen3-Omni DFlash requires pipeline_parallel_size=1; "
@@ -363,12 +394,13 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             # Codebook 0 uses V1's per-request CUDA generator (see
-            # Qwen3OmniTalkerSampler). Residual codebooks draw inside talker_mtp,
-            # which is also what V1 captures: replay advances Philox, so each
-            # step gets a fresh stream. An external uniform buffer is a different
-            # stream and, together with MRv2's murmur3 codebook-0 sampler, raises
-            # Seed-TTS word error by about 0.4 percentage points.
-            self.mtp_sample_uniforms = False
+            # Qwen3OmniTalkerSampler). Residual codebooks receive their own
+            # request-local generator through get_mtp_seed. Feed their noise
+            # through a static tensor so seeded requests can still replay the
+            # whole-MTP graph. Preserve the eager predictor's per-step draw
+            # shapes so enabling that graph does not change any RNG stream.
+            self.mtp_sample_uniforms = True
+            self.mtp_sample_uniforms_preserve_eager_stream = True
             self.mrv2_custom_sampler = mrv2_talker_sampler
             self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
             self.mtp_sample_vocab_size = self._codec_codebook_size
@@ -491,6 +523,10 @@ class Qwen3OmniMoeForConditionalGeneration(
     @property
     def mtp_output_key(self) -> tuple[str, str]:
         return getattr(self, "talker_mtp_output_key", ("codes", "audio"))
+
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return bool(getattr(self, "talker_mtp_accepts_per_row_generators", False))
 
     @property
     def mtp_graph_safe(self) -> bool:
@@ -1373,6 +1409,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         except Exception:
             pass
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
+        if meta.get("resumable") and meta.get("decode_span") and start_index == 0:
+            # The first prefill step starts a fresh text queue for this segment.
+            embed = {**embed, "cached_decode": None}
+            update_dict.setdefault("embed", {})["cached_decode"] = None
+            update_dict.setdefault("meta", {})["eos_emitted"] = False
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
@@ -1524,8 +1565,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         use_v2_model_runner = getattr(self.vllm_config.model_config, "use_v2_model_runner", False)
         queue_started = meta.get("decode_span_queue_started", False)
         queued_decode = use_v2_model_runner or meta.get("decode_span", False) or queue_started
-        if queued_decode and not meta.get("resumable", False):
-            if not use_v2_model_runner and not queue_started:
+        resumable = meta.get("resumable", False)
+        if queued_decode and (not resumable or meta.get("decode_span", False)):
+            if not resumable and not use_v2_model_runner and not queue_started:
                 # MRv1's indexed cache retains consumed rows. Convert it to a
                 # pending-only queue once, when the first speculative span
                 # arrives; later chunks must not trim the pending rows again.

@@ -626,6 +626,7 @@ class DuplexSessionManager:
                 raise DuplexSessionError(f"Duplex session already exists: {session_id}", code="session_exists")
             max_sessions = self.admission_limit
             if self._admission_count() >= max_sessions:
+                self.stage_port.check_session_availability(session_id)
                 self.stage_port.reject_session("global_capacity_exhausted")
                 raise DuplexSessionError(
                     f"duplex_session_capacity_exhausted: limit={max_sessions}",
@@ -705,7 +706,9 @@ class DuplexSessionManager:
             error_code, _, _ = self._control_error(exc)
             if holds_admission_slot and (session_trace := self.session_traces.pop(session_id, None)) is not None:
                 session_trace.end("error", error_code)
-            if error_code in {"resource_exhausted", "session_exists"}:
+            if error_code == "replica_unavailable":
+                self.stage_port.reject_session(error_code)
+            if error_code in {"replica_unavailable", "resource_exhausted", "session_exists"}:
                 logger.info("open_duplex_session rejected: %s", exc)
             else:
                 logger.exception("open_duplex_session failed: %s", exc)

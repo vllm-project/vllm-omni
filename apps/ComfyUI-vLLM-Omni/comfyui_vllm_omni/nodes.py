@@ -18,12 +18,15 @@ from .utils.types import (
     MAX_REFERENCE_IMAGES,
     MAX_REFERENCE_VIDEOS,
     MAX_TIMELINE_GUIDES,
+    MINIMAX_H3_CONTROL_TYPES,
     AudioFormat,
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
     FastH3Deployment,
     H3TimelineGuides,
     LatentMaskEditing,
+    MiniMaxH3Control,
+    MiniMaxH3ControlType,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
     VideoReferences,
@@ -32,6 +35,7 @@ from .utils.types import (
 )
 from .utils.validators import (
     add_sampling_parameters_to_stage,
+    validate_minimax_h3_control,
     validate_model_and_sampling_params_types,
 )
 
@@ -43,8 +47,38 @@ FASTH3_FPS = 24
 # spec has to be named outright rather than recovered from that alias.
 FASTH3_SPEC_MODEL = "MiniMax-H3"
 _FASTH3_GUIDES_ERROR = (
-    "timeline_guides require base MiniMax-H3 weights, not FastH3; disconnect fast_h3 or timeline_guides."
+    "timeline_guides require base MiniMax-H3 weights or a FastH3 Omni deployment; "
+    "disconnect fast_h3 or timeline_guides, or select the Omni variant."
 )
+
+
+_FASTH3_OMNI_GUIDES_ERROR = (
+    "FastH3 Omni serves Ref2VA only: timeline_guides need the references input and no frame, first_frame or last_frame."
+)
+
+
+def _fast_h3_guides_error(
+    fast_h3: dict | None,
+    timeline_guides: list[dict] | None,
+    *,
+    frame=None,
+    first_frame=None,
+    last_frame=None,
+    references=None,
+) -> str | None:
+    """Reject guides a FastH3 deployment cannot serve before anything is uploaded.
+
+    FastH3 Preview (a fused T2VA student) takes no guides. FastH3 Omni takes them on a Ref2VA
+    request, which the client builds only from the references input; frame inputs select FL2VA
+    and no inputs select T2VA, both of which the Omni checkpoint rejects.
+    """
+    if fast_h3 is None or timeline_guides is None:
+        return None
+    if fast_h3.get("variant", "Preview") != "Omni":
+        return _FASTH3_GUIDES_ERROR
+    if references is None or any(value is not None for value in (frame, first_frame, last_frame)):
+        return _FASTH3_OMNI_GUIDES_ERROR
+    return None
 
 
 def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:
@@ -226,6 +260,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "latent_edit": ("LATENT_MASK_EDITING",),
                 # Append new ports last so links in saved workflows keep their slots.
                 "timeline_guides": ("H3_TIMELINE_GUIDES",),
+                "control": ("MINIMAX_H3_CONTROL",),
             },
         }
 
@@ -242,8 +277,10 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         first_frame=None,
         last_frame=None,
         references=None,
+        control=None,
         fast_h3=None,
         timeline_guides=None,
+        latent_edit=None,
         **_kwargs,
     ) -> str | Literal[True]:
         base = super().VALIDATE_INPUTS(url, model)
@@ -255,8 +292,16 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return "Provide either frame or first_frame/last_frame, not both."
         if references is not None and (first_frame is not None or last_frame is not None):
             return "Provide either first_frame/last_frame or references, not both."
-        if fast_h3 is not None and timeline_guides is not None:
-            return _FASTH3_GUIDES_ERROR
+        guides_error = _fast_h3_guides_error(
+            fast_h3,
+            timeline_guides,
+            frame=frame,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            references=references,
+        )
+        if guides_error is not None:
+            return guides_error
         if (
             fast_h3 is not None
             and fast_h3.get("variant", "Preview") == "Preview"
@@ -265,6 +310,15 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return (
                 "FastH3 Preview supports T2VA only; disconnect frame, first_frame, last_frame, and references inputs."
             )
+        if control is not None and any(
+            value is not None for value in (frame, first_frame, last_frame, references, latent_edit)
+        ):
+            return "MiniMax-H3 control cannot be combined with frame, keyframes, references, or latent-mask editing."
+        if control is not None:
+            try:
+                validate_minimax_h3_control(control)
+            except ValueError as exc:
+                return str(exc)
         return True
 
     async def generate(
@@ -281,6 +335,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         first_frame: torch.Tensor | None = None,
         last_frame: torch.Tensor | None = None,
         references: dict | None = None,
+        control: MiniMaxH3Control | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
@@ -299,8 +354,16 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         spec_model = model
 
         if fast_h3 is not None:
-            if timeline_guides is not None:
-                raise ValueError(_FASTH3_GUIDES_ERROR)
+            guides_error = _fast_h3_guides_error(
+                fast_h3,
+                timeline_guides,
+                frame=frame,
+                first_frame=first_frame,
+                last_frame=last_frame,
+                references=references,
+            )
+            if guides_error is not None:
+                raise ValueError(guides_error)
             if fast_h3.get("variant", "Preview") == "Preview" and any(
                 value is not None for value in (frame, first_frame, last_frame, references)
             ):
@@ -374,6 +437,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             first_frame=first_frame,
             last_frame=last_frame,
             references=references,
+            control=control,
             width=width,
             height=height,
             num_frames=num_frames,
@@ -1189,6 +1253,73 @@ class VLLMOmniReverseImageBatch:
 
     def reverse(self, images: torch.Tensor) -> tuple[torch.Tensor]:
         return (images.flip(0),)
+
+
+class VLLMOmniMiniMaxH3Control:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "control_type": (list(MINIMAX_H3_CONTROL_TYPES),),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Controls the selected mode's conditioning strength.",
+                    },
+                ),
+            },
+            "optional": {
+                "control_video": (
+                    "VIDEO",
+                    {"tooltip": "Required for structure modes; optional for inpaint."},
+                ),
+                "source_video": (
+                    "VIDEO",
+                    {"tooltip": "Optional source video; requires mask or mask_video."},
+                ),
+                "mask": (
+                    "MASK",
+                    {"tooltip": "Static mask; white/1 marks areas to regenerate. Do not combine with mask_video."},
+                ),
+                "mask_video": (
+                    "VIDEO",
+                    {"tooltip": "Temporal mask video; do not combine with mask."},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MINIMAX_H3_CONTROL",)
+    RETURN_NAMES = ("control",)
+    FUNCTION = "get_control"
+    CATEGORY = "vLLM-Omni/Video Params"
+
+    def get_control(
+        self,
+        control_type: MiniMaxH3ControlType,
+        strength: float,
+        control_video: VideoInput | None = None,
+        source_video: VideoInput | None = None,
+        mask: torch.Tensor | None = None,
+        mask_video: VideoInput | None = None,
+    ):
+        control = MiniMaxH3Control(
+            control_type=control_type,
+            control_context_scale=strength,
+        )
+        if control_video is not None:
+            control["control_video"] = control_video
+        if source_video is not None:
+            control["source_video"] = source_video
+        if mask is not None:
+            control["mask"] = mask
+        if mask_video is not None:
+            control["mask_video"] = mask_video
+        validate_minimax_h3_control(control)
+        return (control,)
 
 
 class VLLMOmniVideoReferences:

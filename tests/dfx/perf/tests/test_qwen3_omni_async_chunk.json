@@ -19,6 +19,7 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "extra_cli_args": [
         "--async-chunk",
+        "--enable-orch-monitor",
         "--stage-init-timeout",
         "900"
       ]

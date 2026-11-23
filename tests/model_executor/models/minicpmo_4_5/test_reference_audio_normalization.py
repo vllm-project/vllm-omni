@@ -52,14 +52,6 @@ def test_resample_48k_to_24k_halves_sample_count():
     assert torch.all(waveform[12000:] == 0)
 
 
-def test_long_reference_is_truncated_to_6s():
-    samples_7s = torch.arange(7 * TARGET, dtype=torch.float32)
-    waveform, sr = _normalize_reference(samples_7s, TARGET)
-    assert sr == TARGET
-    assert waveform.shape == (MAX_SAMPLES,)
-    assert torch.equal(waveform, samples_7s[:MAX_SAMPLES])
-
-
 def test_short_reference_is_zero_padded_to_6s():
     """The zero-pad is the load-bearing half of S1b.
 
@@ -80,13 +72,6 @@ def test_exact_length_reference_passes_through_unchanged():
     waveform, sr = _normalize_reference(samples_6s, TARGET)
     assert sr == TARGET
     assert torch.equal(waveform, samples_6s)
-
-
-def test_every_output_shares_one_length():
-    """Whatever comes in, one request's L0 equals any other's."""
-    for length in (TARGET // 4, TARGET, 3 * TARGET, MAX_SAMPLES + 1):
-        waveform, _ = _normalize_reference(torch.ones(length), TARGET)
-        assert waveform.numel() == MAX_SAMPLES
 
 
 def test_empty_reference_stays_empty():
@@ -113,7 +98,7 @@ def test_window_length_is_configurable():
     assert torch.equal(waveform[: 5 * TARGET], samples_5s)
 
 
-def test_truncation_emits_warning(caplog):
+def test_long_reference_is_truncated_to_6s_with_warning(caplog):
     """Silent truncation would hide a user-visible behavior change.
 
     A bare ``caplog.at_level`` does not capture vLLM loggers (they do not
@@ -127,10 +112,13 @@ def test_truncation_emits_warning(caplog):
     prev_level = target_logger.level
     target_logger.setLevel(logging.WARNING)
     try:
-        _normalize_reference(samples_7s, TARGET)
+        waveform, sr = _normalize_reference(samples_7s, TARGET)
     finally:
         target_logger.removeHandler(caplog.handler)
         target_logger.setLevel(prev_level)
+    assert sr == TARGET
+    assert waveform.shape == (MAX_SAMPLES,)
+    assert torch.equal(waveform, samples_7s[:MAX_SAMPLES])
     assert any("truncating" in record.getMessage() for record in caplog.records)
 
 
