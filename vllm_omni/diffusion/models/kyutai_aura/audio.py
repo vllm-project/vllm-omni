@@ -61,6 +61,11 @@ class MimiSemanticFeatures:
         return latent.transpose(1, 2).float()
 
 
+def video_frames_for(num_samples: int, sample_rate: int, fps: int) -> int:
+    """Video frames that cover ``num_samples`` of speech at ``fps``, rounded up (at least one)."""
+    return max(1, -(-num_samples * fps // sample_rate))
+
+
 def to_video_rate(features: torch.Tensor, fps: int, video_frames_per_chunk: int) -> tuple[torch.Tensor, int]:
     """Sample [num_layers, T @ 25 Hz, dim] features at the video frame rate, zero-padded to a
     whole number of chunks. Returns ([1, num_layers, dim, num_chunks * frames], num_chunks)."""

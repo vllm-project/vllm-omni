@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.kyutai_aura.audio import to_video_rate
+from vllm_omni.diffusion.models.kyutai_aura.audio import to_video_rate, video_frames_for
 from vllm_omni.diffusion.models.kyutai_aura.config import (
     KYUTAI_AURA_1_3B,
     closest_bucket,
@@ -11,7 +11,7 @@ from vllm_omni.diffusion.models.kyutai_aura.config import (
     unsupported_kyutai_aura,
 )
 from vllm_omni.diffusion.models.kyutai_aura.kv_cache import ChunkPositions, RollingChunkKVCache
-from vllm_omni.diffusion.models.kyutai_aura.sampling import StudentSigmas, decode_spans
+from vllm_omni.diffusion.models.kyutai_aura.sampling import StudentSigmas, crop_chunks, decode_spans
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -109,3 +109,40 @@ def test_student_sigmas_on_the_shifted_grid():
     for t, sigma in zip(KYUTAI_AURA_1_3B.timesteps, sigmas):
         # Each student timestep sits within half a grid step of its sigma's timestep.
         assert abs(1000 * sigma - t) < 1000 / KYUTAI_AURA_1_3B.schedule_steps, t
+
+
+def test_speech_frames_round_up():
+    assert video_frames_for(217920, 24000, 16) == 146  # 9.08 s of speech at 16 fps
+    assert video_frames_for(24000, 24000, 16) == 16
+    assert video_frames_for(24001, 24000, 16) == 17
+    assert video_frames_for(1, 24000, 16) == 1
+    assert video_frames_for(0, 24000, 16) == 1
+
+
+def test_crop_chunks_ends_with_the_speech_and_requests_no_later_chunk():
+    requested: list[int] = []
+
+    def chunks(sizes):
+        for index, size in enumerate(sizes):
+            requested.append(index)
+            yield index, len(sizes), torch.arange(size, dtype=torch.float32).repeat(3, 1)[..., None, None]
+
+    sizes = [13] + [16] * 9  # 10 chunks, 157 frames: the model-card sample before the crop
+    kept = list(crop_chunks(chunks(sizes), 146))
+    assert [video.shape[1] for _, _, video in kept] == [13] + [16] * 8 + [5]
+    assert torch.equal(kept[-1][2][0, :, 0, 0], torch.arange(5, dtype=torch.float32))  # the chunk's first frames
+    assert requested == list(range(10))
+
+    requested.clear()
+    kept = list(crop_chunks(chunks(sizes), 29))  # exactly two whole chunks
+    assert [video.shape[1] for _, _, video in kept] == [13, 16]
+    assert requested == [0, 1]  # the third chunk is never generated
+
+    requested.clear()
+    kept = list(crop_chunks(chunks([13, 16, 16]), 24))  # the plan has one chunk more than the speech needs
+    assert [(index, total, video.shape[1]) for index, total, video in kept] == [(0, 3, 13), (1, 3, 11)]
+    assert requested == [0, 1]
+
+    requested.clear()
+    kept = list(crop_chunks(chunks([13, 16]), 1000))  # num_chunks stopped first: nothing is cropped
+    assert [video.shape[1] for _, _, video in kept] == [13, 16]

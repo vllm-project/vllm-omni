@@ -33,7 +33,13 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
-from vllm_omni.diffusion.models.kyutai_aura.audio import MIMI_REPO, MimiSemanticFeatures, load_speech, to_video_rate
+from vllm_omni.diffusion.models.kyutai_aura.audio import (
+    MIMI_REPO,
+    MimiSemanticFeatures,
+    load_speech,
+    to_video_rate,
+    video_frames_for,
+)
 from vllm_omni.diffusion.models.kyutai_aura.config import (
     DEFAULT_PROMPT,
     closest_bucket,
@@ -41,7 +47,7 @@ from vllm_omni.diffusion.models.kyutai_aura.config import (
     unsupported_kyutai_aura,
 )
 from vllm_omni.diffusion.models.kyutai_aura.kv_cache import RollingChunkKVCache
-from vllm_omni.diffusion.models.kyutai_aura.sampling import StudentSigmas, decode_spans
+from vllm_omni.diffusion.models.kyutai_aura.sampling import StudentSigmas, crop_chunks, decode_spans
 from vllm_omni.diffusion.models.kyutai_aura.transformer import KyutaiAuraTransformer
 from vllm_omni.diffusion.request_streaming import get_emit_chunk
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -309,26 +315,35 @@ class KyutaiAuraPipeline(nn.Module, SupportImageInput, SupportAudioInput):
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        """Generate the whole video of one request, or emit it chunk by chunk with ``streaming_output``."""
+        """Generate the whole video of one request, or emit it chunk by chunk with ``streaming_output``.
+
+        The video ends with the speech: the chunk that reaches the speech's last frame is cropped to
+        it and no later chunk is generated (``num_chunks`` can stop it earlier)."""
         if req.is_dummy_run():
             return [DiffusionOutput(output=torch.zeros(1, 3, 1, 8, 8))]
         text, image, audio, seed, num_chunks = self._request_inputs(req)
+        sample_rate = self.audio_features.sample_rate
+        waveform = load_speech(audio, sample_rate)
+        speech_frames = video_frames_for(len(waveform), sample_rate, self.cfg.fps)
         emit = get_emit_chunk() if getattr(self.od_config, "streaming_output", False) is True else None
         chunks: list[torch.Tensor] = []
         delivered: list[float] = []
-        total = 0
+        sent = 0
         start = time.perf_counter()
-        for index, total, video in self.generate_chunks(image, audio, text, seed=seed, num_chunks=num_chunks):
+        generated = self.generate_chunks(image, audio, text, seed=seed, num_chunks=num_chunks)
+        for index, total, video in crop_chunks(generated, speech_frames):
+            sent += 1
             if emit is not None:
                 emit(DiffusionOutput(finished=False, chunk_index=index, total_chunks=total, output=video[None].half()))
             else:
                 chunks.append(video.cpu())
                 delivered.append(time.perf_counter() - start)
         if emit is not None:
-            return [DiffusionOutput(finished=True, chunk_index=max(total - 1, 0), total_chunks=total)]
+            # The last chunk sent and the number sent, which the crop can make smaller than the plan.
+            return [DiffusionOutput(finished=True, chunk_index=max(sent - 1, 0), total_chunks=sent)]
         self._log_speed(delivered, [c.shape[1] for c in chunks])
         video = torch.cat(chunks, dim=1)[None]
-        sample_rate = self.audio_features.sample_rate
-        waveform = load_speech(audio, sample_rate)
+        # The speech is cut to the video only when the video ends first (num_chunks, or a chunk count from the
+        # speech features that stops up to three frames short); otherwise both end together.
         waveform = waveform[: int(round(video.shape[2] / self.cfg.fps * sample_rate))]
         return [DiffusionOutput(output=(video, np.asarray(waveform), sample_rate, self.cfg.fps))]

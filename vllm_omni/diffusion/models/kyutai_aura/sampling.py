@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Sampling helpers of AURA's chunk-wise generation: student noise levels and VAE decode spans."""
+"""Sampling helpers of AURA's chunk-wise generation: student noise levels, VAE decode spans and the
+crop of the last chunk to the speech."""
 
 from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
 
 import torch
 
@@ -38,3 +41,21 @@ def decode_spans(num_frames: int, group: int, first: bool) -> list[tuple[int, in
         spans.append((start, end))
         start = end
     return spans
+
+
+def crop_chunks(
+    chunks: Iterable[tuple[int, int, torch.Tensor]], frames: int
+) -> Iterator[tuple[int, int, torch.Tensor]]:
+    """Pass (index, total, video [3, T, H, W]) chunks through until ``frames`` video frames are out.
+
+    The chunk that reaches ``frames`` is cropped to it, and no chunk after it is requested, so a
+    lazy chunk generator never computes one. Earlier frames are unchanged: generation is causal."""
+    kept = 0
+    if frames <= 0:
+        return
+    for index, total, video in chunks:
+        video = video[:, : frames - kept]
+        kept += video.shape[1]
+        yield index, total, video
+        if kept >= frames:
+            return

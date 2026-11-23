@@ -20,8 +20,10 @@ AURA ([paper](https://arxiv.org/abs/2611.26540)) is a 4-step causal student of a
 ## Offline generation
 
 ```python
+import numpy as np
 import PIL.Image
 
+from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -30,11 +32,25 @@ output = omni.generate(
     {"prompt": "", "multi_modal_data": {"image": PIL.Image.open("portrait.png"), "audio": "speech.wav"}},
     OmniDiffusionSamplingParams(seed=42),
 )[0]
-frames = output.images  # the video frames; the speech track and its rate are in output.multimodal_output
+
+# The speech track, its rate and the fps are in output.multimodal_output.
+frames = np.asarray(output.images)
+frames = frames.reshape(-1, *frames.shape[-3:])  # [T, H, W, 3]
+if frames.dtype != np.uint8:  # float frames in [0, 1]
+    frames = (frames * 255).round().astype(np.uint8)
+extra = output.multimodal_output
+mp4 = mux_video_audio_bytes(
+    frames,
+    np.asarray(extra["audio"]),
+    fps=extra["fps"],
+    audio_sample_rate=extra["audio_sample_rate"],
+)
+with open("aura.mp4", "wb") as f:
+    f.write(mp4)
 ```
 
 - `prompt` may stay empty: a default description of a person speaking to the camera is then used. The checkpoint was distilled with one fixed description of its own, so output without a prompt differs from the reference implementation's default output; pass a description as `prompt` to steer it.
-- The video covers the whole speech, rounded up to a whole chunk; `extra_args={"num_chunks": N}` limits it to N chunks.
+- The video ends with the speech: the last chunk is cropped to the speech's length and no later chunk is generated; `extra_args={"num_chunks": N}` stops it after N chunks.
 - The portrait is resized and center-cropped to the closest training resolution: 576x576, or 768x512 (width x height). Portraits where the face fills a good part of the frame work best.
 - The first request compiles the transformer blocks (regional compilation); start the engine once and reuse it.
 
