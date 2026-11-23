@@ -33,6 +33,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "runtime_data_plane_stream_failed": "server_error",
     "runtime_data_plane_text_without_audio": "server_error",
     "resource_exhausted": "rate_limit_error",
+    "replica_unavailable": "server_error",
     "session_exists": "invalid_request_error",
     "session_closed": "invalid_request_error",
     "unknown_session": "invalid_request_error",

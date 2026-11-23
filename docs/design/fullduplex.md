@@ -1432,9 +1432,11 @@ embeddings even when they do not add a pooled token.
 The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
 on CUDA, ROCm and NPU. The ROCm override changes runner selection while
 preserving the shared duplex session, async-chunk, device, connector and stage
-topology contracts. The CUDA-only reference-attention, FlashAttention, graph,
-speculation and fused-kernel behavior described below does not apply to ROCm;
-runner selection alone does not establish ROCm runtime or quality qualification.
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph
+and speculation behavior described below does not apply to ROCm. A ROCm FP16
+Code2Wav configuration may select the shared fused CFM body with its SDPA
+fallback; it does not enable NVIDIA tiled attention. Runner selection and this
+dispatch coverage alone do not establish ROCm runtime or quality qualification.
 
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
