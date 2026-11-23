@@ -29,7 +29,9 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import (
     get_deploy_config_path,
     get_deploy_config_stage,
+    get_stage_entries,
     modify_stage_config,
+    resolve_deploy_yaml,
 )
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_run import decode_output, decode_stage_input, encode_payload
@@ -143,6 +145,21 @@ def test_cached_predictor_streaming_audio(omni_server, online_client, run_level)
     )
 
 
+def _launched_deploy_config(omni_server) -> dict:
+    """Return the deploy YAML the live OmniServer was started with."""
+    args = list(omni_server.serve_args)
+    path = None
+    for index, arg in enumerate(args):
+        if arg == "--deploy-config" and index + 1 < len(args):
+            path = args[index + 1]
+            break
+        if arg.startswith("--deploy-config="):
+            path = arg.split("=", 1)[1]
+            break
+    assert path, "shared OmniServer was launched without --deploy-config"
+    return resolve_deploy_yaml(path)
+
+
 # These three cases must stay adjacent and share one module-scoped OmniServer.
 @pytest.mark.core_model
 @pytest.mark.advanced_model
@@ -156,10 +173,26 @@ def test_default_cuda_graph_startup(omni_server) -> None:
     server to become ready after both stages finish model initialization and
     CUDA Graph capture. The regression covered here exited during stage 1
     capture, before fixture setup could complete.
+
+    The process is the shared ``tts_server_params`` overlay, not the shipped
+    file. That overlay, including a CUDA platform stage override, must keep
+    graphs enabled for stages 0 and 1.
     """
     for stage_id in (0, 1):
         stage = get_deploy_config_stage("qwen3_tts.yaml", stage_id=stage_id)
         assert stage.get("enforce_eager", False) is False
+
+    launched = _launched_deploy_config(omni_server)
+    launched_stages = {stage.get("stage_id"): stage for stage in get_stage_entries(launched)}
+    cuda_platform = (launched.get("platforms") or {}).get("cuda") or {}
+    cuda_stages = {stage.get("stage_id"): stage for stage in cuda_platform.get("stages") or []}
+    for stage_id in (0, 1):
+        stage = launched_stages[stage_id]
+        assert stage.get("enforce_eager", False) is False
+        cuda_stage = cuda_stages.get(stage_id)
+        if cuda_stage is not None:
+            assert cuda_stage.get("enforce_eager", False) is False
+    assert launched_stages[0]["default_sampling_params"]["max_tokens"] == 500
 
     assert omni_server.proc is not None
     assert omni_server.proc.poll() is None
