@@ -11,14 +11,13 @@
 
 ## When to use this recipe
 
-Use the recorded versions below to reproduce the pre-MRv2 MammothModa2-Preview
-text-to-image smoke test on one Ascend 910B3. Validation covered one 1024x1024
-request with vLLM 0.34.0 at vLLM-Omni revision `0.33.0rc2.dev385+g62d0e880a`.
+Use this recipe to run MammothModa2-Preview text-to-image on a single Ascend 910B3 with the current Model Runner V2 (MRv2) stack.
 
-Validation on the current Model Runner V2 stack remains pending. The
-[MRv2 T2I tracking issue](https://github.com/vllm-project/vllm-omni/issues/10752)
-tracks missing `generated_len` metadata that can cause the AR stage to skip
-grid constraints.
+Successful T2I image generation was validated with the following environment:
+
+- vLLM-Omni: 0.34.0+npu
+- vLLM: 0.34.0+empty
+- vLLM-Ascend: 0.19.1rc2.dev3635+g19c063b54
 
 ## References
 
