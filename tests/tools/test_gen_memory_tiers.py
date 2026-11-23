@@ -12,7 +12,7 @@ from tools import gen_memory_tiers as cli
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _write_recipe(root, vendor, name, variants, tasks=None):
+def _write_recipe(root, vendor, name, variants, tasks=None, extra=None):
     path = root / vendor / f"{name}.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -22,6 +22,7 @@ def _write_recipe(root, vendor, name, variants, tasks=None):
                 "model": {"model_id": f"{vendor}/{name}"},
                 "omni": {"tasks": tasks if tasks is not None else [{"id": "t2a", "label": "Text to speech"}]},
                 "variants": variants,
+                **(extra or {}),
             }
         ),
         encoding="utf-8",
@@ -131,3 +132,83 @@ def test_checked_in_artifacts_match_the_rendered_output():
 
     assert cli.DEFAULT_OUTPUT.read_text(encoding="utf-8") == page
     assert cli.DEFAULT_JSON_OUTPUT.read_text(encoding="utf-8") == cli.render_json(variants)
+
+
+@pytest.fixture
+def declared(tmp_path):
+    """Recipes that do and do not declare a platform."""
+    models = tmp_path / "recipes" / "models"
+    _write_recipe(
+        models,
+        "acme",
+        "declared",
+        {
+            "cuda_only": {
+                "precision": "nvfp4",
+                "vram_minimum_gb": 13,
+                "supported_hardware": ["b200", "gb200"],
+                "precision_hardware": {"brand": "NVIDIA"},
+            },
+            "both": {
+                "precision": "bf16",
+                "vram_minimum_gb": 48,
+                "supported_hardware": ["h100", "mi300x"],
+            },
+        },
+    )
+    _write_recipe(models, "acme", "silent", {"default": {"precision": "bf16", "vram_minimum_gb": 8}})
+    _write_recipe(
+        models,
+        "acme",
+        "tuned",
+        {"default": {"precision": "bf16", "vram_minimum_gb": 80}},
+        extra={"hardware_overrides": {"amd": {"extra_env": {"VLLM_ROCM_USE_AITER": "0"}}}},
+    )
+    return models
+
+
+def test_a_declared_allowlist_supplies_backends_and_hardware(declared):
+    variants, _ = cli.load_variants(declared)
+    by_variant = {(variant.model_id, variant.variant): variant for variant in variants}
+
+    cuda_only = by_variant[("acme/declared", "cuda_only")]
+    assert cuda_only.backends == ("cuda",)
+    assert cuda_only.hardware == ("b200", "gb200")
+    assert cuda_only.brand == "NVIDIA"
+
+    both = by_variant[("acme/declared", "both")]
+    assert both.backends == ("cuda", "rocm")
+
+
+def test_a_recipe_that_declares_no_platform_reports_no_backend(declared):
+    """Silence is not a claim of support: the backend stays undeclared."""
+    variants, _ = cli.load_variants(declared)
+    silent = next(variant for variant in variants if variant.model_id == "acme/silent")
+
+    assert silent.backends == ()
+    assert silent.backends_label == "not declared"
+
+
+def test_hardware_overrides_record_tuning_not_support(declared):
+    variants, _ = cli.load_variants(declared)
+    tuned = next(variant for variant in variants if variant.model_id == "acme/tuned")
+
+    assert tuned.backends == ()
+    assert tuned.tuned_for == ("rocm",)
+
+
+def test_minimum_memory_is_always_a_dedicated_pool_number(declared):
+    variants, _ = cli.load_variants(declared)
+
+    payload = json.loads(cli.render_json(variants))
+    assert {entry["memory_kind"] for entry in payload} == {"dedicated"}
+    assert {tuple(entry["backends"]) for entry in payload} == {(), ("cuda",), ("cuda", "rocm")}
+
+
+def test_the_rendered_table_exposes_backends_and_hardware(declared):
+    variants, sources = cli.load_variants(declared)
+    page = cli.render(variants, len(sources), markdown_recipe_count=0)
+
+    assert "| Min memory (GiB) | Model | Variant | Precision | Backends | Requires | Tasks | Source |" in page
+    assert "| `acme/declared` | cuda_only | nvfp4 | cuda | b200, gb200, brand: NVIDIA |" in page
+    assert "not declared" in page

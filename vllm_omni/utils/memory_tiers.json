@@ -8,6 +8,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml"
   },
   {
@@ -19,6 +24,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
   },
   {
@@ -30,6 +40,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
   },
   {
@@ -42,6 +57,18 @@
       "Text-to-image",
       "Image-to-image"
     ],
+    "backends": [
+      "cuda"
+    ],
+    "memory_kind": "dedicated",
+    "hardware": [
+      "b200",
+      "gb200",
+      "b300",
+      "gb300"
+    ],
+    "brand": "NVIDIA",
+    "tuned_for": [],
     "source": "recipes/models/black-forest-labs/flux-3-image-klein.yaml"
   },
   {
@@ -54,6 +81,13 @@
       "Text-to-image",
       "Image-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "rocm"
+    ],
     "source": "recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml"
   },
   {
@@ -65,6 +99,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-TTS-Realtime.yaml"
   },
   {
@@ -76,6 +115,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-VoiceGenerator.yaml"
   },
   {
@@ -87,6 +131,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
   },
   {
@@ -98,6 +147,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
   },
   {
@@ -109,6 +163,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml"
   },
   {
@@ -119,6 +178,13 @@
     "precision": "bf16",
     "tasks": [
       "Text \u2192 Speech"
+    ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "rocm"
     ],
     "source": "recipes/models/inclusionAI/Ming-omni-tts-0.5B.yaml"
   },
@@ -132,6 +198,20 @@
       "Text-to-image",
       "Image-to-image"
     ],
+    "backends": [
+      "cuda"
+    ],
+    "memory_kind": "dedicated",
+    "hardware": [
+      "h100",
+      "h200",
+      "b200",
+      "gb200",
+      "b300",
+      "gb300"
+    ],
+    "brand": "NVIDIA",
+    "tuned_for": [],
     "source": "recipes/models/black-forest-labs/flux-3-image-klein.yaml"
   },
   {
@@ -143,6 +223,11 @@
     "tasks": [
       "Text-to-audio"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/stabilityai/stable-audio-open-1.0.yaml"
   },
   {
@@ -154,6 +239,11 @@
     "tasks": [
       "Text-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen-Image.yaml"
   },
   {
@@ -165,6 +255,11 @@
     "tasks": [
       "Text-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen-Image.yaml"
   },
   {
@@ -177,6 +272,21 @@
       "Text-to-image",
       "Image-to-image"
     ],
+    "backends": [
+      "cuda"
+    ],
+    "memory_kind": "dedicated",
+    "hardware": [
+      "h100",
+      "h200",
+      "b200",
+      "gb200",
+      "b300",
+      "gb300",
+      "rtx_pro_6000"
+    ],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/black-forest-labs/flux-3-image-klein.yaml"
   },
   {
@@ -188,6 +298,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/bosonai/higgs-audio-v3-tts-4b.yaml"
   },
   {
@@ -199,6 +314,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/mistralai/Voxtral-4B-TTS-2603.yaml"
   },
   {
@@ -210,6 +330,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/openbmb/VoxCPM2.yaml"
   },
   {
@@ -220,6 +345,13 @@
     "precision": "bf16",
     "tasks": [
       "Text-to-image"
+    ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "rocm"
     ],
     "source": "recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml"
   },
@@ -232,6 +364,13 @@
     "tasks": [
       "Text-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "rocm"
+    ],
     "source": "recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml"
   },
   {
@@ -243,6 +382,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/zai-org/GLM-TTS.yaml"
   },
   {
@@ -254,6 +398,11 @@
     "tasks": [
       "Text \u2192 Sound"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-SoundEffect.yaml"
   },
   {
@@ -265,6 +414,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-TTS.yaml"
   },
   {
@@ -276,6 +430,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-TTSD-v1.0.yaml"
   },
   {
@@ -287,6 +446,22 @@
     "tasks": [
       "Text-to-image"
     ],
+    "backends": [
+      "cuda"
+    ],
+    "memory_kind": "dedicated",
+    "hardware": [
+      "h100",
+      "h200",
+      "b200",
+      "gb200",
+      "b300",
+      "gb300",
+      "rtx_pro_6000",
+      "rtx_pro_6000_8x"
+    ],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml"
   },
   {
@@ -298,6 +473,22 @@
     "tasks": [
       "Text-to-image"
     ],
+    "backends": [
+      "cuda"
+    ],
+    "memory_kind": "dedicated",
+    "hardware": [
+      "h100",
+      "h200",
+      "b200",
+      "gb200",
+      "b300",
+      "gb300",
+      "rtx_pro_6000",
+      "rtx_pro_6000_8x"
+    ],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml"
   },
   {
@@ -309,6 +500,11 @@
     "tasks": [
       "Image-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/meituan-longcat/LongCat-Image-Edit.yaml"
   },
   {
@@ -321,6 +517,11 @@
       "Text-to-image",
       "Image-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/zai-org/GLM-Image.yaml"
   },
   {
@@ -333,6 +534,11 @@
       "t2v",
       "i2v"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/nvidia/Cosmos3-Nano.yaml"
   },
   {
@@ -345,6 +551,11 @@
       "Text-to-image",
       "Image-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen-Image-2.1.yaml"
   },
   {
@@ -357,6 +568,11 @@
       "Text-to-image",
       "Image-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen-Image-2.1.yaml"
   },
   {
@@ -367,6 +583,13 @@
     "precision": "bf16",
     "tasks": [
       "Text-to-image"
+    ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "rocm"
     ],
     "source": "recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml"
   },
@@ -379,6 +602,11 @@
     "tasks": [
       "Text-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Qwen/Qwen-Image.yaml"
   },
   {
@@ -390,6 +618,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/fishaudio/drama-3.yaml"
   },
   {
@@ -401,6 +634,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/fishaudio/s2-pro.yaml"
   },
   {
@@ -419,6 +657,23 @@
       "Full two-stage T2V",
       "Full two-stage I2V"
     ],
+    "backends": [
+      "cuda"
+    ],
+    "memory_kind": "dedicated",
+    "hardware": [
+      "h100",
+      "h200",
+      "b200",
+      "gb200",
+      "b300",
+      "gb300",
+      "dgx_spark_gb10",
+      "rtx_pro_5000",
+      "rtx_pro_6000"
+    ],
+    "brand": "NVIDIA",
+    "tuned_for": [],
     "source": "recipes/models/Lightricks/LTX-2.5-Diffusers.yaml"
   },
   {
@@ -437,6 +692,25 @@
       "Full two-stage T2V",
       "Full two-stage I2V"
     ],
+    "backends": [
+      "cuda",
+      "rocm"
+    ],
+    "memory_kind": "dedicated",
+    "hardware": [
+      "h100",
+      "h200",
+      "b200",
+      "gb200",
+      "b300",
+      "gb300",
+      "rtx_pro_6000",
+      "mi300x",
+      "mi325x",
+      "mi355x"
+    ],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/Lightricks/LTX-2.5-Diffusers.yaml"
   },
   {
@@ -448,6 +722,11 @@
     "tasks": [
       "Speech \u2192 Speech (full duplex)"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/adventists-ai/Sophon-Realtime-32B-Tag.yaml"
   },
   {
@@ -459,6 +738,11 @@
     "tasks": [
       "Text \u2192 Speech"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/IndexTeam/IndexTTS-2.5.yaml"
   },
   {
@@ -471,6 +755,11 @@
       "t2v",
       "i2v"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/IFM/PAN2.yaml"
   },
   {
@@ -484,6 +773,13 @@
       "i2v",
       "ti2v"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "rocm"
+    ],
     "source": "recipes/models/Wan-AI/Wan2.2-T2V-A14B-Diffusers.yaml"
   },
   {
@@ -495,6 +791,13 @@
     "tasks": [
       "Text-to-image",
       "Image-to-image"
+    ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "rocm"
     ],
     "source": "recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml"
   },
@@ -508,6 +811,11 @@
       "t2v",
       "i2v"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/nvidia/Cosmos3-Super.yaml"
   },
   {
@@ -519,6 +827,11 @@
     "tasks": [
       "i2v"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/nvidia/Cosmos3-Super-Image2Video.yaml"
   },
   {
@@ -530,6 +843,11 @@
     "tasks": [
       "Text-to-image"
     ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [],
     "source": "recipes/models/nvidia/Cosmos3-Super-Text2Image.yaml"
   },
   {
@@ -545,6 +863,14 @@
       "Ref2VA - Image",
       "Ref2VA - Image + Audio",
       "Ref2VA - Video / Mixed"
+    ],
+    "backends": [],
+    "memory_kind": "dedicated",
+    "hardware": [],
+    "brand": "",
+    "tuned_for": [
+      "cuda",
+      "rocm"
     ],
     "source": "recipes/models/MiniMaxAI/MiniMax-H3.yaml"
   }

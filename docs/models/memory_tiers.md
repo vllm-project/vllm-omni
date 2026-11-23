@@ -13,6 +13,14 @@ for your device before downloading weights or starting servers.
     minimum is **not yet measured**, not unsupported. Tiers without a
     documented recipe have no evidence either way.
 
+!!! warning "Memory is only one of the gates"
+    A documented minimum is a capacity bound on dedicated device memory. It
+    does not say a model runs on your platform: `Backends` is `not declared`
+    unless the recipe names its supported hardware, and `Requires` lists the
+    cards a variant is restricted to. `vllm-omni doctor` counts a variant as
+    compatible only when the device's backend matches a declared backend and
+    any listed hardware includes the card.
+
 ## Coverage
 
 - 47 variants of 40 models declare a minimum device memory.
@@ -32,9 +40,9 @@ Each variant appears under the first tier whose memory it fits.
 
 3 variants documented at or below this tier.
 
-- `OpenMOSS-Team/MOSS-TTS-Nano` (default, needs 6 GiB, bf16) - Text → Speech
-- `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (base-0.6b, needs 8 GiB, bf16) - Text → Speech
-- `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` (customvoice-0.6b, needs 8 GiB, bf16) - Text → Speech
+- `OpenMOSS-Team/MOSS-TTS-Nano` (default, needs 6 GiB, bf16, not declared) - Text → Speech
+- `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (base-0.6b, needs 8 GiB, bf16, not declared) - Text → Speech
+- `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` (customvoice-0.6b, needs 8 GiB, bf16, not declared) - Text → Speech
 
 ### 12 GiB
 
@@ -44,79 +52,79 @@ No variant documents a minimum in this band; 3 already fit at 8 GiB or below.
 
 11 variants documented at or below this tier; 8 first fit here.
 
-- `black-forest-labs/flux-3-image-klein` (nvfp4, needs 13 GiB, nvfp4) - Text-to-image, Image-to-image
-- `MiniMaxAI/MiniMax-H3-Image` (dlo, needs 16 GiB, bf16) - Text-to-image, Image-to-image
-- `OpenMOSS-Team/MOSS-TTS-Realtime` (default, needs 16 GiB, bf16) - Text → Speech
-- `OpenMOSS-Team/MOSS-VoiceGenerator` (default, needs 16 GiB, bf16) - Text → Speech
-- `Qwen/Qwen3-TTS-12Hz-1.7B-Base` (base-1.7b, needs 16 GiB, bf16) - Text → Speech
-- `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` (default, needs 16 GiB, bf16) - Text → Speech
-- `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` (voicedesign-1.7b, needs 16 GiB, bf16) - Text → Speech
-- `inclusionAI/Ming-omni-tts-0.5B` (default, needs 16 GiB, bf16) - Text → Speech
+- `black-forest-labs/flux-3-image-klein` (nvfp4, needs 13 GiB, nvfp4, cuda) - Text-to-image, Image-to-image
+- `MiniMaxAI/MiniMax-H3-Image` (dlo, needs 16 GiB, bf16, not declared) - Text-to-image, Image-to-image
+- `OpenMOSS-Team/MOSS-TTS-Realtime` (default, needs 16 GiB, bf16, not declared) - Text → Speech
+- `OpenMOSS-Team/MOSS-VoiceGenerator` (default, needs 16 GiB, bf16, not declared) - Text → Speech
+- `Qwen/Qwen3-TTS-12Hz-1.7B-Base` (base-1.7b, needs 16 GiB, bf16, not declared) - Text → Speech
+- `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` (default, needs 16 GiB, bf16, not declared) - Text → Speech
+- `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` (voicedesign-1.7b, needs 16 GiB, bf16, not declared) - Text → Speech
+- `inclusionAI/Ming-omni-tts-0.5B` (default, needs 16 GiB, bf16, not declared) - Text → Speech
 
 ### 24 GiB
 
 22 variants documented at or below this tier; 11 first fit here.
 
-- `black-forest-labs/flux-3-image-klein` (fp8r, needs 17 GiB, fp8) - Text-to-image, Image-to-image
-- `stabilityai/stable-audio-open-1.0` (default, needs 19 GiB, bf16) - Text-to-audio
-- `Qwen/Qwen-Image` (fp8, needs 24 GiB, fp8) - Text-to-image
-- `Qwen/Qwen-Image` (int8, needs 24 GiB, int8) - Text-to-image
-- `black-forest-labs/flux-3-image-klein` (default, needs 24 GiB, bf16) - Text-to-image, Image-to-image
-- `bosonai/higgs-audio-v3-tts-4b` (default, needs 24 GiB, bf16) - Text → Speech
-- `mistralai/Voxtral-4B-TTS-2603` (default, needs 24 GiB, bf16) - Text → Speech
-- `openbmb/VoxCPM2` (default, needs 24 GiB, bf16) - Text → Speech
-- `stabilityai/stable-diffusion-3.5-large` (large, needs 24 GiB, bf16) - Text-to-image
-- `stabilityai/stable-diffusion-3.5-large-turbo` (large_turbo, needs 24 GiB, bf16) - Text-to-image
-- `zai-org/GLM-TTS` (default, needs 24 GiB, bf16) - Text → Speech
+- `black-forest-labs/flux-3-image-klein` (fp8r, needs 17 GiB, fp8, cuda) - Text-to-image, Image-to-image
+- `stabilityai/stable-audio-open-1.0` (default, needs 19 GiB, bf16, not declared) - Text-to-audio
+- `Qwen/Qwen-Image` (fp8, needs 24 GiB, fp8, not declared) - Text-to-image
+- `Qwen/Qwen-Image` (int8, needs 24 GiB, int8, not declared) - Text-to-image
+- `black-forest-labs/flux-3-image-klein` (default, needs 24 GiB, bf16, cuda) - Text-to-image, Image-to-image
+- `bosonai/higgs-audio-v3-tts-4b` (default, needs 24 GiB, bf16, not declared) - Text → Speech
+- `mistralai/Voxtral-4B-TTS-2603` (default, needs 24 GiB, bf16, not declared) - Text → Speech
+- `openbmb/VoxCPM2` (default, needs 24 GiB, bf16, not declared) - Text → Speech
+- `stabilityai/stable-diffusion-3.5-large` (large, needs 24 GiB, bf16, not declared) - Text-to-image
+- `stabilityai/stable-diffusion-3.5-large-turbo` (large_turbo, needs 24 GiB, bf16, not declared) - Text-to-image
+- `zai-org/GLM-TTS` (default, needs 24 GiB, bf16, not declared) - Text → Speech
 
 ## All documented minimums
 
-| Min memory (GiB) | Model | Variant | Precision | Tasks | Source |
-| --- | --- | --- | --- | --- | --- |
-| 6 | `OpenMOSS-Team/MOSS-TTS-Nano` | default | bf16 | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml> |
-| 8 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | base-0.6b | bf16 | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
-| 8 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | customvoice-0.6b | bf16 | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
-| 13 | `black-forest-labs/flux-3-image-klein` | nvfp4 | nvfp4 | Text-to-image, Image-to-image | <gh-file:recipes/models/black-forest-labs/flux-3-image-klein.yaml> |
-| 16 | `MiniMaxAI/MiniMax-H3-Image` | dlo | bf16 | Text-to-image, Image-to-image | <gh-file:recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml> |
-| 16 | `OpenMOSS-Team/MOSS-TTS-Realtime` | default | bf16 | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTS-Realtime.yaml> |
-| 16 | `OpenMOSS-Team/MOSS-VoiceGenerator` | default | bf16 | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-VoiceGenerator.yaml> |
-| 16 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | base-1.7b | bf16 | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
-| 16 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | default | bf16 | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
-| 16 | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | voicedesign-1.7b | bf16 | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
-| 16 | `inclusionAI/Ming-omni-tts-0.5B` | default | bf16 | Text → Speech | <gh-file:recipes/models/inclusionAI/Ming-omni-tts-0.5B.yaml> |
-| 17 | `black-forest-labs/flux-3-image-klein` | fp8r | fp8 | Text-to-image, Image-to-image | <gh-file:recipes/models/black-forest-labs/flux-3-image-klein.yaml> |
-| 19 | `stabilityai/stable-audio-open-1.0` | default | bf16 | Text-to-audio | <gh-file:recipes/models/stabilityai/stable-audio-open-1.0.yaml> |
-| 24 | `Qwen/Qwen-Image` | fp8 | fp8 | Text-to-image | <gh-file:recipes/models/Qwen/Qwen-Image.yaml> |
-| 24 | `Qwen/Qwen-Image` | int8 | int8 | Text-to-image | <gh-file:recipes/models/Qwen/Qwen-Image.yaml> |
-| 24 | `black-forest-labs/flux-3-image-klein` | default | bf16 | Text-to-image, Image-to-image | <gh-file:recipes/models/black-forest-labs/flux-3-image-klein.yaml> |
-| 24 | `bosonai/higgs-audio-v3-tts-4b` | default | bf16 | Text → Speech | <gh-file:recipes/models/bosonai/higgs-audio-v3-tts-4b.yaml> |
-| 24 | `mistralai/Voxtral-4B-TTS-2603` | default | bf16 | Text → Speech | <gh-file:recipes/models/mistralai/Voxtral-4B-TTS-2603.yaml> |
-| 24 | `openbmb/VoxCPM2` | default | bf16 | Text → Speech | <gh-file:recipes/models/openbmb/VoxCPM2.yaml> |
-| 24 | `stabilityai/stable-diffusion-3.5-large` | large | bf16 | Text-to-image | <gh-file:recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml> |
-| 24 | `stabilityai/stable-diffusion-3.5-large-turbo` | large_turbo | bf16 | Text-to-image | <gh-file:recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml> |
-| 24 | `zai-org/GLM-TTS` | default | bf16 | Text → Speech | <gh-file:recipes/models/zai-org/GLM-TTS.yaml> |
-| 32 | `OpenMOSS-Team/MOSS-SoundEffect` | default | bf16 | Text → Sound | <gh-file:recipes/models/OpenMOSS-Team/MOSS-SoundEffect.yaml> |
-| 32 | `OpenMOSS-Team/MOSS-TTS` | default | bf16 | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTS.yaml> |
-| 32 | `OpenMOSS-Team/MOSS-TTSD-v1.0` | default | bf16 | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTSD-v1.0.yaml> |
-| 33 | `OpenMOSS-Team/MOSS-Image-Base` | default | bf16 | Text-to-image | <gh-file:recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml> |
-| 33 | `OpenMOSS-Team/MOSS-Image-SFT` | sft | bf16 | Text-to-image | <gh-file:recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml> |
-| 36 | `meituan-longcat/LongCat-Image-Edit` | default | bf16 | Image-to-image | <gh-file:recipes/models/meituan-longcat/LongCat-Image-Edit.yaml> |
-| 38 | `zai-org/GLM-Image` | default | bf16 | Text-to-image, Image-to-image | <gh-file:recipes/models/zai-org/GLM-Image.yaml> |
-| 39 | `nvidia/Cosmos3-Nano` | default | bf16 | t2v, i2v | <gh-file:recipes/models/nvidia/Cosmos3-Nano.yaml> |
-| 40 | `Qwen/Qwen-Image-2.1` | default | bf16 | Text-to-image, Image-to-image | <gh-file:recipes/models/Qwen/Qwen-Image-2.1.yaml> |
-| 40 | `Qwen/Qwen-Image-2.1` | fp8 | fp8 | Text-to-image, Image-to-image | <gh-file:recipes/models/Qwen/Qwen-Image-2.1.yaml> |
-| 44 | `stabilityai/stable-diffusion-3.5-medium` | default | bf16 | Text-to-image | <gh-file:recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml> |
-| 48 | `Qwen/Qwen-Image` | default | bf16 | Text-to-image | <gh-file:recipes/models/Qwen/Qwen-Image.yaml> |
-| 48 | `fishaudio/drama-3` | default | fp8 | Text → Speech | <gh-file:recipes/models/fishaudio/drama-3.yaml> |
-| 48 | `fishaudio/s2-pro` | default | bf16 | Text → Speech | <gh-file:recipes/models/fishaudio/s2-pro.yaml> |
-| 61 | `Lightricks/LTX-2.5-Diffusers` | fp8 | fp8 | Full one-stage T2V, Full one-stage I2V, Distilled one-stage T2V, Distilled one-stage I2V, Distilled two-stage T2V, Distilled two-stage I2V, Full two-stage T2V, Full two-stage I2V | <gh-file:recipes/models/Lightricks/LTX-2.5-Diffusers.yaml> |
-| 80 | `Lightricks/LTX-2.5-Diffusers` | default | bf16 | Full one-stage T2V, Full one-stage I2V, Distilled one-stage T2V, Distilled one-stage I2V, Distilled two-stage T2V, Distilled two-stage I2V, Full two-stage T2V, Full two-stage I2V | <gh-file:recipes/models/Lightricks/LTX-2.5-Diffusers.yaml> |
-| 80 | `adventists-ai/Sophon-Realtime-32B-Tag` | default | fp8 | Speech → Speech (full duplex) | <gh-file:recipes/models/adventists-ai/Sophon-Realtime-32B-Tag.yaml> |
-| 96 | `IndexTeam/IndexTTS-2.5` | default | bf16 | Text → Speech | <gh-file:recipes/models/IndexTeam/IndexTTS-2.5.yaml> |
-| 108 | `IFM/PAN2` | default | bf16 | t2v, i2v | <gh-file:recipes/models/IFM/PAN2.yaml> |
-| 152 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | default | bf16 | t2v, i2v, ti2v | <gh-file:recipes/models/Wan-AI/Wan2.2-T2V-A14B-Diffusers.yaml> |
-| 153 | `MiniMaxAI/MiniMax-H3-Image` | default | bf16 | Text-to-image, Image-to-image | <gh-file:recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml> |
-| 154 | `nvidia/Cosmos3-Super` | default | bf16 | t2v, i2v | <gh-file:recipes/models/nvidia/Cosmos3-Super.yaml> |
-| 154 | `nvidia/Cosmos3-Super-Image2Video` | default | bf16 | i2v | <gh-file:recipes/models/nvidia/Cosmos3-Super-Image2Video.yaml> |
-| 154 | `nvidia/Cosmos3-Super-Text2Image` | default | bf16 | Text-to-image | <gh-file:recipes/models/nvidia/Cosmos3-Super-Text2Image.yaml> |
-| 202 | `MiniMaxAI/MiniMax-H3` | default | bf16 | T2VA - Text, FL2VA - First Frame, FL2VA - First + Last, Ref2VA - Image, Ref2VA - Image + Audio, Ref2VA - Video / Mixed | <gh-file:recipes/models/MiniMaxAI/MiniMax-H3.yaml> |
+| Min memory (GiB) | Model | Variant | Precision | Backends | Requires | Tasks | Source |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 6 | `OpenMOSS-Team/MOSS-TTS-Nano` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTS-Nano.yaml> |
+| 8 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | base-0.6b | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
+| 8 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | customvoice-0.6b | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
+| 13 | `black-forest-labs/flux-3-image-klein` | nvfp4 | nvfp4 | cuda | b200, gb200, b300, gb300, brand: NVIDIA | Text-to-image, Image-to-image | <gh-file:recipes/models/black-forest-labs/flux-3-image-klein.yaml> |
+| 16 | `MiniMaxAI/MiniMax-H3-Image` | dlo | bf16 | not declared | - | Text-to-image, Image-to-image | <gh-file:recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml> |
+| 16 | `OpenMOSS-Team/MOSS-TTS-Realtime` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTS-Realtime.yaml> |
+| 16 | `OpenMOSS-Team/MOSS-VoiceGenerator` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-VoiceGenerator.yaml> |
+| 16 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | base-1.7b | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
+| 16 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
+| 16 | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | voicedesign-1.7b | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.yaml> |
+| 16 | `inclusionAI/Ming-omni-tts-0.5B` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/inclusionAI/Ming-omni-tts-0.5B.yaml> |
+| 17 | `black-forest-labs/flux-3-image-klein` | fp8r | fp8 | cuda | h100, h200, b200, gb200, b300, gb300, brand: NVIDIA | Text-to-image, Image-to-image | <gh-file:recipes/models/black-forest-labs/flux-3-image-klein.yaml> |
+| 19 | `stabilityai/stable-audio-open-1.0` | default | bf16 | not declared | - | Text-to-audio | <gh-file:recipes/models/stabilityai/stable-audio-open-1.0.yaml> |
+| 24 | `Qwen/Qwen-Image` | fp8 | fp8 | not declared | - | Text-to-image | <gh-file:recipes/models/Qwen/Qwen-Image.yaml> |
+| 24 | `Qwen/Qwen-Image` | int8 | int8 | not declared | - | Text-to-image | <gh-file:recipes/models/Qwen/Qwen-Image.yaml> |
+| 24 | `black-forest-labs/flux-3-image-klein` | default | bf16 | cuda | h100, h200, b200, gb200, b300, gb300, rtx_pro_6000 | Text-to-image, Image-to-image | <gh-file:recipes/models/black-forest-labs/flux-3-image-klein.yaml> |
+| 24 | `bosonai/higgs-audio-v3-tts-4b` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/bosonai/higgs-audio-v3-tts-4b.yaml> |
+| 24 | `mistralai/Voxtral-4B-TTS-2603` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/mistralai/Voxtral-4B-TTS-2603.yaml> |
+| 24 | `openbmb/VoxCPM2` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/openbmb/VoxCPM2.yaml> |
+| 24 | `stabilityai/stable-diffusion-3.5-large` | large | bf16 | not declared | - | Text-to-image | <gh-file:recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml> |
+| 24 | `stabilityai/stable-diffusion-3.5-large-turbo` | large_turbo | bf16 | not declared | - | Text-to-image | <gh-file:recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml> |
+| 24 | `zai-org/GLM-TTS` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/zai-org/GLM-TTS.yaml> |
+| 32 | `OpenMOSS-Team/MOSS-SoundEffect` | default | bf16 | not declared | - | Text → Sound | <gh-file:recipes/models/OpenMOSS-Team/MOSS-SoundEffect.yaml> |
+| 32 | `OpenMOSS-Team/MOSS-TTS` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTS.yaml> |
+| 32 | `OpenMOSS-Team/MOSS-TTSD-v1.0` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/OpenMOSS-Team/MOSS-TTSD-v1.0.yaml> |
+| 33 | `OpenMOSS-Team/MOSS-Image-Base` | default | bf16 | cuda | h100, h200, b200, gb200, b300, gb300, rtx_pro_6000, rtx_pro_6000_8x | Text-to-image | <gh-file:recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml> |
+| 33 | `OpenMOSS-Team/MOSS-Image-SFT` | sft | bf16 | cuda | h100, h200, b200, gb200, b300, gb300, rtx_pro_6000, rtx_pro_6000_8x | Text-to-image | <gh-file:recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml> |
+| 36 | `meituan-longcat/LongCat-Image-Edit` | default | bf16 | not declared | - | Image-to-image | <gh-file:recipes/models/meituan-longcat/LongCat-Image-Edit.yaml> |
+| 38 | `zai-org/GLM-Image` | default | bf16 | not declared | - | Text-to-image, Image-to-image | <gh-file:recipes/models/zai-org/GLM-Image.yaml> |
+| 39 | `nvidia/Cosmos3-Nano` | default | bf16 | not declared | - | t2v, i2v | <gh-file:recipes/models/nvidia/Cosmos3-Nano.yaml> |
+| 40 | `Qwen/Qwen-Image-2.1` | default | bf16 | not declared | - | Text-to-image, Image-to-image | <gh-file:recipes/models/Qwen/Qwen-Image-2.1.yaml> |
+| 40 | `Qwen/Qwen-Image-2.1` | fp8 | fp8 | not declared | - | Text-to-image, Image-to-image | <gh-file:recipes/models/Qwen/Qwen-Image-2.1.yaml> |
+| 44 | `stabilityai/stable-diffusion-3.5-medium` | default | bf16 | not declared | - | Text-to-image | <gh-file:recipes/models/stabilityai/stable-diffusion-3.5-medium.yaml> |
+| 48 | `Qwen/Qwen-Image` | default | bf16 | not declared | - | Text-to-image | <gh-file:recipes/models/Qwen/Qwen-Image.yaml> |
+| 48 | `fishaudio/drama-3` | default | fp8 | not declared | - | Text → Speech | <gh-file:recipes/models/fishaudio/drama-3.yaml> |
+| 48 | `fishaudio/s2-pro` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/fishaudio/s2-pro.yaml> |
+| 61 | `Lightricks/LTX-2.5-Diffusers` | fp8 | fp8 | cuda | h100, h200, b200, gb200, b300, gb300, dgx_spark_gb10, rtx_pro_5000, rtx_pro_6000, brand: NVIDIA | Full one-stage T2V, Full one-stage I2V, Distilled one-stage T2V, Distilled one-stage I2V, Distilled two-stage T2V, Distilled two-stage I2V, Full two-stage T2V, Full two-stage I2V | <gh-file:recipes/models/Lightricks/LTX-2.5-Diffusers.yaml> |
+| 80 | `Lightricks/LTX-2.5-Diffusers` | default | bf16 | cuda, rocm | h100, h200, b200, gb200, b300, gb300, rtx_pro_6000, mi300x, mi325x, mi355x | Full one-stage T2V, Full one-stage I2V, Distilled one-stage T2V, Distilled one-stage I2V, Distilled two-stage T2V, Distilled two-stage I2V, Full two-stage T2V, Full two-stage I2V | <gh-file:recipes/models/Lightricks/LTX-2.5-Diffusers.yaml> |
+| 80 | `adventists-ai/Sophon-Realtime-32B-Tag` | default | fp8 | not declared | - | Speech → Speech (full duplex) | <gh-file:recipes/models/adventists-ai/Sophon-Realtime-32B-Tag.yaml> |
+| 96 | `IndexTeam/IndexTTS-2.5` | default | bf16 | not declared | - | Text → Speech | <gh-file:recipes/models/IndexTeam/IndexTTS-2.5.yaml> |
+| 108 | `IFM/PAN2` | default | bf16 | not declared | - | t2v, i2v | <gh-file:recipes/models/IFM/PAN2.yaml> |
+| 152 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | default | bf16 | not declared | - | t2v, i2v, ti2v | <gh-file:recipes/models/Wan-AI/Wan2.2-T2V-A14B-Diffusers.yaml> |
+| 153 | `MiniMaxAI/MiniMax-H3-Image` | default | bf16 | not declared | - | Text-to-image, Image-to-image | <gh-file:recipes/models/MiniMaxAI/MiniMax-H3-Image.yaml> |
+| 154 | `nvidia/Cosmos3-Super` | default | bf16 | not declared | - | t2v, i2v | <gh-file:recipes/models/nvidia/Cosmos3-Super.yaml> |
+| 154 | `nvidia/Cosmos3-Super-Image2Video` | default | bf16 | not declared | - | i2v | <gh-file:recipes/models/nvidia/Cosmos3-Super-Image2Video.yaml> |
+| 154 | `nvidia/Cosmos3-Super-Text2Image` | default | bf16 | not declared | - | Text-to-image | <gh-file:recipes/models/nvidia/Cosmos3-Super-Text2Image.yaml> |
+| 202 | `MiniMaxAI/MiniMax-H3` | default | bf16 | not declared | - | T2VA - Text, FL2VA - First Frame, FL2VA - First + Last, Ref2VA - Image, Ref2VA - Image + Audio, Ref2VA - Video / Mixed | <gh-file:recipes/models/MiniMaxAI/MiniMax-H3.yaml> |
