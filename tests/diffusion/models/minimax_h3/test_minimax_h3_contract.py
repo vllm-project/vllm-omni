@@ -1053,6 +1053,100 @@ def test_pipeline_allows_encoder_only_lifecycle_without_dit_or_vae(monkeypatch, 
     assert [source.prefix for source in pipeline.weights_sources] == ["text_encoder."]
 
 
+def test_encoder_only_pipeline_rejects_media_requests_and_serves_text_only(monkeypatch, tmp_path):
+    """Media conditioning fails closed at request time without a VAE encoder.
+
+    With ``vae_encoder=false`` the VAEs stay unconstructed, so a request that
+    carries media inputs must surface as OmniClientError instead of a bare
+    ``AttributeError`` on the ``None`` VAE (RFC #10943 Phase 2), while
+    text-only requests still encode to an empty media conditioning.
+    """
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_SHAPE_PLANNER
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+        MiniMaxH3EncoderMediaInput,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    for component in ("transformer", "video_vae", "audio_vae"):
+        (tmp_path / "FL2VA" / component).mkdir()
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeDiT(FakeModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    def component_factory(name):
+        def create(path, *args, **kwargs):
+            return FakeModule()
+
+        return create
+
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3DiTModel", FakeDiT)
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3Qwen3VLEncoder", component_factory("text_encoder"))
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen2TokenizerFast, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen3VLProcessor, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3VideoVAE", component_factory("video_vae"))
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3AudioVAE", component_factory("audio_vae"))
+    monkeypatch.setattr(pipeline_minimax_h3, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        pipeline_minimax_h3,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+    )
+    od_config.model_loaded["transformer"] = False
+    od_config.model_loaded["text_encoder"] = True
+    od_config.model_loaded["vae_encoder"] = False
+    od_config.model_loaded["vae_decoder"] = False
+
+    pipeline = pipeline_minimax_h3.MiniMaxH3Pipeline(od_config=od_config)
+    assert pipeline.video_vae is None
+
+    num_frames = 124
+    shape = dict(
+        task="t2va",
+        height=768,
+        width=1344,
+        num_frames=num_frames,
+        latent_t=MINIMAX_H3_SHAPE_PLANNER.video_latent_t(num_frames),
+        audio_t=MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(num_frames / 24),
+    )
+    media_request = MiniMaxH3EncoderMediaInput(
+        images=(torch.zeros(768, 1344, 3, dtype=torch.uint8),),
+        **shape,
+    )
+    with pytest.raises(OmniClientError, match="VAE encoder"):
+        pipeline._encode_local_media(media_request)
+
+    conditioning = pipeline._encode_local_media(MiniMaxH3EncoderMediaInput(**shape))
+    assert conditioning.visual_condition is None
+    assert conditioning.audio_condition is None
+    assert conditioning.ref_blocks == ()
+
+
 def test_pipeline_still_rejects_vae_decoder_without_vae_encoder(monkeypatch, tmp_path):
     """The remaining VAE guard must still reject decoder-only requests."""
     from vllm_omni.diffusion.data import (

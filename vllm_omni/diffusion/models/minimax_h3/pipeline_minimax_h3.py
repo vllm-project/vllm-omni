@@ -3256,7 +3256,12 @@ class MiniMaxH3Pipeline(
         # host-side over the gloo group like every other object collective
         # here (issue #10645). The tensor broadcasts keep the device group.
         group, rank, world_size = _dit_cpu_rank_world()
-        distributed_video = self.video_vae.is_distributed_enabled()
+        # Media encoding needs the VAE encoders; a decode-only or absent VAE
+        # cannot join the codec collectives. Requests that carry media inputs
+        # are rejected below with OmniClientError (RFC #10943 Phase 2) instead
+        # of dying on a None/decode-only VAE attribute; text-only requests
+        # encode to an empty conditioning without touching any VAE.
+        distributed_video = self.load_vae_encoder and self.video_vae.is_distributed_enabled()
         if distributed_video:
             media = self._distribute_media_inputs(media)
         conditioning = None
@@ -3264,6 +3269,11 @@ class MiniMaxH3Pipeline(
         try:
             if rank == 0 or distributed_video:
                 assert media is not None
+                if not self.load_vae_encoder and media.requires_vae_encoder:
+                    raise OmniClientError(
+                        "MiniMax H3 media conditioning requires a local VAE encoder "
+                        "(enable model_loaded.vae_encoder or pre-encode the media)"
+                    )
                 conditioning = encode_media(
                     media,
                     video_vae=self.video_vae,
