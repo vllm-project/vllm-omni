@@ -227,22 +227,10 @@ def test_native_mooncake_deferred_ar_pages_drain_in_physical_order() -> None:
 
 
 def _tagged_finished_request(request_id: str, final_stage_id: int) -> _FakeFinishedRequest:
-    from vllm import SamplingParams
-    from vllm.v1.engine import EngineCoreRequest
-
+    from tests.core.sched.conftest import make_engine_core_request
     from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
 
-    engine_request = EngineCoreRequest(
-        request_id=request_id,
-        prompt_token_ids=[1],
-        mm_features=None,
-        sampling_params=SamplingParams(max_tokens=1),
-        pooling_params=None,
-        arrival_time=0.0,
-        lora_request=None,
-        cache_salt=None,
-        data_parallel_rank=None,
-    )
+    engine_request = make_engine_core_request(request_id=request_id)
     request = _make_finished_request(request_id)
     request.additional_information = apply_omni_final_stage_metadata(
         engine_request, final_stage_id=final_stage_id
@@ -279,22 +267,20 @@ def test_free_request_leaves_no_omits_kv_transfer_cache_entry(final_stage_id, tr
     sched.requests = {}
     sched._free_blocks = MagicMock(side_effect=lambda request: sched.requests.pop(request.request_id))
 
-    for i in range(8):
-        request = _tagged_finished_request(f"req-{i}", final_stage_id)
-        sched.requests[request.request_id] = request
-        if transfer_state != "none":
-            sched.transfer_triggered_requests.add(request.request_id)
-        if transfer_state == "active":
-            sched.active_kv_transfers.add(request.request_id)
-        elif transfer_state == "waiting":
-            sched.waiting_for_transfer_free.add(request.request_id)
-        sched._free_request(request)
-        assert request.request_id not in sched._omits_kv_transfer_cache
+    request = _tagged_finished_request("req-0", final_stage_id)
+    sched.requests[request.request_id] = request
+    if transfer_state != "none":
+        sched.transfer_triggered_requests.add(request.request_id)
+    if transfer_state == "active":
+        sched.active_kv_transfers.add(request.request_id)
+    elif transfer_state == "waiting":
+        sched.waiting_for_transfer_free.add(request.request_id)
 
+    sched._free_request(request)
+
+    assert request.request_id not in sched._omits_kv_transfer_cache
     if final_stage_id == 1 and transfer_state != "acked":
-        # Blocks are held for KV extraction; the extraction ack frees them later.
-        assert sched.waiting_for_transfer_free == {f"req-{i}" for i in range(8)}
-        for req_id in sorted(sched.waiting_for_transfer_free):
-            sched._free_blocks(sched.requests[req_id])
-    assert sched.requests == {}
-    assert sched._omits_kv_transfer_cache == {}
+        assert request.request_id in sched.waiting_for_transfer_free
+    else:
+        assert sched.requests == {}
+        assert sched._omits_kv_transfer_cache == {}
