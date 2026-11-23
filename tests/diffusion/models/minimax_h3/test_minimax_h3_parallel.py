@@ -185,6 +185,26 @@ def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch, device_name
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(("rows", "use_eagle"), [(99_864, True), (99_865, False)])
+def test_project_qkv_eagle_numel_limit(monkeypatch, rows, use_eagle):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+
+    attention, _, _ = _qkv_inputs()
+    attention.num_heads = attention.num_kv_heads = 56
+    packed = torch.empty(rows, 3 * attention.num_heads * attention.head_dim, device="meta", dtype=torch.bfloat16)
+    table = packed.new_empty((rows, attention.rot_dim))
+    _mock_npu_qkv(monkeypatch, attention, "A2")
+    eagle = Mock(return_value=(None, None, None))
+    fallback = Mock(return_value=(None, None))
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", SimpleNamespace(eagle_split_norm_rope_concat=eagle))
+    monkeypatch.setattr(blocks, "fused_qk_norm_rope", fallback)
+
+    attention._project_qkv(packed, table)
+
+    assert eagle.called == use_eagle
+    assert fallback.called != use_eagle
+
+
 @pytest.mark.parametrize(
     ("device_name", "has_rope", "expected_calls"),
     [

@@ -501,7 +501,12 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
         q_raw, k_raw = q, k
-        if qkv.device.type == "npu" and rope_table is not None and _is_ascend_device_type("A2", "A5"):
+        if (
+            qkv.device.type == "npu"
+            and rope_table is not None
+            and 0 < qkv.numel() <= torch.iinfo(torch.int32).max
+            and _is_ascend_device_type("A2", "A5")
+        ):
             try:
                 from mindiesd.fused_ops import eagle_split_norm_rope_concat
 
