@@ -209,7 +209,7 @@ if HAS_TRITON:
                 if frame >= keep_start:
                     tl.store(keep_ptr + keep_row_offsets[:, None] + in_cols[None, :], values, mask=interior)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["height", "out_height"])
     def _cat_pad_pixels_kernel(
         x_ptr,
         cache_ptr,
@@ -403,7 +403,7 @@ if HAS_TRITON:
             value = main + source.to(tl.float32)
             tl.store(out_ptr + offsets, value.to(dtype), mask=mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["out_height"])
     def _dup_up3d_add_pixels_kernel(
         main_ptr,
         source_ptr,

@@ -438,6 +438,24 @@ def test_padded_upsample_reuses_kernel_across_resolutions(monkeypatch):
 
 
 @torch.inference_mode()
+def test_channels_last_kernels_reuse_binary_across_shard_heights(mocker):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
+
+    cat_pad = mocker.spy(dm._cat_pad_pixels_kernel, "run")
+    residual = mocker.spy(dm._dup_up3d_add_pixels_kernel, "run")
+    for height in (16, 17):
+        x = torch.randn(1, 32, 2, height, 32, device="cuda", dtype=torch.bfloat16)
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+        assert dm.cat_pad_5d(x, None, (1, 1, 1, 1, 0, 0)) is not None
+        assert dm.dup_up3d_add(x, x, 1, 1, 1, False) is not None
+        if height == 16:
+            first_cat_pad, first_residual = cat_pad.spy_return, residual.spy_return
+    assert cat_pad.call_count == residual.call_count == 2
+    assert first_cat_pad is not None and cat_pad.spy_return is first_cat_pad
+    assert first_residual is not None and residual.spy_return is first_residual
+
+
+@torch.inference_mode()
 def test_registry_preserves_lingbot_streaming_spatial_decoder(mocker):
     from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
     from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.entry import WAN_FAMILY_FAST_PATH
