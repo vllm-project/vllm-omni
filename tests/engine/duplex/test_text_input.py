@@ -38,6 +38,15 @@ def text_tokenizer(monkeypatch):
     _stub_tokenizer(monkeypatch)
 
 
+def _text_output(request_id: str, *, empty: bool = False):
+    output = listen_output(request_id)
+    output.finished = False
+    output.outputs[0].token_ids = [151718] if empty else [42]
+    output.multimodal_output.update(duplex_text_input=torch.tensor(True))
+    output.multimodal_output["meta.chunk_eos_token_id"] = 151718
+    return output
+
+
 @pytest.mark.asyncio
 async def test_text_fragments_prefill_in_order_with_audio_without_flushing_partial_pcm():
     h = await open_harness()
@@ -89,12 +98,14 @@ async def test_unforced_text_continues_after_an_empty_model_unit(buffered_sample
         empty.outputs[0].cumulative_token_ids = [listen_id, listen_id, 151718]
         empty.outputs[0].stop_reason = 151718
         empty.multimodal_output["meta.chunk_eos_token_id"] = 151718
+        empty.multimodal_output["duplex_text_input"] = True
         events = await h.deliver_and_settle(
             empty,
             stage_id=0,
             segment_finished=True,
             segment_token_ids=[151718],
             segment_output_metadata=empty.multimodal_output,
+            model_turn_id=0,
         )
         assert "error" not in types(events)
         assert len(h.port.submissions) == 3
@@ -137,6 +148,7 @@ async def test_text_continuation_rearms_after_queued_audio_stays_partial(monkeyp
     try:
         await h.run(append_audio(samples=4000))
         await h.run(commands.AppendText(text="Answer now."))
+        await h.deliver_and_settle(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=0)
         response_id = h.session.active_response_id
         original = h.runner.control.run_turn_detection
 
@@ -175,6 +187,7 @@ async def test_text_continuation_does_not_skip_a_complete_buffered_audio_unit():
     try:
         await h.run(append_audio(samples=32000))
         await h.run(commands.AppendText(text="Answer now."))
+        await h.deliver_and_settle(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=0)
         assert h.session.pending_input_bytes == 16000 * 4
         await h.runner.model.maybe_continue_response(
             expected_epoch=h.session.epoch, expected_response_id=h.session.active_response_id
@@ -192,6 +205,7 @@ async def test_text_continuation_exception_does_not_apply_to_a_later_audio_respo
     try:
         await h.run(append_audio(samples=8000))
         await h.run(commands.AppendText(text="Answer now."))
+        await h.deliver_and_settle(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=0)
         text_response_id = h.session.active_response_id
         await h.deliver_and_settle(
             tts_output(h.stage0_request_id(), tts_is_last_chunk=True, turn_end=True, finished=True)
@@ -218,6 +232,125 @@ async def test_text_continuation_exception_does_not_apply_to_a_later_audio_respo
 
 
 @pytest.mark.asyncio
+async def test_text_reply_continues_when_appended_while_previous_talker_drains():
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), text="First reply"))
+        old_response_id = h.session.active_response_id
+        await h.run(append_audio(samples=8000))
+        await h.run(commands.AppendText(text="Second question."))
+        # Thinker has already handed off turn 0's EOS, but its Talker output
+        # still owns the active protocol response when this text is admitted.
+        assert h.runner._real_input_waiting()
+        assert h.deliver(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=1) is False
+        await h.settle()
+        assert h.session.active_response_id == old_response_id
+        assert h.runner._real_input_waiting()
+        await h.deliver_and_settle(
+            tts_output(
+                h.stage0_request_id(),
+                samples=48000,
+                text="First reply done",
+                turn_id=0,
+                tts_is_last_chunk=True,
+                turn_end=True,
+                finished=True,
+            )
+        )
+        await h.deliver_and_settle(
+            tts_output(
+                h.stage0_request_id(),
+                samples=72000,
+                text="Second reply",
+                turn_id=1,
+                tts_is_last_chunk=True,
+                finished=True,
+            )
+        )
+        assert h.session.active_response_id not in (None, old_response_id)
+        assert len(h.port.submissions) == 3
+        assert h.runner.model_state.continuation_units == 1
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 32000
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous_talker_finished", [False, True])
+async def test_empty_text_unit_opens_its_own_response_during_talker_overlap(previous_talker_finished):
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), text="First reply"))
+        old_response_id = h.session.active_response_id
+        await h.run(append_audio(samples=8000))
+        await h.run(commands.AppendText(text="Second question."))
+        if previous_talker_finished:
+            await h.deliver_and_settle(
+                tts_output(h.stage0_request_id(), tts_is_last_chunk=True, turn_end=True, finished=True)
+            )
+        events = await h.deliver_and_settle(
+            _text_output(h.stage0_request_id(), empty=True),
+            stage_id=0,
+            segment_finished=True,
+            model_turn_id=1,
+        )
+        assert "error" not in types(events)
+        assert "response.created" in types(events)
+        assert h.session.active_response_id not in (None, old_response_id)
+        assert h.session.active_response_turn_id == 1
+        assert len(h.port.submissions) == 3
+        assert h.runner.model_state.continuation_units == 1
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 32000
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_listen_without_unforced_text_preserves_the_draining_response():
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id()))
+        response_id = h.session.active_response_id
+        await h.run(append_audio(samples=8000))
+        # A forced text fragment does not release a reply, even when Thinker's
+        # bridge is already ahead of the response whose audio is still draining.
+        await h.run(commands.AppendText(text="More context.", force_listen=True))
+        output = listen_output(h.stage0_request_id())
+        output.multimodal_output["duplex_text_input"] = torch.tensor(False)
+        events = await h.deliver_and_settle(output, stage_id=0, segment_finished=True, model_turn_id=1)
+        assert h.session.active_response_id == response_id
+        assert "response.done" not in types(events)
+        assert h.runner._real_input_waiting()
+        assert h.runner.model_state.continuation_units == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_text_output_cannot_grant_continuation_in_a_new_epoch():
+    h = await open_harness()
+    try:
+        await h.run(commands.AppendText(text="First question."))
+        old_output = _text_output(h.stage0_request_id())
+        await h.deliver_and_settle(old_output, stage_id=0, model_turn_id=0)
+        await h.run(commands.BargeIn())
+        assert h.session.epoch == 1
+        await h.run(append_audio(samples=24000))
+        await h.deliver_and_settle(old_output, stage_id=0, model_turn_id=0, epoch=0)
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), epoch=1, tts_is_last_chunk=True, finished=True))
+        assert h.session.active_response_id is not None
+        assert len(h.port.submissions) == 2
+        assert h.runner.model_state.continuation_units == 0
+        assert h.session.pending_input_bytes == 32000
+        assert h.runner._real_input_waiting()
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("force_listen", [True, False])
 async def test_text_release_opens_response_after_listening(force_listen):
     h = await open_harness()
@@ -228,7 +361,8 @@ async def test_text_release_opens_response_after_listening(force_listen):
         state.current_turn_ended = True
         runtime = stage0_vision_runtime()
         kwargs = dict(text_token_ids=payload["text_token_ids"], force_listen=payload["force_listen"], epoch=0, seq=1)
-        runtime._stage_prefill_embeddings_only(state, None, **kwargs)
+        result = runtime._stage_prefill_embeddings_only(state, None, **kwargs)
+        assert result["text_input"] is not force_listen
         model = _policy_model_with_state(state)
         logits = torch.zeros(1, VOCAB)
         model.prepare_duplex_sampling(logits, None, rows=(_policy_row(payload),))

@@ -930,6 +930,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             metadata=metadata,
         )
 
+    def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
+        # Observe the text unit's actual model turn without consuming the
+        # Thinker output: speech still needs its normal Talker handoff.
+        return (
+            stage_id == 0
+            and _coerce_int(_multimodal_output(output, _first_completion(output)).get("duplex_text_input")) == 1
+        )
+
     # ---- session policy ----
 
     def create_session_state(self) -> MiniCPMO45ServingSessionState:

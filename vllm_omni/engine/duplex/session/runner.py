@@ -290,9 +290,6 @@ class DuplexSessionRunner:
         # too, even before it reaches the PCM buffer. Continuations must not
         # insert a synthetic frame ahead of that already-received audio.
         self._pending_input_appends = 0
-        # Only this response may continue past an incomplete microphone unit;
-        # a later audio-only response must retain the usual input priority.
-        self._text_response_id: str | None = None
         # Set when a continuation bails because of that counter, and replayed
         # only if the append then submits nothing (overlap drop / ack /
         # continue_output). A real submission clears it.
@@ -1194,8 +1191,6 @@ class DuplexSessionRunner:
                     final=False,
                     precreate_response=command.force_listen is not True,
                 )
-                if command.force_listen is not True:
-                    self._text_response_id = session.active_response_id
                 release = reservation.pop_all().close
                 task.add_done_callback(lambda _done: release())
         elif isinstance(command, Commit):
@@ -2154,7 +2149,7 @@ class DuplexSessionRunner:
         buffer = self.model_state.audio_buffer
         if self._pending_input_appends > 0 or buffer.has_reserved():
             return True
-        if self._text_response_id is not None and self._text_response_id == self.session.active_response_id:
+        if self.run.partial_input_continuation_turn == (self.session.epoch, self.session.active_response_turn_id):
             # Text can release a reply without an audio commit. Keep partial PCM
             # buffered and charged, but do not let it stall that reply forever.
             # Complete audio/vision units still precede generated silence.

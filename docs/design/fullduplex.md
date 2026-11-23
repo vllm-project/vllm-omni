@@ -54,14 +54,18 @@ them in sliding-window units. Repeated prefill of the same append identity
 reuses its embeddings. `force_listen` permits intermediate fragments to enter
 the KV cache without generating a reply; an unforced text unit opens the
 assistant turn once during prefill, since text has no microphone silence
-marking the end of input. The runner creates its response before submission;
+marking the end of input. When no response is active, the runner creates one before submission;
 an empty `<|chunk_eos|>` unit returns directly to the session to advance the
 normal continuation clock instead of waiting for nonexistent Talker output.
 For a response released by unforced text, incomplete buffered PCM does not
 block that clock. The PCM remains charged and unconsumed; queued appends,
 reserved input, and complete audio or vision units retain priority over
-generated silence. This exception belongs to that response ID and does not
-carry over to a later audio-only response. Disabling silence continuation or
+generated silence. Stage 0 confirms this exception for the epoch and model turn
+that consumed the text, using the bridge's turn snapshot before handoff. The
+active response at text admission may still belong to the previous Talker turn;
+it must not receive the new turn's continuation permission. An empty first unit
+also opens the new turn's response before continuing. The exception does not
+carry over to a later audio-only response or a new epoch. Disabling silence continuation or
 using the input clock still prevents synthetic units.
 The Talker handoff skips those completed control units in cumulative output
 before aligning the next speech unit's text and hidden states.

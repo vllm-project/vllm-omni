@@ -376,6 +376,8 @@ class DuplexDataPlaneContext:
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
+    # Producer turn captured at interception, when available (Stage0).
+    model_turn_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

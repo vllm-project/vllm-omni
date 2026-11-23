@@ -61,6 +61,9 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
         duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
 
     outputs: dict[str, Any] = {}
+    # Row-local snapshots replace the previous append's value, including when
+    # audio follows text on the same resumable scheduler request.
+    outputs["duplex_text_input"] = [info.get("text_input") is True for info in duplex_rows]
     prompt_rows = []
     for duplex_info in duplex_rows:
         prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")

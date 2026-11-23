@@ -629,6 +629,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
                 "stage0_window_replaced": window_result is not None,
+                "text_input": has_text and not force_listen,
             }
         )
         # Standalone VISION input can open a response without speech. Camera

@@ -168,6 +168,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         mm_output = dict(mm_output) if isinstance(mm_output, Mapping) else {}
 
         output_turn_id = output_turn_id_from_metadata(mm_output)
+        text_input = coerce_int(mm_output.get("duplex_text_input")) == 1
+        if text_input and context.model_turn_id is not None:
+            output_turn_id = context.model_turn_id
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
         stale_turn = expected_turn_id is not None and output_turn_id is not None and output_turn_id < expected_turn_id
@@ -197,10 +200,22 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                 listen_source=mm_output.get("listen_source") or "model_listen",
                 data_plane_request_id=request_id,
                 end_of_turn=False,
+                continue_with_partial_input=text_input,
             )
             if output_turn_id is not None:
                 listen_result["model_turn_id"] = output_turn_id
             yield listen_result
+            return
+
+        if text_input:
+            # Stage0 projection only records continuation ownership. Do not
+            # encode its hidden states or emit its text before Talker output.
+            yield runtime_result(
+                requires_stage_handoff=True,
+                data_plane_request_id=request_id,
+                model_turn_id=output_turn_id,
+                continue_with_partial_input=True,
+            )
             return
 
         raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
