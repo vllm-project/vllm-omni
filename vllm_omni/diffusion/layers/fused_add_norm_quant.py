@@ -70,6 +70,42 @@ if _FUSED_ADD_LN_MXFP8:
             x.new_empty((rows, x.shape[-1] // _MX_GROUP), dtype=torch.float8_e8m0fnu),
         )
 
+    # Two token segments with their own gate / weight / bias rows ([2, hidden] each): rows
+    # [0, seg) take row 0, rows [seg, end) row 1 (Wan S2V modulates its noisy tokens and its
+    # reference / motion tokens separately). One kernel call per non-empty segment on its
+    # contiguous row range of the caller's tensor, outputs concatenated in row order.
+    @torch.library.custom_op("vllm_omni::fused_add_layer_norm_mxfp8_2seg", mutates_args=("x",), device_types="xpu")
+    def _fused_add_layer_norm_mxfp8_2seg(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        gate: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        seg: int,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = x.shape[-1]
+        x2 = x.view(-1, hidden)
+        y2 = y.reshape(-1, hidden)
+        rows = x2.shape[0]
+        qs, ss = [], []
+        for i, (lo, hi) in enumerate(((0, seg), (seg, rows))):
+            if hi > lo:
+                q, s, _ = _KERNEL(x2[lo:hi], y2[lo:hi], gate[i], weight[i], bias[i], eps)
+                qs.append(q)
+                ss.append(s)
+        if len(qs) == 1:
+            return qs[0], ss[0]
+        return torch.cat(qs), torch.cat(ss)
+
+    @_fused_add_layer_norm_mxfp8_2seg.register_fake
+    def _(x, y, gate, weight, bias, seg, eps):
+        rows = x.numel() // x.shape[-1]
+        return (
+            x.new_empty((rows, x.shape[-1]), dtype=torch.float8_e4m3fn),
+            x.new_empty((rows, x.shape[-1] // _MX_GROUP), dtype=torch.float8_e8m0fnu),
+        )
+
 
 def _as_row_vector(t: torch.Tensor | None, hidden: int, like: torch.Tensor, fill: float) -> torch.Tensor | None:
     """[hidden] view of a broadcast modulation vector; None if it is not one."""
@@ -145,6 +181,79 @@ def fused_add_layernorm_quant(
     if getattr(next_linear, "mxfp8_block_major_a_scale", False):
         # The SYCL-TLA GEMM reads [K/32, M] storage directly and would otherwise
         # transpose-copy the row-major scales itself.
+        scales = scales.t().contiguous().t()
+    return x, QuantizedActivation(
+        data=q,
+        scale=scales,
+        orig_dtype=x.dtype,
+        orig_shape=x.shape,
+        quant_key=kMxfp8Dynamic,
+    )
+
+
+def _as_segment_rows(t: torch.Tensor | None, hidden: int, like: torch.Tensor, fill: float) -> torch.Tensor | None:
+    """[2, hidden] per-segment rows of a modulation tensor; None if it is neither one shared
+    [hidden] vector nor one [hidden] vector per segment."""
+    if t is None:
+        return torch.full((2, hidden), fill, dtype=like.dtype, device=like.device)
+    if t.numel() == hidden:
+        t = t.reshape(1, hidden).expand(2, hidden)
+    elif t.numel() == 2 * hidden:
+        t = t.reshape(2, hidden)
+    else:
+        return None
+    if t.dtype != like.dtype:
+        t = t.to(like.dtype)
+    return t.contiguous()
+
+
+def can_fuse_add_layernorm_quant_2seg(
+    next_linear: torch.nn.Module,
+    x: torch.Tensor,
+    *modulation: torch.Tensor | None,
+) -> bool:
+    """Whether ``fused_add_layernorm_quant_2seg`` will take the fused path.
+
+    ``x`` is one sequence ([1, tokens, hidden]); each modulation tensor is one [hidden]
+    vector or one per segment ([..., 2, hidden] with 2 * hidden elements).
+    """
+    if not can_fuse_add_layernorm_quant(next_linear, x) or x.dim() != 3 or x.shape[0] != 1:
+        return False
+    hidden = x.shape[-1]
+    return all(m is None or m.numel() in (hidden, 2 * hidden) for m in modulation)
+
+
+def fused_add_layernorm_quant_2seg(
+    next_linear: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    gate: torch.Tensor | None,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    seg: int,
+    eps: float,
+) -> "tuple[torch.Tensor, QuantizedActivation]":
+    """``fused_add_layernorm_quant`` with separate modulation for tokens ``[0, seg)`` and ``[seg, end)``.
+
+    ``gate``/``weight``/``bias`` hold the two segments' vectors ([..., 2, hidden]) or one
+    vector shared by both; None means 1, 1 and 0. ``x`` is updated in place. Only valid when
+    ``can_fuse_add_layernorm_quant_2seg`` returned True for the same arguments.
+    """
+    global _logged_active
+    hidden = x.shape[-1]
+    if not y.is_contiguous():
+        y = y.contiguous()
+    gate_v = _as_segment_rows(gate, hidden, x, 1.0)
+    weight_v = _as_segment_rows(weight, hidden, x, 1.0)
+    bias_v = _as_segment_rows(bias, hidden, x, 0.0)
+    if not _logged_active:
+        _logged_active = True
+        logger.info(
+            "fused residual add + LayerNorm + MXFP8 activation quantization active for %s",
+            type(next_linear).__name__,
+        )
+    q, scales = torch.ops.vllm_omni.fused_add_layer_norm_mxfp8_2seg(x, y, gate_v, weight_v, bias_v, seg, eps)
+    if getattr(next_linear, "mxfp8_block_major_a_scale", False):
         scales = scales.t().contiguous().t()
     return x, QuantizedActivation(
         data=q,
