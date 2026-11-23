@@ -1092,8 +1092,18 @@ class MiniMaxH3Pipeline(
             )
             if str(od_config.task_type or "auto").lower() == "auto":
                 self.partition = self._fasth3_checkpoint.partition
-            if control_path and self.partition != "fl2va":
-                raise ValueError("H3 control requires the FL2VA checkpoint partition")
+            if (
+                control_path
+                and self.partition != "fl2va"
+                and not isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
+            ):
+                raise ValueError("H3 control requires the FL2VA checkpoint partition or the FastH3 Omni checkpoint")
+            if (
+                control_path
+                and (model_root / self._fasth3_checkpoint.transformer_component / "nvfp4_weights.safetensors").is_file()
+            ):
+                # The packed NVFP4 DiT (FastH3 Omni QAD) is quantized without od_config.quantization_config.
+                raise ValueError("H3 control requires dense weights; this FastH3 checkpoint ships an NVFP4 DiT")
             self._fasth3_checkpoint.check_serving_contract(partition=self.partition, od_config=od_config)
             release = self._fasth3_checkpoint.release_metadata()
             if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec):
@@ -1616,6 +1626,10 @@ class MiniMaxH3Pipeline(
                 f"must be {num_steps} or omitted, got {int(requested_steps)}"
             )
         return sigma_schedule.base_schedule, num_steps
+
+    def _control_task(self) -> str:
+        """The task control requests use: Ref2VA on the FastH3 Omni checkpoint, T2VA otherwise."""
+        return "ref2va" if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec) else "t2va"
 
     def _base_schedule_for_task(self, task: str) -> DMD2SigmaSchedule | None:
         """Return the distilled schedule of the partition that serves ``task``."""
@@ -3516,11 +3530,20 @@ class MiniMaxH3Pipeline(
             turbo_spec=turbo_spec,
             native_spec=native_spec,
         )
-        if control is not None and task != "t2va":
-            raise OmniClientError("H3 control supports t2va only; reference/keyframe conditioning is unsupported")
+        if control is not None and task != self._control_task():
+            unsupported = "keyframes" if self._control_task() == "ref2va" else "references and keyframes"
+            raise OmniClientError(
+                f"H3 control on this checkpoint supports {self._control_task()} only; "
+                f"{unsupported} are unsupported with control"
+            )
         if control is not None and continuation is not None:
             raise OmniClientError(
                 "MiniMax H3 control does not support long-video continuation; use long_video_mode=full"
+            )
+        if control is not None and resolve_continuation_request(extra) is not None:
+            raise OmniClientError(
+                "MiniMax H3 control does not support continue_from: control rows describe the returned "
+                "frames, not the hidden overlap that guides the continuation"
             )
         if turbo_spec is not None:
             self._validate_turbo_sampling(sampling, turbo_spec)
@@ -4148,12 +4171,15 @@ class MiniMaxH3Pipeline(
         cache_backend = str(self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("none", "cache_dit"):
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
-        if self._fasth3 is not None or self._fasth3_checkpoint is not None:
-            raise OmniClientError("MiniMax H3 timeline guides require base H3 weights, not FastH3")
+        # The FastH3 Omni checkpoint takes guides on its pinned PDD grid. The fused FastH3 V2
+        # student and other distilled schedules stay rejected: they were not validated with guides.
+        fasth3_omni = isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
+        if self._fasth3 is not None or (self._fasth3_checkpoint is not None and not fasth3_omni):
+            raise OmniClientError("MiniMax H3 timeline guides require base H3 weights or FastH3 Omni")
         active_lora = bool(filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale))
         if turbo or native_lora or active_lora:
             raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
-        if self._sigma_schedule_for_request(sampling, task) is not None:
+        if not fasth3_omni and self._sigma_schedule_for_request(sampling, task) is not None:
             raise OmniClientError("MiniMax H3 timeline guides do not support distilled schedules")
 
     def _merge_timeline_guides(
