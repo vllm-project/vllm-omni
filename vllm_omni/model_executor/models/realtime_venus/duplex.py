@@ -62,7 +62,11 @@ class VenusDataPlane(MiniCPMO45DataPlaneSession):
                 # A closed delegate span can precede the foreground turn's
                 # final tokens. Injecting its result before that boundary
                 # lets the old turn's EOS consume the new answer context.
-                self._backend_ready[request_id] = result.get("is_listen") is True or result.get("end_of_turn") is True
+                # Synthetic segment-complete listens only schedule another
+                # unit; they do not close the model's foreground turn.
+                self._backend_ready[request_id] = (
+                    result.get("model_listen") is True or result.get("end_of_turn") is True
+                )
                 turn_id = result.get("model_turn_id", context.turn_id if context is not None else None)
                 previous = self._delegations.get(request_id)
                 if previous is None or previous[0] != turn_id:
@@ -170,7 +174,13 @@ class RealtimeVenusDuplexPlugin(MiniCPMO45DuplexPlugin):
         tokenizer = self._tokenizers.get(str(current.get(_TOKENIZER, "")))
         if tokenizer is None:
             raise DuplexRuntimeConfigError("Venus tokenizer is unavailable", code="invalid_function_call_output")
-        token_ids = tokenizer.encode(f"<backend>{output}</backend>", add_special_tokens=False)
+        # Quoted protocol tags in tool data must remain ordinary text. Encode
+        # the trusted frame separately so only its delimiters are control IDs.
+        token_ids = [
+            *tokenizer.encode("<backend>", add_special_tokens=False),
+            *tokenizer.encode(output, add_special_tokens=False, split_special_tokens=True),
+            *tokenizer.encode("</backend>", add_special_tokens=False),
+        ]
         records = _records(current)
         if (
             len(records) >= 8

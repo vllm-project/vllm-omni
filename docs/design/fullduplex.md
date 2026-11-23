@@ -1834,8 +1834,12 @@ repeat suppression and interruption policy. MiniCPM-o continues to advertise
 `tool_mode: none`.
 
 Accepted Venus results are tokenized as `<backend>result</backend>` into a
-bounded private runtime queue. Results wait for a projected turn-end or listen
-boundary; closing a delegate span alone does not end the foreground turn.
+bounded private runtime queue. The delimiters are encoded separately; reserved
+token spellings inside the result body are encoded as ordinary text, preserving
+their readable content without adding model control tokens.
+Results wait for a projected turn-end or genuine model-listen boundary;
+synthetic segment-complete listen events only schedule another unit and leave
+the result queued. Closing a delegate span alone does not end the foreground turn.
 An identical completed span repeated in a later unit also permits injection,
 so a model waiting for its backend cannot strand the accepted result in a loop.
 The next append reserves their exact token count and feeds them after that
@@ -1868,6 +1872,10 @@ Code2Wav. The codec bridge consumes their pending text even when no audio frames
 exist; the data plane emits that text once at the unit boundary, using the same
 cache-epoch/chunk-sequence deduplication as audio. It does not wait for later
 speech or replay the delegation text with the next audible unit.
+Zero-frame flushes on a live native request carry a scheduling placeholder so
+the generation receiver retains their text and boundary metadata, including
+speech-only flushes with `last_chunk=True`. `code_flat_numel=0` keeps the
+placeholder out of vocoder input; it does not close the resumable request.
 
 This filtering does not execute delegated work or supply the external Venus
 memory runtime. The [Realtime-Venus recipe](gh-file:recipes/inclusionAI/Realtime-Venus.md)

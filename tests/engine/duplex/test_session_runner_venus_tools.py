@@ -62,8 +62,8 @@ def submitted_results(h):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("repeat", [False, True])
-async def test_result_reaches_one_append_and_duplicate_cannot_replay_it(repeat):
+@pytest.mark.parametrize("boundary", ["listen", "turn_end", "repeat"])
+async def test_result_reaches_one_append_and_duplicate_cannot_replay_it(boundary):
     async with venus_session() as h:
         call_id = await delegate(h)
         count = len(h.port.submissions)
@@ -73,7 +73,16 @@ async def test_result_reaches_one_append_and_duplicate_cannot_replay_it(repeat):
         assert error_codes(await answer(h, call_id, "42")) == []
         await h.run(append_audio())
         assert not any(submitted_results(h))  # The delegate turn is still speaking.
-        if repeat:
+        queued = h.session.runtime_config["venus_function_results"]
+        synthetic = tts_output(h.stage0_request_id(), text="", samples=0, finished=True)
+        # Exercise the inherited projector: a finished nonterminal segment
+        # synthesizes a listen event, but the foreground response stays open.
+        events = await h.deliver_and_settle(synthetic, segment_finished=True)
+        assert error_codes(events) == []
+        await h.run(append_audio())
+        assert not any(submitted_results(h))
+        assert h.session.runtime_config["venus_function_results"] == queued
+        if boundary == "repeat":
             repeated = tts_output(
                 h.stage0_request_id(), text="<delegate>12 + 30</delegate>", samples=0, tts_is_last_chunk=True
             )
@@ -83,6 +92,8 @@ async def test_result_reaches_one_append_and_duplicate_cannot_replay_it(repeat):
             events = await h.deliver_and_settle(repeated)
             assert error_codes(events) == []
             assert "response.function_call_arguments.done" not in types(events)
+        elif boundary == "turn_end":
+            await h.deliver_and_settle(tts_output(h.stage0_request_id(), text="", samples=0, turn_end=True))
         else:
             await h.deliver_and_settle(listen_output(h.stage0_request_id()), stage_id=0, segment_finished=True)
         await h.run(append_audio())

@@ -179,7 +179,8 @@ remains in text output and is excluded from speech.
 
 The application executes the task and returns a `function_call_output` with
 the matching `call_id`. The server wraps the result in `<backend>...</backend>`
-and waits for the foreground turn to end or return to listening. The next input
+and waits for the foreground turn to end or the model to return to listening.
+A synthetic segment-complete listen does not release the result. The next input
 unit then carries it after the media, in the same Thinker KV cache.
 If the model repeats the completed delegation while waiting, that control
 boundary also admits the result without executing the tool again.
@@ -199,7 +200,9 @@ is optional application infrastructure, not a serving dependency.
 The shared [tool lifecycle](../../docs/serving/realtime_duplex_api.md#tool-calls-results-deadlines-and-cancellation)
 handles unknown/duplicate results, deadlines, cancellation and late replies.
 Results are limited to 4000 characters, with at most eight pending results and
-4096 pending tokens per session. Rejected results leave the call pending for a
+4096 pending tokens per session. Reserved token spellings quoted in a result
+are encoded as ordinary text; only the server's outer `<backend>` delimiters
+act as control tokens. Rejected results leave the call pending for a
 corrected reply. Cancellation retires results not yet submitted to the model;
 submitted work follows the existing epoch fence. The CLI below keeps pending
 calls across interruptions; custom clients choose their interruption policy.

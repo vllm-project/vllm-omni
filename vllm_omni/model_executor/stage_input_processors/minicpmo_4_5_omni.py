@@ -459,10 +459,11 @@ def tts2code2wav_async_chunk(
         pending_text_utf8.clear()
     if native_duplex and finished:
         state["segment_text_recorded"] = False
-    if flush_pending and not last_chunk and code_flat_numel == 0:
+    if flush_pending and code_flat_numel == 0 and (not last_chunk or (native_duplex and not request_terminal)):
         # Keep the generic generation connector model-agnostic: a real token
         # makes this control-only TTS boundary schedulable, while the explicit
-        # zero length tells Code2Wav to discard the placeholder.
+        # zero length tells Code2Wav to discard the placeholder. A native
+        # speech/turn flush may close the vocoder while the request lives on.
         output_codes = [0]
 
     if last_chunk and not native_duplex:

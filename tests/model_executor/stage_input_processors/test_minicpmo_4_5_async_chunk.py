@@ -96,6 +96,53 @@ def test_venus_delegate_flush_drains_pending_codes_without_closing_dialogue():
     assert terminal.meta.code_flat_numel == 0
 
 
+def test_venus_zero_frame_speech_flush_reaches_generation_receiver():
+    from vllm.sampling_params import SamplingParams
+
+    from tests.worker.test_omni_connector_mixin import MixinHost, MockConnector, _make_model_config, _make_request
+    from vllm_omni.data_entry_keys import to_dict
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    manager = _manager()
+    state = _NativeRequestState(
+        request_id="delegate",
+        external_req_id="delegate",
+        prompt_token_ids=[0],
+        resumable=True,
+        sampling_params=SamplingParams(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    request = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
+    # Both the audible unit and its speech-only flush may stop at codec EOS
+    # without emitting a frame. The resumable request is still alive.
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(text="Let me check."), request)
+    assert first.meta.code_flat_numel == 0
+    muted = _duplex_delta(text="<delegate>lookup</delegate>")
+    muted["meta"].update(speech_flush=torch.tensor(True), speech_muted=torch.tensor(True))
+    payload = tts2code2wav_async_chunk(manager, muted, request)
+    assert payload.meta.last_chunk is True
+    assert payload.meta.finished.item() is False
+    assert payload.meta.code_flat_numel == 0
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=True, worker_type="generation"))
+    host._stage_id = 2
+    connector = MockConnector()
+    host._omni_connector = connector
+    host.register_chunk_recv(_make_request("delegate"))
+    try:
+        connector.put("1", "2", "delegate_1_0", to_dict(payload))
+        assert host._poll_single_request("delegate")
+        received = host.get_local_stage_payload("delegate")
+        assert received["codes"]["audio"].tolist() == [0]
+        assert received["meta"]["code_flat_numel"] == 0
+        assert received["meta"]["codec_chunk_frames"] == 0
+        assert b"<delegate>lookup</delegate>" in bytes(received["meta"]["llm_output_text_utf8"].tolist())
+        assert "delegate" in host._finished_load_reqs
+        assert "delegate" not in host._chunk_stream_completed
+    finally:
+        host.shutdown_omni_connectors()
+
+
 def test_venus_muted_text_is_delivered_without_waiting_for_or_replaying_in_speech():
     manager = _manager()
     request = _request("delegate")
