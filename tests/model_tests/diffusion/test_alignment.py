@@ -25,9 +25,6 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
     "QwenImageLayeredPipeline",
-    # Uses a custom multi-image editing contract; covered by the dedicated
-    # JoyImage tiny-pipeline tests and real-checkpoint E2E accuracy test.
-    "JoyImageEditPipeline",
     # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
     # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
     "QwenImage21Pipeline",
@@ -44,7 +41,6 @@ EXCLUDED_MODELS = [
     # Action expert that needs the reasoning stage's KV prefix; covered by
     # tests/diffusion/models/alpamayo2_super and the full-model E2E test.
     "Alpamayo2SuperPipeline",
-    "WanPipeline",
     # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
     "SeedVR2Pipeline",
     "WanDMDPipeline",
@@ -119,9 +115,18 @@ EXCLUDED_MODELS = [
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
+    # Multi-camera AV variant of Cosmos3; covered by the dedicated
+    # tests/diffusion/models/cosmos3 multiview tests instead of a tiny model.
+    "Cosmos3MultiviewPipeline",
+    # Causal AR bimanual sim model requiring action/camera assets and
+    # persistent AR state; covered by tests/diffusion/models/cosmos3_nano_sim_bimanual.
+    "Cosmos3NanoSimBimanualPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
+    # Robot observations require local policy/VAE/text weights; dedicated CPU
+    # contracts and the checkpoint-gated GPU E2E cover this integration.
+    "Praxis1Pipeline",
     # Experimental Noisy PP / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",

@@ -19,14 +19,14 @@ def test_turn_text_ends_sentence(text, complete):
 
 @pytest.mark.parametrize(
     ("samples", "tokens"),
-    [(0, 0), (1280, 0), (1281, 1), (1599, 1), (1600, 1), (2880, 1), (2881, 2), (96256, 60), (97281, 61)],
+    [(0, 0), (1280, 0), (97281, 61)],
 )
 def test_reference_audio_token_budget_preserves_partial_frames(samples, tokens):
     assert MiniCPMO45DuplexPolicy.audio_token_count(samples) == tokens
 
 
-@pytest.mark.parametrize("samples", [1281, 1599, 1600, 2880, 2881, 96256])
-def test_reference_audio_budget_matches_feature_extractor_and_pooling(samples):
+@pytest.mark.parametrize("samples,tokens", [(1281, 1), (1599, 1), (1600, 1), (2880, 1), (2881, 2), (96256, 60)])
+def test_reference_audio_budget_matches_feature_extractor_and_pooling(samples, tokens):
     import numpy as np
     import torch
     from transformers import WhisperFeatureExtractor
@@ -39,7 +39,7 @@ def test_reference_audio_budget_matches_feature_extractor_and_pooling(samples):
     conv = torch.nn.Conv1d(1, 1, kernel_size=3, stride=2, padding=1)
     with torch.no_grad():
         pooled = torch.nn.functional.avg_pool1d(conv(torch.zeros(1, 1, mel_frames)), kernel_size=5, stride=5)
-    assert MiniCPMO45DuplexPolicy.audio_token_count(samples) == pooled.shape[-1]
+    assert MiniCPMO45DuplexPolicy.audio_token_count(samples) == pooled.shape[-1] == tokens
 
 
 def test_seed_tts_initial_text_is_part_of_native_duplex_context():

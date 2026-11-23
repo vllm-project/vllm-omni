@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Breeze-TTS-2: T5Gemma2 prompt encoding, paged Qwen3, and RVQ decoding."""
 
+from __future__ import annotations
+
 from collections.abc import Iterable
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +15,6 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.config.model import OmniModelConfig
@@ -27,6 +28,10 @@ from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
     BreezeTextEncoderGraph,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker_v2.warmup import is_warmup_request
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 
 class BreezeSampling(TypedDict):
@@ -44,6 +49,7 @@ class BreezeState(TypedDict):
 
 class BreezeForConditionalGeneration(nn.Module):
     have_multimodal_outputs = True
+    mrv2_forward_returns_tensor = True
     has_preprocess = True
     has_postprocess = False
     requires_full_prefix_cached_hidden_states = False
@@ -167,6 +173,11 @@ class BreezeForConditionalGeneration(nn.Module):
                 embeds = torch.cat((reference_embeds[reference_keys[request_id]], embeds), dim=0)
             info["breeze_prepared"] = {"embeds": embeds}
 
+    def preprocess_batch_mrv2(self, *, req_infos: list[dict[str, Any]], device: torch.device) -> None:
+        """Model Runner V2 passes only this step's prefill buffers."""
+        buffers = {str(info["req_id"]): info for info in req_infos}
+        self.preprocess_batch(req_ids=list(buffers), model_intermediate_buffer=buffers, device=device)
+
     def embed_input_ids(self, input_ids: torch.Tensor, **_: object) -> torch.Tensor:
         # vLLM's memory profiling does not have a request payload.
         return self.lm_head.weight.new_zeros((input_ids.numel(), self.hidden_size), dtype=self.model.norm.weight.dtype)
@@ -232,6 +243,18 @@ class BreezeForConditionalGeneration(nn.Module):
             embeds = self.depth_decoder.embed_tokens(current + self.offsets).sum(1)
         return input_ids, embeds, [{} for _ in req_infos]
 
+    def preprocess_decode_batch_mrv2(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Model Runner V2 decode hook; Breeze has no MTP hidden or text-step inputs."""
+        input_ids, embeds, updates = self.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+        empty = input_embeds.new_empty((len(req_infos), 0))
+        return input_ids, embeds, empty, empty, updates
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -262,7 +285,11 @@ class BreezeForConditionalGeneration(nn.Module):
         request_token_spans: list[tuple[int, int]] | None = None,
         **_: object,
     ) -> OmniOutput:
-        if not model_intermediate_buffer:
+        # Model Runner V2 kernel warmup rows carry only a req_id and sampling
+        # params. V1 buffers have no req_id, so real rows still need metadata.
+        if not model_intermediate_buffer or all(
+            is_warmup_request(str(info.get("req_id", ""))) for info in model_intermediate_buffer
+        ):
             self._next_tokens = None
             return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs={})
         if request_token_spans is None or len(request_token_spans) != len(model_intermediate_buffer):

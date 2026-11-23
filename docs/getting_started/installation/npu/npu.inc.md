@@ -74,20 +74,23 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 
 # --8<-- [start:installation-main]
 
-You can also install vLLM-Omni from source if you want to use the latest features
-or bug fixes. This alignment checkout targets vLLM 0.33.0 and requires a
-matching vLLM-Ascend runtime validated on your NPU. The v0.30.0 Ascend images
-above do not establish compatibility with this vLLM 0.33.0 checkout. Check
-[issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for aligned
-versions and NPU validation before selecting a development image.
+To install vLLM-Omni from the main branch, start with the published vLLM-Ascend
+`v0.34.0` base image for your hardware:
+
+| Hardware | Base image |
+| - | - |
+| A2 | `quay.io/atlas-ci/vllm-ascend:v0.34.0` |
+| A3 | `quay.io/atlas-ci/vllm-ascend:v0.34.0-a3` |
+| A5 | `quay.io/atlas-ci/vllm-ascend:v0.34.0-a5` |
+| 310P (experimental) | `quay.io/atlas-ci/vllm-ascend:v0.34.0-310p` |
 
 ```bash
 # Inside a container with matching vLLM and vLLM-Ascend, install Omni from source
 cd /vllm-workspace
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
-pip install -v -e . --no-build-isolation
-# or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e . --no-build-isolation \
+    --extra-index-url https://ascend.devcloud.huaweicloud.com/cann/pypi/simple
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 
@@ -214,16 +217,12 @@ git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 ```
 
-!!! warning "vLLM 0.33 alignment is not yet qualified on NPU"
-    Both `docker/Dockerfile.npu` and `docker/Dockerfile.npu.ci` retain the
-    legacy `v0.32.0` Ascend runtime default. The commands below illustrate
-    hardware suffix selection; they do not produce a validated vLLM 0.33
-    image. Before building this checkout, obtain a matching vLLM 0.33.0 and
-    vLLM-Ascend runtime, pass its verified image repository and tag through
-    `VLLM_ASCEND_IMAGE` and `VLLM_ASCEND_VERSION`, and validate on your NPU.
-    A final vLLM package alone does not establish vLLM-Ascend compatibility.
+All hardware variants use `docker/Dockerfile.npu`, which defaults to the
+published vLLM-Ascend `v0.34.0` base. Choose the device suffix for your hardware:
 
-All hardware variants use `docker/Dockerfile.npu`. Choose the device suffix for your hardware:
+`requirements/npu.txt` includes `cann-shmem` for `--ulysses-a2a-permute`.
+The backend loads the wheel's native libraries automatically; no separate
+SHMEM source build is needed.
 
 === "A2"
 

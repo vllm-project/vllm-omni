@@ -98,6 +98,43 @@ def _log_backend_resolution(
     )
 
 
+def _model_default_backend() -> str | None:
+    """The configured model's default attention backend on this CUDA device, if it declares one."""
+    from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+    from vllm_omni.platforms import current_omni_platform
+
+    config = get_current_diffusion_config_or_none()
+    metadata = get_diffusion_model_metadata(getattr(config, "model_class_name", None))
+    if not metadata.default_attention_backends or not current_omni_platform.is_cuda():
+        return None
+    if getattr(config, "step_execution", False) and getattr(config, "max_num_seqs", 1) > 1:
+        return None
+    capability = current_omni_platform.get_device_capability()
+    return metadata.default_attention_backend(capability.major if capability is not None else None)
+
+
+def _resolve_model_default(head_size: int) -> type[AttentionBackend] | None:
+    """The model default's backend class, or None when there is none or it is unavailable."""
+    model_default_backend = _model_default_backend()
+    if model_default_backend is None:
+        return None
+    try:
+        return _cached_get_backend_cls(model_default_backend, head_size)
+    except ValueError as exc:
+        _log_model_default_unavailable(model_default_backend, str(exc))
+        return None
+
+
+@cache
+def _log_model_default_unavailable(backend_name: str, reason: str) -> None:
+    logger.warning(
+        "Model default diffusion attention backend '%s' is unavailable (%s); using the platform default",
+        backend_name,
+        reason,
+    )
+
+
 def get_attn_backend_for_role(
     role: str,
     head_size: int,
@@ -112,7 +149,8 @@ def get_attn_backend_for_role(
       1. attention_config.per_role[role]           — exact match
       2. attention_config.per_role[role_category]   — category fallback
       3. attention_config.default                   — global default
-      4. Platform default                           — hardware-specific
+      4. Model default                              — the configured model's choice for this GPU
+      5. Platform default                           — hardware-specific
 
     Args:
         role: Attention role string (e.g. "self", "cross", "joint",
@@ -146,6 +184,16 @@ def get_attn_backend_for_role(
         )
         return backend_cls, spec
 
+    backend_cls = _resolve_model_default(head_size)
+    if backend_cls is not None:
+        _log_backend_resolution(
+            role=role,
+            role_category=role_category,
+            backend_name=backend_cls.get_name(),
+            source="model default",
+        )
+        return backend_cls, None
+
     # 2. Platform default
     backend_cls = _cached_get_backend_cls(None, head_size, allow_trtllm_default)
     _log_backend_resolution(
@@ -167,8 +215,9 @@ def get_attn_backend_for_capability(
     SequenceParallel auto-pad does not know ``head_size``. Explicit
     ``AttentionConfig`` selections are loaded from the registry without
     geometry validation, so CUDNN_ATTN is not rejected for the unknown
-    sentinel. Platform defaults still consult the platform with
-    ``HEAD_SIZE_UNKNOWN``.
+    sentinel. The model default and the platform default go through the same
+    lookup as ``get_attn_backend_for_role`` with ``HEAD_SIZE_UNKNOWN``, so the
+    mask-support answer matches the backend the layers will run.
     """
     spec = None
     if attention_config is not None:
@@ -180,4 +229,7 @@ def get_attn_backend_for_capability(
         from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 
         return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
+    backend_cls = _resolve_model_default(HEAD_SIZE_UNKNOWN)
+    if backend_cls is not None:
+        return backend_cls
     return _cached_get_backend_cls(None, HEAD_SIZE_UNKNOWN)

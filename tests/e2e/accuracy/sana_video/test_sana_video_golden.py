@@ -52,6 +52,7 @@ SSIM_THRESHOLDS = {
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.diffusion,
+    pytest.mark.skip(reason="SANA-Video v2 golden assets are unavailable (issue #8236)."),
     pytest.mark.skipif(
         not GOLDEN_BASE_URL,
         reason="Set SANA_VIDEO_GOLDEN_BASE_URL after publishing the frozen v2 S3 assets.",

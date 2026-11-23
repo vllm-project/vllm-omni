@@ -789,7 +789,6 @@ class MTPState:
             logger.warning("Skipping mtp graph capture because this model requires per-request req_infos.")
             return
 
-        from vllm.compilation import monitor
         from vllm.distributed.parallel_state import graph_capture
         from vllm.forward_context import set_forward_context
 
@@ -799,10 +798,9 @@ class MTPState:
         capture_kwargs = self._get_mtp_base_sampling_kwargs()
         logger.info("Capturing MRv2 mtp graphs for sizes %s", capture_sizes)
 
-        # The profiling pass runs this before the decoder's real capture, which
-        # needs capturing to stay enabled, so it restores what was set.
-        capturing_enabled = monitor.cudagraph_capturing_enabled and restore_capturing
-        monitor.set_cudagraph_capturing_enabled(True)
+        # Native V2 selects capture through each forward context below; v0.34
+        # removed the process-global capture flag. Retain the caller keyword.
+        _ = restore_capturing
         try:
             with torch.inference_mode(), graph_capture(device=self.owner.device):
                 for bsz in capture_sizes:
@@ -845,8 +843,6 @@ class MTPState:
             logger.info("Captured MRv2 mtp graphs for %d sizes", len(capture_sizes))
         except RuntimeError as e:
             raise RuntimeError(f"MRv2 mtp graph capture failed: {e}") from e
-        finally:
-            monitor.set_cudagraph_capturing_enabled(capturing_enabled)
 
     def _get_mtp_capture_sizes(self) -> list[int]:
         """Return graph buckets that a request-batched Talker can reach."""
@@ -961,12 +957,13 @@ class MTPState:
             batch_emb = self._mtp_input_embeds[:num_tokens]
             batch_hidden = self._mtp_hidden[:num_tokens]
             batch_step = self._mtp_text_step[:num_tokens]
-            if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, num_tokens)
         elif can_use_graph:
             cudagraph_mode = CUDAGraphMode.FULL
-            if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, bsz)
+        # NPU predictor-owned graphs and fused sampling need random inputs
+        # even without the outer MTP wrapper. Other eager backends retain
+        # per-step generator draws instead of switching to a whole-span draw.
+        if sample_uniform_buffer is not None and (use_graph_runner or current_omni_platform.is_npu()):
+            sample_uniforms = self._prepare_mtp_sample_uniforms(generators, num_tokens)
         with set_forward_context(
             None,
             self.owner.vllm_config,

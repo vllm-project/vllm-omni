@@ -571,7 +571,9 @@ def test_norm_cache_fusion_dispatch(monkeypatch, channels_last, return_bias, his
     def fused(source, gamma, scale, previous, pad, **kwargs):
         assert source is x and gamma is norm.gamma and scale == norm.scale
         assert previous is payload and pad == 2
-        assert kwargs == dict(channels_last=channels_last, silu=True, bias=bias)
+        assert kwargs == dict(
+            channels_last=channels_last, silu=True, bias=bias, probe_reduction=cfg.probe_norm_reduction
+        )
         seen.append(True)
         return assembled, next_cache
 

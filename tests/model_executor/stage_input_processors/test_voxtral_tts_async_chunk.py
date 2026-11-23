@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -24,6 +24,7 @@ def _req(external_req_id: str, *, finished: bool):
 def _make_transfer_manager(codec_chunk_frames=25, codec_left_context_frames=25, codec_chunk_frames_at_begin=5):
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
+        request_payload={},
         connector=SimpleNamespace(
             config={
                 "extra": {

@@ -97,6 +97,10 @@ def test_voice_clone_zh_001(omni_server, online_client) -> None:
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
+        # Whisper-small consistently mishears two words in this sample. Keep
+        # the 0.9 gate and use the established stronger-ASR fallback.
+        "transcript_language": "zh",
+        "transcript_escalation_model": "large-v3",
     }
     _set_rocm_request_timeout(request_config)
     online_client.send_audio_speech_request(request_config)
@@ -121,6 +125,8 @@ def test_voice_clone_zh_002(omni_server, online_client) -> None:
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
+        "transcript_language": "zh",
+        "transcript_escalation_model": "large-v3",
     }
     _set_rocm_request_timeout(request_config)
     online_client.send_audio_speech_request(request_config)

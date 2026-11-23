@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from NextStep-1.1 (https://huggingface.co/stepfun-ai/NextStep-1.1)
 # Original: models/nextstep_model.py — local version with TP-aware layers.
 
@@ -268,7 +268,7 @@ class NextStepModel(nn.Module):
         dtype, device = input_tensor.dtype, input_tensor.device
         sequence_length = input_tensor.shape[1]
         if using_static_cache:
-            target_length = past_key_values.get_max_cache_shape()
+            target_length = past_key_values.get_max_length()
         else:
             target_length = (
                 attention_mask.shape[-1]

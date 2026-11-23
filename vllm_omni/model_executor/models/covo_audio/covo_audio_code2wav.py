@@ -2,19 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2026 Tencent.
+from __future__ import annotations
+
 import os
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from .config_covo_audio import CovoAudioCode2WavConfig
 from .token2wav import JsonHParams, Token2WavDecoder
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 
 class CovoAudioCode2WavForConditionalGeneration(nn.Module):
@@ -52,7 +56,6 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module):
         self.decoder.eval()
         self.infer_config = code2wav_config.inference
         self._decoder_moved = False
-        self._sampler = Sampler()
 
         # Load bundled speaker prompt files for voice timbre control.
         prompt_dir = os.path.join(os.path.dirname(__file__), "speaker_prompt")
@@ -115,6 +118,9 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput | None:
+        from vllm.v1.sample.sampler import Sampler
+
+        self._sampler = Sampler()
         if logits is None or logits.numel() == 0:
             return None
         return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
