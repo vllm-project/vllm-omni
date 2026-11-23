@@ -196,9 +196,10 @@ def test_expired_deadline_never_allocates_or_submits(connectors):
     assert not hasattr(receiver._req_local, "deadline")
 
 
-def test_tcp_requires_explicit_acknowledged_native_capability(connectors):
+@pytest.mark.parametrize("capability", [0, 1, 3])
+def test_tcp_requires_exact_acknowledged_native_capability(connectors, capability):
     with pytest.raises(ValueError, match="native_tcp_proto_version=2"):
-        connectors(protocol="tcp")
+        connectors(protocol="tcp", native_tcp_proto_version=capability)
     connector = connectors(protocol="tcp", native_tcp_proto_version=2)
     assert connector.native_tcp_proto_version == 2
 
@@ -296,6 +297,32 @@ def test_rdma_force_hca_requires_acknowledged_completion_before_native_submissio
     finally:
         sock.close(linger=0)
         ctx.term()
+
+
+@pytest.mark.parametrize("peer_capability", [0, 1, 2])
+def test_rdma_force_hca_receiver_requires_acknowledged_completion(connectors, monkeypatch, peer_capability):
+    """Receiver rejects uncertain rdma+MC_FORCE_HCA before allocating or writing."""
+    # Keep the sender on the verified RDMA path so the test isolates the
+    # receiver-side capability guard. If that guard is removed, the fake native
+    # write below can proceed and the negative cases fail for the right reason.
+    monkeypatch.delenv("MC_FORCE_HCA", raising=False)
+    sender = connectors("sender", protocol="rdma", native_tcp_proto_version=2)
+    monkeypatch.setenv("MC_FORCE_HCA", "1")
+    monkeypatch.setattr(sender, "_requires_tcp_completion", lambda: False)
+    receiver = connectors(protocol="rdma", native_tcp_proto_version=2)
+    metadata = publish(sender)
+    metadata["native_tcp_proto_version"] = peer_capability
+
+    if peer_capability < 2:
+        with pytest.raises(RuntimeError, match="acknowledged completion"):
+            receive(receiver, metadata)
+        assert not sender.engine.calls
+        assert not receiver._pending_receives
+    else:
+        result, size = receive(receiver, metadata)
+        assert size > 0
+        assert result == {"value": 42}
+        assert len(sender.engine.calls) == 1
 
 
 def test_rdma_rejects_missing_hca(connectors, monkeypatch):

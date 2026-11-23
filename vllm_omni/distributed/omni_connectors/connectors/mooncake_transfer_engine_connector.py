@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import os
@@ -185,7 +185,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             self.native_tcp_proto_version = int(config.get("native_tcp_proto_version", 0))
         except (TypeError, ValueError) as exc:
             raise ValueError("native_tcp_proto_version must be an integer") from exc
-        if self.protocol.lower() == "tcp" and self.native_tcp_proto_version < 2:
+        if self.protocol.lower() == "tcp" and self.native_tcp_proto_version != 2:
             raise ValueError(
                 "Mooncake TCP requires native_tcp_proto_version=2; "
                 "the installed SDK capability must be verified explicitly"
@@ -239,8 +239,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         require the acknowledged-completion capability handshake.
         """
         return self.protocol.lower() == "tcp" or (
-            self.protocol.lower() == "rdma"
-            and ("MC_FORCE_TCP" in os.environ or "MC_FORCE_HCA" in os.environ)
+            self.protocol.lower() == "rdma" and ("MC_FORCE_TCP" in os.environ or "MC_FORCE_HCA" in os.environ)
         )
 
     def _validate_rdma_transport(self) -> None:
@@ -260,8 +259,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         get_topology = getattr(self.engine, "get_local_topology", None)
         if get_topology is None:
             raise RuntimeError(
-                "Mooncake RDMA requires get_local_topology() or MC_FORCE_HCA=1 "
-                "to prevent an implicit TCP fallback"
+                "Mooncake RDMA requires get_local_topology() or MC_FORCE_HCA=1 to prevent an implicit TCP fallback"
             )
         try:
             topology = json.loads(get_topology(self.device_name or None))
@@ -283,14 +281,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         if isinstance(topology, dict):
             for value in topology.values():
                 collect(value)
-        requested = {
-            item.strip() for item in str(self.device_name).split(",") if item.strip()
-        }
+        requested = {item.strip() for item in str(self.device_name).split(",") if item.strip()}
         if not hcas or (requested and not requested.issubset(hcas)):
             selected = ", ".join(sorted(requested)) or "any HCA"
             raise RuntimeError(
-                f"Mooncake protocol 'rdma' requires an available HCA ({selected}); "
-                "refusing an implicit TCP fallback"
+                f"Mooncake protocol 'rdma' requires an available HCA ({selected}); refusing an implicit TCP fallback"
             )
 
     def _init_engine(self) -> None:
@@ -815,8 +810,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 self._receiving_keys.add(key)
         if capacity_rejected and capacity_warning:
             logger.warning(
-                "Mooncake receive capacity exhausted; retrying until the deadline "
-                "(inflight=%d, limit=%d)",
+                "Mooncake receive capacity exhausted; retrying until the deadline (inflight=%d, limit=%d)",
                 inflight_receives,
                 self.max_inflight_receives,
             )
