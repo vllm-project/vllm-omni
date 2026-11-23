@@ -1602,6 +1602,17 @@ This preserves the turn boundary in both direct and ASR-handoff prompts without
 restoring unheard text or treating cancellation as a model silence decision.
 The boundary follows the existing recent-history budget and disappears when
 its history item is deleted.
+
+Both text and speech queries precede their observation's frames inside the same
+user message, matching the visual reference frontend. The ASR handoff and
+reconstructed history preserve this query-before-frame format.
+Spoken observations retain the Session item ID that owns their ASR transcript.
+When rebuilding visual history, JoyAI resolves that item's current text and
+keeps it before the original frames in the same user message, matching the ASR
+handoff. A later camera observation must not move the transcript into a separate
+user turn. Deleted transcripts stay absent; cancelled output does not discard
+an accepted user transcript.
+
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting

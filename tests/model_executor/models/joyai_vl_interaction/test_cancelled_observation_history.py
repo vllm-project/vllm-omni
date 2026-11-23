@@ -256,7 +256,7 @@ def test_asr_context_budget_evicts_frames_with_their_turns_without_mutating_hand
     expected = [
         {"role": "system", "content": "policy"},
         {"role": "user", "content": "Keep answers short."},
-        {"role": "user", "content": [*current, {"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"}]},
+        {"role": "user", "content": [{"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"}, *current]},
     ]
     if retain_text:
         expected.insert(2, {"role": "user", "content": [{"type": "text", "text": old_text}]})

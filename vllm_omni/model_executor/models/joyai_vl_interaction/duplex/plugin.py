@@ -882,7 +882,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request.visual_generation = state.visual_memory.generation
         request.frame_time_s = monotonic() - state.visual_memory.start_time
         awaiting_transcript = isinstance(payload, Mapping) and bool(payload.get("audio"))
-        if not awaiting_transcript:
+        if awaiting_transcript:
+            # ASR fills this Session item after the observation is accepted.
+            # Keep its owner so later prompts can restore the original visual turn.
+            transcript_item_id = payload.get("realtime_item_id")
+            if isinstance(transcript_item_id, str):
+                request.transcript_item_id = transcript_item_id
+        else:
             request.query, request.query_index = self._current_query(config, runtime_config)
         item_ids = config.get("conversation_item_ids", ())
         if 0 <= request.query_index < len(item_ids):
@@ -963,6 +969,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                         request.query,
                         request.query_index,
                         query_item_id=request.query_item_id,
+                        transcript_item_id=request.transcript_item_id,
                         history_anchor_item_ids=request.history_anchor_item_ids,
                     )
                 )
@@ -1109,16 +1116,21 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         retained_queries = {-1: runtime_config.get("initial_user_text") or "", **user_queries}
         for _, frames, observation in groups:
             content = []
-            query_key = observation.query_item_id or observation.query_index
+            query_key = observation.transcript_item_id or observation.query_item_id or observation.query_index
+            observation_query = (
+                user_queries.get(observation.transcript_item_id, "")
+                if observation.transcript_item_id is not None
+                else observation.query
+            )
             included_query_key = None
             # Text edits/deletions remain authoritative in Session.history.
             if (
-                observation.query
-                and (observation.query != last_query or query_key != last_query_key)
-                and retained_queries.get(query_key) == observation.query
+                observation_query
+                and (observation_query != last_query or query_key != last_query_key)
+                and retained_queries.get(query_key) == observation_query
             ):
-                content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{observation.query}"})
-                last_query = observation.query
+                content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{observation_query}"})
+                last_query = observation_query
                 last_query_key = included_query_key = query_key
             for frame in frames:
                 content.extend([{"type": "text", "text": f"<{frame.time_s:.1f} seconds>"}, {"type": "image"}])
