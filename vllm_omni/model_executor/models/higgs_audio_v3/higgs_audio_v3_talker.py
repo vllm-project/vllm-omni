@@ -119,6 +119,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     prefer_model_sampler: bool = True
     # Tell the runner to call postprocess() to emit per-step audio codes.
     have_multimodal_outputs: bool = True
+    mrv2_forward_returns_tensor = True
     has_postprocess: bool = False
     skips_model_sampler_output_token_history: bool = True
     postprocess_uses_hidden_states: bool = False
@@ -691,6 +692,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             with torch.inference_mode(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 normed, static_residual_out = layer.post_attention_layernorm(static_hidden, static_residual)
                 static_output = layer.mlp(normed)
+            # Capture only records kernels. The first request at a new batch
+            # size must execute them before consuming the graph's outputs.
+            graph.replay()
             self._mlp_graphs[key] = {
                 "graph": graph,
                 "static_hidden": static_hidden,

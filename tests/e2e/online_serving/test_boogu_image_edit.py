@@ -38,7 +38,7 @@ from tests.helpers.runtime import (
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 EDIT_PROMPT = "Change the style to a colored pencil drawing."
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
 
 EDIT_MODEL = "Boogu/Boogu-Image-0.1-Edit"
 EDIT_TURBO_MODEL = "Boogu/Boogu-Image-0.1-Edit-Turbo"

@@ -629,6 +629,7 @@ class DiffusionWorker:
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
+                hsdp_data_parallel=getattr(parallel_config, "hsdp_data_parallel", False),
             )
             _setup_diffusion_worker_proc_title_and_log_prefix(
                 enable_ep=parallel_config.enable_expert_parallel,
@@ -891,6 +892,12 @@ class DiffusionWorker:
         return _run_and_gather_rank_values(
             "MixFusion capability discovery", lambda: inspect_mixfusion_capability(pipeline)
         )
+
+    def run_helios_vae_warmup(self) -> None:
+        """Run the optional, model-owned warmup once startup dummy work completes."""
+        if self.model_runner is None:
+            raise RuntimeError("Model runner must be initialized before Helios VAE warmup")
+        self.model_runner.run_helios_vae_warmup()
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""
@@ -1199,12 +1206,11 @@ class DiffusionWorker:
     ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
         """Execute a forward pass by delegating to the model runner.
 
-        If *req* is a list (DP multi-concurrency), each rank picks one complete
-        NewRequestData envelope based on its distributed rank. AllGather in
-        the layerwise offload only gathers weight shards (request-independent),
-        so all ranks stay synchronised at each AllGather call while computing
-        different activations. Selecting the envelope keeps Scheduler-issued
-        KV metadata bound to the request that owns its block tables.
+        If *req* is a list (rank-local DP concurrency), each rank picks one
+        complete NewRequestData envelope based on its distributed rank. Weight
+        collectives are request-independent, so ranks can compute different
+        activations while remaining synchronized. Selecting the envelope keeps
+        Scheduler-issued KV metadata bound to its owning request.
 
         Each rank returns its OWN DiffusionOutput (no gather). The executor
         collects N responses via the per-worker result queues.

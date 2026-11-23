@@ -115,6 +115,25 @@ def test_cosmos3_shared_transport_preserves_presentation_and_guardrail_bytes(mon
         np.testing.assert_array_equal(captured[0], captured[1])
 
 
+def test_guarded_text_to_image_returns_every_image(monkeypatch):
+    """With guardrails on, a T2I batch of n images comes back as n images (#10648)."""
+    calls = []
+
+    def check(frames):
+        calls.append(frames.copy())
+        return np.full_like(frames, 50 * len(calls))
+
+    monkeypatch.setattr(guardrails, "_video_guardrail", check)
+    image = torch.linspace(-1, 1, 2).view(2, 1, 1, 1, 1).expand(2, 3, 1, 4, 4).clone()
+
+    images = pipeline_cosmos3.get_cosmos3_post_process_func(config(guardrails_enabled=True))({"image": image})
+
+    assert len(calls) == 2
+    assert len(images) == 2
+    for index, pil_image in enumerate(images):
+        np.testing.assert_array_equal(np.asarray(pil_image), np.full((4, 4, 3), 50 * (index + 1), dtype=np.uint8))
+
+
 @pytest.mark.parametrize("kind", ["audio", "actions", "transfer"])
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
