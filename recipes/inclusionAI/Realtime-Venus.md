@@ -253,10 +253,11 @@ python -m vllm_omni.clients.tool_calls \
 
 ### Look up local inventory
 
-Run the same command with:
+Run the same command with this text seed and greedy sampling:
 
 ```bash
---initial-user-text 'Ask the backend to look up the widget inventory count. Delegate the lookup instead of answering it yourself.'
+--initial-user-text 'Please delegate a lookup of the current widget inventory to the backend. Do not guess the count.' \
+--temperature 0
 ```
 
 The handler reads `inventory.json`; the returned count is 73. Changing that
@@ -267,8 +268,9 @@ that the model delegated or used the result.
 
 ### Ask by voice
 
-Record “Please check the widget inventory with the backend” as mono PCM16 at
-16 kHz. Replace `--initial-user-text ...` with:
+Record “Please delegate a lookup of the widget inventory to the backend” as
+mono PCM16 at 16 kHz. In the addition command, replace
+`--initial-user-text ...` with:
 
 ```bash
 --input-wav /path/to/inventory-question.wav

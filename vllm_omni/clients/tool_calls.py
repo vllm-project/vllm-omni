@@ -325,6 +325,7 @@ def main() -> None:
     inputs.add_argument("--input-wav", help="Stream mono PCM16 at 16 kHz to a native-duplex model")
     inputs.add_argument("--initial-user-text", help="Seed a native-duplex session, then stream silence")
     parser.add_argument("--instructions", help="Session instructions")
+    parser.add_argument("--temperature", type=float, help="Sampling temperature; omit to use the server default")
     parser.add_argument("--output-wav", help="Save generated PCM audio as a WAV file")
     parser.add_argument(
         "--ack-collected-audio",
@@ -353,6 +354,7 @@ def main() -> None:
             modalities=("text", "audio") if native or args.output_wav else ("text",),
             auto_response=native,
             instructions=args.instructions,
+            temperature=args.temperature,
             overlap_policy="listen_only" if native else None,
             extra_body=extra_body,
         )
