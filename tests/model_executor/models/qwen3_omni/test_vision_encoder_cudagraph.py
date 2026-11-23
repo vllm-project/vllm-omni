@@ -392,3 +392,33 @@ def test_thinker_supported_speculation_reaches_model_loading(monkeypatch, method
     monkeypatch.setattr(outer_module, "init_vllm_registered_model", load_model)
     with pytest.raises(RuntimeError, match="reached weight loading"):
         outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_thinker_rejects_duplex_dflash_before_loading(monkeypatch, use_v2, async_chunk):
+    cfg = _config()
+    cfg.model_config.session_mode = "duplex"
+    cfg.model_config.use_v2_model_runner = use_v2
+    cfg.model_config.async_chunk = async_chunk
+    cfg.speculative_config = SimpleNamespace(
+        method="dflash",
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
+    )
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="DFlash.*duplex"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+def test_thinker_duplex_without_dflash_reaches_model_loading(monkeypatch):
+    cfg = _config()
+    cfg.model_config.session_mode = "duplex"
+    cfg.speculative_config = None
+
+    def load_model(**kwargs):
+        raise RuntimeError("reached weight loading")
+
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", load_model)
+    with pytest.raises(RuntimeError, match="reached weight loading"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)

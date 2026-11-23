@@ -447,3 +447,7 @@ request-local error containing the prompt length and configured limit.
     ``````sh
     --8<-- "examples/online_serving/qwen3_omni/run_gradio_demo.sh"
     ``````
+
+DFlash currently supports turn-mode requests only. Qwen3-Omni initialization
+rejects `session_mode=duplex` with DFlash before loading Thinker weights; use
+turn mode or disable DFlash for a duplex deployment.

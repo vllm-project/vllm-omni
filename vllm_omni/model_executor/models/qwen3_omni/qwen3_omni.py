@@ -301,6 +301,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 if spec_config.method in ("eagle3", "extract_hidden_states"):
                     raise ValueError("Qwen3-Omni auxiliary hidden-state speculation only supports DFlash")
                 if spec_config.use_dflash():
+                    if getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
+                        raise ValueError(
+                            "Qwen3-Omni DFlash does not support session_mode=duplex; "
+                            "use session_mode=turn or disable DFlash"
+                        )
                     if vllm_config.parallel_config.pipeline_parallel_size > 1:
                         raise ValueError(
                             "Qwen3-Omni DFlash requires pipeline_parallel_size=1; "

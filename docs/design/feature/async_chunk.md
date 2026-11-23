@@ -353,3 +353,8 @@ the native data plane. Re-admitting the same generation preserves the live
 ledger and output holds after preemption. A new generation refreshes prompt IDs
 and metadata even when computed tokens are nonzero, without releasing pending
 output reservations or replacing the uncommitted payload queue.
+
+When a same-generation native resumable request is re-admitted with zero
+computed tokens after preemption, discard its unpublished Thinker prefill
+accumulator before replaying prompt rows. Retain accepted token history,
+output reservations and queued commits; recomputed rows must appear once.

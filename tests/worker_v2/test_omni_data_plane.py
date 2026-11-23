@@ -1552,3 +1552,57 @@ def test_reregister_preserves_preemption_but_replaces_resumable_segment(
         assert current.output_token_ids == [21]
     assert plane._native_outputs_in_flight["internal"] == 1
     assert plane._uncommitted_payloads.get("internal") is pending
+
+
+def test_resumable_prefill_replay_after_preemption_stays_aligned(plane):
+    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import thinker2talker_async_chunk
+
+    plane._native_resumable = plane.uses_dflash = True
+    plane._send_side_request_payload = {}
+    plane.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            im_start_token_id=151644,
+            user_token_id=872,
+            talker_config=SimpleNamespace(accept_hidden_layer=24),
+            thinker_config=SimpleNamespace(audio_token_id=151675, image_token_id=151655, video_token_id=151656),
+        )
+    )
+    request = _new_request()
+    request.prompt_token_ids = [151644, 872, 198, 13, 151645, 198, 151644, 77091, 198]
+    request.segment_generation = 0
+    request.num_computed_tokens = 0
+    plane.register_request(request)
+    state = plane._native_requests["internal"]
+    rows = torch.arange(9 * 16, dtype=torch.float32).reshape(9, 16)
+    hidden = torch.arange(9 * 8, dtype=torch.float32).reshape(9, 8)
+
+    def prefill(start, end):
+        payload = {"hidden_states": {"layers": {0: rows[start:end], 24: hidden[start:end]}}, "embed": {}}
+        assert thinker2talker_async_chunk(plane, payload, state.snapshot(include_token_history=True)) is None
+
+    prefill(0, 3)
+    plane.reserve_outputs(["internal"])
+    queue = plane._uncommitted_payloads["internal"]
+    # Same generation, but vLLM reset the computed position for recomputation.
+    plane.register_request(request)
+    assert plane._native_requests["internal"] is state
+    assert plane._native_outputs_in_flight["internal"] == 1
+    assert plane._uncommitted_payloads["internal"] is queue
+    prefill(0, 4)
+    prefill(4, 9)
+    tokens = [1000, 1001]
+    decode_rows = torch.ones(2, 16)
+    chunk = thinker2talker_async_chunk(
+        plane,
+        {
+            "hidden_states": {"layers": {0: decode_rows}},
+            "meta": {"decode_span": True, "committed_token_count": 2},
+            "ids": {"output": tokens},
+        },
+        state.snapshot(include_token_history=True),
+        new_token_ids=tokens[1:],
+    )
+    assert chunk.ids.prompt == request.prompt_token_ids
+    torch.testing.assert_close(chunk.embed.prefill[:-1], rows)
+    torch.testing.assert_close(chunk.hidden_states.output, hidden)
+    assert chunk.embed.prefill.shape[0] == len(chunk.ids.prompt) + 1

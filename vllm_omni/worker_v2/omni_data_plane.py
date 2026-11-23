@@ -368,6 +368,11 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             if previous is not None and (
                 not bool(getattr(request_data, "resumable", False)) or segment_generation == previous.segment_generation
             ):
+                if previous.resumable and int(getattr(request_data, "num_computed_tokens", 0) or 0) == 0:
+                    # Same-generation preemption replays the prompt from zero.
+                    # Rebuild only unpublished prefill rows; keep token history,
+                    # output reservations and queued scheduler commits intact.
+                    self._pending_streaming_prefills.pop(previous.external_req_id, None)
                 return
             if (
                 self._uses_resumable_commits(bool(getattr(request_data, "resumable", False)))
