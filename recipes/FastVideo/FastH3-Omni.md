@@ -92,7 +92,7 @@ curl --fail-with-body -sS http://localhost:8000/v1/videos/sync \
 ```
 
 Control describes only the target video; reference rows receive no control
-hint. The control weights were trained against the base FL2VA transformer, so
+hint. Reference-KV offload (`kv_offload_config`) is rejected with control. The control weights were trained against the base FL2VA transformer, so
 control strength and fidelity on the distilled checkpoint may differ from base H3.
 
 ### Measured on 8x H200

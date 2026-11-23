@@ -1036,11 +1036,14 @@ class MiniMaxH3Pipeline(
                 or resolve_offload(od_config).strategy is not OffloadStrategy.NONE
                 or od_config.host_weight_runtime_mode != "disabled"
                 or od_config.cache_backend not in (None, "none")
+                # Reference-KV reuse drops Ref2VA reference rows from the hidden stream after the
+                # first step, while the control branch needs the full packed sequence.
+                or getattr(od_config, "kv_offload_config", None)
             )
             if unsupported:
                 raise ValueError(
                     "H3 control requires request mode, local VAE encoding, dense weights, "
-                    "and no cache/offload/SP/HSDP; TP is supported"
+                    "and no cache/offload/SP/HSDP or reference-KV offload; TP is supported"
                 )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_distilled_lora_adapter_ids: set[int] = set()

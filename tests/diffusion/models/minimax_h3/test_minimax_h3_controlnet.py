@@ -492,6 +492,16 @@ def test_control_rejects_secondary_or_ref2va_partition_before_loading(control_st
         resolve_root.assert_not_called()
 
 
+def test_control_rejects_reference_kv_offload_before_loading(control_startup):
+    """Reference-KV reuse compacts Ref2VA reference rows out of the stream the control branch needs."""
+    pipeline_module, config = control_startup
+    config.kv_offload_config = {"reference_kv": {"enabled": True}}
+    with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
+        with pytest.raises(ValueError, match="reference-KV offload"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+        resolve_root.assert_not_called()
+
+
 def test_startup_accepts_resident_default_policy(control_startup):
     pipeline_module, config = control_startup
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root", side_effect=RuntimeError("guard accepted")):

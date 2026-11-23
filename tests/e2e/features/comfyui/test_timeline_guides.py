@@ -699,15 +699,46 @@ async def test_generate_video_node_forwards_guides(api_calls):
     assert _value(api_calls, "num_frames") == "124"
 
 
-async def test_generate_video_node_forwards_guides_to_fast_h3_omni(api_calls):
+async def test_generate_video_node_forwards_guides_to_fast_h3_omni_as_ref2va(api_calls):
     fast_h3 = {"url": "http://localhost/v1", "model": H3, "variant": "Omni"}
     chain = _chain((36, {"image": _image()}))
-    assert VLLMOmniGenerateVideo.VALIDATE_INPUTS(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain) is True
+    (references,) = VLLMOmniVideoReferences().get_references(image_1=_image(0.3))
+    assert (
+        VLLMOmniGenerateVideo.VALIDATE_INPUTS(
+            url="u", model="m", fast_h3=fast_h3, timeline_guides=chain, references=references
+        )
+        is True
+    )
     (result,) = await VLLMOmniGenerateVideo().generate(
-        **_node_inputs(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain)
+        **_node_inputs(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain, references=references)
     )
     assert result == b"generated-video"
     assert json.loads(_value(api_calls, "timeline_guides")) == [{"frame_index": 36, "image": {"upload_index": 0}}]
+    assert json.loads(_value(api_calls, "extra_params"))["task"] == "ref2va"
+
+
+@pytest.mark.parametrize("inputs", ["none", "frame", "first_frame", "frame_and_references"])
+async def test_generate_video_node_rejects_fast_h3_omni_guides_without_ref2va(api_calls, encoders, inputs):
+    """No references selects T2VA and frame inputs select FL2VA; FastH3 Omni serves Ref2VA only."""
+    fast_h3 = {"url": "http://localhost/v1", "model": H3, "variant": "Omni"}
+    chain = _chain((36, {"image": _image()}))
+    (references,) = VLLMOmniVideoReferences().get_references(image_1=_image(0.3))
+    extra = {
+        "none": {},
+        "frame": {"frame": _image(0.2)},
+        "first_frame": {"first_frame": _image(0.2)},
+        "frame_and_references": {"first_frame": _image(0.2), "references": references},
+    }[inputs]
+    validation = VLLMOmniGenerateVideo.VALIDATE_INPUTS(
+        url="u", model="m", fast_h3=fast_h3, timeline_guides=chain, **extra
+    )
+    assert isinstance(validation, str)
+    with pytest.raises(ValueError, match="FastH3 Omni serves Ref2VA only|either first_frame/last_frame"):
+        await VLLMOmniGenerateVideo().generate(
+            **_node_inputs(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain, **extra)
+        )
+    api_calls.assert_not_called()
+    assert encoders == []
 
 
 @pytest.mark.parametrize("variant", [None, "Preview"])

@@ -52,9 +52,33 @@ _FASTH3_GUIDES_ERROR = (
 )
 
 
-def _fast_h3_rejects_guides(fast_h3: dict | None, timeline_guides: list[dict] | None) -> bool:
-    """FastH3 Omni accepts timeline guides; FastH3 Preview (a fused T2VA student) does not."""
-    return fast_h3 is not None and timeline_guides is not None and fast_h3.get("variant", "Preview") != "Omni"
+_FASTH3_OMNI_GUIDES_ERROR = (
+    "FastH3 Omni serves Ref2VA only: timeline_guides need the references input and no frame, first_frame or last_frame."
+)
+
+
+def _fast_h3_guides_error(
+    fast_h3: dict | None,
+    timeline_guides: list[dict] | None,
+    *,
+    frame=None,
+    first_frame=None,
+    last_frame=None,
+    references=None,
+) -> str | None:
+    """Reject guides a FastH3 deployment cannot serve before anything is uploaded.
+
+    FastH3 Preview (a fused T2VA student) takes no guides. FastH3 Omni takes them on a Ref2VA
+    request, which the client builds only from the references input; frame inputs select FL2VA
+    and no inputs select T2VA, both of which the Omni checkpoint rejects.
+    """
+    if fast_h3 is None or timeline_guides is None:
+        return None
+    if fast_h3.get("variant", "Preview") != "Omni":
+        return _FASTH3_GUIDES_ERROR
+    if references is None or any(value is not None for value in (frame, first_frame, last_frame)):
+        return _FASTH3_OMNI_GUIDES_ERROR
+    return None
 
 
 def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:
@@ -268,8 +292,16 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return "Provide either frame or first_frame/last_frame, not both."
         if references is not None and (first_frame is not None or last_frame is not None):
             return "Provide either first_frame/last_frame or references, not both."
-        if _fast_h3_rejects_guides(fast_h3, timeline_guides):
-            return _FASTH3_GUIDES_ERROR
+        guides_error = _fast_h3_guides_error(
+            fast_h3,
+            timeline_guides,
+            frame=frame,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            references=references,
+        )
+        if guides_error is not None:
+            return guides_error
         if (
             fast_h3 is not None
             and fast_h3.get("variant", "Preview") == "Preview"
@@ -322,8 +354,16 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         spec_model = model
 
         if fast_h3 is not None:
-            if _fast_h3_rejects_guides(fast_h3, timeline_guides):
-                raise ValueError(_FASTH3_GUIDES_ERROR)
+            guides_error = _fast_h3_guides_error(
+                fast_h3,
+                timeline_guides,
+                frame=frame,
+                first_frame=first_frame,
+                last_frame=last_frame,
+                references=references,
+            )
+            if guides_error is not None:
+                raise ValueError(guides_error)
             if fast_h3.get("variant", "Preview") == "Preview" and any(
                 value is not None for value in (frame, first_frame, last_frame, references)
             ):
