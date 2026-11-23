@@ -286,7 +286,9 @@ class FlashAttention3HubBackend(AttentionBackend):
         return FlashAttention3HubImpl
 
 
-class FlashAttention3HubImpl(AttentionImpl[AttentionMetadata]):
+class FlashAttention3HubImpl(FlashAttentionHubImpl):
+    """Load FA3 kernels while reusing the common Hub execution paths."""
+
     def __init__(
         self,
         num_heads: int,
@@ -311,120 +313,3 @@ class FlashAttention3HubImpl(AttentionImpl[AttentionMetadata]):
         self.flash_attn_varlen_func: Callable[..., Any] | None = getattr(hub_module, "flash_attn_varlen_func", None)
         if self.flash_attn_func is None and self.flash_attn_varlen_func is None:
             raise RuntimeError("Failed to load flash-attn3 kernel from HuggingFace Hub: no functions found")
-
-    @staticmethod
-    def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
-        # FA3 returns (out, lse)
-        return out[0] if isinstance(out, tuple) else out
-
-    def _flash_wrapper(self, q, k, v, *, attn_func, **kwargs):
-        if attn_func is not None:
-            return self._unwrap_flash_output(attn_func(q, k, v, **kwargs))
-        return _run_varlen_dense(
-            _require_varlen_func(self.flash_attn_varlen_func),
-            q,
-            k,
-            v,
-            causal=kwargs.get("causal", self.causal),
-            softmax_scale=kwargs.get("softmax_scale", self.softmax_scale),
-        )
-
-    def _forward_varlen_masked(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input
-
-        assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
-        query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _unpad_hub_input(
-            query, key, value, attention_mask
-        )
-
-        out_unpad = _require_varlen_func(self.flash_attn_varlen_func)(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seq_lens_q,
-            cu_seqlens_k=cu_seq_lens_k,
-            max_seqlen_q=max_length_q,
-            max_seqlen_k=max_length_k,
-            **{
-                "causal": self.causal,
-                "softmax_scale": self.softmax_scale,
-            },
-        )
-        out_unpad = self._unwrap_flash_output(out_unpad)
-        if indices_q is None:
-            return out_unpad.reshape(query.size(0), query_length, *out_unpad.shape[1:])
-        return _pad_input(out_unpad, indices_q, query.size(0), query_length)
-
-    def _forward_varlen_dense(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> torch.Tensor:
-        return _run_varlen_dense(
-            _require_varlen_func(self.flash_attn_varlen_func),
-            query,
-            key,
-            value,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-        )
-
-    def forward_cuda(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
-        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
-
-        # Try piecewise attention
-        if full_attn_spans is not None:
-            logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
-            attn_func = partial(
-                self._flash_wrapper,
-                attn_func=self.flash_attn_func,
-            )
-
-            return piecewise_attn(
-                query,
-                key,
-                value,
-                full_attn_spans,
-                self.softmax_scale,
-                attn_func,
-                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
-            )
-
-        if attention_mask is not None and torch.any(~attention_mask):
-            return self._forward_varlen_masked(
-                query,
-                key,
-                value,
-                attention_mask,
-            )
-
-        if self.flash_attn_func is not None:
-            out = self.flash_attn_func(
-                query,
-                key,
-                value,
-                causal=self.causal,
-                softmax_scale=self.softmax_scale,
-            )
-            return self._unwrap_flash_output(out)
-
-        return self._forward_varlen_dense(
-            query,
-            key,
-            value,
-        )
