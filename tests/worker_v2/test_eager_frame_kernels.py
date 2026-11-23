@@ -262,7 +262,8 @@ def test_eager_mtp_kernels_compile_once_for_every_batch_size(monkeypatch):
     for kernel in (kernels._pre_kernel, kernels._post_kernel, kernels._settled_kernel, kernels._history_kernel):
         kernel.device_caches.clear()
     device = torch.device(DEVICE_TYPE, 0)
-    hidden, nq, vocab, slots_total = 128, 16, 64, 32
+    # Request slots cover the largest batch below (33 rows).
+    hidden, nq, vocab, slots_total = 128, 16, 64, 64
 
     def step(n):
         meta = torch.stack([torch.arange(n, device=device)] * 2 + [torch.zeros(n, device=device)] * 3).long()
