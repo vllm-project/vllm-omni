@@ -1649,6 +1649,17 @@ source_file_dependencies:
     - tests/helpers/
     - tests/conftest.py
 
+  diffusion_wan_vae_spatial_shard:
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/distributed/
+    - vllm_omni/experimental/ar_diffusion/streaming_decode.py
+    - vllm_omni/platforms/
+    - tests/diffusion/distributed/test_wan_spatial_shard.py
+    - tests/helpers/mark.py
+    - tests/conftest.py
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+
   diffusion_collective_parity:
     - vllm_omni/diffusion/distributed/
     - vllm_omni/distributed/

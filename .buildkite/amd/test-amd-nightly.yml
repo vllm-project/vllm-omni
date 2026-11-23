@@ -1557,6 +1557,23 @@ steps:
 
   - group: ":full_moon: Diffusion Collective Parity MI300 Nightly"
     steps:
+      - label: "Wan VAE Spatial-Shard Decode Parity"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: diffusion_wan_vae_spatial_shard
+        artifact_paths:
+          - artifacts/rocm-wan-vae-spatial-shard/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 3 30m rocm-wan-vae-spatial-shard
+            tests/diffusion/distributed/test_wan_spatial_shard.py::test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank
+            tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
       - label: "Diffusion Exchange, Ring and CFG Parity · 2 GPUs"
         agent_pool: mi300_2
         depends_on: amd-build
