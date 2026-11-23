@@ -66,6 +66,7 @@ from vllm_omni.diffusion.mixfusion.scheduling import fits_chunk_budget
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
+    SupportsPreparedDenoiseInputs,
     SupportsSamplingStep,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
@@ -189,6 +190,7 @@ def _abort_stepwise_prep(
     following collective.
     """
     state_cache.pop(state.request_id, None)
+    state.prepared_denoise.release()
     if per_req_exc is None:
         per_req_exc = RuntimeError(f"Stepwise preparation failed on another DiT rank for {state.request_id}")
     logger.error(
@@ -1271,8 +1273,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         for request_id in request_ids:
             state = self.state_cache.pop(request_id, None)
             release = getattr(getattr(self, "pipeline", None), "release_step_request", None)
-            if state is not None and callable(release):
-                release(state)
+            if state is not None:
+                try:
+                    if callable(release):
+                        release(state)
+                finally:
+                    if isinstance(state, StepRequestState):
+                        state.prepared_denoise.release()
         batch = getattr(self, "input_batch", None)
         if batch is not None and any(request_id in batch.request_ids for request_id in request_ids):
             self.input_batch = None
@@ -1358,6 +1365,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         error_outputs: list[RunnerOutput] = []
         for state in states:
             if state.request_id in new_request_ids or state.pending_chunk_boundary:
+                was_chunk_boundary = state.pending_chunk_boundary
                 # Everything that requires rank-synchronization must be called
                 # inside a try, record the exception and handle with `_dit_any_rank_failed`.
                 # Reason (example): An exception in ``_initialize_generator`` or
@@ -1417,6 +1425,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         state,
                         consume_pipeline_stage_durations(pipeline),
                     )
+                    if isinstance(pipeline, SupportsPreparedDenoiseInputs):
+                        if was_chunk_boundary:
+                            state.prepared_denoise.invalidate()
+                        state.prepared_denoise.prepare(lambda: pipeline.prepare_denoise_inputs(state))
                 except Exception as exc:
                     per_req_exc = exc
                 if _dit_any_rank_failed(per_req_exc is not None):
@@ -1431,6 +1443,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             cached_batch=getattr(self, "input_batch", None),
             use_mixfusion=use_mixfusion,
         )
+        bind = getattr(pipeline, "bind_prepared_denoise_inputs", None)
+        if callable(bind):
+            bind_exc: BaseException | None = None
+            try:
+                bind(input_batch)
+            except Exception as exc:
+                bind_exc = exc
+            if _dit_any_rank_failed(bind_exc is not None):
+                for state in prepared_states:
+                    _abort_stepwise_prep(self.state_cache, state, error_outputs, bind_exc)
+                self.input_batch = None
+                return [], None, error_outputs
         self.input_batch = input_batch
         return prepared_states, input_batch, error_outputs
 

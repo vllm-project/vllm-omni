@@ -1807,6 +1807,75 @@ def test_profile_run_preserves_prepared_packing_contract(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_prepared_denoise_inputs_follow_request_and_batch_lifetimes():
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    prepared_ids = []
+    bound_orders = []
+
+    class Pipeline:
+        def prepare_encode(self, state):
+            state.latents = torch.zeros(1, 3)
+            state.timesteps = torch.tensor([1.0])
+
+        def prepare_denoise_inputs(self, state):
+            prepared_ids.append(state.request_id)
+            return torch.tensor(ord(state.request_id))
+
+        def bind_prepared_denoise_inputs(self, batch):
+            bound_orders.append(tuple(value.bind().item() for value in batch.prepared_denoise))
+
+    runner.pipeline = Pipeline()
+    states = [StepRequestState(request_id=rid, sampling=OmniDiffusionSamplingParams()) for rid in ("a", "b")]
+    runner.state_cache = {state.request_id: state for state in states}
+
+    prepared, batch, errors = runner._prepare_batch_inputs(states, ["a", "b"])
+    assert not errors and prepared == states
+    assert batch.request_ids == ["a", "b"]
+    assert prepared_ids == ["a", "b"]
+    assert bound_orders == [(ord("a"), ord("b"))]
+
+    _, batch, errors = runner._prepare_batch_inputs(list(reversed(states)), [])
+    assert not errors and batch.request_ids == ["b", "a"]
+    assert prepared_ids == ["a", "b"]
+    assert bound_orders[-1] == (ord("b"), ord("a"))
+
+    runner.release_step_requests(["a"])
+    assert runner.input_batch is None
+    with pytest.raises(RuntimeError, match="stale"):
+        states[0].prepared_denoise.bind()
+    assert states[1].prepared_denoise.bind().item() == ord("b")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_prepared_denoise_hook_failure_does_not_publish_request_state():
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+
+    class Pipeline:
+        def prepare_encode(self, state):
+            state.latents = torch.zeros(1, 3)
+            state.timesteps = torch.tensor([1.0])
+
+        def prepare_denoise_inputs(self, state):
+            if state.request_id == "bad":
+                raise ValueError("invalid geometry")
+            return torch.ones(1)
+
+    runner.pipeline = Pipeline()
+    states = [StepRequestState(request_id=rid, sampling=OmniDiffusionSamplingParams()) for rid in ("bad", "good")]
+    runner.state_cache = {state.request_id: state for state in states}
+
+    prepared, batch, errors = runner._prepare_batch_inputs(states, ["bad", "good"])
+    assert [state.request_id for state in prepared] == ["good"]
+    assert batch.request_ids == ["good"]
+    assert [error.request_id for error in errors] == ["bad"]
+    with pytest.raises(RuntimeError, match="stale"):
+        states[0].prepared_denoise.bind()
+    assert states[1].prepared_denoise.bind().item() == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_preparation_failure_recomputes_layout_for_surviving_request():
     import inspect
 

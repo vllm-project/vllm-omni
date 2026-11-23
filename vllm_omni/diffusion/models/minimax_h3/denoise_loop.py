@@ -23,6 +23,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.prepared_denoise import PreparedDenoiseInputs, prepared_denoise_scope
 from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
@@ -129,6 +130,7 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        self.prepared_rope: PreparedDenoiseInputs[object] | None = None
         # Where the video segment sits in the packed sequence. Resolved to plain
         # ints here so the attention layers never sync on it per step.
         raw_spans = packed.get("video_spans")
@@ -165,21 +167,26 @@ class MiniMaxH3DenoiseBranch:
                 latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
             )
 
-    def prepare_rope_table(self, model: Any) -> None:
-        """Materialize the branch-local DiT RoPE table once per denoise run.
+    def build_rope_table(self, model: Any) -> torch.Tensor | None:
+        """Compute the branch-local DiT RoPE table from fixed position IDs.
 
         ``img_position_ids`` is immutable for this branch while latents and
-        timesteps change every scheduler step. Keeping the table in
-        ``static_kwargs`` makes every model call reuse the exact same BF16
-        tensor without extending its lifetime beyond this request branch.
+        timesteps change every scheduler step. The runtime owns the result.
         """
         prepare = getattr(model, "prepare_rope_table", None)
         if not callable(prepare):
-            return
-        self.static_kwargs["rope_table"] = prepare(
-            self.static_kwargs["img_position_ids"],
-            seq_len=self.seq_len,
-        )
+            return None
+        return prepare(self.static_kwargs["img_position_ids"], seq_len=self.seq_len)
+
+    def prepare_rope_table(self, model: Any) -> None:
+        """Retain the existing static-kwargs path for TaoMate-H3 consumers."""
+        rope_table = self.build_rope_table(model)
+        if rope_table is not None:
+            self.static_kwargs["rope_table"] = rope_table
+
+    def bind_prepared_rope(self, prepared: PreparedDenoiseInputs[object]) -> None:
+        """Attach the request-owned result selected by the current batch view."""
+        self.prepared_rope = prepared if prepared.bind() is not None else None
 
     def forward_kwargs(
         self,
@@ -210,6 +217,7 @@ class MiniMaxH3DenoiseBranch:
         unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,
+            **({"rope_table": self.prepared_rope.bind()} if self.prepared_rope is not None else {}),
             "x": x,
             "audio_x": audio_x,
             "unique_timesteps": unique_timesteps,
@@ -388,8 +396,6 @@ def minimax_h3_denoise_loop(
     # Keep CUDA/CPU on the reference path: its accuracy CI compares the
     # generated video against the official artifact. The table reuse is an
     # Ascend-specific performance optimization and must not alter that path.
-    if current_omni_platform.is_npu():
-        positive.prepare_rope_table(model)
     video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,
@@ -484,13 +490,18 @@ def minimax_h3_denoise_loop(
         return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
 
     try:
-        with torch.inference_mode():
-            sampler_object(sampler).sample(
-                MiniMaxH3ModelBatch({state: adapter}),
-                [state],
-                callback=write_back_and_update_progress,
-                step_context=step_context,
-            )
+        prepare_rope = current_omni_platform.is_npu()
+        with prepared_denoise_scope(
+            prepare=(lambda: positive.build_rope_table(model)) if prepare_rope else None,
+            bind=positive.bind_prepared_rope if prepare_rope else None,
+        ):
+            with torch.inference_mode():
+                sampler_object(sampler).sample(
+                    MiniMaxH3ModelBatch({state: adapter}),
+                    [state],
+                    callback=write_back_and_update_progress,
+                    step_context=step_context,
+                )
     finally:
         minimax_h3_publish_denoise_progress(None, None, None)
         if reference_kv_state is not None:
