@@ -14,6 +14,18 @@ from ..native.mh_moe import (
 )
 from ..native.mh_moe import swiglu7_pair
 
+# At 540p each active rank routes 121,010 tokens x 2 local MoE heads x top-6 = 1,452,120
+# expert rows in one call. Each BF16 projection over those rows is 3.46 GiB, and swiglu7_pair
+# casts both to FP32 at 6.92 GiB each. A 6.93 GiB allocation of that shape is what fails on a
+# 64 GiB card: ranks 0-5 each report it in the first routed layer of the first denoising step,
+# while ranks 6-7 hold expert-parallel padding only. That log has no stack, so which FP32
+# temporary failed is not identified.
+#
+# Routing is per token and grouped MatMul is per row, so slicing the token axis and
+# concatenating the slices is the same function: it bounds the intermediates and leaves the
+# values untouched.
+MOE_TOKEN_CHUNK = 16384
+
 
 def npu_mh_moe_forward(
     x: torch.Tensor,
@@ -23,8 +35,13 @@ def npu_mh_moe_forward(
     w_gate: torch.Tensor,
     w_up: torch.Tensor,
     w_down: torch.Tensor,
+    *,
+    token_chunk: int = MOE_TOKEN_CHUNK,
 ) -> torch.Tensor:
-    """Ascend grouped-MatMul path for independently routed MAGI-2 MoE heads."""
+    """Ascend grouped-MatMul path for independently routed MAGI-2 MoE heads.
+
+    Tokens are routed ``token_chunk`` at a time; ``0`` routes them in one call.
+    """
 
     if x.ndim != 3:
         raise ValueError("multi-head MoE input must be [tokens,heads,head_dim]")
@@ -44,6 +61,24 @@ def npu_mh_moe_forward(
         )
     if w_gate.shape[0] != num_flat_experts:
         raise ValueError(f"expected {num_flat_experts} flattened experts, got {w_gate.shape[0]}")
+
+    if 0 < token_chunk < sequence:
+        return torch.cat(
+            [
+                npu_mh_moe_forward(
+                    x[start : start + token_chunk],
+                    topk_probs[:, start : start + token_chunk],
+                    topk_indices[:, start : start + token_chunk],
+                    num_experts,
+                    w_gate,
+                    w_up,
+                    w_down,
+                    token_chunk=0,
+                )
+                for start in range(0, sequence, token_chunk)
+            ],
+            dim=0,
+        )
 
     top_k = topk_indices.shape[-1]
     flat_x = x.reshape(sequence * heads, head_dim).contiguous()

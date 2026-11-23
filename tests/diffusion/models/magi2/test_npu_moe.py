@@ -89,6 +89,33 @@ def test_npu_mh_moe_forward_matches_native_reference(npu_device, tokens, heads, 
     torch.testing.assert_close(actual.cpu(), expected, rtol=2e-2, atol=2e-2)
 
 
+@hardware_test(res={"npu": "A2"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
+@pytest.mark.parametrize(
+    "token_chunk",
+    [1, 5, 64, 128],
+    ids=["per-token", "ragged-tail", "even-with-remainder", "tail-of-one"],
+)
+def test_npu_mh_moe_token_chunking_is_bit_identical(npu_device, token_chunk):
+    """Each token routes independently, so slicing the token axis must not move a bit."""
+
+    x, probabilities, indices, gate, up, down = _fixed_route_inputs(129, 2, 4)
+    args = (
+        x.to(npu_device),
+        probabilities.to(npu_device),
+        indices.to(npu_device),
+        4,
+        gate.to(npu_device),
+        up.to(npu_device),
+        down.to(npu_device),
+    )
+    with torch.no_grad():
+        unchunked = npu_moe.npu_mh_moe_forward(*args, token_chunk=0)
+        chunked = npu_moe.npu_mh_moe_forward(*args, token_chunk=token_chunk)
+
+    assert torch.equal(chunked, unchunked)
+
+
 @hardware_test(res={"npu": "A5"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
 def test_npu_local_forward_uses_real_routing_and_grouped_matmuls(npu_device, mocker):
