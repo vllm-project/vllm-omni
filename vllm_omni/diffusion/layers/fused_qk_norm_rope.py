@@ -53,6 +53,8 @@ _FUSED_ROTARY_DIM = 96
 # Interleaved-mode geometry bounds (any even rotary_dim <= head_dim <= this).
 _FUSED_MAX_HEAD_DIM = 256
 _HEADS_PER_PROGRAM = 8
+# The per-token Q/K kernel unrolls this many head groups of _HEADS_PER_PROGRAM heads each.
+_TOKEN_QK_MAX_GROUPS = 8
 # The combined interleaved kernel: one warp per program, eight heads per
 # program (bitwise-identical to four; faster in 51 of 52 measured H200 cases
 # across 320 to 16K tokens and 8 to 64 heads, slower only at 20 heads, by 2.6%).
@@ -237,6 +239,7 @@ if HAS_TRITON:
         heads_per_program: tl.constexpr,
     ):
         """Half-split RMSNorm + RoPE of every head of one token of Q (even programs) or K (odd programs)."""
+        tl.static_assert(num_heads <= 8 * heads_per_program)  # eight unrolled head groups below
         pid = tl.program_id(0)
         token = (pid // 2).to(tl.int64)
         if pid % 2 == 0:
@@ -846,7 +849,7 @@ def _token_qk_norm_rope_supported(q: torch.Tensor, k: torch.Tensor) -> bool:
     return (
         q.shape == k.shape
         and q.dtype == torch.bfloat16
-        and q.shape[1] <= 64
+        and q.shape[1] <= _TOKEN_QK_MAX_GROUPS * _HEADS_PER_PROGRAM
         and q.stride(2) == 1
         and k.stride(2) == 1
         and q.stride(1) == q.shape[2]

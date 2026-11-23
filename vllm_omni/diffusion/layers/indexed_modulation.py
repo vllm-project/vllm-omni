@@ -253,7 +253,8 @@ def _indexed_gate_impl(
     rows, hidden_size = x.shape
     if rows == 0:
         return output
-    if x.device.type == "cuda":
+    # Measured and checked bit-identical on NVIDIA only; ROCm keeps the row kernel.
+    if x.device.type == "cuda" and torch.version.hip is None:
         _indexed_gate_column_tiled_kernel[(rows, triton.cdiv(hidden_size, _GATE_BLOCK_N))](
             output,
             x,
