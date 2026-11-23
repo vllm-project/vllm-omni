@@ -5,6 +5,7 @@
 
 import asyncio
 import base64
+from dataclasses import replace
 
 import pytest
 import torch
@@ -182,19 +183,37 @@ async def test_text_continuation_rearms_after_queued_audio_stays_partial(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_text_continuation_does_not_skip_a_complete_buffered_audio_unit():
+@pytest.mark.parametrize("partial_samples", [0, 8000])
+async def test_text_drains_complete_buffered_audio_and_finishes_without_more_input(partial_samples):
     h = await open_harness()
     try:
-        await h.run(append_audio(samples=32000))
+        audio = replace(append_audio(samples=48000 + partial_samples), hints={"force_listen": True})
+        await h.run(audio)
         await h.run(commands.AppendText(text="Answer now."))
-        await h.deliver_and_settle(_text_output(h.stage0_request_id()), stage_id=0, model_turn_id=0)
-        assert h.session.pending_input_bytes == 16000 * 4
-        await h.runner.model.maybe_continue_response(
-            expected_epoch=h.session.epoch, expected_response_id=h.session.active_response_id
+        inputs = [s.prompt["model_intermediate_buffer"]["duplex"]["payload"] for s in h.port.submissions]
+        assert [p["type"] for p in inputs] == ["audio", "audio", "audio", "text"]
+        assert b"".join(base64.b64decode(p["audio"]) for p in inputs[:-1]) == audio.audio[: 48000 * 4]
+        assert all(p["force_listen"] is True for p in inputs[:-1])
+        assert h.session.pending_input_bytes == partial_samples * 4
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            _text_output(h.stage0_request_id(), empty=True), stage_id=0, segment_finished=True, model_turn_id=0
         )
-        assert len(h.port.submissions) == 2
-        assert h.runner.model_state.continuation_units == 0
-        assert h.session.pending_input_bytes == 16000 * 4
+        assert len(h.port.submissions) == 5
+        assert h.runner.model_state.continuation_units == 1
+        events = await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), tts_is_last_chunk=True, turn_end=True, finished=True)
+        )
+        done = [e for e in events if e.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response_id
+        assert done[0].status == "completed"
+        assert h.session.pending_input_bytes == partial_samples * 4
+        if partial_samples:
+            tail = append_audio(samples=16000 - partial_samples, value=0.1)
+            await h.run(tail)
+            payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+            assert base64.b64decode(payload["audio"]) == audio.audio[48000 * 4 :] + tail.audio
+            assert h.session.pending_input_bytes == 0
     finally:
         await close_harness(h)
 
@@ -297,12 +316,114 @@ async def test_empty_text_unit_opens_its_own_response_during_talker_overlap(prev
             model_turn_id=1,
         )
         assert "error" not in types(events)
+        if not previous_talker_finished:
+            assert h.session.active_response_id == old_response_id
+            assert "response.done" not in types(events)
+            assert "response.created" not in types(events)
+            assert len(h.port.submissions) == 2
+            events = await h.deliver_and_settle(
+                tts_output(
+                    h.stage0_request_id(),
+                    samples=48000,
+                    text="First reply done",
+                    turn_id=0,
+                    tts_is_last_chunk=True,
+                    turn_end=True,
+                    finished=True,
+                )
+            )
+            audio = [e for e in events if e.type == "response.output_audio.delta"]
+            assert len(audio) == 1 and audio[0].response_id == old_response_id
+            assert audio[0].delta == "wav-24000"
+            done = [e for e in h.events if e.type == "response.done" and e.response_id == old_response_id]
+            assert len(done) == 1 and done[0].status == "completed"
+            assert events.index(audio[0]) < events.index(done[0])
+            assert events.index(done[0]) < types(events).index("response.created")
         assert "response.created" in types(events)
         assert h.session.active_response_id not in (None, old_response_id)
         assert h.session.active_response_turn_id == 1
         assert len(h.port.submissions) == 3
         assert h.runner.model_state.continuation_units == 1
         assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 32000
+        new_response_id = h.session.active_response_id
+        events = await h.deliver_and_settle(
+            tts_output(
+                h.stage0_request_id(),
+                samples=72000,
+                text="Second reply",
+                turn_id=1,
+                tts_is_last_chunk=True,
+                turn_end=True,
+                finished=True,
+            )
+        )
+        done = [e for e in events if e.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == new_response_id
+        assert done[0].status == "completed"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancel_discards_empty_text_waiting_for_previous_tail():
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), text="First reply"))
+        await h.run(commands.AppendText(text="Second question."))
+        old_request_id = h.stage0_request_id()
+        await h.deliver_and_settle(
+            _text_output(old_request_id, empty=True), stage_id=0, segment_finished=True, model_turn_id=1
+        )
+        await h.run(commands.BargeIn())
+        assert h.session.epoch == 1
+        events = await h.deliver_and_settle(
+            tts_output(old_request_id, samples=48000, turn_end=True, finished=True), epoch=0
+        )
+        assert "response.created" not in types(events)
+        assert h.session.active_response_id is None
+        assert len(h.port.submissions) == 2
+        # Fresh output in the new epoch must not replay the deferred old listen.
+        await h.run(append_audio())
+        events = await h.deliver_and_settle(
+            tts_output(
+                h.stage0_request_id(),
+                epoch=1,
+                turn_id=h.session.turn_id,
+                tts_is_last_chunk=True,
+                turn_end=True,
+                finished=True,
+            )
+        )
+        assert types(events).count("response.created") == 1
+        assert types(events).count("response.done") == 1
+        assert h.session.active_response_id is None
+        assert len(h.port.submissions) == 3
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["\ud800", "hello\udfff"])
+async def test_unencodable_text_is_refused_without_breaking_dispatch(text):
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        command = commands.command_from_realtime(
+            {"type": "input.text.append", "text": text, "event_id": "invalid-utf8"}
+        )
+        events = await h.run(command)
+        assert types(events) == ["error"]
+        assert events[0].code == "bad_event"
+        assert events[0].related_event_id == "invalid-utf8"
+        assert h.session.pending_input_bytes == 0
+        assert not h.port.submissions
+        events = await h.run(commands.AppendText(text="你好", force_listen=True))
+        assert "error" not in types(events)
+        assert len(h.port.submissions) == 1
+        assert h.session.pending_input_bytes == 0
+        events = await h.run(commands.GetSessionStats(event_id="still-dispatching"))
+        assert types(events) == ["session.stats"]
+        assert events[0].request_event_id == "still-dispatching"
     finally:
         await close_harness(h)
 

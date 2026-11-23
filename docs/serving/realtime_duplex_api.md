@@ -2244,7 +2244,8 @@ before answering, send `force_listen: true` on **both** the intermediate text
 and audio events, then release it on the final text fragment. The low-level
 `client.send` method can set this hint on an audio event.
 
-Text and completed media units use the same ordered append queue. A partial
+Text and completed media units use the same ordered append queue. Complete
+buffered media units are submitted before the next text fragment. A partial
 microphone unit stays buffered while a text unit is prefilled; text does not
 advance the audio clock or consume the partial PCM. With the default silence
 continuation enabled, that partial unit does not block the text-triggered
@@ -2253,7 +2254,8 @@ later audio completes its unit or an audio commit flushes it. To include all
 microphone samples in the answer, finish or commit the audio before releasing
 the final text fragment. Queued appends and complete media units retain
 priority over generated silence. Text is subject to the
-session's pending-input byte limit, counted as UTF-8. Empty text and manual
+session's pending-input byte limit, counted as UTF-8. Text that cannot be encoded
+as UTF-8 is rejected with `bad_event` for that event. Empty text and manual
 `auto_response: false` sessions are rejected. This capability is separate from
 `supports_text_only_turn`, which controls `conversation.item.create` followed
 by `response.create`; that message-based path is unchanged.

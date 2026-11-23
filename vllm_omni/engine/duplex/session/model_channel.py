@@ -191,6 +191,7 @@ class ModelChannel:
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
+        self._deferred_text_listen: tuple[int, dict[str, object]] | None = None
 
     def is_input_transcription(self, request_id: str) -> bool:
         return request_id in self._input_transcriptions
@@ -616,6 +617,7 @@ class ModelChannel:
     def cancel_data_plane_stream(self) -> bool:
         had_stream = self._ctx.run.stream_request_id is not None
         self._input_transcriptions.clear()
+        self._deferred_text_listen = None
         self._ctx.run.stream_request_id = None
         return had_stream
 
@@ -934,6 +936,17 @@ class ModelChannel:
             close_reason = close_reason or close_reason_for_result
             if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
                 return None, emitted_response
+        pending = self._deferred_text_listen
+        if pending is not None and session.active_response_id is None:
+            self._deferred_text_listen = None
+            pending_epoch, pending_result = pending
+            pending_turn = coerce_int(pending_result.get("model_turn_id"))
+            if pending_epoch == session.epoch and pending_turn is not None and pending_turn >= session.turn_id:
+                pending_close, pending_emitted = await self._send_one_model_output_event(
+                    pending_result, expected_epoch=pending_epoch
+                )
+                close_reason = close_reason or pending_close
+                emitted_response = emitted_response or pending_emitted
         return close_reason, emitted_response
 
     def _fail_response_from_model_error(self, model_result: dict[str, object]) -> None:
@@ -1068,6 +1081,18 @@ class ModelChannel:
         auto_response = self._out.auto_responds()
         close_reason: str | None = None
         emitted_response = False
+        if (
+            auto_response
+            and model_result.get("continue_with_partial_input") is True
+            and model_turn_id is not None
+            and session.active_response_turn_id is not None
+            and model_turn_id > session.active_response_turn_id
+        ):
+            # The empty next-turn unit has no Talker output to wait for, but
+            # the previous response still owns its outstanding tail audio.
+            # Replay this listen after that response ends, on the same mailbox.
+            self._deferred_text_listen = (session.epoch, model_result)
+            return close_reason, emitted_response
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
         if self._ctx.run.closing:
             return close_reason, emitted_response

@@ -42,10 +42,13 @@ and serves sessions only. See [process runtime usage, ownership, and limits](../
 
 `AppendText` is admitted only when the model advertises `text` as an input
 modality. MiniCPM-o consumes each fragment as a native TEXT unit in automatic
-response mode. The manager charges UTF-8 bytes before mailbox admission; the
+response mode. The manager rejects text that cannot be encoded as UTF-8 with a
+request-scoped `bad_event`, then charges UTF-8 bytes before mailbox admission; the
 runner keeps that charge until its ordered append task completes or is
 cancelled. Text shares the audio/video append tail and epoch fencing, without
-flushing partial PCM or advancing the first audio-encoder window.
+flushing partial PCM or advancing the first audio-encoder window. Before queuing
+text, the runner submits any complete buffered media units through that same
+append tail, preserving their input flags and leaving incomplete PCM buffered.
 
 The MiniCPM plugin tokenizes off the owner loop and reserves exactly the
 context/previous-unit closure, `<unit>`, and text tokens. Stage 0 embeds these
@@ -64,7 +67,8 @@ generated silence. Stage 0 confirms this exception for the epoch and model turn
 that consumed the text, using the bridge's turn snapshot before handoff. The
 active response at text admission may still belong to the previous Talker turn;
 it must not receive the new turn's continuation permission. An empty first unit
-also opens the new turn's response before continuing. The exception does not
+waits for the previous response's final audio and `response.done` before opening
+the new response and continuing. Cancellation discards this deferred unit. The exception does not
 carry over to a later audio-only response or a new epoch. Disabling silence continuation or
 using the input clock still prevents synthetic units.
 The Talker handoff skips those completed control units in cumulative output

@@ -365,11 +365,15 @@ class DuplexSessionManager:
                 return
         if isinstance(command, AppendAudio | AppendText):
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            pending_bytes = (
-                len(command.text.encode("utf-8"))
-                if isinstance(command, AppendText)
-                else len(command.audio) + sum(len(frame) for frame in command.video_frames)
-            )
+            try:
+                pending_bytes = (
+                    len(command.text.encode("utf-8"))
+                    if isinstance(command, AppendText)
+                    else len(command.audio) + sum(len(frame) for frame in command.video_frames)
+                )
+            except UnicodeEncodeError:
+                self.emit(session, [self._error_event("bad_event", "Text must be valid UTF-8", command=command)])
+                return
             if not session.reserve_input_bytes(pending_bytes, limit=limit, queued=True):
                 self.emit(
                     session,

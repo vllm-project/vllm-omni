@@ -209,11 +209,12 @@ class PcmAppendBuffer(ABC):
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
 
     def prepare_backlog(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
-        """Reserve one more whole unit from audio already buffered, if there is one (input-clocked sessions).
+        """Reserve one more complete buffered media unit, leaving partial PCM.
 
         After an append emitted its unit, an input-clocked session calls this
         until it returns ``None``, so an append longer than one unit submits
         every whole unit it completed and is acknowledged after all of them.
+        Text appends also drain these units first, preserving media/text order.
         Default: ``None`` (one unit per append; the rest waits for later
         appends).
         """

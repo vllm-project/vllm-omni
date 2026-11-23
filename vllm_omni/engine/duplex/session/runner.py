@@ -1185,6 +1185,9 @@ class DuplexSessionRunner:
                 if not self._session_auto_responds():
                     self._emit_error("bad_event", "Text append requires auto_response=true", event_id=command.event_id)
                     return
+                self._reset_failed_append_tail()
+                if not await self._submit_buffered_media():
+                    return
                 session.mark_user_input_activity()
                 task = await self._start_append(
                     {"type": "text", "text": command.text, "force_listen": command.force_listen is True},
@@ -2070,20 +2073,22 @@ class DuplexSessionRunner:
         if self._input_clock is not None and allow_emit:
             # Input-clocked sessions: submit every whole unit this append
             # completed, so its acknowledgement covers all of them.
-            while (
-                self._append_chain_healthy()
-                and (
-                    backlog := model_state.audio_buffer.prepare_backlog(
-                        operation_id=uuid.uuid4().hex, chunk_period_ms=session.capabilities.chunk_period_ms or 1000
-                    )
-                )
-                is not None
-            ):
-                if backlog.payload is None:
-                    backlog.rollback()
-                    break
-                await self._start_append(backlog.payload, final=False, pcm_reservation=backlog)
+            await self._submit_buffered_media()
         await self._maybe_commit_vad_turn(vad_result)
+
+    async def _submit_buffered_media(self) -> bool:
+        """Queue complete buffered units in wire order, retaining partial PCM."""
+        while self._append_chain_healthy():
+            backlog = self.model_state.audio_buffer.prepare_backlog(
+                operation_id=uuid.uuid4().hex, chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000
+            )
+            if backlog is None:
+                return True
+            if backlog.payload is None:
+                backlog.rollback()
+                return True
+            await self._start_append(backlog.payload, final=False, pcm_reservation=backlog)
+        return False
 
     def _append_chain_healthy(self) -> bool:
         """Whether more of the buffered audio may be submitted: the session is open and no append in it failed."""
