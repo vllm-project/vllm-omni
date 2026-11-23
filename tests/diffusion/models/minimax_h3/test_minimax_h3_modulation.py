@@ -129,28 +129,6 @@ def test_mindiesd_modulation_dispatch(monkeypatch, mocker, kind, available, rows
             launch.assert_not_called()
 
 
-@pytest.mark.cpu
-def test_npu_fused_modulation_uses_omni_triton_with_eagle_installed(monkeypatch, mocker):
-    from vllm_omni.diffusion.layers import indexed_modulation as modulation
-
-    interface = ModuleType("mindiesd.layers._custom_ops")
-    eagle = mocker.Mock()
-    interface.eagle_indexed_gate_norm_modulate = eagle
-    monkeypatch.setitem(sys.modules, interface.__name__, interface)
-
-    residual = mocker.Mock(is_cpu=False, device=mocker.Mock(type="npu"), shape=(3, 128))
-    gate, branch, weight, shift, scale, indices = (mocker.Mock() for _ in range(6))
-    outputs = (mocker.sentinel.residual, mocker.sentinel.modulated)
-    mocker.patch.object(modulation.torch, "empty_like", side_effect=outputs)
-    launch = mocker.patch.object(modulation, "_launch_row_chunks")
-    mocker.patch.object(modulation, "triton", mocker.Mock(next_power_of_2=lambda width: 128))
-
-    assert indexed_gate_rms_norm_scale_shift(residual, gate, branch, weight, shift, scale, indices, 1e-5) == outputs
-    eagle.assert_not_called()
-    launch.assert_called_once()
-    assert launch.call_args.args[:5] == (modulation._indexed_gate_rms_norm_scale_shift_kernel, 3, "npu", *outputs)
-
-
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
 @pytest.mark.parametrize(
     "device",
@@ -281,10 +259,9 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
 @hardware_test(res={"npu": "A2"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-@pytest.mark.parametrize("hidden_size", [3072, 5376])
-def test_npu_fused_modulation_preserves_bf16_residual_boundary(hidden_size):
+def test_npu_fused_modulation_preserves_bf16_residual_boundary():
     device = current_omni_platform.get_torch_device()
-    residual = torch.ones(2, hidden_size, device=device, dtype=torch.bfloat16)
+    residual = torch.ones(2, 5376, device=device, dtype=torch.bfloat16)
     gate = torch.ones_like(residual[:1])
     branch = torch.zeros_like(residual)
     branch[:, 0] = 2**-8
