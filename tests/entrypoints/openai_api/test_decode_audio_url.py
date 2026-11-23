@@ -5,12 +5,14 @@
 import asyncio
 import base64
 import os
+import runpy
 import tempfile
 
 import httpx
 import pytest
+from vllm import envs
 
-from vllm_omni.entrypoints.openai import video_api_utils
+from vllm_omni.entrypoints.openai import media_input, video_api_utils
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url
 
@@ -33,6 +35,27 @@ def _install_http_transport(monkeypatch, handler):
         return async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+
+
+@pytest.mark.parametrize("general_limit_mb", [1, 0, -1])
+@pytest.mark.parametrize("url_kind", ["http", "data"])
+def test_zero_audio_limit_rejects_nonempty_audio(monkeypatch, general_limit_mb, url_kind):
+    monkeypatch.setattr(envs, "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", general_limit_mb)
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", 0)
+    # Read the startup configuration without reloading the imported module.
+    assert media_input.__file__ is not None
+    configured_limit = runpy.run_path(media_input.__file__)["MAX_AUDIO_INPUT_BYTES"]
+    monkeypatch.setattr(video_api_utils, "MAX_AUDIO_INPUT_BYTES", configured_limit)
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", lambda **kwargs: pytest.fail("Audio must not be written"))
+
+    if url_kind == "http":
+        _install_http_transport(monkeypatch, lambda request: httpx.Response(200, content=b"audio"))
+        url = "https://93.184.216.34/audio.wav"
+    else:
+        url = "data:audio/wav;base64,YXVkaW8="
+
+    with pytest.raises(media_input.MediaInputTooLargeError, match="0 MiB size limit"):
+        _run(decode_audio_url(url))
 
 
 class TestDecodeAudioUrlDataUrl:

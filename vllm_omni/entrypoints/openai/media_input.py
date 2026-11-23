@@ -13,6 +13,7 @@ import asyncio
 import binascii
 import ipaddress
 import socket
+from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Final
@@ -26,22 +27,22 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 _MIB: Final = 1024 * 1024
 
 
-def _limit_bytes_from_megabytes(megabytes: int) -> int | None:
+def _general_limit_bytes(megabytes: int) -> int | None:
+    """Convert the optional general media ceiling to bytes."""
     return None if megabytes <= 0 else megabytes * _MIB
 
 
-def _strictest_enabled_limit(*limits: int | None) -> int | None:
-    enabled_limits = [limit for limit in limits if limit is not None]
-    return min(enabled_limits) if enabled_limits else None
+def _audio_limit_bytes(megabytes: int, general_limit: int | None) -> int:
+    """Keep the audio ceiling in effect even when it allows zero bytes."""
+    audio_limit = max(0, megabytes) * _MIB
+    return audio_limit if general_limit is None else min(general_limit, audio_limit)
 
 
 # Keep these limits aligned with the vLLM 0.34.0 media configuration.
-MAX_IMAGE_INPUT_BYTES: Final[int | None] = _limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
-MAX_VIDEO_INPUT_BYTES: Final[int | None] = _limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
-MAX_AUDIO_INPUT_BYTES: Final[int | None] = _strictest_enabled_limit(
-    _limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB),
-    _limit_bytes_from_megabytes(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB),
-)
+_GENERAL_INPUT_BYTES: Final = _general_limit_bytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
+MAX_IMAGE_INPUT_BYTES: Final = _GENERAL_INPUT_BYTES
+MAX_VIDEO_INPUT_BYTES: Final = _GENERAL_INPUT_BYTES
+MAX_AUDIO_INPUT_BYTES: Final = _audio_limit_bytes(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB, _GENERAL_INPUT_BYTES)
 MEDIA_DOWNLOAD_TIMEOUT_S: Final = 60.0
 _READ_CHUNK_SIZE: Final = 64 * 1024
 _MAX_REDIRECTS: Final = 20
@@ -71,8 +72,8 @@ def decode_base64_media(data: str, *, max_bytes: int | None, source: str) -> byt
         InvalidInputReferenceError: If the payload is malformed or empty.
         MediaInputTooLargeError: If the encoded or decoded payload exceeds the limit.
     """
-    if max_bytes is not None and max_bytes <= 0:
-        raise ValueError("max_bytes must be positive")
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
     if not data:
         raise InvalidInputReferenceError(f"Invalid {source}: media data is empty.")
 
@@ -80,7 +81,7 @@ def decode_base64_media(data: str, *, max_bytes: int | None, source: str) -> byt
         max_encoded_length = 4 * ((max_bytes + 2) // 3)
         if len(data) > max_encoded_length:
             raise MediaInputTooLargeError(
-                f"Invalid {source}: media data exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
+                f"Invalid {source}: media data exceeds the {max_bytes // _MIB} MiB size limit."
             )
 
     try:
@@ -89,16 +90,15 @@ def decode_base64_media(data: str, *, max_bytes: int | None, source: str) -> byt
         raise InvalidInputReferenceError(f"Invalid {source}: media data is not valid base64.") from exc
 
     if max_bytes is not None and len(decoded) > max_bytes:
-        raise MediaInputTooLargeError(
-            f"Invalid {source}: media data exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
-        )
+        raise MediaInputTooLargeError(f"Invalid {source}: media data exceeds the {max_bytes // _MIB} MiB size limit.")
     return decoded
 
 
 @asynccontextmanager
 async def _stream_media_response(
-    client: httpx.AsyncClient, url: httpx.URL, *, source: str
+    client: httpx.AsyncClient, url: httpx.URL, *, source: str, cookies: httpx.Cookies
 ) -> AsyncIterator[httpx.Response]:
+    """Connect to a checked address and match cookies against the logical URL."""
     if url.scheme not in ("http", "https") or not url.host or url.userinfo:
         raise InvalidInputReferenceError(f"Invalid {source}: expected an HTTP(S) URL without credentials.")
 
@@ -110,6 +110,8 @@ async def _stream_media_response(
     except OSError as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: could not resolve the media host.") from exc
 
+    request = httpx.Request("GET", url, headers={"Accept-Encoding": "identity"})
+    cookies.set_cookie_header(request)
     connect_error: httpx.ConnectError | None = None
     async with AsyncExitStack() as stack:
         for _, _, _, _, sockaddr in addresses:
@@ -126,15 +128,19 @@ async def _stream_media_response(
             try:
                 response = await stack.enter_async_context(
                     client.stream(
-                        "GET",
+                        request.method,
                         target,
-                        headers={"Accept-Encoding": "identity", "Host": url.netloc.decode("ascii")},
+                        headers=request.headers,
                         extensions={"sni_hostname": hostname},
                     )
                 )
             except httpx.ConnectError as exc:
                 connect_error = exc
             else:
+                # HTTPX's client jar is keyed to the connection address. Use the logical URL for cookies.
+                client.cookies.clear()
+                response.request = request
+                cookies.extract_cookies(response)
                 yield response
                 return
 
@@ -178,8 +184,8 @@ async def download_media_bytes(
         MediaInputTooLargeError: If the response exceeds ``max_bytes``.
         MediaInputTimeoutError: If the total download time is exceeded.
     """
-    if max_bytes is not None and max_bytes <= 0:
-        raise ValueError("max_bytes must be positive")
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
     if timeout_s <= 0:
         raise ValueError("timeout_s must be positive")
 
@@ -195,8 +201,12 @@ async def download_media_bytes(
             ) as client:
                 current_url = httpx.URL(url)
                 redirect_count = 0
+                cookies_by_origin: defaultdict[tuple[str, bytes], httpx.Cookies] = defaultdict(httpx.Cookies)
                 while True:
-                    async with _stream_media_response(client, current_url, source=source) as response:
+                    origin = (current_url.scheme, current_url.netloc)
+                    async with _stream_media_response(
+                        client, current_url, source=source, cookies=cookies_by_origin[origin]
+                    ) as response:
                         if response.has_redirect_location:
                             if not follow_redirects:
                                 response.raise_for_status()
@@ -206,8 +216,6 @@ async def download_media_bytes(
                                     request=response.request,
                                 )
                             current_url = current_url.join(response.headers["location"])
-                            # The cookie jar would otherwise scope cookies to the pinned IP.
-                            client.cookies.clear()
                             redirect_count += 1
                             continue
 
@@ -227,15 +235,14 @@ async def download_media_bytes(
                                 declared_length = None
                         if max_bytes is not None and declared_length is not None and declared_length > max_bytes:
                             raise MediaInputTooLargeError(
-                                f"Invalid {source}: response exceeds the {max_bytes // (1024 * 1024)} MiB size limit."
+                                f"Invalid {source}: response exceeds the {max_bytes // _MIB} MiB size limit."
                             )
 
                         payload = bytearray()
                         async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
                             if max_bytes is not None and len(payload) + len(chunk) > max_bytes:
                                 raise MediaInputTooLargeError(
-                                    f"Invalid {source}: response exceeds the "
-                                    f"{max_bytes // (1024 * 1024)} MiB size limit."
+                                    f"Invalid {source}: response exceeds the {max_bytes // _MIB} MiB size limit."
                                 )
                             payload.extend(chunk)
                         return bytes(payload)

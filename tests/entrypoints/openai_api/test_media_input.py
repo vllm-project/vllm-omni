@@ -91,6 +91,51 @@ async def test_redirect_media_request_checks_new_destination(monkeypatch, instal
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("location", "expect_cookies"),
+    [
+        pytest.param("/assets/media", True, id="same-origin"),
+        pytest.param("/other/media", False, id="different-path"),
+        pytest.param("https://cdn.media.example.com/assets/media", False, id="different-host"),
+        pytest.param("https://media.example.com:8443/assets/media", False, id="different-port"),
+        pytest.param("http://media.example.com/assets/media", False, id="different-scheme"),
+    ],
+)
+async def test_redirect_media_cookies_follow_the_logical_origin_and_path(
+    monkeypatch, install_transport, location, expect_cookies
+):
+    resolve = AsyncMock(return_value=[_address_info("93.184.216.34", 443)])
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+
+    def handle(request):
+        assert request.url.host == "93.184.216.34"
+        if request.url.path == "/start":
+            assert "cookie" not in request.headers
+            return httpx.Response(
+                302,
+                headers=[
+                    ("location", location),
+                    ("set-cookie", "host_session=valid; Path=/assets"),
+                    ("set-cookie", "domain_session=valid; Domain=media.example.com; Path=/assets"),
+                ],
+            )
+        if expect_cookies:
+            assert set(request.headers["cookie"].split("; ")) == {"host_session=valid", "domain_session=valid"}
+        else:
+            assert "cookie" not in request.headers
+        return httpx.Response(200, content=b"media")
+
+    install_transport(handle)
+
+    assert (
+        await media_input.download_media_bytes(
+            "https://media.example.com/start", max_bytes=5, source="reference", follow_redirects=True
+        )
+        == b"media"
+    )
+
+
+@pytest.mark.asyncio
 async def test_media_download_timeout_includes_address_resolution(monkeypatch, install_transport):
     async def resolve(*args, **kwargs):
         await asyncio.Event().wait()

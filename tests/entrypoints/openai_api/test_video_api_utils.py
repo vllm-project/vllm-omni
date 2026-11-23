@@ -54,23 +54,26 @@ def _install_http_transport(monkeypatch, handler, client_kwargs):
 
 
 def test_media_input_limits_follow_vllm_configuration():
-    general_limit = media_input._limit_bytes_from_megabytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
-    audio_limit = media_input._limit_bytes_from_megabytes(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB)
+    general_limit = media_input._general_limit_bytes(envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB)
 
     assert media_input.MAX_IMAGE_INPUT_BYTES == general_limit
     assert media_input.MAX_VIDEO_INPUT_BYTES == general_limit
-    assert media_input.MAX_AUDIO_INPUT_BYTES == media_input._strictest_enabled_limit(general_limit, audio_limit)
+    assert media_input.MAX_AUDIO_INPUT_BYTES == media_input._audio_limit_bytes(
+        envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB, general_limit
+    )
 
 
 @pytest.mark.parametrize("megabytes", [0, -1])
 def test_non_positive_media_limit_disables_the_limit(megabytes):
-    assert media_input._limit_bytes_from_megabytes(megabytes) is None
+    assert media_input._general_limit_bytes(megabytes) is None
 
 
-def test_audio_uses_the_strictest_enabled_limit():
-    assert media_input._strictest_enabled_limit(25, 1) == 1
-    assert media_input._strictest_enabled_limit(None, 25) == 25
-    assert media_input._strictest_enabled_limit(None, None) is None
+def test_audio_uses_the_stricter_limit_when_the_general_limit_is_enabled():
+    mebibyte = 1024 * 1024
+    assert media_input._audio_limit_bytes(25, mebibyte) == mebibyte
+    assert media_input._audio_limit_bytes(1, 25 * mebibyte) == mebibyte
+    assert media_input._audio_limit_bytes(25, None) == 25 * mebibyte
+    assert media_input._audio_limit_bytes(-1, None) == 0
 
 
 @pytest.mark.asyncio
