@@ -140,7 +140,7 @@ def test_legacy_processor_registration_restored_on_failure(monkeypatch):
     assert registered == [RealtimeVenusOmniConfig]
 
 
-@pytest.mark.parametrize("mode,suffix", [("turn", ""), ("duplex", "_duplex")])
+@pytest.mark.parametrize("mode,suffix", [("duplex", ""), ("duplex", "_duplex"), ("turn", "_turn")])
 def test_venus_deploy_preserves_reference_flow_settings(mode, suffix):
     from vllm_omni.config.stage_config import resolve_deploy_yaml
 

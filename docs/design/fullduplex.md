@@ -1808,6 +1808,11 @@ cancels its tasks and releases its recordings.
 
 ## Realtime-Venus delegation speech condition
 
+Realtime-Venus selects the native duplex engine by default through
+`realtime_venus_omni.yaml`. The explicit `_duplex.yaml` profile remains an alias;
+`realtime_venus_omni_turn.yaml` selects the ordinary turn engine. All three
+profiles share the same 10-step FP32 Flow and stage settings.
+
 Realtime-Venus reuses the MiniCPM-o stage implementation. Its optional
 `delegate_open_token_id` and `delegate_close_token_id` belong to the model
 plugin's special-token metadata. At the native Thinker-to-Talker handoff,

@@ -1,8 +1,10 @@
-# Realtime-Venus Omni: reuse the three-stage execution core.
+# Realtime-Venus Omni: full duplex by default on the shared three-stage core.
+# Keep the validated Venus kernel/compilation defaults from this base.
 base_config: minicpmo_4_5_turn.yaml
 pipeline: realtime_venus_omni
 # The external Venus delegation harness and memory runtime are not provided.
-session_mode: turn
+# Use realtime_venus_omni_turn.yaml for the ordinary turn-based engine.
+session_mode: duplex
 connectors:
   connector_of_shared_memory:
     extra:

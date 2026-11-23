@@ -1,0 +1,3 @@
+# Realtime-Venus Omni using the turn-based engine and ordinary HTTP serving.
+base_config: realtime_venus_omni.yaml
+session_mode: turn

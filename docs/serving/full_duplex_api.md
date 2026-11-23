@@ -153,7 +153,7 @@ WebSocket query parameters cannot switch engines.
     connection as full duplex.
 
 **MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`),
-**Realtime-Venus Omni** (`vllm_omni/deploy/realtime_venus_omni_duplex.yaml`), **Qwen3-Omni**
+**Realtime-Venus Omni** (`vllm_omni/deploy/realtime_venus_omni.yaml`, the default), **Qwen3-Omni**
 (`vllm_omni/deploy/qwen3_omni_duplex.yaml`), and **Nemotron VoiceChat**
 (`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
 over this endpoint today. CUDA Qwen3-Omni deployments can use

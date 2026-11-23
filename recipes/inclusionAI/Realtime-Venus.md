@@ -24,7 +24,7 @@ before constructing the nested configs. A missing or mismatched YAML fails
 explicitly; the adapter does not download a different configuration at startup.
 The checkpoint's tokenizer and processor still require `--trust-remote-code`.
 
-## Serve
+## Serve (full duplex by default)
 
 ```bash
 vllm serve ./Realtime-Venus/Realtime-Venus-Omni \
@@ -33,28 +33,14 @@ vllm serve ./Realtime-Venus/Realtime-Venus-Omni \
   --host 127.0.0.1 --port 8091
 ```
 
-The profile serves ordinary `/v1/chat/completions` requests, with text, image,
-audio and video inputs routed through the shared multimodal processor. Request
-`modalities: ["text", "audio"]` for speech as well as text. Use the existing
-[chat-completions clients](../../examples/online_serving/) and
-[MiniCPM-o recipe](../OpenBMB/MiniCPM-o-4_5.md) for request formats.
+The default profile serves continuous audio/video sessions over WebSocket.
+Omitting `--deploy-config` selects this same full-duplex profile automatically.
+`realtime_venus_omni_duplex.yaml` remains an equivalent explicit alias.
 
 The profile retains the checkpoint's 10 flow-matching steps and FP32 Flow
 weights. It does not inherit the MiniCPM Seed-TTS recipe's 5-step/FP16 Flow
 changes. CUDA graph execution and the existing Talker multi-frame decode are
 reused without duplicating model kernels.
-
-## Full duplex
-
-Select the duplex profile for continuous, one-second audio/video input units
-and model-controlled listening/speaking over WebSocket:
-
-```bash
-vllm serve ./Realtime-Venus/Realtime-Venus-Omni \
-  --omni --trust-remote-code \
-  --deploy-config vllm_omni/deploy/realtime_venus_omni_duplex.yaml \
-  --host 127.0.0.1 --port 8091
-```
 
 Connect to `ws://127.0.0.1:8091/v1/realtime?duplex=1` using the existing
 [DuplexClient](../../docs/serving/realtime_duplex_api.md) or
@@ -73,9 +59,36 @@ the dialogue turn. Further delegated units stay silent; resumed speech starts
 with fresh synthesis state, and a terminator-only unit cannot replay the tail.
 The duplex profile preserves the same 10-step FP32 Flow settings as turn mode.
 
+## Turn-based HTTP serving
+
+Select the turn profile explicitly for ordinary `/v1/chat/completions` requests:
+
+```bash
+vllm serve ./Realtime-Venus/Realtime-Venus-Omni \
+  --omni --trust-remote-code \
+  --deploy-config vllm_omni/deploy/realtime_venus_omni_turn.yaml \
+  --host 127.0.0.1 --port 8091
+```
+
+Text, image, audio and video inputs use the shared multimodal processor.
+Request `modalities: ["text", "audio"]` for speech as well as text. Use the
+existing [chat-completions clients](../../examples/online_serving/) and
+[MiniCPM-o recipe](../OpenBMB/MiniCPM-o-4_5.md) for request formats. Engine mode
+is selected at startup; WebSocket query parameters do not switch engines.
+
+## Tool execution
+
+The released model can emit `<delegate>...</delegate>` requests. The external
+[Realtime-Venus-Harness](https://github.com/inclusionAI/Realtime-Venus/tree/main/harness)
+executes these tasks asynchronously and returns `<backend>...</backend>` feedback
+to the originating conversation. This adaptation preserves delegate text and
+excludes it from speech, but does not integrate the Harness or map delegate spans
+to OpenAI `tools` / `tool_calls`. Tool execution and asynchronous result injection
+are therefore not available in this serving profile.
+
 ## Scope
 
-- Both turn-based serving (the default) and the explicit full-duplex profile
+- Both full-duplex serving (the default) and the explicit turn-based profile
   use the shared Thinker, Talker and Code2Wav stages.
 - The external Realtime-Venus delegation harness, asynchronous tool-result
   orchestration and long-video memory adapter are not integrated. Backbone
