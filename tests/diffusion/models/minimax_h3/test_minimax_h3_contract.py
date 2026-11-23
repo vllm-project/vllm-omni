@@ -1141,10 +1141,76 @@ def test_encoder_only_pipeline_rejects_media_requests_and_serves_text_only(monke
     with pytest.raises(OmniClientError, match="VAE encoder"):
         pipeline._encode_local_media(media_request)
 
+    video_request = MiniMaxH3EncoderMediaInput(
+        videos=(torch.zeros(9, 768, 1344, 3, dtype=torch.uint8),),
+        **shape,
+    )
+    with pytest.raises(OmniClientError, match="VAE encoder"):
+        pipeline._predict_visual_condition_shapes(video_request)
+
     conditioning = pipeline._encode_local_media(MiniMaxH3EncoderMediaInput(**shape))
     assert conditioning.visual_condition is None
     assert conditioning.audio_condition is None
     assert conditioning.ref_blocks == ()
+
+
+def test_encoder_only_pipeline_rejects_controlnet_at_startup(monkeypatch, tmp_path):
+    """Control needs the DiT; a transformer=false deployment must refuse it.
+
+    Without the gate the pipeline would start, silently skip the controlnet
+    weight source, and crash on the first control request when it reaches the
+    absent transformer.
+    """
+    from safetensors.torch import save_file
+
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    for component in ("transformer", "video_vae", "audio_vae"):
+        (tmp_path / "FL2VA" / component).mkdir()
+    controlnet_file = tmp_path / "control.safetensors"
+    save_file({}, str(controlnet_file))
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(pipeline_minimax_h3, "MiniMaxH3DiTModel", FakeModule)
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen2TokenizerFast, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3.Qwen3VLProcessor, "from_pretrained", Mock())
+    monkeypatch.setattr(pipeline_minimax_h3, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        pipeline_minimax_h3,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        trust_remote_code=False,
+        revision=None,
+        task_type="t2va",
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+        controlnet_model_path=str(controlnet_file),
+    )
+    od_config.model_loaded["transformer"] = False
+    od_config.model_loaded["text_encoder"] = True
+    od_config.model_loaded["vae_encoder"] = False
+    od_config.model_loaded["vae_decoder"] = False
+
+    with pytest.raises(ValueError, match="H3 control"):
+        pipeline_minimax_h3.MiniMaxH3Pipeline(od_config=od_config)
 
 
 def test_pipeline_still_rejects_vae_decoder_without_vae_encoder(monkeypatch, tmp_path):

@@ -1204,7 +1204,8 @@ class MiniMaxH3Pipeline(
                     "H3 control binds to one DiT; start the server with --task-type fl2va or --task-type ref2va"
                 )
             unsupported = (
-                not self.load_vae_encoder
+                not self.load_transformer
+                or not self.load_vae_encoder
                 or int(self.parallel_config.ulysses_degree) != 1
                 or int(self.parallel_config.ring_degree) != 1
                 or int(self.parallel_config.allgather_degree) != 1
@@ -3304,6 +3305,14 @@ class MiniMaxH3Pipeline(
         self,
         media: MiniMaxH3EncoderMediaInput,
     ) -> tuple[tuple[int, int, int], ...]:
+        if media.videos and not self.load_vae_encoder:
+            # Shape prediction needs the VAE's latent geometry; without the
+            # encoder the reference would only reach a bare AttributeError
+            # later, in ``encode_media``.
+            raise OmniClientError(
+                "MiniMax H3 video references require a local VAE encoder "
+                "(enable model_loaded.vae_encoder or pre-encode the reference)"
+            )
         shapes = [(1, int(image.shape[0]) // 16, int(image.shape[1]) // 16) for image in media.images]
         for video in media.videos:
             frames = np.asarray(video.detach().cpu().to(torch.uint8).contiguous().numpy())
