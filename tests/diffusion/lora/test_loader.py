@@ -343,6 +343,50 @@ class TestLoraLoaderMixin:
 
         assert torch.equal(to_out.weight.detach().view(torch.uint8), weight_before)
 
+    @pytest.mark.parametrize("packed_name", ["qweight", "weight_packed"])
+    def test_load_lora_into_module_rejects_packed_weight(self, packed_name: str):
+        """AWQ/GPTQ layers register `qweight` and compressed-tensors layers register
+        `weight_packed` in place of `weight`. An adapter that targets such a layer
+        must fail instead of being skipped with a missing-key warning."""
+        pipeline = DummyPipeline(1, HEAD_DIM)
+        to_out = pipeline.transformer.blocks[0].attn.to_out
+        del to_out.weight
+        # AWQ layout: (in, out // pack_factor) int32, eight 4-bit values per element.
+        packed = nn.Parameter(torch.zeros(HEAD_DIM, HEAD_DIM // 8, dtype=torch.int32), requires_grad=False)
+        to_out.register_parameter(packed_name, packed)
+        state_dict = {
+            "transformer.blocks.0.attn.to_out.lora_A.weight": torch.randn(RANK, HEAD_DIM),
+            "transformer.blocks.0.attn.to_out.lora_B.weight": torch.randn(HEAD_DIM, RANK),
+        }
+
+        with pytest.raises(ValueError, match=rf"transformer\.blocks\.0\.attn\.to_out\.{packed_name}"):
+            pipeline.load_lora_into_module(state_dict, pipeline.transformer)
+
+        assert torch.equal(packed, torch.zeros_like(packed))
+
+    @pytest.mark.parametrize("packed_name", ["qweight", "weight_packed"])
+    def test_load_lora_into_module_ignores_untargeted_packed_weight(self, packed_name: str):
+        """A packed layer that the adapter does not target must not fail the load."""
+        pipeline = DummyPipeline(2, HEAD_DIM)
+        target = pipeline.transformer.blocks[0].attn.to_out
+        untargeted = pipeline.transformer.blocks[1].attn.to_out
+        del untargeted.weight
+        packed = nn.Parameter(torch.zeros(HEAD_DIM, HEAD_DIM // 8, dtype=torch.int32), requires_grad=False)
+        untargeted.register_parameter(packed_name, packed)
+        weight_before = target.weight.detach().clone()
+        lora_a = torch.randn(RANK, HEAD_DIM)
+        lora_b = torch.randn(HEAD_DIM, RANK)
+        state_dict = {
+            "transformer.blocks.0.attn.to_out.lora_A.weight": lora_a,
+            "transformer.blocks.0.attn.to_out.lora_B.weight": lora_b,
+        }
+
+        used_keys = pipeline.load_lora_into_module(state_dict, pipeline.transformer)
+
+        assert used_keys == set(state_dict)
+        assert_close(target.weight, weight_before + lora_b @ lora_a)
+        assert torch.equal(packed, torch.zeros_like(packed))
+
 
 # ======================================================
 # Test QwenImageLoraLoaderMixin

@@ -376,6 +376,55 @@ def test_maybe_fuse_distilled_lora_rejects_online_int8_weights(mock_tp_group, mo
     assert model.lora_is_fused is False
 
 
+def test_maybe_fuse_distilled_lora_rejects_awq_qweight_target(mock_tp_group, tmp_path: Path):
+    """AWQ registers `qweight`, `qzeros` and `scales`, and no `weight`. A distilled
+    adapter that targets such a layer must fail at startup; skipping it left the
+    adapter unapplied while lora_is_fused was set to True."""
+    from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig, AutoAWQLinearMethod
+
+    from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
+
+    features = 32
+    method = AutoAWQLinearMethod(
+        AutoAWQConfig(weight_bits=4, group_size=features, zero_point=True, lm_head_quantized=False)
+    )
+    proj = nn.Module()
+    method.create_weights(proj, features, [features], features, features, torch.bfloat16, weight_loader=None)
+    assert set(dict(proj.named_parameters())) == {"qweight", "qzeros", "scales"}
+    proj.qweight.data.zero_()
+
+    class _Pipeline(nn.Module, QwenImageLoraLoaderMixin):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.proj = proj
+
+    lora_path = tmp_path / "distill.safetensors"
+    save_file(
+        {
+            "transformer.proj.lora_A.weight": torch.randn(2, features),
+            "transformer.proj.lora_B.weight": torch.randn(features, 2),
+        },
+        str(lora_path),
+    )
+    od_config = OmniDiffusionConfig(
+        model="",
+        dtype=torch.bfloat16,
+        lora_backend=LoRABackend.DISTILL,
+        lora_path=str(lora_path),
+        lora_scale=1.0,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = _Pipeline()
+    qweight_before = proj.qweight.detach().clone()
+
+    with pytest.raises(ValueError, match=r"transformer\.proj\.qweight"):
+        loader._maybe_fuse_distilled_lora(model)
+
+    assert torch.equal(proj.qweight, qweight_before)
+    assert model.lora_is_fused is False
+
+
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
     from vllm_omni.diffusion.model_loader import diffusers_loader as loader_module
 
