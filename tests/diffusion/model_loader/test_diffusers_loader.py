@@ -1022,6 +1022,25 @@ def test_initialize_model_rejects_unsupported_vision_sp_before_construction(monk
         initialize_model(od_config)
 
 
+def test_initialize_model_requires_concrete_vision_sp_opt_in(monkeypatch):
+    import vllm_omni.diffusion.registry as registry_mod
+
+    class InheritedSupportModel(_ConfigAwareModel):
+        pass
+
+    od_config = _loader_config(
+        model_class_name="InheritedSupportModel",
+        parallel_config=DiffusionParallelConfig(text_encoder_tp_size=8, text_encoder_vision_sp_size=8),
+    )
+    monkeypatch.setattr(
+        registry_mod.DiffusionModelRegistry,
+        "_try_load_model_cls",
+        staticmethod(lambda _name: InheritedSupportModel),
+    )
+    with pytest.raises(ValueError, match="does not support text_encoder_vision_sp_size"):
+        initialize_model(od_config)
+
+
 def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 

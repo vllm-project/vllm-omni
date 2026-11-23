@@ -1237,7 +1237,7 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             choices=[1, 8],
             default=None,
-            help="MiniMax-H3-only experimental vision SP: 1 (replicated, default) or 8 "
+            help="MiniMax-H3-only vision SP: 1 (replicated, default) or 8 "
             "(requires --text-encoder-tp-size 8). "
             "Equivalent to setting DiffusionParallelConfig.text_encoder_vision_sp_size.",
         )

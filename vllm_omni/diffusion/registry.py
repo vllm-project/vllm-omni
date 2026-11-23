@@ -593,9 +593,9 @@ def _prepare_diffusion_quant_config(
 
 
 def validate_text_encoder_vision_sp_support(od_config: OmniDiffusionConfig, model_class: type[nn.Module]) -> None:
-    """Reject opt-in vision SP before constructing a pipeline that cannot consume it."""
-    if od_config.parallel_config.text_encoder_vision_sp_size != 1 and not getattr(
-        model_class, "supports_text_encoder_vision_sp", False
+    """Require each concrete pipeline to opt in to vision SP explicitly."""
+    if od_config.parallel_config.text_encoder_vision_sp_size != 1 and not model_class.__dict__.get(
+        "supports_text_encoder_vision_sp", False
     ):
         raise ValueError(f"{model_class.__name__} does not support text_encoder_vision_sp_size > 1")
 
