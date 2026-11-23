@@ -21,7 +21,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import delegation_tool_definition
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.slow, pytest.mark.omni]
 
 #: The answer the application fabricates for the delegated question.
 DELEGATED_ANSWER = "the code is ZB-4471"

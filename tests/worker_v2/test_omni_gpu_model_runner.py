@@ -4,15 +4,17 @@
 """MRV2 admission, capture, dispatch and request lifecycle contracts."""
 
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
 import torch
+from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.compilation.cuda_graph import CUDAGraphEntry, CUDAGraphWrapper
-from vllm.config import SchedulerConfig
+from vllm.config import SchedulerConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.lora import LoRAConfig
 from vllm.forward_context import ForwardContext, override_forward_context
@@ -30,11 +32,13 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner, _runner_assisted_batch_descriptor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -279,6 +283,57 @@ def test_shutdown_accepts_upstream_states_without_an_audio_sender():
     with patch.object(GPUModelRunner, "shutdown") as parent:
         runner.shutdown()
     parent.assert_called_once()
+
+
+def test_shutdown_unlinks_owned_wakeup_fifo_across_restarts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """Runner shutdown releases real FIFO/thread owners without removing a peer."""
+    monkeypatch.setenv("VLLM_OMNI_SHM_WAKEUP", "1")
+    config = object.__new__(OmniModelConfig)
+    config.stage_id = 1
+    config.async_chunk = True
+    config.worker_type = "ar"
+    config.stage_connector_config = {
+        "name": "SharedMemoryConnector",
+        "extra": {"role": "receiver", "wakeup_scope": str(tmp_path)},
+    }
+    engine_config = object.__new__(VllmConfig)
+    engine_config.model_config = config
+    # Only upstream model/GPU teardown is substituted. The data-plane
+    # constructor, background threads, runner shutdown and FIFO close are real.
+    mocker.patch.object(GPUModelRunner, "shutdown")
+    peer = SharedMemoryConnector({"stage_id": 1, "wakeup_scope": str(tmp_path)})
+    try:
+        assert peer.get_wakeup_generation() is not None
+        assert peer._wake_path is not None
+        peer_path = Path(peer._wake_path)
+        for _ in range(3):
+            plane = OmniRunnerDataPlane(engine_config, config)
+            try:
+                connector = plane._omni_connector
+                assert isinstance(connector, SharedMemoryConnector)
+                assert connector.get_wakeup_generation() is not None
+                assert connector._wake_path is not None
+                path = Path(connector._wake_path)
+                assert path.exists()
+                threads = (plane._recv_thread, plane._save_thread, plane._native_output_worker)
+                runner = object.__new__(OmniGPUModelRunner)
+                runner.model_state = object.__new__(DefaultModelState)
+                runner._native_output_materializer = None
+                runner._omni_data_plane = plane
+
+                runner.shutdown()
+                runner.shutdown()
+
+                assert not path.exists()
+                assert peer_path.exists()
+                assert not any(thread.is_alive() for thread in threads if thread is not None)
+            finally:
+                plane.close()
+    finally:
+        peer.close()
+    assert not peer_path.exists()
 
 
 def test_add_requests_empty_admission_and_stop_id_sanitization():
@@ -721,10 +776,10 @@ def test_capture_contract_uses_model_declaration(stage, declared):
 
 
 @pytest.mark.parametrize(
-    ("stage", "use_mrv2", "returns_aux", "exclude_full"),
-    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, False), ("llm", False, False, True)],
+    ("stage", "returns_aux"),
+    [("llm", False), ("tts", False), ("llm", True)],
 )
-def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
+def test_minicpmo_capture_contract(stage, returns_aux):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -732,18 +787,17 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model.model_stage = stage
-    model._use_v2_model_runner = use_mrv2
     model._returns_aux_hidden_states = returns_aux
     model.have_multimodal_outputs = True
-    assert model.mrv2_forward_returns_tensor is (use_mrv2 and (stage == "tts" or not returns_aux))
-    assert model.mrv2_forward_returns_native_aux is (use_mrv2 and stage == "llm" and returns_aux)
+    assert model.mrv2_forward_returns_tensor is (stage == "tts" or not returns_aux)
+    assert model.mrv2_forward_returns_native_aux is (stage == "llm" and returns_aux)
 
     runner = _make_runner()
     runner.model = model
     runner._configure_cudagraph_output_contract()
 
-    assert runner._model_has_structured_output is exclude_full
-    assert runner._exclude_full_graph is exclude_full
+    assert runner._model_has_structured_output is False
+    assert runner._exclude_full_graph is False
 
 
 def _make_graph_contract_model(architecture, stage):
@@ -764,6 +818,7 @@ def _make_graph_contract_model(architecture, stage):
         ("BreezeForConditionalGeneration", None),
         ("HiggsAudioV3TalkerForConditionalGeneration", None),
         ("Ming3TTSForConditionalGeneration", "llm"),
+        ("MiniMaxMusic3TalkerForConditionalGeneration", None),
         ("MossTTSDelayModel", None),
         ("MossTTSLocalModel", None),
         ("VoxtralTTSForConditionalGeneration", "audio_generation"),
@@ -775,6 +830,8 @@ def test_tensor_returning_model_preserves_mrv2_full_capture(architecture, stage,
     runner = _make_runner()
     runner.model = model
     runner._configure_cudagraph_output_contract()
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
     full = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1)
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.FULL: [full]},

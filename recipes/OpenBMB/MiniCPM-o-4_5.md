@@ -153,8 +153,8 @@ the service after a capture failure. To run without capture, set
 limit there with `code2wav_max_npu_graphs`. Graph mode also requires
 `ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
 
-The inner NPUGraph is independent of the outer runner setting, so do not use a
-global `--enforce-eager` override when Stage 0/1 `PIECEWISE` replay is desired.
+The inner NPUGraph is independent of the outer runner setting. Leave
+`enforce_eager` disabled on stages 0 and 1 to use `PIECEWISE` replay there.
 
 ## GPU
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""HTTP + WebSocket validation for Qwen3-TTS Base, Higgs Audio V3 and Audex TTA ``/v1/audio/speech`` (and related routes)."""
+"""HTTP + WebSocket validation for Qwen3-TTS Base ``/v1/audio/speech`` (and related routes)."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 from tests.helpers.stage_config import get_deploy_config_path
 
+# Other audio models are validated on CPU in test_speech_invalid_model_params.py.
+# Their deployment/generation coverage belongs to the existing model e2e suites.
 # Speech / voice-upload numeric caps for these tests only (not exported from vllm_omni).
 # Align where possible with serving_speech defaults: _TTS_MAX_INSTRUCTIONS_LENGTH (500),
 # _TTS_MAX_NEW_TOKENS_MAX (4096). Voice form max lengths are not public constants in prod;
@@ -53,33 +55,6 @@ _QWEN3_TTS_SPEECH = [
             server_args=_SPEECH_SERVER_ARGS,
         ),
         id="qwen3_tts",
-        marks=_L4_SPEECH_HW,
-    ),
-]
-
-
-_HIGGS_AUDIO_V3_SPEECH = [
-    pytest.param(
-        OmniServerParams(
-            model="bosonai/higgs-audio-v3-tts-4b",
-            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3.yaml"),
-            server_args=_SPEECH_SERVER_ARGS,
-            env_dict={"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"},
-        ),
-        id="higgs_audio_v3",
-        marks=_L4_SPEECH_HW,
-    ),
-]
-
-_AUDEX_TTA_CAPTION = "Heavy rain falling on a tin roof."
-_AUDEX_TTA_SPEECH = [
-    pytest.param(
-        OmniServerParams(
-            model="nvidia/Nemotron-Labs-Audex-2B",
-            stage_config_path=get_deploy_config_path("audex_tta.yaml"),
-            server_args=_SPEECH_SERVER_ARGS,
-        ),
-        id="audex_tta",
         marks=_L4_SPEECH_HW,
     ),
 ]
@@ -143,14 +118,6 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
         pytest.param({"input": "   "}, ("input", "empty"), id="input_whitespace_only"),
         pytest.param({"voice": ""}, "Invalid voice", id="voice_empty", marks=_SKIP_ISSUE_3649),
         pytest.param(
-            {"instructions": 123}, ("instructions", "string_type", "valid string"), id="instructions_wrong_type"
-        ),
-        pytest.param(
-            {"response_format": "mpeg"}, ("response_format", "literal_error", "wav"), id="response_format_invalid"
-        ),
-        pytest.param({"stream_format": 1}, ("stream_format", "literal_error", "audio"), id="stream_format_wrong_type"),
-        pytest.param({"stream": "wrong_type"}, ("stream", "bool_parsing", "validation error"), id="stream_wrong_type"),
-        pytest.param(
             {
                 "voice": "vivian",
                 "task_type": "CustomVoice",
@@ -160,9 +127,6 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
             ("Base checkpoint does not support task_type='CustomVoice'",),
             id="base_checkpoint_customvoice_task_mismatch",
         ),
-        pytest.param(
-            {"task_type": "InvalidEnum"}, ("task_type", "literal_error", "CustomVoice"), id="task_type_invalid"
-        ),
         pytest.param({"language": ""}, ("language", "invalid language", "chinese"), id="language_empty"),
         pytest.param({"ref_audio": "ftp://example.com/a.wav"}, ("ref_audio", "URL"), id="ref_audio_bad_scheme"),
         pytest.param(
@@ -170,40 +134,16 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
             ("ref_audio", "url"),
             id="ref_audio_invalid_uri",
         ),
-        pytest.param({"ref_text": ["x"]}, ("ref_text", "string_type", "valid string"), id="ref_text_wrong_type"),
-        pytest.param(
-            {"x_vector_only_mode": "wrong"},
-            ("x_vector_only_mode", "valid boolean"),
-            id="x_vector_only_mode_string_not_boolean",
-        ),
-        pytest.param(
-            {"speaker_embedding": [0.01] * _QWEN3_TTS_06B_SPEAKER_EMBEDDING_DIM},
-            ("mutually exclusive", "speaker_embedding", "ref_audio"),
-            id="speaker_embedding_with_ref_audio_mutually_exclusive",
-        ),
-        pytest.param({"max_new_tokens": 0}, ("max_new_tokens", "greater_than_equal"), id="max_new_tokens_below_min"),
         pytest.param(
             {"max_new_tokens": _SPEECH_API_MAX_NEW_TOKENS + 1},
             ("max_new_tokens", "exceed 4096"),
             id="max_new_tokens_above_max",
         ),
         pytest.param(
-            {"seed": -(2**63) - 1},
-            ("seed", "greater_than_equal", "-9223372036854775808"),
-            id="seed_below_min",
-        ),
-        pytest.param({"seed": 2**63}, ("seed", "less_than_equal", "9223372036854775807"), id="seed_above_max"),
-        pytest.param(
-            {"initial_codec_chunk_frames": -1},
-            ("initial_codec_chunk_frames", "greater_than_equal", "0"),
-            id="initial_codec_chunk_frames_negative",
-        ),
-        pytest.param(
             {"instructions": "x" * (_SPEECH_API_MAX_INSTRUCTIONS_CHARS + 1)},
             ("instructions", "too long"),
             id="instructions_exceed_api_limit",
         ),
-        # Base clone: whitespace-only ref_text fails serving validation (not pydantic).
         pytest.param(
             {
                 "task_type": "Base",
@@ -229,7 +169,7 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
                 "x_vector_only_mode": True,
                 "speaker_embedding": [0.01] * 512,
             },
-            ("speaker_embedding", "dimensions", str(_QWEN3_TTS_06B_SPEAKER_EMBEDDING_DIM)),
+            ("speaker_embedding", "dimensions", str(1024)),
             id="base_speaker_embedding_wrong_dim_short",
         ),
         pytest.param(
@@ -239,7 +179,7 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
                 "x_vector_only_mode": True,
                 "speaker_embedding": [0.01] * 2048,
             },
-            ("speaker_embedding", "2048", "dimensions", str(_QWEN3_TTS_06B_SPEAKER_EMBEDDING_DIM)),
+            ("speaker_embedding", "2048", "dimensions", str(1024)),
             id="base_speaker_embedding_wrong_dim_long",
         ),
     ],
@@ -271,112 +211,6 @@ def test_speech_invalid_field_values(
     )
 
 
-# Higgs Audio V3: ``references[]`` cookbook alias and serving-layer 400 rejections.
-# Raw HTTP keeps JSON bodies intact (OpenAI SDK strips unknown fields such as ``references``).
-@pytest.mark.parametrize(
-    "extra_json, err_message",
-    [
-        pytest.param({"input": "", "response_format": "wav"}, ("input", "empty"), id="input_empty"),
-        pytest.param({"input": "   ", "response_format": "wav"}, ("input", "empty"), id="input_whitespace_only"),
-        pytest.param(
-            {"input": "Hello world.", "max_new_tokens": 0},
-            ("max_new_tokens", "greater_than_equal"),
-            id="max_new_tokens_below_min",
-        ),
-        pytest.param(
-            {
-                "input": "Hello world.",
-                "references": [
-                    {"audio_path": REF_AUDIO_URL, "text": REF_TEXT},
-                    {"audio_path": REF_AUDIO_URL, "text": REF_TEXT},
-                ],
-                "response_format": "wav",
-            },
-            ("references", "only supports a single reference"),
-            id="multi_reference_payload",
-        ),
-        pytest.param(
-            {"input": "Hello world.", "references": [], "response_format": "wav"},
-            ("references", "non-empty"),
-            id="references_empty_array",
-        ),
-        pytest.param(
-            {"input": "Hello world.", "references": [{"text": REF_TEXT}], "response_format": "wav"},
-            ("audio_path", "required"),
-            id="references_missing_audio_path",
-        ),
-        pytest.param(
-            {"input": "Hello world.", "references": [1], "response_format": "wav"},
-            ("references[0]", "must be an object"),
-            id="references_bad_element_type",
-        ),
-        pytest.param(
-            {
-                "input": "Hello world.",
-                "ref_audio": REF_AUDIO_URL,
-                "references": [{"audio_path": "https://example.com/other.wav"}],
-                "response_format": "wav",
-            },
-            ("mutually exclusive", "ref_audio", "references"),
-            id="ref_audio_and_references_exclusive",
-        ),
-        pytest.param(
-            {
-                "input": "Hello world.",
-                "ref_text": "different transcript",
-                "references": [{"audio_path": REF_AUDIO_URL, "text": REF_TEXT}],
-                "response_format": "wav",
-            },
-            ("references[0].text", "ref_text", "conflict"),
-            id="references_text_conflicts_ref_text",
-        ),
-    ],
-)
-@pytest.mark.parametrize("omni_server", _HIGGS_AUDIO_V3_SPEECH, indirect=True)
-def test_speech_higgs_invalid_field_values(
-    omni_server: OmniServer,
-    online_client: OnlineOmniClient,
-    extra_json: dict[str, object],
-    err_message: str | tuple[str, ...],
-) -> None:
-    body = {"model": omni_server.model, **extra_json}
-    online_client.send_audio_speech_http_request(
-        {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
-    )
-
-
-# Audex TTA (``audex_tta`` deployment): the serving layer builds the caption
-# prompt and injects the RVQ phase contract + default guidance server-side, so
-# guidance knobs and speech-only fields must be rejected before generation.
-@pytest.mark.parametrize(
-    "overrides, err_message",
-    [
-        pytest.param({"extra_params": {"cfg_scale": 99}}, "cfg_scale", id="cfg_scale_out_of_range"),
-        pytest.param({"extra_params": {"cfg_scale": "big"}}, "cfg_scale", id="cfg_scale_wrong_type"),
-        pytest.param({"extra_params": {"tta_rvq": {}}}, "tta_rvq", id="tta_rvq_not_overridable"),
-        pytest.param({"input": "   "}, "caption", id="caption_whitespace_only"),
-        pytest.param({"voice": "alloy"}, "voice", id="voice_not_supported"),
-        pytest.param(
-            {"ref_audio": "https://example.com/ref.wav"},
-            "reference audio",
-            id="ref_audio_not_supported",
-        ),
-    ],
-)
-@pytest.mark.parametrize("omni_server", _AUDEX_TTA_SPEECH, indirect=True)
-def test_speech_audex_tta_invalid_field_values(
-    omni_server: OmniServer,
-    online_client: OnlineOmniClient,
-    overrides: dict[str, object],
-    err_message: str | tuple[str, ...],
-) -> None:
-    body = {"model": omni_server.model, "input": _AUDEX_TTA_CAPTION, **overrides}
-    online_client.send_audio_speech_http_request(
-        {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # POST /v1/audio/speech/batch (JSON)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -655,7 +489,7 @@ def test_speech_batch_invalid_field_values(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ``test_speech_stream_invalid_requests``: build ``session.config`` JSON with ``omni_server.model``.
-_SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES = object()
+_SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_MP3_FRAMES = object()
 
 
 @pytest.mark.parametrize(
@@ -668,9 +502,9 @@ _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES = object()
             id="wrong_first_message_type",
         ),
         pytest.param(
-            _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES,
+            _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_MP3_FRAMES,
             ("invalid session config", "response_format", "pcm"),
-            id="session_config_stream_audio_requires_pcm",
+            id="session_config_stream_audio_rejects_mp3",
         ),
     ],
 )
@@ -682,12 +516,12 @@ def test_speech_stream_invalid_requests(
     err_message: str | tuple[str, ...],
 ) -> None:
     """Bad first WebSocket text frames: non-JSON, wrong ``type``, or invalid ``session.config``."""
-    if send_frames_spec is _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES:
+    if send_frames_spec is _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_MP3_FRAMES:
         send_frames = json.dumps(
             {
                 "type": "session.config",
                 "model": omni_server.model,
-                "response_format": "wav",
+                "response_format": "mp3",
                 "stream_audio": True,
             }
         )

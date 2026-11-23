@@ -26,16 +26,16 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
-from .batched_token2wav import (
+from .code2wav.graphs import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
     PromptFeatures,
     row_offset_signature,
     state_shape_signature,
 )
-from .code2wav_watchdog import Code2WavWatchdog
-from .config_flags import read_bool_flag, resolve_token2wav_trt_config
-from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.watchdog import Code2WavWatchdog
+from .config import read_bool_flag, resolve_token2wav_trt_config, stage_connector_extra
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -509,14 +509,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
-            # Default on for CUDA and NPU. CUDA uses tiled TF32 attention on
-            # SM80+ and SDPA otherwise, so it respects the TF32 opt-out; NPU
-            # uses packed QKV, in-place KV and ACLNN AddLayerNorm, independent
-            # of TF32. An explicit ``cfm_fused_body`` overrides either default.
+            # CUDA FP32 fusion respects the TF32 opt-out. CUDA/ROCm FP16 CFM
+            # and NPU fusion do not depend on TF32. An explicit
+            # ``cfm_fused_body`` overrides these defaults.
             "fused_body": read_bool_flag(
                 extra,
                 "cfm_fused_body",
-                (current_omni_platform.is_cuda() and self._tf32_mode != "off") or current_omni_platform.is_npu(),
+                (current_omni_platform.is_cuda() and self._tf32_mode != "off")
+                or (
+                    (current_omni_platform.is_cuda() or current_omni_platform.is_rocm())
+                    and (
+                        read_bool_flag(extra, "token2wav_float16", False) or read_bool_flag(extra, "cfm_float16", False)
+                    )
+                )
+                or current_omni_platform.is_npu(),
             ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
@@ -613,13 +619,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         return self._default_prompt_normalized
 
     def _extra_config(self) -> dict[str, Any]:
-        model_config = getattr(self.vllm_config, "model_config", None)
-        connector = getattr(model_config, "stage_connector_config", None)
-        if isinstance(connector, Mapping):
-            extra = connector.get("extra", connector)
-        else:
-            extra = getattr(connector, "extra", None)
-        result = dict(extra) if isinstance(extra, Mapping) else {}
+        result = stage_connector_extra(self.vllm_config)
         if os.getenv("MINICPMO_C8_SECONDARY_VOCODER_HOST_CACHE") == "1" and os.getenv("VLLM_OMNI_REPLICA_ID") == "1":
             result["token2wav_setup_cache_size"] = 4
             result["token2wav_setup_host_cache_size"] = 64
@@ -1678,8 +1678,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         By default only validates and enqueues; :meth:`run_idle_prefetch` does
         the work (plus setup with ``token2wav_ref_prefetch_setup``). Optional
         CPU workers materialize and pin references within the same pin budget.
-        A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
-        GPU and NPU generation runners call this hook and
+        A bad payload is logged and skipped, never raised. The MRv2 GPU
+        and NPU generation runners call this hook and
         :meth:`run_idle_prefetch`; runners without these optional hooks prepare
         the reference inline at chunk 0.
         """
@@ -1895,7 +1895,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         # that package's hard-coded `.cuda()` calls, and auto-applies the
         # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
         # on NPU.
-        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
             MiniCPMO45Token2wav as Token2wav,
         )
         from vllm_omni.platforms import current_omni_platform
@@ -2073,12 +2073,9 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         ``OmniGPUWorkerBase.compile_or_warm_up_model`` calls this right after the
         runner's own init work, i.e. weights loaded, profiling done, nothing
-        served yet. Runners that capture their own graphs (CUDA V1) already run a
-        dummy forward at that point, which fires the deferred sweep first and
-        leaves this a no-op; runners that do not (MRv2, NPU) would otherwise
-        defer the sweep to the first real request, where a C8 duplex replay
-        stalls every in-flight stream for ~1-2 s per graph while its first-wave
-        sessions time out.
+        served yet. If a dummy forward already fired the deferred sweep, this
+        is a no-op. Otherwise, warmup avoids deferring the sweep to the first
+        real request, which would stall every in-flight stream during capture.
 
         Capturing here rather than in ``load_weights`` also keeps the allocator
         layout the runner already uses: a sweep at weight-load time raises the
@@ -2086,8 +2083,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         at concurrency 8.
 
         ``cfm_graph_precapture_at_init`` can turn it off. It stays on by default
-        because this is where CUDA V1 already swept: the runner's own warmup has
-        run by now, so the capture reuses the allocator it warmed instead of
+        because the runner's own warmup has run by now, so capture reuses the
+        allocator it warmed instead of
         raising the reserved footprint the way a weight-load-time sweep does.
         """
         if self._extra_config().get("cfm_graph_precapture_after_load") is not None:

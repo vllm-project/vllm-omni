@@ -224,6 +224,9 @@ platforms:
       - stage_id: 1
         # K-step advances one codec frame per FlashAttention query.
         attention_backend: FLASH_ATTN
+        # K-step exposes two control logits, not codec prompt logprobs.
+        # Automatic KV sizing must not request generic prompt logprobs.
+        max_logprobs: 0
         # Cover 16 full 4096-token requests while leaving room for Code2Wav.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         # Fifteen continuation drafts reserve sixteen codec positions per step.
@@ -250,49 +253,114 @@ platforms:
   npu:
     model_runner: v2
     stages:
-    - stage_id: 0
-      max_num_seqs: 8
-      gpu_memory_utilization: 0.55
-      additional_config:
-        encoder_enable_npu_graph: true
-        encoder_max_npu_graphs: 4
-      max_num_batched_tokens: 8192
-      enable_prefix_caching: false
-      compilation_config:
-        cudagraph_mode: FULL_DECODE_ONLY
-      async_scheduling: false
-      speculative_config:
-        method: ngram
-        num_speculative_tokens: 7
-        prompt_lookup_min: 1
-        prompt_lookup_max: 1
-    - stage_id: 1
-      max_num_seqs: 8
-      kv_cache_memory_bytes: 4294967296
-      gpu_memory_utilization: 0.1
-      max_num_batched_tokens: 8192
-      speculative_config:
-        method: ngram
-        num_speculative_tokens: 15
-        prompt_lookup_min: 1
-        prompt_lookup_max: 1
-      async_scheduling: false
-      default_sampling_params:
-        stop_token_ids:
-        - 1
-      compilation_config:
-        cudagraph_mode: FULL_DECODE_ONLY
-    - stage_id: 2
-      max_num_seqs: 8
-      gpu_memory_utilization: 0.22
-      additional_config:
-        code2wav_enable_npu_graph: true
-        cfm_graph_batch_buckets:
-        - 1
-        - 2
-        - 4
-        - 8
-        code2wav_max_npu_graphs: 32
+      - stage_id: 0
+        # Keep the three stages' concurrency caps aligned so the top tier is
+        # not gated by a single stage.
+        max_num_seqs: 8
+        # Measured single-card co-location budget (910B1). The original turn-mode
+        # KV check needs one full 40960-token request on this stage:
+        # 144.8 KiB/token x 40960 = 5.62 GiB, so the KV pool must stay above
+        # that -- 0.50 leaves only 4.79 GiB and engine init fails with
+        # "estimated maximum model length is 33536"; main's platform value
+        # 0.55 gives 7.85 GiB and passes CI (A3). At 0.55 stage 2 starved
+        # into OOM on 910B1 once; re-verify the co-located tiers on both
+        # before shrinking this again.
+        gpu_memory_utilization: 0.55
+        # 32768 leaves no KV cache on 910B1 at the colocated budgets above.
+        # Audio Conv1d stays eager; the transformer stack is what this graph replays.
+        additional_config:
+          encoder_enable_npu_graph: true
+          encoder_max_npu_graphs: 4  # Per encoder (vision/audio).
+        max_num_batched_tokens: 8192
+        # Moved here from the platform-shared block; see the base stage note.
+        # Duplex KV window (window_kv.py) requires prefix caching disabled.
+        enable_prefix_caching: false
+        compilation_config:
+          # Stage 0 carries no K-step, so nearly every step after prefill is a
+          # uniform decode batch; one whole-step graph replays it without the
+          # per-segment launch/sync cost of piecewise splitting. The static-shape
+          # builder gates its runtime buckets on the decode graph mode, so
+          # FULL_DECODE_ONLY covers those steps. Measured on 910B1 with the
+          # three-stage co-located profile, seed-tts en, mean audio RTF at
+          # 32@1 / 64@4 / 128@8: FULL_DECODE_ONLY 0.2749 / 0.5332 / 0.8346
+          # versus PIECEWISE 0.3008 / 0.5428 / 0.8267, i.e. -8.6% at 32@1,
+          # -1.8% at 64@4 and +0.9% at 128@8, inside this tier's ~2% run-to-run
+          # scatter. FULL_AND_PIECEWISE was measured as well (0.2800 / 0.5354 /
+          # 0.8337): no tier beats this mode and startup grows 20-70 s for the
+          # second graph set, so stage 0 keeps the decode-only graph. Stage 1
+          # below already ships FULL_DECODE_ONLY with the K-step.
+          cudagraph_mode: FULL_DECODE_ONLY
+        async_scheduling: false
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+      - stage_id: 1
+        # Concurrency cap raised from 4 to 8; the override block only covered
+        # stages 0 and 2, so stage 1 kept the base value of 4.
+        max_num_seqs: 8
+        # Match CUDA's fixed KV budget and leave headroom for Stage 2
+        # (upstream #8735). When kv_cache_memory_bytes is not None, vLLM
+        # reserves exactly that for KV and skips memory profiling, so the
+        # gpu_memory_utilization below sizes nothing in this stage; it only
+        # acts as the device-level headroom knob for the colocated HiFi-GAN
+        # cuDNN workspace in the replica overlays that set this key to null
+        # (measured on 910B1: ~5.2 GiB Talker KV at 0.10 vs the 4 GiB
+        # fixed budget). Whether 4 GiB covers 8 concurrent Talker requests
+        # with the K=8 step is pending a sweep re-run on the merged config.
+        kv_cache_memory_bytes: 4294967296  # 4 GiB
+        gpu_memory_utilization: 0.10
+        max_num_batched_tokens: 8192
+        # The NPU Talker reserves sixteen codec positions with synchronous scheduling.
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 15
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+        async_scheduling: false
+        default_sampling_params:
+          # The Talker's stop head emits this id to finish a request.
+          stop_token_ids: [1]
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+      - stage_id: 2
+        max_num_seqs: 8
+        # 0.22 covers the 64k-token Code2Wav budget; the headroom that
+        # survived a full three-tier concurrency sweep upstream (measured
+        # on 910B1 under the pre-merge config, where stage 1's 0.10 was
+        # still the live sizing knob). Stage 2 sets no kv_cache_memory_bytes,
+        # so 0.22 remains the live knob here; re-verify on the merged config.
+        gpu_memory_utilization: 0.22
+        # Stage 2 stays outer-eager; CFM Whole-Euler, HiFT and encoder
+        # graphs use the shared Code2Wav wrappers with NPUGraph (upstream
+        # #8735).
+        additional_config:
+          code2wav_enable_npu_graph: true
+          # Batch sizes round up to the next bucket before capture, so the
+          # captured shape space becomes (#buckets x #mel buckets) instead of
+          # one entry per observed batch size. Padded slots are all-zero
+          # inputs and caches whose outputs are dropped; live slots keep their
+          # own math, so this is a capture-key optimization only. Unset keeps
+          # exact-batch capture.
+          cfm_graph_batch_buckets: [1, 2, 4, 8]
+          # Pool stays at 32. The CFM mel bucketing
+          # (cfm_graph_bucket_frames: 16) only aligns the mel-frame dimension;
+          # the capture key carries the full tensor shape
+          # (NPUExactGraphRunner._tensor_signature), so the batch dimension
+          # multiplies the shape space -- an 8-way concurrent stage-2 run
+          # reaches 61 distinct shapes, not 19. Captured graph buffers are
+          # allocated outside vLLM's gpu_memory_utilization budget, and this
+          # profile co-locates three stages on one card (measured pre-merge
+          # as 0.50 + 0.10 + 0.22 with 0.10 the live stage-1 knob; after the
+          # merge stage 1 carries a fixed 4 GiB KV budget instead),
+          # so a 64-entry pool OOMs the card at 128/8 while 32 completes all
+          # three tiers. cfm_graph_batch_buckets above is what makes 32
+          # sufficient: it collapses the batch axis so the 8-way shape space
+          # fits inside the pool instead of overflowing it into eager replay.
+          # It buys shape-space coverage, not graph memory -- both settings
+          # capture up to the pool limit.
+          code2wav_max_npu_graphs: 32
     connectors:
       connector_of_shared_memory:
         extra:

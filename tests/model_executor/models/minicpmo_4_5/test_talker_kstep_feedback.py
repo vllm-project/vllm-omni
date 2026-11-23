@@ -20,12 +20,9 @@ Layers pinned down here:
 - The draft rule: a stop-truncated row (a request that accepted fewer
   tokens than the step ran) folds the whole batch to a draft-free step,
   the same way an empty row already did.
-- The batched decode preprocess re-embeds every live row from its own state
-  record, once per step for the whole batch, and the owned snapshot the
-  codec payload is built from carries the real ids at the row each request
-  owns.
-- Model Runner V2 is refused up front instead of silently arming a loop
-  whose decode preprocess cannot re-embed the real previous frame.
+- The MRv2 batched decode preprocess re-embeds every live row from its own
+  state record, once per step for the whole batch.
+- Model Runner V2 arms the frame loop from the configured draft count.
 - A turn-end chunk masks, allows or forces codec EOS at the same frame as
   on the single-frame path, for every drain kind.
 """
@@ -37,7 +34,6 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import ConditionalChatTTSConfig
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _DRAIN_BOUNDARY_MASK,
     _DRAIN_NONE,
@@ -273,7 +269,9 @@ def test_decode_batch_reembeds_live_rows_from_last_code():
     input_ids = torch.tensor([0, 0, 5], dtype=torch.long)
     req_infos = [{"request_id": request_id, "audio_state": states[request_id]} for request_id in ("r1", "r2", "r3")]
 
-    _, embeds, _ = model.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+    _, embeds, _, _, updates = model.preprocess_decode_batch_mrv2(
+        input_ids=input_ids, input_embeds=torch.zeros(3, 4), req_infos=req_infos
+    )
 
     # The two recorded rows won and the placeholder-only row kept its id; a
     # fallback to the scheduled placeholder would be an all-zero row.
@@ -284,10 +282,7 @@ def test_decode_batch_reembeds_live_rows_from_last_code():
     ]
     # One host-to-device copy and one embedding launch for the whole step.
     assert emb.calls == 1
-    # The owned snapshot the codec payload is built from carries the real ids
-    # too, at the row each request owns.
-    assert model._decode_codec_ids["r1"][0].tolist() == [42, 43, 5]
-    assert [model._decode_codec_ids[request_id][1] for request_id in ("r1", "r2", "r3")] == [0, 1, 2]
+    assert all(update["codes"]["audio"].numel() == 0 for update in updates)
 
     # Parity with the scalar decode hook this batched path replaces.
     _, scalar_embeds, _ = model.preprocess(
@@ -300,16 +295,12 @@ def test_decode_batch_reembeds_live_rows_from_last_code():
     assert torch.equal(scalar_embeds[0], embeds[0])
 
 
-def test_multi_frame_decode_arms_under_both_model_runners():
-    def _config(*, use_v2_model_runner: bool):
-        return SimpleNamespace(
-            model_config=SimpleNamespace(model_stage="tts", use_v2_model_runner=use_v2_model_runner),
-            speculative_config={"method": "ngram", "num_speculative_tokens": 7},
-        )
-
-    # Both runners arm K=8; MRv2 replays one forward per frame.
-    assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=False)) == 8
-    assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True)) == 8
+def test_multi_frame_decode_arms_under_mrv2():
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(model_stage="tts"),
+        speculative_config={"method": "ngram", "num_speculative_tokens": 7},
+    )
+    assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(config) == 8
 
 
 def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"):
@@ -1686,46 +1677,45 @@ _QUIET = next(code for code in _QUIET_CODEC_IDS if code not in _SILENT_CODEC_IDS
 
 
 def _single_frame_eos(drain: int, previous: list[int], current: list[int]) -> tuple[bool, bool]:
-    """(forced, masked) codec EOS on the single-frame path after ``current`` codes of this condition.
+    """Replay MRv2 single-frame output and return its (forced, masked) EOS flags.
 
-    ``previous`` holds codes retained from the previous condition, which the
-    penalty window still carries.
+    Retained codes belong to the prompt's conditioning prefix; only this
+    condition's decode frames advance the silent and quiet run counters.
     """
-    talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    nn.Module.__init__(talker)
-    talker._num_audio_tokens = _NUM_AUDIO_TOKENS
-    talker._codec_eos_id = _EOS_ID
-    talker._force_eos_rows = None
-    talker._mask_eos_rows = None
-    talker._pending_force_eos_rows = None
-    talker._penalty_histories = None
-    talker._request_condition_states = {}
-    talker._deferred_cleanup_ids = set()
-    talker._tts_config = ConditionalChatTTSConfig()
-    talker._codec_temperature = 0.0
-    talker._codec_min_tokens = 0
-    talker._codec_max_tokens = 4032
-    talker._k_step_frames = 0
-    talker.supports_multi_frame_decode = False
-    talker.head_code = nn.ModuleList([nn.Linear(2, _NUM_AUDIO_TOKENS, bias=False)])
-    talker._request_audio_states = {
-        "r1": {
-            "finished": False,
-            "step": len(current),
-            "max_tokens": 104,
-            "min_tokens": 0,
-            "turn_end_drain": drain,
-            "recent_codes": (previous + current)[-16:],
-        }
-    }
-    output = talker.make_omni_output(
-        torch.ones(1, 2),
-        model_intermediate_buffer=[{"request_id": "r1", "codes": {"audio": torch.empty(0)}}],
-        request_token_spans=[(0, 1)],
-    )
-    logits = talker.compute_logits(output.text_hidden_states)
-    forced = bool(output.multimodal_outputs["meta"]["finished"][0])
-    return forced, not forced and logits[0, _EOS_ID].item() == float("-inf")
+    from tests.model_executor.models.minicpmo_4_5.test_talker_mrv2 import _batch, _req_states, _talker
+
+    talker = _talker()
+    prefix = [0] * 4 + previous
+    prompt_len = len(prefix)
+    states = _req_states({0: prompt_len}, token_ids={0: prefix + current})
+    info: dict[str, object] = {"audio_state": {"finished": False, "recent_codes": previous}}
+    if drain != _DRAIN_NONE:
+        info.update(
+            native_duplex=True,
+            duplex={"epoch": 0, "turn_id": 0},
+            meta={"turn_end": True, "turn_text_ends_sentence": drain == _DRAIN_UNTIL_SILENT},
+        )
+    for step in range(len(current) + 1):
+        batch, _ = _batch(
+            [
+                dict(
+                    slot=0,
+                    prompt_len=prompt_len,
+                    computed=prompt_len + step - 1 if step else 0,
+                    span=[current[step - 1]] if step else prefix,
+                    prefill=step == 0,
+                )
+            ]
+        )
+        talker.make_omni_output_mrv2(
+            torch.ones(batch.input_ids.numel(), 2),
+            input_batch=batch,
+            req_states=states,
+            model_intermediate_buffer=[info],
+        )
+    forced = talker.take_mrv2_forced_eos(batch, states, 1).item()
+    masked = talker._mrv2_masked_eos
+    return forced, masked is not None and masked[0].item()
 
 
 def _kstep_eos(drain: int, previous: list[int], current: list[int], temperature: float) -> tuple[bool, bool]:

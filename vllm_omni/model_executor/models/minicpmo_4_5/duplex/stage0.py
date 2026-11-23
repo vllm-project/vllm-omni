@@ -402,9 +402,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
-        final: bool = False,
         stage0_window: dict[str, object] | None = None,
-        stage0_reanchor: dict[str, object] | None = None,
     ) -> _PrefillSteps:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -982,7 +980,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             # A batched-path session whose unit this path has to take: hand the
             # history over as the transformers cache the per-session path grows.
             state.audio_past_key_values = state.audio_past_key_values.to_legacy_cache()
-        self._ensure_dynamic_cache_compat()
         has_audio_cache = state is not None and hasattr(self.thinker, "audio_past_key_values")
         previous_audio_past_key_values = (
             getattr(self.thinker, "audio_past_key_values", None) if has_audio_cache else None
@@ -1126,7 +1123,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             batch_feature = process_audio([ref_audio])
             if hasattr(batch_feature, "to"):
                 batch_feature = batch_feature.to(self.device)
-            self._ensure_dynamic_cache_compat()
             for target in (self.stage_model, self.thinker):
                 get_audio_embedding = getattr(target, "get_audio_embedding", None)
                 if callable(get_audio_embedding):
@@ -1160,26 +1156,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             with suppress(Exception):
                 setattr(batch_feature, name, value)
         return self._stage_audio_embeddings(batch_feature, state=state)
-
-    @staticmethod
-    def _ensure_dynamic_cache_compat() -> None:
-        try:
-            from transformers.cache_utils import DynamicCache
-        except Exception:
-            return
-        if hasattr(DynamicCache, "get_usable_length"):
-            return
-
-        def get_usable_length(self, new_seq_length: int | None = None, layer_idx: int = 0) -> int:
-            get_seq_length = getattr(self, "get_seq_length", None)
-            if not callable(get_seq_length):
-                return 0
-            try:
-                return int(get_seq_length(layer_idx))
-            except TypeError:
-                return int(get_seq_length())
-
-        DynamicCache.get_usable_length = get_usable_length  # type: ignore[attr-defined]
 
     @staticmethod
     def _cat_nested_tensors(value: object) -> torch.Tensor | None:

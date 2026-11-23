@@ -226,7 +226,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # before the next step exports the finished requests' KV caches.
             if callable(flush_pending_metadata):
                 flush_pending_metadata(state.input_batch.req_ids)
+        if not dummy_run and isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
+            output = self._finalize_runner_output(output, idle=not scheduler_output.total_num_scheduled_tokens)
         return output
+
+    @torch.inference_mode()
+    def _finalize_runner_output(
+        self, output: ModelRunnerOutput | AsyncModelRunnerOutput, *, idle: bool
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        state = self.model_state
+        finalize = getattr(type(state), "finalize_runner_output", None)
+        return output if finalize is None else finalize(state, output, idle=idle)
 
     # ------------------------------------------------------------------
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
@@ -252,9 +262,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
     @torch.inference_mode()
     @step_eplb_after()
     @timed("sample")
-    def sample_tokens(
-        self, grammar_output: GrammarOutput | None
-    ) -> OmniAsyncOutput | OmniModelRunnerOutput | ModelRunnerOutput | None:
+    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         kv_extracted = self._kv_extracted_req_ids
         self._kv_extracted_req_ids = None
 
@@ -466,9 +474,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.ec_connector_output = ec_connector_output
 
         self._reserve_native_data_plane_outputs(model_runner_output)
-        if materialize_native:
-            return self._materialize_native_output(async_output)
-        return async_output
+        output = self._materialize_native_output(async_output) if materialize_native else async_output
+        return self._finalize_runner_output(output, idle=False)
 
     def _propose_draft_tokens(
         self,
