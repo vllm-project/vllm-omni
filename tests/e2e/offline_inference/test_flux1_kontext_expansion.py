@@ -46,7 +46,7 @@ def _sampling_512() -> OmniDiffusionSamplingParams:
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 def test_flux_kontext_text_to_image(offline_client: OfflineOmniClient):
     """Test FluxKontext text-to-image generation with real model."""
     request_config = {
@@ -57,7 +57,7 @@ def test_flux_kontext_text_to_image(offline_client: OfflineOmniClient):
     offline_client.send_diffusion_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 def test_flux_kontext_image_edit(offline_client: OfflineOmniClient):
     """Test FluxKontext image-to-image editing with real model."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
