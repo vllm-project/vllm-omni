@@ -1241,6 +1241,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         weight_name_filter: Callable[[str], bool] | None = None,
         disallow_weights: Iterable[str] = (),
     ) -> None:
+        # Direct callers such as HSDP bypass load_model's preparation hook.
+        self._prepare_lazy_weight_loading(model)
         weights_to_load = self._get_expected_parameter_names(model)
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
         if weight_name_filter is not None:
