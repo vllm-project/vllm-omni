@@ -184,6 +184,11 @@ Setting both an explicit `quant.precision` and a quantized global dtype is
 rejected at config load. Execution options such as `fp8_fa_mode` alone do not
 select a precision or enable quantization.
 
+Scheduler-managed paged KV layers reject explicit `quant.precision` at startup,
+including precision selected by a role or schedule profile. Their `forward_paged`
+path does not apply this attention quantization policy. Remove the explicit
+precision for those layers or use `diffusion_kv_mode: dense_legacy`.
+
 `fp8_fa_mode`, `mxfp4_scale_alg`, and `mxfp4_dst_type_max` require an NPU;
 other platforms reject these options during backend initialization. For CUDA
 FA3 FP8, use `quant.precision: fp8` without MindIE-SD execution options.

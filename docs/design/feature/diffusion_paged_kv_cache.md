@@ -317,6 +317,9 @@ Use request execution for the current Hunyuan integration; the unsupported
 batching and step modes are summarized in [Execution Modes](#execution-modes).
 
 The current paged KV format is unquantized BF16 with identity Q/K/V scales.
+Marked scheduler-paged attention layers reject explicit `quant.precision`
+at startup, including resolved per-role specs and schedule candidates, because
+`forward_paged` does not apply the dense attention quantization policy.
 Model weight quantization, CPU offload, layerwise offload, and distributed
 layerwise offload (DLO) have not been validated with this path. Leave those
 options disabled for a validated paged setup; use `dense_legacy` when they are

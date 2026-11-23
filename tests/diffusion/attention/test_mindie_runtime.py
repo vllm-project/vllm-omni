@@ -444,6 +444,39 @@ def test_spec_precision_rejects_unsupported_platform(runtime, monkeypatch):
         make_layer(runtime, monkeypatch, method=None, quant={"precision": "mxfp4"})
 
 
+@pytest.mark.parametrize("source", ["baseline", "schedule"])
+@pytest.mark.parametrize("precision", [None, "fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize(
+    ("scheduler_paged", "paged_role"),
+    [(True, "primary"), (True, None), (False, "primary")],
+    ids=["scheduler-paged", "unmarked", "dense"],
+)
+def test_spec_precision_rejected_on_scheduler_paged_layers(runtime, source, precision, scheduler_paged, paged_role):
+    layer = object.__new__(layer_mod.Attention)
+    torch.nn.Module.__init__(layer)
+    spec = AttentionSpec(backend="FLASH_ATTN", quant={"precision": precision})
+    layer.attention = flash()
+    layer.attn_backend = flash_attn.FlashAttentionBackend
+    layer.attn_spec = spec if source == "baseline" else AttentionSpec(backend="FLASH_ATTN")
+    layer._schedule_candidates = (
+        {"quant": layer_mod.ScheduleCandidate(layer.attn_backend, spec, layer.attention, True)}
+        if source == "schedule"
+        else {}
+    )
+    layer._scheduler_paged_kv = scheduler_paged
+    layer.paged_kv_cache_role = paged_role
+    layer._disable_kv_quant = False
+    layer.layer_idx = 0
+    config = SimpleNamespace(diffusion_kv_cache_dtype=None)
+
+    if scheduler_paged and paged_role is not None and precision is not None:
+        with pytest.raises(ValueError, match=r"quant.precision.*Scheduler-managed paged KV"):
+            layer._init_kv_cache_quantization(config)
+    else:
+        layer._init_kv_cache_quantization(config)
+        assert layer._has_spec_quantization is (precision is not None)
+
+
 @pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize("skip_quant", [False, True])
 def test_packed_capability_uses_spec_precision(runtime, monkeypatch, mocker, precision, skip_quant):

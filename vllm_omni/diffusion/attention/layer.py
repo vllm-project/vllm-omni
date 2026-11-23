@@ -889,6 +889,13 @@ class Attention(nn.Module):
         self._has_spec_quantization = spec_precision is not None or any(
             self._spec_quant_precision(candidate.spec) is not None for candidate in self._schedule_candidates.values()
         )
+        if self._scheduler_paged_kv and self.paged_kv_cache_role is not None and self._has_spec_quantization:
+            raise ValueError(
+                "quant.precision is not supported on Scheduler-managed paged KV layers: "
+                "forward_paged does not apply the attention quantization policy. "
+                "Remove quant.precision from this layer's attention spec and schedule profiles, "
+                "or use diffusion_kv_mode='dense_legacy'."
+            )
 
     @staticmethod
     def _spec_quant_precision(spec: "AttentionSpec | None") -> str | None:
