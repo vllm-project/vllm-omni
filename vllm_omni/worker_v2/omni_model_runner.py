@@ -258,6 +258,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         with self._staged_writes.activate():
             super().__init__(*args, **kwargs)
         self._validate_parallel_support()
+        # Request IDs that opted into last-layer hidden-state return via the
+        # typed OmniEngineCoreRequest field (RL teacher rollouts). Populated
+        # in add_requests; only these rows pay the hidden-state D2H copy.
+        self._hidden_state_req_ids: set[str] = set()
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
             if uses_native_mrv2_data_plane(
@@ -288,6 +292,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         static_staged_writes = (type(sampler) is Sampler or getattr(sampler, "omni_static_staged_writes", False)) and [
             type(p) for p in getattr(sampler, "logits_processors", ())
         ] == [LogitBiasState, PenaltiesState, BadWordsState]
+        hidden_state_req_ids = getattr(self, "_hidden_state_req_ids", None)
+        if hidden_state_req_ids is None:
+            # Late materialization keeps object.__new__-constructed runners
+            # (unit-test doubles) on the same code path.
+            hidden_state_req_ids = self._hidden_state_req_ids = set()
+        for request_data in scheduler_output.scheduled_new_reqs:
+            if getattr(request_data, "return_hidden_states", False):
+                hidden_state_req_ids.add(request_data.req_id)
+        hidden_state_req_ids.difference_update(scheduler_output.finished_req_ids)
         if not scheduler_output.scheduled_new_reqs and static_staged_writes:
             return
         if self._mm_rng_state is not None:

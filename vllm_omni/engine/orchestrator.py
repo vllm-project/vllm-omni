@@ -209,8 +209,14 @@ def build_engine_core_request_from_tokens(
 
     sampling_params = None
     pooling_params = None
+    return_hidden_states = False
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
+        extra_args = getattr(sampling_params, "extra_args", None)
+        if isinstance(extra_args, dict) and extra_args.get("return_hidden_states"):
+            # Lift the client-side extra_args opt-in onto the typed wire field
+            # so the runner never inspects free-form extra_args.
+            return_hidden_states = True
         if model_config is not None:
             remaining = model_config.max_model_len - length_from_prompt_token_ids_or_embeds(
                 prompt_token_ids, prompt_embeds
@@ -253,6 +259,7 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        return_hidden_states=return_hidden_states,
     )
 
 

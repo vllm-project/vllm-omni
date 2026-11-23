@@ -1672,6 +1672,39 @@ def _frontend_cli_fields() -> frozenset[str]:
     return frozenset(config_field.name for config_field in fields(FrontendArgs))
 
 
+def diffusion_ingress_allowed_fields() -> frozenset[str]:
+    """Field names the diffusion ingress validator accepts from raw engine kwargs.
+
+    Single source of truth for the raw-ingress contract shared by
+    ``normalize_and_validate_diffusion_engine_ingress_kwargs`` and external
+    embedders (RL frameworks strip their LLM-only engine args against this
+    set before submitting diffusion requests, instead of mirroring the
+    private per-owner sets).
+    """
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.arg_utils import orchestrator_field_names
+
+    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+    stage_consumed_fields = (
+        diffusion_fields
+        | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+        | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
+        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
+        | _DIFFUSION_STAGE_METADATA_FIELDS
+        | _DIFFUSION_DEFAULT_FACTORY_FIELDS
+    ) - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+    externally_consumed_fields = (
+        _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+        | _NON_STAGE_ENGINE_CLI_FIELDS
+        | _frontend_cli_fields()
+        | orchestrator_field_names()
+        # Coordination fields also live on the typed orchestrator config, not
+        # all of them are present on the CLI-only OrchestratorArgs dataclass.
+        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
+    )
+    return stage_consumed_fields | externally_consumed_fields
+
+
 def normalize_and_validate_diffusion_engine_ingress_kwargs(
     kwargs: Mapping[str, Any],
     *,
@@ -1683,7 +1716,6 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         normalize_omni_diffusion_kwargs,
         validate_omni_diffusion_kwargs,
     )
-    from vllm_omni.engine.arg_utils import orchestrator_field_names
 
     mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
     engine_owned = {
@@ -1705,16 +1737,7 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         | _DIFFUSION_STAGE_METADATA_FIELDS
         | _DIFFUSION_DEFAULT_FACTORY_FIELDS
     ) - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
-    externally_consumed_fields = (
-        _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
-        | _NON_STAGE_ENGINE_CLI_FIELDS
-        | _frontend_cli_fields()
-        | orchestrator_field_names()
-        # Coordination fields also live on the typed orchestrator config, not
-        # all of them are present on the CLI-only OrchestratorArgs dataclass.
-        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
-    )
-    allowed_fields = stage_consumed_fields | externally_consumed_fields
+    allowed_fields = stage_consumed_fields | diffusion_ingress_allowed_fields()
     validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)
     return {name: value for name, value in normalized.items() if name in stage_consumed_fields}
 
