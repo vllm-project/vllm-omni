@@ -861,48 +861,36 @@ steps:
       - label: "MiniCPM-o 4.5 Daily-Omni Accuracy"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_minicpmo_4_5_accuracy
+        env:
+          ROCM_E2E_TIMEOUT_MINUTES: "165"
+          ACC_BENCH_RESULT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-daily-omni-accuracy/results"
         artifact_paths:
           - artifacts/rocm-minicpmo-daily-omni-accuracy/**/*
         commands:
-          - export ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-daily-omni-accuracy"
-          - mkdir -p "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR"
+          - mkdir -p "$$ACC_BENCH_RESULT_DIR"
+          - rm -f "$${ACC_BENCH_RESULT_DIR:?}"/result_acc_*_daily_omni_*.json
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench
+            1 omni rocm-minicpmo-daily-omni-accuracy
           - |
-            node="tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
-            pytest --collect-only -q "$$node" \
-              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
-              > "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt"
-            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 1 ]]; then
-              echo "Expected exactly one MiniCPM-o 4.5 Daily-Omni accuracy node, found $$count." >&2
-              cat "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt"; then
-              echo "MiniCPM-o 4.5 Daily-Omni accuracy node was not collected: $$node" >&2
-              cat "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-          - |
-            set +e
-            node="tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
-            timeout --signal=TERM --kill-after=2m 165m \
-              pytest -s -v "$$node" \
-              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
-              --junitxml="$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
-            if [[ -d tests/e2e/accuracy/minicpmo_4_5/results ]]; then
-              mkdir -p "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/results"
-              cp -a tests/e2e/accuracy/minicpmo_4_5/results/. \
-                "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/results/"
-            fi
+            python3 - "$$ACC_BENCH_RESULT_DIR" <<'PY'
+            import json
+            import sys
+            from pathlib import Path
 
-            exit "$$status"
+            results = list(Path(sys.argv[1]).glob("result_acc_*_daily_omni_*.json"))
+            if len(results) != 1:
+                raise SystemExit(f"Expected one Daily-Omni result, found {len(results)}")
+            result = json.loads(results[0].read_text())
+            expected = {"daily_omni_evaluated_ok": 1197, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
+            for key, value in expected.items():
+                if result.get(key) != value:
+                    raise SystemExit(f"Expected {key}={value}, got {result.get(key)!r}")
+            PY
 
       - label: "MiniCPM-o 4.5 Seed-TTS Accuracy"
         agent_pool: mi300_1
@@ -1669,11 +1657,10 @@ steps:
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
             -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only"
 
-      # Keep the Flux2Klein and LongCatImage startup failures observational.
       - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU"
         agent_pool: mi300_4
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 50
         source_file_dependencies: diffusion_tiny_model
         artifact_paths:
