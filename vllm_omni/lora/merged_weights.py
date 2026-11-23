@@ -50,14 +50,12 @@ def _default_alloc_pinned_bytes(nbytes: int) -> torch.Tensor:
 def _default_free_device_memory(device: torch.device) -> int | None:
     if device.type == "cpu":
         return None
-    if device.type == "cuda":
-        free_bytes, _ = torch.cuda.mem_get_info(device)
-        return int(free_bytes)
-    get_memory_info = getattr(torch.accelerator, "get_memory_info", None)
-    if callable(get_memory_info):
-        free_bytes, _ = get_memory_info(device)
-        return int(free_bytes)
-    return None
+    from vllm_omni.platforms import current_omni_platform
+
+    try:
+        return int(current_omni_platform.get_free_memory(device))
+    except NotImplementedError:
+        return None
 
 
 def _default_use_pinned_host(device: torch.device) -> bool:
