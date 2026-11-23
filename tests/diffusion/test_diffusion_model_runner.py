@@ -1501,18 +1501,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-@pytest.mark.parametrize("mode", ["cast", "reactor"])
-def test_load_model_rejects_npu_int8_nz_with_sleep(monkeypatch, mode):
-    runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(enable_sleep_mode=True)
-    monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", mode)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "is_npu", lambda: True)
-    with pytest.raises(ValueError, match="enable_sleep_mode.*VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE"):
-        runner.load_model()
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monkeypatch):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()

@@ -3,6 +3,7 @@
 """Unit tests for Int8 quantization config."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -569,6 +570,18 @@ def test_npu_int8_nz_ordinary_offload(mocker, monkeypatch, quantized):
     else:
         assert offloader.enable_offload_backend(mocker.Mock(), model) == (model, backend)
         backend.enable.assert_called_once_with(model)
+
+
+@pytest.mark.parametrize("mode", ["cast", "reactor"])
+def test_load_model_rejects_npu_int8_nz_with_sleep(monkeypatch, mode):
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.od_config = SimpleNamespace(enable_sleep_mode=True)
+    monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", mode)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    with pytest.raises(ValueError, match="enable_sleep_mode.*VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE"):
+        runner.load_model()
 
 
 @npu_available
