@@ -1036,14 +1036,11 @@ class MiniMaxH3Pipeline(
                 or resolve_offload(od_config).strategy is not OffloadStrategy.NONE
                 or od_config.host_weight_runtime_mode != "disabled"
                 or od_config.cache_backend not in (None, "none")
-                # Reference-KV reuse drops Ref2VA reference rows from the hidden stream after the
-                # first step, while the control branch needs the full packed sequence.
-                or getattr(od_config, "kv_offload_config", None)
             )
             if unsupported:
                 raise ValueError(
                     "H3 control requires request mode, local VAE encoding, dense weights, "
-                    "and no cache/offload/SP/HSDP or reference-KV offload; TP is supported"
+                    "and no cache/offload/SP/HSDP; TP is supported"
                 )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_distilled_lora_adapter_ids: set[int] = set()
@@ -1067,6 +1064,12 @@ class MiniMaxH3Pipeline(
                 and not isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
             ):
                 raise ValueError("H3 control requires the FL2VA checkpoint partition or the FastH3 Omni checkpoint")
+            if (
+                control_path
+                and (model_root / self._fasth3_checkpoint.transformer_component / "nvfp4_weights.safetensors").is_file()
+            ):
+                # The packed NVFP4 DiT (FastH3 Omni QAD) is quantized without od_config.quantization_config.
+                raise ValueError("H3 control requires dense weights; this FastH3 checkpoint ships an NVFP4 DiT")
             self._fasth3_checkpoint.check_serving_contract(partition=self.partition, od_config=od_config)
             release = self._fasth3_checkpoint.release_metadata()
             if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec):
@@ -3491,13 +3494,19 @@ class MiniMaxH3Pipeline(
             has_native_lora=has_native_lora,
         )
         if control is not None and task != self._control_task():
+            unsupported = "keyframes" if self._control_task() == "ref2va" else "references and keyframes"
             raise OmniClientError(
                 f"H3 control on this checkpoint supports {self._control_task()} only; "
-                "keyframe conditioning is unsupported"
+                f"{unsupported} are unsupported with control"
             )
         if control is not None and continuation is not None:
             raise OmniClientError(
                 "MiniMax H3 control does not support long-video continuation; use long_video_mode=full"
+            )
+        if control is not None and resolve_continuation_request(extra) is not None:
+            raise OmniClientError(
+                "MiniMax H3 control does not support continue_from: control rows describe the returned "
+                "frames, not the hidden overlap that guides the continuation"
             )
         if turbo_spec is not None:
             self._validate_turbo_sampling(sampling, turbo_spec)

@@ -910,10 +910,10 @@ vllm serve "$MODEL" --omni --task-type fl2va --trust-remote-code \
 ```
 
 The initial control path uses resident BF16 weights and tensor parallelism.
-On base H3 weights, reference/keyframe conditioning, visual timeline guides, sequence parallelism, approximate cache
-acceleration and quantized control execution require separate support; do not combine them with
-this configuration. The FastH3 Omni checkpoint takes control as Ref2VA with its
-reference images; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet). Control/Turbo combinations need their own validation and
+Keyframe conditioning, visual timeline guides, continuation (`continue_from` and long-video), sequence parallelism,
+approximate cache acceleration and quantized control execution require separate support; do not combine them with
+this configuration. On base H3 weights control also takes no references. The FastH3 Omni checkpoint takes control as
+Ref2VA with its reference images; see [FastH3 Omni control](../FastVideo/FastH3-Omni.md#controlnet). Control/Turbo combinations need their own validation and
 are not established by ordinary H3 Turbo results.
 
 Active control conditioning cannot be reused in a `latent_refine` pass at a

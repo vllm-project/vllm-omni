@@ -257,8 +257,12 @@ acceleration, including `quality=high`, when using Heun.
 
 ### MiniMax H3 control and inpainting
 
-MiniMax H3 FL2VA accepts preprocessed control videos when the server is
+MiniMax H3 FL2VA (T2VA requests) and the FastH3 Omni checkpoint (Ref2VA requests
+with references) accept preprocessed control videos when the server is
 started with `--controlnet-model-path /absolute/path/to/control.safetensors`.
+A control request may include `input_reference`/`input_references` or other
+reference inputs only when `extra_params.task` is `ref2va`; keyframes,
+latent-mask editing and continuation are rejected with control.
 Use the original MiniMax H3 Fun ControlNet Union checkpoint. The checkpoint
 is loaded at startup; requests cannot select or download weights.
 
