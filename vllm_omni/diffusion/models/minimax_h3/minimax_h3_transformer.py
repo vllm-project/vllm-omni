@@ -852,6 +852,17 @@ class MiniMaxH3DiTModel(nn.Module):
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
         )
         self.od_config = od_config
+        overlap = (getattr(od_config, "additional_config", None) or {}).get("rocm_h3_head_overlap", False)
+        if not isinstance(overlap, bool):
+            raise ValueError("rocm_h3_head_overlap must be a boolean")
+        self._rocm_head_overlap = (
+            overlap
+            and torch.version.hip is not None
+            and od_config.parallel_config.ulysses_degree == 4
+            and od_config.parallel_config.ring_degree == 1
+            and od_config.parallel_config.allgather_degree == 1
+            and not getattr(od_config, "diffusion_use_graph", False)
+        )
         if reference_isolation_enabled(od_config) or getattr(od_config, "kv_offload_config", None) is not None:
             from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import MiniMaxH3CachedAdapter
 
@@ -1658,6 +1669,20 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
 
+        overlap_kwargs = {}
+        if (
+            getattr(self, "_rocm_head_overlap", False)
+            and num_requests == 1
+            and block_packed_total == 37760
+            and reference_kv_state is None
+            and reference_isolation is None
+            and vdn_window is None
+        ):
+            from .head_overlap import prepare_overlap
+
+            if prepare_overlap(self.blocks, hidden, cu_seqlens, block_max_seqlen):
+                overlap_kwargs["rocm_head_overlap"] = True
+
         for block_index, block in enumerate(self.blocks):
             hidden = block(
                 hidden,
@@ -1674,6 +1699,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_compact=compact_reference,
                 reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
+                **overlap_kwargs,
             )
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale
