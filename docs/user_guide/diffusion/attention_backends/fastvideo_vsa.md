@@ -192,8 +192,9 @@ queries keep their 64-token tiles and keys are paired: a query tile attends
 every tile it selected plus the neighbour each one shares a 128-token key
 block with. The selection is therefore a superset of the CUDA route's, never
 a subset, and the attention budget per query is up to twice the configured
-one. Tile padding is zero-filled; its contribution to the softmax denominator
-is removed exactly from the log-sum-exp the operator returns.
+one. Padded key rows are filled with a valid key from their own 128-token
+block and padded value rows are zero; the padded rows' contribution to the
+softmax denominator is then removed using the log-sum-exp the operator returns.
 
 Layers without a VSA gate (the token refiner) and 128-token layouts keep the
 dense path on this platform.

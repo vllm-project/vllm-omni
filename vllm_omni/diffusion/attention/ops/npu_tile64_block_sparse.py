@@ -141,8 +141,15 @@ def npu_tile64_block_sparse_attention(
     pad_mass = torch.matmul(query.transpose(1, 2).float(), representative_key.float().transpose(-1, -2)).mul_(
         softmax_scale
     )
-    pad_mass = pad_mass.sub_(lse).exp_().mul_((KEY_BLOCK - pair_valid).float())
-    pad_mass = pad_mass.mul_(pair_map.repeat_interleave(TILE, dim=-2)).sum(dim=-1, keepdim=True)
+    # ``lse`` covers the blocks a query selected, so only their representatives
+    # are bounded by it. An unselected block's can sit far above, where ``exp``
+    # overflows fp32 and a zero mask applied afterwards turns the infinity into
+    # NaN for the whole row. Blocks with nothing to remove are masked before
+    # the exponent instead.
+    padded = KEY_BLOCK - pair_valid
+    removable = pair_map.repeat_interleave(TILE, dim=-2) & (padded > 0)
+    pad_mass = pad_mass.sub_(lse).masked_fill_(~removable, float("-inf")).exp_().mul_(padded.float())
+    pad_mass = pad_mass.sum(dim=-1, keepdim=True)
     output = output.float() / (1 - pad_mass)
     # A query tile that enabled no key block with a valid key has nothing to attend.
     has_keys = pair_map.any(dim=-1)

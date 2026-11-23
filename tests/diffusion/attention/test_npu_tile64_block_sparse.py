@@ -148,6 +148,36 @@ def test_tile64_recovers_a_padded_block_whose_only_valid_logit_is_far_below_the_
     assert output[0, 64:].abs().sum() == 0  # the other query tile selected nothing
 
 
+@pytest.mark.parametrize(
+    "sizes",
+    [[64, 64, 64, 64], [64, 17, 64, 1]],
+    ids=["unselected_block_full", "unselected_block_padded"],
+)
+def test_tile64_ignores_an_unselected_block_whose_logit_is_far_above_the_selected_ones(operator_calls, sizes):
+    """A key block the query did not select must not reach the correction.
+
+    The operator's log-sum-exp covers the selected blocks only, so the
+    representative logit of an unselected block is not bounded by it. One that
+    sits 88 or more above overflows ``exp`` in fp32, and multiplying that
+    infinity by a zero mask afterwards is NaN for the whole query row.
+    """
+    query, key, value, valid = _tiled_inputs(sizes)
+    query, key = query.float(), key.float()
+    query[..., 0] = 16.0
+    key[0, 128, :, 0] = 200.0 / (16.0 * SCALE)  # the unselected block's representative row: scaled logit +200
+    key[0, 128:] *= valid[128:, None, None]  # padded rows stay zero, as the caller hands them over
+    query, key = query.to(torch.bfloat16), key.to(torch.bfloat16)
+    block_map = torch.zeros(1, 2, 4, 4, dtype=torch.bool)
+    block_map[..., 0] = True  # every query tile selects key tile 0 and nothing in the second key block
+
+    output = npu_tile64_block_sparse_attention(
+        query, key, value, block_map, torch.tensor(sizes, dtype=torch.int32), SCALE
+    )
+
+    assert torch.isfinite(output.float()).all()
+    torch.testing.assert_close(output.float(), _reference(query, key, value, block_map, valid), atol=2e-2, rtol=2e-2)
+
+
 def test_pair_key_tiles_folds_an_odd_tile_count_onto_whole_key_blocks():
     block_map = torch.tensor([[[[True, False, False, False, True], [False, False, True, False, False]]]])
     pair_map, pair_valid = pair_key_tiles(block_map, torch.tensor([64, 3, 0, 64, 10], dtype=torch.int32))
