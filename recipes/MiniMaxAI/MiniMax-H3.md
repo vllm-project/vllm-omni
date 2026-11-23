@@ -622,16 +622,16 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-For this source checkout, build the frozen vLLM 0.33.0 ROCm runtime from
-source using the repository Dockerfile, from the Omni repository root:
+For this source checkout, build the image with the matching vLLM 0.34.0
+ROCm runtime from the Omni repository root:
 
 ```bash
-docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v034-source .
 ```
 
 See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
 for source/runtime details. Container and native H3 validation on ROCm remain
-pending for this checkout; an older ROCm wheel cannot provide its 0.33 APIs.
+pending for this checkout; an older ROCm wheel cannot provide its 0.34 APIs.
 
 Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
@@ -1225,7 +1225,7 @@ full and windowed latents.
 
 ## Request-scoped sampler
 
-H3 supports `euler` (the default) and `res_multistep`. Select the sampler per
+H3 supports `euler` (the default), `res_multistep`, and `heun`. Select the sampler per
 request; it applies to both video and audio, using their separate sigma schedules.
 For the HTTP examples above, set `num_inference_steps=20` and add
 `"sampler":"res_multistep"` to the existing `extra_params` object. For example,
@@ -1248,7 +1248,11 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
-Both samplers use one DiT evaluation per step in request mode and step execution.
+`euler` and `res_multistep` use one DiT evaluation per step in request mode and
+step execution. `heun` evaluates the DiT a second time at the Euler proposal and
+averages the two derivatives, so an N-step schedule ending at zero uses `2N - 1`
+evaluations; the final step to zero is a plain Euler update. Heun needs uncached
+model runs, so it is rejected with `quality=high` or a server-wide cache backend.
 `res_multistep` retains the previous denoised prediction independently for each
 request and each stream; its first and final updates use Euler. Omitting `sampler`
 or selecting `euler` preserves the existing Euler update. Reducing the step count
@@ -1256,8 +1260,8 @@ reduces model evaluations, but quality depends on the prompt and configuration;
 20 RES steps are a candidate to compare against an Euler-50 reference.
 
 Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
-must keep `sampler="euler"`. RES sampling with those schedules has not been
-validated and is rejected with `ValueError`.
+must keep `sampler="euler"`. RES and Heun sampling with those schedules have not
+been validated and are rejected with `ValueError`.
 
 ## Request-scoped quality
 
@@ -1476,7 +1480,7 @@ storyboard prompts into this six-section format.
 
 ### Turbo LoRA
 
-The eight Diffusers-layout LightX2V Turbo artifacts are supported. The
+The nine Diffusers-layout LightX2V Turbo artifacts below are supported. The
 filename records the contract, so the server reads the step count, task family
 and flow shift from it and validates each request against the artifact that is
 loaded. It does not rewrite request or deploy-config sampling values: the
@@ -1491,6 +1495,7 @@ rejected.
 | `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 4 | 6 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 6 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 128 |
 | `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 4 | 12 | 8 |
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 8 | 6 | 8 |
 
@@ -1507,6 +1512,14 @@ request-level `scale` is a further multiplier on top of it.
 > rank`, so the `alpha=8` rows drive at 1/16 the strength of the `alpha=128`
 > rows. 8 is the default of LightX2V's reference script, which never reads the
 > metadata; its documented `v0.1` command does not override that default.
+>
+> `8step_v1.2` is the one artifact that also adapts the timestep modulation:
+> it adds a rank-16 pair on the AdaLN projection of each of the 50 DiT blocks
+> and of the output layer, and stores an alpha tensor next to every pair. Those
+> 51 pairs are applied at their own `scale * alpha / rank` (16 / 16), not at
+> the rank-128 pairs' value. It is also the one `_768p` artifact that runs at
+> `flow_shift` 12: LightX2V's reference configs use 12 for it and 6 for the
+> other `_768p` files.
 
 Every artifact except `minimax_h3_fl2v_turbo_4step_v0.1` also ships a
 `_comfyui_` export of the same weights. Those fuse Q/K/V into one projection
@@ -1563,7 +1576,7 @@ The two `ref2v` rows are not served by this FL2VA command. Start a
 already send `audio_flow_shift=3.0`.
 
 For FL2VA, change `task` and add `input_reference` as shown above. This
-integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
+integration is dynamic-only and does not support prefusion. DLO is
 supported by keeping the request-switchable LoRA A/B buffers resident on the
 accelerator while DLO streams only the base blocks; budget for this additional
 fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
@@ -1684,7 +1697,7 @@ FL2VA takes a first frame, a last frame, or both, with the same
 
 The student was distilled at 8 steps with H3's default video/audio shifts of
 12/3 and the Euler sampler. A request with another step count, a shift
-override, `sampler=res_multistep`, or a `lora=` field is rejected. Add
+override, a non-Euler `sampler`, or a `lora=` field is rejected. Add
 `--quantization fp8` to run the DiT and text-encoder linears in FP8, including
 the linear branch's output projection.
 
@@ -1730,6 +1743,14 @@ H3 replayed the same way. Software: Ubuntu 22.04, driver 580.178.04, Python
 See [FastH3 Omni — Ref2VA](../FastVideo/FastH3-Omni.md) in the
 [FastH3 section](../FastVideo/README.md) for reference-conditioned generation.
 
+### ComfyUI-style LoRA adapters
+
+Use `--lora-backend peft` to load ComfyUI-style single-file A/B LoRA adapters using the native H3 parameter layout. Provide a server-local `.safetensors` path in the request's `lora` object.
+
+Use a `lora` array to combine multiple adapters, each with its own `scale`. These adapters can also be combined with the supported Turbo LoRA. Start with `scale=1.0` and adjust it to control adapter strength.
+
+Select a specific file when a directory contains multiple adapters. General Diffusers checkpoint conversion is not supported.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
@@ -1740,7 +1761,7 @@ See [FastH3 Omni — Ref2VA](../FastVideo/FastH3-Omni.md) in the
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
-| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
+| `extra_params.sampler` | `euler` | Per-request `euler`, `res_multistep`, or `heun` for both streams; fixed distilled schedules require Euler; Heun requires uncached runs |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
@@ -2020,8 +2041,9 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
   own resolution and its own truncated schedule, and the step contract carries
   one schedule per request, so step execution rejects it. `latent_upscale`
   without `latent_refine` works in both modes.
-- Non-empty attention schedules reject `latent_refine` in request mode too;
-  disable the schedule (`attention_schedule=[]`) or refinement (`latent_refine=false`).
+- Non-empty attention step ranges reject `latent_refine` in request mode too;
+  disable them (`attention_schedule=[]`) or refinement (`latent_refine=false`).
+  Sigma windows work with `latent_refine`.
 - Large refine layouts can abort workers with `CUDA error: an illegal memory
   access was encountered`. On B300, observed video token counts of 54,144 per
   rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536

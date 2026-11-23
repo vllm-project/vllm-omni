@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -75,6 +76,8 @@ def test_busy_loop_releases_failed_rpc_traceback_and_device_cache(monkeypatch):
     original = RuntimeError("model execution failed")
     worker_proc = WorkerProc.__new__(WorkerProc)
     worker_proc.gpu_id = 0
+    worker_proc.od_config = SimpleNamespace(step_execution=False)
+    worker_proc._wait_chunk_outputs = Mock(return_value=True)
     worker_proc.mq = Mock()
     worker_proc.mq.dequeue.side_effect = [
         {
@@ -136,6 +139,8 @@ def test_busy_loop_preserves_order_when_overflow_payload_is_delayed(monkeypatch)
     recording_worker = _RecordingWorker()
     worker_proc = WorkerProc.__new__(WorkerProc)
     worker_proc.gpu_id = 0
+    worker_proc.od_config = SimpleNamespace(step_execution=False)
+    worker_proc._wait_chunk_outputs = Mock(return_value=True)
     worker_proc.mq = reader
     worker_proc.worker = recording_worker
     worker_proc.result_mq = None

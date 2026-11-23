@@ -115,3 +115,141 @@ def test_server_accepts_its_own_listener(monkeypatch, in_child):
         assert server.proc.poll() is None
         with socket.create_connection((server.host, server.port), timeout=1):
             pass
+
+
+def test_auto_port_retries_on_address_already_in_use(monkeypatch):
+    """Child EADDRINUSE on an auto port must re-reserve and relaunch."""
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+    monkeypatch.setattr(runtime, "SERVER_PORT_IN_USE_RETRIES", 3)
+    server = runtime.OmniServer("fake-model", [])
+    popen = subprocess.Popen
+    launches: list[int] = []
+
+    def launch(cmd, *args, **kwargs):
+        port = int(cmd[cmd.index("--port") + 1])
+        launches.append(port)
+        pipe_kwargs = {key: kwargs[key] for key in ("stderr", "encoding", "errors", "text", "bufsize") if key in kwargs}
+        if len(launches) == 1:
+            code = (
+                "import sys\nsys.stderr.write('OSError: [Errno 98] Address already in use\\n')\nraise SystemExit(1)\n"
+            )
+            return popen([sys.executable, "-c", code], **pipe_kwargs)
+        code = (
+            f"import socket, time\ns = socket.socket(); s.bind(({server.host!r}, {port})); s.listen(); time.sleep(30)\n"
+        )
+        return popen([sys.executable, "-c", code], **pipe_kwargs)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", launch)
+    with server:
+        assert len(launches) == 2
+        assert server.proc is not None
+        assert server.proc.poll() is None
+        assert server.port == launches[1]
+        with socket.create_connection((server.host, server.port), timeout=1):
+            pass
+
+
+def test_fixed_port_does_not_retry_on_address_already_in_use(monkeypatch):
+    """An explicit port must surface EADDRINUSE instead of hopping ports."""
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        fixed_port = holder.getsockname()[1]
+    server = runtime.OmniServer("fake-model", [], port=fixed_port)
+    popen = subprocess.Popen
+    launches = 0
+
+    def launch(cmd, *args, **kwargs):
+        nonlocal launches
+        launches += 1
+        pipe_kwargs = {key: kwargs[key] for key in ("stderr", "encoding", "errors", "text", "bufsize") if key in kwargs}
+        code = "import sys\nsys.stderr.write('OSError: [Errno 98] Address already in use\\n')\nraise SystemExit(1)\n"
+        return popen([sys.executable, "-c", code], **pipe_kwargs)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", launch)
+    with pytest.raises(RuntimeError, match="Address already in use"):
+        with server:
+            pass
+    assert launches == 1
+
+
+def test_startup_timeout_does_not_retry_on_address_in_use_log(monkeypatch):
+    """A still-running child must not retry even if stderr mentions EADDRINUSE."""
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+    monkeypatch.setattr(runtime, "SERVER_PORT_IN_USE_RETRIES", 3)
+    server = runtime.OmniServer("fake-model", [])
+    calls = {"n": 0}
+
+    class _AliveProc:
+        def poll(self):
+            return None
+
+    def once(self):
+        calls["n"] += 1
+        self.proc = _AliveProc()
+        self._server_error_lines.append("OSError: [Errno 98] Address already in use\n")
+        raise RuntimeError(
+            "Server failed to start within 4 seconds\n"
+            "=== OmniServer stderr ===\n"
+            "OSError: [Errno 98] Address already in use\n"
+        )
+
+    monkeypatch.setattr(runtime.OmniServer, "_start_server_once", once)
+    monkeypatch.setattr(runtime.OmniServer, "_abandon_launch_attempt", lambda self: None)
+    with pytest.raises(RuntimeError, match="failed to start within"):
+        server._start_server()
+    assert calls["n"] == 1
+
+
+def test_server_stderr_evidence_latch_survives_noisy_shutdown():
+    server = runtime.OmniServer("fake-model", [])
+    marker = "torch.OutOfMemoryError: HIP out of memory\n"
+    with server.capture_stderr_evidence(("hip out of memory",)) as capture:
+        server._record_server_stderr_line(marker)
+        for index in range(runtime.SERVER_STDERR_DIAGNOSTIC_TAIL_LINES + 50):
+            server._record_server_stderr_line(f"secondary shutdown trace {index}\n")
+
+        assert capture.wait(timeout=0) == marker
+
+    assert server._server_error_lines.maxlen == runtime.SERVER_STDERR_DIAGNOSTIC_TAIL_LINES
+    assert marker not in server._server_error_lines
+    diagnostic_tail = server._server_error_tail()
+    assert marker not in diagnostic_tail
+    assert "secondary shutdown trace 149" in diagnostic_tail
+
+    server._abandon_launch_attempt()
+    assert server._server_error_lines.maxlen == runtime.SERVER_STDERR_DIAGNOSTIC_TAIL_LINES
+
+    server._record_server_stderr_line(marker)
+    with server.capture_stderr_evidence(("hip out of memory",)) as fresh_capture:
+        assert fresh_capture.wait(timeout=0) == ""
+        server._record_server_stderr_line(marker)
+        assert fresh_capture.wait(timeout=0) == marker
+
+    with server.capture_stderr_evidence(("hip out of memory",)) as ended_capture:
+        pass
+    server._record_server_stderr_line(marker)
+    assert ended_capture.wait(timeout=0) == ""
+
+
+def test_stage_cli_stderr_evidence_capture_reads_only_future_stage_output(tmp_path):
+    server = object.__new__(runtime.OmniServerStageCli)
+    server._server_error_lines = runtime.deque(maxlen=runtime.SERVER_STDERR_DIAGNOSTIC_TAIL_LINES)
+    server._server_stderr_capture_lock = runtime.threading.Lock()
+    server._server_stderr_captures = []
+    stage_log = tmp_path / "stage-1.log"
+    stale_marker = "torch.OutOfMemoryError: HIP out of memory from an earlier request\n"
+    stage_log.write_text(stale_marker, encoding="utf-8")
+    server._stage_log_paths = {1: stage_log}
+
+    marker = "torch.OutOfMemoryError: HIP out of memory from this injection\n"
+    with server.capture_stderr_evidence(("hip out of memory",)) as capture:
+        assert capture.wait(timeout=0) == ""
+        with stage_log.open("a", encoding="utf-8") as stage_output:
+            stage_output.write("unrelated shutdown trace\n")
+            stage_output.write(marker)
+        assert capture.wait(timeout=0.1) == marker
+
+    with stage_log.open("a", encoding="utf-8") as stage_output:
+        stage_output.write("torch.OutOfMemoryError: HIP out of memory after capture ended\n")
+    assert capture.wait(timeout=0) == marker

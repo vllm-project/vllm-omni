@@ -66,6 +66,7 @@ IMAGE_GENERATION = "image_generation"
 IMAGE_GENERATION_TIME_MS = f"{IMAGE_GENERATION}_time_ms"
 IMAGE_PIXELS = "image_pixels"
 DIFFUSION_SCHEDULER_WAITING_KEY = "scheduler_num_waiting_reqs"
+SCHEDULER_QUEUE_WAIT_MS = "scheduler_queue_wait_ms"
 TOTAL_IMAGES = "total_images"
 IMAGE_THROUGHPUT = "image_throughput"
 AVERAGE_PIXELS_PER_IMAGE = "average_pixels_per_image"
@@ -89,6 +90,38 @@ MEAN_VIDEO_RTF = f"mean_{VIDEO_RTF}"
 MEDIAN_VIDEO_RTF = f"median_{VIDEO_RTF}"
 STD_VIDEO_RTF = f"std_{VIDEO_RTF}"
 PERCENTILES_VIDEO_RTF = f"percentiles_{VIDEO_RTF}"
+# Realtime video observations: TTFC/steady samples are seconds on request
+# outputs and milliseconds in aggregates; generated FPS is frames/second.
+VIDEO_TTFC = "video_ttfc"
+VIDEO_FPS = "video_fps"
+VIDEO_STEADY_INTERVAL = "video_steady_interval"
+VIDEO_STEADY_INTERVALS = "video_steady_intervals"
+MEAN_VIDEO_TTFC_MS = f"mean_{VIDEO_TTFC}_ms"
+MEDIAN_VIDEO_TTFC_MS = f"median_{VIDEO_TTFC}_ms"
+STD_VIDEO_TTFC_MS = f"std_{VIDEO_TTFC}_ms"
+PERCENTILES_VIDEO_TTFC_MS = f"percentiles_{VIDEO_TTFC}_ms"
+MIN_VIDEO_FPS = f"min_{VIDEO_FPS}"
+MEAN_VIDEO_FPS = f"mean_{VIDEO_FPS}"
+MEDIAN_VIDEO_FPS = f"median_{VIDEO_FPS}"
+STD_VIDEO_FPS = f"std_{VIDEO_FPS}"
+PERCENTILES_VIDEO_FPS = f"percentiles_{VIDEO_FPS}"
+MEAN_VIDEO_STEADY_INTERVAL_MS = f"mean_{VIDEO_STEADY_INTERVAL}_ms"
+MEDIAN_VIDEO_STEADY_INTERVAL_MS = f"median_{VIDEO_STEADY_INTERVAL}_ms"
+STD_VIDEO_STEADY_INTERVAL_MS = f"std_{VIDEO_STEADY_INTERVAL}_ms"
+PERCENTILES_VIDEO_STEADY_INTERVAL_MS = f"percentiles_{VIDEO_STEADY_INTERVAL}_ms"
+VIDEO_STREAM_METRIC_UNITS = {VIDEO_TTFC: "ms", VIDEO_FPS: "frames/s", VIDEO_STEADY_INTERVAL: "ms", VIDEO_RTF: "ratio"}
+VIDEO_RTF_CLIENT_SCOPE = {
+    "numerator": "client_session_wall_seconds",
+    "denominator": "frames / target_fps",
+    "timing_boundary": (
+        "after session.start send completes through session.done and keepalive cleanup; connection setup/close excluded"
+    ),
+}
+VIDEO_RTF_SERVER_SCOPE = {
+    "numerator": "server_generation_seconds; client_request_latency_seconds fallback",
+    "denominator": "resolved_video_content_duration_seconds",
+    "duration_resolution": "payload duration_s; payload num_frames/fps; request seconds; request num_frames/fps",
+}
 MEAN_VIDEO_GENERATION_MS = f"mean_{VIDEO_GENERATION}_ms"
 MEDIAN_VIDEO_GENERATION_MS = f"median_{VIDEO_GENERATION}_ms"
 STD_VIDEO_GENERATION_MS = f"std_{VIDEO_GENERATION}_ms"
@@ -137,6 +170,10 @@ VLLM_QUEUED_MS = "vllm_queued_ms"
 VLLM_PREFILL_MS = "vllm_prefill_ms"
 VLLM_DECODE_MS = "vllm_decode_ms"
 VLLM_NUM_PREEMPTIONS = "vllm_num_preemptions"
+ORCHESTRATOR_DISPATCH_WAIT_MS = "orchestrator_dispatch_wait_ms"
+ORCHESTRATOR_DISPATCH_WAIT_MAX_MS = "orchestrator_dispatch_wait_max_ms"
+ORCHESTRATOR_DISPATCH_BATCHES = "orchestrator_dispatch_batches"
+ORCHESTRATOR_SNAPSHOT = "orchestrator_snapshot"
 NUM_TOKENS_IN = "num_tokens_in"
 NUM_TOKENS_OUT = "num_tokens_out"
 AUDIO_SAMPLE_RATE = "audio_sample_rate"
@@ -161,7 +198,9 @@ GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
 # Session placement families are registered only when the opt-in policy emits.
 DUPLEX_RESERVED_SESSIONS = METRIC_PREFIX + "duplex_reserved_sessions"
 DUPLEX_ADMISSION_REJECTED = METRIC_PREFIX + "duplex_admission_rejected"
-DUPLEX_ADMISSION_REJECT_REASONS = frozenset({"global_capacity_exhausted", "replica_capacity_exhausted", "unknown"})
+DUPLEX_ADMISSION_REJECT_REASONS = frozenset(
+    {"global_capacity_exhausted", "replica_capacity_exhausted", "replica_unavailable", "unknown"}
+)
 
 
 # ============================================================================

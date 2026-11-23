@@ -52,6 +52,15 @@ def test_deepstack_buffers_use_execution_device(mocker, vision_limit, num_tokens
     )
     vllm_config.with_hf_config.return_value = vllm_config
 
+    # The pin's _mark_tower_model imports get_pp_group inside the method from
+    # vllm.distributed (no use_v2_model_runner guard anymore), so patch the
+    # module production reads. Stage 0: first and last rank, like real
+    # construction where the PP group is always initialized.
+    mocker.patch(
+        "vllm.distributed.get_pp_group",
+        return_value=mocker.Mock(is_first_rank=True, is_last_rank=True),
+    )
+
     # Replace only the large networks. vLLM's real _mark_tower_model context
     # still builds the disabled visual module on meta and removes its weights.
     mocker.patch.object(thinker_module, "Qwen3OmniMoeAudioEncoder", side_effect=lambda *args, **kwargs: nn.Linear(8, 8))

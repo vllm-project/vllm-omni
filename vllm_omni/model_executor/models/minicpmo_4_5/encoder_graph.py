@@ -77,7 +77,6 @@ class EncoderNPUGraph:
             component_name="MiniCPM encoder",
             disable_config_hint="set encoder_enable_npu_graph=false in stage-0 additional_config",
         )
-        self._runners = self._graph_runners.runners
 
     def __call__(self, *inputs):
         tensors = tuple(x for x in inputs if x is not None)

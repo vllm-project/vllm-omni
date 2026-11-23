@@ -12,7 +12,7 @@ import os
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from types import AsyncGeneratorType
@@ -35,6 +35,7 @@ from vllm_omni.diffusion.data import (
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
     uses_diffusers_adapter,
+    uses_rank_local_dp_concurrency,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
@@ -48,9 +49,9 @@ from vllm_omni.diffusion.io_support import (
     supports_multimodal_input,
 )
 from vllm_omni.diffusion.mixfusion.setup import validate_mixfusion_config
+from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
-    any_selected_component_uses_allgather,
     resolve_offload_strategy,
 )
 from vllm_omni.diffusion.output_formatter import (
@@ -67,6 +68,7 @@ from vllm_omni.diffusion.registry import (
     supports_mixfusion,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+from vllm_omni.diffusion.request_streaming import RequestStreamState
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -77,12 +79,14 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.utils.pipeline_utils import (
     pipeline_supports,
     resolve_custom_pipeline_cls,
+    resolve_pipeline_cls,
     supports_pre_tokenized_prompt_ids,
 )
 from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics.definitions import SCHEDULER_QUEUE_WAIT_MS
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
     extract_diffusion_denoise_ms,
@@ -183,12 +187,6 @@ def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
         )
         model_cls = DiffusionModelRegistry._try_load_model_cls(name)
     return getattr(model_cls, "supports_request_cancellation", False) is True
-
-
-def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
-    parallel_config = getattr(od_config, "parallel_config", None)
-    dp_size = getattr(parallel_config, "data_parallel_size", 1)
-    return dp_size > 1 and any_selected_component_uses_allgather(od_config)
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -379,6 +377,14 @@ class DiffusionEngine:
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
+        if getattr(getattr(od_config, "parallel_config", None), "hsdp_data_parallel", False) and getattr(
+            od_config, "model_class_name", None
+        ) in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
+            # H3 shares conditioning across WORLD and assumes one output owner.
+            raise ValueError(
+                "hsdp_data_parallel is unsupported for MiniMax-H3: "
+                "conditioning and output ownership are not request-local."
+            )
         mixfusion_needs_steps = validate_mixfusion_config(od_config, supported=supports_mixfusion)
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
@@ -387,16 +393,34 @@ class DiffusionEngine:
             od_config.step_execution = True
             self.step_execution = True
         if od_config.streaming_output and not self.step_execution:
-            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
-            od_config.step_execution = True
-            self.step_execution = True
+            if supports_step_execution(resolve_pipeline_cls(od_config)):
+                logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")
+                od_config.step_execution = True
+                self.step_execution = True
+            else:
+                # Request-only pipelines keep Request execution. Intermediate
+                # CHUNK_READY media requires the pipeline to bind the request
+                # chunk emitter (CausVid today); otherwise the client only sees
+                # a single final result.
+                logger.warning_once(
+                    "streaming_output=True on a request-only pipeline keeps Request "
+                    "execution. Intermediate CHUNK_READY media is emitted only when "
+                    "the pipeline binds the request chunk emitter (currently CausVid); "
+                    "other request pipelines still return a single final output."
+                )
 
         if self.step_execution:
+            if getattr(getattr(od_config, "parallel_config", None), "hsdp_data_parallel", False):
+                raise ValueError("hsdp_data_parallel currently supports request execution only, not step execution")
             self.supports_request_batch = False
             return DiffusionExecutionMode.STEP_BATCH
 
         self.supports_request_batch = supports_request_batch(od_config)
-        if not self.supports_request_batch and _max_num_seqs(od_config) > 1 and not _uses_dlo_dp_concurrency(od_config):
+        if (
+            not self.supports_request_batch
+            and _max_num_seqs(od_config) > 1
+            and not uses_rank_local_dp_concurrency(od_config)
+        ):
             raise ValueError(
                 f"{getattr(od_config, 'model_class_name', None)!r} does not support request-level batching. "
                 "Use max_num_seqs=1 for serial request execution, or choose a pipeline with "
@@ -407,6 +431,8 @@ class DiffusionEngine:
     def _init_executor(self, od_config: OmniDiffusionConfig) -> None:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
+        if od_config.streaming_output and not self.step_execution:
+            self.executor.register_chunk_ready_handler(self._on_request_chunk_ready)
 
     def _init_scheduler(
         self,
@@ -436,17 +462,21 @@ class DiffusionEngine:
             )
 
     def _init_runtime_state(self) -> None:
-        # DP multi-concurrency: allow batching dp_size requests so each
-        # worker processes a different request in parallel.  Only enabled
-        # for distributed layerwise offload (which shards weights and
-        # needs all ranks active simultaneously).  Ordinary DP with a
-        # non-batch pipeline should not schedule multiple requests.
+        # Rank-local DP concurrency: allow batching dp_size compatible
+        # requests so each worker processes a different request while all
+        # ranks follow the same sharded-weight collective schedule.
         dp_size = getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1)
-        if _uses_dlo_dp_concurrency(self.od_config):
+        if uses_rank_local_dp_concurrency(self.od_config):
             self.scheduler.max_num_running_reqs = dp_size
             self.dp_concurrent = True
+            mode = (
+                "HSDP rank-local requests"
+                if getattr(getattr(self.od_config, "parallel_config", None), "hsdp_data_parallel", False)
+                else "distributed layerwise offload"
+            )
             logger.info(
-                "dp_concurrent: max_num_running_reqs=%d, batch_wait=%sms",
+                "Rank-local DP concurrency enabled (%s): max_num_running_reqs=%d, batch_wait=%sms",
+                mode,
                 dp_size,
                 self.od_config.request_batch_max_wait_ms,
             )
@@ -473,13 +503,19 @@ class DiffusionEngine:
         self._shutting_down = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
-        self._request_cancellations = (
-            RequestCancellationRegistry() if supports_request_cancellation(self.od_config) else None
-        )
+        self._request_cancellations = None
+        if supports_request_cancellation(self.od_config):
+            create_registry = getattr(self.executor, "create_cancellation_registry", None)
+            if callable(create_registry):
+                # Ray (and any multi-host executor) must not use POSIX SHM names.
+                self._request_cancellations = create_registry()
+            else:
+                self._request_cancellations = RequestCancellationRegistry()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         # pause_scheduler(mode="keep"): no new batch is scheduled while set.
         self._scheduling_paused = False
         self._streaming_playback = {}
+        self._request_chunk_states: dict[str, RequestStreamState] = {}
         # Copied onto the existing output metrics payload so queue monitoring
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
@@ -568,7 +604,7 @@ class DiffusionEngine:
                     **scheduler_metrics,
                 }
                 if request.scheduler_queue_wait_ms is not None:
-                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
+                    metrics_update[SCHEDULER_QUEUE_WAIT_MS] = request.scheduler_queue_wait_ms
                 vae_decode_ms = extract_diffusion_vae_decode_ms(output)
                 if vae_decode_ms is not None:
                     metrics_update["vae_decode_time_ms"] = vae_decode_ms
@@ -918,6 +954,9 @@ class DiffusionEngine:
     def release_streaming_output(self, request_id: str, chunk_index: int) -> None:
         """Release the single output credit only after its downstream consumer resumes."""
         with self._cv:
+            chunk_state = self._request_chunk_states.get(request_id)
+            if chunk_state is not None:
+                chunk_state.release_chunk(chunk_index)
             state = (self._streaming_playback or {}).get(request_id)
             if state is None or state.outstanding_chunk != chunk_index:
                 return
@@ -929,6 +968,120 @@ class DiffusionEngine:
             elif state.idle_since is not None:
                 state.idle_since = time.monotonic()
             self._cv.notify_all()
+
+    def _ensure_request_stream_admitable(self, request_id: str) -> None:
+        """Caller holds ``_cv``. Block ID reuse until the prior stream is popped."""
+        if not getattr(self.od_config, "streaming_output", False) or getattr(self, "step_execution", False):
+            return
+        existing = getattr(self, "_request_chunk_states", {}).get(request_id)
+        if existing is None:
+            return
+        raise ValueError(
+            f"Refusing to re-admit request_id={request_id!r}: previous request "
+            f"stream is not retired (cancelled={existing.cancelled}, "
+            f"terminal_emitted={existing.terminal_emitted}). Wait until the "
+            "in-flight execution finishes and stream state is popped."
+        )
+
+    def _init_request_stream(self, request: OmniDiffusionRequest, request_id: str) -> None:
+        """Initialize request-mode output state while holding ``_cv``.
+
+        An unretired stream (including a cancelled abort tombstone) must not be
+        overwritten: a late CHUNK_READY from the previous forward could otherwise
+        bind into the new admission. Retirement is the ``pop`` in
+        ``_emit_finished_request`` after the previous execution completes.
+        """
+        if not getattr(self.od_config, "streaming_output", False) or getattr(self, "step_execution", False):
+            return
+        # Admission already ran ``_ensure_request_stream_admitable`` under the
+        # same ``_cv`` before ``scheduler.add_request``; do not re-check here
+        # (a raise would leave a scheduler-only request behind).
+        sampling = request.sampling_params
+        self._request_chunk_states[request_id] = RequestStreamState(
+            max_output_bytes=int(sampling.streaming_max_output_bytes),
+            output_ack=bool(sampling.streaming_output_ack),
+        )
+
+    def _cancel_request_chunk_states_locked(self, request_ids: Iterable[str] | None = None) -> None:
+        """Caller holds ``_cv``. Late CHUNK_READY messages are dropped, not delivered."""
+        states = self._request_chunk_states
+        selected = states.values() if request_ids is None else (states.get(request_id) for request_id in request_ids)
+        for state in selected:
+            if state is None:
+                continue
+            state.cancelled = True
+
+    def _on_request_chunk_ready(
+        self,
+        request_id: str,
+        chunk_index: int,
+        output: DiffusionOutput | None,
+        error: str | None,
+    ) -> None:
+        """Deliver one in-order chunk. Does not update the request scheduler."""
+        async_output_id = output.async_output_id if output is not None else None
+        with self._cv:
+            state = self._request_chunk_states.get(request_id)
+            decision, payload = (
+                ("drop", None)
+                if state is None
+                else state.accept_chunk(request_id, chunk_index, output, error, async_output_id)
+            )
+            stream = self._out_streams.get(request_id)
+        if decision == "drop":
+            if async_output_id is not None:
+                self.executor.drop_output(async_output_id)
+            return
+        if decision == "fail":
+            logger.warning("%s", payload)
+            if async_output_id is not None:
+                self.executor.drop_output(async_output_id)
+            self._put_stream_output(stream, DiffusionOutput(finished=True, error=str(payload)))
+            # Stop the in-flight forward and retire scheduler state; late packs
+            # keep reclaiming via cancelled stream state.
+            self.abort(request_id)
+            return
+        assert isinstance(payload, DiffusionOutput)
+        self._put_stream_output(stream, payload)
+
+    def _materialize_async_diffusion_output(self, out: DiffusionOutput) -> DiffusionOutput:
+        """Resolve ``async_output_id`` so packing errors are visible before finals."""
+        async_output_id = out.async_output_id
+        if async_output_id is None:
+            return out
+        if out.error or out.aborted:
+            self.executor.drop_output(async_output_id)
+            return out
+        try:
+            fut = self.executor.wait_output_ready(async_output_id)
+            return fut.result(timeout=_async_output_timeout())
+        except Exception as exc:
+            try:
+                self.executor.drop_output(async_output_id)
+            except Exception:
+                logger.exception("drop_output after async final failure for %s", async_output_id)
+            return DiffusionOutput(finished=True, error=f"async final output failed: {exc}")
+
+    def _finish_request_stream(
+        self,
+        state: RequestStreamState | None,
+        out: DiffusionOutput,
+    ) -> DiffusionOutput | None:
+        """Do not resend a full video after chunks, and do not turn a partial failure into success.
+
+        Returns None when a terminal chunk-stream result was already queued.
+        When chunks were streamed, resolve any final ``async_output_id`` first so
+        packing failures keep error semantics before suppressing duplicate media.
+        """
+        if state is None:
+            return out
+        if state.terminal_emitted:
+            if out.async_output_id is not None:
+                self.executor.drop_output(out.async_output_id)
+            return None
+        if state.next_chunk_index > 0 and out.async_output_id is not None:
+            out = self._materialize_async_diffusion_output(out)
+        return state.finish(out)
 
     def _expire_streaming_idle(self) -> None:
         with self._cv:
@@ -1188,6 +1341,7 @@ class DiffusionEngine:
                 self._request_cancellations.cancel_all()
             if self.stop_event is not None:
                 self.stop_event.set()
+            self._cancel_request_chunk_states_locked()
             streams = list(self._out_streams.values())
             self._cv.notify_all()
 
@@ -1258,7 +1412,13 @@ class DiffusionEngine:
         # the busy loop removes request state, so it cannot change in between.
         with self._cv:
             stream = self._out_streams.get(request_id)
+            # Detach output state before finalization permits request-id reuse.
+            # Waiting on final packing must never pop a newly admitted stream.
+            chunk_state = self._request_chunk_states.pop(request_id, None)
         out = self._finalize_finished_request(request_id, runner_output, missing_result_error)
+        out = self._finish_request_stream(chunk_state, out)
+        if out is None:
+            return
         self._put_stream_output(stream, out)
 
     def _emit_outputs(
@@ -1497,6 +1657,9 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
+            # Check before scheduler admission so a refused stream cannot leave a
+            # scheduler-only request behind.
+            self._ensure_request_stream_admitable(request.request_id)
             queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
             if self._request_cancellations is not None:
                 request.cancellation_signal = self._request_cancellations.create(request.request_id)
@@ -1516,6 +1679,7 @@ class DiffusionEngine:
                     output_ack=request.sampling_params.streaming_output_ack,
                 )
             self._out_streams[request_id] = queue
+            self._init_request_stream(request, request_id)
             self._cv.notify_all()
 
         return request_id
@@ -1581,12 +1745,22 @@ class DiffusionEngine:
                             describe(async_output_id) if describe else "unavailable",
                         )
                         raise
+                output._wait_device_ready()
                 finished = output.finished
                 yield output
                 with self._cv:
                     playback = (self._streaming_playback or {}).get(request_id)
                     auto_release = playback is not None and not playback.output_ack
                 if auto_release and output.streaming_metrics:
+                    self.release_streaming_output(request_id, output.chunk_index)
+                chunk_state = self._request_chunk_states.get(request_id)
+                if (
+                    chunk_state is not None
+                    and not chunk_state.output_ack
+                    and not output.finished
+                    and not output.request_started
+                    and output.async_output_id is not None
+                ):
                     self.release_streaming_output(request_id, output.chunk_index)
                 if output.finished:
                     break
@@ -1752,6 +1926,20 @@ class DiffusionEngine:
             self.close()
             raise
 
+        additional_config = getattr(self.od_config, "additional_config", None) or {}
+        profiles = additional_config.get("helios_vae_warmup_profiles")
+        if profiles is None or (
+            isinstance(profiles, Sequence) and not isinstance(profiles, (str, bytes, Mapping)) and not profiles
+        ):
+            return
+
+        try:
+            self.collective_rpc(method="run_helios_vae_warmup")
+        except Exception as e:
+            logger.error(f"Helios VAE warmup failed: {e}")
+            self.close()
+            raise
+
     def _make_dummy_request(
         self,
         *,
@@ -1792,9 +1980,11 @@ class DiffusionEngine:
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-                # Warm up the base attention only: service ranges are sized for real
-                # requests, not for the fixed short warm-up sequence.
+                # Warm up the base attention only. Service step ranges are sized for real requests, not for the
+                # fixed short warm-up sequence, and a service sigma window that covers the first step's sigma
+                # would select its profile on the warm-up step.
                 attention_schedule=(),
+                attention_sigma_schedule=(),
             ),
         )
 
@@ -1848,10 +2038,11 @@ class DiffusionEngine:
             max(kv_request.seq_len for kv_request in kv_requests),
             max(kv_request.target_len for kv_request in kv_requests),
         )
-        dlo_dp_request_mode = self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH and _uses_dlo_dp_concurrency(
-            self.od_config
+        rank_local_dp_request_mode = (
+            self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH
+            and uses_rank_local_dp_concurrency(self.od_config)
         )
-        profile_batch_size = 1 if dlo_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_batch_size = 1 if rank_local_dp_request_mode else _max_num_seqs(self.od_config)
         profile_requests: list[OmniDiffusionRequest] = []
         for index in range(profile_batch_size):
             profile_request = copy.copy(request)
@@ -2058,6 +2249,8 @@ class DiffusionEngine:
                 self._out_streams.clear()
                 if self._streaming_playback is not None:
                     self._streaming_playback.clear()
+                self._cancel_request_chunk_states_locked()
+                self._request_chunk_states.clear()
                 # Registered streams retain ownership of queued outputs until
                 # their consumers finish draining or close their generators.
                 live_streams = set(pending_streams)
@@ -2152,8 +2345,10 @@ class DiffusionEngine:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         request_ids = list(dict.fromkeys(request_ids))
 
+        # Drop late chunks before any further executor wait so a chunk that
+        # arrives during KV drain is not delivered as success.
+        self._cancel_request_chunk_states_locked(request_ids)
         self._poll_native_kv(drain_request_ids=request_ids)
-
         for request_id in request_ids:
             if self._streaming_playback is not None:
                 self._streaming_playback.pop(request_id, None)
