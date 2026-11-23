@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared prompt-template construction for HunyuanImage-3.0-Instruct.
 
 Single source of truth for the AR-prefill prompt format used by the
@@ -36,6 +37,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from .system_prompt import get_system_prompt
+
+HUNYUAN_AR_PROMPT_TOKEN_IDS_KEY = "ar_prompt_token_ids"
+HUNYUAN_AR_GENERATED_TOKEN_IDS_KEY = "ar_generated_token_ids"
 
 # HunyuanImage-3.0-Instruct special token ids from tokenizer.json.
 # Keep offline AR prompt/stop-token behavior independent of runtime

@@ -10,6 +10,7 @@ implements for the session manager/runner.
 from __future__ import annotations
 
 import base64
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -33,8 +34,17 @@ class DuplexOutputAction(str, Enum):
 
 
 @dataclass(frozen=True)
+class DuplexInputCapacity:
+    """Model-selected context allowance checked on the engine's expanded input."""
+
+    max_context_tokens: int
+    reserved_output_tokens: int
+
+
+@dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, object]
+    input_capacity: DuplexInputCapacity | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +93,7 @@ class DuplexStageSubmission:
     # True: resume/update an existing stage0 id. False: open a new ephemeral id.
     # Distinct from DuplexCapabilities.supports_core_resumable_request.
     resumable: bool = True
+    input_capacity: DuplexInputCapacity | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -118,6 +129,9 @@ class DuplexOutputContext:
 
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
+
+    def check_session_availability(self, session_id: str) -> None:
+        """Check for a live replica group without reserving a slot. Legacy ports do nothing."""
 
     def reserve_session(self, session_id: str) -> None:
         """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""
@@ -257,6 +271,8 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 
 
 __all__ = [
+    "ToolCallAbandonReason",
+    "abandoned_tool_call_notice",
     "DuplexFence",
     "DuplexAppendPlan",
     "DuplexOutputAction",
@@ -275,3 +291,26 @@ __all__ = [
     "duplex_same_turn_request_ids",
     "duplex_session_id_from_request_id",
 ]
+
+
+class ToolCallAbandonReason(str, Enum):
+    """Why a call ended without a usable result, or was refused as a repeat."""
+
+    TIMEOUT = "timeout"
+    EPOCH_CANCELLED = "epoch_cancelled"
+    CLIENT_CANCELLED = "client_cancelled"
+    CLIENT_FAILED = "client_failed"
+    #: Not a settlement: a repeat of an abandoned call, never exposed or recorded.
+    SUPPRESSED = "suppressed"
+
+
+def abandoned_tool_call_notice(reason: ToolCallAbandonReason) -> str:
+    """The fixed status a plugin shows the model. It never carries client text."""
+    return json.dumps(
+        {
+            "status": "abandoned",
+            "reason": reason.value,
+            "instruction": "This tool call did not complete. Do not call it again unless the user asks.",
+        },
+        separators=(",", ":"),
+    )

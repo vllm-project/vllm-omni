@@ -6,6 +6,7 @@ import weakref
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
@@ -235,6 +236,64 @@ def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, mo
     assert decode(manager, cache) is None
     assert len(cleanup) == 1
     assert bool((cache[0]["cond"]["key"] == 1).all())
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+def test_recapture_after_releasing_last_graph_with_live_pool_output(graph_case):
+    manager, device, _ = graph_case
+    retained_outputs = []
+    original_stream = torch.cuda.current_stream()
+    with torch.cuda.stream(original_stream), torch.inference_mode():
+        for value in (1.0, 2.0, 3.0):
+            cache = make_cache(device, value)
+            register(manager, cache)
+            result = decode(manager, cache)
+            assert result is not None
+            expected = torch.ones_like(result).sin() + value + (value + 1) + 2
+            torch.testing.assert_close(result, expected)
+            # Keep a pool allocation alive after its last graph is destroyed.
+            # Reusing a global pool handle then hits the allocator's use_count
+            # assertion even though the request's static prefix was released.
+            entry = next(iter(manager.entries.values()))
+            retained_outputs.append(entry.output)
+            del entry, cache
+            manager.release_idle_entries()
+            assert not manager.entries
+        assert torch.cuda.current_stream() == original_stream
+    assert len(retained_outputs) == 3
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("failure_phase", ["begin", "end"])
+def test_capture_context_failure_restores_caller_stream(graph_case, monkeypatch, failure_phase):
+    manager, device, cleanup = graph_case
+    cache = make_cache(device, 1.0)
+    register(manager, cache)
+    original_stream = torch.cuda.current_stream()
+
+    class FailingCaptureGraph(torch.cuda.CUDAGraph):
+        def capture_begin(self, *args, **kwargs):
+            if failure_phase == "begin":
+                raise RuntimeError("injected capture_begin failure")
+            return super().capture_begin(*args, **kwargs)
+
+        def capture_end(self):
+            super().capture_end()
+            if failure_phase == "end":
+                raise RuntimeError("injected capture_end failure")
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", FailingCaptureGraph)
+    # Isolate the injected begin/end error from any retired global pool left
+    # alive by the preceding lifecycle regression on an unfixed implementation.
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", torch.cuda.graph_pool_handle)
+    # Restore test state even on an unfixed implementation whose graph
+    # context switches streams before raising in __enter__ or __exit__.
+    with torch.cuda.stream(original_stream):
+        assert decode(manager, cache) is None
+        assert torch.cuda.current_stream() == original_stream
+        assert list(manager.entries.values()) == [None]
+        assert bool((cache[0]["cond"]["key"] == 1).all())
+        assert cleanup
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)

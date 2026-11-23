@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM-Omni Omni Perf Ceiling"
+  short_description: "Estimate idealized omni serving performance and per-stage gaps."
+  default_prompt: "Use $omni-perf-ceiling to measure this vLLM-Omni omni deployment at the target concurrencies, derive the calibrated roofline estimates, and report a per-stage gap ledger."

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -57,10 +57,12 @@ def build_x_to_text_prompt(
 ) -> tuple[dict[str, Any], list[int] | None]:
     """Build BAGEL's chat prompt for text-output tasks."""
     del model
-    image_token = "<|image_pad|>\n" if has_image else ""
+    image_token = "<|image_pad|>" if has_image else ""
+    text = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+    framed_text = f"<|im_start|>{text}<|im_end|>" if text else ""
     return (
         {
-            "prompt": f"<|im_start|>user\n{image_token}{prompt}<|im_end|>\n<|im_start|>assistant\n",
+            "prompt": f"{image_token}{framed_text}<|im_start|>",
             "modalities": ["text"],
         },
         None,

@@ -39,6 +39,7 @@ from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.metrics.utils import (
     extract_queue_wait_s,
+    iter_request_output_items,
     normalize_failure_reason,
     observe_stage_workload_metrics,
 )
@@ -202,7 +203,7 @@ class OmniBase(PDDisaggregationMixin):
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)
-        self.__dict__["_name"] = self.__class__.__name__
+        self._initialize_output_state()
         self.model = model
         self.log_stats = log_stats
         self.collect_stage_metrics = collect_stage_metrics
@@ -241,7 +242,6 @@ class OmniBase(PDDisaggregationMixin):
         # (explicit ``False``) is not fallen-back-through by ``or``.
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
-        self.request_states: dict[str, ClientRequestState] = {}
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
@@ -262,6 +262,11 @@ class OmniBase(PDDisaggregationMixin):
 
         # PD disaggregation state (detects if a prefill/decode stage pair is configured)
         self._init_pd_state()
+
+    def _initialize_output_state(self) -> None:
+        """Bookkeeping shared by generation and session-only frontends."""
+        self.__dict__["_name"] = self.__class__.__name__
+        self.request_states: dict[str, ClientRequestState] = {}
 
     def _create_engine(self, **engine_kwargs: Any) -> OmniEngineBase:
         """Construct this entrypoint's engine (``AsyncOmniEngine`` for turn-based use)."""
@@ -702,7 +707,7 @@ class OmniBase(PDDisaggregationMixin):
                 e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
                 # Extract finished_reason from upstream CompletionOutput so
                 # the per-reason completion Counter is labelled correctly.
-                completion_outputs = getattr(engine_outputs, "outputs", None) or []
+                completion_outputs = iter_request_output_items(engine_outputs)
                 fr = (getattr(completion_outputs[0], "finish_reason", None) if completion_outputs else None) or "stop"
                 self.prom_metrics.request_succeeded(
                     e2e_seconds,

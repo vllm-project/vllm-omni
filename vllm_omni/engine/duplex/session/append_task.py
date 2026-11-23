@@ -76,6 +76,8 @@ class AppendAttempt:
     on_append_prepared: Callable[[], None] | None = None
     #: Last chance to call the append off, checked once the predecessor is done.
     before_append: Callable[[], bool] | None = None
+    #: Input eligibility consumed before this append; restored only on capacity rejection.
+    unanswered_source_ids: tuple[int, ...] = ()
 
     # ------------------------------------------------------------------ #
     # Compensation                                                       #
@@ -243,6 +245,8 @@ class AppendAttempt:
             raise
         except DuplexInputCapacityError as exc:
             self.abandon(reason=exc.code)
+            if not self.ctx.run.closing and session.state == DuplexSessionState.OPEN and session.epoch == self.epoch:
+                session.restore_unanswered_user_sources(self.unanswered_source_ids)
             self.out.emit_error(exc.code, str(exc), retryable=True)
             # Already queued successors keep their failed predecessor. A new
             # client commit may retry admission without a poisoned append tail.

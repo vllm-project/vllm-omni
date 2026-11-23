@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 
 logger = init_logger(__name__)
@@ -110,6 +111,18 @@ class RMSNorm(CustomOp):
             return self._forward_fused(x)
         except Exception:
             return self.forward_native(x)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Opt-in: select the reference before launching a potentially
+        # incompatible prebuilt kernel, since an invalid HIP image can poison
+        # later operations (no try/except fallback is possible).
+        if envs.VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS:
+            return self.forward_native(x, residual)
+        return self.forward_cuda(x, residual)
 
     def forward_musa(
         self,

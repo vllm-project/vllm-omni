@@ -34,7 +34,7 @@ CFG-Parallel eliminates this bottleneck by distributing the forward passes acros
 vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. Pipelines inherit from this mixin and implement a `diffuse()` method that orchestrates the denoising loop.
 
 | Method | Purpose | Automatic Behavior |
-|--------|---------|-------------------|
+| -------- | --------- | ------------------- |
 | [`predict_noise_maybe_with_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Predict noise with 2-branch CFG | Detects parallel mode, distributes computation, gathers results |
 | [`predict_noise_with_multi_branch_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Predict noise with N-branch CFG | Round-robin dispatches N branches across M GPUs |
 | [`scheduler_step_maybe_with_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Step scheduler | All ranks step locally (no broadcast needed) |
@@ -48,14 +48,17 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
 `predict_noise_maybe_with_cfg()` automatically detects and switches between two execution modes:
 
 - **CFG-Parallel mode** (when `cfg_world_size > 1`):
-  - Rank 0 computes positive prompt prediction
-  - Rank 1 computes negative prompt prediction
-  - Results are gathered via `all_gather()`
-  - All ranks compute CFG combine locally (deterministic, identical results)
+    - Rank 0 computes positive prompt prediction
+    - Rank 1 computes negative prompt prediction
+    - Results are gathered via `all_gather()`
+    - All ranks compute CFG combine locally (deterministic, identical results)
 
 - **Sequential mode** (when `cfg_world_size == 1`):
-  - Single rank computes both positive and negative predictions
-  - Directly combines them with CFG formula
+    - Single rank computes both positive and negative predictions
+    - Directly combines them with CFG formula
+    - **CFG batching**: pipelines that set `supports_cfg_batching = True` compute both predictions in one
+    `predict_noise()` call on the branches concatenated along dim 0, then split the output at the positive batch
+    size (`enable_cfg_batching`, default off). See [Opt in to CFG batching](#opt-in-to-cfg-batching).
 
 `scheduler_step_maybe_with_cfg()` ensures consistent latent states across all ranks:
 
@@ -68,7 +71,7 @@ Some models require more than 2 CFG branches. For example, Bagel and OmniGen2 us
 `predict_noise_with_multi_branch_cfg()` handles these by automatically dispatching N branches across M GPUs using round-robin (rule: branch `i` → rank `i % M`):
 
 | Branches (N) | GPUs (M) | Dispatch |
-|:---:|:---:|:---|
+| :---: | :---: | :--- |
 | 3 | 2 | `[[0, 2], [1]]` |
 | 3 | 3 | `[[0], [1], [2]]` |
 | 4 | 2 | `[[0, 2], [1, 3]]` |
@@ -167,6 +170,31 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         return current_model(**kwargs)[0]
 ```
 
+### Opt in to CFG batching
+
+With one CFG rank, a pipeline can run both branches as one batched denoiser call. Opt in only when both branches
+always have the same shapes beyond the batch dimension (prompts padded to a fixed length, shared latents) and the
+denoiser keeps no per-branch state:
+
+```python
+class MyPipeline(nn.Module, CFGParallelMixin):
+    supports_cfg_batching = True
+    # Optional: kwarg whose dim 0 is the branch batch size (default "hidden_states").
+    cfg_batching_batch_kwarg = "hidden_states"
+    # Optional: unbatched kwargs that are equal in both branches but built per branch,
+    # e.g. Flux's [L, 3] text and image position ids. The positive value is passed through.
+    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids"})
+```
+
+`merge_cfg_branch_kwargs()` concatenates every tensor whose dim 0 is the branch batch size, merges dicts, lists and
+tuples element by element, and passes through values that are the same object in both branches (or equal plain
+scalars). Anything else, such as different prompt lengths or `None` in one branch, makes that step run sequentially
+with a one-time warning. Declare every unbatched tensor in `cfg_batching_shared_kwargs`: the dim-0 check runs before
+the identity check, so an unbatched tensor whose length happens to equal the branch batch size (one image token at
+batch 1, for example) would otherwise be concatenated. Override `merge_cfg_branch_kwargs()` for custom merging. Batching is skipped with
+CFG-Parallel, pipeline parallelism and any `cache_backend`; the merged call is not stamped with
+`transformer.cfg_branch`. Parity is tested in `tests/diffusion/models/test_cfg_batching_parity.py`; add the pipeline
+there when opting in.
 
 ### Override `cfg_normalize_function()` for Custom Normalization
 
@@ -190,7 +218,6 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
         # noise_pred = comb_pred * (cond_norm / noise_norm)
         # return noise_pred
 ```
-
 
 ### Multi-Branch CFG (3+ branches)
 
@@ -317,6 +344,7 @@ python text_to_image.py \
 **Problem:** Guidance scale too low or negative prompt not provided.
 
 **Solution:** Ensure `guidance_scale > 1.0` and negative prompt is provided:
+
 ```python
 images = pipeline(
     prompt="a cat",
@@ -332,7 +360,7 @@ images = pipeline(
 Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
-|-------|------|---------|-------|
+| ------- | ------ | --------- | ------- |
 | **Qwen-Image** | `vllm_omni/diffusion/models/qwen_image/cfg_parallel.py` | Mixin | Dual-stream transformer |
 | **Qwen-Image-Edit** | `vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_edit.py` | Mixin | Image editing with `output_slice` |
 | **Wan2.2** | `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py` | Mixin | Dual-transformer architecture |

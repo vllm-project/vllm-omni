@@ -53,6 +53,7 @@ def _core_on_npu(model) -> StepAudio2Token2WavCore:
     core._s3_failed = set()
     core._s3_graph_lock = threading.Lock()
     core._s3_graph_done = None
+    core._s3_cuda_graph = None
     core._s3_replay_calls = 0
     core._s3_eager_calls = 0
     return core

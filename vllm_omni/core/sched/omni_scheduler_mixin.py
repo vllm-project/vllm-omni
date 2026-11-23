@@ -8,6 +8,7 @@ import os
 import queue
 import time
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -36,8 +37,10 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
     uses_native_mrv2_data_plane,
+    uses_native_qwen3_omni_resumable,
 )
 from vllm_omni.core.sched.output import (
+    OmniChunkCommit,
     OmniChunkRecvHandle,
     OmniNewRequestData,
     OmniRequestPrewarm,
@@ -45,7 +48,9 @@ from vllm_omni.core.sched.output import (
 )
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
+    JOYAI_FINISH_ON_NEXT_STOP_KEY,
     deserialize_payload,
+    request_flag_is_set,
     returns_stage_payload,
     unflatten_payload,
 )
@@ -55,12 +60,35 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
 logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
 _ASYNC_CHUNK_PREWARM_PREFIX = f"{ASYNC_CHUNK_PREWARM_NS}."
+_FINISH_ON_NEXT_STOP_ATTR = f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}"
+
+
+def _request_finishes_on_next_stop(request: Request) -> bool:
+    return request_flag_is_set(request, JOYAI_FINISH_ON_NEXT_STOP_KEY)
+
+
+def _initialize_resumable_segment_generation(request: Request) -> None:
+    """Publish generation 0 on a fresh resumable request before its first park.
+
+    Streaming replacements increment with ``int(getattr(..., 0) or 0) + 1``.
+    A missing counter made the first 2150 publish ``None``, so sentence-TTS
+    compared ``None`` to ``1`` with the 200 ms token-identity fallback.
+    One-shot requests stay unset so connector watermarking does not
+    speculate ``generation + 1`` (#6816).
+    """
+    if not getattr(request, "resumable", False):
+        return
+    if getattr(request, "_omni_segment_generation", None) is not None:
+        return
+    request._omni_segment_generation = 0
+
 
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
@@ -194,6 +222,146 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
 
+    def _talker_kstep_armed(self) -> bool:
+        """True when this scheduler drives the Talker multi-frame decode.
+
+        Both conditions come off the engine config: the stage must be the
+        Talker (``model_config.model_stage == "tts"``) and it must carry the
+        injected n-gram config whose ``num_speculative_tokens`` is exactly
+        ``K - 1``. Interpretation is delegated to the shared
+        ``talker_kstep_contract`` module -- the model-side gate resolves the
+        same config through it, so the scheduler and the model cannot drift
+        apart (a missing ``method`` is disabled on both sides, and the frame
+        ceiling is enforced once).
+        """
+        cache = getattr(self, "_omni_talker_kstep_cache", None)
+        if cache is None:
+            # vLLM's Scheduler does not expose speculative_config as an
+            # attribute and SchedulerConfig has no num_speculative_tokens
+            # either, so the canonical engine-side source is vllm_config.
+            # Reading anything else silently yields 0 drafts and this whole
+            # guard never arms.
+            vllm_cfg = getattr(self, "vllm_config", None)
+            spec = getattr(self, "speculative_config", None)
+            if spec is None:
+                spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
+            model_cfg = getattr(vllm_cfg, "model_config", None)
+            cache = self._omni_talker_kstep_cache = (
+                talker_kstep_frames(getattr(model_cfg, "model_stage", None), spec) > 0
+            )
+        return cache
+
+    def _enforce_kstep_span_uniformity(self, scheduler_output: SchedulerOutput) -> None:
+        """Book uniform spans on the *scheduled* output before dispatch.
+
+        The pre-schedule guard above reasons about request state, but the
+        actual per-request frame count is only fixed inside upstream
+        ``schedule()``: vllm v1/core/sched/scheduler.py derives each
+        request's ``num_scheduled_spec_tokens`` from its own token budget
+        (streaming placeholders, remaining budget), so one step can leave
+        the scheduler with span widths like 4/5/5/6/6 -- which the talker
+        multi-frame loop refuses, fatally.
+
+        Exactly two booked shapes are executable on the static-shape decode
+        backend -- q_len=1 and q_len=1+num_spec rows (the captured FULL
+        graphs book exactly those two) -- so this pass rewrites the
+        schedule into the one that needs no drafts:
+
+        * single-frame: drop every draft so all decode rows book one row.
+          A narrower multi-frame step is NOT a fallback: trimming to the
+          batch minimum (10-09: a uniform 3-frame batch) leaves the runner
+          no graph to replay and it stalls silently -- stage 1 emitted no
+          chunks and stage 2 errored every request after a 600s wait. On a
+          draftless step ``constant_drafts`` re-arms the full K-step, so
+          one single-frame step is all the recovery the pipeline needs.
+
+        CUDA eager execution with a dynamic draft lookup is the exception:
+        for a pure decode batch, trim every row to the requested width before
+        upstream books computed/in-flight tokens. Static graphs and NPU keep
+        the full-or-single-frame guard above.
+
+        Rows wider than 1 without drafts are prefill/extend rows; they may
+        only coexist with single-frame decode rows, so any drafts go.
+        """
+        if not self._talker_kstep_armed():
+            return
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not num_scheduled_tokens:
+            return
+        dynamic_lookup = getattr(self, "dynamic_sd_lookup", None)
+        vllm_config = getattr(self, "vllm_config", None)
+        device_config = getattr(vllm_config, "device_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        dynamic_cuda = (
+            dynamic_lookup is not None
+            and getattr(device_config, "device_type", None) == "cuda"
+            and getattr(model_config, "enforce_eager", False)
+        )
+        if dynamic_cuda:
+            # The table is built for ``max_num_batched_tokens`` worth of rows
+            # and its last entry carries forward; clamp so a batch larger than
+            # the table cannot index past it.
+            assert dynamic_lookup is not None  # narrowed by dynamic_cuda
+            batch_index = min(len(num_scheduled_tokens), len(dynamic_lookup) - 1)
+            target = int(dynamic_lookup[batch_index])
+            max_drafts = int(getattr(self, "num_spec_tokens", 0) or 0)
+            if not 0 <= target <= max_drafts:
+                raise ValueError(f"Dynamic Talker draft count {target} is outside [0, {max_drafts}]")
+            uniform_decode = len(spec_tokens) == len(num_scheduled_tokens) and all(
+                len(drafts) >= target and num_scheduled_tokens[rid] == len(drafts) + 1
+                for rid, drafts in spec_tokens.items()
+            )
+            if uniform_decode:
+                for rid, drafts in list(spec_tokens.items()):
+                    num_scheduled_tokens[rid] = target + 1
+                    if target:
+                        spec_tokens[rid] = drafts[:target]
+                    else:
+                        del spec_tokens[rid]
+                scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+                scheduler_output.num_spec_tokens_to_schedule = target
+                return
+        changed = False
+        min_frames = None
+        if any(n > 1 and rid not in spec_tokens for rid, n in num_scheduled_tokens.items()):
+            # Mixed step: a prefill/extend row next to a drafted decode row
+            # is exactly the non-uniform shape the runner dies on.
+            if spec_tokens:
+                for rid in spec_tokens:
+                    num_scheduled_tokens[rid] = 1
+                spec_tokens.clear()
+                changed = True
+                min_frames = 0
+        elif spec_tokens:
+            num_spec_tokens = int(getattr(self, "num_spec_tokens", 0) or 0)
+            uniform_full = len(spec_tokens) == len(num_scheduled_tokens) and {len(v) for v in spec_tokens.values()} == {
+                num_spec_tokens
+            }
+            if not uniform_full:
+                # A narrower K-step is not executable: the static-shape decode
+                # backend has no graph for q_len in (1, 1+num_spec), so a
+                # trim-to-minimum rewrite stalls the runner silently. Drop
+                # every draft and let the single-frame step re-arm the K-step
+                # (constant_drafts re-drafts after a draftless step).
+                for rid, v in spec_tokens.items():
+                    if v:
+                        num_scheduled_tokens[rid] -= len(v)
+                spec_tokens.clear()
+                changed = True
+                min_frames = 0
+        if changed:
+            scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+            logger.warning(
+                "[kstep] booked spans were non-uniform; rewrote the step to a "
+                "uniform %d-frame batch (%d rows, total=%d, per_req=%s) instead of "
+                "feeding the multi-frame loop spans it declines",
+                min_frames,
+                len(num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                dict(num_scheduled_tokens),
+            )
+
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
         # The scheduler must agree with the stage's worker about which runner
@@ -212,6 +380,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             model_config,
             use_v2_model_runner=self.use_v2_model_runner,
         )
+        self._native_resumable = uses_native_qwen3_omni_resumable(model_config)
+        self._pending_chunk_commits: list[OmniChunkCommit] = []
+        self._resume_chunk_receivers: set[str] = set()
         self.chunk_transfer_adapter = (
             OmniChunkTransferAdapter(self.vllm_config)
             if getattr(model_config, "async_chunk", False) and not self._native_data_plane
@@ -238,6 +409,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
+        # Aborted, errored, and ignored requests. Wrapped onto the next
+        # scheduler output so the runner can drop their pending payloads.
+        self._discarded_req_ids: set[str] = set()
         # Async-chunk prewarm payloads popped in add_request, keyed by request
         # id; handed to the runner once by _wrap_omni_scheduler_output.
         self._pending_request_prewarms: dict[str, dict[str, Any]] = {}
@@ -326,7 +500,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Replace a downstream stage's placeholder with its next payload."""
         self._reset_streaming_session_replacement_state(session)
         session._output_token_ids.clear()
-        session._all_token_ids.clear()
+        # _all_token_ids is a TokenBuffer (array) since vLLM 0.34; it has no
+        # .clear(), so empty it with the del-slice idiom the pin uses.
+        del session._all_token_ids[:]
         new_prompt = update.prompt_token_ids or ()
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0
@@ -439,7 +615,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         chunk_finished_req_ids: set[str] = set()
         stage_recv_req_ids: set[str] = set()
         for output in connector_outputs:
-            request_metadata.update(output.request_metadata)
+            for req_id, update in output.request_metadata.items():
+                previous = request_metadata.get(req_id)
+                if previous is not None and previous.replace_prompt:
+                    update = replace(update, replace_prompt=True, resize_prompt_to=previous.resize_prompt_to)
+                request_metadata[req_id] = update
             chunk_ready_req_ids.update(output.chunk_ready_req_ids)
             chunk_finished_req_ids.update(output.chunk_finished_req_ids)
             stage_recv_req_ids.update(output.stage_recv_req_ids)
@@ -450,6 +630,64 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         chunk_ready_req_ids.intersection_update(live_request_ids)
         chunk_finished_req_ids.intersection_update(live_request_ids)
         stage_recv_req_ids.intersection_update(live_request_ids)
+        max_model_len = getattr(self, "max_model_len", 0)
+        if model_mode == "ar" and max_model_len:
+            for req_id in chunk_ready_req_ids | stage_recv_req_ids:
+                request = self.requests[req_id]
+                input_update = request_metadata.get(req_id)
+                prompt_length = request.num_prompt_tokens
+                if input_update is not None:
+                    if input_update.prompt_token_ids is not None:
+                        prompt_length = len(input_update.prompt_token_ids)
+                    elif input_update.resize_prompt_to is not None:
+                        prompt_length = input_update.resize_prompt_to
+                if prompt_length + max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1)) > max_model_len:
+                    self._finish_oversized_prompt(request, prompt_length)
+                    request_metadata.pop(req_id, None)
+                    chunk_ready_req_ids.discard(req_id)
+                    chunk_finished_req_ids.discard(req_id)
+                    stage_recv_req_ids.discard(req_id)
+        if getattr(self, "_native_resumable", False) and input_coordinator.receives_chunks:
+            for req_id, update in list(request_metadata.items()):
+                request = self.requests.get(req_id)
+                if request is None or not request.resumable:
+                    continue
+                # A delivered replacement may still be waiting for admission.
+                # Its explicit False survives until the prompt is consumed.
+                waiting_for_prompt = getattr(request, "_omni_waiting_native_prompt", request.num_computed_tokens == 0)
+                if update.replace_prompt and update.resize_prompt_to is not None:
+                    self._release_replaced_streaming_prompt_cache(request)
+                    self._reset_streaming_session_replacement_state(request)
+                    request._output_token_ids.clear()
+                    del request._all_token_ids[:]
+                    request.block_hashes.clear()
+                    request.prompt_token_ids = []
+                    request.num_computed_tokens = 0
+                    request._omni_waiting_native_prompt = False
+                elif model_mode == "ar" and waiting_for_prompt and (update.input_terminal or update.segment_finished):
+                    # After the Talker stopped, a closing Thinker may only
+                    # send a marker. There is no prompt or codec step to run.
+                    request_metadata.pop(req_id)
+                    chunk_ready_req_ids.discard(req_id)
+                    chunk_finished_req_ids.discard(req_id)
+                    if update.input_terminal:
+                        self._pending_data_plane_terminal_req_ids.add(req_id)
+                        request.resumable = False
+                        self.finish_requests(req_id, RequestStatus.FINISHED_STOPPED)
+                    else:
+                        self._resume_chunk_receivers.add(req_id)
+                    continue
+                if update.input_terminal:
+                    request.resumable = False
+        if model_mode == "ar" and getattr(self, "_native_resumable", False):
+            # A codec may reach EOS before the upstream segment marker
+            # arrives. Only a new prompt can wake its next decode.
+            chunk_ready_req_ids = {
+                req_id
+                for req_id in chunk_ready_req_ids
+                if (request := self.requests.get(req_id)) is not None
+                and not getattr(request, "_omni_waiting_native_prompt", False)
+            }
         if request_metadata:
             input_coordinator.update_request_metadata(
                 self.requests,
@@ -733,6 +971,20 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             return
         self._latest_omni_connector_output = omni_output
 
+    def _record_full_payload_discard(self, request: Request) -> None:
+        """Remember a failed request so its pending full payload is dropped."""
+        if getattr(request, "status", None) not in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
+            return
+        discarded = getattr(self, "_discarded_req_ids", None)
+        if discarded is None:
+            discarded = set()
+            self._discarded_req_ids = discarded
+        discarded.add(request.request_id)
+
     def _wrap_omni_scheduler_output(
         self,
         base: SchedulerOutput,
@@ -779,14 +1031,35 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             if request_id in self.requests
         ]
         pending_prewarms.clear()
+        pending_output_ids: dict[str, list[int]] = getattr(self, "_finished_req_output_token_ids", {})
+        finished_output_ids = {
+            req_id: pending_output_ids.pop(req_id) for req_id in base.finished_req_ids if req_id in pending_output_ids
+        }
+        discarded_req_ids: set[str] | None = getattr(self, "_discarded_req_ids", None)
+        if discarded_req_ids is None:
+            finished_discarded_req_ids: set[str] = set()
+        else:
+            finished_discarded_req_ids = discarded_req_ids & set(base.finished_req_ids)
+            discarded_req_ids.difference_update(finished_discarded_req_ids)
         scheduler_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
+            finished_req_output_token_ids=finished_output_ids,
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
+            input_segment_finished_req_ids=(
+                input_coordinator.segment_finished_req_ids.intersection(input_coordinator._scheduled_request_ids(base))
+                if input_coordinator is not None
+                else set()
+            ),
             pending_request_prewarms=request_prewarms,
+            chunk_commits=getattr(self, "_pending_chunk_commits", []),
+            resume_chunk_receivers=getattr(self, "_resume_chunk_receivers", set()),
+            discarded_req_ids=finished_discarded_req_ids,
         )
+        self._pending_chunk_commits = []
+        self._resume_chunk_receivers = set()
         OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
         return scheduler_output
 
@@ -863,6 +1136,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         routed_experts: Any = None,
         num_nans_in_logits: int = 0,
         is_segment_finished: bool | None = False,
+        segment_generation: int | None = None,
         new_prompt_len_snapshot: int | None = None,
         num_generation_tokens: int | None = None,
         error: Any = None,
@@ -872,6 +1146,10 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if isinstance(pooling_output, dict):
             pooling_output_payload = serialize_additional_information(pooling_output)
             pooling_output = None
+        if segment_generation is None:
+            raw_generation = getattr(request, "_omni_segment_generation", None)
+            if not isinstance(raw_generation, bool) and isinstance(raw_generation, int):
+                segment_generation = raw_generation
 
         return OmniEngineCoreOutput(
             request_id=request.request_id,
@@ -892,6 +1170,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             routed_experts=routed_experts,
             num_nans_in_logits=num_nans_in_logits,
             is_segment_finished=is_segment_finished,
+            segment_generation=segment_generation,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
             num_generation_tokens=num_generation_tokens,
             error=error,
@@ -917,7 +1196,13 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def has_requests(self) -> bool:
         """Keep stepping while a finished run request's output waits for its stage payload."""
-        return bool(self._outputs_awaiting_stage_payload) or super().has_requests()
+        return (
+            bool(self._outputs_awaiting_stage_payload)
+            or bool(getattr(self, "_pending_chunk_commits", ()))
+            or bool(getattr(self, "_pending_input_timeout_outputs", ()))
+            or bool(getattr(self, "_resume_chunk_receivers", ()))
+            or super().has_requests()
+        )
 
     def _handle_failed_kv_load_outputs(
         self,
@@ -1075,6 +1360,23 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             self.kv_holding_waiting.remove_requests(removable)
             self.deferred_waiting.difference_update(removable)
 
+    def _resume_native_chunk_receiver(self, request: Request) -> bool:
+        coordinator = getattr(self, "input_coordinator", None)
+        if (
+            not getattr(self, "_native_resumable", False)
+            or coordinator is None
+            or not coordinator.receives_chunks
+            or not request.resumable
+        ):
+            return False
+        coordinator.segment_finished_req_ids.discard(request.request_id)
+        coordinator.requests_with_ready_chunks.discard(request.request_id)
+        self._resume_chunk_receivers.add(request.request_id)
+        request._omni_waiting_native_prompt = True
+        request.status = RequestStatus.WAITING
+        self._enqueue_waiting_request(request)
+        return True
+
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
         """Resume duplex connector polling without an external update."""
         adapter = self.chunk_transfer_adapter
@@ -1087,6 +1389,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
         ):
             return
+        # Connector-only resumes bypass the generation bump in _update_request_as_session.
+        request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
         self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.WAITING
         self.deferred_waiting.discard(request)
@@ -1169,8 +1473,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # silently. Honoring them needs a LogitBiasState-style per-request
         # machine the codec path does not have; finish the request as
         # FINISHED_ERROR instead of letting it diverge unnoticed.
-        kstep_armed = getattr(self, "_talker_kstep_armed", None)
-        if kstep_armed is not None and kstep_armed():
+        if self._talker_kstep_armed():
             sp = getattr(request, "sampling_params", None)
             unsupported = [
                 name for name in ("logit_bias", "allowed_token_ids") if sp is not None and getattr(sp, name, None)
@@ -1186,17 +1489,52 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 super().add_request(request)
                 self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
                 return
+        finishes_on_next_stop = _request_finishes_on_next_stop(request)
+        if finishes_on_next_stop:
+            setattr(request, _FINISH_ON_NEXT_STOP_ATTR, True)
         existing = self.requests.get(request.request_id)
         if existing is None:
             # Only a fresh prewarm placeholder carries the payload; streaming
             # updates re-add a live id and are left untouched.
             self._take_async_chunk_prewarm(request)
-        elif existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
-            if adapter is not None:
-                self._finish_parked_streaming_session(existing, adapter)
-                return
+            _initialize_resumable_segment_generation(request)
+        else:
+            if finishes_on_next_stop:
+                setattr(existing, _FINISH_ON_NEXT_STOP_ATTR, True)
+            if existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
+                if adapter is not None:
+                    self._finish_parked_streaming_session(existing, adapter)
+                    return
+                if getattr(self, "_native_resumable", False) and not request.resumable:
+                    self._pending_data_plane_terminal_req_ids.add(existing.request_id)
+                    existing.resumable = False
+                    self.finish_requests(existing.request_id, RequestStatus.FINISHED_STOPPED)
+                    return
         super().add_request(request)
+
+    def _finish_oversized_prompt(self, request: Request, prompt_length: int) -> None:
+        """Emit a request-local error when a stage cannot accommodate its input."""
+        reason = (
+            f"Stage input prompt has {prompt_length} tokens and cannot fit sampling room "
+            f"within max_model_len={self.max_model_len}. "
+            "Increase this stage's max_model_len to accommodate the upstream payload."
+        )
+        logger.error("Rejecting request %s: %s", request.request_id, reason)
+        request.stop_reason = reason
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        pending[request.request_id] = (
+            request.client_index,
+            OmniEngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=reason,
+            ),
+        )
+        self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
 
     def _take_async_chunk_prewarm(self, request: Request) -> None:
         """Pop the ``ASYNC_CHUNK_PREWARM_NS.*`` entries off a new request.
@@ -1259,13 +1597,28 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         Sender ownership starts when the first chunk is queued, before the
         background thread initializes its chunk counter. A prewarmed receiver
         needs a terminal even if that first chunk has not been sent yet.
-        Final stages never queue sends, so they never match.
+
+        A 2150 segment stop may already have dropped the sender token. The
+        producer stage still owes that terminal; ``has_active_sender`` alone
+        would abort a parked close with no ``finished`` chunk, and the
+        downstream vocoder waits until the client times out. That no-sender
+        fallback is only for a parked request already stamped
+        finish-on-next-stop. Unstamped MiniCPM-style sessions keep the old
+        ``has_active_sender``-only behavior. Receiver-only final stages never
+        queue sends, so they never match.
         """
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is None:
             return None
         external_req_id = getattr(request, "external_req_id", None) or request.request_id
-        return adapter if adapter.has_active_sender(external_req_id) else None
+        if adapter.has_active_sender(external_req_id):
+            return adapter
+        if not _request_finishes_on_next_stop(request):
+            return None
+        sends = getattr(adapter, "custom_process_next_stage_input_func", None) is not None
+        if getattr(adapter, "receives_chunks", False) and not sends:
+            return None
+        return adapter
 
     def _finish_parked_streaming_session(self, request: Request, adapter: OmniChunkTransferAdapter) -> None:
         """End a parked async-chunk session with a downstream terminal chunk."""

@@ -22,7 +22,7 @@ The small Cosmos3 checkpoint, for constrained deployments. It runs on the shared
   `--guidance-scale` / `--flow-shift` and still get native Edge output:
 
 | | Edge | Nano / Super |
-|---|---|---|
+| --- | --- | --- |
 | T2I | 640×640 | 1024² |
 | T2V / I2V | 480×832 | 1280×720 |
 | Video `guidance_scale` | 5.0 | 6.0 |
@@ -41,6 +41,11 @@ For the larger checkpoints see [Cosmos3-Nano](./Cosmos3-Nano.md) and [Cosmos3-Su
 - **Acceleration**: `--quantization fp8` and attention-backend selection are supported. Cache-DiT and
   Sequence Parallel are inherited from the base Cosmos3 transformer (Edge overrides neither) and act on
   the shared GEN pathway — not separately benchmarked here. Tensor Parallel is untested on this checkpoint.
+- **T2I with `n > 1`** runs as one batched denoising loop, so images can differ from earlier releases
+  for the same seed, usually slightly. Tensor, sequence, CFG or pipeline parallelism, HSDP and cache backends
+  keep the serial per-image loop; data-parallel replicas still batch. With layerwise offload under
+  `torch.compile`, batched images can also differ slightly from batched images without offload. Start the server with
+  `--additional-config '{"cosmos3_batch_t2i_outputs": false}'` to keep the serial loop everywhere.
 
 ## Usage
 

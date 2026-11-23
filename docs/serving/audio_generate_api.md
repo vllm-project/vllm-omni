@@ -82,7 +82,7 @@ Content-Type: application/json
 | `num_inference_steps` | int | model default | Number of denoising steps (higher = better quality, slower) |
 | `seed` | int | null | Random seed for reproducible generation |
 
-When provided, `audio_length`, `audio_start`, and `frame_rate` must be finite
+When provided as top-level fields, `audio_length`, `audio_start`, and `frame_rate` must be finite
 numbers. `audio_length` and `frame_rate` must also be greater than zero. When
 `audio_length` is provided, the derived end time (`audio_start + audio_length`)
 must remain finite; a null `audio_start` is treated as zero. Model-specific
@@ -271,7 +271,9 @@ Invalid or missing parameters:
 Request validation failures also return HTTP 400 in the OpenAI-compatible
 `error` envelope. These include invalid `response_format`, out-of-range `speed`,
 non-finite timing parameters, and overflow of the derived audio end time.
-Requests with these timing errors are rejected before engine submission.
+Requests with these errors in the top-level timing fields are rejected before
+engine submission. Model-specific `extra_params` retain their pipeline's
+validation rules.
 
 ### 404 Not Found
 

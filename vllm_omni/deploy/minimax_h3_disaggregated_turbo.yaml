@@ -10,6 +10,8 @@ connectors:
 
 stages:
   - stage_id: 0
+    # Encoder is an LLM-AR stage. Diffusion stays on its own runner.
+    model_runner: v2
     devices: "0,1"
     max_num_seqs: 1
     gpu_memory_utilization: 0.6

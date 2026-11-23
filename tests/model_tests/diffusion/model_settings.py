@@ -51,6 +51,9 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
+        # ROCm multi-GPU cold starts repeatedly straddle the default 600s
+        # deadline while succeeding just beyond it. Keep a finite 50% margin.
+        offline_init_timeout_s=900,
     ),
     "LTX2Pipeline": DiffusionModelTestOpts(
         model="Lightricks/LTX-2",
@@ -112,6 +115,16 @@ DIFFUSION_TEST_SETTINGS = {
         ],
         check_i2v_t2v_divergence=False,
         check_multi_output=False,
+    ),
+    "WanPipeline": DiffusionModelTestOpts(
+        model="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        builder=diff_model_builders.tiny_wan_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        model_type_marker=ModelTypeMarker.DIFFUSION,
+        extra_test_groups=[
+            [DiffusionAccs.PIPELINE_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL],
+        ],
     ),
     "QwenImagePipeline": DiffusionModelTestOpts(
         model="Qwen/Qwen-Image",

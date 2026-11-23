@@ -37,6 +37,13 @@ stage gets its deploy `default_sampling_params`, and an observation `seed`
 applies to all stages. The reply is the actions of the stage that returns
 them.
 
+An inference message can ask for several samples with
+`"sampling_params": {"n": <int>}`, which sets the first stage's `n`. It
+needs a policy whose first stage sends one KV cache per sample
+(`omni_kv_config["per_sample_kv"]`, for example Alpamayo 2 Super); the reply
+then stacks one action chunk per sample along a new leading axis, and sample
+i uses seed `seed + i`. Other policies reject `n > 1`.
+
 When the first stage needs a prompt built from the observation (token ids,
 images), the diffusion stage's `model_config` also names
 `openpi_prompt_builder`, a class following the `OpenPIPromptBuilder` protocol

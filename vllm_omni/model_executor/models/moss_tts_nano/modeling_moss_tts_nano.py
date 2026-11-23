@@ -472,7 +472,7 @@ class MossTTSNanoForGeneration(nn.Module):
 
         infos = runtime_additional_information or [{}]
 
-        if not runtime_additional_information or all(info.get("_is_dummy") for info in infos):
+        if all(not info or info.get("_is_dummy") for info in infos):
             # Dummy/warmup path: finish immediately for every row.
             self._ar_last_chunk_flags = [True] * len(infos)
             return OmniOutput(
@@ -488,7 +488,9 @@ class MossTTSNanoForGeneration(nn.Module):
         last_chunk_flags: list[bool] = []
 
         for info in infos:
-            if info.get("_is_dummy"):
+            if not info or info.get("_is_dummy"):
+                if not info:
+                    logger.warning("MOSS-TTS-Nano: empty runtime_additional_information row in batch; skipping row")
                 outputs.append(empty)
                 srs.append(sr_tensor)
                 last_chunk_flags.append(True)

@@ -1,4 +1,4 @@
-# Opt-in single-H200 native full-duplex codec profile (V1).
+# Opt-in single-H200 native full-duplex codec profile.
 # Inherits the native session/stage capacities, sampling and chunk sizes.
 # Enables Stage 0 (multimodal duplex prefill) and Stage 2 (code2wav DiT) optimizations.
 # Ordinary TF32 for CFM DiT GEMMs (cuBLAS allow_tf32 + Triton tf32 dots).

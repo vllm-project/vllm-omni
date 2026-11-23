@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 pipeline: GPT AR talker (text → mel codes) → S2Mel + BigVGAN (mel → audio).
 
 Two-stage non-streaming pipeline. S2Mel flow matching (25 Euler steps) requires
@@ -23,10 +23,11 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="indextts2_talker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            extras={"skip_tokenizer_init": True, "tokenizer": "gpt2"},
+            extras={"skip_tokenizer_init": True},
             custom_process_next_stage_input_func=f"{_PROC}.talker2s2mel_full_payload",
             sampling_constraints={
                 "detokenize": False,
@@ -37,6 +38,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="indextts2_s2mel_decoder",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
@@ -60,6 +62,7 @@ INDEXTTS25_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="indextts2_5_talker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -74,6 +77,7 @@ INDEXTTS25_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="indextts2_5_s2mel_decoder",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

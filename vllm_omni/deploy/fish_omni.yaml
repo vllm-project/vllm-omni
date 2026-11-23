@@ -1,3 +1,6 @@
+# Historical Fish/Drama profile; unavailable with vLLM 0.34 / V2-only execution.
+# Configuration resolution rejects this profile because its DAC stage requires retired Model Runner V1.
+# Keep the V1 pin to fail explicitly; selecting V2 does not implement model support.
 # Fish Audio Drama 3 deploy: async-chunk streaming fish_omni → dac_decoder.
 # Stage 0 (Qwen3.5 MoE backbone + codebook tower, Model Runner V2) streams
 # frames to Stage 1 (the S2 Pro DAC codec). Tuned on 1× H200.
@@ -68,8 +71,10 @@ stages:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
       temperature: 1.0
-      top_k: 30
-      top_p: 0.9
+      top_k: -1  # Uncapped main token; codebook heads keep at most 30 candidates.
+      top_p: 1.0  # Quiet frames can put speech continuations and EOS outside a 0.9 nucleus.
+      extra_args:
+        fish_omni_reference_top_p: 0.9  # Keep the voice-cloning default when a reference is present.
       max_tokens: 500
       repetition_penalty: 1.0
 

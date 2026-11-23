@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -16,7 +16,6 @@ from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import (
@@ -54,6 +53,9 @@ from .patch_emission import (
     _resolve_runtime_int,
     _validate_ming_decode_window,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 

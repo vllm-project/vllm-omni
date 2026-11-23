@@ -1,0 +1,29 @@
+# Isolated from the inference interpreter; VBench/WBench use older Torch APIs.
+setuptools==80.9.0  # CLIP imports pkg_resources, removed in setuptools 81.
+torch==2.4.0
+torchvision==0.19.0
+numpy==1.26.4
+pyarrow==19.0.1  # Newer releases require NumPy 2, incompatible with this Torch.
+opencv-python==4.11.0.86
+pyiqa==0.1.15.post2
+transformers==4.51.3
+timm==1.0.29
+decord==0.6.0
+scipy==1.15.3
+scikit-image==0.25.2
+open-clip-torch==3.3.0
+openai-clip==1.0.1
+PyYAML==6.0.3
+einops==0.8.2
+omegaconf==2.3.1
+safetensors==0.8.0
+easydict==1.13
+fairscale==0.4.13
+fvcore==0.1.5.post20221221
+ftfy==6.3.1
+accelerate==1.15.0
+trl==0.17.0
+fire==0.7.1
+peft==0.15.2
+qwen-vl-utils==0.0.11
+tensorboard==2.20.0

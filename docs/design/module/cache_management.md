@@ -9,6 +9,7 @@ owners:
 primary_code_paths:
   - vllm_omni/diffusion/cache/**
 related_code_paths:
+  - vllm_omni/diffusion/distributed/noisy_pipeline_parallel/**
   - vllm_omni/experimental/ar_diffusion/kv_cache/**
   - vllm_omni/core/**
 depends_on:

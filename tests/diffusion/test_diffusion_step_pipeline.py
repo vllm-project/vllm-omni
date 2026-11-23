@@ -17,8 +17,11 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_open_port
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.attention import schedule as schedule_module
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, AttentionSigmaWindow
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, parse_attention_schedule_config
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
@@ -31,6 +34,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import (
     ChunkMediaSpec,
@@ -333,15 +337,18 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
     def forward(self):
         return None
 
-    def denoise_step(self):
+    # Signature matches the pipeline protocol so the override type-checks; the
+    # profiler calls it without arguments.
+    def denoise_step(self, input_batch=None, **kwargs):
+        del input_batch, kwargs
         return "ok"
 
 
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -505,10 +512,17 @@ def _make_runner(
     runner = object.__new__(runner_cls)
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
+        step_execution=False,
+        diffusion_use_graph=False,
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
         cache_backend=None,
         diffusion_kv_mode=diffusion_kv_mode,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1, cfg_parallel_size=1, use_hsdp=False),
         streaming_output=False,
+        diffusion_attention_schedule=None,
     )
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
@@ -525,10 +539,17 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
+        step_execution=False,
+        diffusion_use_graph=False,
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
         cache_backend=None,
         diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1, cfg_parallel_size=1, use_hsdp=False),
         streaming_output=False,
+        diffusion_attention_schedule=None,
     )
     runner.device = device
     runner.pipeline = _DistributedStepPipeline(mode=mode, device=device)
@@ -599,6 +620,7 @@ def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._closed = False
     engine.abort_queue = queue.Queue()
+    engine._request_chunk_states = {}
     return engine
 
 
@@ -937,6 +959,97 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
+
+    def test_unscheduled_step_leaves_attention_schedule_unbound(self):
+        """Without a service schedule, the real forward context carries no schedule during denoise."""
+        runner = _make_runner()
+        runner.vllm_config = None
+        seen: list[object] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                ctx = get_forward_context()
+                seen.append(ctx.attention_schedule)
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        assert seen == [None, None]
+        assert "req-1" not in runner.state_cache
+        assert is_forward_context_available() is False
+
+    def test_cached_step_reuses_the_schedule_resolved_at_admission(self, monkeypatch):
+        """A request's schedule is resolved once when it reaches the runner, not again on each later step."""
+        runner = _make_runner()
+        runner.vllm_config = None
+        runner.od_config.diffusion_attention_schedule = parse_attention_schedule_config(
+            {
+                "profiles": {"dense": {"default": "TORCH_SDPA"}},
+                "default": [{"start": 1, "end": None, "profile": "dense"}],
+            }
+        )
+        resolved: list[object] = []
+        real_resolve = schedule_module.resolve_attention_schedule
+
+        def _recording_resolve(*args, **kwargs):
+            schedule = real_resolve(*args, **kwargs)
+            resolved.append(schedule)
+            return schedule
+
+        monkeypatch.setattr(schedule_module, "resolve_attention_schedule", _recording_resolve)
+        seen: list[object] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                seen.append(get_forward_context().attention_schedule)
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        expected = (AttentionScheduleRange(start=1, end=None, profile="dense"),)
+        assert seen == [expected, expected]
+        assert resolved == [expected]
+
+    def test_cached_step_reuses_the_sigma_schedule_resolved_at_admission(self, monkeypatch):
+        """A request's sigma windows are resolved once when it reaches the runner, not again on each later step."""
+        runner = _make_runner()
+        runner.vllm_config = None
+        runner.od_config.diffusion_attention_schedule = parse_attention_schedule_config(
+            {
+                "profiles": {"dense": {"default": "TORCH_SDPA"}},
+                "sigma": [{"low": 0.0, "high": 0.5, "profile": "dense"}],
+            }
+        )
+        resolved: list[object] = []
+        real_resolve = schedule_module.resolve_attention_sigma_schedule
+
+        def _recording_resolve(*args, **kwargs):
+            schedule = real_resolve(*args, **kwargs)
+            resolved.append(schedule)
+            return schedule
+
+        monkeypatch.setattr(schedule_module, "resolve_attention_sigma_schedule", _recording_resolve)
+        seen: list[object] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                seen.append(get_forward_context().attention_sigma_schedule)
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        expected = (AttentionSigmaWindow(low=0.0, high=0.5, profile="dense"),)
+        assert seen == [expected, expected]
+        assert resolved == [expected]
 
     @staticmethod
     def _make_grouping_runner(pipeline, *, grouping: bool):
@@ -1349,6 +1462,8 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
+            device: torch.device
+
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
@@ -1423,6 +1538,12 @@ class TestRunner:
         runner = object.__new__(DiffusionModelRunner)
         runner.vllm_config = _make_vllm_config()
         runner.od_config = SimpleNamespace(
+            kv_transfer_config=None,
+            cfg_kv_collect_func=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            diffusion_use_graph=False,
+            enable_prompt_embed_cache=False,
+            prompt_embed_cache_size=32,
             enable_cpu_offload=False,
             enable_layerwise_offload=False,
             enforce_eager=True,
@@ -1430,8 +1551,9 @@ class TestRunner:
             cache_config=None,
             step_execution=True,
             model_class_name="RequestOnlyPipeline",
-            parallel_config=SimpleNamespace(use_hsdp=False),
+            parallel_config=SimpleNamespace(data_parallel_size=1, cfg_parallel_size=1, use_hsdp=False),
             streaming_output=False,
+            diffusion_attention_schedule=None,
         )
         runner.device = torch.device("cpu")
         runner.pipeline = None
@@ -1442,6 +1564,11 @@ class TestRunner:
 
         monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeLoader)
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeProfiler)
+        monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "init_diffusion_model_runner_runtime",
+            MagicMock(return_value=None),
+        )
         monkeypatch.setattr(
             model_runner_module,
             "enable_offload_backend",
@@ -1459,6 +1586,9 @@ class _RecordingLoRAManager:
 
     def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
+
+    def set_request_adapters(self, adapters, scales=1.0) -> None:
+        self.calls.append((adapters, scales))
 
 
 def _make_step_worker(lora_manager=None, *, expected_output=None):
@@ -1650,7 +1780,7 @@ class TestEngine:
     )
     def test_step_engine_returns_error(self, execute_fn, expected_error, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler, execute_fn=execute_fn)
 
         output = engine.add_req_and_wait_for_response(_make_engine_request("req-error", num_inference_steps=2))
@@ -1660,7 +1790,7 @@ class TestEngine:
 
     def test_step_execution_completes(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-step", num_inference_steps=2)
 
@@ -1686,7 +1816,7 @@ class TestEngine:
 
     def test_step_abort_stops_rescheduling_after_first_step(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-stop", num_inference_steps=4)
 
@@ -1711,7 +1841,7 @@ class TestEngine:
 
     def test_step_abort_after_reschedule_returns_aborted_output(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-mid", num_inference_steps=4)
 
@@ -1738,7 +1868,7 @@ class TestEngine:
 
     def test_finished_step_without_result_returns_error(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=None))
         engine = _make_engine(
             scheduler,
             execute_fn=lambda _: RunnerOutput(
@@ -1796,7 +1926,7 @@ class TestSupportedPipelines:
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_ulysses_parallel():
@@ -1806,13 +1936,13 @@ def test_execute_stepwise_with_ulysses_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ulysses", "29540"),
+        args=(world_size, "ulysses", str(get_open_port())),
         nprocs=world_size,
     )
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_ring_parallel():
@@ -1822,13 +1952,13 @@ def test_execute_stepwise_with_ring_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ring", "29541"),
+        args=(world_size, "ring", str(get_open_port())),
         nprocs=world_size,
     )
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_cfg_parallel():
@@ -1838,6 +1968,6 @@ def test_execute_stepwise_with_cfg_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "cfg", "29542"),
+        args=(world_size, "cfg", str(get_open_port())),
         nprocs=world_size,
     )

@@ -33,6 +33,37 @@ def test_weight_transfer_config_is_pipeline_wide_field():
     assert "weight_transfer_config" in PIPELINE_WIDE_ENGINE_FIELDS
 
 
+@pytest.mark.parametrize("execution_type_name", ["LLM_AR", "LLM_GENERATION"])
+def test_weight_transfer_config_is_owned_by_llm_stages(execution_type_name):
+    """LLM stage ownership validation must accept vLLM's weight-transfer config."""
+    from vllm_omni.config.omni_config import _validate_stage_engine_override_ownership
+    from vllm_omni.config.stage_config import StageExecutionType
+
+    _validate_stage_engine_override_ownership(
+        0,
+        getattr(StageExecutionType, execution_type_name),
+        {"weight_transfer_config": {"backend": "omni_lora_ipc"}},
+    )
+
+
+def test_weight_transfer_config_reaches_ar_stage_engine_args():
+    """The pipeline-wide setting must reach the LLM worker's VllmConfig."""
+    from transformers import Qwen3OmniMoeConfig
+
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+    from vllm_omni.config.stage_config import DeployConfig
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    transfer = {"backend": "omni_lora_ipc"}
+    pipeline = resolve_pipeline_config("qwen3_omni_moe", Qwen3OmniMoeConfig())
+    deploy = DeployConfig(weight_transfer_config=transfer)
+
+    stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    assert stage.weight_transfer_config == transfer
+    assert _project_omni_stage_engine_args(stage)["weight_transfer_config"] == transfer
+
+
 def test_weight_transfer_config_is_deploy_override_key():
     """It must survive build_stage_runtime_overrides' internal-key filter."""
     from vllm_omni.config.stage_config import deploy_runtime_override_keys
@@ -86,11 +117,49 @@ def test_ar_worker_still_inherits_upstream_gpu_worker():
     from vllm_omni.worker.base import OmniGPUWorkerBase
 
     assert issubclass(OmniGPUWorkerBase, GPUWorker)
-    for method in _LIFECYCLE_METHODS:
+    for method in _LIFECYCLE_METHODS[:-1]:
         assert method not in vars(OmniGPUWorkerBase), (
             f"{method} is overridden on OmniGPUWorkerBase; the AR stage should "
             "reuse upstream's implementation so the two stay in sync."
         )
+
+
+def test_ar_merged_backend_rejects_runtime_lora_before_model_load():
+    from vllm.config.weight_transfer import WeightTransferConfig
+
+    from vllm_omni.worker.base import OmniGPUWorkerBase
+
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.vllm_config = SimpleNamespace(
+        weight_transfer_config=WeightTransferConfig(backend="omni_lora_ipc"),
+        lora_config=object(),
+    )
+    with pytest.raises(ValueError, match="requires enable_lora=False"):
+        worker.load_model()
+
+
+def test_ar_merged_finish_failure_uses_pinned_worker_cleanup(monkeypatch):
+    from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+
+    from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
+    from vllm_omni.worker.base import OmniGPUWorkerBase
+
+    engine = object.__new__(MergedLoRAIPCWeightTransferEngine)
+    engine.reset_weight_update_target = MagicMock()
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.weight_transfer_engine = engine
+    worker._weight_update_active = True
+    worker._end_weight_update = lambda **kwargs: pytest.fail("unpinned private vLLM cleanup called")
+
+    def fail_finish(self):
+        raise RuntimeError("rank vote failed")
+
+    monkeypatch.setattr(GPUWorker, "finish_weight_update", fail_finish)
+    with pytest.raises(RuntimeError, match="rank vote failed"):
+        worker.finish_weight_update()
+
+    assert worker._weight_update_active is False
+    engine.reset_weight_update_target.assert_called_once_with()
 
 
 # --- Diffusion stage: implemented on DiffusionWorker ---

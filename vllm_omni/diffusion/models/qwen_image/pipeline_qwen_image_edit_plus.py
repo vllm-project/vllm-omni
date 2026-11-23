@@ -23,6 +23,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwe
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.text_encoder_tp import maybe_shard_text_encoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -232,13 +233,18 @@ class QwenImageEditPlusPipeline(
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
         # half-written cache (missing-shard ``OSError`` and the default
         # -config size-mismatch ``RuntimeError``) instead of crashing the worker.
-        self.text_encoder = from_pretrained_with_prefetch(
-            Qwen2_5_VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        # Match Diffusers' CPU initialization of the encoder's FP32 RoPE
+        # frequencies. Computing them on GPU changes BF16 conditioning (#10238).
+        with torch.device("cpu"):
+            self.text_encoder = from_pretrained_with_prefetch(
+                Qwen2_5_VLForConditionalGeneration.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=qwen_subfolders,
+                local_files_only=local_files_only,
+            )
+        # Shard on CPU (no-op unless text_encoder_tp_size > 1) before moving to device.
+        self.text_encoder = maybe_shard_text_encoder(self.text_encoder, od_config).to(self.device)
 
         self.vae = from_pretrained_with_prefetch(
             AutoencoderKLQwenImage.from_pretrained,
