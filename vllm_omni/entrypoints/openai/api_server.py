@@ -1127,6 +1127,7 @@ async def omni_init_app_state(
                 diffusion_engine=engine_client,  # type: ignore
                 model_name=model_name,
                 stage_configs=diffusion_stage_configs,
+                allowed_local_media_path=getattr(args, "allowed_local_media_path", "") or "",
             )
             if "x2v" in supported_tasks
             else None

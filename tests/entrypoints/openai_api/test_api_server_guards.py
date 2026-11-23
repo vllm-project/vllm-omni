@@ -146,6 +146,7 @@ def multistage_handler(monkeypatch):
 @pytest.fixture
 def diffusion_handler(monkeypatch):
     speech_kwargs = {}
+    video_kwargs = {}
 
     def _for_diffusion_factory(label: str):
         def _factory(cls, *args, **kwargs):
@@ -157,6 +158,10 @@ def diffusion_handler(monkeypatch):
         speech_kwargs.update(kwargs)
         return _marker("speech")
 
+    def _video_factory(cls, *args, **kwargs):
+        video_kwargs.update(kwargs)
+        return _marker("video")
+
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
     monkeypatch.setattr(
@@ -164,7 +169,7 @@ def diffusion_handler(monkeypatch):
         "for_diffusion",
         _for_diffusion_factory("audio_generate"),
     )
-    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
+    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", classmethod(_video_factory))
     monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
     monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", classmethod(_speech_factory))
     monkeypatch.setattr(
@@ -173,7 +178,7 @@ def diffusion_handler(monkeypatch):
         classmethod(lambda cls, *a, **k: _marker("openpi")),
     )
 
-    return {"speech_kwargs": speech_kwargs}
+    return {"speech_kwargs": speech_kwargs, "video_kwargs": video_kwargs}
 
 
 def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
@@ -1825,6 +1830,24 @@ async def test_diffusion_speech_extra_args(diffusion_handler, tmp_path) -> None:
     assert config.resolve_max_bytes == 1234
     assert config.resolve_max_entries == 17
     assert config.speaker_max_bytes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"allowed_local_media_path": "/allowed/media"}, "/allowed/media"),
+        ({}, ""),
+    ],
+)
+async def test_diffusion_video_allowed_local_media_path(diffusion_handler, overrides, expected) -> None:
+    stage = SimpleNamespace(stage_type="diffusion", engine_args={})
+    engine = _FakeEngineClient(stage_configs=[stage], supported_tasks=("x2v",))
+
+    state = State()
+    await api_server.omni_init_app_state(engine, state, _minimal_args(**overrides))
+
+    assert diffusion_handler["video_kwargs"]["allowed_local_media_path"] == expected
 
 
 @pytest.mark.asyncio
