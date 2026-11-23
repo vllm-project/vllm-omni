@@ -34,7 +34,7 @@ Successful T2I image generation was validated with the following environment:
 - AR/DiT `gpu_memory_utilization`: 0.5/0.3, as committed; these are configuration
   budgets, not measured peak-memory values
 - Successful-run vLLM version: `0.34.0`
-- Successful-run vLLM-Omni version: `0.33.0rc2.dev385+g62d0e880a`
+- Successful-run vLLM-Omni version: `0.34.0`
 
 
 ## Offline command
