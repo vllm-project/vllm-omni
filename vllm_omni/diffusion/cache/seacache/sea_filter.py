@@ -10,11 +10,16 @@ import torch
 
 # SeaCache paper: "Spectral-Evolution-Aware Cache for Accelerating Diffusion Models"
 # https://arxiv.org/abs/2602.18993
-def apply_sea_filter(hidden_states: torch.Tensor, sigma: float, power_exp: float = 3.0) -> torch.Tensor:
+def apply_sea_filter(
+    hidden_states: torch.Tensor,
+    sigma: float,
+    power_exp: float = 3.0,
+    *,
+    dimensions: tuple[int, int, int] = (0, 1, 2),
+) -> torch.Tensor:
     """Apply the separable SEA Wiener filter over ``(T, H, W)``."""
     original_dtype = hidden_states.dtype
     hidden_states = hidden_states.contiguous().float()
-    dimensions = (0, 1, 2)
     spectrum = torch.fft.fftn(hidden_states, dim=dimensions)
 
     sigma = max(1e-6, min(1.0 - 1e-6, float(sigma)))

@@ -25,6 +25,7 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
+from .race import MiniMaxH3RACE
 from .sampling import create_h3_sample_solver
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
@@ -334,6 +335,7 @@ def minimax_h3_denoise_loop(
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    race_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -369,6 +371,8 @@ def minimax_h3_denoise_loop(
     video_solver = create_h3_sample_solver(sampler, sigmas_video)
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
+    # With at most two steps the spectral gate refreshes every step anyway.
+    race = MiniMaxH3RACE(model=model, branch=positive, num_steps=num_steps) if race_enabled and num_steps > 2 else None
     reference_kv_state = None
     create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
     if callable(create_reference_kv_state):
@@ -426,12 +430,24 @@ def minimax_h3_denoise_loop(
                 )
                 if getattr(getattr(model, "arch", None), "pdd_steps", None) is not None:
                     fk["pdd_step"] = step
-                with torch.inference_mode():
-                    v_video, v_audio = model(**fk)
+                refresh = race is None or race.should_refresh(step, s_v, fk)
+                mv_video_t = mv_audio_t = None
+                if refresh:
+                    with torch.inference_mode():
+                        v_video, v_audio = model(**fk)
+                    mv_video_t = v_video.float()[update]
+                    mv_audio_t = v_audio.float()[audio_update]
                 if reference_kv_state is not None:
                     reference_kv_state.end_step()
-                mv_video_t = v_video.float()[update]
-                mv_audio_t = v_audio.float()[audio_update]
+
+                video_correction = audio_correction = None
+                if race is not None:
+                    mv_video_t, video_correction = race.video.step(
+                        video_rows[update], mv_video_t, t_v, 1.0 - sigmas_video[step + 1]
+                    )
+                    mv_audio_t, audio_correction = race.audio.step(
+                        audio_rows[audio_update], mv_audio_t, t_a, 1.0 - sigmas_audio[step + 1]
+                    )
 
                 if video_edit is None:
                     x0_video = minimax_h3_rf_v_to_x0(
@@ -470,10 +486,16 @@ def minimax_h3_denoise_loop(
                 )
                 if audio_anchor is not None:
                     audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
+                if video_correction is not None:
+                    video_rows[update] += video_correction
+                if audio_correction is not None:
+                    audio_rows[audio_update] += audio_correction
                 if on_step is not None:
                     on_step(step, video_rows, audio_rows)
                 check_request_cancellation(synchronize=True)
 
+        if race is not None:
+            race.log_result()
     finally:
         minimax_h3_publish_denoise_progress(None, None, None)
         if reference_kv_state is not None:

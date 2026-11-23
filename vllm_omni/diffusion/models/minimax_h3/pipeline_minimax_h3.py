@@ -966,6 +966,26 @@ class MiniMaxH3Pipeline(
         self.parallel_config = od_config.parallel_config
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
+        race_flag = os.environ.get("VLLM_OMNI_MINIMAX_H3_RACE", "0")
+        if race_flag not in {"0", "1"}:
+            raise ValueError("VLLM_OMNI_MINIMAX_H3_RACE must be 0 or 1")
+        self._race_enabled = race_flag == "1"
+        if self._race_enabled:
+            if (
+                getattr(od_config, "step_execution", False)
+                or self.parallel_config.sequence_parallel_size != 1
+                or self.parallel_config.use_hsdp
+                or getattr(od_config, "lora_path", None)
+                or getattr(od_config, "quantization_config", None) is not None
+                or getattr(od_config, "cache_backend", None) not in (None, "none")
+                or getattr(od_config, "kv_offload_config", None) is not None
+            ):
+                raise ValueError(
+                    "MiniMax H3 RACE requires a dense base checkpoint, SP1, request mode, and cache-backend none"
+                )
+            offload = resolve_offload(od_config)
+            if offload.offloads(DIT_COMPONENT) and offload.resident_layers < 1:
+                raise ValueError("MiniMax H3 RACE with DiT offload requires --dlo-resident-layers 1 or more")
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
@@ -2386,6 +2406,18 @@ class MiniMaxH3Pipeline(
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        race_enabled = getattr(self, "_race_enabled", False)
+        if race_enabled and (
+            task != "t2va"
+            or inputs["sampler"] != "euler"
+            or type(transformer) is not MiniMaxH3DiTModel
+            or base_schedule is not None
+            or refine is not None
+            or init_latents is not None
+            or locked_audio_rows is not None
+            or any(inputs[key] is not None for key in ("cond_anchor", "audio_anchor", "video_edit", "audio_edit"))
+        ):
+            raise ValueError("MiniMax H3 RACE requires T2VA with no media conditioning and the native Euler schedule")
         # Each pass (including each output and hi-res refine) owns its cache.
         # Refine can change both the packed shape and the schedule length.
         registry = getattr(transformer, "_hook_registry", None)
@@ -2411,6 +2443,7 @@ class MiniMaxH3Pipeline(
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
+                    race_enabled=race_enabled,
                     on_step=lambda step, video, audio: progress.update(),
                 )
 
@@ -3825,6 +3858,8 @@ class MiniMaxH3Pipeline(
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")
+        if getattr(self, "_race_enabled", False) and request.sampling_params.lora_request is not None:
+            raise OmniClientError("MiniMax H3 RACE requires the base checkpoint without a LoRA adapter")
         check_request_cancellation()
         context = self._prepare_request_inputs(
             request.prompts[0],
