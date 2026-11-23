@@ -35,7 +35,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict, get_stage_connector_spec
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict, build_vllm_config, get_stage_connector_spec
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -43,6 +43,29 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Explicit so engine configs with connectors build on any platform.
 AR_WORKER_CLS = "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
+
+
+def test_build_vllm_config_upgrades_inc_quantization(tmp_path, mocker):
+    from transformers import LlamaConfig
+    from vllm.config import DeviceConfig, ModelConfig
+    from vllm.model_executor.layers.quantization.inc import INCConfig
+
+    from vllm_omni.quantization.inc_config import OmniINCConfig
+
+    LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path), skip_tokenizer_init=True, enforce_eager=True),
+        device_config=DeviceConfig(device="cpu"),
+        quant_config=INCConfig(weight_bits=4, group_size=128, sym=True),
+    )
+    mocker.patch.object(OmniEngineArgs, "create_engine_config", return_value=config)
+
+    upgraded, _ = build_vllm_config(
+        SimpleNamespace(final_output_type=None), model=str(tmp_path), engine_args_dict={"model": str(tmp_path)}
+    )
+
+    assert isinstance(upgraded.quant_config, OmniINCConfig)
+    assert upgraded.num_hash_lookahead_tokens == config.num_hash_lookahead_tokens
 
 
 @pytest.mark.parametrize("logits_processor", [LogitBiasState, None], ids=["logit_bias", "audex_cfg"])

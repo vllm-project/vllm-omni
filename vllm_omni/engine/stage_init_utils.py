@@ -22,12 +22,13 @@ import time
 import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import regex as re
 from vllm.config import VllmConfig
+from vllm.config.utils import replace
 from vllm.logger import init_logger
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache, ShmObjectStoreSenderCache
 from vllm.pooling_params import PoolingParams
