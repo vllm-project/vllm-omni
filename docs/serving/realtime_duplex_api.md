@@ -1068,8 +1068,9 @@ or `--initial-user-text` on a model that supports initial text seeding. These
 modes stream silence after the supplied input until the timeout, so tools run
 alongside incoming audio and native models can continue their answer. Native
 input requests text and audio; use `--output-wav answer.wav` to save the speech.
-This CLI records with `commit_all_on_done`; an interactive playback application
-should use `ack_only` and acknowledge audio actually played. See the
+For offline probes, `--ack-collected-audio` explicitly simulates immediate
+playback of received audio. Interactive applications must acknowledge audio
+actually played. See the
 [Venus tool examples](gh-file:recipes/inclusionAI/Realtime-Venus.md#tool-execution)
 for local arithmetic, inventory lookup and voice requests.
 

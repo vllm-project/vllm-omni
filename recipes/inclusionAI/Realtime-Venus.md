@@ -245,7 +245,7 @@ python -m vllm_omni.clients.tool_calls \
   --model ./Realtime-Venus/Realtime-Venus-Omni \
   --tools-json tools.json --handler delegate=tool_handlers:delegate \
   --initial-user-text 'Ask the backend to add 12 and 30. Delegate the calculation instead of doing it yourself.' \
-  --timeout 60 --output-wav answer.wav
+  --timeout 60 --output-wav answer.wav --ack-collected-audio
 ```
 
 ### Look up local inventory
@@ -272,8 +272,11 @@ Record “Please check the widget inventory with the backend” as mono PCM16 at
 ```
 
 The generic CLI prints JSON events, requests text and audio for native input,
-and saves speech with `--output-wav`. It uses `commit_all_on_done` for this
-recording workflow. In an interactive application, run
+and saves speech with `--output-wav`. Realtime sessions require playback ACKs.
+The explicit `--ack-collected-audio` option simulates immediate playback for
+this offline probe by acknowledging received audio; it does not play sound.
+This also lets the model continue after a spoken prelude to a tool call.
+In an interactive application, run
 `DuplexToolRunner(client, {"delegate": delegate}).run()` alongside your
 audio playback loop, use `playback_commit_policy="ack_only"`, and acknowledge
 audio actually played. Handler failures send

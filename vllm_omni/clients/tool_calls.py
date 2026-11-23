@@ -306,7 +306,14 @@ def main() -> None:
     from importlib import import_module
     from pathlib import Path
 
-    from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig, read_pcm16_wav, write_pcm16_wav
+    from vllm_omni.clients.duplex import (
+        DuplexClient,
+        EventCollector,
+        SessionConfig,
+        acknowledge_collected_playback,
+        read_pcm16_wav,
+        write_pcm16_wav,
+    )
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
@@ -319,6 +326,11 @@ def main() -> None:
     inputs.add_argument("--initial-user-text", help="Seed a native-duplex session, then stream silence")
     parser.add_argument("--instructions", help="Session instructions")
     parser.add_argument("--output-wav", help="Save generated PCM audio as a WAV file")
+    parser.add_argument(
+        "--ack-collected-audio",
+        action="store_true",
+        help="Simulate immediate playback of received audio for an offline probe; does not play sound",
+    )
     parser.add_argument("--timeout", type=float, default=60, help="Seconds to consume events before closing")
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -346,13 +358,19 @@ def main() -> None:
         )
         async with DuplexClient(args.url, model=args.model, config=config) as client:
             runner = DuplexToolRunner(client, handlers)
-            collector = EventCollector() if args.output_wav else None
+            collector = EventCollector() if args.output_wav or args.ack_collected_audio else None
 
             async def print_events() -> None:
                 async for event in client.events():
                     if collector is not None:
                         collector.add(event.raw)
                     print(json.dumps(event.raw), flush=True)
+                    if args.ack_collected_audio and event.type in (
+                        "response.output_audio.delta",
+                        "response.audio.delta",
+                    ):
+                        assert collector is not None
+                        await acknowledge_collected_playback(client, collector)
 
             printer = asyncio.create_task(print_events())
             running = asyncio.create_task(runner.run())
@@ -390,7 +408,7 @@ def main() -> None:
                 printer.cancel()
                 feeding.cancel()
                 await asyncio.gather(running, printer, feeding, return_exceptions=True)
-                if collector is not None:
+                if args.output_wav and collector is not None:
                     await asyncio.to_thread(
                         write_pcm16_wav,
                         Path(args.output_wav),
