@@ -311,6 +311,8 @@ def test_analyse_video_with_audio_input(omni_server, openai_client):
         "model": omni_server.model,
         "messages": messages,
         "modalities": ["text"],
+        # This smoke check accepts reasoning even if the final answer has not started.
+        "allow_reasoning": True,
     }
 
     openai_client.send_omni_request(request_config)

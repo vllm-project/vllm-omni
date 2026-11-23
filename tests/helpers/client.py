@@ -120,6 +120,7 @@ class OmniResponse:
     cached_tokens: int | None = None
     multimodal_tokens: dict[str, int] | None = None
     logprobs: list | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass
@@ -450,12 +451,16 @@ class OnlineOmniClient:
         result = OmniResponse()
         try:
             text_content = ""
+            reasoning_content = ""
             audio_data = []
             for chunk in chat_completion:
                 if result.request_id is None:
                     result.request_id = getattr(chunk, "id", None)
                 for choice in chunk.choices:
                     content = getattr(getattr(choice, "delta", None), "content", None)
+                    reasoning = getattr(getattr(choice, "delta", None), "reasoning", None)
+                    if reasoning:
+                        reasoning_content += reasoning
                     modality = getattr(chunk, "modality", None)
                     if modality == "audio" and content:
                         audio_data.append(content)
@@ -474,6 +479,7 @@ class OnlineOmniClient:
                 merged_seg.export(wav_buf, format="wav")
                 result.audio_bytes = wav_buf.getvalue()
             result.text_content = text_content
+            result.reasoning_content = reasoning_content
             result.audio_data = audio_data
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
@@ -489,11 +495,14 @@ class OnlineOmniClient:
             result.request_id = getattr(chat_completion, "id", None)
             audio_data = None
             text_content = None
+            reasoning_content = None
             for choice in chat_completion.choices:
                 if hasattr(choice.message, "audio") and choice.message.audio is not None:
                     audio_data = choice.message.audio.data
                 if hasattr(choice.message, "content") and choice.message.content is not None:
                     text_content = choice.message.content
+                if (reasoning := getattr(choice.message, "reasoning", None)) is not None:
+                    reasoning_content = reasoning
             # Extract cached & prompt token counts for prefix caching tests
             usage = getattr(chat_completion, "usage", None)
             if usage:
@@ -504,6 +513,7 @@ class OnlineOmniClient:
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
             result.text_content = text_content
+            result.reasoning_content = reasoning_content
             result.e2e_latency = time.perf_counter() - wall_start
             if chat_completion.choices and chat_completion.choices[0].logprobs is not None:
                 result.logprobs = chat_completion.choices[0].logprobs.content
