@@ -1694,3 +1694,41 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     torch.testing.assert_close(history.embeds[:1], embeds)
     state.finish_audio({"request"})
     assert not state._talker_inputs
+
+
+@pytest.mark.parametrize(
+    "method, aux, async_chunk, payload_model, data_plane, session_mode, expected",
+    [
+        pytest.param("dflash", True, True, True, False, "turn", True, id="dflash"),
+        pytest.param("dflash", False, True, True, False, "turn", False, id="dflash-without-shared-aux"),
+        pytest.param("ngram_gpu", False, True, True, False, "turn", True, id="ngram_gpu"),
+        pytest.param("ngram_gpu", False, True, True, True, "turn", True, id="ngram_gpu-native-turn"),
+        pytest.param("ngram_gpu", False, True, True, True, "duplex", False, id="ngram_gpu-native-duplex"),
+        pytest.param("ngram_gpu", False, False, True, False, "turn", False, id="ngram_gpu-without-async-chunk"),
+        pytest.param("ngram_gpu", False, True, False, False, "turn", False, id="ngram_gpu-other-model"),
+        pytest.param("ngram", False, True, True, False, "turn", False, id="ngram"),
+        pytest.param("draft_model", False, True, True, False, "turn", False, id="draft_model"),
+        pytest.param(None, False, True, True, False, "turn", False, id="no-speculation"),
+    ],
+)
+@pytest.mark.cpu
+def test_scheduler_speculative_payload_gate(
+    method, aux, async_chunk, payload_model, data_plane, session_mode, expected
+):
+    runner = object.__new__(OmniARModelRunner)
+    runner.speculative_config = (
+        None if method is None else SimpleNamespace(method=method, use_dflash=lambda: method == "dflash")
+    )
+    runner.use_aux_hidden_state_outputs = aux
+    runner.model = SimpleNamespace(extract_aux_hidden_states=lambda output: None)
+    if payload_model:
+        runner.model.supports_speculative_payload = True
+    runner.model_config = SimpleNamespace(
+        async_chunk=async_chunk,
+        use_v2_model_runner=True,
+        supports_native_mrv2_data_plane=data_plane,
+        session_mode=session_mode,
+        hf_config=SimpleNamespace(model_type="qwen3_omni_moe"),
+    )
+    runner._omni_data_plane = object() if data_plane else None
+    assert runner._uses_scheduler_speculative_payload() is expected

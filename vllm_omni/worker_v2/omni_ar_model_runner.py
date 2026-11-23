@@ -515,9 +515,21 @@ class OmniARModelRunner(OmniGPUModelRunner):
     def _uses_scheduler_speculative_payload(self) -> bool:
         return (
             bool(getattr(self.model_config, "async_chunk", False))
-            and self._shares_drafter_aux_output()
-            and self.speculative_config.use_dflash()
+            and (
+                (self._shares_drafter_aux_output() and self.speculative_config.use_dflash())
+                or self._uses_draft_free_speculative_payload()
+            )
             and (self._omni_data_plane is None or uses_native_qwen3_omni_resumable(self.model_config))
+        )
+
+    def _uses_draft_free_speculative_payload(self) -> bool:
+        # The span is built from rejection-sampler output, so ngram_gpu needs
+        # no shared drafter capture.
+        spec = self.speculative_config
+        return (
+            spec is not None
+            and spec.method == "ngram_gpu"
+            and getattr(self.model, "supports_speculative_payload", False) is True
         )
 
     def _propose_draft_tokens(
