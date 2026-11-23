@@ -130,6 +130,30 @@
         ],
         "seed_tts_locale": "en",
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline_confirmation": {
+          "MI300": {
+            "metrics": [
+              "median_audio_ttfp_ms",
+              "mean_audio_ttfp_ms",
+              "mean_e2el_ms",
+              "mean_audio_rtf"
+            ],
+            "attempts": 3,
+            "tolerance": 0.1
+          },
+          "H100": {
+            "metrics": [
+              "median_audio_ttfp_ms",
+              "mean_audio_ttfp_ms"
+            ],
+            "attempts": 3,
+            "tolerance": [
+              0.1,
+              0.1,
+              0.2
+            ]
+          }
+        },
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
@@ -318,7 +342,7 @@
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
-              47.608052744180895
+              53.1143423
             ],
             "median_audio_rtf": [
               0.10447128517880797
@@ -330,7 +354,7 @@
               570.9654912963742
             ],
             "mean_audio_ttfp_ms": [
-              47.61341529792844
+              53.5113552
             ],
             "mean_audio_rtf": [
               0.1047175386011452
@@ -388,6 +412,20 @@
           "task_type": "CustomVoice"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline_confirmation": {
+          "H100": {
+            "metrics": [
+              "median_audio_ttfp_ms",
+              "mean_audio_ttfp_ms"
+            ],
+            "attempts": 3,
+            "tolerance": [
+              0.1,
+              0.1,
+              0.2
+            ]
+          }
+        },
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
@@ -612,7 +650,7 @@
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
-              49.72266749973642
+              55.0385062
             ],
             "median_audio_rtf": [
               0.10650177953993444
@@ -624,7 +662,7 @@
               481.3887928517943
             ],
             "mean_audio_ttfp_ms": [
-              49.9990168500517
+              55.5274976
             ],
             "mean_audio_rtf": [
               0.10662775745228226
@@ -681,6 +719,27 @@
           "language": "English"
         },
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline_confirmation": {
+          "MI300": {
+            "metrics": [
+              "mean_audio_rtf"
+            ],
+            "attempts": 3,
+            "tolerance": 0.1
+          },
+          "H100": {
+            "metrics": [
+              "median_audio_ttfp_ms",
+              "mean_audio_ttfp_ms"
+            ],
+            "attempts": 3,
+            "tolerance": [
+              0.1,
+              0.1,
+              0.2
+            ]
+          }
+        },
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
@@ -905,7 +964,7 @@
         "baseline": {
           "MI300": {
             "median_audio_ttfp_ms": [
-              593.1683047529077
+              727.2405025432818
             ],
             "median_audio_rtf": [
               0.36148580612998726

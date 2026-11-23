@@ -45,7 +45,7 @@ def needs_omni_connector(model_config: Any) -> bool:
     return (
         bool(getattr(model_config, "requires_full_payload_input", False))
         or bool(getattr(model_config, "custom_process_next_stage_input_func", None))
-        or get_stage_connector_role(model_config) is not None
+        or get_stage_connector_role(model_config) not in (None, "none")
     )
 
 
@@ -55,7 +55,10 @@ def _should_create_payload_connector(model_config: Any) -> bool:
     Sender edges may instead be owned solely by KV transfer. Receivers still
     need a connector even though they do not declare a downstream payload hook.
     """
-    if get_stage_connector_role(model_config) != "sender":
+    role = get_stage_connector_role(model_config)
+    if role == "none":
+        return False
+    if role != "sender":
         return True
 
     next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)

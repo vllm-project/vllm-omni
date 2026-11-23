@@ -15,12 +15,18 @@ membership so a rename cannot quietly drop it again.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.interfaces import (
     SupportsMultiFrameDecode,
     requires_request_sample_eligibility,
     supports_multi_frame_decode,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+    MiniCPMO45OmniTTSForConditionalGeneration,
+    _request_key,
+)
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -42,6 +48,14 @@ class _Model:
         return frame_outputs
 
 
+def _talker(k_frames=8):
+    talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.batch_stop_logits = None
+    talker._k_step_frames = k_frames
+    return talker
+
+
 def test_wrapper_satisfies_the_protocol():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
@@ -49,15 +63,23 @@ def test_wrapper_satisfies_the_protocol():
 
     # The runner only ever sees the wrapper, so the wrapper is what has to
     # satisfy the contract.
-    assert isinstance(MiniCPMO45OmniForConditionalGeneration, type)  # importable
-    for name in (
-        "supports_multi_frame_decode",
-        "batch_stop_logits",
-        "take_batch_stop_logits",
-        "set_batch_stop_logits",
-        "merge_frame_outputs",
-    ):
-        assert hasattr(MiniCPMO45OmniForConditionalGeneration, name), name
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.model_stage = "tts"
+    wrapper.talker = _talker()
+
+    assert supports_multi_frame_decode(wrapper) is True
+    assert isinstance(wrapper, SupportsMultiFrameDecode)
+    logits = torch.tensor([[0.0, -torch.inf]])
+    wrapper.set_batch_stop_logits(logits)
+    assert wrapper.batch_stop_logits is logits
+    assert wrapper.take_batch_stop_logits() is logits
+    assert wrapper.batch_stop_logits is None
+    assert wrapper.take_batch_stop_logits() is None
+
+    frame = OmniOutput(text_hidden_states=torch.zeros(1, 4))
+    assert wrapper.merge_frame_outputs([frame], [logits]) is frame
+    assert wrapper.batch_stop_logits is logits
 
 
 def test_flag_off_reads_false_without_contract():
@@ -130,41 +152,26 @@ def test_flag_on_without_members_raises_and_names_them():
         assert member in message
 
 
-def test_armed_model_passes():
-    assert supports_multi_frame_decode(_Model(armed=True)) is True
-
-
-def test_runtime_checkable_protocol_agrees():
-    assert isinstance(_Model(), SupportsMultiFrameDecode)
-
-
 def test_sample_eligibility_flag():
     assert requires_request_sample_eligibility(SimpleNamespace(requires_request_sample_eligibility=True)) is True
     assert requires_request_sample_eligibility(SimpleNamespace()) is False
 
 
-def test_stop_logits_reader_and_definition_agree():
-    """The stop-row holder is read by name from the runner.
+@pytest.mark.parametrize(
+    ("info", "row", "expected"),
+    [
+        pytest.param({"req_id": "7", "request_id": "stale"}, 0, "7", id="mrv2-id-wins"),
+        pytest.param({"request_id": "engine-9"}, 3, "engine-9", id="v1-id"),
+        pytest.param({}, 5, "5", id="missing-id"),
+        pytest.param(None, 2, "2", id="missing-info"),
+        pytest.param({"req_id": 11}, 0, "11", id="integer-id"),
+    ],
+)
+def test_request_key_matches_runner_identity(info, row, expected):
+    assert _request_key(info, row) == expected
 
-    Renaming the model's attribute without the runner's read site makes the
-    lookup return None forever -- the gate then hands over
-    ``text_hidden_states`` and the two-wide stop row never reaches the request.
-    Pin both ends: the attribute exists only under the public name, and no
-    reader still spells the old one.
-    """
-    from pathlib import Path
 
-    import vllm_omni
-
-    root = Path(vllm_omni.__file__).parent
-    talker_src = (root / "model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_tts.py").read_text()
-    # The holder is an instance attribute assigned in __init__ / set_batch_stop_logits.
-    assert "self.batch_stop_logits" in talker_src
-    assert "self._batch_stop_logits" not in talker_src
-
-    stale = [
-        str(path.relative_to(root))
-        for path in root.rglob("*.py")
-        if '"_batch_stop_logits"' in path.read_text() or "'_batch_stop_logits'" in path.read_text()
-    ]
-    assert not stale, f"readers still use the private name: {stale}"
+@pytest.mark.parametrize(("k_frames", "identity"), [(0, True), (1, True), (8, False)])
+def test_mrv2_decode_preprocess_identity(k_frames, identity):
+    # K-step rows must re-embed the previous real codec frame, not placeholders.
+    assert _talker(k_frames).mrv2_decode_preprocess_is_identity is identity

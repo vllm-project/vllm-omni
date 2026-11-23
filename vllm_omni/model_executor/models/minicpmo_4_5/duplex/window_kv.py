@@ -65,8 +65,9 @@ parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
 The arithmetic it delegates to is CPU-covered by
-``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``, which
-also checks the RoPE identity behind :func:`rotate_cached_keys` numerically.
+``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``. The
+neighboring ``test_window_wiring.py`` checks :func:`rotate_cached_keys`
+against attention and BF16 rotation references.
 ``tests/worker_v2/test_minicpmo_duplex_block_table.py`` exercises MRv2's actual
 GPU block-table gather across the allocation bound and after compaction. The
 spec disables ordinary sliding-window masking: that bound sizes admission,
