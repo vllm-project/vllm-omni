@@ -258,8 +258,9 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
        scalars are never sent to the API server;
     2. aborting before first output and after partial output raises no exception, sends no partial
        synthesis payload, emits one terminal marker, cleans up request state, and ignores late output;
-    3. Both indextts2_mrv2.yaml and indextts2_5_mrv2.yaml overlays declare MRv2 on Stage 0 and
-       Stage 1 with supports_native_mrv2_data_plane=True and unchunked prefill on Stage 0.
+    3. Both default indextts2.yaml and indextts2_5.yaml deploy configs declare MRv2 on Stage 0 and
+       Stage 1 with supports_native_mrv2_data_plane=True, unchunked prefill on Stage 0, and
+       opt-in s2mel_allow_tf32=False by default.
     """
     plane, sent_packets, cleaned_reqs = _make_mrv2_data_plane_with_indextts()
 
@@ -384,7 +385,7 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
     with pytest.raises(ValueError, match="IndexTTS Stage 0 payload must be a dict"):
         talker2s2mel_full_payload(None, None, SimpleNamespace(external_req_id="ext-live", aborted=False))
 
-    # 3. Verify both IndexTTS pipelines and MRv2 overlays
+    # 3. Verify both IndexTTS pipelines and default MRv2 deploy configs
     for pipeline in (INDEXTTS2_PIPELINE, INDEXTTS25_PIPELINE):
         assert pipeline.stages[0].supports_native_mrv2_data_plane is True
         assert pipeline.stages[0].custom_process_next_stage_input_func.endswith("talker2s2mel_full_payload")
@@ -392,18 +393,26 @@ def test_mrv2_abort_and_publish_output_with_indextts_full_payload():
         assert pipeline.stages[1].sync_process_input_func.endswith("talker2s2mel_token_only")
 
     deploy_dir = Path(__file__).parents[4] / "vllm_omni" / "deploy"
-    for overlay_name in ("indextts2_mrv2.yaml", "indextts2_5_mrv2.yaml"):
-        cfg = yaml.safe_load((deploy_dir / overlay_name).read_text(encoding="utf-8"))
+    for deploy_name in ("indextts2.yaml", "indextts2_5.yaml"):
+        cfg = yaml.safe_load((deploy_dir / deploy_name).read_text(encoding="utf-8"))
         stage0 = next(s for s in cfg["stages"] if s["stage_id"] == 0)
         stage1 = next(s for s in cfg["stages"] if s["stage_id"] == 1)
-        assert stage0["model_runner"] == "v2"
-        assert stage1["model_runner"] == "v2"
+        assert cfg["model_runner"] == "v2"
+        assert stage0.get("model_runner", cfg["model_runner"]) == "v2"
+        assert stage1.get("model_runner", cfg["model_runner"]) == "v2"
         assert stage0["enable_prefix_caching"] is False
         assert stage0["enable_chunked_prefill"] is False
         assert stage0["max_num_batched_tokens"] >= stage0["max_model_len"]
         assert "tokenizer" not in stage0
         assert "tokenizer" not in stage1
-        assert stage1["hf_overrides"]["s2mel_allow_tf32"] is True
+        assert stage1["hf_overrides"]["s2mel_allow_tf32"] is False
+
+    v2_cfg = yaml.safe_load((deploy_dir / "indextts2.yaml").read_text(encoding="utf-8"))
+    v2_s0 = next(s for s in v2_cfg["stages"] if s["stage_id"] == 0)
+    v2_s1 = next(s for s in v2_cfg["stages"] if s["stage_id"] == 1)
+    assert v2_s0["max_num_seqs"] == 16
+    assert v2_s1["max_num_seqs"] == 16
+    assert v2_s1["hf_overrides"]["s2mel_cfm_batch_size"] == 16
 
 
 def test_s2mel_tf32_context_restores_backend_flags():
