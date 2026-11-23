@@ -193,6 +193,7 @@ class TestHeliosRoPEEquivalence:
         """The eligible path hands the fused NPU kernel a half-width interleaved table."""
         hidden, freqs = _make_inputs(1, 16, 8, 64, dtype=torch.bfloat16)
         rope = HeliosRotaryEmbedding()
+        seen: dict[str, torch.Tensor] = {}
 
         def apply_fused(
             x: torch.Tensor,
@@ -201,17 +202,27 @@ class TestHeliosRoPEEquivalence:
             interleaved: bool,
             half_head_dim: bool,
         ) -> torch.Tensor:
-            assert x is hidden
+            # The kernel consumes the frequency table at the activation dtype,
+            # so the adapter rotates in fp32 to keep an fp32 table exact.
+            assert x.dtype == torch.float32
+            assert torch.equal(x, hidden.float())
             # One half-width row per token, kept 4-D so it broadcasts over
             # batch and heads the way the fused kernel requires.
             assert cos.shape == sin.shape == (1, 16, 1, 32)
+            assert cos.dtype == sin.dtype == freqs.dtype
             assert interleaved and half_head_dim
+            seen["x"] = x
             return x
 
         monkeypatch.setattr(rope, "_can_use_npu_impl", lambda *_: True)
         monkeypatch.setattr(rope_module, "apply_rotary_emb_torch_npu", apply_fused)
         monkeypatch.setattr(rope.impl, "_forward_method", rope.impl.forward_npu)
-        assert rope(hidden, freqs) is hidden
+        out = rope(hidden, freqs)
+        # The kernel's fp32 result is cast back, so callers still see the
+        # activation dtype and the shape they passed in.
+        assert out.dtype == hidden.dtype
+        assert out.shape == hidden.shape
+        assert torch.equal(out, seen["x"].to(hidden.dtype))
 
     def test_odd_head_dim_raises(self) -> None:
         """Odd head_dim should be rejected as an invalid RoPE config."""

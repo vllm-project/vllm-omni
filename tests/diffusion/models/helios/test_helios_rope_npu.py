@@ -11,10 +11,6 @@ from vllm_omni.diffusion.models.helios.helios_transformer import HeliosRotaryEmb
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
-# bfloat16 keeps eight significand bits, so one unit in the last place of an
-# element is 2**-7 of its magnitude.
-BF16_ULP = 2.0**-7
-
 
 def _reference(hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x_1, x_2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
@@ -32,12 +28,15 @@ def _reference(hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Te
     )
 
 
+# Helios reaches this layer at four sequence lengths over a pyramid
+# generation. 2940 is the TP1 stage-0 shape; 11776 is the largest.
 @hardware_test(res={"npu": "A3"}, num_cards=1)
-def test_helios_rope_npu_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the fused NPU kernel's arithmetic at Helios's TP1 stage-0 shape."""
+@pytest.mark.parametrize("seq_len", [2940, 11776])
+def test_helios_rope_npu_matches_reference(seq_len: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fused NPU kernel must reproduce the portable path exactly."""
     torch.manual_seed(1101)
-    hidden_states = torch.randn(1, 2940, 40, 128, dtype=torch.bfloat16, device="npu")
-    angles = torch.randn(1, 2940, 64, dtype=torch.float32, device="npu")
+    hidden_states = torch.randn(1, seq_len, 40, 128, dtype=torch.bfloat16, device="npu")
+    angles = torch.randn(1, seq_len, 64, dtype=torch.float32, device="npu")
     freqs_cis = torch.cat(
         (
             angles.cos().repeat_interleave(2, dim=-1),
@@ -51,7 +50,7 @@ def test_helios_rope_npu_matches_reference(monkeypatch: pytest.MonkeyPatch) -> N
     assert rope._can_use_npu_impl(hidden_states, freqs_cis)
 
     # Count the fused call rather than assume it. Without this, a dispatch
-    # change elsewhere would silently leave the comparisons below checking the
+    # change elsewhere would silently leave the comparison below checking the
     # portable implementation against itself.
     fused_calls = 0
     fused = rope_module.apply_rotary_emb_torch_npu
@@ -67,21 +66,8 @@ def test_helios_rope_npu_matches_reference(monkeypatch: pytest.MonkeyPatch) -> N
     assert actual.shape == hidden_states.shape
     assert actual.dtype == hidden_states.dtype
 
-    # ``npu_rotary_mul`` takes the frequency table at the activation dtype and
-    # accumulates in fp32. Given the same bfloat16 table, the portable
-    # implementation reproduces it exactly, which pins the fused arithmetic
-    # with no tolerance at all.
-    torch.testing.assert_close(
-        actual,
-        _reference(hidden_states, freqs_cis.bfloat16().float()),
-        atol=0,
-        rtol=0,
-    )
-
-    # Against the full-precision table that rounding is the whole difference.
-    # Bound it in absolute terms: elements where the two rotary terms nearly
-    # cancel differ by more than one step of their own magnitude, so a relative
-    # bound would say nothing about the error that matters.
-    expected = _reference(hidden_states, freqs_cis)
-    scale = expected.float().abs().amax()
-    assert (actual.float() - expected.float()).abs().amax() <= BF16_ULP * scale
+    # ``npu_rotary_mul`` consumes the frequency table at the activation dtype,
+    # so the adapter rotates in fp32 to keep this fp32 table exact. The result
+    # is then bit-identical to the portable implementation, which pins the
+    # fused arithmetic with no tolerance at all.
+    torch.testing.assert_close(actual, _reference(hidden_states, freqs_cis), atol=0, rtol=0)

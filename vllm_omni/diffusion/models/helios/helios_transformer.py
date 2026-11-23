@@ -135,7 +135,12 @@ class HeliosRotaryEmbedding(nn.Module):
 
         cos = freqs_cis[..., :head_dim:2].unsqueeze(-2)
         sin = freqs_cis[..., head_dim + 1 :: 2].unsqueeze(-2)
-        return self.impl(hidden_states, cos, sin)
+        # ``npu_rotary_mul`` consumes the frequency table at the activation
+        # dtype, so rotating bfloat16 activations would round this fp32 table
+        # first and perturb the result. Rotating in fp32 keeps the table exact
+        # and makes the output bit-identical to ``apply_rotary_emb_helios``,
+        # which also promotes to fp32 and rounds once on the way out.
+        return self.impl(hidden_states.float(), cos, sin).to(hidden_states.dtype)
 
 
 class DistributedRMSNorm(nn.Module):
