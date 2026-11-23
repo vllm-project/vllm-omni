@@ -46,7 +46,7 @@ automatically, so no `--model-class-name` or deploy YAML is needed.
 | ---- | ----- |
 | Text-to-image size | Any height/width; rounded up to a multiple of 32. Default 1024x1024 |
 | Editing inputs | Exactly one reference image |
-| Editing output size | Same as the input image by default (`resize_to_edit_image`) |
+| Editing output size | Same as the input image; an explicit `height`/`width` (or `size`) is used as given |
 | Understanding inputs | Up to one image per request |
 | Sampler | Flow-matching Euler, 25 steps, `shift=4.0`, CFG on the predicted clean image |
 | Defaults | `cfg_scale=4.0`, `img_cfg_scale=1.0` (image CFG off), `seed=42` |
@@ -111,6 +111,23 @@ curl -s http://localhost:8091/v1/chat/completions -H "Content-Type: application/
 }'
 ```
 
+The OpenAI-style image endpoints also work. `extra_params` carries the
+request knobs listed in the notes below:
+
+```bash
+curl -s http://localhost:8091/v1/images/generations -H "Content-Type: application/json" -d '{
+  "prompt": "A red lighthouse on a cliff at sunset",
+  "size": "1024x1024", "num_inference_steps": 25, "seed": 42,
+  "true_cfg_scale": 4.0, "extra_params": {"shift": 4.0}
+}'
+
+curl -s http://localhost:8091/v1/images/edits \
+  -F image=@input.jpg -F prompt="把背景换成雪山" \
+  -F num_inference_steps=25 -F seed=42
+```
+
+Both return the image as `data[0].b64_json`.
+
 ## Verification
 
 The text-to-image command writes `hiuni_t2i.png` at 1024x768. The editing
@@ -127,7 +144,7 @@ return a non-empty `choices[0].message.content`.
   | `cfg_scale` | T2I, edit | 4.0 | Text guidance |
   | `img_cfg_scale` | edit | 1.0 | Image guidance; 1.0 disables it |
   | `shift` | T2I, edit | 4.0 | Timestep shift of the sigma schedule |
-  | `resize_to_edit_image` | edit | `true` | Resize the output back to the input size |
+  | `resize_to_edit_image` | edit | `true` unless a size is given | Resize the output back to the input size |
   | `min_pixels` / `max_pixels` | edit, understanding | 262144 / 262144 (edit), 262144 / 4194304 (understanding) | Image processor pixel range |
   | `think_mode` | text | `"think"` | `"think"` opens a reasoning block, `"empty"` prefills an empty one, `"none"` adds nothing |
   | `max_new_tokens` | text | 1024 | Generated token budget |

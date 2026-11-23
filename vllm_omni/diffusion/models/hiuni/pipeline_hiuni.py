@@ -509,7 +509,9 @@ class HiUniPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             s["shift"],
             reference=reference,
         )
-        resize = bool(extra_args.get("resize_to_edit_image", True))
+        # Without an explicit size the output is resized back to the input image, as in the reference implementation.
+        explicit_size = s["height"] is not None or s["width"] is not None
+        resize = bool(extra_args.get("resize_to_edit_image", not explicit_size))
         output = decode_image(latents, height, width, image.size if resize else None)
         return DiffusionOutput(output={"payload": {"image": output}, "metadata": {}})
 
