@@ -250,7 +250,6 @@ class StageDiffusionClient(StageClientBase):
             elif msg_type == "rpc_result":
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
             elif msg_type == "load_result":
-                # DTPS: DiT-load query reply from the subprocess.
                 fut = self._load_future
                 if fut is not None and not fut.done():
                     try:

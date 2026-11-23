@@ -640,7 +640,6 @@ class StageDiffusionProc:
                             )
 
                 elif msg_type == "get_load":
-                    # DTPS: report this replica's DiT scheduler queue depth + request-id sets to the orchestrator.
                     try:
                         sched = getattr(self._engine, "scheduler", None) if self._engine else None
                         if sched is None:

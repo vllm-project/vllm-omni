@@ -283,14 +283,6 @@ class StageEngineCoreProc(EngineCoreProc):
         vLLM's ``getattr(self, method_name)`` discovers this method via the
         MRO (``StageEngineCoreProc`` -> ``EngineCoreProc`` -> ``EngineCore``),
         so no vLLM patch is needed.
-
-        ``frozenset`` values (``waiting_ids`` / ``running_ids``) are decoded
-        as ``list`` after the msgspec ZMQ round-trip; convert them back so
-        ``DTPSScheduler._dit_phase`` can use set union for blind in-flight
-        de-duplication.
-
-        Defensive ``getattr(scheduler, "update_dit_load", None)`` so non-DTPS
-        deployments (dit_load_aware=false) are unaffected.
         """
         if isinstance(dit_load, dict):
             for key in ("waiting_ids", "running_ids"):
