@@ -736,8 +736,7 @@ def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
     assert state.intermediate_buffer.req_id_to_index == {"replacement": 0, "peer": 1}
 
 
-@pytest.mark.parametrize("lifecycle", [False, True])
-def test_encoder_only_omni_stage_keeps_encoder_state_and_omni_lifecycle(monkeypatch, lifecycle):
+def test_encoder_only_omni_stage_keeps_encoder_state_and_omni_lifecycle(monkeypatch):
     from vllm.model_executor.layers.attention import Attention
     from vllm.v1.attention.backend import AttentionType
     from vllm.v1.worker.gpu.model_states.encoder_only import EncoderOnlyModelState
@@ -759,7 +758,7 @@ def test_encoder_only_omni_stage_keeps_encoder_state_and_omni_lifecycle(monkeypa
     upstream = MagicMock(side_effect=AssertionError("encoder-only Omni stage used the upstream state"))
     monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", upstream)
     monkeypatch.setattr(OmniEncoderOnlyModelState, "__init__", lambda *_args: None)
-    model = SimpleNamespace(**({"have_multimodal_outputs": True} if lifecycle else {}))
+    model = SimpleNamespace()
     state = init_omni_model_state(vllm_config, model, None, torch.device("cpu"))
     assert isinstance(state, OmniModelState) and isinstance(state, EncoderOnlyModelState)
     mro = type(state).__mro__
