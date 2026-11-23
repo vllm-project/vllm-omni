@@ -862,7 +862,6 @@ def pretty_str(envinfo):
 
     # If nvidia_gpu_models is multiline, start on the next line
     mutable_dict["nvidia_gpu_models"] = maybe_start_on_next_line(envinfo.nvidia_gpu_models)
-    mutable_dict["musa_gpu_models"] = maybe_start_on_next_line(envinfo.musa_gpu_models)
 
     musa_optional_fields = (
         "musa_runtime_version",
@@ -884,6 +883,7 @@ def pretty_str(envinfo):
         if mutable_dict[field] is None:
             mutable_dict[field] = "None"
     if has_musa_info:
+        mutable_dict["musa_gpu_models"] = mutable_dict["musa_gpu_models"].replace("\n", ", ")
         mutable_dict["musa_info"] = "\n{}\n".format(musa_info_fmt.format(**mutable_dict))
     else:
         mutable_dict["musa_info"] = ""

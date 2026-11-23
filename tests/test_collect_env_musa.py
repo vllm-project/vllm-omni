@@ -362,15 +362,23 @@ def test_get_env_info_collects_musa_fields_once(monkeypatch):
 
 
 @pytest.mark.parametrize("build_version", [None, "40305", "5.2.0"])
-def test_pretty_str_includes_labeled_musa_block(monkeypatch, build_version):
+@pytest.mark.parametrize(
+    ("gpu_models", "expected_models"),
+    [
+        ("MTT S5000", "MTT S5000"),
+        ("MTT S5000\nMTT S5000", "MTT S5000, MTT S5000"),
+    ],
+    ids=["single-gpu", "dual-gpu"],
+)
+def test_pretty_str_includes_labeled_musa_block(monkeypatch, build_version, gpu_models, expected_models):
     collect_env = load_collect_env(monkeypatch)
     env = collect_env.SystemEnv(*(["value"] * len(collect_env.SystemEnv._fields)))._replace(
         musa_available="True",
         musa_runtime_version=build_version,
         musa_package_version="2.11.0.post1+musa5.2.0",
         musa_driver_version="3.3.6-server",
-        musa_gpu_models="MTT S5000",
-        musa_visible_devices="MTHREADS_VISIBLE_DEVICES=1,2,3",
+        musa_gpu_models=gpu_models,
+        musa_visible_devices="MTHREADS_VISIBLE_DEVICES=4,5",
         torchada_package_version="1.0.0",
         mthreads_ml_py_package_version="2.0.0",
     )
@@ -383,9 +391,9 @@ def test_pretty_str_includes_labeled_musa_block(monkeypatch, build_version):
     assert "torchada package version     : 1.0.0" in output
     assert "mthreads-ml-py version       : 2.0.0" in output
     assert "MUSA driver version          : 3.3.6-server" in output
-    assert "MUSA GPU models              : MTT S5000" in output
     assert (
-        "MUSA visible devices         : MTHREADS_VISIBLE_DEVICES=1,2,3\n\n"
+        f"MUSA GPU models              : {expected_models}\n"
+        "MUSA visible devices         : MTHREADS_VISIBLE_DEVICES=4,5\n\n"
         "==============================\n"
         "          CPU Info"
     ) in output
@@ -429,6 +437,7 @@ def test_pretty_str_includes_musa_block_for_partial_installation(monkeypatch):
     assert "MUSA Info" in output
     assert "MUSA available               : N/A" in output
     assert "torch-musa package version   : 2.11.0.post1+musa5.2.0" in output
+    assert "MUSA GPU models              : None\n" in output
     assert ("Is XNNPACK available         : value\n\n==============================\n         MUSA Info") in output
 
 
