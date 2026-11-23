@@ -52,22 +52,6 @@ def _require_varlen_func(func: Callable[..., Any] | None) -> Callable[..., Any]:
     return func
 
 
-def _unpad_hub_input(query, key, value, attention_mask):
-    from vllm_omni.diffusion.attention.backends.utils.fa import _index_first_axis, _unpad_input, _upad_input
-
-    batch_size, q_len = query.shape[:2]
-    if q_len == key.size(1):
-        return _upad_input(query, key, value, attention_mask, q_len, _unpad_input)
-
-    # AllGather's local queries need not be a suffix of the global keys.
-    # The mask covers keys only; keep every query row.
-    k, indices_k, cu_k, max_k, _ = _unpad_input(key, attention_mask)
-    v = _index_first_axis(value, indices_k)
-    q = query.flatten(0, 1)
-    cu_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=query.device)
-    return q, k, v, None, (cu_q, cu_k), (q_len, max_k)
-
-
 def _run_varlen_dense(
     varlen_func,
     query: torch.Tensor,
@@ -170,11 +154,11 @@ class FlashAttentionHubImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input
+        from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input, _unpad_qkv_input
 
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _unpad_hub_input(
+        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _unpad_qkv_input(
             query, key, value, attention_mask
         )
 

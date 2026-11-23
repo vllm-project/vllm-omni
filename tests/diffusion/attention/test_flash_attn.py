@@ -725,8 +725,9 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
 
 
 @pytest.mark.cpu
-def test_varlen_masked_routing_by_role(monkeypatch):
-    """The unpad route is picked by role, not Q/K length equality; runs without a GPU."""
+@pytest.mark.parametrize("query_length", [2, 4])
+def test_varlen_masked_routing_by_role(monkeypatch, query_length):
+    """Only equal-length self-attention applies the key mask to query rows."""
     calls = []
 
     def fake_varlen_func(q, k, v, **kwargs):
@@ -737,25 +738,26 @@ def test_varlen_masked_routing_by_role(monkeypatch):
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
 
     batch_size, seq_len, num_heads, head_dim = 2, 4, 2, 8
-    query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+    query = torch.randn(batch_size, query_length, num_heads, head_dim)
+    key = torch.randn(batch_size, seq_len, num_heads, head_dim)
     metadata = AttentionMetadata(attn_mask=torch.tensor([[True, True, False, False], [True, True, True, False]]))
 
     cross_impl = FlashAttentionImpl(
         num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False, role="cross"
     )
-    output = cross_impl.forward_cuda(query, query, query, metadata)
+    output = cross_impl.forward_cuda(query, key, key, metadata)
     assert output.shape == query.shape
     num_q_rows, cu_seqlens_q, cu_seqlens_k = calls[-1]
-    assert num_q_rows == batch_size * seq_len
-    assert cu_seqlens_q.tolist() == [0, 4, 8]
+    assert num_q_rows == batch_size * query_length
+    assert cu_seqlens_q.tolist() == [0, query_length, 2 * query_length]
     assert cu_seqlens_k.tolist() == [0, 2, 5]
 
     self_impl = FlashAttentionImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False)
-    output = self_impl.forward_cuda(query, query, query, metadata)
+    output = self_impl.forward_cuda(query, key, key, metadata)
     assert output.shape == query.shape
     num_q_rows, cu_seqlens_q, cu_seqlens_k = calls[-1]
-    assert num_q_rows == 5
-    assert cu_seqlens_q.tolist() == [0, 2, 5]
+    assert num_q_rows == (5 if query_length == seq_len else batch_size * query_length)
+    assert cu_seqlens_q.tolist() == ([0, 2, 5] if query_length == seq_len else [0, query_length, 2 * query_length])
     assert cu_seqlens_k.tolist() == [0, 2, 5]
 
 
