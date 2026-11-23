@@ -1237,9 +1237,9 @@ class Cosmos3OmniDiffusersPipeline(
         ):
             raise ValueError(
                 "Cosmos3 manual CUDA graphs require a single resident CUDA GPU with eager execution "
-                "or regional compilation, "
-                "with no cache or SeaCache and unquantized or serialized ModelOpt FP8 weights, "
-                "without offload, LoRA, sleep or attention schedules."
+                "or regional compilation, with unquantized or serialized ModelOpt FP8 weights, "
+                "and without offload, LoRA, sleep or attention schedules. "
+                "Caching must be disabled or use SeaCache."
             )
 
         model_path = od_config.model
