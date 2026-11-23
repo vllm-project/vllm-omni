@@ -20,6 +20,14 @@ if TYPE_CHECKING:
     from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
 
+def _attention_backend_metadata() -> str:
+    return "torch_sdpa_default_bf16" if torch.version.hip is not None else "torch_sdpa_cudnn_bf16"
+
+
+def _omni_attention_backend() -> str:
+    return "TORCH_SDPA" if torch.version.hip is not None else "CUDNN_ATTN"
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("official", "omni"), required=True)
@@ -197,12 +205,16 @@ def _configure_official_vocoder_determinism() -> None:
 
 
 def _configure_official_sdpa(pipeline: Any) -> None:
-    """Pin official connector and denoiser attention to cuDNN, with MATH fallback."""
+    """Use the same platform-appropriate PyTorch SDPA policy as Omni."""
     from ltx_core.loader.attention_ops import set_attention_module_op
     from ltx_core.model.transformer.attention import PytorchAttention
     from torch.nn.attention import SDPBackend
 
-    attention = PytorchAttention(priority=[SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH])
+    attention = (
+        PytorchAttention()
+        if torch.version.hip is not None
+        else PytorchAttention(priority=[SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH])
+    )
     module_op = set_attention_module_op(
         attention=attention,
         masked_attention=attention,
@@ -352,7 +364,7 @@ def _run_official_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None
         audio_sample_rate=audio.sampling_rate,
         metadata={
             "backend": "official",
-            "attention_backend": "torch_sdpa_cudnn_bf16",
+            "attention_backend": _attention_backend_metadata(),
             "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
             "seed": request["seed"],
             "num_frames": request["num_frames"],
@@ -586,7 +598,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
         fps=float(request["fps"]),
         metadata={
             "backend": "official",
-            "attention_backend": "torch_sdpa_cudnn_bf16",
+            "attention_backend": _attention_backend_metadata(),
             "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
             "seed": request["seed"],
             "sigmas": request.get("sigmas"),
@@ -696,7 +708,7 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     torch.backends.cuda.enable_cudnn_sdp(False)
     _reset_accelerator_peak_memory_stats()
 
-    attention_config = {"default": {"backend": "CUDNN_ATTN"}}
+    attention_config = {"default": {"backend": _omni_attention_backend()}}
 
     from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
@@ -757,7 +769,7 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
             fps=float(request["fps"]),
             metadata={
                 "backend": "omni",
-                "attention_backend": "torch_sdpa_cudnn_bf16",
+                "attention_backend": _attention_backend_metadata(),
                 "seed": request["seed"],
                 "sigmas": request.get("sigmas"),
                 "model": args.model,
@@ -794,7 +806,7 @@ def _run_omni_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
         model_class_name=args.model_class_name,
         enforce_eager=True,
         enable_layerwise_offload=args.enable_layerwise_offload,
-        diffusion_attention_config={"default": {"backend": "CUDNN_ATTN"}},
+        diffusion_attention_config={"default": {"backend": _omni_attention_backend()}},
         parallel_config=DiffusionParallelConfig(),
     )
     try:
@@ -819,7 +831,7 @@ def _run_omni_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
             audio_sample_rate=audio_sample_rate,
             metadata={
                 "backend": "omni",
-                "attention_backend": "torch_sdpa_cudnn_bf16",
+                "attention_backend": _attention_backend_metadata(),
                 "seed": request["seed"],
                 "num_frames": request["num_frames"],
                 "sigmas": request["sigmas"],
