@@ -1439,7 +1439,7 @@ class MiniMaxH3DiTModel(nn.Module):
         video_layout = kwargs.get("video_token_layout")
         reference_kv_state = kwargs.get("reference_kv_state")
         reference_isolation = kwargs.get(REFERENCE_ISOLATION_STATE)
-        if reference_isolation is None and reference_isolation_enabled(self.od_config):
+        if reference_isolation is None and reference_isolation_enabled(getattr(self, "od_config", None)):
             raise ValueError("--kv-isolate requires full-loop inference; step execution is unsupported")
         if reference_isolation is not None:
             if self.vdn_config is not None:
