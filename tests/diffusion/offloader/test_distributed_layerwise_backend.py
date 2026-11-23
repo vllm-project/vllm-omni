@@ -2857,27 +2857,42 @@ class TestDistributedComponentSelection:
         assert calls == (["configured", "planned"] if configured else ["planned"])
 
     @pytest.mark.parametrize(
-        ("env", "expected"),
+        ("allocator_conf", "expected"),
         [
-            ({}, "pinned_max_round_threshold_mb:64,pinned_use_cuda_host_register:True,pinned_num_register_threads:8"),
+            ("", "pinned_max_round_threshold_mb:64,pinned_use_cuda_host_register:True,pinned_num_register_threads:8"),
             (
-                {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,pinned_use_cuda_host_register:False"},
+                "expandable_segments:True,pinned_use_cuda_host_register:False",
+                "expandable_segments:True,pinned_use_cuda_host_register:False,"
                 "pinned_max_round_threshold_mb:64,pinned_num_register_threads:8",
             ),
             (
-                {
-                    "PYTORCH_ALLOC_CONF": "pinned_max_round_threshold_mb:128,pinned_num_register_threads:4",
-                    "PYTORCH_CUDA_ALLOC_CONF": "pinned_use_cuda_host_register:False",
-                },
+                "pinned_max_round_threshold_mb:128,pinned_num_register_threads:4,pinned_use_cuda_host_register:False",
                 None,
+            ),
+            (
+                "max_split_size_mb:128",
+                "max_split_size_mb:128,pinned_max_round_threshold_mb:64,"
+                "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+            ),
+            (
+                "max_split_size_mb:128, ",
+                "max_split_size_mb:128,pinned_max_round_threshold_mb:64,"
+                "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+            ),
+            (
+                "max_split_size_mb:128,roundup_power2_divisions:[256:1,512:2,>:4],"
+                "garbage_collection_threshold:0.8,max_non_split_rounding_mb:64",
+                "max_split_size_mb:128,roundup_power2_divisions:[256:1,512:2,>:4],"
+                "garbage_collection_threshold:0.8,max_non_split_rounding_mb:64,"
+                "pinned_max_round_threshold_mb:64,pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
             ),
         ],
     )
-    def test_pinned_allocator_settings_keep_user_choices(self, monkeypatch, env, expected):
+    def test_pinned_allocator_settings_keep_user_choices(self, monkeypatch, allocator_conf, expected):
         for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
             monkeypatch.delenv(name, raising=False)
-        for name, value in env.items():
-            monkeypatch.setenv(name, value)
+        # Runtime settings may differ from the environment that initialized PyTorch.
+        monkeypatch.setattr(torch._C, "_accelerator_getAllocatorSettings", lambda: allocator_conf)
         applied: list[str] = []
         monkeypatch.setattr(torch._C, "_accelerator_setAllocatorSettings", applied.append)
 

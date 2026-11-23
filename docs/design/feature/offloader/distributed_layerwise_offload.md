@@ -63,6 +63,19 @@ full model-and-hardware end-to-end test.
 
 ## Design
 
+### CUDA pinned-memory allocator defaults
+
+When host pinning is enabled on CUDA, DLO adds missing allocator settings for
+`pinned_max_round_threshold_mb:64`, `pinned_use_cuda_host_register:True`, and
+`pinned_num_register_threads:8` before preparing host shards. These settings
+affect subsequent pinned allocations throughout the worker process.
+
+The backend reads PyTorch's current allocator configuration and preserves its
+options when appending defaults, including runtime settings and bracketed
+`roundup_power2_divisions` values. Replacing the configuration with only the
+pinned defaults would reset unrelated device-allocator options. Existing
+pinned settings take precedence; non-CUDA platforms are unchanged.
+
 ### DLO consumes the existing parallel topology
 
 DLO does not create a new DP, TP, or SP topology. It reads the configured

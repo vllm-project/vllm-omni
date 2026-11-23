@@ -18,7 +18,6 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 import weakref
@@ -95,11 +94,12 @@ _PINNED_HOST_ALLOCATOR_SETTINGS = {
 
 def _configure_pinned_host_allocator() -> None:
     """Apply DLO's pinned-allocator settings the user has not chosen explicitly."""
-    user_conf = ",".join(os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"))
+    user_conf = torch._C._accelerator_getAllocatorSettings().rstrip().rstrip(",")
     settings = [f"{key}:{value}" for key, value in _PINNED_HOST_ALLOCATOR_SETTINGS.items() if key not in user_conf]
     if settings:
+        # The setter resets omitted device options, so replay the full current configuration.
         # Only affects later allocations; blocks pinned earlier keep their own free path.
-        torch._C._accelerator_setAllocatorSettings(",".join(settings))
+        torch._C._accelerator_setAllocatorSettings(",".join(filter(None, [user_conf, *settings])))
 
 
 def _retain_active_hwr_registration(
