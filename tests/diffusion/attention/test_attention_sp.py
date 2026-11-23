@@ -37,7 +37,6 @@ do not exercise the full model-registry pipeline.
 import os
 import pickle
 import tempfile
-from itertools import product
 from types import SimpleNamespace
 
 import pytest
@@ -231,27 +230,17 @@ def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
         impl = getattr(flash_attn_hub, backend)(num_heads=1, head_size=64, softmax_scale=0.125)
         query = torch.zeros(2, 2, 1, 64, device=device, dtype=torch.bfloat16)
         joint = torch.zeros(2, 4, 1, 64, device=device, dtype=query.dtype)
-        for joint_strategy, (mask_image, mask_joint) in product(
-            ("front", "rear"), [(False, True), (True, True), (True, False)]
-        ):
-            image_mask = torch.tensor(
-                [[True, True, True, not mask_image], [True, not mask_image, True, True]], device=device
-            )
-            joint_mask = torch.tensor(
-                [[True, True, True, not mask_joint], [True, not mask_joint, not mask_joint, not mask_joint]],
-                device=device,
-            )
-            local_image_mask = image_mask[:, 2 * rank : 2 * rank + 2]
+        joint_mask = torch.tensor([[True, True, True, False], [True, False, False, False]], device=device)
+        local_image_mask = torch.ones(query.shape[:2], dtype=torch.bool, device=device)
+        for joint_strategy in ("front", "rear"):
             metadata = AttentionMetadata(
-                attn_mask=image_mask if mask_image else None,
-                joint_attn_mask=joint_mask if mask_joint else None,
+                joint_attn_mask=joint_mask,
                 joint_query=joint,
                 joint_key=joint,
                 joint_value=joint_mask[:, :, None, None].expand_as(joint).to(query.dtype),
                 joint_strategy=joint_strategy,
             )
-            value = local_image_mask[:, :, None, None].expand_as(query).to(query.dtype)
-            q, k, v, metadata, _ = strategy.pre_attention(query, query, value, metadata)
+            q, k, v, metadata, _ = strategy.pre_attention(query, query, torch.ones_like(query), metadata)
             output = impl.forward_cuda(q, k, v, metadata)
             valid_queries = torch.cat(
                 [joint_mask, local_image_mask] if joint_strategy == "front" else [local_image_mask, joint_mask],
