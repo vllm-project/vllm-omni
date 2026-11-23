@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import requests
 import torch
+import urllib3
 from huggingface_hub import snapshot_download
 
 from tests.e2e.accuracy.helpers import (
@@ -186,7 +187,21 @@ def _download_reference_asset(
 ) -> Path:
     reference_path = output_dir / filename
     download_url = url.replace("/blob/", "/resolve/", 1)
-    response = requests.get(download_url, timeout=120)
+    # Conditioning inputs are hosted on cdn.hailuoai.com, whose DNS
+    # resolution is intermittent from CI runners (#6295, #10661). Retry
+    # transient connection failures so the accuracy job does not fail
+    # before generation starts; SHA256 still gates content integrity.
+    retries = urllib3.util.Retry(
+        total=4,
+        connect=4,
+        read=2,
+        backoff_factor=2,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(max_retries=retries))
+    response = session.get(download_url, timeout=120)
     response.raise_for_status()
     content = response.content
     digest = hashlib.sha256(content).hexdigest()
