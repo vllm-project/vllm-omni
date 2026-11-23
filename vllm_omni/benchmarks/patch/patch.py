@@ -55,6 +55,10 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
     daily_omni_local_videos_dir,
     resolve_daily_omni_local_root,
 )
+from vllm_omni.benchmarks.data_modules.mixed_omni_dataset import (
+    MixedOmniSampleRequest,
+    generate_mixed_omni_samples,
+)
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     DEFAULT_OMNIINTERACT_REPO,
     OmniInteractDataset,
@@ -440,14 +444,17 @@ def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict
 
 
 def _attach_omni_chat_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni / Video-MME."""
-    if not isinstance(sample, (DailyOmniSampleRequest, VideoMMESampleRequest)):
-        return
-    rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
-    if sample.omni_chat_messages is not None:
+    """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni / Video-MME / Mixed-Omni."""
+    if isinstance(sample, (DailyOmniSampleRequest, VideoMMESampleRequest)):
+        rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
+        if sample.omni_chat_messages is not None:
+            setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+        elif isinstance(sample, DailyOmniSampleRequest):
+            setattr(rfi, "mm_position", sample.omni_chat_mm_position)
+    elif isinstance(sample, MixedOmniSampleRequest):
+        rfi.extra_body = sample.omni_extra_body
         setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
-    elif isinstance(sample, DailyOmniSampleRequest):
-        setattr(rfi, "mm_position", sample.omni_chat_mm_position)
+        setattr(rfi, "omni_task_type", sample.omni_task_type)
 
 
 def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
@@ -775,11 +782,26 @@ def get_samples(args, tokenizer, **kwargs):
         "openai-realtime-duplex",
         "daily-omni",
     ]
-    is_omni_dataset = is_daily_omni or is_videomme or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
+    is_omni_dataset = (
+        is_daily_omni
+        or is_videomme
+        or is_seed_tts
+        or is_omniinteract
+        or args.dataset_name in ("random-mm", "mixed-omni")
+    )
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
         return get_samples_old(args, tokenizer, **kwargs)
+
+    # Mixed-Omni: generate i2t + t2i + it2i mixed samples for DTPS evaluation.
+    if args.dataset_name == "mixed-omni":
+        config_str = getattr(args, "mixed_omni_config", None) or "{}"
+        config = json.loads(config_str) if isinstance(config_str, str) else config_str
+        seed = getattr(args, "seed", 0)
+        samples = generate_mixed_omni_samples(config, seed=seed)
+        args.num_prompts = len(samples)
+        return samples
 
     if is_omniinteract:
         dataset_path = getattr(args, "dataset_path", None)
