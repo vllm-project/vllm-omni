@@ -179,28 +179,41 @@ def test_deferred_spatial_bias_preserves_invalid_extent(ndim, axis, dtype):
 
 @pytest.mark.parametrize("ndim,axis,dtype", [(4, "height", torch.float32), (5, "width", torch.bfloat16)])
 @torch.inference_mode()
-def test_paired_halo_copies(ndim, axis, dtype):
-    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.triton_spatial_halo import launch_halo_pair
+def test_channels_last_halo_exchange(ndim, axis, dtype):
+    from types import SimpleNamespace
 
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    rank = dist.get_rank()
+    world = dist.get_world_size()
     shape = (2, 7, 3, 9, 11) if ndim == 5 else (6, 7, 9, 11)
-    memory_format = torch.channels_last_3d if ndim == 5 else torch.channels_last
-    source = torch.randn(shape, device="cuda", dtype=dtype).contiguous(memory_format=memory_format)
-    target = torch.full_like(source, 42)
-    expected = target.clone()
+    fmt = torch.channels_last_3d if ndim == 5 else torch.channels_last
     dim = ndim - (2 if axis == "height" else 1)
-    top = source.narrow(dim, 1, 2)
-    bottom = source.narrow(dim, source.shape[dim] - 3, 2)
-    send_top = torch.empty(top.shape, dtype=dtype, device="cuda", memory_format=memory_format)
-    send_bottom = torch.empty_like(send_top)
-    assert launch_halo_pair(top, bottom, send_top, send_bottom)
-    assert torch.equal(send_top, top)
-    assert torch.equal(send_bottom, bottom)
-    assert launch_halo_pair(
-        send_top, send_bottom, target.narrow(dim, 0, 2), target.narrow(dim, target.shape[dim] - 2, 2)
+    extent = shape[dim]
+    # Each rank has distinct, exactly representable values on both boundaries.
+    coords = torch.arange(extent, device="cuda", dtype=dtype)
+    view = [1] * ndim
+    view[dim] = extent
+    buf = (coords + 16 * rank).view(view).expand(shape).contiguous(memory_format=fmt)
+    expected = buf.clone()
+    expected.narrow(dim, 0, 2).zero_()
+    expected.narrow(dim, extent - 2, 2).zero_()
+    if rank > 0:
+        expected.narrow(dim, 0, 2).copy_(buf.narrow(dim, extent - 4, 2) - 16)
+    if rank + 1 < world:
+        expected.narrow(dim, extent - 2, 2).copy_(buf.narrow(dim, 2, 2) + 16)
+
+    module = SimpleNamespace(
+        split_tensor_dim=dim,
+        group=dist.group.WORLD,
+        _backend="nccl",
+        _halo_recv_top_buf=None,
+        _halo_recv_bottom_buf=None,
     )
-    expected.narrow(dim, 0, 2).copy_(top)
-    expected.narrow(dim, expected.shape[dim] - 2, 2).copy_(bottom)
-    assert torch.equal(target, expected)
+    spatial._exchange_input_halos(module, buf, 2, rank, world)
+    assert torch.equal(buf, expected)
+    assert module._halo_recv_top_buf.is_contiguous(memory_format=fmt)
+    assert module._halo_recv_bottom_buf.is_contiguous(memory_format=fmt)
 
 
 @pytest.mark.parametrize(

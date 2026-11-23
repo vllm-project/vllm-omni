@@ -320,7 +320,7 @@ def test_registry_configures_wan_spatial_temporal_chunk_size(monkeypatch, mocker
             self.vae = vae
 
     monkeypatch.setattr(registry.DiffusionModelRegistry, "_try_load_model_cls", lambda _: Pipeline)
-    monkeypatch.setattr(registry, "_apply_wan_vae_fastpath_if_enabled", lambda *args: None)
+    monkeypatch.setattr(registry, "_apply_vae_fast_paths_if_enabled", lambda *args: None)
     config = OmniDiffusionConfig(
         model_class_name="test_wan_vae",
         vae_fast_path="off",

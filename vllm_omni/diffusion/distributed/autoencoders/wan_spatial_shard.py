@@ -279,24 +279,10 @@ def _halo_exchange_p2p(
     recv_bottom_buf: torch.Tensor,
 ) -> None:
     memory_format = _halo_memory_format(recv_top_buf)
-    packed = False
-    if (
-        memory_format != torch.contiguous_format
-        and top_row_ref.is_cuda
-        and top_row_ref.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and not torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-    ):
-        from .wan_vae_fastpath.triton_spatial_halo import launch_halo_pair
-
-        top_row = torch.empty_like(recv_top_buf)
-        bottom_row = torch.empty_like(recv_bottom_buf)
-        packed = launch_halo_pair(top_row_ref, bottom_row_ref, top_row, bottom_row)
     p2p_ops = []
     if rank > 0:
         prev_rank = _global_rank(group, rank - 1)
-        if not packed:
-            top_row = top_row_ref.contiguous(memory_format=memory_format)
+        top_row = top_row_ref.contiguous(memory_format=memory_format)
         p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
         p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
     else:
@@ -304,8 +290,7 @@ def _halo_exchange_p2p(
 
     if rank < world_size - 1:
         next_rank = _global_rank(group, rank + 1)
-        if not packed:
-            bottom_row = bottom_row_ref.contiguous(memory_format=memory_format)
+        bottom_row = bottom_row_ref.contiguous(memory_format=memory_format)
         p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
     else:
@@ -315,24 +300,6 @@ def _halo_exchange_p2p(
         reqs = dist.batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
-
-
-def _copy_received_halos(
-    top: torch.Tensor, bottom: torch.Tensor, out_top: torch.Tensor, out_bottom: torch.Tensor
-) -> None:
-    if (
-        top.is_cuda
-        and top.stride(1) == 1
-        and top.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and not torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-    ):
-        from .wan_vae_fastpath.triton_spatial_halo import launch_halo_pair
-
-        if launch_halo_pair(top, bottom, out_top, out_bottom):
-            return
-    out_top.copy_(top)
-    out_bottom.copy_(bottom)
 
 
 def _exchange_input_halos(module: nn.Module, buf: torch.Tensor, halo: int, rank: int, world_size: int) -> None:
@@ -352,12 +319,8 @@ def _exchange_input_halos(module: nn.Module, buf: torch.Tensor, halo: int, rank:
         recv_top_buf=module._halo_recv_top_buf,
         recv_bottom_buf=module._halo_recv_bottom_buf,
     )
-    _copy_received_halos(
-        module._halo_recv_top_buf,
-        module._halo_recv_bottom_buf,
-        _narrow_along_dim(buf, dim, 0, halo),
-        _narrow_along_dim(buf, dim, buf.shape[dim] - halo, halo),
-    )
+    _narrow_along_dim(buf, dim, 0, halo).copy_(module._halo_recv_top_buf)
+    _narrow_along_dim(buf, dim, buf.shape[dim] - halo, halo).copy_(module._halo_recv_bottom_buf)
 
 
 def _spatial_conv_forward(
@@ -515,6 +478,7 @@ class WanDistConv2d(nn.Conv2d):
         self._trim_cache: dict[int, tuple[int, int, int]] = {}
         self._backend = dist.get_backend(group) if dist.is_initialized() else None
         self.input_memory_format = torch.contiguous_format
+        self.reuse_input_buffer = False
         self._input_buf: torch.Tensor | None = None
 
     def forward(
@@ -522,7 +486,7 @@ class WanDistConv2d(nn.Conv2d):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         from .wan_vae_fastpath.forwards import CFG_ATTR
 
-        if getattr(self, CFG_ATTR, None) is not None and not torch.is_grad_enabled():
+        if (self.reuse_input_buffer or hasattr(self, CFG_ATTR)) and not torch.is_grad_enabled():
             x_padded, local_extent = self._assemble_input(x)
         else:
             x = F.pad(x, self._non_split_padding)
@@ -534,6 +498,10 @@ class WanDistConv2d(nn.Conv2d):
                 recv_top_buf=self._halo_recv_top_buf,
                 recv_bottom_buf=self._halo_recv_bottom_buf,
             )
+            if self.halo_size and _rank_world(self.group)[1] == 1:
+                halo = self.halo_size
+                padding = (halo, halo, 0, 0) if self.split_dim == "width" else (0, 0, halo, halo)
+                x_padded = F.pad(x_padded, padding)
             local_extent = x.shape[self.split_tensor_dim]
         return _spatial_conv_forward(self, x_padded, local_extent, return_bias=return_bias)
 
@@ -574,7 +542,7 @@ class WanDistConv2d(nn.Conv2d):
         """Copy the activation and received halos into one reusable padded input."""
         left, right, top, bottom = self._non_split_padding
         rank, world_size = _rank_world(self.group)
-        halo = self.halo_size if world_size > 1 else 0
+        halo = self.halo_size
         dim = self.split_tensor_dim
         halo_h = halo if self.split_dim == "height" else 0
         halo_w = halo if self.split_dim == "width" else 0
@@ -584,7 +552,7 @@ class WanDistConv2d(nn.Conv2d):
         buf = _persistent_input_buffer(self, (batch, channels, total_height, total_width), x)
         buf[:, :, halo_h + top : halo_h + top + height, halo_w + left : halo_w + left + width].copy_(x)
         local_extent = buf.shape[dim] - 2 * halo
-        if halo:
+        if halo and world_size > 1:
             _exchange_input_halos(self, buf, halo, rank, world_size)
         return buf, local_extent
 
@@ -1093,7 +1061,7 @@ def spatial_shard_decode(
     The first latent frame remains separate to initialize the temporal
     upsamplers. Larger chunks amortize halo exchanges and kernel launches but
     increase memory and may change convolution rounding, even with lossless
-    local kernels. None selects min(8, group size) for an installed channels-last
+    local kernels. None selects min(4, group size) for an installed channels-last
     path and 1 otherwise. All ranks must use the same setting.
     """
     if temporal_chunk_size is not None and (
@@ -1113,7 +1081,7 @@ def spatial_shard_decode(
 
         report = getattr(vae, REPORT_ATTR, None)
         channels_last = report is not None and report.installed and report.level == "channels_last"
-        temporal_chunk_size = min(8, world_size) if channels_last else 1
+        temporal_chunk_size = min(4, world_size) if channels_last else 1
     produce_output = world_size <= 1 or rank == 0
 
     vae.clear_cache()

@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--vae-spatial-temporal-chunk-size",
         type=int,
         default=None,
-        help="Spatial decode chunk override; default: min(8, SP GPU count) for channels_last; 1 otherwise",
+        help="Spatial decode chunk override; default: min(4, SP GPU count) for channels_last; 1 otherwise",
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=2)
@@ -408,7 +408,7 @@ def main() -> None:
         )
         if parallel and args.vae_spatial_temporal_chunk_size is None:
             print(
-                "Automatic chunks: off=lossless=1, channels_last=min(8, SP GPU count). "
+                "Automatic chunks: off=lossless=1, channels_last=min(4, SP GPU count). "
                 "Set --vae-spatial-temporal-chunk-size explicitly for same-chunk numerical comparisons."
             )
     golden = None
