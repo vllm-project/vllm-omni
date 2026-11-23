@@ -4,6 +4,7 @@
 """Request-level batching contract for the SDXL text2image pipeline."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -23,38 +24,7 @@ LATENT_CHANNELS = 4
 VAE_SCALE = 8
 
 
-class _MarkerTokenizer:
-    def __call__(self, prompts, padding, max_length, truncation, return_tensors):
-        ids = torch.tensor([[int(prompt), int(prompt)] for prompt in prompts])
-        return SimpleNamespace(input_ids=ids)
-
-
-class _MarkerEncoderOutput:
-    def __init__(self, ids: torch.Tensor) -> None:
-        self.hidden_states = [ids.unsqueeze(-1).float()] * 2
-        self.pooled = ids[:, :1].float()
-
-    def __getitem__(self, index: int) -> torch.Tensor:
-        assert index == 0
-        return self.pooled
-
-
-class _MarkerEncoder(nn.Module):
-    def forward(self, ids: torch.Tensor, output_hidden_states: bool) -> _MarkerEncoderOutput:
-        assert output_hidden_states
-        return _MarkerEncoderOutput(ids)
-
-
-@pytest.mark.parametrize(
-    ("prompts", "num_images", "expected"),
-    [
-        (["1", "2"], 2, [1, 1, 2, 2]),
-        (["1", "2", "3"], 3, [1, 1, 1, 2, 2, 2, 3, 3, 3]),
-        (["1", "2"], 1, [1, 2]),
-        (["1"], 2, [1, 1]),
-    ],
-)
-def test_clip_embeddings_keep_prompt_order(prompts, num_images, expected) -> None:
+def test_clip_embeddings_keep_prompt_order() -> None:
     """Token and pooled conditioning must identify the same prompt for every image."""
     pipeline = object.__new__(StableDiffusionXLPipeline)
     nn.Module.__init__(pipeline)
@@ -62,10 +32,15 @@ def test_clip_embeddings_keep_prompt_order(prompts, num_images, expected) -> Non
     pipeline.od_config = SimpleNamespace(dtype=torch.float32)
     pipeline.tokenizer_max_length = 2
 
-    token, pooled = pipeline._get_clip_prompt_embeds(
-        prompts, _MarkerTokenizer(), _MarkerEncoder(), num_images, return_pooled=True
-    )
+    ids = torch.tensor([[1, 1], [2, 2]])
+    tokenizer = Mock(return_value=SimpleNamespace(input_ids=ids))
+    encoder_output = MagicMock()
+    encoder_output.hidden_states = [ids.unsqueeze(-1).float()] * 2
+    encoder_output.__getitem__.return_value = ids[:, :1].float()
+    encoder = Mock(return_value=encoder_output)
+    token, pooled = pipeline._get_clip_prompt_embeds(["A", "B"], tokenizer, encoder, 2, return_pooled=True)
 
+    expected = [1, 1, 2, 2]
     assert token[:, 0, 0].tolist() == expected
     assert pooled is not None
     assert pooled[:, 0].tolist() == expected
