@@ -388,3 +388,32 @@ def test_a_cuda_step_matches_the_cpu_step() -> None:
     for step, requests in enumerate([{"a": 1, "b": 3}, {"b": 2, "c": 5, "a": 1}]):
         cuda_output = _step(cuda_model, requests, step=step)
         assert _audios(cuda_output) == _audios(_step(cpu_model, requests, step=step))
+
+
+@pytest.mark.cpu
+def test_mimi_nested_checkpoint_keys_cover_installed_codec() -> None:
+    from transformers import MimiConfig, MimiModel
+
+    with torch.device("meta"):
+        model = MimiModel(MimiConfig())
+    if not hasattr(model.encoder, "encoder_seanet"):
+        pytest.skip("installed Transformers uses the flat Mimi layout")
+
+    # Derive flat keys from the actual model, independently of the loader's
+    # remap table. Meta tensors avoid allocating the full Mimi weights.
+    flat = {}
+    expected_missing = set()
+    for name, tensor in model.state_dict().items():
+        if name.startswith(("encoder.encoder_transformer.", "decoder.decoder_transformer.")):
+            expected_missing.add(name)
+            continue
+        name = name.replace("encoder.encoder_seanet.", "encoder.", 1)
+        name = name.replace("decoder.decoder_seanet.", "decoder.", 1)
+        name = name.removeprefix("encoder.") if name.startswith("encoder.downsample.") else name
+        name = name.removeprefix("decoder.") if name.startswith("decoder.upsample.") else name
+        flat[name] = tensor
+
+    assert expected_missing
+    incompatible = model.load_state_dict(personaplex_mimi._nest_codec_weights(flat), strict=False)
+    assert set(incompatible.missing_keys) == expected_missing
+    assert not incompatible.unexpected_keys

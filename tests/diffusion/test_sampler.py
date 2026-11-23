@@ -16,6 +16,7 @@ from vllm_omni.diffusion.sampler import (
     SamplingState,
     _commit,
     res_multistep_coefficients,
+    sample_heun,
     sample_res_multistep,
     sampler_object,
 )
@@ -36,11 +37,10 @@ def test_sampler_wraps_algorithm_function():
         Sampler()
     with pytest.raises(ValueError, match="Unsupported sampler"):
         sampler_object("unknown")
-    with pytest.raises(ValueError, match="Unsupported sampler"):
-        sampler_object("heun")
+    assert sampler_object("heun").sampler_function is sample_heun
 
 
-@pytest.mark.parametrize("name", ["euler", "res_multistep"])
+@pytest.mark.parametrize("name", ["euler", "res_multistep", "heun"])
 def test_full_loop_matches_resumed_steps(name):
     full, stepped = _state(), _state()
 
@@ -53,7 +53,7 @@ def test_full_loop_matches_resumed_steps(name):
     assert torch.equal(full.latents[0], stepped.latents[0])
 
 
-@pytest.mark.parametrize("name", ["euler", "res_multistep"])
+@pytest.mark.parametrize("name", ["euler", "res_multistep", "heun"])
 def test_failure_does_not_publish_any_state_or_history(name):
     states = [_state(), _state()]
     originals = [s.latents for s in states]
@@ -103,7 +103,7 @@ def test_res_history_is_owned_by_request_and_pass():
     assert _state().history is None
 
 
-@pytest.mark.parametrize("name", ["euler"])
+@pytest.mark.parametrize("name", ["euler", "heun"])
 def test_stateless_algorithms_do_not_create_res_history(name, monkeypatch):
     def unexpected_coefficients(*args, **kwargs):
         pytest.fail("Stateless sampling must not construct RES history")
@@ -280,3 +280,76 @@ def test_full_coupled_run_matches_reference_implementation(name):
     assert state.finished
     for got, want in zip(state.latents, _REF_FINAL[name], strict=True):
         torch.testing.assert_close(got, torch.tensor(want, dtype=torch.float64), rtol=1e-12, atol=0.0)
+
+
+def _reference_heun(latents, schedules, model):
+    """Per-stream float64 Heun as in k-diffusion: Euler proposal, then average both slopes."""
+    xs = [x.clone() for x in latents]
+    calls = 0
+    for i in range(len(schedules[0]) - 1):
+        sigmas = [s[i] for s in schedules]
+        nexts = [s[i + 1] for s in schedules]
+        x0s = model(xs, sigmas)
+        calls += 1
+        ds = [(x - x0) / sigma for x, x0, sigma in zip(xs, x0s, sigmas)]
+        proposals = [x + (nxt - sigma) * d for x, d, sigma, nxt in zip(xs, ds, sigmas, nexts)]
+        if nexts[0] == 0:
+            xs = proposals
+            continue
+        x0s_2 = model(proposals, nexts)
+        calls += 1
+        xs = [
+            x + (nxt - sigma) * (d + (proposal - x0_2) / nxt) / 2
+            for x, d, proposal, x0_2, sigma, nxt in zip(xs, ds, proposals, x0s_2, sigmas, nexts)
+        ]
+    return xs, calls
+
+
+@pytest.mark.parametrize(
+    "schedules",
+    [(_REF_VIDEO_SIGMAS, _REF_AUDIO_SIGMAS), ((1.0, 0.8, 0.5, 0.2, 0.0), (1.0, 0.7, 0.3, 0.1, 0.0))],
+)
+def test_heun_full_coupled_run_matches_reference(schedules):
+    initial = (
+        torch.tensor([0.9, -0.4, 0.25], dtype=torch.float64),
+        torch.tensor([-1.2, 0.6], dtype=torch.float64),
+    )
+
+    def x0(x, sigma):
+        return 0.5 * torch.tanh(x) + 0.1 * sigma
+
+    expected, expected_calls = _reference_heun(initial, schedules, lambda xs, ss: [x0(x, s) for x, s in zip(xs, ss)])
+    state = SamplingState(tuple(x.clone() for x in initial), schedules)
+    calls = []
+
+    def model(evaluations):
+        calls.append([e.sigmas for e in evaluations])
+        return [tuple(x0(x, s) for x, s in zip(e.latents, e.sigmas)) for e in evaluations]
+
+    sampler_object("heun").sample(model, [state])
+    assert state.finished
+    assert len(calls) == expected_calls == 2 * (len(schedules[0]) - 1) - 1
+    for got, want in zip(state.latents, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=1e-12, atol=0.0)
+
+
+def test_heun_correction_evaluates_proposal_at_next_sigma_and_batches_only_non_terminal_requests():
+    early, late = _state((1.0, 0.5, 0.0)), _state((1.0, 0.0))
+    seen = []
+
+    def model(evaluations):
+        seen.append([(e.state, e.sigmas, e.latents[0].clone()) for e in evaluations])
+        return [(torch.full((3,), 0.25),) for e in evaluations]
+
+    sampler_object("heun").sample(model, [early, late], num_steps=1)
+    prediction, correction = seen
+    assert [(s, sig) for s, sig, _ in prediction] == [(early, (1.0,)), (late, (1.0,))]
+    # Only the request whose next sigma is non-zero is corrected, at that next sigma,
+    # from the Euler proposal x + (0.5 - 1.0) * (x - x0) / 1.0 = 0.625.
+    ((state, sigmas, proposal),) = correction
+    assert state is early and sigmas == (0.5,)
+    torch.testing.assert_close(proposal, torch.full((3,), 0.625))
+    # The terminal request keeps its Euler proposal, which lands on x0.
+    torch.testing.assert_close(late.latents[0], torch.full((3,), 0.25))
+    assert early.step_index == late.step_index == 1
+    assert early.history is None and late.history is None

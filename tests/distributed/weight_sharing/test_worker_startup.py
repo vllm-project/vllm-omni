@@ -3,6 +3,7 @@
 
 import importlib
 import multiprocessing
+import os
 from dataclasses import dataclass
 from typing import cast
 
@@ -24,8 +25,11 @@ class _StartupConfig:
     worker_extension_cls: str | None = None
 
 
-def _startup_worker(rank, config, writer, broadcast, wake, extension, pipeline_args, *, sharing_registry=None):
+def _startup_worker(
+    rank, config, writer, broadcast, wake, extension, pipeline_args, *, sharing_registry=None, parent_pid=None
+):
     # Exercise real spawn transport and shared registration without initializing CUDA.
+    assert parent_pid == os.getppid()
     assert not hasattr(config, "_sharing_worker_registry")
     if sharing_registry is not None:
         assert sharing_registry.register(rank)
@@ -48,9 +52,10 @@ def test_startup_registry_stays_out_of_request_rpc(mocker, sharing):
         ["_launch_workers"],
         dict(
             mp=ctx,
+            os=os,
             cast=cast,
             logger=mocker.Mock(),
-            set_multiprocessing_worker_envs=lambda: None,
+            set_multiprocessing_worker_envs=mocker.Mock(),
             WorkerProc=mocker.Mock(worker_main=_startup_worker),
         ),
     )

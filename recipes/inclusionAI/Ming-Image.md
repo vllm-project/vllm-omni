@@ -39,6 +39,25 @@ vllm serve "$MODEL" --omni --deploy-config vllm_omni/deploy/ming_image.yaml --po
 
 For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer`.
 
+### Attention Backend
+
+On 2x H100, FlashAttention is the recommended default for both Design and Design-Layer.
+
+This recommendation was measured on 2x H100 NVL 94GB with vLLM 0.31.0,
+PyTorch 2.13.0+cu130, using 1024x1024 images, 12 steps and serial requests (`max_num_seqs: 1`, edge `max_inflight: 1`).
+
+To select it explicitly:
+
+```bash
+vllm serve "$MODEL" --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --diffusion-attention-backend FLASH_ATTN \
+  --port 8091
+```
+
+SageAttention (`SAGE_ATTN`) 2.2.0 can produce black or corrupted images ([#8660](https://github.com/vllm-project/vllm-omni/issues/8660)).
+Use `FLASH_ATTN` as above or `TORCH_SDPA` with the default compilation settings instead.
+
 ## Text-to-image
 
 Note that a prompt refiner is expected to describe the prompts with details; we will refine with more example inputs soon.
