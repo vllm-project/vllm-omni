@@ -5623,6 +5623,26 @@ def test_graph_option_rejects_unsupported_config_before_loading(monkeypatch, ove
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=config)
 
 
+def test_graph_option_rejects_multiview_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cuda"))
+    load_config = Mock(side_effect=AssertionError("component loading must not start"))
+    monkeypatch.setattr(pipeline_cosmos3.FlowUniPCMultistepScheduler, "load_config", load_config)
+    config = OmniDiffusionConfig(
+        additional_config={"cosmos3_manual_cuda_graphs": True},
+        tf_model_config=TransformerConfig.from_dict(
+            {"backbone_type": pipeline_cosmos3.COSMOS3_MULTIVIEW_BACKBONE_TYPE}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="manual CUDA graphs are not supported for multiview checkpoints"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=config)
+
+    load_config.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("quant_method", "serialized", "supported"),
     [("modelopt", True, True), ("modelopt", False, False), ("modelopt_fp4", True, False)],

@@ -1217,6 +1217,11 @@ class Cosmos3OmniDiffusersPipeline(
         )
         if not isinstance(use_manual_cuda_graphs, bool):
             raise ValueError("cosmos3_manual_cuda_graphs must be a boolean")
+        if (
+            use_manual_cuda_graphs
+            and _tf_config_get(od_config.tf_model_config, "backbone_type", None) == COSMOS3_MULTIVIEW_BACKBONE_TYPE
+        ):
+            raise ValueError("Cosmos3 manual CUDA graphs are not supported for multiview checkpoints.")
         if use_manual_cuda_graphs and (
             self.device.type != "cuda"
             or od_config.parallel_config.world_size != 1
