@@ -2857,11 +2857,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if self._dtps is not None:
             self._dtps.evict_request(request_id)
-            # Use the DTPS ar-only classification (which checks
-            # omni_final_stage_id) rather than the KV connector's
-            # _should_transfer_kv_for_request, so blind tracking is
-            # decoupled from the KV connector's need_send_cache setting.
-            if not self._dtps._request_is_ar_only(request):
+            if not self._dtps.request_is_ar_only(request):
                 self._dtps.register_finished_downstream(request_id)
 
         if (

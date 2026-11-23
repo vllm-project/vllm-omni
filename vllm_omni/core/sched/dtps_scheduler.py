@@ -68,7 +68,7 @@ class DTPSScheduler:
         self._last_phase_stats: dict[str, int | bool] = {}
         self._ar_only_cache: dict[str, bool] = {}
 
-    def _request_is_ar_only(self, req: Request) -> bool:
+    def request_is_ar_only(self, req: Request) -> bool:
         """True when the request terminates at this AR stage (no downstream).
 
         Result is cached per request_id — deserialization happens at most
@@ -204,7 +204,7 @@ class DTPSScheduler:
         """
         inflight_running = 0
         if running is not None:
-            inflight_running = sum(1 for r in running if not self._request_is_ar_only(r))
+            inflight_running = sum(1 for r in running if not self.request_is_ar_only(r))
         self._dit_phase(inflight_running)
 
         # When the DiT load snapshot is stale or empty (all DiT replicas
@@ -231,7 +231,7 @@ class DTPSScheduler:
         now = time.time()
 
         for req in list(waiting):
-            is_ar_only = self._request_is_ar_only(req)
+            is_ar_only = self.request_is_ar_only(req)
             arrival = getattr(req, "arrival_time", None)
             wait = (now - arrival) if arrival is not None else 0.0
             if wait > aging_threshold:
@@ -261,7 +261,7 @@ class DTPSScheduler:
             for r in reqs:
                 w = (now - r.arrival_time) if r.arrival_time else 0.0
                 npt = getattr(r, "num_prompt_tokens", 0) or 0
-                tag = "AR+DiT" if not self._request_is_ar_only(r) else "AR"
+                tag = "AR+DiT" if not self.request_is_ar_only(r) else "AR"
                 parts.append(f"{r.request_id}({tag},{w:.1f}s,{npt}t)")
             return "[" + ",".join(parts) + "]"
 
