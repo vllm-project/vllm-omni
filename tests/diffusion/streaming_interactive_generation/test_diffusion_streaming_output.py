@@ -11,6 +11,7 @@ Covers:
 import asyncio
 import contextlib
 import queue
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -464,6 +465,9 @@ class TestPipelineStreamingOutputToEntrypoint:
         omni._paused = False
         omni.request_states = {}
         omni.final_output_task = None
+        omni._output_loop = None
+        omni._output_loop_lock = threading.Lock()
+        omni._frontend_shutting_down = False
         omni.event_resolver = AsyncEventResolver()
         omni._enable_ar_profiler = False
         omni.prom_metrics = MagicMock()

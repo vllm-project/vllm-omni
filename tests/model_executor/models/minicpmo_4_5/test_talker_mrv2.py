@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model Runner V2 path of MiniCPM-o 4.5's Talker: device-side codec output,
-EOS control and the 16-frame codec penalty must match the V1 host path."""
+EOS control and the 16-frame codec penalty must match the scalar reference."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.model_executor.models.minicpmo_4_5.helpers import reference_codec_penalty
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
     MiniCPMO45OmniTTSForConditionalGeneration,
@@ -98,7 +99,7 @@ def _spec_config(num_speculative_tokens: int):
 def test_mrv2_output_emits_decode_input_codes_with_validity_and_forced_eos() -> None:
     talker = _talker()
     rows = [
-        # Final prefill chunk: no code yet (V1 emits an empty delta).
+        # Final prefill chunk: no code yet; emit an empty delta.
         dict(slot=2, prompt_len=5, computed=0, span=[0, 0, 0, 0, 0], prefill=True),
         # Decode with a codec id: emitted this step.
         dict(slot=0, prompt_len=4, computed=6, span=[17], prefill=False),
@@ -168,8 +169,8 @@ def test_sampler_adapter_keeps_upstream_counts_and_only_forces_codec_eos(mocker,
     mask = None if forced is None else torch.tensor(forced)
     talker = SimpleNamespace(_codec_eos_id=7, take_mrv2_forced_eos=mocker.Mock(return_value=mask))
     sampler = MiniCPMO45TalkerSampler(base, talker)
-    # Isolate EOS routing from the separately tested V1-compatible codec draw.
-    mocker.patch.object(sampler, "_sample_like_v1", side_effect=base)
+    # Isolate EOS routing from the separately tested seeded codec draw.
+    mocker.patch.object(sampler, "_sample_seeded", side_effect=base)
     logits, batch = torch.zeros(2, 8), object()
     assert sampler(logits, batch) is output
     assert output.sampled_token_ids.tolist() == [[2], [3 if forced is None else 7]]
@@ -211,7 +212,7 @@ def test_mrv2_talker_native_duplex_output(condition_seq) -> None:
 
 @pytest.mark.parametrize("fence", [{"epoch": -1, "turn_id": 5}, {"epoch": True, "turn_id": 5}, {"turn_id": 5}])
 def test_mrv2_talker_rejects_native_duplex_without_fence_identity(fence) -> None:
-    """Same contract as V1 make_omni_output: condition fencing needs non-negative int identities."""
+    """Condition fencing needs non-negative int identities."""
     batch, _ = _batch([dict(slot=0, prompt_len=4, computed=6, span=[17], prefill=False)], pad_to=1)
     with pytest.raises(RuntimeError, match="requires non-negative integer epoch and turn_id"):
         _talker().make_omni_output_mrv2(
@@ -263,8 +264,8 @@ def test_mrv2_turn_end_drain_masks_cadence_eos(mocker, step, turn_start, turn_en
     base = mocker.Mock(side_effect=lambda logits, _: SimpleNamespace(sampled_token_ids=logits.argmax(-1)[:, None]))
     base.req_states = states
     sampler = MiniCPMO45TalkerSampler(base, talker)
-    # Isolate EOS routing from the separately tested V1-compatible codec draw.
-    mocker.patch.object(sampler, "_sample_like_v1", side_effect=base)
+    # Isolate EOS routing from the separately tested seeded codec draw.
+    mocker.patch.object(sampler, "_sample_seeded", side_effect=base)
     logits = torch.zeros(1, _EOS + 1)
     logits[0, _EOS] = 10
     output = sampler(logits, batch)
@@ -304,7 +305,7 @@ def _mrv2_turn_end_samples_eos(mocker, talker, *, step: int, code: int, wants_eo
     logits = torch.zeros(1, _EOS + 1)
     logits[0, _EOS if wants_eos else 0] = 10
     sampler = MiniCPMO45TalkerSampler(base, talker)
-    mocker.patch.object(sampler, "_sample_like_v1", side_effect=base)
+    mocker.patch.object(sampler, "_sample_seeded", side_effect=base)
     return sampler(logits, batch).sampled_token_ids.item() == _EOS
 
 
@@ -405,7 +406,6 @@ def test_codec_penalty_carries_previous_segment_through_reordered_slots(device, 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        _apply_batched_repetition_penalty,
         _apply_codec_window_penalty_gpu,
     )
 
@@ -421,7 +421,7 @@ def test_codec_penalty_carries_previous_segment_through_reordered_slots(device, 
         prefixes[slot, -len(prefix) :] = torch.tensor(prefix, device=device)
         histories.append(torch.tensor(prefix + output))
     logits = torch.linspace(-3, 3, 32, device=device).repeat(2, 1)
-    expected = _apply_batched_repetition_penalty(logits.cpu(), histories, penalty=1.05, window_size=16)
+    expected = reference_codec_penalty(logits.cpu(), histories, penalty=1.05, window_size=16)
     _apply_codec_window_penalty_gpu(
         logits,
         torch.tensor([2, 0], device=device),
@@ -547,7 +547,6 @@ def test_codec_penalty_window_includes_the_steps_earlier_drafts(device, output_c
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        _apply_batched_repetition_penalty,
         _CodecWindowPenaltiesState,
     )
 
@@ -569,7 +568,7 @@ def test_codec_penalty_window_includes_the_steps_earlier_drafts(device, output_c
             slots.append(slot)
             local_pos.append(j)
     logits = torch.linspace(-3, 3, 32, device=device).repeat(len(histories), 1)
-    expected = _apply_batched_repetition_penalty(logits.cpu(), histories, penalty=1.05, window_size=16)
+    expected = reference_codec_penalty(logits.cpu(), histories, penalty=1.05, window_size=16)
 
     state = object.__new__(_CodecWindowPenaltiesState)
     state.window_size = 16
@@ -829,40 +828,10 @@ def test_draft_config_without_target_layers_gets_a_readable_error(mocker):
         eagle3_utils.set_eagle3_aux_hidden_state_layers(talker, spec_config)
 
 
-@pytest.mark.parametrize(
-    "use_v2,spec,ok",
-    [
-        (False, None, True),
-        (False, SimpleNamespace(method="ngram", num_speculative_tokens=7), True),
-        (False, {"method": "ngram", "num_speculative_tokens": 7}, True),
-        (False, SimpleNamespace(method="ngram", num_speculative_tokens=0), False),
-        (False, SimpleNamespace(method="suffix", num_speculative_tokens=4), False),
-        (False, SimpleNamespace(num_speculative_tokens=4), False),
-        (True, SimpleNamespace(method="suffix", num_speculative_tokens=4), True),
-    ],
-)
-def test_v1_talker_takes_only_a_speculative_config_that_arms_multi_frame(use_v2, spec, ok):
-    talker_cls = MiniCPMO45OmniTTSForConditionalGeneration
-    vllm_config = SimpleNamespace(
-        speculative_config=spec, model_config=SimpleNamespace(model_stage="tts", use_v2_model_runner=use_v2)
-    )
-    # The same frame count __init__ reads back from the shared K-step contract.
-    frames = talker_cls._parse_k_step_frames(vllm_config)
-    if ok:
-        talker_cls._check_v1_draft_method(vllm_config, use_v2, frames)
-        # A V1 config that loads is the K-step loop.
-        assert frames > 0 or spec is None or use_v2
-    else:
-        assert frames == 0
-        with pytest.raises(NotImplementedError, match=r"model_runner: v1 .* got method="):
-            talker_cls._check_v1_draft_method(vllm_config, use_v2, frames)
-
-
-@pytest.mark.parametrize("v2,session,ok", [(True, "turn", True), (True, "duplex", False), (False, "turn", False)])
-def test_talker_drafter_layers_need_turn_sessions_on_mrv2(mocker, v2, session, ok):
+@pytest.mark.parametrize("session,ok", [("turn", True), ("duplex", False)])
+def test_talker_drafter_layers_need_turn_sessions_on_mrv2(mocker, session, ok):
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     torch.nn.Module.__init__(talker)
-    talker._use_v2_model_runner = v2
     talker._k_step_frames = 0
     talker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session))
     talker.tts_model = mocker.Mock()

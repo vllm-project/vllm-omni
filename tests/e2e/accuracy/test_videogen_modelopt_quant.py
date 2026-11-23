@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end ModelOpt FP8 quality accuracy for video-gen DiTs.
 
-Modeled on ``test_hunyuan_image3.py``'s ``test_quantized_dit_matches_bf16_accuracy``:
 for each calibrated FP8 checkpoint the test generates one video with BF16 and one
 with the FP8 DiT under the same seed, scores prompt-faithfulness with CLIP on the
 middle frame, then asserts both ``CLIP >= absolute_floor`` and

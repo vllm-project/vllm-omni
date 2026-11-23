@@ -58,7 +58,7 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     return worker
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 class TestDiffusionWorkerSleep:
     """Test DiffusionWorker.sleep method."""
 
@@ -201,7 +201,7 @@ class TestDiffusionWorkerSleep:
         assert bool(result) is True
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 class TestDiffusionWorkerWakeUp:
     """Test DiffusionWorker.wake_up method."""
 
@@ -333,7 +333,7 @@ class TestDiffusionWorkerShutdown:
         destroy.assert_called_once_with()
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 class TestDiffusionWorkerInitLoraManager:
     """Test DiffusionWorker.init_lora_manager method."""
 

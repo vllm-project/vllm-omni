@@ -18,9 +18,12 @@ from tests.dfx.reliability.helpers import (
     FaultScenario,
     _deploy_config_path,
     extract_openai_error_contract_from_bytes,
+    gpu_oom_pressure_status,
     inject_gpu_oom,
     post_json_raw,
+    snapshot_server_worker_pids,
     stop_gpu_oom_hogs,
+    wait_for_worker_pid_death,
 )
 
 GPU_OOM_MARKERS = (
@@ -35,6 +38,7 @@ GPU_OOM_MARKERS = (
     "hiperroroutofmemory",
     "memory allocation failed with oom on device",
 )
+EXECUTOR_SHUTDOWN_MARKERS = ("executor shut down",)
 
 
 class GpuOomUnderLoad(FaultScenario):
@@ -81,6 +85,54 @@ def _assert_image_success(status: int, body: bytes) -> None:
     assert base64.b64decode(image, validate=True), "response has empty image bytes"
 
 
+def _require_oom_pressure(handle: Any, *, phase: str) -> str:
+    verified, diagnostics = gpu_oom_pressure_status(handle)
+    assert verified, f"OOM sidecar pressure was not verified {phase}: {diagnostics}"
+    return diagnostics
+
+
+def _snapshot_oom_workers(
+    server: Any,
+    *,
+    worker_markers_extra: tuple[str, ...] = (),
+) -> list[int]:
+    worker_pids = snapshot_server_worker_pids(
+        server,
+        worker_markers_extra=worker_markers_extra,
+    )
+    assert worker_pids, "OOM fault probe found no live server workers before the request"
+    print(f"[oom-under-load] workers before fault request: {worker_pids}", flush=True)
+    return worker_pids
+
+
+def _assert_oom_failure_evidence(
+    *,
+    server: Any,
+    handle: Any,
+    workers_before: list[int],
+    response_evidence: str,
+    stderr_capture: Any,
+    context: str,
+) -> None:
+    """Accept explicit OOM or verified pressure + worker death + shutdown."""
+    response_normalized = response_evidence.casefold()
+    response_has_oom = any(marker in response_normalized for marker in GPU_OOM_MARKERS)
+    stderr_evidence = stderr_capture.wait(timeout=0 if response_has_oom else 2)
+    explicit_oom = response_has_oom or any(marker in stderr_evidence.casefold() for marker in GPU_OOM_MARKERS)
+    executor_shutdown = any(marker in response_normalized for marker in EXECUTOR_SHUTDOWN_MARKERS)
+    dead_workers = [] if explicit_oom else wait_for_worker_pid_death(workers_before, timeout_sec=5)
+    pressure_diagnostics = _require_oom_pressure(handle, phase="after the fault request")
+    stderr_tail = "".join(getattr(server, "_server_error_lines", ()))[-4096:]
+    assert explicit_oom or (executor_shutdown and dead_workers), (
+        f"{context} failed without explicit GPU OOM evidence or verified pressure/worker-death "
+        "executor-shutdown proof; "
+        f"executor_shutdown={executor_shutdown}, workers_before={workers_before}, "
+        f"dead_workers={dead_workers}, pressure={pressure_diagnostics}, "
+        f"response_head={response_evidence[:4096]!r}, captured_stderr={stderr_evidence!r}, "
+        f"stderr_tail={stderr_tail!r}"
+    )
+
+
 def run_oom_under_load(
     model: FaultModel,
     server: Any,
@@ -93,53 +145,61 @@ def run_oom_under_load(
 ) -> None:
     success_check(*post_json_raw(server.host, server.port, endpoint, warmup, timeout_sec=180))
     print("[oom-under-load] multimodal preflight passed; starting memory pressure", flush=True)
-    stderr_before = set(getattr(server, "_server_error_lines", ()))
     config = model.hard_oom_config
-    handle = inject_gpu_oom(
-        device=resolve_oom_device_spec(config, _deploy_config_path(server)),
-        target_mem_ratio=config["target_mem_ratio"],
-        hold_seconds=config["hold_seconds"],
-        startup_timeout_sec=config["startup_timeout_sec"],
-        strict=config["strict"],
-        max_free_bytes=config.get("max_free_bytes"),
-    )
-    fault_body = b""
-    status: int | None = None
-    try:
-        started = time.monotonic()
-        print("[oom-under-load] pressure ready; sending one multimodal fault request (timeout=180s)", flush=True)
-        try:
-            status, fault_body = post_json_raw(server.host, server.port, endpoint, payload, timeout_sec=180)
-        except Exception as exc:
-            print(f"[oom-under-load] request exception after {time.monotonic() - started:.3f}s: {exc!r}", flush=True)
-            # A dead API can close/refuse the connection; a client timeout or
-            # unrelated exception is not the expected request-failure contract.
-            assert _looks_like_server_unreachable(exc), f"unexpected OOM request failure: {exc!r}"
-        else:
-            # Bound diagnostics; never print the request's base64 media.
-            print(
-                f"[oom-under-load] request status={status}, elapsed={time.monotonic() - started:.3f}s, "
-                f"response_bytes={len(fault_body)}, response_head={fault_body[:4096]!r}",
-                flush=True,
-            )
-            assert status in (500, 503), f"OOM request must fail with 500/503, got {status}: {fault_body[:500]!r}"
-            assert extract_openai_error_contract_from_bytes(fault_body) is not None, (
-                f"OOM response lacks an OpenAI error object: {fault_body[:500]!r}"
-            )
-        assert time.monotonic() - started < 180, "OOM request did not fail within its deadline"
-        # The API may return generic EngineDeadError; the harness's stderr
-        # buffer can identify whether GPU OOM actually caused it.
-        stderr_delta = "".join(line for line in getattr(server, "_server_error_lines", ()) if line not in stderr_before)
-        evidence = fault_body.decode("utf-8", errors="replace") + stderr_delta
-        oom_markers = GPU_OOM_MARKERS
-        assert any(marker in evidence.lower() for marker in oom_markers), (
-            "request failed without explicit GPU OOM evidence in this injection's response or logs; "
-            f"status={status}, response_head={fault_body[:4096]!r}, "
-            f"stderr_tail={stderr_delta[-4096:]!r}"
+    with server.capture_stderr_evidence(GPU_OOM_MARKERS) as stderr_capture:
+        handle = inject_gpu_oom(
+            device=resolve_oom_device_spec(config, _deploy_config_path(server)),
+            target_mem_ratio=config["target_mem_ratio"],
+            hold_seconds=config["hold_seconds"],
+            startup_timeout_sec=config["startup_timeout_sec"],
+            strict=config["strict"],
+            max_free_bytes=config.get("max_free_bytes"),
         )
-    finally:
-        stop_gpu_oom_hogs(handle)
-        print("[oom-under-load] memory pressure removed", flush=True)
+        fault_body = b""
+        status: int | None = None
+        try:
+            pressure_diagnostics = _require_oom_pressure(handle, phase="before the fault request")
+            workers_before = _snapshot_oom_workers(
+                server,
+                worker_markers_extra=(model.worker_pattern,),
+            )
+            print(f"[oom-under-load] verified pressure: {pressure_diagnostics}", flush=True)
+            started = time.monotonic()
+            print("[oom-under-load] pressure ready; sending one multimodal fault request (timeout=180s)", flush=True)
+            try:
+                status, fault_body = post_json_raw(server.host, server.port, endpoint, payload, timeout_sec=180)
+            except Exception as exc:
+                print(
+                    f"[oom-under-load] request exception after {time.monotonic() - started:.3f}s: {exc!r}",
+                    flush=True,
+                )
+                # A dead API can close/refuse the connection; a client timeout or
+                # unrelated exception is not the expected request-failure contract.
+                assert _looks_like_server_unreachable(exc), f"unexpected OOM request failure: {exc!r}"
+            else:
+                # Bound diagnostics; never print the request's base64 media.
+                print(
+                    f"[oom-under-load] request status={status}, elapsed={time.monotonic() - started:.3f}s, "
+                    f"response_bytes={len(fault_body)}, response_head={fault_body[:4096]!r}",
+                    flush=True,
+                )
+                assert status in (500, 503), f"OOM request must fail with 500/503, got {status}: {fault_body[:500]!r}"
+                assert extract_openai_error_contract_from_bytes(fault_body) is not None, (
+                    f"OOM response lacks an OpenAI error object: {fault_body[:500]!r}"
+                )
+            assert time.monotonic() - started < 180, "OOM request did not fail within its deadline"
+            response_evidence = fault_body.decode("utf-8", errors="replace")
+            _assert_oom_failure_evidence(
+                server=server,
+                handle=handle,
+                workers_before=workers_before,
+                response_evidence=response_evidence,
+                stderr_capture=stderr_capture,
+                context=f"OOM request status={status}",
+            )
+        finally:
+            stop_gpu_oom_hogs(handle)
+            print("[oom-under-load] memory pressure removed", flush=True)
 
     try:
         health = client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code

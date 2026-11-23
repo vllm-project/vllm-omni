@@ -1131,6 +1131,10 @@ def _launch_omni_core_engines(
         )
 
 
+class LocalReplicaStartupError(RuntimeError):
+    """A colocated EngineCore process exited during its readiness handshake."""
+
+
 @contextlib.contextmanager
 def launch_stage_replica(
     vllm_config: VllmConfig,
@@ -1241,17 +1245,24 @@ def launch_stage_replica(
         )
         if watched_frontend_processes is not None:
             engine_launch.watched_frontend_processes = watched_frontend_processes
-        wait_for_engine_startup_with_deadline(
-            handshake_socket,
-            engines_to_handshake,
-            vllm_config.parallel_config,
-            False,  # coordinated_dp
-            vllm_config.cache_config,
-            engine_launch,
-            timeout=stage_init_timeout,
-            kill_processes=lambda: shutdown(engine_manager.processes),
-            stage_label=f"LLM stage-{stage_id} replica-{replica_id}",
-        )
+        stage_label = f"LLM stage-{stage_id} replica-{replica_id}"
+        try:
+            wait_for_engine_startup_with_deadline(
+                handshake_socket,
+                engines_to_handshake,
+                vllm_config.parallel_config,
+                False,  # coordinated_dp
+                vllm_config.cache_config,
+                engine_launch,
+                timeout=stage_init_timeout,
+                kill_processes=lambda: shutdown(engine_manager.processes),
+                stage_label=stage_label,
+            )
+        except RuntimeError as exc:
+            # A ready sentinel confirms the local EngineCore actually exited.
+            if num_api_servers == 1 and connection.wait([p.sentinel for p in engine_manager.processes], timeout=0):
+                raise LocalReplicaStartupError(f"{stage_label} exited before READY") from exc
+            raise
 
 
 def launch_headless_llm_replica(
