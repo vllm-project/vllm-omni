@@ -732,6 +732,38 @@ class TestRequestModeDispatch:
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
 
+class TestTimeoutEnvironmentParsing:
+    """Deadline budgets must stay finite and positive.
+
+    ``collective_rpc`` derives its dequeue deadline from these values: zero
+    expires before any reply can arrive, and NaN/inf never expire at all, which
+    silently disables the fail-closed path the timeout exists for.
+    """
+
+    ENV = "VLLM_OMNI_EXECUTE_MODEL_TIMEOUT"
+
+    def test_default_and_override(self, monkeypatch):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        monkeypatch.delenv(self.ENV, raising=False)
+        assert executor_module._positive_timeout_seconds(self.ENV, 3600.0) == 3600.0
+
+        monkeypatch.setenv(self.ENV, "120")
+        assert executor_module._positive_timeout_seconds(self.ENV, 3600.0) == 120.0
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "-0.5", "nan", "inf", "-inf", "1e400", "abc", ""])
+    def test_rejects_unbounded_or_non_positive(self, monkeypatch, raw):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        monkeypatch.setenv(self.ENV, raw)
+        with pytest.raises(ValueError) as excinfo:
+            executor_module._positive_timeout_seconds(self.ENV, 3600.0)
+
+        message = str(excinfo.value)
+        assert self.ENV in message
+        assert repr(raw) in message
+
+
 # ───────────────── concurrent collective RPC ─────────────────
 
 
