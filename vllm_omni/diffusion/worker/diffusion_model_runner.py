@@ -385,10 +385,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if getattr(self.od_config, "enable_sleep_mode", False):
             from vllm_omni.quantization.npu_int8_weight_nz import get_weight_nz_mode
 
-            if get_weight_nz_mode() in ("cast", "reactor"):
+            if get_weight_nz_mode() is not None:
                 raise ValueError(
                     "enable_sleep_mode is incompatible with VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE='cast' or 'reactor'; "
-                    "use 'auto' or 'off', or disable sleep mode"
+                    "set the mode to 'off' or disable sleep mode"
                 )
 
         self._require_attention_schedule_pipeline(load_format)

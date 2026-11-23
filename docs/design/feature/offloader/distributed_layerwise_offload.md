@@ -156,43 +156,17 @@ requests must take the same execution path at every denoising step.
 
 ### NPU INT8 weight layout
 
-`VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE` controls the layout of weights from NPU
-INT8 linear layers. It applies after loading and quantization, so resident
-weights can come from an INT8 checkpoint or from online quantization. Scales,
-biases and floating-point weights keep their original layout. Other platforms
-ignore this setting. On NPU, an unknown value raises `ValueError`. With sleep
-disabled, a model without eligible weights can use any of the four modes.
+`VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE` defaults to `off`. Set it to `cast` or
+`reactor` to convert finalized NPU INT8 linear weights to `FRACTAL_NZ`
+(format 29). Both modes convert resident weights once after loading.
 
-The default `auto` converts resident weights to `FRACTAL_NZ` once on Ascend
-A2/A3 devices with a 910B, 910C or 910_93 SoC when internal formats are
-enabled and the runtime provides NZ allocation. On Ascend 950 series (A5)
-with offloading disabled, `auto` probes each device with a public
-`torch_npu.npu_format_cast` to `FRACTAL_NZ` (format 29) and an INT8 matmul
-using the converted weight. Only weights supported by that path are converted.
-If the probe detects unsupported conversion or matmul, the resident weights
-keep their original ND layout.
+For DLO, `cast` converts each streamed weight on the NPU after upload.
+`reactor` packs the padded NZ bytes on the CPU and binds an NZ view over the
+transfer buffer on the NPU. Disabling DLO restores the ordinary CPU weights.
 
-With `enable_sleep_mode=True`, `auto` preserves the resident layout so sleep
-can reclaim the `weights` pool. Startup rejects explicit `cast` or `reactor`
-with sleep enabled before loading weights, even for models without eligible
-INT8 weights. Ordinary model-level and layer-wise CPU offload keep their
-existing layout in `auto`.
-
-For DLO, `auto` selects `reactor` for the streamed MiniMax-H3 DiT stacks
-`blocks` and `token_refiner.blocks` when online INT8 weights use the ordinary
-loader, pinned host memory and multi-rank AllGather. Every participating rank
-must have an Ascend 910B4-1, `torch_npu`
-2.10.0.post4 (local build suffixes are accepted), internal formats enabled and
-a working NZ view over the transfer buffer. Leading resident blocks retain ND.
-Other DLO paths keep the ordinary layout, including mmap sources, rank-local
-transfers and staged components.
-
-Set the mode to `off` to disable conversion. To force an upload path, use
-`cast` to convert on device after each upload or `reactor` to pack padded NZ
-bytes on the host and bind an NZ view after transfer. Both explicit modes
-convert resident weights once. Disabling DLO restores ordinary CPU weights.
-Forcing either mode with ordinary CPU offload raises an error when the model
-contains eligible weights.
+With sleep mode enabled, NPU startup rejects `cast` and `reactor` before
+loading weights. Ordinary model-level and layer-wise CPU offload also reject
+either mode when the model contains eligible INT8 weights.
 
 ### Rank-local path without DLO AllGather
 

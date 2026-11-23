@@ -181,22 +181,20 @@ def enable_offload_backend(
                 host_weight_plan=state.host_weight_plan if state is not None else None,
             )
             supports_nz = backend is None or isinstance(backend, DistributedLayerwiseOffloadBackend)
-            if not supports_nz and get_weight_nz_mode() in ("cast", "reactor") and int8_weight_names(model):
+            if not supports_nz and get_weight_nz_mode() is not None and int8_weight_names(model):
                 raise ValueError("NPU INT8 weight NZ supports resident weights and distributed layerwise offload")
             if backend is not None:
                 logger.info("Enabling offloader backend: %s", backend.__class__.__name__)
                 backend.enable(model)
             elif state is not None:
                 state.close_loader_ownership()
-            resident_mode = get_weight_nz_mode() if supports_nz else None
-            # Sleep can reclaim only weights allocated inside the loader's memory pool.
-            if resident_mode is not None and not (resident_mode == "auto" and od_config.enable_sleep_mode):
+            if supports_nz and get_weight_nz_mode() is not None:
                 owned = (
                     backend.weight_nz_owned_parameter_ids()
                     if isinstance(backend, DistributedLayerwiseOffloadBackend)
                     else frozenset()
                 )
-                prepare_resident_weights(model, excluded_parameter_ids=owned, allow_a5_auto=backend is None)
+                prepare_resident_weights(model, excluded_parameter_ids=owned)
             return backend
         except Exception:
             if backend is not None:

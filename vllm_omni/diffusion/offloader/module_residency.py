@@ -476,7 +476,7 @@ class PinnedModuleStager:
         self._nz_mode = weight_nz.get_weight_nz_mode()
         self._nz_masters: dict[torch.Tensor, torch.Tensor] = {}
         self._nz_host_weights: dict[torch.Tensor, torch.Tensor] = {}
-        if self._nz_mode in ("cast", "reactor"):
+        if self._nz_mode is not None:
             for item in modules:
                 for name in weight_nz.int8_weight_names(item):
                     target = item.get_parameter(name)
@@ -545,13 +545,11 @@ class PinnedModuleStager:
     def _restore_masters(self) -> None:
         self._bind([group.master for group in self._groups])
         for target, master in self._nz_masters.items():
-            with torch.inference_mode(_local_tensor(target).is_inference()):
-                set_tensor_storage(target, master)
+            _set_storage_preserving_inference(target, master)
 
     def _bind_nz_weights(self) -> None:
         for target, weight in zip(self._nz_masters, self._nz_device_weights, strict=True):
-            with torch.inference_mode(_local_tensor(target).is_inference()):
-                set_tensor_storage(target, weight)
+            _set_storage_preserving_inference(target, weight)
 
     def set_cache_retention(self, cache_retention: BoundedAllocatorCache | None) -> None:
         self.cache_retention = cache_retention
