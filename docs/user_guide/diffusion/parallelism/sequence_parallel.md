@@ -266,6 +266,19 @@ On NPU, the flag retains the existing
 
 ---
 
+## Compiling FA4 Ring attention
+
+On Blackwell, Ring prefers vLLM's bundled FlashAttention dispatcher. When it
+selects FA4, compiled Ring uses the bundled FA4 kernel. Ring can also use
+standalone CuTe FA4 when the bundled dispatcher is unavailable.
+
+With `torch.compile` enabled and PyTorch 2.14 or newer, set the following before
+starting workers to enable experimental native P2P compilation:
+
+```bash
+export TORCHDYNAMO_ENABLE_P2P_COMPILATION=1
+```
+
 ## Troubleshooting
 
 ### Common Issue 1: Performance Not Scaling

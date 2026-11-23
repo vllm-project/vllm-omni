@@ -189,7 +189,13 @@ def _guide_pipeline():
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(
+        cache_backend="none",
+        additional_config={},
+        step_execution=False,
+        controlnet_model_path=None,
+        diffusion_attention_schedule=None,
+    )
     pipeline._base_schedule_by_partition = {"t2va": None, "fl2va": None, "ref2va": None}
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
@@ -197,8 +203,7 @@ def _guide_pipeline():
     pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
     pipeline._turbo_lora_specs = {}
-    pipeline._native_distilled_lora_adapter_ids = set()
-    pipeline._lora_sigma_schedules = {}
+    pipeline._native_lora_specs = {}
     return pipeline
 
 

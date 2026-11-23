@@ -602,7 +602,7 @@ def test_fail_fast_on_timeout_accepts_immediate_chat_omni_dispatch() -> None:
 def test_fail_fast_on_timeout_rejects_finite_rate_before_dispatch(mocker) -> None:
     from vllm_omni.benchmarks import serve
 
-    run_benchmark = mocker.patch.object(serve, "main_async")
+    run_benchmark = mocker.patch.object(serve, "vllm_main_async")
     enable_fail_fast = mocker.patch.object(serve, "set_fail_fast_on_timeout")
     args = argparse.Namespace(
         omni_fail_fast_on_timeout=True,

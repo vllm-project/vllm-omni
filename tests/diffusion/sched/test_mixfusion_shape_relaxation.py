@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 import vllm_omni.diffusion.registry as registry_module
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
@@ -69,7 +70,7 @@ def _initialized_scheduler(scheduler_cls, monkeypatch: pytest.MonkeyPatch, pipel
         lambda model_class_name: pipeline_cls,
     )
     scheduler = scheduler_cls()
-    scheduler.initialize(SimpleNamespace(model_class_name="StubPipeline"))
+    scheduler.initialize(OmniDiffusionConfig(model_class_name="StubPipeline", diffusion_attention_schedule=None))
     return scheduler
 
 

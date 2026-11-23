@@ -575,7 +575,9 @@ class StageConfigFactory:
             return None
         from vllm_omni.config.composable_parallel import apply_strategy_specs
 
-        applied = apply_strategy_specs(stages, strategy_specs)
+        # Device counts are checked in _reconcile_strategy_with_cli, after CLI
+        # overrides (e.g. --stage-overrides devices) are merged.
+        applied = apply_strategy_specs(stages, strategy_specs, check_devices=False)
         if applied.omni_lb_policy is not None:
             logger.info(
                 "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "

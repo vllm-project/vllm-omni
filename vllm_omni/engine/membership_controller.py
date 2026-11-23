@@ -12,6 +12,7 @@ clients via an injected factory and mutating StagePool membership.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
@@ -61,7 +62,7 @@ class MembershipController:
         self._watcher_task: asyncio.Task[None] | None = None
         self._output_queue: OutputQueueWriter | None = None
         self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
-        self._replica_removed_callback: Callable[[int, int], None] | None = None
+        self._replica_removed_callback: Callable[[int, int], Awaitable[None] | None] | None = None
         self._replica_added_callback: Callable[[int, int, StagePoolClient], Coroutine[Any, Any, None]] | None = None
 
         self._hub: OmniCoordClientForHub | None = OmniCoordClientForHub(coordinator_pub_address)
@@ -126,7 +127,12 @@ class MembershipController:
         affected = pool.invalidate_addr(input_addr)
         self._detach_replica(stage_id, input_addr)
         if client is not None and replica_id is not None and self._replica_removed_callback is not None:
-            self._replica_removed_callback(stage_id, replica_id)
+            # Ordering matters: a session owner closes the sessions pinned to this
+            # replica before the generic per-request cleanup runs, so the client
+            # observes a typed session close rather than an anonymous abort.
+            removed = self._replica_removed_callback(stage_id, replica_id)
+            if inspect.isawaitable(removed):
+                await removed
         if affected and effective_cleanup_callback is not None:
             await effective_cleanup_callback(affected)
         if affected and effective_output_queue is not None:
@@ -298,7 +304,7 @@ class MembershipController:
         *,
         output_queue: OutputQueueWriter,
         cleanup_callback: Callable[[list[str]], Awaitable[None]],
-        replica_removed_callback: Callable[[int, int], None] | None = None,
+        replica_removed_callback: Callable[[int, int], Awaitable[None] | None] | None = None,
         replica_added_callback: Callable[[int, int, StagePoolClient], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         """Install replica lifecycle callbacks and request cleanup sinks."""

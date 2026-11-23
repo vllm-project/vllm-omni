@@ -38,7 +38,7 @@ _H3_ATTENTION_DTYPE = torch.bfloat16
 
 def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, AttentionSpec]]:
     """The self-attention spec of each schedule profile that selects FASTVIDEO_VSA, with its name."""
-    schedule = getattr(od_config, "diffusion_attention_schedule", None)
+    schedule = od_config.diffusion_attention_schedule
     if schedule is None:
         return []
     specs = []

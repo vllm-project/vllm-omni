@@ -38,7 +38,7 @@ from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
 )
-from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
+from vllm_omni.entrypoints.utils import mark_serve_cli_args, parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 if TYPE_CHECKING:
@@ -73,7 +73,7 @@ _WATERMARK_CONFIG_HELP = f"JSON watermark configuration. Example: {WATERMARK_CON
 def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     """Adapt shared stage-override validation to argparse's error type."""
     try:
-        parsed = parse_stage_overrides(value)
+        parsed = parse_stage_overrides(value, filter_deploy_fields=False)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
     if parsed is None:
@@ -171,6 +171,7 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: TrackingNamespace) -> None:
+        mark_serve_cli_args(args)
         if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
             log_logo()
@@ -178,6 +179,11 @@ class OmniServeCommand(CLISubcommand):
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
+
+        # Argument converters can run more than once in the tracking parser.
+        # Filter and warn once before any API workers receive the overrides.
+        if (stage_overrides := getattr(args, "stage_overrides", None)) is not None:
+            args.stage_overrides = parse_stage_overrides(stage_overrides)
 
         if getattr(args, "no_guardrails", False):
             existing = getattr(args, "model_config", None)
@@ -472,6 +478,11 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="Path to a deploy config YAML (new format with stages/engine_args).",
+        )
+        omni_config_group.add_argument(
+            "--duplex-engine-backend-as-process",
+            action="store_true",
+            help="Run the duplex runtime in a separate process to isolate the frontend GIL; serves sessions only.",
         )
         omni_config_group.add_argument(
             "--strategy-config",
@@ -878,6 +889,15 @@ class OmniServeCommand(CLISubcommand):
             help="Number of GPUs to shard weights across. -1 = auto (world_size / replicate_size).",
         )
         omni_config_group.add_argument(
+            "--hsdp-data-parallel",
+            action="store_true",
+            help=(
+                "Process one independent compatible request per HSDP rank while "
+                "retaining collective parameter sharding. Requires all other "
+                "parallel sizes to be 1."
+            ),
+        )
+        omni_config_group.add_argument(
             "--hsdp-replicate-size",
             type=int,
             default=1,
@@ -975,10 +995,10 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=_nonneg_finite_float,
-            default=0.0,
+            default=None,
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
-            "0 disables admission (default).",
+            "0 disables admission. Defaults to 500 with --hsdp-data-parallel, else 0.",
         )
         # Server-level MixFusion defaults. Unset flags leave the deploy YAML's
         # per-stage ``enable_mixfusion`` / ``mixfusion_min_chunk_tokens`` /
@@ -1666,6 +1686,7 @@ def run_headless(args: TrackingNamespace) -> None:
         engine_args_dict=engine_args_dict,
         headless=True,
         watermark_config=args.watermark_config,
+        local_replica_count=omni_dp_size_local,
     )
     parallel_config = vllm_config.parallel_config
 
