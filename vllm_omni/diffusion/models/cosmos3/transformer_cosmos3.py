@@ -242,6 +242,22 @@ def _validate_mixed_precision_runtime(
             raise ValueError("Cosmos3 mixed precision with HSDP does not support CPU offload")
 
 
+def _validate_moe_mixed_precision_runtime(od_config: OmniDiffusionConfig) -> None:
+    # Routed experts switch precision through a per-object quant_method.apply
+    # override, which these features bypass or replace without notice.
+    if getattr(od_config, "lora_path", None):
+        raise ValueError(
+            "Cosmos3 mixed precision on routed experts does not support LoRA "
+            "because the LoRA MoE wrapper replaces the expert quant method"
+        )
+    cache_backend = getattr(od_config, "cache_backend", None)
+    if cache_backend not in (None, "none"):
+        raise ValueError(
+            "Cosmos3 mixed precision on routed experts does not support Cache-DiT "
+            f"or other step caches (cache_backend={cache_backend!r})"
+        )
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -502,6 +518,22 @@ def _apply_rotary_pos_emb(
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def _broadcast_und_kv(
+    cached_kv: list[tuple[torch.Tensor, torch.Tensor]],
+    batch_size: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Expand batch-1 UND K/V to the GEN batch as views; return other caches unchanged.
+
+    T2I ``num_outputs_per_prompt > 1`` encodes the shared prompt once, so
+    the cache stays batch 1 while the GEN pathway runs ``batch_size`` latents.
+    """
+    if batch_size == 1 or not cached_kv or cached_kv[0][0].shape[0] != 1:
+        return cached_kv
+    return [
+        (key.expand(batch_size, *key.shape[1:]), value.expand(batch_size, *value.shape[1:])) for key, value in cached_kv
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -936,8 +968,9 @@ class Cosmos3CrossAttention(nn.Module):
         """
         Args:
             hidden_states: [B, S_gen_local, hidden_size] (may be sequence-sharded)
-            k_und: [B, S_und, H_kv_local, D] pre-computed UND keys (TP-sharded, post-norm/RoPE)
-            v_und: [B, S_und, H_kv_local, D] pre-computed UND values (TP-sharded)
+            k_und: [B, S_und, H_kv_local, D] pre-computed UND keys (TP-sharded, post-norm/RoPE);
+                may be a batch-1 cache expanded to B as a view
+            v_und: [B, S_und, H_kv_local, D] pre-computed UND values (TP-sharded); same as k_und
             freqs_cos: [B, S_gen_local, 1, D]
             freqs_sin: [B, S_gen_local, 1, D]
         """
@@ -1578,6 +1611,8 @@ class Cosmos3VFMTransformer(nn.Module):
         if mixed_precision_config is not None:
             self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
             self.mixed_precision_runtime.install(self)
+            if self.mixed_precision_runtime.has_routed_experts:
+                _validate_moe_mixed_precision_runtime(od_config)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps) if is_pp_last_rank else PPMissingLayer()
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
@@ -2051,6 +2086,9 @@ class Cosmos3VFMTransformer(nn.Module):
         # joint_key/value for Ulysses head-slicing in the attention backend.
         if self.cached_kv is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        # A local view: the stored cache (CFG branches, session state, PP
+        # transport) stays batch 1.
+        und_kv = _broadcast_und_kv(self.cached_kv, hidden_gen.shape[0])
         if freqs_gen is None:
             hidden_gen, freqs_gen = self._shard_gen_inputs(hidden_gen)
         freqs_cos, freqs_sin = freqs_gen
@@ -2066,10 +2104,10 @@ class Cosmos3VFMTransformer(nn.Module):
             # e.g. by tests or cache wrappers).
             if _pp_parallel_active():
                 own_layers = self.gen_layers[self.start_layer : self.end_layer]
-                own_kv = self.cached_kv[self.start_layer : self.end_layer]
+                own_kv = und_kv[self.start_layer : self.end_layer]
             else:
                 own_layers = self.gen_layers
-                own_kv = self.cached_kv
+                own_kv = und_kv
             for layer, (k_und, v_und) in zip(own_layers, own_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,

@@ -78,6 +78,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
+| [`Gradium/Phonon-31M-EN-RTX3090.md`](./Gradium/Phonon-31M-EN-RTX3090.md) | English default-voice streaming TTS, B=1, TP=1 | 1x RTX 3090 24GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
 | [`higurashi-ai/Haru-4B-H200.md`](./higurashi-ai/Haru-4B-H200.md) | Live full-duplex spoken dialogue over `/v1/realtime?duplex=1` (character card + voice reference) | 1x NVIDIA H200 141GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
@@ -155,6 +156,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Tongyi-MAI/Z-Image-Turbo.md`](./Tongyi-MAI/Z-Image-Turbo.md) | Offline few-step text-to-image; online text-to-image and image-editing serving | 1x Intel Arc Pro B70 32GB / 1x RTX 5880 48GB |
 | [`Wan-AI/Wan2.2-T2V.md`](./Wan-AI/Wan2.2-T2V.md) | Text-to-video serving (Wan2.2 14B) with Skip-Softmax sparse attention | 8x H20/H100/A100 / 1x datacenter Blackwell (B200/B300) / 1x Intel Arc Pro B70 32GB |
 | [`Wan-AI/Wan2.2-TI2V-5B-A100.md`](./Wan-AI/Wan2.2-TI2V-5B-A100.md) | Unified 720p text-to-video and image-to-video serving (Wan2.2 5B) | 1x A100-SXM4-80GB |
+| [`Wan-AI/Wan2.2-TI2V-5B-RTX-PRO-4500.md`](./Wan-AI/Wan2.2-TI2V-5B-RTX-PRO-4500.md) | Unified 720p text-to-video and image-to-video serving (Wan2.2 5B) | 1x RTX PRO 4500 Blackwell 32GB |
 | [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md) | Image-to-video serving (Wan2.2 14B) | 8x Ascend NPU (A2/A3) |
 | [`Wan-AI/Wan2.2-S2V.md`](./Wan-AI/Wan2.2-S2V.md) | Speech-to-video serving (Wan2.2 14B) | 2x A100/H100 80GB |
 | [`Wan-AI/Wan2.1-VACE.md`](./Wan-AI/Wan2.1-VACE.md) | Unified T2V, I2V, V2LF, FLF2V, inpaint, and R2V | 1x RTX 5090 (1.3B) / 1x L40S 48GB with layerwise offload (14B) |
