@@ -1875,7 +1875,10 @@ class Cosmos3VFMTransformer(nn.Module):
             freqs_und = cos_und.unsqueeze(2), sin_und.unsqueeze(2)
 
         with self._offload_context("reasoner"):
-            full_kv = self.language_model(text_ids, freqs_und)
+            if self._und_graph is None:
+                full_kv = self.language_model(text_ids, freqs_und)
+            else:
+                full_kv = self._und_graph(text_ids=text_ids, freqs=freqs_und)
         # K/V stay replicated; framework Attention head-slices them through
         # joint_key/value when tensor parallelism is active.
         trimmed_kv = [(key[:, :max_real_len], value[:, :max_real_len]) for key, value in full_kv]
@@ -2134,13 +2137,11 @@ class Cosmos3VFMTransformer(nn.Module):
         # joint_key/value for Ulysses head-slicing in the attention backend.
         if cached_kv is None:
             cached_kv = self.cached_kv
-            if cached_kv is None:
-                raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-            # A local view: the stored cache (CFG branches, session state, PP
-            # transport) stays batch 1.
-            und_kv = _broadcast_und_kv(cached_kv, hidden_gen.shape[0])
-        else:
-            und_kv = cached_kv
+        if cached_kv is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        # A local view: the stored cache (CFG branches, session state, PP
+        # transport) stays batch 1.
+        und_kv = _broadcast_und_kv(cached_kv, hidden_gen.shape[0])
         if freqs_gen is None:
             hidden_gen, freqs_gen = self._shard_gen_inputs(hidden_gen)
         freqs_cos, freqs_sin = freqs_gen
@@ -2553,11 +2554,7 @@ class Cosmos3VFMTransformer(nn.Module):
             )
             self.cached_freqs_gen = freqs_gen
 
-            if need_kv and self._und_graph is not None:
-                with self._offload_context("reasoner"):
-                    full_kv = self._und_graph(text_ids=text_ids, freqs=freqs_und)
-                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in full_kv]
-            elif need_kv:
+            if need_kv:
                 self.cached_kv, encoded_text_len = self.encode_und_kv(
                     text_ids,
                     text_mask,
@@ -2691,7 +2688,7 @@ class Cosmos3VFMTransformer(nn.Module):
         dispatch here lets cache hits skip GEN without capturing cache decisions
         or residual history inside the graph.
         """
-        if self._gen_graph is not None and prep.hidden_gen.shape[0] == 1:
+        if self._gen_graph is not None:
             if prep.freqs_gen is None:
                 raise RuntimeError("Cosmos3 GEN inputs must go through _shard_gen_prep before the stack.")
             return self._gen_graph(
