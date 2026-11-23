@@ -42,7 +42,10 @@ def test_zimage(offline_client: OfflineOmniClient):
 # advanced_model: XPU broad 2-card stage only, as above.
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards={"cuda": 1, "xpu": 2})
+@hardware_test(
+    res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"},
+    num_cards={"cuda": 1, "rocm": 1, "xpu": 2},
+)
 @pytest.mark.parametrize("omni_runner", [(MODEL, None, {"diffusion_use_graph": True})], indirect=True)
 def test_zimage_denoise_graph(offline_client: OfflineOmniClient):
     def generate(prompt: str):

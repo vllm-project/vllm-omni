@@ -77,7 +77,7 @@ def _send_inpaint_with_generator(
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_flux2_klein_inpaint_deterministic(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
     seed = 12345
@@ -99,7 +99,7 @@ def test_flux2_klein_inpaint_deterministic(offline_client: OfflineOmniClient):
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_flux2_klein_inpaint_different_seeds_different_output(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
 

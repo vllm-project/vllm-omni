@@ -47,7 +47,7 @@ VARIANTS = {
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize(
     "_hardware",
-    [pytest.param(None, marks=hardware_marks(res={"cuda": "H100"}))],
+    [pytest.param(None, marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}))],
 )
 def test_sana_video_i2v_first_frame_latents_match_diffusers(variant: str, _hardware) -> None:
     del _hardware

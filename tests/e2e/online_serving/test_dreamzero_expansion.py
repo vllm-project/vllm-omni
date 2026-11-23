@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E online serving tests for DreamZero OpenPI websocket serving."""
 
@@ -87,7 +87,7 @@ def _validate_dreamzero_openpi_session(response: OpenPIWebSocketResponse) -> Non
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_dreamzero_openpi_online(omni_server, openai_client, tmp_path: Path) -> None:
     video_dir = tmp_path / "dreamzero_videos"
