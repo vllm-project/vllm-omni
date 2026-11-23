@@ -189,17 +189,62 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         return model_output
 
     def _add_legacy_forward_inputs(self, model_inputs: dict[str, Any], input_batch: Any) -> None:
-        """Supply forward-only metadata for pipelines not on the native plane."""
+        """Supply forward-only metadata for pipelines not on the native plane.
+
+        The three legacy keys are only meaningful to Omni pipelines, so they are
+        dropped here rather than inside a single dispatch path: PIECEWISE graph
+        replay and the K-step frame loop call ``self.model`` directly and would
+        otherwise hand a fixed core-style forward() keywords it cannot bind.
+        Only these injected keys are filtered; inputs produced by the model
+        state or the caller are left untouched.
+        """
         if self._omni_data_plane is not None:
             return
-        model_inputs.setdefault("sampling_metadata", getattr(input_batch, "sampling_metadata", None))
-        logits_index = getattr(
-            input_batch,
-            "logits_indices",
-            getattr(input_batch, "logits_index", None),
+        self._resolve_forward_signature()
+        legacy_inputs: dict[str, Any] = {
+            "sampling_metadata": getattr(input_batch, "sampling_metadata", None),
+            "logits_index": getattr(
+                input_batch,
+                "logits_indices",
+                getattr(input_batch, "logits_index", None),
+            ),
+            "sampler": self.sampler,
+        }
+        if not self._forward_accepts_var_kwargs and self._forward_param_names is not None:
+            legacy_inputs = {name: value for name, value in legacy_inputs.items() if name in self._forward_param_names}
+        for name, value in legacy_inputs.items():
+            model_inputs.setdefault(name, value)
+
+    def _resolve_forward_signature(self) -> None:
+        """Cache which keyword arguments the model's forward() accepts.
+
+        A model with a fixed core-style signature rejects the legacy inputs,
+        while a model that declares ``**kwargs`` (or whose signature cannot be
+        inspected) keeps receiving every input.
+        """
+        if self._forward_signature_resolved:
+            return
+        self._forward_signature_resolved = True
+        try:
+            forward = getattr(self.model, "forward", None)
+            if forward is None:
+                self._forward_accepts_var_kwargs = True
+                return
+            parameters = list(inspect.signature(forward).parameters.values())
+        except (TypeError, ValueError):
+            # A model may expose forward through a descriptor that raises, or
+            # one inspect cannot read. Keep the previous behaviour: send
+            # everything.
+            self._forward_accepts_var_kwargs = True
+            return
+        self._forward_accepts_var_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
         )
-        model_inputs.setdefault("logits_index", logits_index)
-        model_inputs.setdefault("sampler", self.sampler)
+        self._forward_param_names = frozenset(
+            parameter.name
+            for parameter in parameters
+            if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
 
     def _get_mm_embeddings(
         self,
@@ -1224,39 +1269,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
     def _call_model(self, model_inputs: dict[str, Any], *, input_batch: Any, batch_desc: Any) -> Any:
         """Invoke the model once; platform runners may override for frame loops."""
-        self._resolve_forward_signature()
-        if not self._forward_accepts_var_kwargs and self._forward_param_names is not None:
-            model_inputs = {name: value for name, value in model_inputs.items() if name in self._forward_param_names}
         return self.model(**model_inputs)
-
-    def _resolve_forward_signature(self) -> None:
-        """Cache which keyword arguments the model's forward() accepts.
-
-        Legacy AR inputs are only meant for Omni pipelines. A model with a fixed
-        core-style signature rejects them, while a model that declares
-        ``**kwargs`` (or whose signature cannot be inspected) keeps receiving
-        every input.
-        """
-        if self._forward_signature_resolved:
-            return
-        self._forward_signature_resolved = True
-        forward = getattr(self.model, "forward", None)
-        if forward is None:
-            self._forward_accepts_var_kwargs = True
-            return
-        try:
-            parameters = list(inspect.signature(forward).parameters.values())
-        except (TypeError, ValueError):
-            self._forward_accepts_var_kwargs = True
-            return
-        self._forward_accepts_var_kwargs = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
-        )
-        self._forward_param_names = frozenset(
-            parameter.name
-            for parameter in parameters
-            if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        )
 
     # ------------------------------------------------------------------
     # Request lifecycle: update intermediate buffer from cached requests

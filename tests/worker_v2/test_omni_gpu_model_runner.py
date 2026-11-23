@@ -1011,38 +1011,72 @@ def _legacy_inputs() -> tuple[dict[str, Any], SimpleNamespace]:
     return model_inputs, batch
 
 
-def test_call_model_filters_legacy_inputs_for_fixed_signature():
+def test_legacy_inputs_are_filtered_before_any_dispatch_path():
+    """PIECEWISE replay and the K-step loop call self.model directly.
+
+    Both bypass _call_model, so the filter has to happen where the keys are
+    injected. Feeding the assembled dict straight to the model is what
+    CudaGraphManager.run_pw_graph's default path does.
+    """
     model = _FixedSignatureModel()
     runner = _legacy_runner(model, native=False)
     model_inputs, batch = _legacy_inputs()
+
     runner._add_legacy_forward_inputs(model_inputs, batch)
-    assert {"sampling_metadata", "logits_index", "sampler"} <= set(model_inputs)
+    assert not ({"sampling_metadata", "logits_index", "sampler"} & set(model_inputs))
 
-    output = runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
-
+    output = model(**model_inputs)
     torch.testing.assert_close(output, torch.tensor([2.0, 6.0]))
     assert model.calls == 1
 
 
-def test_call_model_keeps_legacy_inputs_for_var_kwargs_model():
+def test_legacy_inputs_are_kept_for_var_kwargs_model():
     model = _VarKwargsModel()
     runner = _legacy_runner(model, native=False)
     model_inputs, batch = _legacy_inputs()
-    runner._add_legacy_forward_inputs(model_inputs, batch)
 
-    runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+    model(**model_inputs)
 
     assert model.seen is not None
     assert {"sampling_metadata", "logits_index", "sampler"} <= set(model.seen)
 
 
-def test_call_model_native_plane_never_adds_legacy_inputs():
+def test_native_plane_never_injects_legacy_inputs():
     model = _VarKwargsModel()
     runner = _legacy_runner(model, native=True)
     model_inputs, batch = _legacy_inputs()
-    runner._add_legacy_forward_inputs(model_inputs, batch)
 
-    runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+    model(**model_inputs)
 
     assert model.seen is not None
     assert not ({"sampling_metadata", "logits_index", "sampler"} & set(model.seen))
+
+
+def test_caller_supplied_inputs_are_never_filtered():
+    """The filter covers only the three injected keys, not model-state inputs."""
+    model = _FixedSignatureModel()
+    runner = _legacy_runner(model, native=False)
+    model_inputs, batch = _legacy_inputs()
+
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+
+    assert set(model_inputs) == {"input_ids", "positions", "inputs_embeds", "intermediate_tensors"}
+
+
+def test_forward_descriptor_that_raises_keeps_previous_behaviour():
+    """A raising descriptor must not break the call; fall back to passing all."""
+
+    class _RaisingForwardModel(torch.nn.Module):
+        @property
+        def forward(self):
+            raise TypeError("forward is not inspectable here")
+
+    model = _RaisingForwardModel()
+    runner = _legacy_runner(model, native=False)
+    model_inputs, batch = _legacy_inputs()
+
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+
+    assert {"sampling_metadata", "logits_index", "sampler"} <= set(model_inputs)
