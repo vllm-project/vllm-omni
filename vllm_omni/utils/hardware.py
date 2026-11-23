@@ -85,15 +85,58 @@ def _parse_mib(value: str) -> int | None:
         return None
 
 
+def _visible_gpu_tokens() -> list[str] | None:
+    """GPUs CUDA offers this process, or ``None`` when nothing is hidden.
+
+    A serving process honours ``CUDA_VISIBLE_DEVICES`` (and the container
+    runtime's ``NVIDIA_VISIBLE_DEVICES``), so a card hidden from it cannot be
+    used for serving and must not be recommended. CUDA treats an empty value
+    and ``-1`` as "no devices".
+    """
+    for variable in ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"):
+        raw = os.environ.get(variable)
+        if raw is None:
+            continue
+        raw = raw.strip()
+        if raw.lower() in ("all", ""):
+            return None if raw.lower() == "all" else []
+        if raw in ("-1",) or raw.lower() in ("none", "void"):
+            return []
+        return [token.strip() for token in raw.split(",") if token.strip()]
+    return None
+
+
+def _is_visible(index: int, uuid: str, tokens: list[str]) -> bool:
+    if str(index) in tokens or (uuid and uuid in tokens):
+        return True
+    # Entries may be abbreviated UUIDs, so compare the shorter prefix.
+    return any(
+        token.startswith("GPU-") and (uuid.startswith(token) or token.startswith(uuid)) for token in tokens if uuid
+    )
+
+
 def _from_nvidia_smi() -> list[Device]:
     """Read NVIDIA GPUs without importing torch; also covers `nvidia-smi` on WSL2."""
-    output = _run("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits")
+    output = _run("nvidia-smi", "--query-gpu=index,uuid,name,memory.total", "--format=csv,noheader,nounits")
+    tokens = _visible_gpu_tokens()
     devices: list[Device] = []
-    for line in (output or "").splitlines():
-        name, _, memory = line.rpartition(",")
-        if not name.strip():
+    for position, line in enumerate((output or "").splitlines()):
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) < 2:
             continue
-        devices.append(Device(kind="cuda", name=name.strip(), total_mib=_parse_mib(memory)))
+        if len(fields) >= 4:
+            index, uuid, memory = fields[0], fields[1], fields[-1]
+            name = ", ".join(fields[2:-1])
+        else:  # tolerate the older name,memory form
+            index, uuid, memory = "", "", fields[-1]
+            name = ", ".join(fields[:-1])
+        if not name:
+            continue
+        visible_index = int(index) if index.isdigit() else position
+        if tokens is not None and not _is_visible(visible_index, uuid, tokens):
+            logger.debug("skipping GPU %s (%s): not visible to this process", visible_index, name)
+            continue
+        devices.append(Device(kind="cuda", name=name, total_mib=_parse_mib(memory)))
     return devices
 
 
