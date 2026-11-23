@@ -191,7 +191,11 @@ class TestHeliosRoPEEquivalence:
 
     def test_npu_impl_adapts_to_fused_kernel_layout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The eligible path hands the fused NPU kernel a half-width interleaved table."""
-        hidden, freqs = _make_inputs(1, 16, 8, 64, dtype=torch.bfloat16)
+        # Production pairs bfloat16 activations with an fp32 frequency table, and
+        # ``_can_use_npu_impl`` admits no other combination. Building both at the
+        # same dtype would let a narrowing adapter pass this test unnoticed.
+        hidden, _ = _make_inputs(1, 16, 8, 64, dtype=torch.bfloat16)
+        _, freqs = _make_inputs(1, 16, 8, 64, dtype=torch.float32)
         rope = HeliosRotaryEmbedding()
         seen: dict[str, torch.Tensor] = {}
 
@@ -209,7 +213,10 @@ class TestHeliosRoPEEquivalence:
             # One half-width row per token, kept 4-D so it broadcasts over
             # batch and heads the way the fused kernel requires.
             assert cos.shape == sin.shape == (1, 16, 1, 32)
-            assert cos.dtype == sin.dtype == freqs.dtype
+            # The table must arrive at full precision: narrowing it to the
+            # activation dtype is exactly the rounding this revision removes.
+            assert freqs.dtype == torch.float32
+            assert cos.dtype == sin.dtype == torch.float32
             assert interleaved and half_head_dim
             seen["x"] = x
             return x
