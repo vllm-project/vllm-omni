@@ -1,0 +1,52 @@
+# LongCat-Next deploy: thinker (bf16, TP=4) + combined multi-decoder
+# stage on 4x A100-80GB. GPUs 0-2: thinker TP=4 bf16 (~37 GiB/GPU).
+# GPU 3: thinker rank 3 + multi_decoder (~57-61 GiB total, fits 80 GiB;
+# image ~15-20 GiB + audio ~3.33 GiB, both can be resident simultaneously).
+#
+# Uses the 2-stage longcat_next_thinker_multi_decoder pipeline. The 3-stage
+# thinker->image_decoder->audio_decoder pipeline is broken: the orchestrator
+# always forwards to src_stage_id + 1, ignoring declared input_sources, so
+# the audio decoder always gets image output. Collapsing both decoders into
+# one LongcatNextMultiDecoder stage sidesteps this at the root. See
+# modeling_longcat_next_multi_decoder.py for details.
+pipeline: longcat_next_thinker_multi_decoder
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    # >= 2 so a request's visual-CFG twin decodes in the same step as its
+    # parent (the model combines both streams' logits per step). With
+    # max_num_seqs=1 the twin decodes separately and CFG silently no-ops.
+    max_num_seqs: 2
+    tensor_parallel_size: 4
+    devices: "0,1,2,3"
+    trust_remote_code: true
+    enforce_eager: true
+    gpu_memory_utilization: 0.65
+    max_num_batched_tokens: 8192
+    max_model_len: 65536
+    default_sampling_params:
+      temperature: 0.4
+      top_k: 20
+      top_p: 0.85
+      max_tokens: 2048
+      repetition_penalty: 1.1
+      detokenize: true
+      ignore_eos: false
+
+  - stage_id: 1
+    model_stage: multi_decoder
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "3"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+platforms: {}
