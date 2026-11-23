@@ -29,8 +29,12 @@ def _native_ops():
         )
         return torch.ops.vllm_omni_h3_overlap
     except (ImportError, OSError, RuntimeError) as exc:
-        logger.warning("Using PyTorch for H3 head-group packing and restoration: %s", exc)
+        logger.warning("Native H3 head-group packing and restoration are unavailable: %s", exc)
         return None
+
+
+def has_native_transport() -> bool:
+    return _native_ops() is not None
 
 
 def _pack_torch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

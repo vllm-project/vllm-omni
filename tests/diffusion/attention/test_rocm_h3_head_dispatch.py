@@ -7,9 +7,32 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionImpl
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.models.minimax_h3 import head_overlap
+from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _allow_rocm_head_overlap
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize(
+    ("hip", "degrees", "extra", "expected"),
+    [
+        ("rocm", (4, 1, 1), {}, True),
+        ("rocm", (4, 1, 1), {"rocm_h3_head_overlap": False}, False),
+        ("rocm", (4, 1, 1), {"rocm_h3_head_overlap": True}, True),
+        ("rocm", (1, 1, 1), {}, False),
+        ("rocm", (2, 1, 1), {}, False),
+        ("rocm", (4, 2, 1), {}, False),
+        ("rocm", (4, 1, 2), {}, False),
+        (None, (4, 1, 1), {}, False),
+    ],
+)
+def test_auto_selection_depends_on_backend_and_topology(monkeypatch, hip, degrees, extra, expected):
+    monkeypatch.setattr(torch.version, "hip", hip)
+    usp, ring, gather = degrees
+    parallel = DiffusionParallelConfig(ulysses_degree=usp, ring_degree=ring, allgather_degree=gather)
+    config = SimpleNamespace(parallel_config=parallel, additional_config=extra)
+    assert _allow_rocm_head_overlap(config) is expected
 
 
 @pytest.fixture
@@ -35,6 +58,7 @@ def collective(monkeypatch):
     monkeypatch.setattr(head_overlap.dist, "get_world_size", lambda _: 4)
     monkeypatch.setattr(head_overlap, "get_ulysses_mode", lambda *, default: "strict")
     monkeypatch.setattr(head_overlap, "prepare_head_fmha", lambda device: object())
+    monkeypatch.setattr(head_overlap, "has_native_transport", lambda: True)
     monkeypatch.setattr(torch.cpu, "is_current_stream_capturing", lambda: False, raising=False)
 
     def prepare(*, bounds=(0, 37749, 37760), cut=37749, peer_cut=37749, expected_vote=37749, grad=False):
@@ -45,13 +69,13 @@ def collective(monkeypatch):
             votes.append(vote.tolist())
             # These two entries are the MIN of the other three ranks. A rank
             # that cannot participate sets the first entry to zero.
-            vote.copy_(torch.minimum(vote, vote.new_tensor([peer_cut, -peer_cut])))
+            vote.copy_(torch.minimum(vote, vote.new_tensor([peer_cut, -max(peer_cut, 0)])))
 
         monkeypatch.setattr(head_overlap.dist, "all_reduce", all_reduce)
         hidden = torch.empty((9440, 1), dtype=torch.bfloat16)
         with torch.set_grad_enabled(grad):
             accepted = head_overlap.prepare_overlap(blocks, hidden, torch.tensor(bounds, dtype=torch.int32), cut)
-        assert votes == [[expected_vote, -expected_vote]]
+        assert votes == [[expected_vote, -max(expected_vote, 0)]]
         return accepted
 
     return SimpleNamespace(prepare=prepare, layer=layer, strategy=strategy, impl=impl, blocks=blocks)
@@ -73,9 +97,18 @@ def test_gradients_veto_the_exchange_even_with_detached_hidden(collective):
     assert not collective.prepare(grad=True, expected_vote=0)
 
 
-def test_unavailable_native_kernel_vetoes_the_exchange(collective, monkeypatch):
+def test_missing_native_fmha_disables_future_probes_on_all_ranks(collective, monkeypatch):
     monkeypatch.setattr(head_overlap, "prepare_head_fmha", lambda device: None)
-    assert not collective.prepare(expected_vote=0)
+    assert collective.prepare(expected_vote=-1) is None
+
+
+def test_missing_native_transport_disables_future_probes_on_all_ranks(collective, monkeypatch):
+    monkeypatch.setattr(head_overlap, "has_native_transport", lambda: False)
+    assert collective.prepare(expected_vote=-1) is None
+
+
+def test_remote_missing_kernel_disables_future_probes_on_local_rank(collective):
+    assert collective.prepare(peer_cut=-1) is None
 
 
 def test_only_strict_ulysses_can_use_split_head_packets(collective, monkeypatch):

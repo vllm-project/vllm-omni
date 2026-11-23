@@ -7,6 +7,7 @@ import torch.distributed as dist
 
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.utils.rocm_h3_head_fmha import prepare_head_fmha
+from vllm_omni.diffusion.attention.parallel.rocm_h3_head_overlap import has_native_transport
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
@@ -42,14 +43,15 @@ def _supports_layer(owner, group) -> bool:
 
 
 @torch.compiler.disable
-def prepare_overlap(blocks, hidden: torch.Tensor, bounds: torch.Tensor, cut: int) -> bool:
-    """Vote once before the blocks. A missing kernel or invalid layout on any rank selects stock on all ranks."""
+def prepare_overlap(blocks, hidden: torch.Tensor, bounds: torch.Tensor, cut: int) -> bool | None:
+    """Vote once before the blocks. None disables future probes on this model if any rank lacks native kernels."""
     group = get_sp_group().ulysses_group
     if dist.get_world_size(group) != 4 or torch.get_device_module(hidden.device).is_current_stream_capturing():
         return False
 
     eligible = (
-        hidden.dtype == torch.bfloat16
+        cut in QUALIFIED_CUTS
+        and hidden.dtype == torch.bfloat16
         and hidden.shape[0] == 9440
         and bounds.shape == (3,)
         and bounds.device == hidden.device
@@ -61,17 +63,22 @@ def prepare_overlap(blocks, hidden: torch.Tensor, bounds: torch.Tensor, cut: int
         and not torch.are_deterministic_algorithms_enabled()
         and get_ulysses_mode(default="strict") == "strict"
         and all(_supports_layer(getattr(block, "attn", None), group) for block in blocks)
-        and prepare_head_fmha(hidden.device) is not None
     )
     # Include the device values in the vote. Shape and max_seqlen alone do not
     # establish the document boundary consumed by the grouped kernel.
     vote = torch.zeros(2, device=hidden.device, dtype=torch.int32)
-    if eligible and cut in QUALIFIED_CUTS:
-        matches = (bounds == bounds.new_tensor([0, cut, 37760])).all()
-        vote = torch.where(matches, bounds.new_tensor([cut, -cut]), vote)
-    # MIN yields (smallest cut, -largest cut). A zero vetoes the split.
+    if eligible:
+        if prepare_head_fmha(hidden.device) is None or not has_native_transport():
+            vote[0] = -1
+        else:
+            matches = (bounds == bounds.new_tensor([0, cut, 37760])).all()
+            vote = torch.where(matches, bounds.new_tensor([cut, -cut]), vote)
+    # MIN gives a shared outcome: missing kernel (-1), veto for this forward
+    # (0), or the smallest and negated largest cuts for the four ready ranks.
     dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
     smallest, negative_largest = vote.tolist()
+    if smallest == -1:
+        return None
     return smallest > 0 and smallest == -negative_largest
 
 
