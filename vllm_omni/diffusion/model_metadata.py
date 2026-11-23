@@ -199,7 +199,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=1,
         final_output_type="video",
     ),
-    "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LingBotVideoPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        additional_output_types=("image",),
+    ),
+    # World requires causal multi-frame blocks and does not support Video's T2I mode.
+    "LingBotWorldCausalDMDPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),
@@ -235,7 +240,6 @@ _DIFFUSION_MODEL_METADATA_ALIASES = {
     "LTX2TwoStagePipeline": "LTX2Pipeline",
     "LTX2DistilledOneStagePipeline": "LTX2DistilledPipeline",
     "LTX2DistilledTwoStagePipeline": "LTX2DistilledPipeline",
-    "LingBotWorldCausalDMDPipeline": "LingBotVideoPipeline",
     "BooguImageTurboPipeline": "BooguImagePipeline",
 }
 

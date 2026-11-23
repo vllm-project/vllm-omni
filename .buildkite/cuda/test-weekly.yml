@@ -276,7 +276,9 @@ steps:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0" > /tmp/gepard-overrides.txt
+          # NeMo also downgrades protobuf below the version used to generate
+          # the image's Google RPC stubs, which makes pytest fail at import.
+          - printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0" "protobuf>=6.33.6,<7" > /tmp/gepard-overrides.txt
           - uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" "nemo_toolkit[tts]==2.7.3" --overrides /tmp/gepard-overrides.txt
           - >-
             pytest -s -v tests/e2e/offline_inference/test_gepard_tts.py

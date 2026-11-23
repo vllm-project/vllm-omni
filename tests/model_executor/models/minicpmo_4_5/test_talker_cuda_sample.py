@@ -6,7 +6,7 @@ import torch
 from vllm.triton_utils import triton
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.models.minicpmo_4_5.talker_cuda_sample import _validate_argmax, sample
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import _sample_cuda
 
 pytestmark = [pytest.mark.core_model]
 
@@ -18,7 +18,7 @@ def test_cpu_fallback_preserves_rng():
     actual_rng = torch.Generator().manual_seed(27)
     for _ in range(20):
         expected = torch.multinomial(probabilities, 1, generator=expected_rng).reshape(1)
-        torch.testing.assert_close(sample(probabilities, actual_rng), expected)
+        torch.testing.assert_close(_sample_cuda(probabilities, actual_rng), expected)
     assert torch.equal(expected_rng.get_state(), actual_rng.get_state())
 
 
@@ -34,12 +34,12 @@ def test_cuda_sample_and_graph_preserve_tokens_and_rng(width, sparse):
     actual_rng = torch.Generator("cuda").manual_seed(987)
     for _ in range(100):
         expected = torch.multinomial(probabilities, 1, generator=expected_rng).reshape(1)
-        assert torch.equal(expected, sample(probabilities, actual_rng))
+        assert torch.equal(expected, _sample_cuda(probabilities, actual_rng))
     assert torch.equal(expected_rng.get_state(), actual_rng.get_state())
     graphs, outputs = [], []
     for fn in (
         lambda: torch.multinomial(probabilities, 1, generator=expected_rng).reshape(1),
-        lambda: sample(probabilities, actual_rng),
+        lambda: _sample_cuda(probabilities, actual_rng),
     ):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -58,6 +58,8 @@ def test_cuda_sample_and_graph_preserve_tokens_and_rng(width, sparse):
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -0.1, 0.0])
 def test_invalid_probability_flag(bad):
+    from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import _validate_argmax
+
     # Inspect the flag without poisoning the process with a device assertion.
     probabilities = torch.zeros((1, 6562), device="cuda")
     probabilities[0, 5] = bad

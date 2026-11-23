@@ -54,7 +54,7 @@ def test_cpu_preserves_gradients():
     x = torch.randn(3, requires_grad=True)
     graph(x, None).sum().backward()
     torch.testing.assert_close(x.grad, x.detach().cos())
-    assert not graph._runners
+    assert not graph._graph_runners.runners
 
 
 @pytest.mark.cpu
@@ -97,7 +97,7 @@ def test_optional_masks_stream_isolation_and_global_cap(monkeypatch):
     stream.npu_stream = 3
     assert graph(x, None) is None
     assert len(calls) == 2
-    assert len(graph._runners) == 2
+    assert len(graph._graph_runners.runners) == 2
 
 
 @pytest.mark.skipif(not hasattr(torch, "npu"), reason="torch-npu required")
@@ -114,4 +114,4 @@ def test_npu_replay_updates_mask_and_retains_outputs():
     torch.testing.assert_close(graph(x, mask), x.sin() + mask)
     torch.testing.assert_close(old, expected_old)
     torch.testing.assert_close(graph(x, None), x.sin())
-    assert sum(r.stats["captures"] for r in graph._runners.values()) == 2
+    assert graph._graph_runners.captures == 2

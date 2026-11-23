@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.dit_fused import (
     blocks_forward_chunk_fused,
     supports_fused_body,
 )

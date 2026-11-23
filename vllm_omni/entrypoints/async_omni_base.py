@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from collections.abc import AsyncGenerator, Iterable
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,7 @@ logger = init_logger(__name__)
 # A queued output wakes the final-output loop immediately; this wait only
 # bounds how often the orchestrator liveness check runs while idle.
 _FINAL_OUTPUT_WAIT_S = 1.0
+_SHUTDOWN_REASON = "server is shutting down"
 # Longest the final-output loop dispatches a batch before yielding the loop.
 _FINAL_OUTPUT_YIELD_INTERVAL_S = 0.001
 # Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
@@ -135,6 +137,9 @@ class AsyncOmniBase(OmniBase):
     def _initialize_async_frontend(self) -> None:
         """Attach engine metadata and the shared output pump without renderers."""
         self.final_output_task: asyncio.Task | None = None
+        self._output_loop: asyncio.AbstractEventLoop | None = None
+        self._output_loop_lock = threading.Lock()
+        self._frontend_shutting_down = False
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
         self.input_processor = self.engine.input_processor
@@ -390,12 +395,23 @@ class AsyncOmniBase(OmniBase):
 
     # ==================== Output Handler ====================
 
+    def _check_frontend_admission(self) -> None:
+        """Bind the serving loop before a request can park or register."""
+        # Serialize the first admission check with shutdown before any loop
+        # has been bound, even when no output pump has started.
+        if self._output_loop is None:
+            with self._output_loop_lock:
+                self._output_loop = asyncio.get_running_loop()
+        if self._frontend_shutting_down:
+            raise OmniEngineDeadError(_SHUTDOWN_REASON)
+
     def _final_output_handler(self) -> None:
         """Start the final output handler if not already running.
 
         This handler reads messages from the Orchestrator output queue and
         routes them to per-request asyncio.Queues.
         """
+        self._check_frontend_admission()
         if self.final_output_task is not None:
             return
 
@@ -618,11 +634,15 @@ class AsyncOmniBase(OmniBase):
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.get(rid)
-            input_stream_task = getattr(state, "input_stream_task", None)
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
+            self._cancel_input_pump(getattr(state, "input_stream_task", None))
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
+
+    @staticmethod
+    def _cancel_input_pump(task: asyncio.Task | None) -> None:
+        # A second cancel interrupts async cleanup inside the input iterator.
+        if task is not None and not task.done() and not task.cancelling():  # type: ignore[attr-defined]
+            task.cancel()
 
     @staticmethod
     def _synthetic_abort_output_message(
@@ -694,11 +714,74 @@ class AsyncOmniBase(OmniBase):
     # ==================== Shutdown ====================
 
     def shutdown(self, timeout: float | None = None) -> None:
-        """Shutdown the engine."""
+        """Shutdown the engine and release the frontend's request waiters."""
+        self._close_async_frontend()
+        OmniBase.shutdown(self, timeout)
+
+    def _close_async_frontend(self) -> None:
+        """Close admission and finish loop-owned cleanup before engine teardown."""
+        with self._output_loop_lock:
+            loop = self._output_loop
+            if loop is None:
+                # No output task or request can register before observing this.
+                self._frontend_shutting_down = True
+
+        if loop is not None:
+            try:
+                caller_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                caller_loop = None
+            if loop.is_running() and caller_loop is not loop:
+                self._shutdown_frontend_from_executor(loop)
+            else:
+                self._shutdown_frontend()
+
+    def _shutdown_frontend_from_executor(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Wait for the serving loop callback before engine teardown."""
+        finished = threading.Event()
+
+        def stop_frontend() -> None:
+            try:
+                self._shutdown_frontend()
+            finally:
+                finished.set()
+
+        try:
+            loop.call_soon_threadsafe(stop_frontend)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+            return
+        # The launcher awaits this executor call, leaving the serving loop free
+        # to deliver the errors. If the loop stops concurrently, no callback
+        # can run and the executor must still be able to release the engine.
+        while not finished.wait(timeout=0.1) and loop.is_running():
+            pass
+
+    def _shutdown_frontend(self) -> None:
+        """Close admission and stop the output pump on its owning loop."""
+        if self._frontend_shutting_down:
+            return
+        self._frontend_shutting_down = True
+
+        # No coroutine can register a request between this fan-out and
+        # cancellation. Each registered request can drain its own terminal error.
+        for req_state in list(self.request_states.values()):
+            req_state.queue.put_nowait(
+                ErrorMessage(error=_SHUTDOWN_REASON, fatal=True, request_id=req_state.request_id)
+            )
+            # generate() can be waiting for its first input before it starts
+            # reading the output queue. The pump may not have run yet.
+            first_chunk_submitted = req_state.first_chunk_submitted
+            if first_chunk_submitted is not None and not first_chunk_submitted.done():
+                first_chunk_submitted.set_result(None)
+            self._cancel_input_pump(req_state.input_stream_task)
+            for task in list(req_state.interaction_error_tasks):
+                task.cancel()
         if self.final_output_task is not None:
             self.final_output_task.cancel()
             self.final_output_task = None
-        for req_state in list(self.request_states.values()):
-            for task in list(getattr(req_state, "interaction_error_tasks", ())):
-                task.cancel()
-        OmniBase.shutdown(self)
+        self._on_frontend_shutdown()
+
+    def _on_frontend_shutdown(self) -> None:
+        """Wake any subclass-owned frontend waiters."""

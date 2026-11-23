@@ -181,7 +181,7 @@ def test_yue2_adapter_validation_rejects_invalid_requests(overrides, expected_fr
     assert all(fragment in error for fragment in expected_fragments)
 
 
-@pytest.mark.parametrize("cot,cfg_scale", [("full", 1), ("full", 1.5), ("off", 1.5)])
+@pytest.mark.parametrize("cot,cfg_scale", [("melody", 1), ("full", 1), ("full", 1.5), ("off", 1.5)])
 @pytest.mark.asyncio
 async def test_http_song_sampling_isolated_from_defaults(mocker, cot, cfg_scale):
     engine = mocker.Mock(
