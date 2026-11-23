@@ -109,6 +109,14 @@ def is_diffusers_rms_norm(module: Any) -> bool:
     )
 
 
+def _has_standard_forward(module: nn.Module, *installed: Callable) -> bool:
+    forward = module.forward
+    return getattr(forward, "__self__", None) is module and getattr(forward, "__func__", None) in (
+        type(module).forward,
+        *installed,
+    )
+
+
 def _has_forward_hooks(*modules: nn.Module | None) -> bool:
     """Whether calling any of ``modules`` would run forward hooks, so the call cannot be inlined.
 
@@ -675,13 +683,7 @@ def _run_cached_causal_conv(
     elif cache_x.shape[2] < CACHE_T and is_repeat_marker:
         cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
 
-    if (
-        return_bias
-        and isinstance(conv, WanDistCausalConv3d)
-        and _kernels_allowed(x)
-        and not conv._forward_hooks
-        and not conv._forward_pre_hooks
-    ):
+    if return_bias and isinstance(conv, WanDistCausalConv3d) and _kernels_allowed(x) and not _has_forward_hooks(conv):
         # Keep halo exchange and masking inside the distributed convolution;
         # consume its bias in the existing local norm/residual fusion kernels.
         out, bias = conv(x, payload, return_bias=True)
@@ -991,6 +993,9 @@ def resample_forward(
         and type(self.resample[0]) in (nn.Upsample, WanUpsample)
         and _is_nearest_2x(self.resample[0])
         and type(self.resample[1]) is WanDistConv2d
+        and _has_standard_forward(self.resample)
+        and _has_standard_forward(self.resample[0], upsample_forward)
+        and _has_standard_forward(self.resample[1])
         and not _has_forward_hooks(self.resample, *self.resample)
     ):
         fused = self.resample[1].forward_upsampled(x, return_bias=return_bias)

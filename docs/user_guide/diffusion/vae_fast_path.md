@@ -380,8 +380,8 @@ Wan spatial-shard decode supports both fast-path levels with height or width
 sharding. It reuses the single-GPU normalization, residual, upsampling, and
 causal-input kernels while keeping halo exchange inside distributed convolutions.
 Both Conv2d and Conv3d use shared halo exchange and output masking helpers.
-The channels-last path packs both outgoing halos in one launch and scatters
-both received halos in one launch, retaining channels-last NCCL buffers. It
+The channels-last path uses PyTorch tensor copies for halo exchange and retains
+channels-last NCCL buffers. It
 also computes attention only for local queries, with full-frame keys and values.
 For eligible BF16 channels-last inputs, nearest-2x upsampling writes directly
 into the padded Conv2d input before the existing halo exchange. Spatial 1x1
@@ -420,8 +420,8 @@ SDPA rounding; lossless keeps full-frame attention. Padded convolution outputs
 are masked in place only during inference, before any deferred bias
 can affect invalid positions.
 
-On four GB300 GPUs, Cosmos3-Nano VAE, BF16, 1280×720×189 frames, width sharding,
-the completed channels-last path measured:
+An earlier revision using paired halo kernels measured the following chunk-size
+tradeoff on four GB300 GPUs (Cosmos3-Nano VAE, BF16, 1280×720×189, width sharding):
 
 | Latent frames per chunk | Median decode | Peak allocated memory per GPU |
 | --- | --- | --- |

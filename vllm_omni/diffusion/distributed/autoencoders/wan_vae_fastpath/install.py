@@ -190,6 +190,8 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
         and parallel_mode.startswith("spatial_shard")
         and getattr(executor, "parallel_size", 1) > 1
         and (distributed_enabled is None or distributed_enabled())
+        and torch.distributed.is_initialized()
+        and executor.parallel_size == torch.distributed.get_world_size(getattr(executor, "group", None))
     ):
         setattr(vae, SPATIAL_LEVEL_ATTR, level)
         return _skip(level, "deferred until spatial-shard wrappers are installed")
