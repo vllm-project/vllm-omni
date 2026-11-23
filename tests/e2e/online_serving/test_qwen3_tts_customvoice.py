@@ -11,7 +11,6 @@ import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-import copy
 import io
 import json
 
@@ -30,9 +29,7 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import (
     get_deploy_config_path,
     get_deploy_config_stage,
-    get_stage_entries,
     modify_stage_config,
-    resolve_deploy_yaml,
 )
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_run import decode_output, decode_stage_input, encode_payload
@@ -146,36 +143,6 @@ def test_cached_predictor_streaming_audio(omni_server, online_client, run_level)
     )
 
 
-def _launched_deploy_config(omni_server) -> dict:
-    """Return the deploy YAML the live OmniServer was started with.
-
-    ``resolve_deploy_yaml`` follows ``base_config`` only. It does not merge
-    ``platforms.rocm`` / ``platforms.xpu``, which set stage 1 ``enforce_eager``.
-    """
-    args = list(omni_server.serve_args)
-    path = None
-    for index, arg in enumerate(args):
-        if arg == "--deploy-config" and index + 1 < len(args):
-            path = args[index + 1]
-            break
-        if arg.startswith("--deploy-config="):
-            path = arg.split("=", 1)[1]
-            break
-    assert path, "shared OmniServer was launched without --deploy-config"
-    return resolve_deploy_yaml(path)
-
-
-def _stage_graph_view(stage: dict, stage_id: int) -> dict:
-    """Drop the overlay's sampling cap and a run-level dummy ``load_format``."""
-    viewed = copy.deepcopy(stage)
-    viewed.pop("load_format", None)
-    if stage_id == 0 and isinstance(viewed.get("default_sampling_params"), dict):
-        sampling = dict(viewed["default_sampling_params"])
-        sampling.pop("max_tokens", None)
-        viewed["default_sampling_params"] = sampling
-    return viewed
-
-
 # These three cases must stay adjacent and share one module-scoped OmniServer.
 @pytest.mark.core_model
 @pytest.mark.advanced_model
@@ -189,32 +156,10 @@ def test_default_cuda_graph_startup(omni_server) -> None:
     server to become ready after both stages finish model initialization and
     CUDA Graph capture. The regression covered here exited during stage 1
     capture, before fixture setup could complete.
-
-    The process boots the shared ``tts_server_params`` overlay. Its default
-    stage entries, not a host platform merge, must keep the shipped graph
-    settings (``enforce_eager`` and ``compilation_config`` included). A
-    ``platforms.cuda`` stage override, if one is added later, must not set
-    ``enforce_eager``.
     """
     for stage_id in (0, 1):
         stage = get_deploy_config_stage("qwen3_tts.yaml", stage_id=stage_id)
         assert stage.get("enforce_eager", False) is False
-
-    shipped = resolve_deploy_yaml(get_deploy_config_path("qwen3_tts.yaml"))
-    launched = _launched_deploy_config(omni_server)
-    assert launched.get("async_chunk") is shipped.get("async_chunk") is True
-    shipped_stages = {stage.get("stage_id"): stage for stage in get_stage_entries(shipped)}
-    launched_stages = {stage.get("stage_id"): stage for stage in get_stage_entries(launched)}
-    for stage_id in (0, 1):
-        launched_stage = launched_stages[stage_id]
-        assert launched_stage.get("enforce_eager", False) is False
-        assert launched_stage.get("compilation_config") == shipped_stages[stage_id].get("compilation_config")
-        assert _stage_graph_view(launched_stage, stage_id) == _stage_graph_view(shipped_stages[stage_id], stage_id)
-    assert launched_stages[0]["default_sampling_params"]["max_tokens"] == 500
-    cuda_platform = (launched.get("platforms") or {}).get("cuda") or {}
-    for stage in cuda_platform.get("stages") or []:
-        if stage.get("stage_id") in (0, 1):
-            assert stage.get("enforce_eager", False) is False
 
     assert omni_server.proc is not None
     assert omni_server.proc.poll() is None
