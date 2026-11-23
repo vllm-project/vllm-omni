@@ -186,9 +186,18 @@ def npu_tile64_block_sparse_attention(
     # NaN for the whole row. Blocks with nothing to remove are masked before
     # the exponent instead.
     padded = KEY_BLOCK - pair_valid
-    removable = pair_map.repeat_interleave(TILE, dim=-2) & (padded > 0)
-    pad_mass = pad_mass.sub_(lse).masked_fill_(~removable, float("-inf")).exp_().mul_(padded.float())
-    pad_mass = pad_mass.sum(dim=-1, keepdim=True)
+    # The mask varies per query tile, not per row, so it is applied to a tiled
+    # view by broadcast. Expanding it to one entry per row would materialise
+    # two row-by-block boolean tensors, and at these shapes the correction is
+    # bound by the passes it makes over tensors that size, not by arithmetic.
+    removable = pair_map & (padded > 0)
+    pad_mass = pad_mass.sub_(lse)
+    # The view is a temporary of this statement alone. Holding it in a name
+    # past the reduction below would keep this buffer -- the largest the
+    # correction allocates -- alive while the fp32 output is allocated, which
+    # costs that much peak memory for nothing.
+    pad_mass.unflatten(2, (tiles, TILE)).masked_fill_(~removable.unsqueeze(-2), float("-inf"))
+    pad_mass = pad_mass.exp_().mul_(padded.float()).sum(dim=-1, keepdim=True)
     output = output.float() / (1 - pad_mass)
     # A query tile that enabled no key block with a valid key has nothing to attend.
     has_keys = pair_map.any(dim=-1)
