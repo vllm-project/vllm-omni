@@ -12,7 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
-from itertools import groupby
+from itertools import chain, groupby, zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
@@ -204,6 +204,7 @@ from .regenerate import (
     resolve_regenerate_adapter,
 )
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
+from .startup_lora import MiniMaxH3StartupLoRA, load_startup_peft_adapter
 from .time_request import (
     MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS,
     MINIMAX_H3_SHAPE_PLANNER,
@@ -709,6 +710,7 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    supports_startup_lora_fusion: ClassVar[bool] = True
     denoise_step_updates_state: ClassVar[bool] = True
     # DiT implementation constructed for the primary ``transformer``.
     # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
@@ -749,6 +751,45 @@ class MiniMaxH3Pipeline(
     _fasth3_checkpoint: FastH3CheckpointSpec | None = None
     # Set from --lora-path when it names an Open-H3-Regenerate release.
     _regenerate: MiniMaxH3RegenerateAdapter | None = None
+
+    _fixed_startup_lora: tuple[LoRARequest, float] | None = None
+    _startup_lora_fusion: MiniMaxH3StartupLoRA | None = None
+
+    def prepare_startup_lora(self) -> None:
+        """Parse the fixed adapter before original floating weights are streamed."""
+        if self._fixed_startup_lora is not None:
+            return
+        if self.partition == "combined":
+            raise ValueError("startup-merge requires one MiniMax-H3 partition; set --task-type fl2va or ref2va")
+        if self.lora_is_fused or self._fasth3_checkpoint is not None:
+            raise ValueError("startup-merge cannot be combined with an already fused/distilled checkpoint")
+        from vllm.lora.utils import get_adapter_absolute_path
+
+        from vllm_omni.lora.request import LoRARequest
+        from vllm_omni.lora.utils import stable_lora_int_id
+
+        path = get_adapter_absolute_path(self.od_config.lora_path)
+        request = LoRARequest("startup", stable_lora_int_id(path), path)
+        loaded = self._load_diffusion_lora_adapter(lora_request=request, lora_path=path, dtype=torch.float32)
+        if loaded is None:
+            model = load_startup_peft_adapter(path, request)
+        else:
+            model, _ = loaded
+        scale = self.od_config.lora_scale
+        native_spec = self._native_lora_specs.get(request.lora_int_id)
+        if native_spec is not None and native_spec.video_shift is not None and scale not in (0.0, 1.0):
+            raise ValueError("MiniMax-H3 native LoRA v2 requires lora_scale=1.0")
+        self._startup_lora_fusion = MiniMaxH3StartupLoRA(model, scale)
+        self._fixed_startup_lora = request, scale
+        logger.info("MiniMax-H3 startup LoRA will be fused into floating checkpoint weights before TP/quantization")
+
+    def _active_lora_adapters(self, sampling: OmniDiffusionSamplingParams) -> tuple[tuple[LoRARequest, float], ...]:
+        fixed = self._fixed_startup_lora
+        if fixed is None:
+            return filter_active_lora_adapters(sampling.lora_request, getattr(sampling, "lora_scale", 1.0))
+        if sampling.lora_request is not None:
+            raise OmniClientError("startup-merge uses a fixed LoRA; omit the request lora field")
+        return filter_active_lora_adapters(*fixed)
 
     def _load_diffusion_lora_adapter(
         self,
@@ -801,6 +842,9 @@ class MiniMaxH3Pipeline(
             lora_model, peft_helper, spec = native_loaded
             self._native_lora_specs[lora_request.lora_int_id] = spec
             return lora_model, peft_helper
+        if getattr(od_config, "lora_application", "runtime") == "startup-merge":
+            # Startup fusion falls back to the original PEFT factors.
+            return None
         return load_minimax_h3_native_adapter(
             transformer=self.transformer,
             lora_request=lora_request,
@@ -845,7 +889,7 @@ class MiniMaxH3Pipeline(
         constrains the task nor imposes its sampler contract.
         """
 
-        adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        adapters = self._active_lora_adapters(sampling)
         specs = [
             self._turbo_lora_specs[request.lora_int_id]
             for request, _ in adapters
@@ -873,7 +917,7 @@ class MiniMaxH3Pipeline(
 
     def _active_native_spec(self, sampling: Any) -> NativeDistilledLoRASpec | None:
         self._prune_native_lora_specs()
-        for request, _ in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale):
+        for request, _ in self._active_lora_adapters(sampling):
             if (spec := self._native_lora_specs.get(request.lora_int_id)) is not None:
                 return spec
         return None
@@ -887,7 +931,7 @@ class MiniMaxH3Pipeline(
                 f"MiniMax-H3 native LoRA task mismatch: active adapter requires task={spec.task!r}, got task={task!r}"
             )
         if spec.video_shift is not None and spec.audio_shift is not None:
-            for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale):
+            for request, scale in self._active_lora_adapters(sampling):
                 if self._native_lora_specs.get(request.lora_int_id) is spec and scale != 1.0:
                     raise OmniClientError("MiniMax-H3 native LoRA v2 requires lora_scale=1.0")
             extra = sampling.extra_args or {}
@@ -1465,7 +1509,12 @@ class MiniMaxH3Pipeline(
                 stream = self._fasth3.apply(stream)
             if getattr(component, "_adaln_sidecar_candidate", None) is not None:
                 stream = self._verify_adaln_weights(component, stream)
-            loaded = component.load_weights(stream)
+            if prefix == "transformer." and self._startup_lora_fusion is not None:
+                loaded = component.load_weights(stream, startup_lora=self._startup_lora_fusion)
+                self._startup_lora_fusion.validate()
+                self._startup_lora_fusion = None
+            else:
+                loaded = component.load_weights(stream)
             if prefix == "transformer.":
                 transformer_loaded = set(loaded)
             if prefix not in {"text_encoder.", "controlnet."}:
@@ -1512,7 +1561,92 @@ class MiniMaxH3Pipeline(
     @property
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
-        return self._fasth3 is not None or self._vdn is not None or self._regenerate is not None
+        return (
+            self._fixed_startup_lora is not None
+            or self._fasth3 is not None
+            or self._vdn is not None
+            or self._regenerate is not None
+        )
+
+    @torch.no_grad()
+    def warmup_startup_adaln_cache(self) -> None:
+        """Populate exact AdaLN results using the final, startup-fused modules."""
+        if self._fixed_startup_lora is None:
+            return
+        if self._startup_lora_fusion is not None:
+            raise RuntimeError("AdaLN warmup requires completed startup LoRA fusion")
+        cache = self.transformer.adaln_cache
+        if not cache.max_bytes:
+            return
+        if cache.offload_weights or resolve_offload_strategy(self.od_config) is not OffloadStrategy.NONE:
+            # With offload, weights reach their compute device through the
+            # normal request lifecycle, even if only the text encoder streams.
+            logger.info("MiniMax-H3 startup AdaLN cache will fill during requests with weight offload")
+            return
+        from .adaln_cache import MODES, schedule_contract, timestep_plans
+
+        sampling = OmniDiffusionSamplingParams()
+        spec = self._active_turbo_spec(sampling)
+        native_spec = self._active_native_spec(sampling)
+        tasks = {"ref2va"} if self.partition == "ref2va" else {"t2va", "fl2va"}
+        video_shift, audio_shift = self.default_video_shift, self.default_audio_shift
+        if native_spec is not None:
+            tasks.intersection_update({native_spec.task})
+            if native_spec.video_shift is not None and native_spec.audio_shift is not None:
+                video_shift, audio_shift = native_spec.video_shift, native_spec.audio_shift
+        if spec is not None:
+            tasks.intersection_update(spec.supported_tasks)
+            sampling.num_inference_steps = spec.denoise_steps
+            video_shift, audio_shift = spec.video_shift, spec.audio_shift
+        self._prepare_adaln_adapter(sampling)
+        projections = [block.adaln_proj for block in self.transformer.blocks]
+        projections.append(self.transformer.final_layer.adaln_proj)
+        device = next(self.transformer.time_embedder.parameters()).device
+        hits, misses = cache.hits, cache.misses
+        schedules = []
+        for mode in MODES:
+            task = "ref2va" if mode.startswith("ref2va") else mode
+            if task not in tasks:
+                continue
+            positions, steps = self._resolve_sigma_positions(task, sampling)
+            contract = schedule_contract(
+                mode=mode,
+                num_steps=steps,
+                base_schedule=positions,
+                flow_shift=video_shift,
+                audio_flow_shift=audio_shift,
+            )
+            schedules.append(timestep_plans(contract))
+
+        # Budget whole plans from the gathered BF16 output sizes. Using planned
+        # bytes keeps every TP rank on the same collective path, even if one
+        # rank cannot store a result. Round-robin avoids starving later modes.
+        bytes_per_row = torch.bfloat16.itemsize * sum(projection.linear.output_size for projection in projections)
+        bytes_left = cache.max_bytes
+        warmed_plans: set[tuple[float, ...]] = set()
+        plans = (plan for plan in chain.from_iterable(zip_longest(*schedules)) if plan is not None)
+        # The cache must own ordinary tensors even if startup is in inference mode.
+        with torch.inference_mode(False), torch.no_grad():
+            for plan in plans:
+                if bytes_left < bytes_per_row:
+                    break
+                plan_bytes = plan.numel() * bytes_per_row
+                if plan_bytes > bytes_left:
+                    continue
+                key = tuple(plan.tolist())
+                if key in warmed_plans:
+                    continue
+                warmed_plans.add(key)
+                bytes_left -= plan_bytes
+                embedding = self.transformer.time_embedder(plan.to(device))
+                cache.prepare(embedding)
+                for projection in projections:
+                    projection(embedding)
+        logger.info(
+            "MiniMax-H3 startup AdaLN cache warmed: %d projections computed, %d reused",
+            cache.misses - misses,
+            cache.hits - hits,
+        )
 
     def _configure_adaln_sidecar(
         self,
@@ -1528,6 +1662,10 @@ class MiniMaxH3Pipeline(
 
         from .adaln_cache import MiniMaxH3AdalnCache, file_digest
 
+        if getattr(self.od_config, "lora_application", "runtime") == "startup-merge":
+            # A teacher sidecar is verified against checkpoint tensors before
+            # startup fusion, so it cannot represent the final AdaLN weights.
+            return
         config = self.od_config.cache_config
         path = config.get(key) if isinstance(config, Mapping) else getattr(config, key, None)
         if path is None or not transformer.adaln_cache.max_bytes:
@@ -1586,8 +1724,7 @@ class MiniMaxH3Pipeline(
 
     def _prepare_adaln_adapter(self, sampling: OmniDiffusionSamplingParams) -> None:
         identity = tuple(
-            (request.lora_int_id, request.lora_path, scale)
-            for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+            (request.lora_int_id, request.lora_path, scale) for request, scale in self._active_lora_adapters(sampling)
         )
         if identity != getattr(self, "_adaln_adapter_identity", None):
             self._clear_adaln_caches()
@@ -4165,7 +4302,7 @@ class MiniMaxH3Pipeline(
         turbo: bool,
         native_lora: bool,
     ) -> None:
-        """Guides are validated against base weights and the full schedule only."""
+        """Validate the checkpoint, schedule and adapter constraints for timeline guides."""
         if cache_dit is not None:
             raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
         cache_backend = str(self.od_config.cache_backend or "none").lower()
@@ -4176,7 +4313,7 @@ class MiniMaxH3Pipeline(
         fasth3_omni = isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
         if self._fasth3 is not None or (self._fasth3_checkpoint is not None and not fasth3_omni):
             raise OmniClientError("MiniMax H3 timeline guides require base H3 weights or FastH3 Omni")
-        active_lora = bool(filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale))
+        active_lora = bool(self._active_lora_adapters(sampling))
         if turbo or native_lora or active_lora:
             raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
         if not fasth3_omni and self._sigma_schedule_for_request(sampling, task) is not None:

@@ -372,7 +372,7 @@ def load_minimax_h3_native_distilled_lora(
             return None
         if lora_application == "merged":
             raise ValueError(
-                "MiniMax-H3 native distilled LoRA requires --lora-application runtime; "
+                "MiniMax-H3 native distilled LoRA requires --lora-application runtime or startup-merge; "
                 "merged application cannot enforce the adapter's sampling contract"
             )
         version = metadata.get("native_format_version")

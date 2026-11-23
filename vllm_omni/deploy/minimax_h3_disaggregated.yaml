@@ -45,4 +45,3 @@ stages:
       from_stage_0: shared_memory_connector
     default_sampling_params:
       seed: 42
-      num_inference_steps: 50

@@ -38,7 +38,6 @@ stages:
       ulysses_degree: 4
       vae_patch_parallel_size: 1
     default_sampling_params:
-      num_inference_steps: 50
       seed: 42
   - stage_id: 2
     devices: "0,1,2,3"

@@ -1291,7 +1291,14 @@ def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
     assert loader.take_host_weight_plan() is plan
 
 
-def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
+@pytest.mark.parametrize(
+    ("application", "expected_calls"),
+    [
+        ("runtime", ["plan", "read", "load", "process"]),
+        ("startup-merge", ["prepare", "read", "load", "process"]),
+    ],
+)
+def test_dlo_ordinary_loader_preserves_startup_fusion(monkeypatch, application, expected_calls):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
     od_config = _loader_config(
@@ -1300,29 +1307,73 @@ def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
             data_parallel_size=1, sequence_parallel_size=1, use_hsdp=False, tensor_parallel_size=1
         ),
         quantization_config=None,
+        lora_application=application,
         diffusion_attention_schedule=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
         model="unused",
     )
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
-    model = nn.Module()
+
+    class StartupFusionPipeline(nn.Module):
+        supports_startup_lora_fusion = True
+
+    model = StartupFusionPipeline()
     model.transformer = nn.Linear(2, 2, bias=False)
     calls: list[str] = []
 
     loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
-    loader.load_weights = lambda _model: calls.append("load")  # type: ignore[method-assign]
     loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
     loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
-    monkeypatch.setattr(
-        loader_mod,
-        "build_checkpoint_mmap_plan",
-        lambda *_args, **_kwargs: HostWeightPlanResult(None, "not direct-compatible"),
-    )
+
+    def get_weights(_model):
+        calls.append("read")
+        return iter([("transformer.weight", torch.ones_like(model.transformer.weight))])
+
+    def load_weights(weights):
+        calls.append("load")
+        return {name for name, _ in weights}
+
+    def plan_direct_weights(*_args, **_kwargs):
+        calls.append("plan")
+        return HostWeightPlanResult(None, "not direct-compatible")
+
+    monkeypatch.setattr(loader, "get_all_weights", get_weights)
+    monkeypatch.setattr(model, "prepare_startup_lora", lambda: calls.append("prepare"), raising=False)
+    monkeypatch.setattr(model, "load_weights", load_weights, raising=False)
+    monkeypatch.setattr(loader_mod, "build_checkpoint_mmap_plan", plan_direct_weights)
 
     assert loader.load_model(load_device="cpu") is model
-    assert calls == ["load", "process"]
+    assert calls == expected_calls
     assert loader.take_host_weight_plan() is None
+
+
+@pytest.mark.parametrize("application", ["startup-merge", "runtime"])
+def test_taomate_inherited_hook_does_not_enable_startup_fusion(mocker, application):
+    from vllm_omni.diffusion.models.taomate_h3.pipeline import TaoMateH3Pipeline
+
+    od_config = _loader_config(
+        lora_application=application,
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = TaoMateH3Pipeline.__new__(TaoMateH3Pipeline)
+    nn.Module.__init__(model)
+    prepare = mocker.patch.object(model, "prepare_startup_lora")
+    read_weights = mocker.patch.object(loader, "get_all_weights", return_value=iter(()))
+    load = mocker.patch.object(model, "load_weights", return_value=set())
+
+    if application == "startup-merge":
+        with pytest.raises(ValueError, match="startup-merge is not supported by TaoMateH3Pipeline"):
+            loader.load_weights(model)
+        read_weights.assert_not_called()
+        load.assert_not_called()
+    else:
+        loader.load_weights(model)
+        read_weights.assert_called_once_with(model)
+        load.assert_called_once()
+    prepare.assert_not_called()
 
 
 def test_dlo_mmap_plan_with_distilled_lora_falls_back_to_ordinary_loader(monkeypatch):

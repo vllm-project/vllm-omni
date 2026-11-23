@@ -185,6 +185,26 @@ def normalize_pipeline_cli_overrides(
     """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
     normalized = dict(cli_overrides)
     selected_stage_id = normalized.get("stage_id") if normalized.get(SERVE_CLI_SCOPE_KEY) else None
+    startup_merge = normalized.get("lora_application") == "startup-merge"
+    if startup_merge and isinstance(selected_stage_id, int) and selected_stage_id < 0:
+        raise ValueError(
+            "--lora-application startup-merge cannot be used with --stage-id none. "
+            "Use the LoRA flags on the DiT process or configure them in its stage's deploy YAML or --stage-overrides."
+        )
+    startup_lora_stage_id = pipeline.startup_lora_stage_id
+    if startup_merge and startup_lora_stage_id is not None:
+        if isinstance(selected_stage_id, int) and selected_stage_id != startup_lora_stage_id:
+            raise ValueError(
+                f"--lora-application startup-merge is not used by stage {selected_stage_id} of "
+                f"pipeline {pipeline.model_type!r}. Use the LoRA flags on stage {startup_lora_stage_id} "
+                "or configure them in that stage's deploy YAML or --stage-overrides."
+            )
+        # A fixed adapter is fused only where the DiT checkpoint is loaded.
+        for name in ("lora_application", "lora_backend", "lora_path", "lora_scale"):
+            value = normalized.pop(name, None)
+            stage_key = f"stage_{startup_lora_stage_id}_{name}"
+            if value is not None and normalized.get(stage_key) is None:
+                normalized[stage_key] = value
     for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
         invalid_stage_keys = [
             key
@@ -482,6 +502,8 @@ class StagePipelineConfig:
     # scheduling. The scheduler only receives its typed effects.
     scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    # Admission count for step-capable stages, including streaming output.
+    step_execution_default_steps: int | None = None
 
 
 @dataclass(frozen=True)
@@ -537,6 +559,8 @@ class PipelineConfig:
     chat_template: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
+    # Owner of top-level startup-merge options in split diffusion pipelines.
+    startup_lora_stage_id: int | None = None
 
     def __post_init__(self) -> None:
         errors = self.get_validation_errors()
@@ -562,6 +586,10 @@ class PipelineConfig:
         if not self.stages:
             errors.append("Pipeline has no stages defined")
             return errors
+        if self.startup_lora_stage_id is not None:
+            owner = self.get_stage(self.startup_lora_stage_id)
+            if owner is None or owner.execution_type != StageExecutionType.DIFFUSION:
+                errors.append("startup_lora_stage_id must identify a diffusion stage")
         stage_ids = [s.stage_id for s in self.stages]
         if len(stage_ids) != len(set(stage_ids)):
             errors.append("Duplicate stage IDs found")
@@ -1686,6 +1714,7 @@ def merge_pipeline_deploy(
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
                 sampling_constraints=dict(ps.sampling_constraints),
+                step_execution_default_steps=ps.step_execution_default_steps,
                 yaml_engine_args=engine_args,
                 yaml_runtime=runtime,
                 yaml_extras=extras,
@@ -1719,6 +1748,7 @@ class StageConfig:
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    step_execution_default_steps: int | None = None
 
     def to_omegaconf(self) -> Any:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
@@ -1815,5 +1845,12 @@ class StageConfig:
         # Pass through extra YAML fields (default_sampling_params,
         # output_connectors, input_connectors, tts_args, etc.)
         config_dict.update(self.yaml_extras)
+        if self.step_execution_default_steps is not None and (
+            engine_args.get("step_execution") or engine_args.get("streaming_output")
+        ):
+            config_dict["default_sampling_params"] = {
+                "num_inference_steps": self.step_execution_default_steps,
+                **config_dict.get("default_sampling_params", {}),
+            }
 
         return create_config(config_dict)

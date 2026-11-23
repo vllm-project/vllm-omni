@@ -75,7 +75,6 @@ stages:
           method: int8
     default_sampling_params:
       seed: 42
-      num_inference_steps: 50
 
   - stage_id: 2 # independent VAE decoder on the 8 dies the encoder does not use
     devices: "8,9,10,11,12,13,14,15"

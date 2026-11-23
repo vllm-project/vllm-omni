@@ -175,13 +175,15 @@ def _v2_metadata(task: str) -> dict[str, str]:
     }
 
 
-def _native_pipeline(*, application="runtime", partition="fl2va"):
+def _native_pipeline(*, application="runtime", partition="fl2va", lora_path=None, lora_scale=1.0):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = OmniDiffusionConfig(lora_backend="peft", lora_application=application)
+    pipeline.od_config = OmniDiffusionConfig(
+        lora_backend="peft", lora_application=application, lora_path=lora_path, lora_scale=lora_scale
+    )
     pipeline.partition = partition
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline.transformer = torch.nn.Module()
@@ -212,6 +214,40 @@ def test_native_v2_fl2va_loads_on_combined_partition(tmp_path):
         pipeline._validate_native_sampling(sampling, task="ref2va")
     with pytest.raises(OmniClientError, match="active adapter requires task='fl2va', got task='ref2va'"):
         pipeline._resolve_task("ref2va", {}, turbo_spec=None, native_spec=parsed)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+@pytest.mark.parametrize("scale", [0.0, 0.5, 1.0])
+def test_native_v2_startup_keeps_adapter_sampling_contract(tmp_path, task, scale):
+    metadata = _v2_metadata(task)
+    spec = lora_module._parse_native_v2(metadata, task)
+    path = tmp_path / f"{task}.safetensors"
+    _write_tiny_native(path, metadata=metadata, spec=spec)
+    pipeline = _native_pipeline(application="startup-merge", partition=task, lora_path=str(path), lora_scale=scale)
+
+    if scale == 0.5:
+        with pytest.raises(ValueError, match="requires lora_scale=1"):
+            pipeline.prepare_startup_lora()
+        assert pipeline._startup_lora_fusion is None
+        return
+
+    pipeline.prepare_startup_lora()
+    assert pipeline._startup_lora_fusion is not None
+    sampling = OmniDiffusionSamplingParams()
+    if scale == 0.0:
+        assert pipeline._active_native_spec(sampling) is None
+        return
+
+    assert pipeline._active_native_spec(sampling) == spec
+    pipeline._validate_native_sampling(sampling, task=task)
+    assert pipeline._resolve_sigma_positions(task, sampling) == (
+        spec.schedule.base_schedule,
+        spec.schedule.num_inference_steps,
+    )
+    sampling.extra_args = {"audio_flow_shift": 4.0}
+    with pytest.raises(OmniClientError, match="requires audio_flow_shift=3"):
+        pipeline._validate_native_sampling(sampling, task=task)
 
 
 @pytest.mark.cpu
@@ -642,6 +678,14 @@ def test_pipeline_native_step_count_follows_adapter_schedule():
 
     pipeline._validate_native_sampling(
         SimpleNamespace(lora_request=request, lora_scale=1.0, num_inference_steps=2),
+        task="t2va",
+    )
+    pipeline._validate_native_sampling(
+        SimpleNamespace(
+            lora_request=[LoRARequest("inactive", 8, "/tmp/inactive.safetensors"), request],
+            lora_scale=[0.0, 1.0],
+            num_inference_steps=2,
+        ),
         task="t2va",
     )
     with pytest.raises(OmniClientError, match="num_inference_steps must be 2 or omitted, not 3"):
