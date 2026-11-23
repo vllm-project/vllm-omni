@@ -198,9 +198,9 @@ class DTPSScheduler:
         """Reorder the AR ``waiting`` queue by DTPS priority layers.
 
         L0: any request waiting > aging_s (FCFS)
-        L1: ar_downstream within budget
+        L1: ar_downstream within budget (num_prompt_tokens ASC)
         L2: remaining ar_only (FCFS)
-        L3: ar_downstream beyond budget
+        L3: ar_downstream beyond budget (num_prompt_tokens ASC)
         """
         inflight_running = 0
         if running is not None:

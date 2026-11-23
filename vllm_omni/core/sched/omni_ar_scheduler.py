@@ -2855,17 +2855,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
 
-        # [OmniDTPS] Remove the finished request's ar-only classification
-        # from the DTPS cache to prevent unbounded growth.
         if self._dtps is not None:
             self._dtps.evict_request(request_id)
-
-        # [OmniDTPS] A downstream (t2i/it2i) request leaving AR's running
-        # set: register its id into the DTPS blind-spot set so AR counts it
-        # as in-flight DiT load until a poll reports it. No-op when DTPS is
-        # disabled; idempotent.
-        if self._dtps is not None and self._should_transfer_kv_for_request(request_id):
-            self._dtps.register_finished_downstream(request_id)
+            # Use the DTPS ar-only classification (which checks
+            # omni_final_stage_id) rather than the KV connector's
+            # _should_transfer_kv_for_request, so blind tracking is
+            # decoupled from the KV connector's need_send_cache setting.
+            if not self._dtps._request_is_ar_only(request):
+                self._dtps.register_finished_downstream(request_id)
 
         if (
             getattr(self, "num_spec_tokens", 0) > 0

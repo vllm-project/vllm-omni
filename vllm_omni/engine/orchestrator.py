@@ -846,9 +846,7 @@ class OrchestratorBase:
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
-                # [OmniDTPS] Clean up DitLoadState when a diffusion replica
-                # is unregistered so stale load data is not reported to AR.
-                if self._dit_load_aware and self._dit_load_state is not None and msg.stage_id < len(self.stage_pools):
+                if self._dit_load_aware and self._dit_load_state is not None and msg.stage_id in {p["dit_stage_id"] for p in self._dtps_pairs}:
                     pool = self.stage_pools[msg.stage_id]
                     if pool.stage_type == "diffusion":
                         replica_id = pool.get_replica_id_by_addr(msg.input_addr)
@@ -1548,20 +1546,20 @@ class OrchestratorBase:
                                 idle = False
                                 continue
 
-                            # [OmniDTPS] Poll DiT load after draining the
-                            # output so the snapshot reflects the post-output
-                            # queue depth.
-                            if self._dit_load_aware:
+                            if self._dit_load_aware and stage_id in {p["dit_stage_id"] for p in self._dtps_pairs}:
                                 try:
-                                    await self._poll_dit_load_throttled(stage_id, pool, replica_id)
+                                    await self._poll_dit_load_throttled(
+                                        stage_id,
+                                        pool,
+                                        replica_id,
+                                    )
                                 except Exception:
                                     logger.debug(
-                                        "[Orchestrator] _poll_dit_load_throttled failed for stage-%s rep-%s",
+                                        "[Orchestrator] leagcy _poll_dit_load_throttled failed for stage-%s rep-%s",
                                         stage_id,
                                         replica_id,
                                         exc_info=True,
                                     )
-
                             if not is_diffusion_request_started_output(diffusion_output):
                                 diffusion_output = await pool.process_diffusion_output(diffusion_output)
                                 pool.record_output_timestamps([diffusion_output])
