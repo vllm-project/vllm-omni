@@ -490,6 +490,18 @@ source_file_dependencies:
     - tests/diffusion/ar_diffusion/
     - vllm_omni/experimental/ar_diffusion/
 
+  diffusion_pipeline_parallel_parity:
+    - tests/diffusion/distributed/test_pipeline_parallel.py
+    - tests/helpers/distributed.py
+    - tests/helpers/mark.py
+    - tests/conftest.py
+    - vllm_omni/diffusion/distributed/pipeline_parallel.py
+    - vllm_omni/diffusion/distributed/cfg_parallel.py
+    - vllm_omni/diffusion/distributed/parallel_state.py
+    - vllm_omni/diffusion/distributed/group_coordinator.py
+    - vllm_omni/diffusion/distributed/comm.py
+    - vllm_omni/platforms/
+
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
     - tests/diffusion/test_mossimage_rope.py
