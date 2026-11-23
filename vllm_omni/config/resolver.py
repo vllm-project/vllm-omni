@@ -14,7 +14,7 @@ from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_s
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
-from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS, PipelineConfig
+from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS, SERVE_CLI_SCOPE_KEY, PipelineConfig
 from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.registry import DiffusionModelRegistry, resolve_native_single_file
@@ -222,13 +222,17 @@ def resolve_omni_config(
     strategy_config_path: str | None,
 ) -> OmniConfigResolution:
     """Resolve registry/deploy inputs through the single public entrypoint."""
-    normalized_overrides = _convert_dataclasses_to_dict(dict(cli_overrides or {}))
+    raw_overrides = dict(cli_overrides or {})
+    scope_serve_stage_flags = raw_overrides.pop(SERVE_CLI_SCOPE_KEY, False)
+    normalized_overrides = _convert_dataclasses_to_dict(raw_overrides)
     normalized_overrides = with_trust_remote_code_override(normalized_overrides, trust_remote_code)
     native_single_file_model = resolve_native_single_file(normalized_overrides.get("model_class_name"))
     is_native_single_file = native_single_file_model is not None and Path(model).is_file()
     if is_native_single_file:
         normalized_overrides["model_class_name"] = native_single_file_model
     registry_overrides = dict(normalized_overrides)
+    if scope_serve_stage_flags:
+        registry_overrides[SERVE_CLI_SCOPE_KEY] = True
     filtered_stage_overrides = _flatten_stage_overrides(registry_overrides, stage_overrides)
 
     strategy_specs = _load_strategy_specs(strategy_config_path)

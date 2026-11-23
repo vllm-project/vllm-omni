@@ -672,6 +672,10 @@ class StreamingSpeechSessionConfig(BaseModel):
     language: str | None = None
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = Field(
+        default=None,
+        description="Target sample rate of the returned audio. If omitted, use the model's native sample rate.",
+    )
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(
@@ -696,6 +700,15 @@ class StreamingSpeechSessionConfig(BaseModel):
         max_length=_MAX_EMBEDDING_DIM,
         description="Pre-computed speaker embedding vector. Mutually exclusive with ref_audio.",
     )
+    # The fields below mean the same as on OpenAICreateSpeechRequest; the
+    # handler validates them by building that request at session.config time.
+    ref_audio_codes: list[list[StrictInt]] | None = None
+    ref_audio_2: str | None = None
+    ambient_sound: str | None = None
+    duration_seconds: float | None = Field(default=None, ge=0.0)
+    token_count: StrictInt | None = Field(default=None, gt=0, le=_INT64_MAX)
+    cache_salt: str | None = None
+    extra_params: dict[str, Any] | None = None
     stream_audio: bool = Field(
         default=False,
         description=(
@@ -749,4 +762,11 @@ class StreamingSpeechSessionConfig(BaseModel):
                     "WebSocket stream_audio=true currently requires speed=1.0; "
                     "native speed control is only available through HTTP streaming."
                 )
+        if (self.duration_seconds is not None or self.token_count is not None) and (
+            self.split_granularity != "none" or self.text_input_mode != "buffered"
+        ):
+            raise ValueError(
+                "duration_seconds and token_count set the length of a whole request, so they require "
+                "split_granularity='none' and text_input_mode='buffered'."
+            )
         return self

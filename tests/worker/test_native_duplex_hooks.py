@@ -405,10 +405,24 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     torch.nn.Module.__init__(model)
     model.model_stage = "llm"
     model.thinker = _Thinker()
-    output = model.forward(
+    batch = SimpleNamespace(
+        req_ids=["req-a", "req-b"],
+        num_reqs=2,
         input_ids=torch.tensor([1, 2, 3, 4]),
-        positions=torch.arange(4),
-        runtime_additional_information=[
+        positions=torch.tensor([0, 1, 1, 2]),
+        is_prefilling_np=np.array([True, True]),
+        num_computed_prefill_tokens_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([2, 2]),
+        prefill_len_np=np.array([2, 3]),
+    )
+    hidden = model.forward(input_ids=batch.input_ids, positions=batch.positions)
+    assert isinstance(hidden, torch.Tensor)
+    # MRv2 attaches request metadata from the live batch after forward/replay.
+    output = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=[
             {
                 "global_request_id": ["req-a"],
                 "duplex": {
@@ -426,6 +440,10 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
         ],
     )
 
+    assert output.text_hidden_states is hidden
+    assert output.multimodal_outputs["latent"] is hidden
+    torch.testing.assert_close(output.multimodal_outputs["latent_input_ids"], batch.input_ids[:, None])
+    torch.testing.assert_close(output.multimodal_outputs["latent_positions"], batch.positions[:, None])
     prompt_rows = output.multimodal_outputs["duplex_prompt_token_ids"]
     listen_rows = output.multimodal_outputs["meta"]["listen_token_id"]
     assert to_payload_element(prompt_rows, 0, 0, 2) == [101, 102]
@@ -784,9 +802,7 @@ def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffe
         # Keep the tiny fake processor's initial chunk unpadded to model carry.
         runtime._pad_first_audio_chunk_if_needed = lambda *args: None
         assert runtime._stage_prefill_embeddings_only(state, np.zeros(2, dtype=np.float32), seq=0)["success"] is False
-    first = runtime._stage_prefill_embeddings_only(
-        state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1, final=buffered
-    )
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1)
     assert first["input_token_ids"] == [1, 11, 2, 1, 11]
     assert state.window_units == []
     assert state.pending_window_unit.token_ids == first["input_token_ids"]
@@ -1729,7 +1745,6 @@ def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit(
         state,
         np.arange(8, dtype=np.float32),
         seq=1,
-        final=True,
     )
 
     assert result["success"] is True
@@ -1813,7 +1828,6 @@ def test_minicpmo_stage0_final_does_not_promote_first_chunk_alignment_tail_to_un
         state,
         np.zeros(8, dtype=np.float32),
         seq=3,
-        final=True,
     )
 
     assert first["input_token_ids"].count(1) == 1
@@ -1862,7 +1876,7 @@ def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_em
 
 
 def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.config import (
         patch_minicpmo_remote_config,
     )
 

@@ -12,7 +12,7 @@ import os
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from types import AsyncGeneratorType
@@ -86,6 +86,7 @@ from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics.definitions import SCHEDULER_QUEUE_WAIT_MS
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
     extract_diffusion_denoise_ms,
@@ -603,7 +604,7 @@ class DiffusionEngine:
                     **scheduler_metrics,
                 }
                 if request.scheduler_queue_wait_ms is not None:
-                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
+                    metrics_update[SCHEDULER_QUEUE_WAIT_MS] = request.scheduler_queue_wait_ms
                 vae_decode_ms = extract_diffusion_vae_decode_ms(output)
                 if vae_decode_ms is not None:
                     metrics_update["vae_decode_time_ms"] = vae_decode_ms
@@ -1922,6 +1923,20 @@ class DiffusionEngine:
             self._dummy_run()
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
+            self.close()
+            raise
+
+        additional_config = getattr(self.od_config, "additional_config", None) or {}
+        profiles = additional_config.get("helios_vae_warmup_profiles")
+        if profiles is None or (
+            isinstance(profiles, Sequence) and not isinstance(profiles, (str, bytes, Mapping)) and not profiles
+        ):
+            return
+
+        try:
+            self.collective_rpc(method="run_helios_vae_warmup")
+        except Exception as e:
+            logger.error(f"Helios VAE warmup failed: {e}")
             self.close()
             raise
 

@@ -1,4 +1,5 @@
-# Historical PersonaPlex profile; unavailable with vLLM 0.34 / V2-only execution.
+# Historical V1 profile. On vLLM 0.34 use personaplex_duplex_mrv2.yaml
+# with duplex mode and async_chunk enabled.
 # Configuration resolution rejects this profile because its Talker requires retired Model Runner V1.
 # Keep the V1 pin to fail explicitly; selecting V2 does not implement model support.
 # PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory chunk streaming.

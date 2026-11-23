@@ -37,6 +37,7 @@ from vllm_omni.core.sched.utils import (
 from vllm_omni.core.sched.utils import (
     streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
+from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
@@ -109,6 +110,10 @@ def _should_emit_engine_output(
         bool(getattr(model_config, "use_v2_model_runner", False))
         and bool(getattr(model_config, "async_chunk", False))
         and not bool(getattr(model_config, "final_output", False))
+        # Only suppress per-step IPC on stages that stream async outputs over a
+        # connector (e.g. Talker). Orchestrator-fed stages (e.g. Stage-0 ASR)
+        # still need their intermediate tokens to reach OutputProcessor.
+        and stage_sends_async_output(model_config)
     )
 
 
@@ -236,9 +241,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._thinker_ngram = is_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
-            from vllm.v1.spec_decode.ngram_proposer import _find_longest_matched_ngram_and_propose_tokens
+            from vllm_omni.core.sched.ngram_lookup import find_longest_matched_ngram_and_propose_tokens
 
-            self._scheduler_ngram = _find_longest_matched_ngram_and_propose_tokens
+            self._scheduler_ngram = find_longest_matched_ngram_and_propose_tokens
             self._ngram_min = self.vllm_config.speculative_config.prompt_lookup_min
             self._ngram_max = self.vllm_config.speculative_config.prompt_lookup_max
             # Compile the lookup before serving the first request.

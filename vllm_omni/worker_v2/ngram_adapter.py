@@ -61,6 +61,16 @@ class _SchedulerNgramSpeculator:
     num_query_per_req = 1
     num_extra_query_per_req = 0
 
+    # The scheduler tracks request state and context limits for this proposer.
+    def add_request(self, req_index: int) -> None:
+        pass
+
+    def on_requests_finished(self, finished_req_ids: set[str]) -> None:
+        pass
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        pass
+
     def init_cudagraph_manager(self, cudagraph_mode: object) -> None:
         pass
 
