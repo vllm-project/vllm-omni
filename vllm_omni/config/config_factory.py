@@ -278,13 +278,34 @@ class StageConfigFactory:
         except Exception as e:
             logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
 
+        # Fallback for weight-only local checkpoints without config.json (e.g.
+        # Magenta RealTime 2 bundles under checkpoints/mrt2_*.safetensors).
+        config_dir = Path(config_source)
+        if config_dir.is_dir():
+            if any(
+                (config_dir / rel).is_file()
+                for rel in (
+                    "checkpoints/mrt2_base.safetensors",
+                    "checkpoints/mrt2_small.safetensors",
+                    "mrt2_base.safetensors",
+                    "mrt2_small.safetensors",
+                )
+            ):
+                return "magenta_realtime"
+
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path
         # basename against registered pipeline keys — longest match wins
         # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9). Only
         # the basename is scanned so URI segments such as the bucket name
         # cannot select an unrelated pipeline.
-        return _match_pipeline_key(model, OMNI_PIPELINES.keys())
+        matched = _match_pipeline_key(model, OMNI_PIPELINES.keys())
+        if matched is not None:
+            return matched
+        basename = _name_match_candidate(model).lower().replace("-", "").replace("_", "")
+        if "magentart2" in basename or "mrt2" in basename:
+            return "magenta_realtime"
+        return None
 
     @classmethod
     def get_pipeline_config(
