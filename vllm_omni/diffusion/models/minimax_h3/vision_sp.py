@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Opt-in SP8 vision, preserving full replicated downstream output contracts.
+"""Opt-in vision sequence parallelism, preserving full replicated downstream output contracts.
 
 Batch is deliberately disabled. Weights and module boundaries remain owned by
 encoder.py, retaining its offloader hooks. Expanding the supported input layouts
@@ -46,7 +46,8 @@ def row_aligned_call(
     if local.ndim != 2 or local.shape[0] != indices.numel():
         raise ValueError("row-aligned vision input does not match its shard layout")
     full = local.new_zeros((count, local.shape[1]))
-    full.index_copy_(0, indices, local)
+    for begin, end, source in transport.row_copy_ranges(merged=merged):
+        full[begin:end].copy_(local[source : source + end - begin])
     return module(full).index_select(0, indices)
 
 
@@ -60,7 +61,7 @@ def segment_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torc
     return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
 
-def forward_sp8(
+def forward_vision_sp(
     model: MiniMaxH3Qwen3VLVisionModel,
     pixels: torch.Tensor,
     grid: torch.Tensor,
@@ -69,7 +70,9 @@ def forward_sp8(
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Shard whole spatial merger groups, exchange heads, then gather all outputs."""
     lengths = tuple(h * w for t, h, w in grid.cpu().tolist() for _ in range(t))
-    plan = build_vision_plan(lengths, 8, num_heads=model.config.num_heads, merge_size=model.spatial_merge_size)
+    plan = build_vision_plan(
+        lengths, dist.get_world_size(group), num_heads=model.config.num_heads, merge_size=model.spatial_merge_size
+    )
     transport = VisionAllToAll(plan, group=group)
     ids = plan.rank_token_indices[transport.rank]
     select = torch.tensor(ids, dtype=torch.long, device=pixels.device)
@@ -91,7 +94,7 @@ def forward_sp8(
     return gather_vision_outputs((final, deepstack), plan, group=group)
 
 
-def attention_sp8(
+def attention_vision_sp(
     attention: MiniMaxH3Qwen3VLVisionAttention,
     hidden: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],

@@ -642,18 +642,19 @@ def test_from_cli_args_preserves_text_encoder_tp_size():
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/7564
-def test_text_encoder_vision_sp_survives_engine_arg_filtering():
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_text_encoder_vision_sp_survives_engine_arg_filtering(size):
     from vllm_omni.config.config_factory import StageConfigFactory
 
-    args = OmniEngineArgs.from_cli_args(Namespace(text_encoder_tp_size=8, text_encoder_vision_sp_size=8))
-    assert args.text_encoder_vision_sp_size == 8
+    args = OmniEngineArgs.from_cli_args(Namespace(text_encoder_tp_size=size, text_encoder_vision_sp_size=size))
+    assert args.text_encoder_vision_sp_size == size
     stage = StageConfigFactory.create_default_diffusion(
         {
             "text_encoder_tp_size": args.text_encoder_tp_size,
             "text_encoder_vision_sp_size": args.text_encoder_vision_sp_size,
         }
     )[0]
-    assert stage["engine_args"]["parallel_config"]["text_encoder_vision_sp_size"] == 8
+    assert stage["engine_args"]["parallel_config"]["text_encoder_vision_sp_size"] == size
 
 
 def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():

@@ -657,10 +657,10 @@ class MiniMaxH3Qwen3VLVisionBlock(nn.Module):
             normalized = self.norm1(hidden_states)
             output = self.attn(normalized, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
         else:
-            from .vision_sp import attention_sp8, row_aligned_call
+            from .vision_sp import attention_vision_sp, row_aligned_call
 
             normalized = row_aligned_call(self.norm1, hidden_states, sequence_parallel)
-            output = attention_sp8(
+            output = attention_vision_sp(
                 self.attn, normalized, position_embeddings, sequence_parallel, _apply_rotary_pos_emb_vision
             )
         hidden_states = hidden_states + output
@@ -819,9 +819,9 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         group = self.sequence_parallel_group
         if group is not None:
-            from .vision_sp import forward_sp8
+            from .vision_sp import forward_vision_sp
 
-            return forward_sp8(self, hidden_states, grid_thw, group=group)
+            return forward_vision_sp(self, hidden_states, grid_thw, group=group)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds

@@ -115,6 +115,7 @@ class VisionAllToAll:
         self._permutation_device: torch.device | None = None
         self._permutation: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None
         self._row_layouts: dict[tuple[torch.device, bool], tuple[torch.Tensor, int]] = {}
+        self._copy_ranges: dict[bool, tuple[tuple[int, int, int], ...]] = {}
 
     def row_layout(self, device: torch.device, *, merged: bool = False) -> tuple[torch.Tensor, int]:
         """Return this rank's original row positions and full replicated row count."""
@@ -126,6 +127,20 @@ class VisionAllToAll:
                 sum(map(len, rows)),
             )
         return self._row_layouts[key]
+
+    def row_copy_ranges(self, *, merged: bool = False) -> tuple[tuple[int, int, int], ...]:
+        """Map local contiguous spans into their original global row positions."""
+        if merged not in self._copy_ranges:
+            rows = self.plan.rank_merger_indices if merged else self.plan.rank_token_indices
+            indices = rows[self.rank]
+            ranges = []
+            start = 0
+            for offset in range(1, len(indices) + 1):
+                if offset == len(indices) or indices[offset] != indices[offset - 1] + 1:
+                    ranges.append((indices[start], indices[offset - 1] + 1, start))
+                    start = offset
+            self._copy_ranges[merged] = tuple(ranges)
+        return self._copy_ranges[merged]
 
     def _permutation_for(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if device != self._permutation_device:
@@ -167,13 +182,13 @@ class VisionAllToAll:
 
 
 def resolve_vision_sp_group(value: int, encoder_group: _EncoderGroup | None) -> dist.ProcessGroup | None:
-    """Serve only the validated opt-in SP8/TP8 layout; never silently fall back."""
-    if type(value) is not int or value not in (1, 8):
-        raise ValueError("text_encoder_vision_sp_size must be 1 (replicated) or 8")
+    """Use the existing text encoder TP group for opt-in vision SP."""
+    if type(value) is not int or value not in (1, 2, 4, 8):
+        raise ValueError("text_encoder_vision_sp_size must be one of 1, 2, 4, 8")
     if value == 1:
         return None
-    if encoder_group is None or encoder_group.world_size != 8:
-        raise ValueError("text_encoder_vision_sp_size=8 requires text_encoder_tp_size=8")
+    if encoder_group is None or encoder_group.world_size != value:
+        raise ValueError(f"text_encoder_vision_sp_size={value} requires text_encoder_tp_size={value}")
     return encoder_group.device_group
 
 

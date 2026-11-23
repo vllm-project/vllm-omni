@@ -1235,10 +1235,10 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--text-encoder-vision-sp-size",
             type=int,
-            choices=[1, 8],
+            choices=[1, 2, 4, 8],
             default=None,
-            help="MiniMax-H3-only vision SP: 1 (replicated, default) or 8 "
-            "(requires --text-encoder-tp-size 8). "
+            help="MiniMax-H3-only vision SP: 1 (replicated, default), or 2/4/8 "
+            "(must match --text-encoder-tp-size). "
             "Equivalent to setting DiffusionParallelConfig.text_encoder_vision_sp_size.",
         )
         omni_config_group.add_argument(

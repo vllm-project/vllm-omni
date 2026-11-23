@@ -223,19 +223,15 @@ remaining flags stay unchanged.
 
 #### Qwen3-VL vision sequence parallelism
 
-MiniMax-H3 supports vision SP8 on Ascend NPU using the existing text encoder
-TP8 group. It is independent of DiT `--usp` / `--ring` and adds no devices.
+MiniMax-H3 vision SP on Ascend NPU reuses the local text encoder's TP group.
+It is independent of DiT `--usp` / `--ring` and adds no devices.
 
-Append to the serving command above:
-
-```bash
-  --text-encoder-vision-sp-size 8
-```
-
-Only `1` (default) and `8` are supported. SP8 requires
-`--text-encoder-tp-size 8` and a locally loaded text encoder. Python and deployment
-YAML use `text_encoder_vision_sp_size` in the diffusion `parallel_config`.
-Set the value to `1` and restart the server to disable vision SP8.
+Append `--text-encoder-vision-sp-size 8` to the TP8 serving command above.
+Available degrees are `1` (default), `2`, `4`, and `8`. An enabled degree must
+match `--text-encoder-tp-size`; for TP4, set the vision SP degree to `4`.
+Python and deployment YAML use
+`text_encoder_vision_sp_size` in the diffusion `parallel_config`.
+The default `1` leaves vision computation replicated.
 
 #### Cache-DiT
 

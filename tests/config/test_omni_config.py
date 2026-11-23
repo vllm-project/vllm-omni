@@ -1551,18 +1551,19 @@ def test_sub_config_fields_match_structured_scopes():
 
 
 @pytest.mark.parametrize("config_cls", [DiffusionParallelConfig, OmniStageDiffusionParallelConfig])
-@pytest.mark.parametrize("vision_sp_size", [0, 2, 4, 16, -1])
+@pytest.mark.parametrize("vision_sp_size", [0, 3, 16, -1])
 def test_vision_sp_config_rejects_unsupported_sizes(config_cls, vision_sp_size):
     with pytest.raises(ValueError, match="text_encoder_vision_sp_size"):
         config_cls(text_encoder_tp_size=8, text_encoder_vision_sp_size=vision_sp_size)
 
 
 @pytest.mark.parametrize("config_cls", [DiffusionParallelConfig, OmniStageDiffusionParallelConfig])
-def test_vision_sp_config_requires_tp8_without_adding_world_size(config_cls):
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_vision_sp_config_requires_matching_tp_without_adding_world_size(config_cls, size):
     assert config_cls().text_encoder_vision_sp_size == 1
-    with pytest.raises(ValueError, match="requires text_encoder_tp_size=8"):
-        config_cls(text_encoder_tp_size=4, text_encoder_vision_sp_size=8)
-    parallel = config_cls(ulysses_degree=8, text_encoder_tp_size=8, text_encoder_vision_sp_size=8)
+    with pytest.raises(ValueError, match=f"requires text_encoder_tp_size={size}"):
+        config_cls(text_encoder_tp_size=size // 2, text_encoder_vision_sp_size=size)
+    parallel = config_cls(ulysses_degree=8, text_encoder_tp_size=size, text_encoder_vision_sp_size=size)
     assert parallel.sequence_parallel_size == 8
     assert parallel.world_size == 8
 

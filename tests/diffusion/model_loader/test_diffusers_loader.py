@@ -976,13 +976,15 @@ class _ConfigAwareModel(nn.Module):
         self.od_config = od_config
 
 
-@pytest.mark.parametrize("vision_sp_size", [1, 8])
+@pytest.mark.parametrize("vision_sp_size", [1, 2, 4, 8])
 def test_initialize_model_sets_current_diffusion_config_during_model_construction(monkeypatch, vision_sp_size):
     import vllm_omni.diffusion.registry as registry_mod
 
     od_config = _loader_config(
         model_class_name="DummyPipeline",
-        parallel_config=DiffusionParallelConfig(text_encoder_tp_size=8, text_encoder_vision_sp_size=vision_sp_size),
+        parallel_config=DiffusionParallelConfig(
+            text_encoder_tp_size=max(vision_sp_size, 2), text_encoder_vision_sp_size=vision_sp_size
+        ),
         vae_use_slicing=False,
         vae_use_tiling=False,
     )

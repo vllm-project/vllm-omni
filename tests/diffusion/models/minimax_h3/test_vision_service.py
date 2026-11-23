@@ -25,18 +25,21 @@ def load_module():
     return module
 
 
-def _collective_worker(rank, rendezvous):
+def _collective_worker(rank, rendezvous, size):
     """Exercise actual CPU collectives without loading the serving runtime."""
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=size, timeout=timedelta(seconds=30))
     try:
         module = load_module()
         for lengths in ((12, 4, 20), (4,), (0, 0)):
-            plan = module.build_vision_plan(lengths, 2, num_heads=4)
-            full = torch.arange(sum(lengths) * 8, dtype=torch.float32).reshape(sum(lengths), 4, 2)
+            plan = module.build_vision_plan(lengths, size, num_heads=16)
+            full = torch.arange(sum(lengths) * 32, dtype=torch.float32).reshape(sum(lengths), 16, 2)
+            heads_per_rank = 16 // size
             local = full[list(plan.rank_token_indices[rank])]
             transport = module.VisionAllToAll(plan, group=dist.group.WORLD)
             heads = transport.to_heads(local)
-            torch.testing.assert_close(heads, full[:, rank * 2 : (rank + 1) * 2], rtol=0, atol=0)
+            torch.testing.assert_close(
+                heads, full[:, rank * heads_per_rank : (rank + 1) * heads_per_rank], rtol=0, atol=0
+            )
             restored = transport.to_tokens(heads)
             torch.testing.assert_close(restored, local, rtol=0, atol=0)
             assert transport.calls == 2
@@ -53,8 +56,9 @@ def _collective_worker(rank, rendezvous):
 
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="Gloo is required")
-def test_real_collectives_preserve_uneven_empty_and_deepstack_layouts(tmp_path):
-    mp.spawn(_collective_worker, args=((tmp_path / "vision-rendezvous").as_uri(),), nprocs=2, join=True)
+@pytest.mark.parametrize("size", [2, 4])
+def test_real_collectives_preserve_uneven_empty_and_deepstack_layouts(tmp_path, size):
+    mp.spawn(_collective_worker, args=((tmp_path / "vision-rendezvous").as_uri(), size), nprocs=size, join=True)
 
 
 def test_transport_uses_explicit_encoder_group(monkeypatch):
@@ -98,23 +102,24 @@ def test_full_output_gather_restores_global_merger_order(monkeypatch):
     assert torch.equal(torch.stack([final, *deep]), full)
 
 
-@pytest.mark.parametrize("value", [0, 2, 4, 16, -1, "8", "yes", True, None])
+@pytest.mark.parametrize("value", [0, 3, 16, -1, "8", "yes", True, None])
 def test_service_rejects_unsupported_sp_size(mocker, value):
     m = load_module()
     with pytest.raises(ValueError):
         m.resolve_vision_sp_group(value, mocker.Mock(world_size=8, device_group=object()))
 
 
-def test_service_is_opt_in_and_requires_exact_tp8(mocker):
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_service_is_opt_in_and_requires_matching_tp(mocker, size):
     m = load_module()
     assert m.resolve_vision_sp_group(1, None) is None
-    group = mocker.Mock(world_size=8, device_group=object())
+    group = mocker.Mock(world_size=size, device_group=object())
     assert m.resolve_vision_sp_group(1, group) is None
-    assert m.resolve_vision_sp_group(8, group) is group.device_group
+    assert m.resolve_vision_sp_group(size, group) is group.device_group
     with pytest.raises(ValueError):
-        m.resolve_vision_sp_group(8, mocker.Mock(world_size=4))
+        m.resolve_vision_sp_group(size, mocker.Mock(world_size=size // 2))
     with pytest.raises(ValueError):
-        m.resolve_vision_sp_group(8, None)
+        m.resolve_vision_sp_group(size, None)
 
 
 def test_empty_rank_shard_keeps_explicit_hidden_dimension(mocker):
@@ -123,7 +128,9 @@ def test_empty_rank_shard_keeps_explicit_hidden_dimension(mocker):
 
     path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/vision_sp.py"
     tree = ast.parse(path.read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "attention_sp8")
+    function = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "attention_vision_sp"
+    )
     aligned = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "row_aligned_call")
     namespace = {"torch": torch, "segment_attention": lambda q, k, v: v}
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
@@ -135,9 +142,10 @@ def test_empty_rank_shard_keeps_explicit_hidden_dimension(mocker):
         to_heads=lambda x: x.new_zeros((4, 2, 2)),
         to_tokens=lambda x: x.new_empty((0, 16, 2)),
         row_layout=lambda device, merged=False: (torch.empty(0, dtype=torch.long, device=device), 4),
+        row_copy_ranges=lambda merged=False: (),
     )
     hidden = torch.empty(0, 32)
-    result = namespace["attention_sp8"](attention, hidden, (None, None), transport, lambda q, k, c, s: (q, k))
+    result = namespace["attention_vision_sp"](attention, hidden, (None, None), transport, lambda q, k, c, s: (q, k))
     assert result.shape == (0, 32)
 
 
@@ -156,14 +164,14 @@ def load_row_aligned_call():
     return namespace["row_aligned_call"]
 
 
-@pytest.mark.parametrize("rank", [0, 1, 7])
+@pytest.mark.parametrize("size,rank", [(2, 0), (2, 1), (4, 0), (4, 3), (8, 0), (8, 1), (8, 7)])
 @pytest.mark.parametrize("lengths", [(4,), (12, 4, 20), (0, 0)])
 @pytest.mark.parametrize("merged", [False, True])
-def test_original_row_layout_is_cached_metadata_only(monkeypatch, rank, lengths, merged):
+def test_original_row_layout_is_cached_metadata_only(monkeypatch, size, rank, lengths, merged):
     module = load_module()
     monkeypatch.setattr(module.dist, "get_rank", lambda group=None: rank)
-    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 8)
-    plan = module.build_vision_plan(lengths, 8)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: size)
+    plan = module.build_vision_plan(lengths, size)
     transport = module.VisionAllToAll(plan)
     positions, count = transport.row_layout(torch.device("cpu"), merged=merged)
     rows = plan.rank_merger_indices if merged else plan.rank_token_indices
@@ -171,16 +179,22 @@ def test_original_row_layout_is_cached_metadata_only(monkeypatch, rank, lengths,
     assert count == sum(map(len, rows))
     assert positions.dtype == torch.long
     assert transport.row_layout(torch.device("cpu"), merged=merged)[0] is positions
+    ranges = transport.row_copy_ranges(merged=merged)
+    assert [row for begin, end, _source in ranges for row in range(begin, end)] == list(rows[rank])
+    assert [row for begin, end, source in ranges for row in range(source, source + end - begin)] == list(
+        range(len(rows[rank]))
+    )
+    assert transport.row_copy_ranges(merged=merged) is ranges
     assert transport.calls == 0 and transport.sent_bytes == 0
 
 
-@pytest.mark.parametrize("rank", [0, 1, 7])
+@pytest.mark.parametrize("size,rank", [(2, 0), (2, 1), (4, 0), (4, 3), (8, 0), (8, 1), (8, 7)])
 @pytest.mark.parametrize("merged", [False, True])
-def test_row_aligned_kernel_retains_original_shape_and_positions(monkeypatch, rank, merged):
+def test_row_aligned_kernel_retains_original_shape_and_positions(monkeypatch, size, rank, merged):
     module = load_module()
     monkeypatch.setattr(module.dist, "get_rank", lambda group=None: rank)
-    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 8)
-    transport = module.VisionAllToAll(module.build_vision_plan((12, 4, 20), 8))
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: size)
+    transport = module.VisionAllToAll(module.build_vision_plan((12, 4, 20), size))
     indices, count = transport.row_layout(torch.device("cpu"), merged=merged)
     full = torch.arange(count * 3).reshape(count, 3).float()
 
@@ -194,6 +208,11 @@ def test_row_aligned_kernel_retains_original_shape_and_positions(monkeypatch, ra
     kernel = LayoutSensitiveKernel()
     expected = kernel(full).index_select(0, indices)
     local = full.index_select(0, indices)
+
+    def reject_scatter(*_args, **_kwargs):
+        raise AssertionError("row alignment must copy contiguous spans without generic scatter")
+
+    monkeypatch.setattr(torch.Tensor, "index_copy_", reject_scatter)
     actual = load_row_aligned_call()(kernel, local, transport, merged=merged)
     assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
     if indices.numel():

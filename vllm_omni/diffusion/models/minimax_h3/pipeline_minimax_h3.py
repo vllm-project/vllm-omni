@@ -694,6 +694,16 @@ class _SingleRankEncoderGroup:
         self.device_group = None
 
 
+class _NonMemberEncoderGroup:
+    """Metadata for DiT ranks that do not run text-encoder collectives."""
+
+    def __init__(self, ranks: list[int]) -> None:
+        self.ranks = ranks
+        self.world_size = len(ranks)
+        self.rank_in_group = -1
+        self.device_group = None
+
+
 class MiniMaxH3Pipeline(
     nn.Module,
     DenoiseProgressMixin,
@@ -1644,6 +1654,12 @@ class MiniMaxH3Pipeline(
         if text_encoder_tp_size == 1:
             return _SingleRankEncoderGroup(rank=self._dit_rank)
         ranks = list(range(text_encoder_tp_size))
+        if self._dit_rank not in ranks:
+            # Match GroupCoordinator's device/CPU group creation order on all
+            # ranks without constructing its member-only wrapper here.
+            dist.new_group(ranks, backend=current_omni_platform.dist_backend)
+            dist.new_group(ranks, backend="gloo")
+            return _NonMemberEncoderGroup(ranks)
         return init_world_group(
             ranks=ranks,
             local_rank=envs.LOCAL_RANK,

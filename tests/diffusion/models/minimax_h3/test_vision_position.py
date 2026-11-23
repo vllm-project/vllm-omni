@@ -161,13 +161,14 @@ def extracted_module(*nodes: ast.stmt) -> ast.Module:
     return ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[]))
 
 
-def sp_namespace(mocker, rank):
+def sp_namespace(mocker, rank, size):
     path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/vision_sp.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    method = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "forward_sp8")
+    method = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "forward_vision_sp")
     parallel = load_module()
     namespace = {
         "torch": torch,
+        "dist": mocker.Mock(get_world_size=mocker.Mock(return_value=size)),
         "build_vision_plan": parallel.build_vision_plan,
         "VisionAllToAll": lambda *args, **kwargs: mocker.Mock(rank=rank),
         "gather_vision_outputs": lambda result, *args, **kwargs: result,
@@ -176,9 +177,11 @@ def sp_namespace(mocker, rank):
     return namespace
 
 
-@pytest.mark.parametrize("rank", [0, 7])
-def test_sp8_position_dispatches_only_local_tokens(mocker, rank):
-    namespace = sp_namespace(mocker, rank)
+@pytest.mark.parametrize("size", [2, 4, 8])
+@pytest.mark.parametrize("last_rank", [False, True])
+def test_vision_sp_position_dispatches_only_local_tokens(mocker, size, last_rank):
+    rank = size - 1 if last_rank else 0
+    namespace = sp_namespace(mocker, rank, size)
     model = mocker.Mock(
         pos_embed=torch.nn.Embedding(49, 4),
         num_grid_per_side=7,
@@ -205,9 +208,11 @@ def test_sp8_position_dispatches_only_local_tokens(mocker, rank):
 
     model.patch_embed = patch_embed
     pixels, grid = torch.zeros(24, 4), torch.tensor([[2, 2, 6]])
-    result, deep = namespace["forward_sp8"](model, pixels, grid, group=None)
+    group = object()
+    result, deep = namespace["forward_vision_sp"](model, pixels, grid, group=group)
+    namespace["dist"].get_world_size.assert_called_once_with(group)
     assert patch_shapes == [(24, 4)]
-    ids = namespace["build_vision_plan"]((12, 12), 8).rank_token_indices[rank]
+    ids = namespace["build_vision_plan"]((12, 12), size).rank_token_indices[rank]
     assert_bytes(result, reference_interpolate(model, grid)[list(ids)])
     assert deep == []
     assert calls == [{"token_indices": ids}]
