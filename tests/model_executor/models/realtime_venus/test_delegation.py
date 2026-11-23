@@ -45,3 +45,11 @@ def test_limit_allows_split_closing_tag():
     parser = DelegateParser()
     assert parser.feed("<delegate>" + "x" * 4000 + "</delega") is None
     assert parser.feed("te>") == "x" * 4000
+
+
+def test_repeated_span_while_waiting_for_backend_is_one_call():
+    parser = DelegateParser()
+    assert parser.feed("<delegate>lookup inventory</delegate>") == "lookup inventory"
+    assert parser.feed("<delegate>lookup ") is None
+    assert parser.feed("inventory</delegate>", end_of_turn=True) is None
+    assert not parser.failed

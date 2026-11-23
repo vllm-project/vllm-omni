@@ -173,7 +173,8 @@ the question correctly.
 The default **duplex** server maps a complete `<delegate>...</delegate>` span
 to a Realtime `function_call` named `delegate`, with JSON arguments
 `{"question": "the model's natural-language task"}`. It accepts one delegation
-per model turn, including spans split across audio units. The original span
+per model turn, including spans split across audio units. Repeating the same
+span while waiting does not execute the tool again. The original span
 remains in text output and is excluded from speech.
 
 The application executes the task and returns a `function_call_output` with
@@ -243,8 +244,8 @@ python -m vllm_omni.clients.tool_calls \
   --url 'ws://127.0.0.1:8091/v1/realtime?duplex=1' \
   --model ./Realtime-Venus/Realtime-Venus-Omni \
   --tools-json tools.json --handler delegate=tool_handlers:delegate \
-  --initial-user-text 'Use <delegate>add 12 and 30</delegate> to ask the backend, then answer using its result.' \
-  --timeout 60
+  --initial-user-text 'Ask the backend to add 12 and 30. Delegate the calculation instead of doing it yourself.' \
+  --timeout 60 --output-wav answer.wav
 ```
 
 ### Look up local inventory
@@ -270,10 +271,12 @@ Record “Please check the widget inventory with the backend” as mono PCM16 at
 --input-wav /path/to/inventory-question.wav
 ```
 
-The generic CLI prints JSON events and requests text output. For speech output,
-use `DuplexToolRunner(client, {"delegate": delegate}).run()` alongside your
-existing duplex audio playback loop, request `modalities=("text", "audio")`,
-and acknowledge audio actually played. Handler failures send
+The generic CLI prints JSON events, requests text and audio for native input,
+and saves speech with `--output-wav`. It uses `commit_all_on_done` for this
+recording workflow. In an interactive application, run
+`DuplexToolRunner(client, {"delegate": delegate}).run()` alongside your
+audio playback loop, use `playback_commit_policy="ack_only"`, and acknowledge
+audio actually played. Handler failures send
 `function_call.cancel` with reason `failed`; they are not returned as invented
 business results. Stop the runner when closing the session so in-flight handlers
 are cancelled.

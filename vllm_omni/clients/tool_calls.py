@@ -306,7 +306,7 @@ def main() -> None:
     from importlib import import_module
     from pathlib import Path
 
-    from vllm_omni.clients.duplex import DuplexClient, SessionConfig, read_pcm16_wav
+    from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig, read_pcm16_wav, write_pcm16_wav
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
@@ -318,6 +318,7 @@ def main() -> None:
     inputs.add_argument("--input-wav", help="Stream mono PCM16 at 16 kHz to a native-duplex model")
     inputs.add_argument("--initial-user-text", help="Seed a native-duplex session, then stream silence")
     parser.add_argument("--instructions", help="Session instructions")
+    parser.add_argument("--output-wav", help="Save generated PCM audio as a WAV file")
     parser.add_argument("--timeout", type=float, default=60, help="Seconds to consume events before closing")
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -337,7 +338,7 @@ def main() -> None:
         if args.initial_user_text is not None:
             extra_body["duplex_initial_user_text"] = args.initial_user_text
         config = SessionConfig(
-            modalities=("text",),
+            modalities=("text", "audio") if native or args.output_wav else ("text",),
             auto_response=native,
             instructions=args.instructions,
             overlap_policy="listen_only" if native else None,
@@ -345,9 +346,12 @@ def main() -> None:
         )
         async with DuplexClient(args.url, model=args.model, config=config) as client:
             runner = DuplexToolRunner(client, handlers)
+            collector = EventCollector() if args.output_wav else None
 
             async def print_events() -> None:
                 async for event in client.events():
+                    if collector is not None:
+                        collector.add(event.raw)
                     print(json.dumps(event.raw), flush=True)
 
             printer = asyncio.create_task(print_events())
@@ -386,6 +390,13 @@ def main() -> None:
                 printer.cancel()
                 feeding.cancel()
                 await asyncio.gather(running, printer, feeding, return_exceptions=True)
+                if collector is not None:
+                    await asyncio.to_thread(
+                        write_pcm16_wav,
+                        Path(args.output_wav),
+                        collector.audio_bytes(),
+                        sample_rate_hz=collector.output_sample_rate_hz,
+                    )
 
     asyncio.run(serve())
 

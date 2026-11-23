@@ -58,6 +58,13 @@ def submitted_results(h):
 async def test_result_reaches_one_append_and_duplicate_cannot_replay_it():
     async with venus_session() as h:
         call_id = await delegate(h)
+        repeated = tts_output(
+            h.stage0_request_id(), text="<delegate>12 + 30</delegate>", samples=0, tts_is_last_chunk=True
+        )
+        repeated.multimodal_output.update({SPEECH_MUTED_KEY: True, "meta.duplex_audio_chunk_seq": 1})
+        events = await h.deliver_and_settle(repeated)
+        assert error_codes(events) == []
+        assert "response.function_call_arguments.done" not in types(events)
         count = len(h.port.submissions)
         await h.run(append_audio())
         assert len(h.port.submissions) > count  # Input continues during the call.

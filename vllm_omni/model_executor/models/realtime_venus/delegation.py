@@ -15,7 +15,7 @@ class DelegateParser:
 
     pending: str = ""
     opened: bool = False
-    completed: bool = False
+    completed_query: str | None = None
     failed: bool = False
 
     OPEN = "<delegate>"
@@ -39,8 +39,6 @@ class DelegateParser:
                     "",
                 )
                 return None
-            if self.completed:
-                self._fail("only one delegate request is allowed per model turn")
             self.pending = self.pending[start + len(self.OPEN) :]
             self.opened = True
         end = self.pending.find(self.CLOSE)
@@ -57,12 +55,18 @@ class DelegateParser:
         query = query.strip()
         if not query:
             self._fail("delegate request must not be empty")
+        repeated = self.completed_query is not None
+        if repeated and query != self.completed_query:
+            self._fail("only one delegate request is allowed per model turn")
         self.pending = self.pending[end + len(self.CLOSE) :]
         self.opened = False
-        self.completed = True
+        self.completed_query = query
         # Validate any second span in the same delta before executing the first.
         self.feed("", end_of_turn=end_of_turn)
-        return query
+        # Native generation may repeat the same span while awaiting a backend
+        # result. It is still this turn's one call, not another execution or a
+        # protocol error that should interrupt its outstanding result.
+        return None if repeated else query
 
     def _fail(self, message: str) -> None:
         self.failed = True

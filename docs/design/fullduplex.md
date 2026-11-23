@@ -1826,7 +1826,9 @@ Models without these optional IDs retain their existing handoff.
 
 The Venus session plugin additionally projects one completed delegate span per
 model turn as the shared Realtime `delegate(question)` function. Parsing is
-request/turn-local and accepts spans split across text deltas. The application
+request/turn-local and accepts spans split across text deltas. A repetition of
+the same completed span within that model turn cannot execute a second call.
+The application
 executes the call; the shared session ledger owns result admission, deadlines,
 repeat suppression and interruption policy. MiniCPM-o continues to advertise
 `tool_mode: none`.

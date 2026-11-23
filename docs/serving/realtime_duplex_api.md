@@ -1066,7 +1066,10 @@ python -m vllm_omni.clients.tool_calls --help
 For native input, replace `--prompt` with `--input-wav` (mono PCM16, 16 kHz),
 or `--initial-user-text` on a model that supports initial text seeding. These
 modes stream silence after the supplied input until the timeout, so tools run
-alongside incoming audio and native models can continue their answer. See the
+alongside incoming audio and native models can continue their answer. Native
+input requests text and audio; use `--output-wav answer.wav` to save the speech.
+This CLI records with `commit_all_on_done`; an interactive playback application
+should use `ack_only` and acknowledge audio actually played. See the
 [Venus tool examples](gh-file:recipes/inclusionAI/Realtime-Venus.md#tool-execution)
 for local arithmetic, inventory lookup and voice requests.
 
