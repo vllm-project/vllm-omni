@@ -2692,7 +2692,7 @@ _AMD_DIFFUSION_PARITY_WEEKLY_JOBS = (
 _AMD_DIFFUSION_PARITY_WEEKLY_LABELS = {job[0] for job in _AMD_DIFFUSION_PARITY_WEEKLY_JOBS}
 
 
-def test_longcat_boogu_flux_krea2_weekly_jobs_are_exact_nonblocking_rocm_owners() -> None:
+def test_longcat_boogu_flux_krea2_weekly_jobs_are_exact_blocking_rocm_owners() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -2718,7 +2718,7 @@ def test_longcat_boogu_flux_krea2_weekly_jobs_are_exact_nonblocking_rocm_owners(
         nodes,
     ) in _AMD_DIFFUSION_PARITY_WEEKLY_JOBS:
         step = _find_step(label, AMD_WEEKLY_PIPELINE)
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["agent_pool"] == agent_pool
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
@@ -6516,12 +6516,10 @@ def test_minicpmo_ready_grades_render_blocking() -> None:
         assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-def test_weekly_keeps_only_active_diffusion_burn_in_nonblocking() -> None:
+def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
     assert len(steps) == 52
-    assert sum(step["grade"] == "Blocking" for step in steps) == 41
-    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == (
-        _WAN21_VACE_WEEKLY_LABELS | _AMD_DIFFUSION_PARITY_WEEKLY_LABELS
-    )
+    assert sum(step["grade"] == "Blocking" for step in steps) == 50
+    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS

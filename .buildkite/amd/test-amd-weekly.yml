@@ -1338,13 +1338,13 @@ steps:
             tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py::test_qwen_image_autoround_w4a16_generate
             -m 'slow and diffusion and rocm and MI325 and cards_1'
 
-      # Add exact MI325 owners for the CUDA weekly LongCat contracts. Keep the
-      # new jobs nonblocking until these exact selectors pass on AMD hardware.
+      # Exact MI325 owners for the CUDA weekly LongCat contracts, promoted
+      # after these selectors passed on AMD hardware without skips or retries.
       - label: "LongCat online · 1-GPU"
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_longcat_weekly
@@ -1368,7 +1368,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_longcat_weekly
@@ -1393,7 +1393,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_boogu_weekly
@@ -1430,7 +1430,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_boogu_weekly
@@ -1456,7 +1456,7 @@ steps:
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_boogu_weekly
@@ -1479,7 +1479,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_flux_weekly
@@ -1504,7 +1504,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_flux_weekly
@@ -1536,7 +1536,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_krea2_weekly
@@ -1563,7 +1563,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 300
         source_file_dependencies:
           - diffusion_krea2_weekly
