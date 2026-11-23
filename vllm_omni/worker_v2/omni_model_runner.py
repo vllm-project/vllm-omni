@@ -226,19 +226,23 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         """
         if self._forward_signature_resolved:
             return
-        self._forward_signature_resolved = True
         try:
             forward = getattr(self.model, "forward", None)
             if forward is None:
                 self._forward_accepts_var_kwargs = True
+                self._forward_signature_resolved = True
                 return
             parameters = list(inspect.signature(forward).parameters.values())
-        except (TypeError, ValueError):
+        except Exception:
             # A model may expose forward through a descriptor that raises, or
             # one inspect cannot read. Keep the previous behaviour: send
-            # everything.
+            # everything. Catching broadly is deliberate -- the descriptor can
+            # raise anything, and a probe failing must not break the first
+            # forward. Do not cache: the model may be inspectable later (for
+            # example once capture_model has restored the real forward).
             self._forward_accepts_var_kwargs = True
             return
+        self._forward_signature_resolved = True
         self._forward_accepts_var_kwargs = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
         )
@@ -1308,6 +1312,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
     def _call_model(self, model_inputs: dict[str, Any], *, input_batch: Any, batch_desc: Any) -> Any:
         """Invoke the model once; platform runners may override for frame loops."""
+        self._resolve_forward_signature()
+        if not self._forward_accepts_var_kwargs and self._forward_param_names is not None:
+            # Filter the whole dict, not just the legacy keys: the model state adds
+            # model_intermediate_buffer / runtime_additional_information /
+            # seq_token_counts, which a fixed core-style forward() cannot bind either.
+            model_inputs = {name: value for name, value in model_inputs.items() if name in self._forward_param_names}
         return self.model(**model_inputs)
 
     # ------------------------------------------------------------------

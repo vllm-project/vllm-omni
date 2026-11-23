@@ -1313,3 +1313,102 @@ def test_forward_descriptor_that_raises_keeps_previous_behaviour():
     runner._add_legacy_forward_inputs(model_inputs, batch)
 
     assert {"sampling_metadata", "logits_index", "sampler"} <= set(model_inputs)
+
+
+@pytest.mark.parametrize("exc", [TypeError("not inspectable"), ValueError("bad sig"), RuntimeError("descriptor")])
+def test_any_descriptor_failure_falls_back_instead_of_propagating(exc):
+    """A probe failure must never escape and break the first forward.
+
+    A descriptor can raise any exception type, not just the two inspect uses
+    for unreadable signatures, so the fallback has to be unconditional.
+    """
+
+    class _RaisingForwardModel(torch.nn.Module):
+        @property
+        def forward(self):
+            raise exc
+
+    runner = _legacy_runner(_RaisingForwardModel(), native=False)
+    model_inputs, batch = _legacy_inputs()
+
+    runner._add_legacy_forward_inputs(model_inputs, batch)
+
+    assert {"sampling_metadata", "logits_index", "sampler"} <= set(model_inputs)
+
+
+def test_call_model_filters_model_state_keys_for_a_fixed_forward():
+    """The model state adds keys a fixed core-style forward() cannot bind.
+
+    ``_call_model`` is the path that hands the assembled dict to the model, so
+    it has to drop anything the signature does not accept -- not only the three
+    legacy keys. Otherwise model_intermediate_buffer /
+    runtime_additional_information / seq_token_counts reach forward() untouched.
+    """
+    model = _FixedSignatureModel()
+    runner = _legacy_runner(model, native=False)
+    model_inputs, batch = _legacy_inputs()
+    # Exactly what OmniModelState.prepare_inputs contributes.
+    model_inputs.update(
+        {
+            "model_intermediate_buffer": object(),
+            "runtime_additional_information": {},
+            "seq_token_counts": torch.tensor([2]),
+        }
+    )
+
+    output = runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
+
+    torch.testing.assert_close(output, torch.tensor([2.0, 6.0]))
+    assert model.calls == 1
+
+
+def test_call_model_passes_model_state_keys_to_a_var_kwargs_forward():
+    """The mirror case: a **kwargs forward receives everything, state keys included."""
+    model = _VarKwargsModel()
+    runner = _legacy_runner(model, native=False)
+    model_inputs, batch = _legacy_inputs()
+    model_inputs["model_intermediate_buffer"] = object()
+
+    runner._call_model(model_inputs, input_batch=batch, batch_desc=None)
+
+    assert model.seen is not None
+    assert "model_intermediate_buffer" in model.seen
+    assert {"sampling_metadata", "logits_index", "sampler"} <= set(model.seen)
+
+
+def test_signature_probe_retries_after_a_temporary_failure():
+    """capture_model swaps in a *args/**kwargs wrapper and restores it afterwards.
+
+    A probe that runs during that window must not cache "accepts everything"
+    for the rest of the run, or filtering stays disabled once the real forward
+    is back.
+    """
+
+    class _Swappable(torch.nn.Module):
+        forward_raises = True
+
+        def forward(self, input_ids, positions, inputs_embeds, intermediate_tensors):
+            return input_ids
+
+    model = _Swappable()
+    runner = _legacy_runner(model, native=False)
+
+    class _Property:
+        def __get__(self, obj, objtype=None):
+            raise RuntimeError("temporarily uninspectable")
+
+    # Simulate the swap window: forward is uninspectable for one probe.
+    original = _Swappable.forward
+    _Swappable.forward = _Property()
+    try:
+        runner._resolve_forward_signature()
+        assert runner._forward_accepts_var_kwargs is True
+        assert runner._forward_signature_resolved is False
+    finally:
+        _Swappable.forward = original
+
+    # Restored: the next probe must re-inspect and see the fixed signature.
+    runner._resolve_forward_signature()
+    assert runner._forward_signature_resolved is True
+    assert runner._forward_accepts_var_kwargs is False
+    assert "sampling_metadata" not in runner._forward_param_names
