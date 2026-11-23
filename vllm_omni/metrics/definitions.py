@@ -170,6 +170,10 @@ VLLM_QUEUED_MS = "vllm_queued_ms"
 VLLM_PREFILL_MS = "vllm_prefill_ms"
 VLLM_DECODE_MS = "vllm_decode_ms"
 VLLM_NUM_PREEMPTIONS = "vllm_num_preemptions"
+ORCHESTRATOR_DISPATCH_WAIT_MS = "orchestrator_dispatch_wait_ms"
+ORCHESTRATOR_DISPATCH_WAIT_MAX_MS = "orchestrator_dispatch_wait_max_ms"
+ORCHESTRATOR_DISPATCH_BATCHES = "orchestrator_dispatch_batches"
+ORCHESTRATOR_SNAPSHOT = "orchestrator_snapshot"
 NUM_TOKENS_IN = "num_tokens_in"
 NUM_TOKENS_OUT = "num_tokens_out"
 AUDIO_SAMPLE_RATE = "audio_sample_rate"
@@ -194,7 +198,9 @@ GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
 # Session placement families are registered only when the opt-in policy emits.
 DUPLEX_RESERVED_SESSIONS = METRIC_PREFIX + "duplex_reserved_sessions"
 DUPLEX_ADMISSION_REJECTED = METRIC_PREFIX + "duplex_admission_rejected"
-DUPLEX_ADMISSION_REJECT_REASONS = frozenset({"global_capacity_exhausted", "replica_capacity_exhausted", "unknown"})
+DUPLEX_ADMISSION_REJECT_REASONS = frozenset(
+    {"global_capacity_exhausted", "replica_capacity_exhausted", "replica_unavailable", "unknown"}
+)
 
 
 # ============================================================================

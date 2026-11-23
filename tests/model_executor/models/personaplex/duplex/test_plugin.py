@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.personaplex.duplex.plugin import (
     PersonaPlexSessionState,
 )
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -108,9 +109,13 @@ def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stage
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 
-def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches() -> None:
+def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches(monkeypatch) -> None:
     import inspect
 
+    # This is explicitly the CUDA MRv2 profile. Keep the assertion independent
+    # of the host running the CPU suite, since non-CUDA platforms intentionally
+    # retain a rejecting V1 override and are covered in tests/config.
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
     deploy = load_deploy_config(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml"))
     overrides = deploy.stages[0].engine_extras["hf_overrides"]
 

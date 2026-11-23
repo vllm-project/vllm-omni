@@ -2088,3 +2088,118 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.fixture
+def _cpu_sdpa_attention(monkeypatch: pytest.MonkeyPatch):
+    """Build real GEN/UND attention layers that run on CPU through torch SDPA."""
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    selector._cached_get_backend_cls.cache_clear()
+    monkeypatch.setattr(
+        current_omni_platform,
+        "get_diffusion_attn_backend_cls",
+        lambda **kwargs: DiffusionAttentionBackendEnum.TORCH_SDPA.get_path(),
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    yield
+    selector._cached_get_backend_cls.cache_clear()
+
+
+@pytest.mark.usefixtures("_cpu_sdpa_attention")
+@pytest.mark.parametrize("batch_size", [2, 3])
+@pytest.mark.parametrize("config_kind", ["base", "edge"])
+def test_gen_layers_broadcast_batch1_und_kv_to_gen_batch(config_kind, batch_size) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeVFMTransformer
+
+    torch.manual_seed(0)
+    if config_kind == "edge":
+        model_cls, config = Cosmos3EdgeVFMTransformer, _tiny_cosmos3_edge_config(num_hidden_layers=2)
+        latents, video_shape = torch.randn(batch_size, 48, 1, 4, 4), (1, 4, 4)
+    else:
+        model_cls, config = Cosmos3VFMTransformer, _tiny_cosmos3_config(num_hidden_layers=2)
+        latents, video_shape = torch.randn(batch_size, 2, 1, 2, 2), (1, 2, 2)
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+
+    od_config = OmniDiffusionConfig(
+        model=None, tf_model_config=TransformerConfig.from_dict(config), dtype=torch.float32
+    )
+    model = model_cls(od_config).eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0, 0.5)
+    kwargs = dict(
+        timestep=torch.tensor([500.0]),
+        text_ids=torch.tensor([[1, 2, 3]]),
+        text_mask=torch.ones(1, 3, dtype=torch.long),
+        video_shape=video_shape,
+        fps=24.0,
+    )
+
+    with torch.inference_mode():
+        serial = []
+        for row in latents.split(1):
+            model.reset_cache()
+            serial.append(model(hidden_states=row, **kwargs))
+        serial = torch.cat(serial)
+
+        model.reset_cache()
+        batched = model(hidden_states=latents, **kwargs)
+        # The cache keeps the batch-1 prompt encoding; only GEN sees the views.
+        assert all(key.shape[0] == 1 and value.shape[0] == 1 for key, value in model.cached_kv)
+        cached = model(hidden_states=latents, **kwargs)
+
+    # Batch size can select a different CPU GEMM kernel (e.g. MKL on AVX-512),
+    # so batched and serial fp32 results may differ in the last bits. Reusing
+    # the batch-1 cache at the same batch size must be exact.
+    torch.testing.assert_close(batched, serial, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(cached, batched, atol=0, rtol=0)
+
+
+def test_broadcast_und_kv_expands_batch1_views_only() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _broadcast_und_kv
+
+    single = [(torch.randn(1, 3, 2, 4), torch.randn(1, 3, 2, 4)) for _ in range(2)]
+    expanded = _broadcast_und_kv(single, 3)
+    for (key, value), (out_key, out_value) in zip(single, expanded, strict=True):
+        assert out_key.shape == (3, 3, 2, 4) and out_value.shape == (3, 3, 2, 4)
+        assert out_key.data_ptr() == key.data_ptr() and out_value.data_ptr() == value.data_ptr()
+        assert torch.equal(out_key[2], key[0]) and torch.equal(out_value[2], value[0])
+    assert single[0][0].shape[0] == 1
+
+    # Every other cache reaches the layers exactly as before.
+    matching = [(torch.randn(2, 3, 2, 4), torch.randn(2, 3, 2, 4))]
+    assert _broadcast_und_kv(matching, 2) is matching
+    assert _broadcast_und_kv(matching, 3) is matching
+    assert _broadcast_und_kv(single, 1) is single
+
+
+def test_gen_stack_passes_broadcast_und_kv_to_layers() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.cached_kv = [(torch.full((1, 3, 1, 2), float(i)), torch.full((1, 3, 1, 2), i + 10.0)) for i in range(2)]
+    stored = model.cached_kv
+    model.gen_sp_gather = lambda hidden: hidden
+    seen: list[tuple[int, int]] = []
+
+    class Layer(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def forward(self, hidden, **kwargs):
+            seen.append((kwargs["k_und"].shape[0], kwargs["v_und"].shape[0]))
+            return hidden
+
+    model.gen_layers = nn.ModuleList([Layer(i) for i in range(2)])
+    freqs = (torch.zeros(1, 4, 1, 2), torch.zeros(1, 4, 1, 2))
+    model._run_gen_layers(torch.zeros(2, 4, 8), freqs_gen=freqs)
+
+    assert seen == [(2, 2), (2, 2)]
+    assert model.cached_kv is stored
+    assert all(key.shape[0] == 1 for key, _ in model.cached_kv)

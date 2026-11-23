@@ -29,8 +29,8 @@ MODEL = "Qwen/Qwen-Image-Layered"
 EDIT_PROMPT = "Decompose this image into layers."
 EMPTY_EDIT_PROMPT = ""
 NEGATIVE_PROMPT = "blurry, low quality, distorted"
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
 
 
 # ── Feature combination cases (2 cards) ─────────────────────────────────────

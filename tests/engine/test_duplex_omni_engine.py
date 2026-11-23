@@ -278,7 +278,7 @@ def test_orchestrator_receives_real_frontend_identity_and_exposes_warmup_budget(
     engine._client_config = {"client_count": count, "client_index": index, "stage_addresses": {}}
     received = {}
     orchestrator = SimpleNamespace(
-        replica_placement=SimpleNamespace(owned_group_count=2),
+        replica_placement=SimpleNamespace(live_group_count=2),
         session_manager=SimpleNamespace(admission_limit=16),
     )
 

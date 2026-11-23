@@ -588,7 +588,7 @@ async def omni_run_server_worker(
         # not another call to the empty 0.01 s JIT-kernel registry.
         duplex_warmup_frames = 0
         warmup_kind = None
-        if getattr(app.state, "openai_serving_duplex", None) is not None:
+        if isinstance(engine_client, DuplexOmni) and engine_client.engine.duplex_frontend_group_count > 0:
             duplex_cfg = getattr(engine_client, "duplex_session_config", None)
             duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
             warmup_kind = startup_warmup_kind(lookup_duplex_plugin(engine_client), duplex_warmup_frames)
@@ -849,7 +849,9 @@ async def _init_duplex_app_state(
     state.openai_serving_chat = await _init_duplex_chat(engine_client, state, args, request_logger)
     state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
     state.server_load_metrics = 0
-    if state.openai_serving_chat is not None:
+    if engine_client.engine.duplex_frontend_group_count == 0:
+        logger.warning("Duplex sessions unavailable on this frontend: no complete replica group survived startup")
+    elif state.openai_serving_chat is not None:
         logger.info(
             "Duplex mode: serving %s over /v1/realtime?duplex=1 and /v1/chat/completions",
             engine_client.model,

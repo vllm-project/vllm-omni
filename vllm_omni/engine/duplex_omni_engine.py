@@ -126,7 +126,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
             **orchestrator_kwargs,
         )
         placement = orchestrator.replica_placement
-        self.duplex_frontend_group_count = placement.owned_group_count if placement is not None else 1
+        self.duplex_frontend_group_count = placement.live_group_count if placement is not None else 1
         self.duplex_frontend_max_sessions = orchestrator.session_manager.admission_limit
         return orchestrator
 
