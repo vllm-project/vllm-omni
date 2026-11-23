@@ -3471,7 +3471,12 @@ class TestPlatformOverrides:
             "chatterbox_turbo.yaml",
             "chatterbox.yaml",
         )
-        rocm_full_mrv2 = platform == "rocm" and filename in ("qwen3_tts.yaml", "minicpmo_4_5.yaml")
+        rocm_full_mrv2 = platform == "rocm" and filename in (
+            "qwen3_tts.yaml",
+            "minicpmo_4_5.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
         if platform == "cuda":
             expected_runner = cuda_default_runner
         elif all_platforms_mrv2 or npu_full_mrv2 or xpu_full_mrv2 or rocm_full_mrv2:

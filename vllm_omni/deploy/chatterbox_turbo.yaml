@@ -8,8 +8,8 @@
 # CUDA, where it was measured: with and without streaming, at 1 and at 8
 # concurrent streams, V2 and the default runner are within run-to-run
 # variation of each other. The ``platforms:`` section at the end still selects
-# V1 on NPU, ROCm and MUSA; vLLM 0.34 removed V1, so those platforms are refused
-# at startup. XPU inherits V2.
+# V1 on NPU and MUSA; vLLM 0.34 removed V1, so those platforms are refused at
+# startup. XPU and ROCm inherit V2.
 #
 # Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 keeps float32 weights
 # for HiFT, which is not half-precision safe, runs the flow decoder under
@@ -127,8 +127,6 @@ platforms:
       - stage_id: 0
         additional_config:
           conditioning_device: cpu
-  rocm:
-    model_runner: v1
   musa:
     model_runner: v1
     stages:

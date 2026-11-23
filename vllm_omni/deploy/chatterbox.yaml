@@ -97,8 +97,6 @@ platforms:
           conditioning_device: cpu
           exaggeration: 0.5
           cfg_weight: 0.5
-  rocm:
-    model_runner: v1
   musa:
     model_runner: v1
     stages:
