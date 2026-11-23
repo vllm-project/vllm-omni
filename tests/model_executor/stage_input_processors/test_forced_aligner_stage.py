@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import numpy as np
@@ -104,6 +107,25 @@ def test_decode_pooling_output_handles_hf_config_without_thinker():
         timestamp_token_id=99,
         timestamp_segment_time=100.0,
         classify_num=4,
+    )
+    request = SimpleNamespace(
+        prompt_token_ids=[99, 99],
+        additional_information={ALIGNER_WORDS_KEY: [["hi"]]},
+    )
+    logits = torch.zeros((2, 4), dtype=torch.float32)
+    logits[0, 1] = 1.0
+    logits[1, 3] = 1.0
+
+    ms = decode_pooling_output(logits, request, hf_config)
+    assert ms.tolist() == [[100, 300]]
+
+
+def test_decode_pooling_output_prefers_vllm_034_root_num_labels():
+    hf_config = SimpleNamespace(
+        timestamp_token_id=99,
+        timestamp_segment_time=100.0,
+        num_labels=4,
+        thinker_config=SimpleNamespace(classify_num=999),
     )
     request = SimpleNamespace(
         prompt_token_ids=[99, 99],

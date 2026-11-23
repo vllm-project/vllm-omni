@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -939,6 +940,9 @@ class TestPromptUpdateIntegration:
         omni._paused = False
         omni.request_states = {}
         omni.final_output_task = None
+        omni._output_loop = None
+        omni._output_loop_lock = threading.Lock()
+        omni._frontend_shutting_down = False
         omni.event_resolver = AsyncEventResolver()
         omni._enable_ar_profiler = False
         omni.prom_metrics = MagicMock()

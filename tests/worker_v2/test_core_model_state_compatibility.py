@@ -30,7 +30,7 @@ from vllm_omni.worker_v2 import omni_ar_model_runner as ar_module
 from vllm_omni.worker_v2 import omni_model_runner as base_module
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
-from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, RequestLifecycleUpdate
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 from vllm_omni.worker_v2.staged_writes import StagedWrites
 
@@ -206,18 +206,18 @@ class CPUField:
         pass
 
 
-def request_state():
+def request_state(num_speculative_steps=0):
     obj = object.__new__(RequestState)
     obj.req_id_to_index, obj.index_to_req_id, obj.free_indices = {}, {}, [0, 1]
     obj.max_num_reqs, obj.max_model_len, obj.max_num_batched_tokens = 2, 32, 16
-    obj.num_speculative_steps = 0
+    obj.num_speculative_steps = num_speculative_steps
     obj.max_seq_len = np.zeros(2, dtype=np.int32)
     for name in ("prompt_len", "prefill_len", "total_len", "num_computed_tokens"):
         setattr(obj, name, CPUField(2))
     obj.all_token_ids = CPUField((2, 32))
     obj.num_computed_prefill_tokens = np.zeros(2, dtype=np.int32)
     obj.num_computed_tokens_np = np.zeros(2, dtype=np.int32)
-    obj.draft_tokens = torch.zeros(2, 0, dtype=torch.int64)
+    obj.draft_tokens = torch.zeros(2, num_speculative_steps, dtype=torch.int64)
     obj.last_sampled_tokens = torch.zeros(2, 1, dtype=torch.int64)
     return obj
 
@@ -258,16 +258,18 @@ def loaded_runner(monkeypatch, *, config=None, model=None, runner_cls=AR):
     runner = object.__new__(runner_cls)
     runner.vllm_config, runner.model_config, runner.scheduler_config = cfg, cfg.model_config, cfg.scheduler_config
     runner.parallel_config, runner.compilation_config = cfg.parallel_config, cfg.compilation_config
-    runner.cache_config, runner.load_config, runner.speculative_config = cfg.cache_config, cfg.load_config, None
+    runner.cache_config, runner.load_config = cfg.cache_config, cfg.load_config
+    runner.speculative_config = cfg.speculative_config
+    spec = runner.speculative_config
+    runner.use_aux_hidden_state_outputs = spec is not None and spec.uses_aux_hidden_states
+    runner.num_speculative_steps = spec.num_speculative_tokens if spec is not None else 0
     runner.device = torch.device("cpu")
     runner.max_num_reqs, runner.max_num_tokens, runner.vocab_size = 2, 16, 32
-    runner.req_states = request_state()
+    runner.req_states = request_state(runner.num_speculative_steps)
     runner.encoder_cache = runner.lora_config = runner.speculator = runner.pp_handler = None
     runner.pooling_runner = runner.prompt_logprobs_worker = runner.rejection_sampler = None
     runner.is_first_pp_rank = runner.is_last_pp_rank = True
     runner.is_pooling_model = runner.is_encoder_decoder = False
-    runner.use_aux_hidden_state_outputs = False
-    runner.num_speculative_steps = 0
     runner.batch_sharder = None
     runner._staged_writes = StagedWrites()
     runner.jit_warmup_registry = JitWarmupRegistry(cfg)
@@ -318,6 +320,11 @@ def loaded_runner(monkeypatch, *, config=None, model=None, runner_cls=AR):
     monkeypatch.setattr(core_module, "PromptLogprobsWorker", CPULogprobs)
     monkeypatch.setattr(core_module, "StructuredOutputsWorker", lambda **kw: SimpleNamespace())
     monkeypatch.setattr(core_module, "build_custom_logits_processors", lambda *a: [])
+    if spec is not None:
+        # The CPU fixture supplies the target's auxiliary tensors and sampling results.
+        runner.use_pp = False
+        monkeypatch.setattr(core_module, "set_eagle3_aux_hidden_state_layers", lambda *args: None)
+        monkeypatch.setattr(core_module, "RejectionSampler", lambda *args, **kwargs: object())
     model.loading_runner = runner
     runner.load_model(model=model)
     assert runner.model_state.model is model
@@ -532,6 +539,27 @@ def test_finish_requests_cleans_each_id_once(monkeypatch, mocker, state_cls, fin
             assert runner.model_state.intermediate_buffer.buffers[slot] == {"req_id": "C"}
         else:
             assert runner.model_state.live == {"B": 1, "C": 0}
+
+
+@pytest.mark.parametrize("preempt_peer", [False, True])
+def test_finish_requests_combines_model_lifecycle_with_core_cleanup(monkeypatch, mocker, preempt_peer):
+    class LifecycleState(CoreState):
+        def get_request_lifecycle(self, scheduler_output):
+            return RequestLifecycleUpdate(reset_req_ids={"A"}, release_req_ids={"A", "B"})
+
+    runner, model = loaded_runner(monkeypatch, model=TinyModel(LifecycleState))
+    configure_step(monkeypatch, runner, model)
+    state_remove = mocker.spy(runner.model_state, "remove_request")
+    output = scheduled()
+    output.preempted_req_ids = {"B"} if preempt_peer else None
+
+    runner.finish_requests(output)
+
+    assert output.finished_req_ids == set()
+    assert [call.args for call in state_remove.call_args_list] == [("A",), ("B",)]
+    assert runner.req_states.req_id_to_index == {}
+    assert runner.model_state.live == {}
+    assert ("model_finished", ["A"]) in model.events
 
 
 def cached_chunk_output(prompt_token_ids):
@@ -911,30 +939,120 @@ def test_missing_multimodal_feedback_hook_fails_during_load(monkeypatch):
     assert ("sampler_constructed",) not in model.events
 
 
-@pytest.mark.parametrize("kind", ["omni-output", "drafter-state"])
-def test_ar_rejects_pending_aux_without_consuming_the_step(monkeypatch, kind):
+def test_ar_rejects_pending_omni_aux_without_consuming_the_step(monkeypatch):
     runner, model = loaded_runner(monkeypatch)
     configure_step(monkeypatch, runner, model)
     runner.execute_model(scheduled())
     step = runner.execute_model_state
     aux = {"existing": torch.ones(2)}
-    if kind == "omni-output":
-        runner._last_aux_output = aux
-        error = "structured output"
-    else:
-        step = step._replace(aux_hidden_states=[aux["existing"]])
-        runner.execute_model_state = step
-        error = "AR auxiliary output"
+    runner._last_aux_output = aux
 
-    with pytest.raises(NotImplementedError, match=f"{error}.*CoreState"):
+    with pytest.raises(NotImplementedError, match="structured output.*CoreState"):
         runner.sample_tokens(None)
 
     assert runner.execute_model_state is step
-    if kind == "omni-output":
-        assert runner._last_aux_output is aux
-    else:
-        assert step.aux_hidden_states[0] is aux["existing"]
+    assert runner._last_aux_output is aux
     assert not any(event[0] == "sample" for event in model.events)
+
+
+@pytest.fixture
+def drafter_step(monkeypatch, mode):
+    config = make_config()
+    config.speculative_config = SimpleNamespace(uses_aux_hidden_states=True, num_speculative_tokens=1)
+    runner, model = loaded_runner(monkeypatch, config=config)
+    batch = configure_step(monkeypatch, runner, model, mode)
+    runner.cudagraph_manager = SimpleNamespace(
+        run_pw_graph=lambda model, inputs: model(**inputs),
+        run_fullgraph=lambda descriptor: model(input_ids=batch.input_ids, positions=batch.positions),
+    )
+    return runner, model, batch
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_core_state_passes_aux_hidden_states_to_drafter(monkeypatch, mocker, drafter_step):
+    runner, model, batch = drafter_step
+    assert type(runner.model_state) is CoreState
+    hidden = torch.tensor([[2.0, 2.5], [5.0, 5.5]])
+    aux = [hidden + 10, hidden + 20]
+    monkeypatch.setattr(model, "forward", lambda **kwargs: (hidden, aux))
+    runner.speculator = SimpleNamespace(supports_mm_inputs=False, propose=mocker.Mock(return_value=torch.tensor([[7]])))
+    runner.sampler.sampling_states = SimpleNamespace(temperature=CPUField(2), seeds=CPUField(2))
+    runner.req_states.next_prefill_tokens = torch.zeros(2, dtype=torch.int64)
+    runner.draft_tokens_handler.set_draft_tokens = mocker.Mock()
+    runner._draft_workspace_lane = 0
+    runner.adaptive_verification = None
+    output = scheduled()
+    output.num_spec_tokens_to_schedule = 1
+
+    assert runner.execute_model(output) is None
+    assert runner.execute_model_state.hidden_states is hidden
+    assert runner.execute_model_state.aux_hidden_states is aux
+    assert runner._last_aux_output is None
+    assert runner.sample_tokens(None).get_output().sampled_token_ids == [[1]]
+    assert model.sampled_hidden is hidden
+    assert runner.execute_model_state is None
+
+    runner.speculator.propose.assert_called_once()
+    args, kwargs = runner.speculator.propose.call_args
+    assert args[0] is batch
+    assert args[3] is hidden
+    assert args[4] is aux
+    assert kwargs["num_speculative_tokens"] == 1
+    runner.draft_tokens_handler.set_draft_tokens.assert_called_once()
+    published_batch, draft_tokens = runner.draft_tokens_handler.set_draft_tokens.call_args.args
+    assert published_batch is batch
+    torch.testing.assert_close(draft_tokens, torch.tensor([[7]]))
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_core_state_validates_main_output_after_drafter_tuple_unpack(monkeypatch, drafter_step):
+    runner, model, _ = drafter_step
+    hidden = torch.zeros(2, 2)
+    structured = OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    monkeypatch.setattr(model, "forward", lambda **kwargs: (structured, [hidden]))
+
+    with pytest.raises(NotImplementedError, match=r"structured output \(OmniOutput\).*CoreState"):
+        runner.execute_model(scheduled())
+
+    assert runner.execute_model_state is None
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_ar_preserves_model_owned_payload_with_shared_drafter_layers(monkeypatch, mode):
+    class ConverterState(CoreState):
+        def postprocess_model_output(self, output, batch, states):
+            return output.text_hidden_states, output.multimodal_outputs
+
+    config = make_config()
+    config.speculative_config = SimpleNamespace(uses_aux_hidden_states=True, num_speculative_tokens=1)
+    model = TinyModel(ConverterState)
+    model.have_multimodal_outputs = True
+    model._returns_tuple = True
+    model.supports_mrv2_full_graph_aux_outputs = True
+    model.supports_speculative_payload = True
+    model.extract_aux_hidden_states = lambda output: (
+        output.text_hidden_states,
+        output.multimodal_outputs["layers"],
+    )
+    runner, model = loaded_runner(monkeypatch, config=config, model=model)
+    configure_step(monkeypatch, runner, model, mode)
+    hidden = torch.ones(2, 2)
+    payload = {"layers": [hidden + 10, hidden + 20]}
+    structured = OmniOutput(text_hidden_states=hidden, multimodal_outputs=payload)
+    monkeypatch.setattr(model, "forward", lambda **kwargs: structured)
+    runner.cudagraph_manager = SimpleNamespace(
+        run_pw_graph=lambda model, inputs: model(**inputs),
+        run_fullgraph=lambda descriptor: runner._flatten_capture_aux_output((hidden, payload)),
+    )
+
+    assert runner.execute_model(scheduled()) is None
+    assert runner.execute_model_state.hidden_states is hidden
+    assert all(
+        actual is expected
+        for actual, expected in zip(runner.execute_model_state.aux_hidden_states, payload["layers"], strict=True)
+    )
+    saved_payload = runner._last_aux_output if mode == CUDAGraphMode.FULL else runner._last_multimodal_outputs
+    assert saved_payload["layers"][0] is payload["layers"][0]
 
 
 @pytest.mark.parametrize("kind", ["direct", "no-gather", "no-converter", "legacy"])

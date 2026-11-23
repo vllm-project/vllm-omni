@@ -112,6 +112,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def __init__(self) -> None:
         from vllm_ascend.utils import adapt_patch
 
+        from vllm_omni.platforms.npu import log_ascend_runtime_build
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
         from vllm_omni.platforms.npu.ascend_warmup_patch import (
             apply_ascend_warmup_patch,
@@ -120,16 +121,17 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             apply_minicpmo_4_5_code2wav_patch,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts import (
-            apply_qwen3_tts_patches,
+            apply_qwen3_tts_code2wav_patch,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
             apply_qwen3_tts_tokenizer_v2_patch,
         )
 
+        log_ascend_runtime_build()
         adapt_patch(is_global_patch=True)
         apply_contiguous_kv_patch()
         apply_minicpmo_4_5_code2wav_patch()
-        apply_qwen3_tts_patches()
+        apply_qwen3_tts_code2wav_patch()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
         # The Triton rejection/penalties warmup guard for multi-frame decode must

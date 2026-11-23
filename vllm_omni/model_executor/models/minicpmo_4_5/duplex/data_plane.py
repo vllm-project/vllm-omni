@@ -13,17 +13,14 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.model_executor.common.request_outputs import coerce_int
+from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
-
-
-@dataclass(frozen=True, slots=True)
-class MiniCPMO45DataPlaneContext(DuplexDataPlaneContext):
-    """Serving state needed to project one MiniCPM data-plane output (the framework fields)."""
 
 
 @dataclass(slots=True)
@@ -109,7 +106,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         self,
         result: object,
         *,
-        context: MiniCPMO45DataPlaneContext | None = None,
+        context: DuplexDataPlaneContext | None = None,
     ) -> Iterator[dict[str, object]]:
         if not isinstance(result, dict):
             return
@@ -123,9 +120,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         self,
         output: object,
         *,
-        context: MiniCPMO45DataPlaneContext | None = None,
+        context: DuplexDataPlaneContext | None = None,
     ) -> Iterator[dict[str, object]]:
-        context = context or MiniCPMO45DataPlaneContext()
+        context = context or DuplexDataPlaneContext()
         stage_metrics = _output_stage_metrics(output)
 
         def runtime_result(**values: object) -> dict[str, object]:
@@ -578,30 +575,6 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         )
 
 
-def coerce_int(value: object) -> int | None:
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1)
-            if value.numel() == 0:
-                return None
-            value = value[0].item()
-        except Exception:
-            return None
-    elif hasattr(value, "reshape") and hasattr(value, "size"):
-        try:
-            value = value.reshape(-1)
-            if int(value.size) == 0:
-                return None
-            item = value[0]
-            value = item.item() if hasattr(item, "item") else item
-        except Exception:
-            return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def output_turn_id_from_metadata(mm_output: dict[str, object]) -> int | None:
     return _first_metadata_int(mm_output, "duplex_turn_id", "turn_id")
 
@@ -711,19 +684,6 @@ def _completion_token_ids(completion: object) -> list[int]:
         if token_ids:
             return token_ids
     return []
-
-
-def _coerce_int_list(value: object) -> list[int]:
-    if value is None:
-        return []
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1).tolist()
-        except Exception:
-            return []
-    if not isinstance(value, (list, tuple)):
-        return []
-    return [item for raw in value if (item := coerce_int(raw)) is not None]
 
 
 def _audio_num_samples(audio_data: object) -> int | None:

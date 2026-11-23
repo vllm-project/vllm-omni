@@ -25,7 +25,12 @@ tts_ws_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+            server_args=[
+                "--trust-remote-code",
+                "--stage-overrides",
+                '{"0": {"enforce_eager": true}, "1": {"enforce_eager": true}}',
+                "--disable-log-stats",
+            ],
             env_dict={"VLLM_DISABLE_COMPILE_CACHE": "1"},
         ),
         id="qwen3-tts-ws-customvoice",

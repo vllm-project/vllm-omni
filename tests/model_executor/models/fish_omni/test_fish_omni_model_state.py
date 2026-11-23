@@ -35,7 +35,7 @@ class _Model:
             dtype=torch.float32,
             device=torch.device("cpu"),
         )
-        self.buffers.noise = torch.zeros((4, 5, 8))
+        self.buffers.noise = torch.zeros((4, 154))
 
     def build_frames(self, info, device):
         assert info["text"] == "hello"
@@ -88,6 +88,44 @@ def test_new_request_stages_its_prompt_rows(make_state):
     _, (top_k, generated), ras = state._pending_slots[1]
     assert (top_k, generated) == (30, 0)
     assert ras[-PROMPT.shape[0] :] == PROMPT[:, 0].tolist()
+
+
+@pytest.mark.parametrize(("request_k", "expected"), [(-1, 4096), (0, 4096), (7, 7), (128, 128), (8192, 4096)])
+def test_stage_main_token_top_k(make_state, request_k, expected):
+    state = make_state()
+    state.model.max_top_k = 4096
+    request = _request("a")
+    request.sampling_params.top_k = request_k
+    state.add_request(0, request)
+    _, (top_k, _), _ = state._pending_slots[0]
+    assert top_k == expected
+
+
+@pytest.mark.parametrize(
+    ("reference", "requested", "extra", "expected"),
+    [
+        (None, 1.0, {"fish_omni_reference_top_p": 0.9}, 1.0),
+        ("ref_audio_wav", 1.0, {"fish_omni_reference_top_p": 0.9}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": 0.9}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": 0.9, "top_p": 1.0}, 1.0),
+        ("ref_codes", 0.8, {"fish_omni_reference_top_p": 0.9}, 0.8),
+        ("ref_codes", 1.0, {}, 1.0),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": 0}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": 1.5}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": "x"}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": None}, 0.9),
+        ("ref_codes", 1.0, {"fish_omni_reference_top_p": float("nan")}, 0.9),
+    ],
+)
+def test_reference_nucleus_default(make_state, reference, requested, extra, expected):
+    state = make_state()
+    if reference:
+        state.intermediate_buffer.buffers[0][reference] = torch.zeros(1)
+    req = _request("a")
+    req.sampling_params.top_p = requested
+    req.sampling_params.extra_args = extra
+    state.add_request(0, req)
+    assert state._pending_slots[0][0][1] == expected
 
 
 def test_preempted_request_resumes_with_its_generated_frames(make_state):
@@ -214,7 +252,7 @@ def test_max_top_k_is_a_power_of_two_from_the_ras_top_k_to_the_codebook(value, o
 
     config = SimpleNamespace() if value is None else SimpleNamespace(fish_omni_max_top_k=value)
     if ok:
-        assert max_top_k(config, 4096) == (64 if value is None else value)
+        assert max_top_k(config, 4096) == (4096 if value is None else value)
     else:
         with pytest.raises(ValueError, match="power of two"):
             max_top_k(config, 4096)
