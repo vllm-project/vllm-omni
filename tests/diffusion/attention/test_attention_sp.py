@@ -234,11 +234,7 @@ def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
             # Every valid value is one and every padding value zero.
             torch.testing.assert_close(output, torch.ones_like(output))
             # Equal Q/K lengths retain the existing query-padding behavior.
-            square_output = impl.forward_cuda(k, k, v, metadata)
-            torch.testing.assert_close(
-                square_output[metadata.attn_mask], torch.ones_like(square_output[metadata.attn_mask])
-            )
-            assert torch.count_nonzero(square_output[~metadata.attn_mask]) == 0
+            torch.testing.assert_close(impl.forward_cuda(k, k, v, metadata), v, atol=0, rtol=1e-2)
     finally:
         destroy_distributed_env()
 
@@ -253,15 +249,14 @@ def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
         pytest.param("FlashAttention3HubImpl", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
     ],
 )
-def test_allgather_joint_key_mask_reaches_flash_hub(backend):
+def test_allgather_joint_key_mask_reaches_flash_hub(backend, tmp_path):
     from vllm_omni.diffusion.attention.backends.utils.fa import _is_hopper
 
-    if not current_omni_platform.is_cuda() or current_omni_platform.get_device_count() < 2:
-        pytest.skip("Requires two CUDA GPUs")
+    if not current_omni_platform.is_cuda():
+        pytest.skip("Requires CUDA GPUs")
     if backend == "FlashAttention3HubImpl" and not _is_hopper():
         pytest.skip("FA3 Hub requires Hopper GPUs")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        torch.multiprocessing.spawn(_joint_mask_hub_worker, args=(backend, f"file://{tmpdir}/store"), nprocs=2)
+    torch.multiprocessing.spawn(_joint_mask_hub_worker, args=(backend, f"file://{tmp_path}/store"), nprocs=2)
 
 
 @pytest.mark.cpu
