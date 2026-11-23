@@ -2945,7 +2945,7 @@ _COSMOS3_T2I_NODE = "tests/e2e/online_serving/test_cosmos3.py::test_text_to_imag
 
 _WAN21_VACE_WEEKLY_JOBS = (
     (
-        "Wan2.1 VACE probe · 1-GPU",
+        "Wan2.1 VACE · 1-GPU",
         "mi300_1",
         "1",
         "2",
@@ -2958,7 +2958,7 @@ _WAN21_VACE_WEEKLY_JOBS = (
         ),
     ),
     (
-        "Wan2.1 VACE probe · 2-GPU",
+        "Wan2.1 VACE · 2-GPU",
         "mi300_2",
         "2",
         "5",
@@ -3044,7 +3044,7 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, _COSMOS3_T2I_NODE) == []
 
 
-def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
+def test_wan21_vace_weekly_has_two_exact_blocking_rocm_jobs() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -3070,7 +3070,7 @@ def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
         nodes,
     ) in _WAN21_VACE_WEEKLY_JOBS:
         step = _find_step(label, AMD_WEEKLY_PIPELINE)
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["agent_pool"] == agent_pool
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
@@ -3081,7 +3081,6 @@ def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
 
         assert len(step["commands"]) == 1
         command = step["commands"][0]
-        assert "MI325" not in command
         assert "-m rocm" not in command
         tokens = split(command)
         runner_index = tokens.index(runner)
@@ -3115,9 +3114,9 @@ def test_wan21_vace_weekly_has_two_exact_nonblocking_rocm_probes() -> None:
     } <= dependency_paths
 
     source = Path("tests/e2e/online_serving/test_wan_2_1_vace_expansion.py").read_text(encoding="utf-8")
-    assert 'SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})' in source
-    assert 'PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)' in source
-    assert '"rocm": "MI325"' not in source
+    assert 'SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})' in source
+    assert "PARALLEL_FEATURE_MARKS = hardware_marks(" in source
+    assert 'res={"cuda": "H100", "rocm": "MI325"}, num_cards=2' in source
 
 
 @pytest.mark.parametrize(
@@ -6639,10 +6638,10 @@ def test_minicpmo_ready_grades_render_blocking() -> None:
         assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
 
 
-def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
+def test_weekly_has_no_nonblocking_jobs_after_vace_promotion() -> None:
     weekly = _load_yaml(AMD_WEEKLY_PIPELINE)
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
     assert len(steps) == 54
-    assert sum(step["grade"] == "Blocking" for step in steps) == 52
-    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS
+    assert sum(step["grade"] == "Blocking" for step in steps) == 54
+    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == set()
