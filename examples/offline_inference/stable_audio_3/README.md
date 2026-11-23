@@ -44,21 +44,17 @@ flowchart TD
 
 `stabilityai/stable-audio-3-medium` is **gated** — accept the license on its
 [model page](https://huggingface.co/stabilityai/stable-audio-3-medium) and
-`hf auth login` first. The HF repo does not ship the `model_index.json` /
-`transformer/config.json` that vLLM-Omni's engine uses for model discovery, so
-download via the helper script, which fetches the weights and writes both files:
-
-```bash
-python tools/download_stable_audio_3.py --output-dir ./stable-audio-3-medium
-```
+`hf auth login` first. vLLM-Omni recognizes the Hub ID and a local copy of the
+repo from SA3's native `model_config.json`, so no preparation step is needed.
+Directories prepared by `tools/download_stable_audio_3.py` keep working.
 
 ## Run
 
-Point the shared `text_to_audio.py` driver at the prepared local directory (from the repository root):
+Run the shared `text_to_audio.py` driver (from the repository root):
 
 ```bash
 python examples/offline_inference/text_to_audio/text_to_audio.py \
-    --model ./stable-audio-3-medium \
+    --model stabilityai/stable-audio-3-medium \
     --prompt "An ambient drone evolving slowly with shimmering overtones" \
     --audio-length 120.0 \
     --num-inference-steps 100 \
