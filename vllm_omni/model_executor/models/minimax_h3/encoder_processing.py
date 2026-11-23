@@ -1046,7 +1046,6 @@ def encode_media(
     if not (
         emit_conditioning
         and has_visual
-        and audio_inputs
         and callable(prepare_waveform)
         and not torch.is_autocast_enabled("cpu")
         and all(waveform.device.type == "cpu" for waveform, _ in audio_inputs)
