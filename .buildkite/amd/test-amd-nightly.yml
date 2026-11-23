@@ -646,6 +646,26 @@ steps:
 
   - group: ":full_moon: Qwen-Image MI300 Nightly"
     steps:
+      - label: "Qwen-Image 2.1 Text-to-Image Documentation"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 90
+        source_file_dependencies: [diffusion_text_to_image_doc, rocm_diffusion_nightly_runner]
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-21-docs/**/*
+        commands:
+          - export OUTPUT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-21-docs/images/$${BUILDKITE_JOB_ID:?}"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 3 75m rocm-qwen-image-21-docs
+            'tests/examples/offline_inference/test_text_to_image.py::test_text_to_image[more_cli_examples_001]'
+            'tests/examples/online_serving/test_text_to_image.py::test_api_calls_001[omni_server0]'
+            'tests/examples/online_serving/test_text_to_image.py::test_api_calls_002[omni_server0]'
+            -m 'full_model and example and rocm and MI325 and cards_1'
+
       - label: "Qwen-Image Official-Weight Smoke"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
@@ -861,48 +881,36 @@ steps:
       - label: "MiniCPM-o 4.5 Daily-Omni Accuracy"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_minicpmo_4_5_accuracy
+        env:
+          ROCM_E2E_TIMEOUT_MINUTES: "165"
+          ACC_BENCH_RESULT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-daily-omni-accuracy/results"
         artifact_paths:
           - artifacts/rocm-minicpmo-daily-omni-accuracy/**/*
         commands:
-          - export ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-daily-omni-accuracy"
-          - mkdir -p "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR"
+          - mkdir -p "$$ACC_BENCH_RESULT_DIR"
+          - rm -f "$${ACC_BENCH_RESULT_DIR:?}"/result_acc_*_daily_omni_*.json
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench
+            1 omni rocm-minicpmo-daily-omni-accuracy
           - |
-            node="tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
-            pytest --collect-only -q "$$node" \
-              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
-              > "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt"
-            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 1 ]]; then
-              echo "Expected exactly one MiniCPM-o 4.5 Daily-Omni accuracy node, found $$count." >&2
-              cat "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt"; then
-              echo "MiniCPM-o 4.5 Daily-Omni accuracy node was not collected: $$node" >&2
-              cat "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
-              exit 5
-            fi
-          - |
-            set +e
-            node="tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
-            timeout --signal=TERM --kill-after=2m 165m \
-              pytest -s -v "$$node" \
-              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
-              --junitxml="$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
-            if [[ -d tests/e2e/accuracy/minicpmo_4_5/results ]]; then
-              mkdir -p "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/results"
-              cp -a tests/e2e/accuracy/minicpmo_4_5/results/. \
-                "$$ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR/results/"
-            fi
+            python3 - "$$ACC_BENCH_RESULT_DIR" <<'PY'
+            import json
+            import sys
+            from pathlib import Path
 
-            exit "$$status"
+            results = list(Path(sys.argv[1]).glob("result_acc_*_daily_omni_*.json"))
+            if len(results) != 1:
+                raise SystemExit(f"Expected one Daily-Omni result, found {len(results)}")
+            result = json.loads(results[0].read_text())
+            expected = {"daily_omni_evaluated_ok": 1197, "daily_omni_no_gold": 0, "daily_omni_request_failed": 0}
+            for key, value in expected.items():
+                if result.get(key) != value:
+                    raise SystemExit(f"Expected {key}={value}, got {result.get(key)!r}")
+            PY
 
       - label: "MiniCPM-o 4.5 Seed-TTS Accuracy"
         agent_pool: mi300_1
@@ -1569,6 +1577,23 @@ steps:
 
   - group: ":full_moon: Diffusion Collective Parity MI300 Nightly"
     steps:
+      - label: "Wan VAE Spatial-Shard Decode Parity"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: diffusion_wan_vae_spatial_shard
+        artifact_paths:
+          - artifacts/rocm-wan-vae-spatial-shard/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 3 30m rocm-wan-vae-spatial-shard
+            tests/diffusion/distributed/test_wan_spatial_shard.py::test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank
+            tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
       - label: "Diffusion Exchange, Ring and CFG Parity · 2 GPUs"
         agent_pool: mi300_2
         depends_on: amd-build
@@ -1669,11 +1694,10 @@ steps:
             "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cfg_parallel+tensor_parallel+cpu_offload]]"
             -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only"
 
-      # Keep the Flux2Klein and LongCatImage startup failures observational.
       - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU"
         agent_pool: mi300_4
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 50
         source_file_dependencies: diffusion_tiny_model
         artifact_paths:
