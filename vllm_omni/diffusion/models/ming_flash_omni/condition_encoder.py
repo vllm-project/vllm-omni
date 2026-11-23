@@ -342,7 +342,7 @@ class MingConditionEncoder(nn.Module):
                 device=x.device,
             )
         elif attention_mask.dim() == 2:
-            mask_2d = attention_mask.to(x.dtype)
+            mask_2d = attention_mask.to(torch.bool if current_omni_platform.is_npu() else x.dtype)
             attention_mask = mask_2d[:, None, None, :].expand(b, 1, n, n)
 
         out = self.connector(

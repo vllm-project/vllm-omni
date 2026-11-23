@@ -41,7 +41,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("is_npu", [False, True])
-def test_query_connector_default_mask_keeps_all_tokens_visible(monkeypatch, is_npu):
+@pytest.mark.parametrize("use_2d_mask", [False, True], ids=["default", "2d-ones"])
+def test_query_connector_mask_keeps_all_tokens_visible(monkeypatch, is_npu, use_2d_mask):
     monkeypatch.setattr(condition_encoder, "current_omni_platform", SimpleNamespace(is_npu=lambda: is_npu))
 
     class Connector(torch.nn.Module):
@@ -52,7 +53,8 @@ def test_query_connector_default_mask_keeps_all_tokens_visible(monkeypatch, is_n
     encoder = condition_encoder.MingConditionEncoder(SimpleNamespace(text_encoder_norm=False), normalize_output=False)
     encoder.connector = Connector()
     hidden = torch.randn(1, 3, 4, dtype=torch.bfloat16)
-    assert torch.equal(encoder(hidden), hidden)
+    attention_mask = torch.ones(hidden.shape[:2]) if use_2d_mask else None
+    assert torch.equal(encoder(hidden, attention_mask=attention_mask), hidden)
     mask = encoder.connector.mask
     assert mask.shape == (1, 1, 3, 3)
     assert mask.dtype == (torch.bool if is_npu else hidden.dtype)
