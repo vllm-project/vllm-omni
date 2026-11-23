@@ -46,11 +46,9 @@ class CompactGraph:
         self.embed = torch.empty_like(embeds[:rows])
         self.positions = torch.empty_like(positions[:rows])
         self.slots = torch.empty_like(first.slot_mapping[:rows])
-        self.lengths = torch.empty_like(first.seq_lens_device.reshape(-1)[:rows])
+        self.lengths = first.seq_lens_device.new_empty((rows,))
         self.first_length = torch.empty_like(self.lengths)
-        self.blocks = torch.empty_like(
-            first.block_tables[:rows, : capacity // runner.vllm_config.cache_config.block_size]
-        )
+        self.blocks = first.block_tables.new_empty((rows, capacity // runner.vllm_config.cache_config.block_size))
         heads = model._tts_config.num_attention_heads
         self.bias = torch.empty((rows, heads, 1, capacity), dtype=embeds.dtype, device=embeds.device)
         self.lse = torch.empty(1, dtype=embeds.dtype, device=embeds.device)
@@ -185,18 +183,26 @@ class CompactGraph:
                 else:
                     del rotary.forward
 
-    def prepare_step(self, first, width):
-        torch.sub(first.seq_lens_device.reshape(-1)[: self.rows], width - 1, out=self.first_length)
-        self.blocks.copy_(first.block_tables[: self.rows, : self.blocks.shape[1]])
+    def prepare_step(self, first, width, active_rows):
+        torch.sub(first.seq_lens_device.reshape(-1)[:active_rows], width - 1, out=self.first_length[:active_rows])
+        self.blocks[:active_rows].copy_(first.block_tables[:active_rows, : self.blocks.shape[1]])
+        if active_rows < self.rows:
+            # FIA still needs valid pages for every row in the captured batch.
+            self.blocks[active_rows:].copy_(self.blocks[:1])
 
-    def bind(self, first, embeds, positions, width, frame):
-        end = self.rows * width
+    def bind(self, first, embeds, positions, width, frame, active_rows):
+        end = active_rows * width
         if self.down_projections and not self.fixed_down_lanes:
             torch.add(self.lane_base, frame, out=self.lanes)
-        self.embed.copy_(embeds[frame:end:width])
-        self.positions.copy_(positions[frame:end:width])
-        self.slots.copy_(first.slot_mapping[frame:end:width])
-        torch.add(self.first_length, frame, out=self.lengths)
+        self.embed[:active_rows].copy_(embeds[frame:end:width])
+        self.positions[:active_rows].copy_(positions[frame:end:width])
+        self.slots[:active_rows].copy_(first.slot_mapping[frame:end:width])
+        torch.add(self.first_length[:active_rows], frame, out=self.lengths[:active_rows])
+        if active_rows < self.rows:
+            self.embed[active_rows:].zero_()
+            self.positions[active_rows:].zero_()
+            self.slots[active_rows:].fill_(-1)
+            self.lengths[active_rows:].fill_(1)
 
     def forward(self):
         static_shape_decode.emit_mask_refresh(self.bias, self.lengths, self.bias.shape[1], self.capacity)
@@ -246,7 +252,7 @@ class CompactGraph:
 
 def prepare(runner, talker, model_inputs, input_batch, width):
     rows = input_batch.num_reqs
-    if MODE is None or width != 16 or input_batch.has_prefill or (rows != 16 and not 2 <= rows <= 8):
+    if MODE is None or width != 16 or input_batch.has_prefill or not 2 <= rows <= 16:
         return None
     try:
         mode, _, variant = Path(MODE).read_text().strip().partition("_")
@@ -254,13 +260,14 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         return None
     if (
         mode not in ("shadow", "active")
-        or variant not in ("", "fixed", "fixed_rope", "fixed_wide")
+        or variant not in ("", "fixed", "fixed_rope", "fixed_wide", "fixed_padded")
         or model_inputs.get("intermediate_tensors") is not None
     ):
         return None
-    if rows == 16 and variant != "fixed_wide":
+    padded = 8 < rows < 16 and variant == "fixed_padded"
+    if rows > 8 and not (padded or rows == 16 and variant in ("fixed_wide", "fixed_padded")):
         return None
-    fixed_down_lanes = variant in ("fixed", "fixed_rope", "fixed_wide") and rows > 4
+    fixed_down_lanes = variant in ("fixed", "fixed_rope", "fixed_wide", "fixed_padded") and rows > 4
     fused_rope = variant == "fixed_rope"
     spans = runner.model_state._request_token_spans(input_batch)
     if spans != [(i * width, (i + 1) * width) for i in range(rows)]:
@@ -310,6 +317,10 @@ def prepare(runner, talker, model_inputs, input_batch, width):
     wide_rows = embeds.shape[0]
     if rows == 16 and wide_rows != rows * width:
         return None
+    graph_rows = 16 if padded else rows
+    graph_wide_rows = graph_rows * width if padded else wide_rows
+    if wide_rows > graph_wide_rows:
+        return None
     if not hasattr(runner, "_c8_talker_graphs"):
         runner._c8_talker_graphs = {}
         runner._c8_talker_ready = set()
@@ -323,20 +334,16 @@ def prepare(runner, talker, model_inputs, input_batch, width):
     # Use 512 on any build that cannot provide a host length vector.
     preferred = full_capacity
     # The 16-row variant uses one capture shape to bound retained graph memory.
-    if length is not None and rows != 16:
+    if length is not None and graph_rows != 16:
         preferred = static_shape_decode.select_bucket(length, (128, 256, full_capacity))
     candidate_capacities = (preferred, full_capacity) if preferred != full_capacity else (full_capacity,)
-    graph_key = next(
-        (
-            key
-            for capacity in candidate_capacities
-            if (key := (rows, wide_rows, capacity, fixed_down_lanes, fused_rope)) not in rejected
-        ),
-        None,
-    )
-    if graph_key is None:
+    for capacity in candidate_capacities:
+        graph_key = (graph_rows, graph_wide_rows, capacity, fixed_down_lanes, fused_rope)
+        qualification = (*graph_key, rows, wide_rows) if padded else graph_key
+        if qualification not in rejected:
+            break
+    else:
         return None
-    capacity = graph_key[2]
     compact = graphs.get(graph_key)
     if compact is None:
         try:
@@ -347,28 +354,28 @@ def prepare(runner, talker, model_inputs, input_batch, width):
                 metadata,
                 embeds,
                 positions,
-                rows,
+                graph_rows,
                 capacity,
-                wide_rows,
+                graph_wide_rows,
                 fixed_down_lanes=fixed_down_lanes,
                 fused_rope=fused_rope,
             )
         except ValueError:
-            rejected.add(graph_key)
+            rejected.add(qualification)
             logger.exception("[c8-talker-narrow] unsupported geometry rows=%d", rows)
             return None
     if tuple(compact.metadata) != tuple(metadata):
         return None
     # Keep the complete first K-step on the reference path while comparing
     # every frame; only subsequent steps may use the qualified graph.
-    shadow = mode == "shadow" or graph_key not in ready
+    shadow = mode == "shadow" or qualification not in ready
 
     def frame_forward(frame, wide_forward):
-        if frame == 0 and graph_key not in rejected:
-            compact.prepare_step(first, width)
-        if not shadow and graph_key not in rejected:
+        if frame == 0 and qualification not in rejected:
+            compact.prepare_step(first, width, rows)
+        if not shadow and qualification not in rejected:
             try:
-                compact.bind(first, embeds, positions, width, frame)
+                compact.bind(first, embeds, positions, width, frame, rows)
                 logger.info_once(
                     "[c8-talker-narrow] active replay rows=%d capacity=%d fixed=%s rope=%s",
                     rows,
@@ -376,21 +383,21 @@ def prepare(runner, talker, model_inputs, input_batch, width):
                     fixed_down_lanes,
                     fused_rope,
                 )
-                output = compact.replay()
+                output = compact.replay()[:rows]
                 if hybrid and frame == width - 1:
                     trace_context(input_batch, "compact_batch", length, capacity)
                 return output
             except (RuntimeError, TypeError, ValueError):
-                rejected.add(graph_key)
+                rejected.add(qualification)
                 logger.exception("[c8-talker-narrow] replay failed rows=%d", rows)
         reference = wide_forward()[frame : rows * width : width].clone()
-        if graph_key in rejected or not shadow:
+        if qualification in rejected or not shadow:
             return reference
-        compact.bind(first, embeds, positions, width, frame)
-        slots = compact.slots.long()
+        compact.bind(first, embeds, positions, width, frame, rows)
+        slots = compact.slots[:rows].long()
         expected_kv = [cache.index_select(0, slots) for cache in compact.kv]
         try:
-            actual = compact.replay()
+            actual = compact.replay()[:rows]
             hidden_ok = torch.equal(actual, reference)
             kv_ok = all(
                 torch.equal(old, cache.index_select(0, slots))
@@ -400,8 +407,8 @@ def prepare(runner, talker, model_inputs, input_batch, width):
             logger.exception("[c8-talker-narrow] shadow capture failed rows=%d", rows)
             hidden_ok = kv_ok = False
         if not (hidden_ok and kv_ok):
-            ready.discard(graph_key)
-            rejected.add(graph_key)
+            ready.discard(qualification)
+            rejected.add(qualification)
             for cache, old in zip(compact.kv, expected_kv, strict=True):
                 cache.index_copy_(0, slots, old)
             logger.warning(
@@ -412,8 +419,8 @@ def prepare(runner, talker, model_inputs, input_batch, width):
                 hidden_ok,
                 kv_ok,
             )
-        elif frame == width - 1 and graph_key not in ready:
-            ready.add(graph_key)
+        elif frame == width - 1 and qualification not in ready:
+            ready.add(qualification)
             logger.info(
                 "[c8-talker-narrow] shadow exact all frames rows=%d capacity=%d fixed=%s rope=%s",
                 rows,

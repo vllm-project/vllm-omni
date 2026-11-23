@@ -111,7 +111,7 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize("matches", [False, True])
-@pytest.mark.parametrize("rows", [2, 16])
+@pytest.mark.parametrize("rows", [2, 12, 16])
 def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, rows):
     mode = tmp_path / "mode"
     mode.write_text("active_fixed")
@@ -135,26 +135,29 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, ro
         "positions": torch.arange(tokens),
     }
 
-    if rows == 16:
+    if rows > 8:
         assert talker_batched_decode.prepare(runner, None, inputs, batch, 16) is None
-        mode.write_text("active_fixed_wide")
+        mode.write_text("active_fixed_wide" if rows == 16 else "active_fixed_padded")
 
     class Graph:
         def __init__(self, *args, **kwargs):
             self.metadata = {"layer": metadata}
-            self.slots = torch.arange(rows)
+            self.slots = torch.arange(16 if rows > 8 else rows)
             self.kv = []
-            if rows == 16:
-                assert args[-2:] == (512, tokens)
+            if rows > 8:
+                assert args[-3:] == (16, 512, 256)
 
         def prepare_step(self, *args):
             pass
 
-        def bind(self, first, embeds, positions, width, frame):
+        def bind(self, first, embeds, positions, width, frame, active_rows):
+            assert active_rows == rows
             self.frame = frame
 
         def replay(self):
             result = wide[self.frame : tokens : 16]
+            if rows == 12:
+                result = torch.cat((result, torch.zeros(4, 2, dtype=result.dtype)))
             return result + (0 if matches else 1)
 
     monkeypatch.setattr(talker_batched_decode, "CompactGraph", Graph)
