@@ -266,6 +266,14 @@ On NPU, the flag retains the existing
 
 ---
 
+## Ring attention on SAIL PPU
+
+Ring can use the SAIL SDK's PPU build of FlashAttention 3. Install a
+[compatible SAIL stack](https://github.com/vllm-project/vllm-sail/blob/main/docs/getting_started/installation.md)
+with the PPU FA3 package, then use `FLASH_ATTN` with `ring_degree > 1`.
+Ring prefers the SDK's FA3 kernel when the SAIL platform is active and the
+FA3 interface is available.
+
 ## Compiling FA4 Ring attention
 
 On Blackwell, Ring prefers vLLM's bundled FlashAttention dispatcher. When it
