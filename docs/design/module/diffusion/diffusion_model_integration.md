@@ -80,6 +80,15 @@ preparation step already published its failures this way, but the encoder
 forward did not, so an encoder operator failure on rank 0 left the other
 ranks waiting in the broadcast.
 
+The publishing helper has to match the set of ranks that ran the work. A
+rank-0-only broadcast carries rank 0's failure and ignores every other rank's
+payload, so it is the wrong helper as soon as more than one rank runs the
+work: with `text_encoder_tp_size > 1` a non-zero encoder rank can fail while
+rank 0 succeeds, and the request would then complete with a missing encoder
+output instead of failing. When the failing rank is not fixed, the helper
+has to collect the per-rank failure status and let every rank raise the same
+failure.
+
 ## Safe-change guide
 
 Test registry selection, checkpoint loading, minimal inference, input and output

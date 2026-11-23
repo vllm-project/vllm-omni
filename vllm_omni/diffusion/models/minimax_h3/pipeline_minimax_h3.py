@@ -646,20 +646,7 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
         if exc is not None:
             raise exc
         return
-    if rank == 0:
-        if exc is None:
-            payload: list[Any] = [None]
-        else:
-            payload = [
-                {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "status_code": getattr(exc, "status_code", None),
-                    "error_type": getattr(exc, "error_type", None),
-                }
-            ]
-    else:
-        payload = [None]
+    payload: list[Any] = [_exception_metadata(exc) if rank == 0 else None]
     dist.broadcast_object_list(payload, src=0, group=group)
     info = payload[0]
     if info is None:
@@ -667,12 +654,32 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
     if rank == 0:
         assert exc is not None
         raise exc
-    # Rebuild a matching client-facing error on non-zero ranks so the runner's
-    # per-request try/except records the same 4xx status as rank 0. The exact
-    # subclass need not survive the wire; the message and status suffice.
+    _raise_published_exception(info, source_rank=0)
+
+
+def _exception_metadata(exc: Exception | None) -> dict[str, Any] | None:
+    """Serialize an exception into a payload that can cross a process group."""
+    if exc is None:
+        return None
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "status_code": getattr(exc, "status_code", None),
+        "error_type": getattr(exc, "error_type", None),
+    }
+
+
+def _raise_published_exception(info: dict[str, Any], source_rank: int) -> None:
+    """Raise a failure that ``source_rank`` published to the other ranks.
+
+    The failing rank raises its own exception, so the original traceback is
+    kept there. The other ranks rebuild a matching client-facing error so the
+    runner's per-request try/except records the same 4xx status. The exact
+    subclass need not survive the wire; the message and status suffice.
+    """
     status_code = info.get("status_code")
     error_type = info.get("error_type")
-    message = f"[rank 0] {info['type']}: {info['message']}"
+    message = f"[rank {source_rank}] {info['type']}: {info['message']}"
     if status_code is not None:
         raise client_error_from_metadata(
             message,
@@ -680,6 +687,56 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
             error_type=error_type,
         )
     raise RuntimeError(message)
+
+
+def _publish_any_rank_exception(exc: Exception | None) -> None:
+    """Synchronize an exception raised by *any* DiT rank across every DiT rank.
+
+    ``_broadcast_rank0_exception`` can only carry rank 0's failure: the
+    broadcast source is fixed at rank 0 and every other rank's payload is
+    ignored. That is enough for the preparation step, which only runs on
+    rank 0, but not for the text encoder forward, which runs on the first
+    ``text_encoder_tp_size`` ranks. With more than one encoder rank a
+    non-zero encoder rank can fail while rank 0 succeeds, and the rank-0
+    broadcast drops that failure: every rank then continues into the output
+    broadcast, and the request completes with a missing encoder output
+    instead of failing.
+
+    This helper all-gathers the per-rank failure status instead, so the
+    lowest failing rank owns the error and every other rank raises the same
+    failure. It is a collective like its rank-0 counterpart, so every rank
+    has to call it before any subsequent collective.
+    """
+    if not dist.is_initialized():
+        if exc is not None:
+            raise exc
+        return
+    # The payload is a Python object, so it has to travel host-side over the
+    # gloo group instead of the device group. This is the access pattern the
+    # rest of the codebase already uses for object transfers.
+    group = get_world_group().cpu_group
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        if exc is not None:
+            raise exc
+        return
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(
+        gathered,
+        {"rank": rank, "error": _exception_metadata(exc)},
+        group=group,
+    )
+    failures = [item for item in gathered if item is not None and item["error"] is not None]
+    if not failures:
+        return
+    failure = min(failures, key=lambda item: item["rank"])
+    source_rank = int(failure["rank"])
+    info = failure["error"]
+    if source_rank == rank:
+        assert exc is not None
+        raise exc
+    _raise_published_exception(info, source_rank=source_rank)
 
 
 def _broadcast_tensor(
@@ -3177,7 +3234,13 @@ class MiniMaxH3Pipeline(
         # the encoder: it is a collective, and the ranks that skipped the
         # encoder are exactly the ones that would otherwise wait in the
         # broadcast below for a rank that failed.
-        _broadcast_rank0_exception(encode_error)
+        if self.text_encoder_tp_size > 1:
+            # More than one rank runs the encoder, so the failure can come
+            # from any of them and the rank-0-only broadcast would drop the
+            # failure of a non-zero encoder rank.
+            _publish_any_rank_exception(encode_error)
+        else:
+            _broadcast_rank0_exception(encode_error)
         return (
             _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
             _broadcast_tensor(tags, dtype=torch.long, device=self.device),
