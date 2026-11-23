@@ -231,7 +231,7 @@ def test_real_module_hooks_and_component_cleanup(mocker, branch, fail):
 def test_encode_prompt_releases_non_source_hidden_before_receive(mocker, mode, rank, tp_size, world_size):
     expected_hidden = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
     expected_tags = torch.tensor([0, 1, 2])
-    output_ref = None
+    output_ref: weakref.ReferenceType[torch.Tensor] | None = None
     events = []
 
     def encode(input_ids, vision_kwargs):
@@ -246,6 +246,7 @@ def test_encode_prompt_releases_non_source_hidden_before_receive(mocker, mode, r
         assert device == torch.device("cpu")
         if dtype == torch.bfloat16:
             if rank == 0:
+                assert output_ref is not None
                 assert tensor is output_ref()
             else:
                 assert tensor is None
