@@ -175,14 +175,20 @@ configured budgets. This is a token limit, not an audio-duration limit.
 Speech requests can override the first AR stage's temperature and repetition
 penalty at the top level or through `extra_params`. Explicit top-level values
 take precedence over nested values, then the stage's `default_sampling_params`;
-omitted or `null` values do not override them. `temperature` must be finite and
-nonnegative; `repetition_penalty` must be finite and positive, with `1.0`
-disabling repetition scaling for the first AR stage.
+omitted or `null` values do not override them. Overrides are merged before
+validation, so shadowed nested values are ignored. The first-stage `temperature`
+follows vLLM `SamplingParams` validation and normalization (currently a finite
+value in `[0, 2]`, with small positive values raised to `0.01`).
+Normalization happens before adapter prompt construction, so model metadata
+and stage sampling use the same effective temperature.
+`repetition_penalty` must be finite and positive, with `1.0` disabling repetition
+scaling for the first AR stage.
 
 For Qwen3-TTS, request `temperature` also controls the residual Subtalker's
-temperature and sampling switch. Without a request override, an effective
-first-stage temperature of zero also makes the Subtalker greedy; other values
-keep its deployment defaults. Explicit `extra_params.subtalker_sampling_params`
+temperature and sampling switch, using the normalized first-stage value.
+Without a request override, an effective first-stage temperature of zero also
+makes the Subtalker greedy; other values keep its deployment defaults.
+Explicit `extra_params.subtalker_sampling_params`
 fields override residual defaults and take precedence over temperature
 inheritance; `{}` keeps residual defaults without inheriting temperature.
 Accepted fields are `do_sample` (boolean), `temperature` (finite, nonnegative),
@@ -622,6 +628,9 @@ when the first text arrives. `ref_audio` takes a single string and
 `speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
 length of a whole request, so they require `split_granularity="none"` and
 `text_input_mode="buffered"`. Session parameters:
+
+`temperature`, `repetition_penalty`, and `extra_params` are forwarded through
+the same sampling override validation, precedence, and normalization as REST.
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |

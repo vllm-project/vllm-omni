@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import anyio
+import msgspec
 import numpy as np
 import soundfile as sf
 import torch
@@ -33,7 +34,7 @@ from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAI
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.exceptions import VLLMClientError
+from vllm.exceptions import VLLMClientError, VLLMValidationError
 from vllm.logger import init_logger
 from vllm.multimodal.media import AudioMediaIO, MediaConnector
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -2355,6 +2356,48 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         is_streaming_request = request.is_streaming() and not qwen3_full_payload
         sampling_params_list = coerce_param_message_types(sampling_params_list, is_streaming_request)
 
+        # Validate and normalize request-owned sampling before adapters build
+        # prompts from it, so model metadata and stage sampling stay aligned.
+        if request.extra_params is not None and sampling_params_list:
+            if not isinstance(request.extra_params, dict):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="extra_params must be a JSON object/dict.",
+                )
+            import copy
+
+            extra_params = request.extra_params
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            overrides = {
+                name: value
+                for name in ("temperature", "top_p", "top_k", "repetition_penalty")
+                if (value := extra_params.get(name)) is not None
+            }
+            if overrides and isinstance(sampling_params_list[0], SamplingParams):
+                # Reconstruct to preserve vLLM validation, normalization and
+                # sampling-mode cache ownership before Subtalker inheritance.
+                try:
+                    sampling_params_list[0] = msgspec.structs.replace(sampling_params_list[0], **overrides)
+                except VLLMValidationError as exc:
+                    # Speech preparation reports invalid requests as ValueError.
+                    raise ValueError(str(exc)) from exc
+            else:
+                for name, value in overrides.items():
+                    setattr(sampling_params_list[0], name, value)
+            if "temperature" in overrides:
+                temperature = sampling_params_list[0].temperature
+                extra_params = {**extra_params, "temperature": temperature}
+                updates: dict[str, object] = {"extra_params": extra_params}
+                if request.temperature is not None:
+                    updates["temperature"] = temperature
+                request = request.model_copy(update=updates)
+            if sampling_params_list[0].extra_args is None:
+                sampling_params_list[0].extra_args = {}
+            # ``omni_user_seed`` is owned by the serving layer, not clients.
+            applied_extra_params = {key: value for key, value in extra_params.items() if key != "omni_user_seed"}
+            sampling_params_list[0].extra_args.update(applied_extra_params)
+            logger.info("Applied extra_params: %s", applied_extra_params)
+
         # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
         # dedicated TTS model resolves to an adapter that owns its validation,
         # uploaded-speaker handling, prompt/param building, and sampling
@@ -2421,31 +2464,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             cap = raw_max if isinstance(raw_max, int) else 200
             text = request.input[: max(cap - base_len, 0)]
             logger.debug("TTS speech request %s: text=%r", request_id, text)
-
-        # Apply model-specific extra parameters
-        if request.extra_params is not None and sampling_params_list:
-            if not isinstance(request.extra_params, dict):
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST.value,
-                    detail="extra_params must be a JSON object/dict.",
-                )
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            for name in ("temperature", "top_p", "top_k", "repetition_penalty"):
-                if (value := request.extra_params.get(name)) is not None:
-                    setattr(sampling_params_list[0], name, value)
-            if sampling_params_list[0].extra_args is None:
-                sampling_params_list[0].extra_args = {}
-            # ``omni_user_seed`` is a serving-layer marker for the
-            # seeded-request isolation policy, not a client knob: copying it
-            # from extra_params would let a request serialize the engine without
-            # asking for reproducibility.
-            applied_extra_params = {
-                key: value for key, value in request.extra_params.items() if key != "omni_user_seed"
-            }
-            sampling_params_list[0].extra_args.update(applied_extra_params)
-            logger.info("Applied extra_params: %s", applied_extra_params)
 
         # Apply adapter-owned sampling overrides, including request-level token
         # limits and model-specific dynamic token or stop-token configuration.
