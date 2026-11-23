@@ -56,7 +56,7 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
-from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
@@ -129,6 +129,7 @@ def _open_message(
     *,
     output_buffer: DuplexOutputBuffer | None = None,
     session_id: str = SESSION_ID,
+    modalities: tuple[str, ...] = ("text",),
 ) -> OpenDuplexSessionMessage:
     return OpenDuplexSessionMessage(
         control_id=f"open-{session_id}",
@@ -136,7 +137,7 @@ def _open_message(
         output_buffer=output_buffer or DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         session_config=DuplexSessionConfig(
             model="openbmb/MiniCPM-o-4_5",
-            modalities=["text"],
+            modalities=list(modalities),
             instructions="public instructions",
             extra_body={"auto_response": True, **(extra_body or {})},
         ),
@@ -437,6 +438,52 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     assert counter.value == 0
 
 
+@pytest.mark.asyncio
+async def test_resumable_append_refreshes_stage_submit_ts(monkeypatch) -> None:
+    """A later append on the same request id must not keep the first segment's clock."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["now"])
+    orchestrator, _, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert request_state.stage_submit_ts[0] == pytest.approx(1_000.0)
+
+    clock["now"] = 5_000.0
+    await _submit(orchestrator, _append_audio())
+    assert request_state.stage_submit_ts[0] == pytest.approx(5_000.0)
+
+    await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_duplex_submit_excludes_llm_send_wait(monkeypatch) -> None:
+    """Duplex LLM submit() starts the stage clock after a delayed send, not before."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("vllm_omni.engine.orchestrator._time.time", lambda: clock["now"])
+    seen_at_submit: list[float] = []
+    orchestrator, _, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+    pool = orchestrator.stage_pools[0]
+    original = pool.submit_initial
+
+    async def delayed_submit_initial(req_id, req_state, request, **kwargs):
+        seen_at_submit.append(req_state.stage_submit_ts.get(0, -1.0))
+        clock["now"] = 1_500.0
+        return await original(req_id, req_state, request, **kwargs)
+
+    pool.submit_initial = delayed_submit_initial
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert seen_at_submit == [-1.0]
+    assert request_state.stage_submit_ts[0] == pytest.approx(1_500.0)
+
+    await orchestrator.session_manager.shutdown()
+
+
 @pytest.fixture
 def ephemeral_submissions(mocker):
     orchestrator, clients, _, _ = _build(stages=2)
@@ -535,6 +582,24 @@ async def test_ephemeral_prewarm_does_not_hold_stage_input_lock(ephemeral_submis
     finally:
         first.cancel()
         await asyncio.gather(first, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_prewarm_follows_plugin_choice(ephemeral_submissions, mocker):
+    orchestrator, clients, submissions, _ = ephemeral_submissions
+    orchestrator.async_chunk = True
+    # "first" stands for a turn that can never reach the downstream stages.
+    mocker.patch.object(
+        orchestrator.plugin, "prewarms_downstream_stages", side_effect=lambda request_id: request_id != "first"
+    )
+    prewarm = mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", return_value=True)
+
+    assert (await orchestrator.submit(submissions[0])).request_id == "first"
+    assert (await orchestrator.submit(submissions[1])).request_id == "second"
+
+    # Stage0 still gets both requests; only the downstream prewarm is skipped.
+    assert [args[0].request_id for args in clients[0].add_request_calls] == ["first", "second"]
+    assert [call.args[0] for call in prewarm.call_args_list] == ["second"]
 
 
 @pytest.mark.asyncio
@@ -1313,6 +1378,64 @@ def _placement_config(**kwargs) -> DuplexSessionRuntimeConfig:
     return DuplexSessionRuntimeConfig(
         replica_policy="least_sessions", max_sessions=8, max_sessions_per_replica=2, **kwargs
     )
+
+
+@pytest.mark.parametrize("groups", [None, [{0: 0}, {0: 1}]], ids=["implicit", "explicit"])
+@pytest.mark.asyncio
+async def test_least_sessions_skips_replica_that_exited_before_ready(groups) -> None:
+    # StageRuntime leaves a hole for replica 0 when it exits before READY.
+    survivor = FakeStageClient(final_output=True)
+    pool = StagePool(
+        0,
+        [None, survivor],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=_stage_configs(1)[0],
+    )
+    orchestrator = DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=_placement_config(replica_groups=groups),
+    )
+    try:
+        assert (await _open(orchestrator, orchestrator.rpc_async_queue)).ok
+        await _submit(orchestrator, _append_audio())
+        assert survivor.add_request_calls
+        request = survivor.add_request_calls[0][0]
+        assert request.request_id == _stage0_request_id()
+        assert pool.get_bound_replica_id(request.request_id) == 1
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("groups", [None, [{0: 0, 1: 0}, {0: 1, 1: 1}]], ids=["implicit", "explicit"])
+async def test_crossed_startup_failures_respect_session_groups(groups) -> None:
+    pools = [StagePool(0, [None, FakeStageClient()]), StagePool(1, [FakeStageClient(final_output=True), None])]
+    rpc = asyncio.Queue()
+    orchestrator = DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc,
+        stage_pools=pools,
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=_placement_config(replica_groups=groups),
+    )
+    try:
+        result = await _open(orchestrator, rpc)
+        if groups is None:
+            assert result.ok
+            assert [orchestrator.replica_placement.route(SESSION_ID, stage) for stage in (0, 1)] == [1, 0]
+        else:
+            assert not result.ok and result.error_code == "replica_unavailable"
+            assert not result.error_retryable
+            snapshot = orchestrator.replica_placement.snapshot()
+            assert snapshot["groups"] == groups
+            assert not snapshot["sessions"]
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio

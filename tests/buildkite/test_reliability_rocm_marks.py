@@ -32,10 +32,7 @@ INVALID_PARAMETER_ROCM_MARKS = {
     "test_invalid_image_generation.py": {'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 1},
     "test_invalid_image_editing.py": {'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 1},
     "test_invalid_audio_diffusion.py": {'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})': 1},
-    "test_invalid_audio_speech.py": {
-        'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})': 1,
-        'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 2,
-    },
+    "test_invalid_audio_speech.py": {'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})': 1},
 }
 
 
@@ -195,10 +192,10 @@ def test_nightly_pipeline_does_not_own_fault_injection_files() -> None:
     "filename,class_name",
     [("test_qwen3_omni_replica.py", "Qwen3OmniReplica"), ("test_minicpmo_4_5_replica.py", "MiniCPMO45Replica")],
 )
-def test_replica_coverage_is_intentionally_cuda_only(filename: str, class_name: str) -> None:
+def test_replica_coverage_requires_cuda_and_rocm_resources(filename: str, class_name: str) -> None:
     resource = _class_assignment(RELIABILITY_DIR / filename, class_name, "res")
     assert resource is not None
-    assert ast.literal_eval(resource) == {"cuda": "H100"}
+    assert ast.literal_eval(resource) == {"cuda": "H100", "rocm": "MI325"}
 
 
 @pytest.mark.parametrize("key", ["diffusion_wan22_reliability", "diffusion_hunyuan_image3_reliability"])

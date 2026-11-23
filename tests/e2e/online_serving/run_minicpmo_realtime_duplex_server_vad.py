@@ -48,7 +48,7 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
         )
         cursor = len(client.events.events)
         await client.stream_pcm16(interrupt + bytes(16_000 * 2 * 800 // 1000), chunk_ms=args.chunk_ms, realtime=True)
-        await until(lambda: _events(client.events.events, target_id, "response.done"), "cancelled response.done")
+        await until(lambda: _events(client.events.events, target_id, "response.done"), "target response.done")
         await client.commit()
         await until(
             lambda: any(
@@ -66,22 +66,42 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
 
     done = _events(events, target_id, "response.done")
     terminal = done[0] if len(done) == 1 else None
-    trailing = events[events.index(terminal) + 1 :] if terminal is not None else events
+    target_response = terminal.get("response") if terminal is not None else None
+    cleared = _events(events[cursor:], target_id, "output_audio_buffer.cleared")
+    speech_started = [event for event in events[cursor:] if event.get("type") == "input_audio_buffer.speech_started"]
+    cutoff = terminal
+    if cleared and (cutoff is None or events.index(cleared[0]) < events.index(cutoff)):
+        cutoff = cleared[0]
+    trailing = events[events.index(cutoff) + 1 :] if cutoff is not None else events
+    followup_events = events[events.index(cleared[0]) + 1 :] if cleared else trailing
+    playback_cleared = (
+        len(cleared) == 1 and len(speech_started) == 1 and events.index(cleared[0]) > events.index(speech_started[0])
+    )
     stale = any(
         e.get("type") == "response.output_audio.delta" and RealtimeEventCollector.response_id(e) == target_id
         for e in trailing
     )
     followup_audio = any(
         e.get("type") == "response.output_audio.delta" and RealtimeEventCollector.response_id(e) != target_id
-        for e in events[cursor:]
+        for e in followup_events
     )
     ok = (
         terminal is not None
-        and isinstance(terminal.get("response"), dict)
-        and terminal["response"].get("status") == "cancelled"
-        and terminal["response"].get("status_details", {}).get("reason") == "turn_detected"
+        and isinstance(target_response, dict)
+        and (
+            (
+                target_response.get("status") == "cancelled"
+                and target_response.get("status_details", {}).get("reason") == "turn_detected"
+            )
+            or (
+                target_response.get("status") == "completed"
+                and target_response.get("status_details", {}).get("reason") == "stop"
+                and playback_cleared
+                and events.index(terminal) < events.index(speech_started[0])
+            )
+        )
         and not stale
-        and sum(e.get("type") == "input_audio_buffer.speech_started" for e in events[cursor:]) == 1
+        and len(speech_started) == 1
         and sum(e.get("type") == "input_audio_buffer.speech_stopped" for e in events[cursor:]) == 1
         and any(e.get("type") == "input_audio_buffer.committed" for e in events[cursor:])
         and followup_audio
@@ -151,6 +171,7 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
             "interrupt_cursor": cursor,
             "event_count": len(events),
             "target_done_count": len(done),
+            "target_playback_cleared_count": len(cleared),
             "target_terminals": terminals,
             "stale_target_audio": stale,
             "stale_target_audio_count": sum(
