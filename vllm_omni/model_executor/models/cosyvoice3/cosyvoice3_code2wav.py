@@ -573,14 +573,15 @@ class CosyVoice3Code2Wav(nn.Module):
 
         Build each prompt/continuation contiguously before right padding. Padding
         the prompt and continuation separately would insert a gap in conditioning.
-        The default keeps exact-length CPU-F0 HiFT. The opt-in Hopper profile
-        uses packed Flow, batched HiFT, and FP64 GPU F0.
+        The default keeps exact-length per-request HiFT. The opt-in packed
+        profile uses packed Flow and batched HiFT. Both paths use GPU FP32 F0
+        on CUDA by default; COSYVOICE3_F0_ON_CPU=1 selects CPU F0.
         """
         if not items:
             return []
         if stream_items:
             if not cosyvoice3_packed_streaming_enabled():
-                raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on Hopper")
+                raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on a GPU with FA2/FA3")
             if any(bool(item.get("finalize", False)) != bool(items[0].get("finalize", False)) for item in items):
                 raise ValueError("Use forward_streaming_batch to group mixed finalization states")
         if len(items) > 8:
@@ -797,5 +798,7 @@ class CosyVoice3Code2Wav(nn.Module):
                 logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")
         if self.config.cosyvoice3_compile_dit:
+            # Like HiFT folding, cuDNN QKV packing changes state_dict keys.
+            # Reload original checkpoints only into a fresh model instance.
             compile_cosyvoice3_padded_dit(self.flow_model.decoder.estimator, device)
             logger.info("CosyVoice3 padded DiT compilation configured; first-use compilation occurs during warmup")

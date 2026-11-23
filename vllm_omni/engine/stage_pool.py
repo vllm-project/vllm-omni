@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -58,6 +58,7 @@ from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
+    extract_diffusion_scheduler_wait_ms,
     iter_mm_outputs,
     iter_request_output_items,
 )
@@ -269,24 +270,18 @@ class StagePool:
     def __init__(
         self,
         stage_id: int,
-        clients: StagePoolClient | list[StagePoolClient],
+        clients: StagePoolClient | Sequence[StagePoolClient | None],
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
         watermarkers: Mapping[str, Watermarker] | None = None,
         strict_watermarking: bool = False,
     ) -> None:
-        if isinstance(clients, list):
-            normalized_clients: list[StagePoolClient] = list(clients)
-        else:
-            normalized_clients = [clients]
-
-        # Allow empty pools when running in distributed head mode for a
-        # non-self stage; clients will arrive via add_client(...).
         self.stage_id = stage_id
-        # Slots can become None after a dynamic remove_client (distributed mode);
-        # iterate via live_replica_ids() to skip holes.
-        self.clients: list[StagePoolClient | None] = list(normalized_clients)
+        # A slot is empty after a startup failure or dynamic removal. Keep its
+        # index reserved so routing and metrics use the original replica IDs.
+        # Distributed heads can also start with no slots and add clients later.
+        self.clients: list[StagePoolClient | None] = list(clients) if isinstance(clients, Sequence) else [clients]
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self.collect_stage_metrics = True
@@ -706,7 +701,7 @@ class StagePool:
         self.release_binding(request_id)
 
     def invalidate_addr(self, input_addr: str) -> list[str]:
-        """Drop affinity rows pointing at ``input_addr``; return affected request ids."""
+        """Return requests routed to ``input_addr``, dropping their affinity rows."""
         affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
         for rid in affected:
             self._affinity.pop(rid, None)
@@ -715,24 +710,21 @@ class StagePool:
     # ---- Legacy (non-distributed) route binding ----
 
     def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
-        """Bind a real request to a required local replica, without selecting a fallback.
+        """Bind a real request to a required replica, without selecting a fallback.
 
         Call before input preprocessing or sender metadata construction, then
         pass the same pin to submission to recheck availability. Session
         reservations belong to the duplex placement owner, not this ledger.
+
+        Pins use the explicit-routing ledger and availability checks. Translate
+        routing errors for internal callers, which require a stage failure.
         """
-        if self._hub is not None or self._lb is not None:
-            raise StageUnavailableError("pinned replica routing is only supported for local stage pools")
-        if not self.is_replica_available(replica_id):
-            raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
-        bound = self.get_bound_replica_id(request_id)
-        if bound is not None and bound != replica_id:
+        try:
+            return self.bind_requested_replica(request_id, replica_id)
+        except OmniClientError as exc:
             raise StageUnavailableError(
-                f"stage {self.stage_id} request {request_id} is bound to replica {bound}, "
-                f"conflicting with pinned replica {replica_id}"
-            )
-        self._request_bindings[request_id] = replica_id
-        return replica_id
+                f"stage {self.stage_id} pinned replica {replica_id} is unavailable or conflicting: {exc}"
+            ) from exc
 
     def parallel_sample_parent_id(self, request_id: str) -> str | None:
         """The id of the n > 1 request whose sample (child request) is ``request_id``, else None."""
@@ -1132,13 +1124,26 @@ class StagePool:
         request_outputs: list[Any],
         *,
         submit_ts: float,
+        submit_perf: float | None = None,
         request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
-        now = _time.time()
-        stage_gen_time_ms = (now - submit_ts) * 1000.0
+        if submit_perf is not None:
+            stage_gen_time_ms = (_time.perf_counter() - submit_perf) * 1000.0
+        else:
+            stage_gen_time_ms = (_time.time() - submit_ts) * 1000.0
+        scheduler_wait_ms = extract_diffusion_scheduler_wait_ms(request_outputs[0]) if request_outputs else None
+        if scheduler_wait_ms is not None:
+            if scheduler_wait_ms > stage_gen_time_ms:
+                logger.warning(
+                    "Stage-%s diffusion scheduler wait %.3f ms exceeds stage generation %.3f ms",
+                    self.stage_id,
+                    scheduler_wait_ms,
+                    stage_gen_time_ms,
+                )
+            stage_gen_time_ms -= scheduler_wait_ms
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
         native_text_metrics = {}
         if request_id:
@@ -1184,6 +1189,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             stage_gen_time_ms=stage_gen_time_ms,
+            scheduler_queue_wait_ms=scheduler_wait_ms,
             rx_transfer_bytes=0,
             rx_decode_time_ms=0.0,
             rx_in_flight_time_ms=0.0,
@@ -1220,6 +1226,7 @@ class StagePool:
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
         has_output_timestamps = bool(output_timestamps)
+        now = _time.time()
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)

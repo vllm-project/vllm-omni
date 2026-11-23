@@ -324,7 +324,7 @@ def test_chunk_count_limit_rejects_before_generation(chunk_count, step_mode):
         prepared = (
             pipeline.prepare_encode(state).extra["prepared"]
             if step_mode
-            else pipeline._prepare_request_input(request.prompt, request.sampling_params.extra_args)
+            else pipeline._prepare_request_input(request.prompt, request.sampling_params)
         )
         assert len(prepared.chunks.texts) == chunk_count
     else:
@@ -557,7 +557,7 @@ def test_short_clone_uses_reference_duration_before_chunking_threshold():
     for ref_length in (100, 200):
         pipeline._inline_reference_cache.clear()
         pipeline.reference = torch.zeros(8, ref_length, dtype=torch.long)
-        prepared = pipeline._prepare_request_input(prompt, {})
+        prepared = pipeline._prepare_request_input(prompt, OmniDiffusionSamplingParams())
         assert prepared.chunks is None
         assert prepared.target_len == ref_length
 
@@ -579,10 +579,10 @@ def test_reference_duration_changes_whether_chunking_starts():
     prompt = {"input": text, "ref_text": text, "ref_audio": (torch.ones(4), 10)}
     extra = {"audio_chunk_threshold": 6.0, "audio_chunk_duration": 3.0}
     pipeline.reference = torch.zeros(8, 100, dtype=torch.long)
-    assert pipeline._prepare_request_input(prompt, extra).chunks is None
+    assert pipeline._prepare_request_input(prompt, OmniDiffusionSamplingParams(extra_args=extra)).chunks is None
     pipeline._inline_reference_cache.clear()
     pipeline.reference = torch.zeros(8, 200, dtype=torch.long)
-    assert len(pipeline._prepare_request_input(prompt, extra).chunks.texts) > 1
+    assert len(pipeline._prepare_request_input(prompt, OmniDiffusionSamplingParams(extra_args=extra)).chunks.texts) > 1
 
 
 @pytest.mark.parametrize("step_mode", [False, True])

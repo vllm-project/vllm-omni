@@ -287,6 +287,9 @@ class PlacementStagePort(FakeStagePort):
         self.release_calls: list[str] = []
         self.rejections: list[str] = []
 
+    def check_session_availability(self, session_id: str) -> None:
+        self.placement.check_session_availability(session_id)
+
     def reserve_session(self, session_id: str) -> None:
         self.reserve_calls.append(session_id)
         self.placement.reserve(session_id)
@@ -656,6 +659,21 @@ async def test_capacity_rejection_is_retryable_and_logged_at_info(caplog: pytest
             assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
     finally:
         manager_logger.removeHandler(caplog.handler)
+
+
+@pytest.mark.parametrize("limit", [0, 1], ids=["zero-budget", "free-slot"])
+async def test_unavailable_group_rejection_is_counted_once_and_logged_at_info(limit, mocker) -> None:
+    port = PlacementStagePort()
+    port.placement.mark_unavailable(0, 0)
+    info = mocker.spy(session_manager_module.logger, "info")
+    exception = mocker.spy(session_manager_module.logger, "exception")
+    async with Harness.create(stage_port=port, admission_limit=limit) as harness:
+        result = await harness.open("new")
+        assert result.error_code == "replica_unavailable" and not result.error_retryable
+        assert port.rejections == ["replica_unavailable"]
+        assert not port.placement.snapshot()["sessions"]
+        info.assert_any_call("open_duplex_session rejected: %s", mocker.ANY)
+        exception.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1960,7 +1978,7 @@ async def test_replica_reservation_is_held_before_plugin_await_without_exceeding
         # Both opens execute their synchronous admission before parking on the gate.
         await asyncio.sleep(0)
         try:
-            assert port.placement.snapshot()["sessions"] == {"a": 0, "b": 1}
+            assert port.placement.snapshot()["sessions"] == {"a": 0, "b": 3}
             assert harness.manager._admission_count() == 2
             rejected = await harness.open("c")
             assert rejected.error_code == "resource_exhausted"
@@ -2020,6 +2038,26 @@ async def test_frontend_budget_remains_occupied_until_cleanup_finishes() -> None
             port.cleanup_gate.set()
         assert (await closing).ok
         assert (await harness.open("b")).ok
+
+
+async def test_no_live_group_takes_precedence_while_last_session_is_closing() -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port, max_sessions=1) as harness:
+        assert (await harness.open("old")).ok
+        port.cleanup_gate = asyncio.Event()
+        closing = asyncio.create_task(harness.close("old"))
+        await asyncio.wait_for(port.cleanup_started.wait(), timeout=1)
+        try:
+            port.placement.mark_unavailable(0, 0)
+            before = port.placement.snapshot()
+            result = await harness.open("new")
+            assert result.error_code == "replica_unavailable" and not result.error_retryable
+            assert port.rejections == ["replica_unavailable"]
+            assert port.reserve_calls == ["old"]
+            assert port.placement.snapshot() == before
+        finally:
+            port.cleanup_gate.set()
+            await closing
 
 
 async def test_duplicate_open_does_not_release_an_inflight_replica_reservation() -> None:
@@ -2217,7 +2255,7 @@ async def test_replica_failure_expires_idle_owner_and_preserves_other_group() ->
         assert events[0].code == "replica_unavailable"
         assert harness.manager.get("a") is None
         assert harness.manager.get("b") is not None
-        assert port.placement.snapshot()["sessions"] == {"b": 1}
+        assert port.placement.snapshot()["sessions"] == {"b": 3}
         assert port.placement.route("b", 1) == 1
         assert port.release_calls == ["a"]
 
@@ -2238,8 +2276,10 @@ async def test_failure_inside_append_does_not_await_its_own_cancellation() -> No
 
         append = asyncio.create_task(append_discovering_failure())
         runner.tasks.track_append_task(append, epoch=0, final=False, response_bound=False)
-        await asyncio.wait_for(returned_from_failure.wait(), timeout=1)
-        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=1)
+        # Keep the deadlock checks bounded while allowing scheduler latency on
+        # loaded CI workers.
+        await asyncio.wait_for(returned_from_failure.wait(), timeout=5.0)
+        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=5.0)
         assert append.cancelled()
         assert harness.manager.get("a") is None
         assert port.placement.snapshot()["sessions"] == {}

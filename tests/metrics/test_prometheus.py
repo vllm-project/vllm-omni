@@ -185,11 +185,17 @@ class TestDuplexPlacementMetrics:
         other = OmniPrometheusMetrics(model_name="duplex-other-metrics")
         metrics.inc_duplex_admission_rejected("global_capacity_exhausted")
         metrics.inc_duplex_admission_rejected("replica_capacity_exhausted")
+        metrics.inc_duplex_admission_rejected("replica_unavailable")
         metrics.inc_duplex_admission_rejected("arbitrary-session-id")
         metrics.inc_duplex_admission_rejected("another-session-id")
         other.inc_duplex_admission_rejected("replica_capacity_exhausted")
 
-        for reason, expected in [("global_capacity_exhausted", 1), ("replica_capacity_exhausted", 1), ("unknown", 2)]:
+        for reason, expected in [
+            ("global_capacity_exhausted", 1),
+            ("replica_capacity_exhausted", 1),
+            ("replica_unavailable", 1),
+            ("unknown", 2),
+        ]:
             assert (
                 duplex_registry.get_sample_value(
                     defs.DUPLEX_ADMISSION_REJECTED + "_total",

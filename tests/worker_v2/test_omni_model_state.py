@@ -36,6 +36,8 @@ def test_prepare_attn_forwards_release_model_specific_metadata():
 
 
 class _DummyInputBatch:
+    num_computed_prefill_tokens_np: np.ndarray
+    prefill_len_np: np.ndarray
     is_prefilling_np: np.ndarray
     req_ids: list[str]
 
@@ -431,6 +433,48 @@ def test_decode_cohort_uses_batch_hook(hook_name):
     assert torch.equal(model_inputs["input_ids"], torch.tensor([111, 212]))
     assert state.intermediate_buffer.buffers[0]["meta"]["step"] == 11
     assert torch.equal(seen_text_steps[0], torch.tensor([[51.0, 52.0], [61.0, 62.0]]))
+
+
+def test_decode_cohort_accepts_three_value_hook_without_mtp():
+    # preprocess_phase_contract.md: without talker_mtp the hook returns
+    # (input_ids, inputs_embeds, updates), as Voxtral TTS does.
+    state = _make_state(max_num_reqs=2, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1", "meta": {"step": 1}}
+    state.intermediate_buffer.buffers[1] = {"req_id": "r2", "meta": {"step": 2}}
+    new_embeds = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+    def preprocess_decode_batch(*, input_ids, req_infos):
+        assert [info["req_id"] for info in req_infos] == ["r1", "r2"]
+        return input_ids, new_embeds, [{"meta": {"step": 11}}, {"meta": {"step": 12}}]
+
+    def unexpected_preprocess(*_args, **_kwargs):
+        raise AssertionError("decode requests must use the batch hook")
+
+    state.model.preprocess_decode_batch = preprocess_decode_batch
+    state.model.preprocess = unexpected_preprocess
+    model_inputs = {
+        "input_ids": torch.tensor([101, 202], dtype=torch.long),
+        "inputs_embeds": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    }
+    state.run_preprocess(
+        _DummyInputBatch([0, 1], num_computed_tokens_cpu=[1, 1]),
+        model_inputs,
+    )
+    assert torch.equal(model_inputs["input_ids"], torch.tensor([101, 202]))
+    assert torch.equal(model_inputs["inputs_embeds"], new_embeds)
+    assert state.intermediate_buffer.buffers[1]["meta"]["step"] == 12
+
+
+def test_decode_cohort_rejects_three_value_hook_with_mtp():
+    state = _make_state(max_num_reqs=1, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1"}
+    state.model.preprocess_decode_batch = lambda *, input_ids, req_infos: (input_ids, torch.zeros(1, 2), [{}])
+    state._has_mtp = True
+    with pytest.raises(RuntimeError, match="five values"):
+        state.run_preprocess(
+            _DummyInputBatch([0], num_computed_tokens_cpu=[1]),
+            {"input_ids": torch.tensor([101], dtype=torch.long), "inputs_embeds": torch.zeros(1, 2)},
+        )
 
 
 def test_static_decode_embeddings_refresh_from_input_ids():
@@ -832,6 +876,8 @@ def test_rope_shim_constructs_sequential_mrope_state():
     with (
         patch("vllm.platforms.current_platform", CpuPlatform()),
         patch("vllm.v1.worker.gpu.buffer_utils.is_uva_available", return_value=False),
+        # Pin-memory support is cached separately from the platform and UVA.
+        patch("vllm.v1.worker.gpu.buffer_utils.is_pin_memory_available", return_value=False),
     ):
         rope = _make_safe_get_rope(get_rope_state)(
             config,
@@ -850,7 +896,16 @@ def test_rope_shim_constructs_sequential_mrope_state():
     rope.init_prefill_positions(1, model, [11, 22, 33, 44], [])
     assert rope.prefill_delta.np[1] == 0
     assert rope.prefill_positions._staged_write_indices == [3, 4, 5]
-    assert rope.prefill_positions._staged_write_contents == [0, 1, 2, 3] * 3
+    # The pin's StagedWriteTensor keeps ndarray staged rows by reference in
+    # _staged_write_chunks instead of extending _staged_write_contents.
+    # With UVA available, omni's staged-write shim replaces stage_write and
+    # stages the same rows as a list of ndarrays in _staged_write_contents,
+    # leaving _staged_write_chunks empty. Accept either representation.
+    staged = rope.prefill_positions._staged_write_chunks
+    if not staged:
+        contents = rope.prefill_positions._staged_write_contents
+        staged = contents if isinstance(contents, list) else [contents]
+    assert [np.asarray(chunk).reshape(-1).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
 
 
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])

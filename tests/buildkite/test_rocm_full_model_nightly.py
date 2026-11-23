@@ -19,6 +19,7 @@ RUNNER = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     ("overrides", "expected_status", "executes_tests"),
     [
         ({}, 0, True),
+        ({"ROCM_E2E_RUN_LEVEL": "core_model"}, 0, True),
         ({"MODEL_KIND": "tts"}, 0, True),
         ({"ROCM_E2E_LEVEL_MARKER": "slow", "ROCM_E2E_TIMEOUT_MINUTES": "75"}, 0, True),
         ({"COLLECTED": "0"}, 1, False),
@@ -37,6 +38,7 @@ RUNNER = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     ],
     ids=[
         "pass",
+        "core-model-run-level",
         "tts-pass",
         "weekly-marker-and-timeout",
         "empty-collection",
@@ -123,6 +125,7 @@ def test_nightly_runner_fails_closed(
         "TIMEOUT_STATUS": "0",
         "LEAK": "0",
         "PS_FAILURE": "0",
+        "ROCM_E2E_RUN_LEVEL": "full_model",
         "MODEL_KIND": "omni",
         "ROCM_E2E_LEVEL_MARKER": "full_model",
         "ROCM_E2E_TIMEOUT_MINUTES": "105",
@@ -151,7 +154,7 @@ def test_nightly_runner_fails_closed(
         in args
     )
     assert "tests/fake.py\ntests/fake_extra.py\n" in args
-    assert "--run-level\nfull_model\n" in args
+    assert f"--run-level\n{env['ROCM_E2E_RUN_LEVEL']}\n" in args
     assert "--shard-id\n0\n--num-shards\n1\n" in args
     collection_succeeded = env["COLLECTED"] == "5" and env["COLLECTION_STATUS"] == "0"
     if collection_succeeded:

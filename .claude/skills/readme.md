@@ -37,6 +37,10 @@ self-check.
 
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
+- [`add-fullduplex-model`](add-fullduplex-model/SKILL.md): guides integration of
+  new full-duplex speech and multimodal models on the unified engine-resident
+  duplex framework (`DuplexOmni`, `DuplexModelPlugin`, Model Runner V2 hooks,
+  `WS /v1/realtime?duplex=1`, and `omni_duplex_eval`)
 - [`add-omni-model`](add-omni-model/SKILL.md): integrates a new multi-stage
   thinker/talker/code2wav omni model, from the HF reference through pipeline,
   stage hand-off processors, deploy YAML, parity ladder, tests, and recipe
