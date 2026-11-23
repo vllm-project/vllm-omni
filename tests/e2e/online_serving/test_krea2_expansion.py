@@ -40,7 +40,7 @@ PROMPT = "a fox in the snow, photorealistic"
 # darkbrush is a trigger-word LoRA; include its trigger phrase so the LoRA case has a strong signal.
 LORA_PROMPT = "a fox in the snow, monochrome ink wash style"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
 
 
 def _get_diffusion_feature_cases(model: str):
