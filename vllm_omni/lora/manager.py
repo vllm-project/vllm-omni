@@ -571,6 +571,7 @@ class LoRAManager:
         with any ``max_cached_adapters`` value (including the default of 1).
         """
         specs: list[tuple[LoRAModel, float]] = []
+        validate_composition = getattr(self.pipeline, "_validate_diffusion_lora_composition", None)
         for request, scale in pairs:
             lora_model = self._registered_adapters.get(request.lora_int_id)
             if lora_model is not None:
@@ -579,6 +580,8 @@ class LoRAManager:
                 # Transient load for composition only; never registered, so it
                 # cannot evict (or be evicted from) the adapter cache.
                 lora_model, _ = self._load_adapter(request)
+            if callable(validate_composition):
+                validate_composition(lora_model=lora_model)
             specs.append((lora_model, scale))
 
         composed_key_repr = repr(key)
