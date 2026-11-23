@@ -7,7 +7,7 @@
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
 - [Batch Parallel Decode](#batch-parallel-decode)
-- [Spatially-Sharded Decode (Wan)](#spatially-sharded-decode-wan)
+- [Spatially-Sharded Decode and Encode (Wan)](#spatially-sharded-decode-and-encode-wan)
 - [Distributed Encode Split (Wan)](#distributed-encode-split-wan)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
