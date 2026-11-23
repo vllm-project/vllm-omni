@@ -200,6 +200,8 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         external_req_id=external_req_id or req_id,
         status=status,
         prompt_token_ids=[],
+        _all_token_ids=[],
+        _output_token_ids=[],
         num_prompt_tokens=0,
         num_computed_tokens=0,
         num_output_placeholders=0,
@@ -227,19 +229,17 @@ def _streaming_request(mocker: MockerFixture, num_computed_tokens: int) -> Simpl
 @pytest.mark.parametrize("stale_token_ids", [[0], [9] * 256])
 def test_refresh_generation_chunk_prefill_state_replaces_stale_token_mirrors(stale_token_ids) -> None:
     prompt_token_ids = list(range(187))
-    all_token_ids = list(stale_token_ids)
-    request = SimpleNamespace(
-        prompt_token_ids=prompt_token_ids,
-        _all_token_ids=all_token_ids,
-        all_token_ids=ConstantList(all_token_ids),
-        _output_token_ids=[7, 8],
-        num_prompt_tokens=len(stale_token_ids),
-        prefill_stats=None,
-    )
+    request = Request("chunk-prefill", stale_token_ids, SamplingParams(max_tokens=8), pooling_params=None)
+    request.append_output_token_ids([7, 8])
+    all_token_ids = request._all_token_ids
+    all_token_ids_view = request.all_token_ids
+    request.prompt_token_ids = prompt_token_ids
+    request.prefill_stats = None
 
     OmniChunkTransferAdapter._refresh_generation_chunk_prefill_state(request)
 
     assert request._all_token_ids is all_token_ids
+    assert request.all_token_ids is all_token_ids_view
     assert request._all_token_ids == prompt_token_ids
     assert list(request.all_token_ids) == prompt_token_ids
     assert request._output_token_ids == []
@@ -670,6 +670,10 @@ def test_scheduler_chunk_gate_preserves_kv_holding_queue(build_adapter, active_s
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    # vLLM 0.34 Scheduler state reached via the inherited upstream enqueue
+    # path; __new__ bypasses the __init__ that creates them.
+    scheduler.connector = None
+    scheduler.async_kv_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.deferred_waiting = set()
     scheduler._outputs_awaiting_stage_payload = {}
     scheduler.running = []
@@ -1348,7 +1352,12 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter, prompt_to
         is_segment_finished=True,
     )
     request.additional_information["meta"]["segment"] = "next"
-    live_prompt_token_ids.append(3)
+    if wrap_prompt:
+        live_prompt_token_ids.append(3)
+    else:
+        # vLLM 0.34 copies the prompt into an array-backed TokenBuffer, so the
+        # caller's list no longer aliases the request's storage; grow it there.
+        request.prompt_token_ids.append(3)
     request.append_output_token_ids([8])
     request._omni_segment_generation = 1
     adapter.save_async(
@@ -1357,7 +1366,10 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter, prompt_to
         is_segment_finished=True,
     )
     request.additional_information["meta"]["segment"] = "later"
-    live_prompt_token_ids.append(4)
+    if wrap_prompt:
+        live_prompt_token_ids.append(4)
+    else:
+        request.prompt_token_ids.append(4)
     request.append_output_token_ids([9])
 
     assert len(adapter._pending_save_reqs) == 2
@@ -2756,6 +2768,10 @@ def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
     scheduler.chunk_transfer_adapter = adapter
     scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
+    # vLLM 0.34 Scheduler state reached via the inherited upstream finish /
+    # requeue paths; __new__ bypasses the __init__ that creates them.
+    scheduler.connector = None
+    scheduler.async_kv_waiting = DummyWaitingQueue()
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request] if placement == "running" else []
     scheduler.waiting = DummyWaitingQueue([request] if placement == "waiting" else [])
@@ -2944,7 +2960,8 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={"req-s1": 0},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=["req-s1"],
         routed_experts=None,
         routed_experts_dict=None,
     )
@@ -3032,7 +3049,8 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={"req-ar": 0},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=["req-ar"],
         kv_extracted_req_ids=None,
         routed_experts=None,
         routed_experts_dict=None,
@@ -3083,6 +3101,10 @@ def _parked_sender_scheduler(adapter, session):
     scheduler.chunk_transfer_adapter = adapter
     scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
+    # vLLM 0.34 Scheduler state reached via the inherited upstream finish /
+    # requeue paths; __new__ bypasses the __init__ that creates them.
+    scheduler.connector = None
+    scheduler.async_kv_waiting = DummyWaitingQueue()
     scheduler.requests = {session.request_id: session}
     scheduler.running = []
     scheduler.waiting = DummyWaitingQueue()
@@ -3521,7 +3543,8 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=[],
     )
     return scheduler, scheduler_output, model_runner_output, cleanup_calls
 
@@ -3542,7 +3565,8 @@ def test_generation_holds_sentence_until_final_output(build_adapter, mocker: Moc
     schedule.num_scheduled_tokens = {request.request_id: 1}
     schedule.scheduled_new_reqs = []
     schedule.scheduled_cached_reqs = SimpleNamespace(req_ids=[request.request_id])
-    output.req_id_to_index = {request.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    output.req_ids = [request.request_id]
     output.routed_experts = None
 
     def receive_next_sentence(req):

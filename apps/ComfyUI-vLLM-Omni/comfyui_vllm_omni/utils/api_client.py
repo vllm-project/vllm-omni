@@ -29,22 +29,27 @@ from .format import (
     bytes_to_video,
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
+    mask_tensor_to_png_bytes,
     video_to_base64,
     video_to_bytes,
 )
 from .latent_mask import scalar_mask_to_json, video_mask_to_json
 from .logger import get_logger, pretty_printer
-from .models import lookup_model_spec
+from .models import lookup_model_spec, lookup_params_builder
 from .types import (
+    MAX_MINIMAX_H3_CONTROL_BYTES,
     MAX_REFERENCE_AUDIOS,
     MAX_REFERENCE_IMAGES,
     MAX_REFERENCE_VIDEOS,
     MAX_TIMELINE_GUIDE_BYTES,
     MAX_TIMELINE_GUIDES,
     MAX_TOTAL_REFERENCES,
+    MINIMAX_H3_CONTROL_TYPES,
     TIMELINE_GUIDE_FPS,
     AudioFormat,
+    MiniMaxH3Control,
 )
+from .validators import validate_minimax_h3_control
 
 logger = get_logger(__name__)
 
@@ -162,6 +167,31 @@ def _encode_timeline_guides(timeline_guides: list[dict]) -> tuple[str, list[tupl
     return json.dumps(manifest), uploads
 
 
+# crf=0 keeps 1px structure hints. It is lossless only for the YUV frames the encoder gets: ComfyUI
+# writes yuv420p, so black/white hints round-trip exactly while colour is stored at half resolution.
+MINIMAX_H3_CONTROL_VIDEO_ENCODING = {"format": "mp4", "codec": "h264", "crf": 0}
+
+
+def _add_video_upload(
+    form: aiohttp.FormData,
+    field_name: str,
+    video: VideoInput,
+    filename: str,
+    *,
+    format: str | None = None,
+    codec: str | None = None,
+    crf: float | None = None,
+) -> None:
+    buffer = video_to_bytes(video, filename, format=format, codec=codec, crf=crf)
+    size, limit = buffer.getbuffer().nbytes, MAX_MINIMAX_H3_CONTROL_BYTES
+    if size > limit:
+        raise ValueError(
+            f"{field_name} is {size / 2**20:.2f} MiB ({size} bytes) after encoding, "
+            f"above the server's {limit // 2**20} MiB limit; trim or downscale the clip."
+        )
+    form.add_field(field_name, buffer, filename=filename, content_type="video/mp4")
+
+
 async def url_json(session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs) -> dict[str, Any]:
     try:
         async with getattr(session, verb)(url, **kwargs) as response:
@@ -230,7 +260,7 @@ class VLLMOmniClient:
         if sampling_params is not None:
             payload.update(sampling_params)
         if lora is not None:
-            payload["lora"] = lora
+            payload["lora"] = lora.get("adapters", lora)
         logger.debug("img gen payload: %s", payload)
 
         url = self.base_url + "/images/generations"
@@ -306,7 +336,7 @@ class VLLMOmniClient:
             for k, v in sampling_params.items():
                 form.add_field(k, str(v))
         if lora is not None:
-            form.add_field("lora", json.dumps(lora, ensure_ascii=False))
+            form.add_field("lora", json.dumps(lora.get("adapters", lora), ensure_ascii=False))
         if mask is not None:
             mask_filename = "mask.png"
             form.add_field(
@@ -371,7 +401,7 @@ class VLLMOmniClient:
             sampling_params=sampling_params,
             modalities=["image"],
             # === below are additional `extra_body` fields, handled by **kwargs ===
-            lora=lora,
+            lora=lora.get("adapters", lora) if lora is not None else None,
         )
         choices = await self._generate_base_chat_completion(model, payload)
 
@@ -399,6 +429,7 @@ class VLLMOmniClient:
         first_frame: torch.Tensor | None = None,
         last_frame: torch.Tensor | None = None,
         references: dict | None = None,
+        control: MiniMaxH3Control | None = None,
         sampling_params: dict | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
@@ -424,8 +455,27 @@ class VLLMOmniClient:
         if references is not None and (first_frame is not None or last_frame is not None):
             raise ValueError("Provide either first_frame/last_frame or references, not both.")
 
+        if control is not None and any(
+            value is not None for value in (frame, first_frame, last_frame, references, latent_edit)
+        ):
+            raise ValueError(
+                "MiniMax-H3 control cannot be combined with frame, keyframes, references, or latent-mask editing."
+            )
+        if control is not None:
+            validate_minimax_h3_control(control)
+            conflicting_namespaces = set(extra_params) & set(MINIMAX_H3_CONTROL_TYPES)
+            if conflicting_namespaces:
+                conflicts = ", ".join(sorted(conflicting_namespaces))
+                raise ValueError(f"Conflicting MiniMax-H3 control namespaces: {conflicts}.")
+
         spec, matched_pattern = lookup_model_spec(spec_model or model)
         is_minimax_h3 = matched_pattern is not None and "MiniMax-H3" in matched_pattern
+        # Custom served names reach H3 through the MiniMax-H3 Params type, as request serialization does.
+        if control is not None and not (is_minimax_h3 or (model_params or {}).get("type") == "minimax_h3"):
+            raise ValueError(
+                f"MiniMax-H3 control is supported only for MiniMax-H3, not {model}; "
+                "for a custom served name, connect MiniMax-H3 Video Params."
+            )
         if (first_frame is not None or last_frame is not None) and not is_minimax_h3:
             raise ValueError("first_frame and last_frame are supported only for MiniMax-H3; use frame for this model.")
 
@@ -442,7 +492,10 @@ class VLLMOmniClient:
             if latent_edit is not None:
                 raise ValueError("timeline_guides cannot be combined with latent_edit; disconnect one of them.")
             # The server treats a missing scale as active and a zero scale as inactive.
-            if lora is not None and (lora.get("scale") is None or float(lora["scale"]) != 0.0):
+            if lora is not None and any(
+                adapter.get("scale") is None or float(adapter["scale"]) != 0.0
+                for adapter in lora.get("adapters", [lora])
+            ):
                 raise ValueError(
                     "timeline_guides require base MiniMax-H3 weights; disconnect the request-level LoRA "
                     "(or set its scale to 0)."
@@ -468,7 +521,7 @@ class VLLMOmniClient:
             # Guides need cache-free execution; only guided requests carry this field.
             form.add_field("quality", "lossless")
         if lora is not None:
-            form.add_field("lora", json.dumps(lora, ensure_ascii=False))
+            form.add_field("lora", json.dumps(lora.get("adapters", lora), ensure_ascii=False))
 
         # === multimodal inputs (first-last-frames, references, etc.) ===
         input_reference_image: torch.Tensor | None = None
@@ -592,13 +645,60 @@ class VLLMOmniClient:
             form.add_field("timeline_guides", manifest)
             for filename, content_type, buffer in uploads:
                 form.add_field("guide_files", buffer, filename=filename, content_type=content_type)
+        if control is not None:
+            control_type = control["control_type"]
+            form.add_field("control_type", control_type)
+            control_video = control.get("control_video")
+            if control_video is not None:
+                control_filename = "control.mp4"
+                _add_video_upload(
+                    form,
+                    "control_reference",
+                    control_video,
+                    control_filename,
+                    **MINIMAX_H3_CONTROL_VIDEO_ENCODING,
+                )
+            source_video = control.get("source_video")
+            if source_video is not None:
+                source_filename = "source.mp4"
+                _add_video_upload(
+                    form,
+                    "source_reference",
+                    source_video,
+                    source_filename,
+                    **MINIMAX_H3_CONTROL_VIDEO_ENCODING,
+                )
+            mask = control.get("mask")
+            if mask is not None:
+                mask_filename = "mask.png"
+                form.add_field(
+                    "mask_reference",
+                    mask_tensor_to_png_bytes(mask, mask_filename),
+                    filename=mask_filename,
+                    content_type="image/png",
+                )
+            mask_video = control.get("mask_video")
+            if mask_video is not None:
+                mask_filename = "mask.mp4"
+                _add_video_upload(
+                    form,
+                    "mask_reference",
+                    mask_video,
+                    mask_filename,
+                    **MINIMAX_H3_CONTROL_VIDEO_ENCODING,
+                )
+            extra_params = {
+                **extra_params,
+                control_type: {"control_context_scale": control["control_context_scale"]},
+            }
 
         # === model specific params. Either use a specialized builder, or add flattened fields as-is ===
+        model_params_type = None
         if model_params is not None:
             model_params = dict(model_params)
-            model_params.pop("type", None)
+            model_params_type = model_params.pop("type", None)
 
-        params_builder = spec.get("params_builder") if spec else None
+        params_builder = lookup_params_builder(spec_model or model, model_params_type)
         if params_builder is not None:
             form_fields = params_builder(
                 model_params or {},

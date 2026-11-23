@@ -5,37 +5,9 @@
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze import BreezeForConditionalGeneration
+from tests.model_executor.models.breeze_tts_2_helpers import _decode_info, _embedding_talker
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def _embedding_talker(dtype):
-    model = BreezeForConditionalGeneration.__new__(BreezeForConditionalGeneration)
-    torch.nn.Module.__init__(model)
-    model.num_codebooks, model.hidden_size = 16, 8
-    model.register_buffer("offsets", torch.arange(model.num_codebooks) * 7)
-    model.depth_decoder = torch.nn.Module()
-    model.depth_decoder.embed_tokens = torch.nn.Embedding(16 * 7, 8, dtype=dtype)
-    with torch.no_grad():
-        model.depth_decoder.embed_tokens.weight.copy_(
-            torch.randn(16 * 7, 8, generator=torch.Generator().manual_seed(17))
-        )
-    return model
-
-
-def _decode_info(request_id, current, seed):
-    return {
-        "global_request_id": [request_id],
-        "breeze_prompt": {"role": "cond", "guidance_scale": 1.0},
-        "breeze_sampling": {"temperature": 0.9, "top_k": 4, "top_p": 1.0, "repetition_penalty": 1.1},
-        "breeze_state": {
-            "current": current,
-            "history": torch.tensor([[1, 2, 3]], dtype=torch.long),
-            "generator": torch.Generator().manual_seed(seed),
-        },
-        "_omni_is_prefill": False,
-    }
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

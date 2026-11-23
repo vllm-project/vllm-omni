@@ -21,6 +21,8 @@ class SchedulingMetadataUpdate:
     prompt_token_ids: tuple[int, ...] | None = None
     resize_prompt_to: int | None = None
     input_terminal: bool = False
+    # Native MRv2 receive: the producing step's duplex chunk id from payload meta.
+    duplex_perf_chunk: tuple[int, int] | None = None
 
 
 @dataclass
@@ -77,6 +79,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
 
     multimodal_outputs: list[dict[str, object]] | None = None
     inter_stage_outputs: list[dict[str, Any] | None] | None = None
+    # MRv2-only tags frozen before asynchronous output materialization.
+    _duplex_perf_chunks: dict[str, tuple[int, int]] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
@@ -92,12 +96,17 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     invalid_logits_req_ids: set[str] = field(default_factory=set)
     # Request-local model failures, materialized after asynchronous D2H.
     request_errors: dict[str, str] | None = None
+    # AR full-payload steps: executed input-token range [start, end) per request.
+    # Absent for one-shot generation, which keeps append/replace accumulation.
+    full_payload_token_ranges: dict[str, tuple[int, int]] | None = None
+    # Keys replaced by the prefix-cache merge for each request. Only those
+    # tensors may contain rows from before this step.
+    full_payload_prefix_cache_keys: dict[str, frozenset[str]] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
         return cls(
             req_ids=[],
-            req_id_to_index={},
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},

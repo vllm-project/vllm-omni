@@ -106,7 +106,7 @@ run; preserve old artifacts before refreshing the suite's output directory.
 Use the matching maintained lane and its resource budget:
 
 - Nightly image accuracy runs under **Diffusion X2I(&A&T)**. Current examples
-  include Qwen-Image, JoyAI-Image-Edit, and HunyuanImage3-DIT.
+  include Qwen-Image and HunyuanImage3-DIT.
 - Nightly video accuracy runs under **Diffusion X2V**. Current examples include
   Wan2.2 I2V, MiniMax H3 I2VA/Ref2VA, and HunyuanVideo-1.5.
 - Weekly carries expensive or non-critical cases. Current examples include
@@ -135,11 +135,11 @@ selection must remain visible without breaking unrelated nightly coverage.
 
 Use the maintained NPU pipeline when the requested model and reference support
 that platform. The existing
-[HunyuanImage3 accuracy case](../../../../tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py)
+[HunyuanImage3 accuracy case](../../../../tests/e2e/accuracy/test_hunyuan_image3.py)
 declares `@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=4)`
 for its online comparison. Its
 [nightly step](../../../../.buildkite/npu/test-npu-nightly.yml) selects the exact
-file with `-m "full_model and A3" --run-level full_model`, uses `a3_npu_4`, and
+file with `-m "full_model and diffusion and npu and A3 and cards_4" --run-level full_model`, uses `a3_npu_4`, and
 sets `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA`. These are that case's resources and
 backend, not defaults for every NPU model.
 
@@ -350,7 +350,7 @@ calibration-only or inactive CI case.
 For a later change, rerun only the affected checks:
 
 | Change | Minimum follow-up |
-|---|---|
+| --- | --- |
 | Skill/documentation only | Format and link checks; no accuracy rerun |
 | Model-directory move only | Migration checks above; reuse numerical evidence if the effective execution contract is unchanged |
 | CI routing/markers/artifact paths only | Collection/rendering, dependency selection and retention checks; reuse numerical evidence if the execution contract is unchanged |

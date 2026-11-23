@@ -61,7 +61,12 @@ class _FakeKVTransferManager:
 def _make_runner(connector, *, payload_keys=("text_encoder_output",), optional_keys=(), recv_stages=("0", "1")):
     runner = object.__new__(DiffusionModelRunner)
     runner.od_config = SimpleNamespace(
-        stage_input_payload_keys=payload_keys, stage_input_optional_payload_keys=optional_keys, stage_id=1
+        kv_transfer_config=None,
+        cfg_kv_collect_func=None,
+        stage_input_payload_keys=payload_keys,
+        stage_input_optional_payload_keys=optional_keys,
+        stage_id=1,
+        diffusion_attention_schedule=None,
     )
     runner.device = torch.device("cpu")
     runner._local_rank = 0
@@ -73,7 +78,9 @@ def _make_runner(connector, *, payload_keys=("text_encoder_output",), optional_k
 
 def _make_sender(connector, *, payload_keys=("prompt_embeds",), send_stages=("0", "1")):
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(stage_output_payload_keys=payload_keys, stage_id=0)
+    runner.od_config = SimpleNamespace(
+        kv_transfer_config=None, cfg_kv_collect_func=None, stage_output_payload_keys=payload_keys, stage_id=0
+    )
     runner.device = torch.device("cpu")
     runner.pipeline = None
     runner.kv_transfer_manager = _FakeKVTransferManager(connector, send_stages=send_stages)
@@ -593,6 +600,7 @@ def test_native_kv_runner_keeps_synchronous_payload_transport(monkeypatch):
     connector = _FakeConnector(_conditioning())
     manager = _FakeKVTransferManager(connector)
     config = SimpleNamespace(
+        cfg_kv_collect_func=None,
         stage_input_payload_keys=("text_encoder_output",),
         stage_input_optional_payload_keys=(),
         stage_id=1,
@@ -621,7 +629,7 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
     runner = _make_runner(connector)
     runner.state_cache = {}
     request = _make_request({"prompt": "a cat"})
-    request.sampling_params = SimpleNamespace(attention_schedule=None)
+    request.sampling_params = SimpleNamespace(attention_schedule=None, attention_sigma_schedule=None)
     kv_calls = []
 
     def receive_kv(state_request, **kwargs):

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels import (
     _reference_global_sort_routes,
@@ -109,7 +110,7 @@ def _resolvable_rows(
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 @pytest.mark.parametrize("route_norm", [True, False])
 def test_fused_routing_matches_reference(heads: int, tokens: int, experts: int, top_k: int, route_norm: bool) -> None:
-    logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
+    logits, expert_bias = _router_inputs(heads, tokens, experts, device=DEVICE_TYPE)
     reference_probs, reference_indices = _reference_topk_probs_and_indices(
         logits, top_k, expert_bias=expert_bias, route_norm=route_norm
     )
@@ -136,7 +137,7 @@ def test_fused_routing_matches_reference(heads: int, tokens: int, experts: int, 
 
 @hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 def test_fused_routing_without_bias_matches_reference() -> None:
-    logits, _ = _router_inputs(12, 512, 256, device="cuda", with_bias=False)
+    logits, _ = _router_inputs(12, 512, 256, device=DEVICE_TYPE, with_bias=False)
     reference = _reference_topk_probs_and_indices(logits, 6)
     fused = compute_topk_probs_and_indices(logits, 6)
     resolvable = _resolvable_rows(logits, None, 6)
@@ -144,12 +145,12 @@ def test_fused_routing_without_bias_matches_reference() -> None:
     torch.testing.assert_close(fused[0], reference[0], rtol=ROUTE_WEIGHT_RTOL, atol=ROUTE_WEIGHT_ATOL)
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_selection_bias_does_not_reach_the_route_weight() -> None:
     """A bias large enough to reorder selection must not change the weights."""
 
-    logits, _ = _router_inputs(4, 256, 64, device="cuda", with_bias=False)
-    expert_bias = torch.zeros(4, 64, device="cuda")
+    logits, _ = _router_inputs(4, 256, 64, device=DEVICE_TYPE, with_bias=False)
+    expert_bias = torch.zeros(4, 64, device=DEVICE_TYPE)
     expert_bias[:, ::2] = 5.0
     probs, indices = compute_topk_probs_and_indices(logits, 4, expert_bias=expert_bias, route_norm=False)
 
@@ -165,7 +166,7 @@ def test_selection_bias_does_not_reach_the_route_weight() -> None:
 def test_fused_routing_ties_break_towards_the_lowest_expert() -> None:
     """Exact ties are undefined for torch.topk; the fused kernel is explicit."""
 
-    logits = torch.full((1, 1, 8), -10.0, device="cuda")
+    logits = torch.full((1, 1, 8), -10.0, device=DEVICE_TYPE)
     logits[0, 0, [1, 3, 5]] = 2.0
     probs, indices = compute_topk_probs_and_indices(logits, 3, route_norm=False)
     assert indices[0, 0].tolist() == [1, 3, 5]
@@ -188,9 +189,9 @@ def test_broadcast_expert_bias_matches_reference(bias_shape: tuple[int, ...]) ->
     the end of its own storage.
     """
 
-    logits, _ = _router_inputs(4, 128, 64, device="cuda", with_bias=False)
-    generator = torch.Generator(device="cuda").manual_seed(7)
-    expert_bias = torch.randn(4, device="cuda", generator=generator).reshape(bias_shape)
+    logits, _ = _router_inputs(4, 128, 64, device=DEVICE_TYPE, with_bias=False)
+    generator = torch.Generator(device=DEVICE_TYPE).manual_seed(7)
+    expert_bias = torch.randn(4, device=DEVICE_TYPE, generator=generator).reshape(bias_shape)
     reference = _reference_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
     fused = compute_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
     resolvable = _resolvable_rows(logits, expert_bias, 5)
@@ -207,7 +208,7 @@ def test_broadcast_expert_bias_matches_reference(bias_shape: tuple[int, ...]) ->
 def test_narrow_dtype_expert_bias_matches_reference(bias_dtype: torch.dtype) -> None:
     """Upcasting a narrow bias is exactly the promotion the reference performs."""
 
-    logits, expert_bias = _router_inputs(4, 128, 64, device="cuda")
+    logits, expert_bias = _router_inputs(4, 128, 64, device=DEVICE_TYPE)
     assert expert_bias is not None
     expert_bias = expert_bias.to(bias_dtype)
     reference = _reference_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
@@ -231,8 +232,8 @@ def test_exhausted_selection_scores_still_pick_distinct_experts() -> None:
     alone routes the same expert twice.
     """
 
-    logits = torch.zeros(1, 4, 8, device="cuda")
-    expert_bias = torch.full((1, 8), float("-inf"), device="cuda")
+    logits = torch.zeros(1, 4, 8, device=DEVICE_TYPE)
+    expert_bias = torch.full((1, 8), float("-inf"), device=DEVICE_TYPE)
     expert_bias[0, 2] = 0.0
     _, indices = compute_topk_probs_and_indices(logits, 3, expert_bias=expert_bias, route_norm=False)
     for row in indices[0]:
@@ -253,7 +254,7 @@ def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> Non
     """
 
     heads, tokens, experts, top_k = 2, 16, 12, 4
-    logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
+    logits, expert_bias = _router_inputs(heads, tokens, experts, device=DEVICE_TYPE)
     assert expert_bias is not None
     logits[0, 0] = float("nan")
     logits[1, 3, [9, 4]] = float("nan")
@@ -291,7 +292,7 @@ def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> Non
 @hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 def test_global_sort_routes_is_bit_identical_to_reference(heads: int, tokens: int, experts: int, top_k: int) -> None:
-    logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
+    logits, expert_bias = _router_inputs(heads, tokens, experts, device=DEVICE_TYPE)
     probs, indices = compute_topk_probs_and_indices(logits, top_k, expert_bias=expert_bias)
     expected = _reference_global_sort_routes(probs, indices, experts)
     actual = global_sort_routes(probs, indices, experts)
@@ -300,10 +301,10 @@ def test_global_sort_routes_is_bit_identical_to_reference(heads: int, tokens: in
         assert torch.equal(candidate, reference_tensor), name
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_global_sort_routes_layout_invariants() -> None:
     heads, tokens, experts, top_k = 6, 333, 64, 3
-    logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
+    logits, expert_bias = _router_inputs(heads, tokens, experts, device=DEVICE_TYPE)
     probs, indices = compute_topk_probs_and_indices(logits, top_k, expert_bias=expert_bias)
     gather_ids, sorted_probs, offsets = global_sort_routes(probs, indices, experts)
 
@@ -330,7 +331,7 @@ def test_routes_drive_the_expert_kernel_identically() -> None:
     """The two route builders must produce interchangeable expert inputs."""
 
     heads, tokens, experts, top_k, head_dim, expert_dim = 3, 64, 16, 4, 32, 48
-    device = "cuda"
+    device = DEVICE_TYPE
     generator = torch.Generator(device=device).manual_seed(7)
     logits, expert_bias = _router_inputs(heads, tokens, experts, device=device, seed=7)
     hidden = torch.randn(tokens, heads, head_dim, device=device, generator=generator)
@@ -464,7 +465,7 @@ def _median_microseconds(operation, *, warmup: int = 10, iterations: int = 30) -
     torch.accelerator.synchronize()
     samples = []
     for _ in range(iterations):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = DEVICE_MODULE.Event(enable_timing=True), DEVICE_MODULE.Event(enable_timing=True)
         start.record()
         operation()
         end.record()
@@ -481,12 +482,14 @@ def _median_microseconds(operation, *, warmup: int = 10, iterations: int = 30) -
     reason="Routing speedup floor is calibrated on NVIDIA CUDA only",
 )
 @pytest.mark.benchmark
+# Speed assertion only: the fused kernel is tuned against the CUDA
+# reference, so keep this case CUDA-only while the XPU path lands.
 @hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 def test_fused_routing_stays_faster_than_the_reference() -> None:
     """Regression gate on the M1 route-construction speedup (CUDA only)."""
 
     heads, tokens, experts, top_k = 12, 4096, 256, 6
-    logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
+    logits, expert_bias = _router_inputs(heads, tokens, experts, device=DEVICE_TYPE)
 
     reference_us = _median_microseconds(
         lambda: _reference_topk_probs_and_indices(logits, top_k, expert_bias=expert_bias)

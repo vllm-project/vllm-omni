@@ -39,6 +39,7 @@ from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIP
 from vllm_omni.diffusion.models.physis.wan.pipeline_config import PHYSIS_WAN_PIPELINE
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
+from vllm_omni.model_executor.models.abot_world.pipeline import ABOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.alpamayo2_super.pipeline import ALPAMAYO2_SUPER_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
@@ -60,6 +61,7 @@ from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
 )
+from vllm_omni.model_executor.models.cosmos3_nano_sim_bimanual.pipeline import COSMOS3_NANO_SIM_BIMANUAL_PIPELINE
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
@@ -69,6 +71,7 @@ from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
 from vllm_omni.model_executor.models.glm_tts.pipeline import GLM_TTS_PIPELINE
 from vllm_omni.model_executor.models.gr00t.pipeline import GR00T_N1D7_PIPELINE
+from vllm_omni.model_executor.models.haru.pipeline import HARU_PIPELINE
 from vllm_omni.model_executor.models.higgs_audio_v2.pipeline import HIGGS_AUDIO_V2_PIPELINE
 from vllm_omni.model_executor.models.higgs_audio_v3.pipeline import HIGGS_AUDIO_V3_PIPELINE
 from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
@@ -85,7 +88,6 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
-from vllm_omni.model_executor.models.kokoro.pipeline import KOKORO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lfm3_audio.pipeline import LFM3_AUDIO_PIPELINE, LFM3_AUDIO_TEXT_PIPELINE
 from vllm_omni.model_executor.models.lfm3_omni.pipeline import LFM3_OMNI_PIPELINE, LFM3_OMNI_TEXT_PIPELINE
@@ -126,6 +128,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
 )
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.model_executor.models.phonon.pipeline import resolve_phonon_pipeline
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
@@ -157,6 +160,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "abot_world": ABOT_WORLD_PIPELINE,
     "alpamayo2_super": ALPAMAYO2_SUPER_PIPELINE,
     "arktts": AUDIO8_TTS_PIPELINE,
     "audex_s2s": AUDEX_S2S_PIPELINE,
@@ -172,6 +176,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
     "causvid_wan": CAUSVID_WAN_PIPELINE,
+    "cosmos3_nano_sim_bimanual": COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
@@ -187,6 +192,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "glm_image": GLM_IMAGE_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
+    "gradium_phonon_tts": resolve_phonon_pipeline,
+    "haru": HARU_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
     "hunyuan_image3_ar": HUNYUAN_IMAGE3_AR_PIPELINE,
@@ -197,7 +204,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
-    "kokoro": KOKORO_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lfm3_audio": LFM3_AUDIO_PIPELINE,
     "lfm3_audio_text": LFM3_AUDIO_TEXT_PIPELINE,

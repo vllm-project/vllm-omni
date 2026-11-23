@@ -292,7 +292,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 dtype=dtype,
                 on_finished=timing.mark,
             )
-            run_cell_pipeline(ctx=ctx, adapter=adapter)
+            run_cell_pipeline(ctx=ctx, members={request_id: adapter})
             finished = self._gather_finished(adapter.finished, pp)
             durations = timing.durations(pp)
             if self.pp_rank == 0:

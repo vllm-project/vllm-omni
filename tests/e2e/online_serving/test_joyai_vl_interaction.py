@@ -14,7 +14,7 @@ from PIL import Image
 
 from tests.e2e.online_serving.helpers.joyai_vl_interaction import joyai_server_params
 from tests.helpers.mark import hardware_test
-from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
+from vllm_omni.clients.duplex import DuplexClient, EventCollector, ReconnectPolicy, SessionConfig
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.full_model, pytest.mark.omni]
 
@@ -34,7 +34,8 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
         extra_body={"tts_language": "English"},
     )
     collector = EventCollector()
-    async with DuplexClient(url, model=model, config=config, reconnect=None) as client:
+    reconnect = ReconnectPolicy(max_attempts=5, backoff_s=(0.25, 1.0))
+    async with DuplexClient(url, model=model, config=config, reconnect=reconnect) as client:
         consumer = asyncio.create_task(collector.consume(client))
         await asyncio.sleep(0)
         try:
@@ -56,6 +57,23 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
                 )
             pending_playback = None
             for index, color in enumerate(("red", "blue", "green", "yellow")):
+                if index == 3:
+                    # Resume the same session after cancelling its spoken turn.
+                    # The yellow response below must still use its instructions
+                    # and must complete through the new transport.
+                    session_id, resume_token = client.session_id, client.resume_token
+                    assert session_id and resume_token
+                    resumed = asyncio.create_task(client.wait_for("session.resumed", timeout_s=90))
+                    await asyncio.sleep(0)
+                    try:
+                        assert client._ws is not None
+                        await client._ws.close()
+                        await resumed
+                    finally:
+                        resumed.cancel()
+                        await asyncio.gather(resumed, return_exceptions=True)
+                    assert client.session_id == session_id
+                    assert client.resume_token and client.resume_token != resume_token
                 image = io.BytesIO()
                 Image.new("RGB", (224, 224), color).save(image, format="JPEG")
                 done = asyncio.create_task(client.wait_for("response.done", timeout_s=180))

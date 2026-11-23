@@ -70,6 +70,19 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
 layout.
 
+### AR Model Runner V2
+
+HunyuanImage3 AR follows the repository's Model Runner V2 default, including
+the AR-only, AR+DiT and Mooncake KV connector deployments and accuracy tests.
+
+The AR sampler preserves comprehension token blocking, image-generation stage
+transitions, and greedy aspect-ratio selection using MRv2's device-side
+token history. Speculative decoding must be disabled for this stage.
+
+The adapter uses the existing generic Omni model states and does not change
+attention. NPU execution requires an Ascend runtime matching the repository's
+vLLM version; the retained v0.33 NPU image is not qualified for vLLM 0.34.
+
 ### Shared T2I/IT2I offline examples
 
 Text-to-image and image-editing route through the shared task examples, with
@@ -136,15 +149,17 @@ the same checkpoint, parallelism, and image settings.
 
 #### Commands
 
-Start the DiT-only server with one of the following CLI-only configurations.
-These commands use explicit CLI flags for all parallelism and runtime settings.
+Each command selects the DiT-only deploy, which defines one diffusion stage
+on visible devices `0,1,2,3`. Each parallelism configuration below uses all
+four devices.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 4 \
   --quantization fp8 \
   --distributed-executor-backend mp \
@@ -152,12 +167,13 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 2 \
   --usp 2 \
   --quantization fp8 \
@@ -166,12 +182,13 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
   --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
   --tensor-parallel-size 2 \
   --cfg-parallel-size 2 \
   --quantization fp8 \
@@ -371,8 +388,8 @@ Validated checkpoint:
 feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8
 ```
 
-Start the server with CUTLASS selected from the CLI for quantized linear and
-MoE kernels:
+Select the DiT-only deployment and give stage 0 both visible devices. The
+quantized linear and MoE kernels use CUTLASS.
 
 ```bash
 CUDA_VISIBLE_DEVICES=2,3 \
@@ -381,6 +398,8 @@ vllm serve feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
   --host 0.0.0.0 \
   --port 8091 \
   --trust-remote-code \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
+  --stage-overrides '{"0":{"devices":"0,1"}}' \
   --tensor-parallel-size 2 \
   --enable-expert-parallel \
   --linear-backend cutlass \
@@ -442,25 +461,8 @@ Denoising steps: 20
 
 #### Accuracy
 
-Run the HunyuanImage-3.0 quantized DiT accuracy check with the BF16, FP8, and
-mixed FP8/NVFP4 checkpoints:
-
-```bash
-CUDA_VISIBLE_DEVICES=2,3 \
-HUNYUAN_IMAGE3_QUANT_DEVICES=0,1 \
-HUNYUAN_IMAGE3_QUANT_TP=2 \
-HUNYUAN_IMAGE3_BF16_MODEL=/path/to/hunyuan-image3-bf16 \
-HUNYUAN_IMAGE3_FP8_MODEL=/path/to/hunyuan-image3-modelopt-fp8 \
-HUNYUAN_IMAGE3_NVFP4_MODEL=/path/to/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8 \
-PYTHONPATH=/path/to/vllm-omni:/path/to/vllm:${PYTHONPATH:-} \
-python -m pytest -s -v \
-  tests/e2e/accuracy/test_hunyuan_image3.py \
-  -k quantized_dit_matches_bf16_accuracy
-```
-
-The test compares quantized images with the BF16 image using CLIP-based image
-and text scores, plus structural SSIM / PSNR checks. The current structural
-thresholds are `SSIM >= 0.20` and `PSNR >= 10.0`.
+The CI accuracy matrix below replaces the former opt-in BF16 versus
+FP8/NVFP4 comparison tests.
 
 #### Notes
 
@@ -470,3 +472,88 @@ thresholds are `SSIM >= 0.20` and `PSNR >= 10.0`.
 - `--force-cutlass-fp8` keeps the FP8 dense layers on the CUTLASS FP8 path.
 - The benchmark table is an online HTTP concurrency-16 result; do not compare
   it directly with loaded-once request-level benchmarks.
+
+## CI performance and accuracy matrix
+
+The test matrix includes these four-card workloads. AR+DiT accuracy is
+marked `local_model` and excluded from CUDA nightly `full_model` selection;
+its BF16 TP=2 DiT stage exceeded 80 GB per GPU during model initialization.
+The NPU accuracy job explicitly selects `(full_model or local_model)` to
+run all three accuracy cases. Other workloads use `full_model` selection:
+
+| Workload | Weights | Parallelism | Dataset / output | Concurrency | Metrics |
+| --- | --- | --- | --- | --- | --- |
+| AR + DiT performance | Distil, FP8 | AR TP=2 (0,1), DiT TP=1/SP=2 (2,3) | custom IT2I | 1,16 | latency, throughput |
+| DiT performance | Distil, FP8 | TP=1/SP=4 (0,1,2,3) | random T2I | 1,4 | latency, throughput |
+| DiT accuracy | Distil, BF16 | TP=4 (0,1,2,3) | IT2I, one output image | 1 | PSNR, SSIM |
+| AR + DiT accuracy | Distil, BF16 | AR TP=2 (0,1), DiT TP=2 (2,3) | IT2I, one output image | 1 | PSNR, SSIM, CoT similarity, image similarity, CoT prefix |
+
+Performance uses `tencent/HunyuanImage-3.0-Instruct-Distil` with
+`--quantization fp8` for both stages. It does not benchmark the original
+Instruct checkpoint with an eight-step schedule. SP uses Ulysses. Both
+performance deploys set `async_chunk: false` (non-duplex).
+
+Performance cases reuse the production `hunyuan_image_3_moe.yaml` and
+`hunyuan_image3_dit.yaml` deployments. Their JSON `stage_overrides` selects
+the four-card topology on CUDA and NPU, uses the shared-memory connector
+for colocated AR+DiT, and limits AR memory utilization to 0.85 to leave
+headroom for IT2I VAE encoding. No performance-only deployment YAML is needed.
+
+The AR+DiT workload extends the existing
+`tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json`: it retains the custom
+prompt, input image, `/v1/images/edits` endpoint and `think_recaption` task.
+The DiT-only request format can also be compared with
+`tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json`, which uses
+the two-image dataset shared by the prefix-cache accuracy tests. This
+existing local-model performance suite is retained alongside the new matrix;
+it does not supply an accuracy reference image. The previous
+AR+DiT H200 performance baseline describes Instruct with DiT TP=2, so it
+does not calibrate the distilled FP8 TP=1/SP=2 workload.
+
+Run from the repository root on four H100/B200 GPUs with the matching
+vLLM/vLLM-Omni runtime, cached weights and access to the input image URLs:
+
+```bash
+pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_ar_tp2_dit_sp2.json -m "full_model and diffusion and H100 and cards_4" --run-level full_model
+pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_dit_sp4.json -m "full_model and diffusion and H100 and cards_4" --run-level full_model
+pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py -k test_hunyuan_image3_ar_tp2_dit_tp2_it2i -m "local_model and diffusion and H100 and cards_4" --run-level full_model
+```
+
+Both accuracy workloads use the distilled checkpoint in BF16 without
+quantization and with eight inference steps. Performance workloads retain FP8. AR+DiT accuracy also needs
+`FlagEmbedding` and the embedding/CLIP model caches. `HUNYUAN_MODEL_PATH`
+(AR+DiT) and `HUNYUAN_IMAGE3_MODEL` (DiT-only) may point to local distilled
+checkpoints. AR+DiT retains its existing distilled image/CoT references and
+thresholds; the BF16 outputs must still pass those checks.
+
+DiT-only IT2I uses `tests/assets/hunyuan_image3/it2i.jsonl`, both input
+images in their listed order, `bot_task=none`, `sys_type=en_unified`, seed
+42, 8 steps, guidance 2.5, BF16 without quantization, and one 1280x720 output.
+It selects the official distilled direct-DiT reference for the current
+platform from `tests/assets/hunyuan_image3/`:
+
+| Platform profile | Reference PNG | SSIM floor | PSNR floor (dB) |
+| --- | --- | --- | --- |
+| CUDA: H200/H100/B200/default | `hunyuan_image3_dit_distill_it2i_ref.png` | 0.95 | 29.0 |
+| NPU: A3 | `hunyuan_image3_dit_distill_it2i_ref_npu.png` | 0.92 | 28.0 |
+
+These are acceptance floors, with margin below the five-run calibration
+minima, rather than the measured means. The CUDA measurements were collected
+on H200; H100/B200 and the default profile use the same configured floors.
+See the [CUDA/H200 calibration](https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-6940430119)
+and [A3 calibration](https://github.com/vllm-project/vllm-omni/pull/10408#issuecomment-6936673053).
+The AR+DiT image/CoT references and thresholds remain separate. No reference
+environment variables are required:
+
+```bash
+pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py::test_hunyuan_image3_dit_tp4_it2i_online --run-level full_model
+pytest -sv tests/e2e/accuracy/test_hunyuan_image3.py::test_hunyuan_image3_dit_tp4_it2i_online -m "full_model and diffusion and H100 and cards_4" --run-level full_model
+```
+
+The two new performance workloads intentionally have empty `baseline` maps
+until calibration on the target CI hardware. The unified runner records `mean_e2el_ms`,
+`p99_e2el_ms` and `request_throughput`, but empty baselines do not establish a
+performance regression gate. Populate each hardware bucket with measured
+values before treating the matrix as calibrated. Sweep baseline values are
+lists in concurrency order: `[1,16]` for AR+DiT and `[1,4]` for DiT. Do not
+reuse the previous Instruct TP=2/SP=2 or TP=4 benchmark numbers.

@@ -774,8 +774,9 @@ class MiniMaxH3ImagePipeline(
         pixels = minimax_h3_quantize_image(pixels)
         if (canvas_w, canvas_h) != (parsed["width"], parsed["height"]):
             pixels = minimax_h3_resize_image_output(pixels, parsed["width"], parsed["height"])
-        # Hand the host uint8 HWC images: the writer needs no layout copy.
-        pixels = pixels.permute(0, 2, 3, 1).contiguous().cpu()
+        # Pack HWC on the host: device-side packing before the transfer can
+        # stall repeated native-4K requests on Rubin.
+        pixels = pixels.cpu().permute(0, 2, 3, 1).contiguous()
         return DiffusionOutput(output=pixels)
 
 

@@ -22,7 +22,11 @@ from vllm.benchmarks.datasets import SampleRequest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput, RequestFuncOutput
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, DuplexSample, load_samples
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import (
+    DEFAULT_JUDGE_FRAME_MAX_SIDE,
+    evaluate_sample,
+    summarize_scores,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     DEFAULT_INSTRUCTIONS,
@@ -50,6 +54,7 @@ class DuplexEvalEvaluation:
     fps: int = 2
     window_size: float = 10.0
     workers: int = 1
+    frame_max_side: int | None = DEFAULT_JUDGE_FRAME_MAX_SIDE
 
 
 @dataclass
@@ -106,6 +111,7 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
             fps=args.duplex_eval_judge_fps,
             window_size=args.duplex_eval_window_size,
             workers=args.duplex_eval_eval_workers,
+            frame_max_side=args.duplex_eval_judge_frame_max_side or None,
         )
     requests: list[SampleRequest] = []
     reference = PreparedReferenceAudio.from_path(args.duplex_eval_ref_audio) if args.duplex_eval_ref_audio else None
@@ -170,6 +176,7 @@ def _evaluate_published_samples(
                 judge,
                 judge_fps=options.fps,
                 judge_video_mode=options.video_mode,
+                judge_frame_max_side=options.frame_max_side,
                 window_size=options.window_size,
             )
         except Exception as exc:  # noqa: BLE001 - preserve other cases and completed service measurements

@@ -48,3 +48,31 @@ normal completion, cancellation, failure, and shutdown.
 
 Test setup, transfer, synchronization, timeout, cancellation, failure, and
 cleanup across every affected backend.
+
+## Full-payload request lifecycle
+
+The worker owns pending full-payload outputs under the internal request ID.
+The scheduler supplies terminal status; the connector does not infer success
+from a request disappearing from the active batch.
+
+- **Completion:** stop and length-limit completion flush the accumulated
+  payload once, then release its data and position tracking.
+- **Cancellation or failure:** aborted, errored, and ignored requests are
+  carried on `discarded_req_ids`. The MRv2 data plane drops their pending
+  payloads instead of publishing them. Already submitted connector writes are
+  outside the pending accumulator's ownership.
+- **Preemption and resume:** keep accumulated AR outputs. Each payload key
+  tracks its emitted input-token boundary. Recomputed prefixes do not append
+  a second copy or overwrite the accepted prefix; an overlapping token-aligned
+  tensor contributes only its new suffix. Prefix-cache merges are identified
+  by the keys the AR runner's cache rewrite actually replaced, not by a
+  row-count heuristic. Snapshot/replace fields and scalar metadata update only
+  when the logical boundary advances. A partially overlapping non-token-aligned
+  tensor raises an explicit error because its rows cannot safely be sliced by
+  token position. One-shot generation payloads omit the token range and keep
+  their existing append/replace policy.
+- **Retry:** a fresh request starts with empty payload and position state.
+  Reusing an internal ID is safe only after terminal cleanup. Preemption is
+  continuation of the same request, not a fresh retry.
+
+Lifecycle regressions live in `tests/worker/test_full_payload_lifecycle.py`.

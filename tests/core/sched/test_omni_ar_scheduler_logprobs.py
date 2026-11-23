@@ -243,7 +243,8 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={"req": 0},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=["req"],
         routed_experts=None,
     )
 
@@ -301,7 +302,8 @@ def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, 
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={"bad": 0, "good": 1},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=["bad", "good"],
         routed_experts=None,
     )
 
@@ -343,7 +345,6 @@ def test_fixed_token_scores_reach_engine_output(scored) -> None:
     scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
     model_runner_output = OmniModelRunnerOutput(
         req_ids=["req"],
-        req_id_to_index={"req": 0},
         sampled_token_ids=[[7]],
         prompt_logprobs_dict={},
         prompt_token_id_logprobs_dict={"req": scores} if scored else {},
@@ -368,7 +369,8 @@ def _pooling_model_runner_output(pooler_tensor) -> SimpleNamespace:
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={"req": 0},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=["req"],
         routed_experts=None,
     )
 

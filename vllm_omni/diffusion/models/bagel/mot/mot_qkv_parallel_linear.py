@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import torch
 from torch.nn.parameter import Parameter
+from transformers import PretrainedConfig
+from vllm.config.lora import LoRAConfig
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
@@ -20,6 +22,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import invoke_mot_gemm
+from vllm_omni.lora.layers import OmniMergedQKVParallelLinearWithLoRA
 
 logger = init_logger(__name__)
 
@@ -141,6 +144,21 @@ class MoTQKVParallelLinear(QKVParallelLinear):
             self.gen_exp.register_parameter("bias", None)
 
         self.update_param_tp_status()
+
+    def _create_omni_lora_layer(
+        self,
+        *,
+        max_loras: int,
+        lora_config: LoRAConfig,
+        packed_modules_list: list[str],
+        model_config: PretrainedConfig | None = None,
+    ) -> MoTQKVParallelLinearWithLoRA | None:
+        """Build the BAGEL-aware wrapper for the packed text QKV expert."""
+        if len(packed_modules_list) != 3:
+            return None
+        instance = MoTQKVParallelLinearWithLoRA(self)
+        instance.create_lora_weights(max_loras, lora_config, model_config)
+        return instance
 
     # ==================================================================
     #  Forward
@@ -366,4 +384,29 @@ class MoTQKVParallelLinear(QKVParallelLinear):
         )
         output[text_idx] = output_text
         output[vae_idx] = output_vae
+        return output
+
+
+class MoTQKVParallelLinearWithLoRA(OmniMergedQKVParallelLinearWithLoRA):
+    """Apply a packed QKV adapter only to BAGEL's text-routed expert."""
+
+    def forward(
+        self,
+        input_: torch.Tensor,
+        text_indices: torch.Tensor | None = None,
+        vae_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        base_output = self.base_layer(input_, text_indices, vae_indices)
+        output = base_output[0] if isinstance(base_output, tuple) else base_output
+
+        if text_indices is None:
+            output = self._add_lora_delta(input_, output)
+        elif text_indices.numel() > 0:
+            text_input = input_.index_select(0, text_indices)
+            text_output = output.index_select(0, text_indices)
+            text_output = self._add_lora_delta(text_input, text_output)
+            output = output.index_copy(0, text_indices, text_output)
+
+        if isinstance(base_output, tuple):
+            return output, base_output[1]
         return output
