@@ -321,6 +321,8 @@ def _draw_kernel(
     min_temperature,
     BLOCK_V: tl.constexpr,
     K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    KEEP_CROSSING: tl.constexpr,
     HAS_MAP: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -330,14 +332,19 @@ def _draw_kernel(
     logits = logits.to(tl.float32) / temperature
     row_max = tl.max(logits, axis=0)
     total = tl.sum(tl.exp(logits - row_max), axis=0)
-    ranks = tl.arange(0, K)
-    values = tl.load(top_values_ptr + row * top_stride + ranks).to(tl.float32) / temperature
-    ids = tl.load(top_ids_ptr + row * top_stride + ranks)
+    ranks = tl.arange(0, BLOCK_K)
+    values = tl.load(top_values_ptr + row * top_stride + ranks, mask=ranks < K, other=float("-inf"))
+    values = values.to(tl.float32) / temperature
+    ids = tl.load(top_ids_ptr + row * top_stride + ranks, mask=ranks < K, other=0)
     probs = tl.exp(values - row_max) / total
     cumulative = tl.cumsum(probs, axis=0)
-    keep = ((cumulative <= tl.load(top_p_ptr + row)) & (ranks < tl.load(top_k_ptr + row))) | (ranks == 0)
-    noise = -tl.log(tl.maximum(tl.load(noise_ptr + row * noise_stride + ranks), 1e-30))
-    score = tl.where(keep, probs / noise, -1.0)
+    if KEEP_CROSSING:
+        cumulative = tl.gather(cumulative, tl.maximum(ranks - 1, 0), axis=0)
+    top_p = tl.load(top_p_ptr + row)
+    keep = (((top_p >= 1.0) | (cumulative <= top_p)) & (ranks < tl.load(top_k_ptr + row))) | (ranks == 0)
+    uniform = tl.load(noise_ptr + row * noise_stride + ranks, mask=ranks < K, other=0.5)
+    noise = -tl.log(tl.maximum(uniform, 1e-30))
+    score = tl.where(keep & (ranks < K), probs / noise, -1.0)
     choice = tl.argmax(score, axis=0)
     token = tl.sum(tl.where(ranks == choice, ids, 0), axis=0)
     if HAS_MAP:
@@ -355,12 +362,15 @@ def draw_top_k_top_p(
     id_map: torch.Tensor | None = None,
     top: tuple[torch.Tensor, torch.Tensor] | None = None,
     min_temperature: float = 1e-5,
+    *,
+    keep_top_p_crossing: bool = False,
 ) -> torch.Tensor:
     """Sample one index per row in fp32, top-k capped at ``max_top_k``.
 
     Ranks ``>= top_k`` and candidates whose inclusive cumulative probability
-    exceeds ``top_p`` (over the whole row's distribution) are dropped; rank 0 is
-    always kept, so a temperature at ``min_temperature`` takes the argmax.
+    exceeds ``top_p`` (over the whole row's distribution) are dropped. Semantic
+    draws set ``keep_top_p_crossing`` to keep the first candidate past that
+    threshold. Rank 0 is always kept.
     ``uniform`` is ``[rows, >= max_top_k]`` U(0, 1) noise; ``top`` reuses a
     ``torch.topk(logits, max_top_k)`` result shared by several draws; ``id_map``
     maps column indices to token ids.
@@ -371,7 +381,7 @@ def draw_top_k_top_p(
         return out
     if not _triton_device(logits):
         return _eager_draw_top_k_top_p(
-            logits, temperature, top_k, top_p, uniform, max_top_k, id_map, top, min_temperature
+            logits, temperature, top_k, top_p, uniform, max_top_k, id_map, top, min_temperature, keep_top_p_crossing
         )
     if top is None:
         top = torch.topk(logits, max_top_k, dim=-1)
@@ -393,6 +403,8 @@ def draw_top_k_top_p(
         min_temperature,
         BLOCK_V=triton.next_power_of_2(vocab),
         K=max_top_k,
+        BLOCK_K=triton.next_power_of_2(max_top_k),
+        KEEP_CROSSING=keep_top_p_crossing,
         HAS_MAP=id_map is not None,
         num_warps=8,
     )
@@ -468,6 +480,7 @@ def _eager_draw_top_k_top_p(
     id_map: torch.Tensor | None,
     top: tuple[torch.Tensor, torch.Tensor] | None,
     min_temperature: float,
+    keep_top_p_crossing: bool,
 ) -> torch.Tensor:
     scaled_temperature = temperature.float().clamp_min(min_temperature).unsqueeze(-1)
     logits_f = logits.float() / scaled_temperature
@@ -479,8 +492,11 @@ def _eager_draw_top_k_top_p(
         values, ids = top
     probs = torch.exp(values.float() / scaled_temperature - row_max) / total
     cumulative = torch.cumsum(probs, dim=-1)
+    if keep_top_p_crossing:
+        cumulative = torch.nn.functional.pad(cumulative[:, :-1], (1, 0))
     ranks = torch.arange(max_top_k, device=logits.device)
-    keep = ((cumulative <= top_p.float().unsqueeze(-1)) & (ranks < top_k.unsqueeze(-1))) | (ranks == 0)
+    threshold = top_p.float().unsqueeze(-1)
+    keep = (((threshold >= 1.0) | (cumulative <= threshold)) & (ranks < top_k.unsqueeze(-1))) | (ranks == 0)
     noise = -torch.log(uniform[:, :max_top_k].clamp_min(1e-30))
     score = torch.where(keep, probs / noise, torch.full_like(probs, -1.0))
     token = ids.gather(-1, score.argmax(dim=-1, keepdim=True)).squeeze(-1)

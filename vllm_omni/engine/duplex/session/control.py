@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, validate_se
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter, session_auto_responds
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported, check_input_clock_unchanged
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallRejection, ToolCallState
@@ -47,6 +48,10 @@ from vllm_omni.engine.duplex.turn_detection import (
 from vllm_omni.protocol.duplex.events import error_event
 
 logger = init_logger(__name__)
+
+
+class TurnDetectionAudioError(ValueError):
+    """Turn detection could not read an append's audio: the runner refuses the append (``bad_audio``)."""
 
 
 class SessionControl:
@@ -145,8 +150,10 @@ class SessionControl:
             self._detector = None
             return [(event, None)]
         except ValueError as exc:
-            self._out.emit_error("bad_audio", str(exc))
-            return []
+            # The runner refuses the append (error ``bad_audio`` with the
+            # client's event id; an input-clocked session also acknowledges it
+            # as rejected), like audio that failed to decode.
+            raise TurnDetectionAudioError(str(exc)) from exc
         detected: list[tuple[dict[str, object], TurnDetectionResult | None]] = []
         for index, segment in enumerate(segments):
             payload = dict(event, audio=segment.audio, format="pcm_f32le", sample_rate_hz=16000)
@@ -339,6 +346,14 @@ class SessionControl:
         )
         if unsupported is not None:
             self._out.emit_error("unsupported_turn_detection", unsupported, event_id=realtime_event_id)
+            return
+        try:
+            check_input_clock_supported(self._ctx.plugin, candidate_config.extra_body)
+            # The clock mode and its timeouts are fixed at creation, like the
+            # acknowledgements they decide.
+            check_input_clock_unchanged(session.config.extra_body, candidate_config.extra_body)
+        except DuplexRuntimeConfigError as exc:
+            self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
             return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
             self._out.emit_error(

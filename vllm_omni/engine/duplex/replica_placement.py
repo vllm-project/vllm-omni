@@ -149,6 +149,17 @@ class DuplexReplicaPlacement:
             return self._group_count if self._frontend_count == 1 else len(self._reserved)
         return len(self._groups)
 
+    @property
+    def live_group_count(self) -> int:
+        """Complete groups owned by this frontend, including groups currently at capacity."""
+        if not self._unavailable:
+            return self.owned_group_count
+        if self._groups is not None:
+            return sum(self._unavailable.isdisjoint(group.replicas.items()) for group in self._groups)
+        # The implicit product needs one live, owned replica on every stage.
+        live_per_stage = Counter(stage for stage, _ in self._reserved.keys() - self._unavailable)
+        return prod(live_per_stage[stage] for stage in range(len(self._stage_replica_counts)))
+
     def frontend_session_limit(self, global_max_sessions: int) -> int:
         """Bound this frontend by its equal share and its owned replica capacity.
 
@@ -162,6 +173,16 @@ class DuplexReplicaPlacement:
         owned_capacity = min(owned_replicas_per_stage.values()) * self._capacity
         return min(share + (self._frontend_index < remainder), owned_capacity)
 
+    def check_session_availability(self, session_id: str) -> None:
+        """Raise if this frontend has no complete group, regardless of occupancy."""
+        if self.live_group_count == 0:
+            raise DuplexSessionError(
+                "No complete duplex replica group is available on this frontend",
+                code="replica_unavailable",
+                retryable=self._frontend_count > 1,
+                session_id=session_id,
+            )
+
     def reserve(self, session_id: str) -> ReplicaReservation:
         """Return an existing reservation or atomically choose an eligible group."""
         existing = self._sessions.get(session_id)
@@ -169,6 +190,7 @@ class DuplexReplicaPlacement:
             return existing
         reservation = self._choose_implicit_group() if self._groups is None else self._choose_explicit_group()
         if reservation is None:
+            self.check_session_availability(session_id)
             raise DuplexSessionError(
                 "replica_capacity_exhausted: no replica group has capacity on every stage",
                 code="resource_exhausted",

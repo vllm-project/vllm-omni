@@ -26,7 +26,9 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.engine.omni_engine_base import _derive_supported_tasks
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -38,6 +40,7 @@ from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.cosmos3.pipeline import COSMOS3_OMNI_DEPLOY_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -218,6 +221,7 @@ def test_client(mock_async_diffusion):
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     # Set up app state with diffusion engine
     app.state.engine_client = mock_async_diffusion
@@ -301,6 +305,7 @@ def async_omni_test_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -365,6 +370,7 @@ def async_omni_rgba_test_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -429,6 +435,7 @@ def async_omni_stage_configs_only_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     assert not hasattr(engine, "stage_list")
@@ -507,6 +514,7 @@ def mammoth_moda2_test_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -576,6 +584,7 @@ def streaming_image_edit_client():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
@@ -610,6 +619,7 @@ def test_health_endpoint_no_engine():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     # Don't set any engine
 
     client = TestClient(app)
@@ -630,6 +640,7 @@ def test_health_endpoint_dead_engine():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
 
     dead_engine = AsyncMock()
     dead_engine.check_health = AsyncMock(side_effect=EngineDeadError())
@@ -661,6 +672,7 @@ def test_models_endpoint_no_engine():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     # Don't set any engine
 
     client = TestClient(app)
@@ -699,6 +711,77 @@ def test_generate_single_image(test_client):
     img = Image.open(io.BytesIO(img_bytes))
     assert img.size == (64, 64)  # Our mock returns 64x64 images
     assert test_client.app.state.engine_client.captured_prompt["modalities"] == ["image"]
+
+
+@pytest.mark.parametrize("deploy_overlay", [False, True])
+def test_cosmos3_images_api_keeps_image_and_video_tasks(test_client, deploy_overlay):
+    if deploy_overlay:
+        config = VllmOmniConfig.from_pipeline_config(COSMOS3_OMNI_DEPLOY_PIPELINE)
+    else:
+        config = StageConfigFactory.create_typed_default_diffusion(
+            "nvidia/Cosmos3-Super", {"model_class_name": "Cosmos3OmniDiffusersPipeline"}
+        )
+    assert config.stage_configs[0].final_output_type == "video"
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+    assert set(test_client.app.state.supported_tasks) == {"x2i", "x2v"}
+
+    response = test_client.post("/v1/images/generations", json={"prompt": "A cat", "size": "1024x1024"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["b64_json"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["robbyant/lingbot-video-dense-1.3b", "robbyant/lingbot-video-moe-30b-a3b"],
+)
+def test_lingbot_images_api_accepts_single_frame_with_video_defaults(test_client, mock_async_diffusion, model):
+    config = StageConfigFactory.create_typed_default_diffusion(model, {"model_class_name": "LingBotVideoPipeline"})
+    assert config.stage_configs[0].final_output_type == "video"
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+    test_client.app.state.openai_serving_models = _DiffusionServingModels([BaseModelPath(name=model, model_path=model)])
+    mock_async_diffusion.default_sampling_params_list[0].num_frames = 81
+
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "model": model,
+            "prompt": "a robotic arm picks up a red block",
+            "size": "320x192",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_frames": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 3.0,
+            "flow_shift": 3.0,
+            "seed": 42,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["b64_json"]
+    assert test_client.app.state.supported_tasks == ("x2i", "x2v")
+    assert mock_async_diffusion.captured_prompt["modalities"] == ["image"]
+    assert mock_async_diffusion.captured_sampling_params_list[0].num_frames == 1
+    assert mock_async_diffusion.default_sampling_params_list[0].num_frames == 81
+
+
+@pytest.mark.parametrize("model_class", ["LingBotWorldCausalDMDPipeline", "WanPipeline"])
+def test_video_only_pipeline_rejects_image_generation(test_client, mock_async_diffusion, model_class):
+    config = StageConfigFactory.create_typed_default_diffusion("test-model", {"model_class_name": model_class})
+    test_client.app.state.stage_configs = config.stage_configs
+    test_client.app.state.supported_tasks = _derive_supported_tasks(config.stage_configs)
+
+    response = test_client.post(
+        "/v1/images/generations", json={"prompt": "a robotic arm picks up a red block", "num_frames": 1}
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == "The model does not support image generation"
+    assert test_client.app.state.supported_tasks == ("x2v",)
+    assert mock_async_diffusion.generate_calls == 0
 
 
 def test_generate_images_guardrail_error_returns_400(test_client, mock_async_diffusion):
@@ -953,6 +1036,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
     chat_handler.engine_client = engine
@@ -1455,6 +1539,7 @@ def test_model_not_loaded():
 
     app = FastAPI()
     app.include_router(router)
+    app.state.supported_tasks = ("x2i",)
     # Don't set diffusion_engine to simulate uninitialized state
     app.state.diffusion_engine = None
 
@@ -2979,7 +3064,7 @@ def test_image_routes_inherit_engine_defaults(test_client: TestClient, route: st
     )
     test_client.app.state.engine_client.default_sampling_params_list = [defaults]
     for override in (explicit, False):
-        payload = {"prompt": "a cat"}
+        payload: dict[str, str | int | float] = {"prompt": "a cat"}
         if override:
             payload.update(guidance_scale=0.0, seed=0, n=1)
         if route == "generations":

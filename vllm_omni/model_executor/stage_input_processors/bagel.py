@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for Bagel: CFG prompt expansion and KV cache collection.
 
 Bagel's 3-branch CFG requires multiple prompts through the AR stage:
@@ -6,6 +9,7 @@ Bagel's 3-branch CFG requires multiple prompts through the AR stage:
   - cfg_img (image unconditional): user prompt without image (same as gen for text2img)
 
 This module provides model-specific functions referenced by bagel.yaml:
+  - prompt_transform_func -> frame_prompt
   - prompt_expand_func  -> expand_cfg_prompts
   - cfg_kv_collect_func -> collect_cfg_kv_caches
 """
@@ -21,6 +25,32 @@ logger = logging.getLogger(__name__)
 
 CFG_TEXT_SUFFIX = "__cfg_text"
 CFG_IMG_SUFFIX = "__cfg_img"
+IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
+BOS = "<|im_start|>"
+EOS = "<|im_end|>"
+
+
+def _frame_text(text: str) -> str:
+    text = text.removeprefix(BOS).removesuffix(EOS)
+    return f"{BOS}{text}{EOS}" if text else ""
+
+
+def _frame_prompt_text(text: str) -> str:
+    return IMG2IMG_PLACEHOLDER.join(_frame_text(part) for part in text.split(IMG2IMG_PLACEHOLDER))
+
+
+def frame_prompt(prompt: dict[str, Any] | str, sampling_params_list: Any) -> dict[str, Any] | str:
+    if not isinstance(prompt, dict):
+        return prompt
+    modalities = prompt.get("modalities", [])
+    if "image" not in modalities and "img2img" not in modalities:
+        return prompt
+    text = prompt.get("prompt")
+    if not isinstance(text, str):
+        return prompt
+    framed = dict(prompt)
+    framed["prompt"] = _frame_prompt_text(text)
+    return framed
 
 
 @dataclass
@@ -85,7 +115,7 @@ def expand_cfg_prompts(
         if not neg_prompt:
             return []
         neg_prompt_dict = {
-            "prompt": neg_prompt,
+            "prompt": _frame_text(neg_prompt),
             "modalities": prompt.get("modalities", []),
         }
         return [
@@ -97,10 +127,8 @@ def expand_cfg_prompts(
         ]
 
     if "img2img" in modalities:
-        IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
-
         cfg_text_dict: dict[str, Any] = {
-            "prompt": f"{IMG2IMG_PLACEHOLDER}{neg_prompt}",
+            "prompt": f"{IMG2IMG_PLACEHOLDER}{_frame_text(neg_prompt)}",
             "modalities": ["img2img"],
         }
         mm_data = prompt.get("multi_modal_data")
@@ -108,7 +136,7 @@ def expand_cfg_prompts(
             cfg_text_dict["multi_modal_data"] = mm_data
 
         original_text = prompt.get("prompt", "")
-        cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
+        cfg_img_text = _frame_prompt_text(original_text).replace(IMG2IMG_PLACEHOLDER, "")
         cfg_img_dict: dict[str, Any] = {
             "prompt": cfg_img_text,
             "modalities": ["img2img"],
@@ -171,7 +199,7 @@ def expand_cfg_prompts_think(
         if not neg_prompt:
             return []
         neg_prompt_dict = {
-            "prompt": neg_prompt,
+            "prompt": _frame_text(neg_prompt),
             "modalities": prompt.get("modalities", []),
         }
         return [
@@ -184,8 +212,6 @@ def expand_cfg_prompts_think(
         ]
 
     if "img2img" in modalities:
-        IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
-
         original_text = prompt.get("prompt", "")
         # Extract system prompt prefix (everything before <|fim_middle|>)
         # so cfg_text gets system_prompt + image (no user text), matching
@@ -193,7 +219,7 @@ def expand_cfg_prompts_think(
         parts = original_text.split(IMG2IMG_PLACEHOLDER, 1)
         system_prefix = parts[0] if len(parts) > 1 else ""
 
-        cfg_text_prompt = f"{system_prefix}{IMG2IMG_PLACEHOLDER}{neg_prompt}"
+        cfg_text_prompt = f"{_frame_text(system_prefix)}{IMG2IMG_PLACEHOLDER}{_frame_text(neg_prompt)}"
         cfg_text_dict: dict[str, Any] = {
             "prompt": cfg_text_prompt,
             "modalities": ["img2img"],
@@ -202,7 +228,7 @@ def expand_cfg_prompts_think(
         if mm_data:
             cfg_text_dict["multi_modal_data"] = mm_data
 
-        cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
+        cfg_img_text = _frame_prompt_text(original_text).replace(IMG2IMG_PLACEHOLDER, "")
         cfg_img_dict: dict[str, Any] = {
             "prompt": cfg_img_text,
             "modalities": ["img2img"],

@@ -33,7 +33,16 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Runtime process placement
+
+The optional process runtime isolates the orchestrator from the frontend GIL
+and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
+
 ## Playback completion ownership
+
+Cancellation of a retained model stream identifies the response owning its
+queued audio, even after generation completes. The Realtime projection clears
+that playback without emitting a second terminal for the completed response.
 
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.
@@ -595,8 +604,8 @@ vllm_omni/
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
 │   ├── realtime/                    the OpenAI Realtime API itself
-│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (22 ship as Tier 1;
-│   │   │                            8 have a Tier 2 twin in protocol/duplex)
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (21 ship as Tier 1;
+│   │   │                            9 have a Tier 2 twin in protocol/duplex)
 │   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
 │   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
 │   │   ├── formats.py               audio format spellings, what is supported, per-session validation
@@ -610,9 +619,9 @@ vllm_omni/
 │       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
 │       │                            items, session, capabilities) so the engine never
 │       │                            imports protocol/realtime directly
-│       ├── events.py                the whole 42-event vocabulary: 22 Tier-1 re-exports,
-│       │                            8 Tier-2 subclasses (session.created + resume_token, ...),
-│       │                            12 Tier-3 events (listen/speak, playback, resume, ...);
+│       ├── events.py                the whole 44-event vocabulary: 21 Tier-1 re-exports,
+│       │                            9 Tier-2 subclasses (session.created + resume_token, ...),
+│       │                            14 Tier-3 events (listen/speak, playback, resume, ...);
 │       │                            DuplexEvent = RealtimeEvent
 │       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
 │       │                            2 Tier-2 subclasses (append + hints, commit + final),
@@ -650,6 +659,7 @@ vllm_omni/
 │           ├── memory_runtime.py    SessionMemoryRuntime: execute private model-planned memory requests
 │           ├── control.py           SessionControl: server VAD and the events that reconfigure it
 │           ├── append_task.py       AppendAttempt: one append in flight and the rollback its failure owes
+│           ├── input_clock.py       InputClock: model units and input acknowledgements of input-clocked sessions
 │           ├── helpers.py           pure reads and payload builders over a session
 │           ├── lease.py             DuplexLeaseState (idle TTL, disconnect grace, resume generation)
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
@@ -846,9 +856,12 @@ for queue updates and the final validity check before delivery.
   runner. Inputs reach the runner through one mailbox in this order: client
   commands (from `_request_handler`, in request-queue order), stage outputs
   (`on_stage_output` enqueues an internal item; it does not mutate the session
-  inline), timers (silence continuation, bounded auto-response) and internal
-  items (deferred overlap promotion, VAD-synthesized commits). The mailbox
-  worker processes items one at a time.
+  inline), timers (silence continuation, bounded auto-response, the input
+  clock's timeout check) and internal items (deferred overlap promotion,
+  VAD-synthesized commits; in an input-clocked session also the
+  `StageProgress` record queued behind each stage output, the marker of an
+  input refused at admission, and the settling of an append task). The
+  mailbox worker processes items one at a time.
 - **Slow work is not awaited inline.** An `AppendAudio` handler reserves
   bytes, then schedules a tracked append task on the per-session append tail:
   the task awaits `_offload(decode/resample/VAD)` on a dedicated
@@ -1287,6 +1300,124 @@ sampling defaults once the stage pools exist. Plugin hooks that may block
 (`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
 offloaded from the loop.
 
+Input-clocked sessions (`extra_body.clock == "input"`, see the
+[API reference](../serving/realtime_duplex_api.md#input-clocked-sessions))
+track every model unit (one Stage0 submission) until all of its output has
+been emitted. The clock lives in `session/input_clock.py` and exists only for
+sessions created with the option; the runner calls it at explicit points: a
+client input is admitted (indexed in wire order when the runner takes it on
+its mailbox; an input the manager refuses at admission is indexed by an
+explicit `runner.input_refused` call in each refusal branch, which only queues
+a payload-free marker acknowledged as `rejected`, like an append the runner
+refuses before its audio reaches the model, `_refuse_append`; an append server
+VAD split into segments is refused from the refused segment on, the segments
+before it stay buffered and its `audio_end_ms` says where they end), begins
+and ends, a Stage0 submission is created / accepted / finishes, a committed turn is deferred or
+its deferred audio is dropped, a cancel advances the epoch, and teardown. Each
+stage output puts a `StageProgress` item on the session mailbox *after* the
+events of that output, and an append's outcome and the timeout checks are
+settled from the mailbox too, so an acknowledgement never overtakes the output
+it covers. A command that waits on the mailbox for an append (a commit or
+`session.update`) watches the timeouts of the appends still running and gives
+up once one of their units is due or timed out, so a stalled submission
+cannot keep the timeout check queued behind it from running. A unit takes its
+ordinal among its epoch's Stage0 submissions when Stage0 accepts it, and the
+n-th Stage0 segment end of the epoch decides that unit (also after the unit
+was settled, so late output is never credited to the next unit; a unit
+settled before Stage0 accepted it stays matchable until its submission
+resolves, and a deferred turn submitted after its reserved slot was settled
+takes that settled unit's place unless a client input submitted it); a
+non-final stage only ends a unit through a decision, and only
+the final stage completes a speaking unit. Two optional hooks carry what only
+the model knows. `unit_decision(stage_id, decision, output, context,
+runtime_config) -> DuplexUnitDecision | None` labels a decision of a stage
+before the final one and says whether it ends the unit's pipeline (default:
+any decision does, labelled `listen` when its metadata sets `model_listen`;
+a plugin overrides this when some decisions do not end the unit); it is also
+asked about every segment end of such a stage that carries no decision
+(default: no classification), so a plugin can end a unit whose segment hands
+the next stage nothing. It is called when the output arrives and reads the
+live output at that moment. Decisions taken on the final stage are not
+consulted. `unit_output_complete(unit, final_stage_id, new_output, new_context,
+state, runtime_config) -> bool` says when the oldest speaking unit's
+final-stage output is complete; `unit` carries only its session-wide index,
+its epoch and its ordinal in that epoch, and two flags (the stage before the
+final one ended its segment; the final stage ended its segment for it: the
+final stage's segment ends go to the speaking units in order, so a unit that
+still waits for its upstream segment end does not take the next unit's), and
+the engine keeps no output history (default: the final
+stage marks one segment end per unit; a final stage that streams across unit
+boundaries keeps its own markers or coverage in `state`, which the engine
+replaces with an empty dict whenever a cancel starts a new epoch, so frame
+coverage is counted per epoch against the ordinal). Later-stage progress
+that overtakes the Stage0 segment end of its unit (no unit is speaking yet,
+or none still needs that stage's segment end) is held by the clock and
+replayed in arrival order when the next unit of the epoch starts speaking.
+It is held only while the epoch has a Stage0 submission without a segment
+end yet (the unit it can belong to); otherwise, and once the epoch has no
+such submission left, it is dropped with a warning, so it never ends a unit
+submitted after it arrived. If more than 256 events are held, the clock
+drops all of them and holds nothing more for that epoch (logged as an
+error): the epoch's later units are left to the timeouts until a cancel.
+Progress that arrives while a later unit of its epoch is pending is
+attributed to that unit, so a plugin's later stages must not emit progress
+(e.g. a repeated segment end) for a unit after it is complete.
+A hook that raises is logged once per session and counts as "no decision" /
+"not complete", which leaves the unit to the timeouts. A settled speaking
+unit keeps its place for its final-stage output, so attribution stays
+correct after a stall. Each acknowledgement reports only units created up
+to its input. A plugin whose input buffer can cut several units from one
+append implements `PcmAppendBuffer.prepare_backlog`; the runner then submits
+all of them for that append. The timeouts' defaults are the same for every
+model (a per-plugin default is a possible follow-up). A plugin enables the mode with
+`supports_input_clock = True` once those hooks match its real unit
+boundaries; sessions of other models that ask for it are refused
+(`input_clock_unsupported`). No model opts in yet.
+
+What a plugin must guarantee before it opts in:
+
+- Stage0 ends every accepted submission with exactly one segment end, in
+  submission order, and the unit's decision (if any) is taken on that
+  segment-ending output. An extra or missing segment end (e.g. a
+  prefill-only append that produces none) shifts the epoch's later units onto
+  the wrong segment ends: an acknowledgement may then arrive before its
+  unit's output, or wait for the timeouts, until the next cancel starts a new
+  epoch; the timeouts keep acknowledgements coming but do not resynchronise.
+- The stage just before the final one (`final_stage_id - 1`) is the only
+  one whose segment end sets a unit's `upstream_segment_finished`, and it
+  ends exactly one segment per unit; an extra one is held for, or credited
+  to, the next unit.
+- With `final_stage_id == 0` (e.g. a text-only request), a unit completes at
+  its Stage0 segment end whatever the hooks say.
+- The default `unit_output_complete` assumes final-stage outputs of
+  different units do not interleave (each unit's audio ends with its own
+  segment end before the next unit's begins). A model whose final stage
+  streams across unit boundaries must override it. Turns never overlap in
+  an input-clocked session: the session is created without
+  `supports_concurrent_turn_requests` (`apply_input_clock_capabilities`,
+  the one place that decides it, so the advertised value and the runner's
+  check cannot disagree), so a commit during a response waits for that
+  response (the deferred-turn path),
+  because the clock credits outputs to the speaking units in order.
+  Crediting by request, which would let turns overlap, is future work.
+- A unit is complete when everything the model emits for it has been
+  emitted. A final stage that synthesises the end of a unit's output only
+  together with later units' input (e.g. a vocoder lookahead, or a codec
+  that emits several units per chunk) may complete the unit before that
+  output, as real-time operation emits it; the lag is model-specific and
+  each model documents its own in its model entry. The
+  acknowledgement waits for a response continuation the output handler
+  spawned (e.g. the `response.done` a non-resumable model sends from it);
+  the wait is bounded (one second) and happens once per continuation, so a
+  continuation that blocks is logged and acknowledged around rather than
+  stalling the session, and delays only the acknowledgement that waited for it.
+
+Every cancel that calls off appends of an input-clocked session advances the
+epoch (an overlap barge-in does so too, where a session without the clock
+keeps its epoch when nothing else was running), so a called-off submission
+that already reached Stage0 has its output dropped instead of shifting the
+count.
+
 Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
 for the shared request identity, sequencing and config snapshots. Token budgets,
 PCM framing and model-specific worker fields remain in the plugins.
@@ -1297,6 +1428,15 @@ ceil to 160-sample mel frames, ceil through the stride-2 CNN, then floor
 through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
+
+The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
+on CUDA, ROCm and NPU. The ROCm override changes runner selection while
+preserving the shared duplex session, async-chunk, device, connector and stage
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph
+and speculation behavior described below does not apply to ROCm. A ROCm FP16
+Code2Wav configuration may select the shared fused CFM body with its SDPA
+fallback; it does not enable NVIDIA tiled attention. Runner selection and this
+dispatch coverage alone do not establish ROCm runtime or quality qualification.
 
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
@@ -1317,6 +1457,14 @@ scheduler's accepted span. The scheduler still supplies the canonical unit
 content and terminator for the next append, including with sliding windows off.
 Sentence-ending punctuation remains a Talker drain hint; it does not decide
 whether the Thinker may end a turn.
+
+An explicit `response.create` may open a latched assistant turn on its first
+silence unit. The sampler consumes that opening marker once per request/unit,
+even if the turn was already open, so repeated decode steps cannot undo a later
+`<|turn_eos|>` decision. The consumed identity lives in the session state.
+Opening a forced response permits the model to speak or listen. Its initial
+listen decision is preserved and closes the response without audio; only an
+already-speaking turn uses the normal listen-to-TTS continuation rewrite.
 
 `<|turn_eos|>` does not terminate the input unit. The Thinker continues until
 a chunk terminator, and the Talker receives all forwarded tokens and their
@@ -1446,6 +1594,28 @@ budgets the JoyAI prompt against JoyAI's generation settings. Session model conf
 comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
+
+JoyAI keeps an empty assistant message for a retained visual observation's
+response when cancellation leaves no committed speech. This preserves the turn
+boundary in both direct and ASR-handoff prompts without restoring unheard text
+or treating cancellation as a model silence decision. The boundary follows the
+existing recent-history budget and disappears when its history item is deleted.
+The ASR handoff retains frame timestamps and observation-to-history references,
+so an old frame precedes its reply boundary and the new transcript accompanies
+only the current observation. Both paths apply the image limit before selecting
+recent history. An empty boundary is omitted when none of its observation's
+frames survives prompt assembly; pending consolidation records alone do not
+keep it alive. Non-empty committed replies
+still referenced by the observation ledger remain eligible at the recent-history
+boundary even after their frames leave the prompt.
+Frame eviction removes only the standalone generated timestamp paired with the
+frame; neighboring user text remains, even when it ends with a timestamp.
+
+For a speech-only follow-up without a new or working-window frame, the ASR
+handoff includes the latest frame still awaiting visual consolidation. It keeps
+that frame's original timestamp and observation-to-history references, before
+the new transcript's turn. Once the frame has been summarized, the summary
+provides its context instead of restoring the cached raw frame.
 
 While idle, JoyAI retains the latest camera frame and one input chunk of audio
 pre-roll. Once speech starts, it keeps the utterance until commit. An idle

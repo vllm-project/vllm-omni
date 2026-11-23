@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model]
@@ -245,17 +246,17 @@ class TestStateEvictionContract:
         assert state.precomputed_stop_logits is None
         assert state.precomputed_is_stopping is None
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_batched_stop_precompute_sets_audio_collect_cache(self) -> None:
-        if not torch.cuda.is_available():
+        if not DEVICE_MODULE.is_available():
             pytest.skip("CUDA is required to exercise batched stop D2H precompute")
 
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
         talker._audio_emit_every = 2
         states = [
-            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device="cuda")),
-            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]], device="cuda")),
+            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device=DEVICE_TYPE)),
+            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]], device=DEVICE_TYPE)),
         ]
 
         talker._precompute_stop_flags_for_audio_collect(states)
@@ -296,16 +297,16 @@ class TestStateEvictionContract:
         assert states[1].precomputed_is_stopping is False
         assert states[1].is_stopping is False
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_length_limit_discard_synchronizes_and_clears_pending(self) -> None:
-        if not torch.cuda.is_available():
+        if not DEVICE_MODULE.is_available():
             pytest.skip("CUDA is required to exercise the stop-mask discard path")
 
         _, RState, _ = _voxcpm2_talker_mod()
         talker = _make_bare_talker()
         talker._audio_emit_every = 2
         states = [
-            RState(request_id="limit", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device="cuda")),
+            RState(request_id="limit", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device=DEVICE_TYPE)),
         ]
 
         talker._precompute_stop_flags_for_audio_collect(states)
@@ -1124,23 +1125,23 @@ class TestAudioEmitCoalescing:
         assert len(out.multimodal_outputs["model_outputs"]) == 1
         torch.testing.assert_close(out.multimodal_outputs["model_outputs"][0], torch.tensor([1.0, 2.0]))
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_make_omni_output_coalesces_gpu_audio_to_cpu(self) -> None:
-        if not torch.cuda.is_available():
+        if not DEVICE_MODULE.is_available():
             pytest.skip("CUDA is required to exercise D2H coalescing")
         talker = _make_bare_talker()
         talker._coalesce_audio_d2h = True
         talker._sample_rate = 16000
         talker._audio_queue = [
-            ("req-0", torch.tensor([1.0, 2.0], device="cuda")),
-            ("req-1", torch.tensor([3.0], device="cuda")),
+            ("req-0", torch.tensor([1.0, 2.0], device=DEVICE_TYPE)),
+            ("req-1", torch.tensor([3.0], device=DEVICE_TYPE)),
         ]
 
         out = talker.make_omni_output(torch.zeros(2, 1))
 
         audio = out.multimodal_outputs["model_outputs"]
         assert len(audio) == 2
-        assert all(not chunk.is_cuda for chunk in audio)
+        assert all(not chunk.device.type == DEVICE_TYPE for chunk in audio)
         torch.testing.assert_close(audio[0], torch.tensor([1.0, 2.0]))
         torch.testing.assert_close(audio[1], torch.tensor([3.0]))
 

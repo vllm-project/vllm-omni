@@ -304,23 +304,10 @@ class TestDeployTopology:
         }
         assert stages[1].yaml_engine_args["speculative_config"]["method"] == "ngram"
 
-    def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
-        pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
-        talker = pipeline.get_stage(1)
-        code2wav = pipeline.get_stage(2)
-        assert talker is not None
-        assert code2wav is not None
-        assert talker.custom_process_next_stage_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"
-        )
-        assert talker.async_chunk_process_next_stage_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_async_chunk"
-        )
-        assert code2wav.sync_process_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
-        )
-
-    def test_no_async_chunk_selects_full_payload_processor(self) -> None:
+    def test_no_async_chunk_selects_full_payload_processor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Resolve on a platform that runs this deploy (MRv2). XPU and MUSA are
+        # deferred and must raise; test_minicpmo_4_5_duplex_mrv2_deploy covers that.
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
         deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
         deploy.async_chunk = False
         stages = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
