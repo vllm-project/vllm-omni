@@ -176,9 +176,9 @@ class AllGatherKVParallelAttention:
             )
 
         if joint_len == 0:
-            # No joint keys: the image mask already covers every key.
-            assert img_mask is not None
-            attn_metadata.attn_mask = img_mask.bool().contiguous()
+            # No joint keys: preserve an absent mask, or normalize the image mask.
+            if img_mask is not None:
+                attn_metadata.attn_mask = img_mask.bool().contiguous()
             return attn_metadata
 
         if joint_mask is None:
