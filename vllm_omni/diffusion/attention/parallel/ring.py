@@ -16,7 +16,7 @@ from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
     HAS_FA3,
     HAS_FA4,
     HAS_FLASH_ATTN,
-    HAS_VLLM_FLASH_ATTN,
+    bundled_flash_attn_version,
 )
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
@@ -32,16 +32,7 @@ logger = init_logger(__name__)
 
 
 def _can_use_vllm_flash_attn(device: torch.device) -> bool:
-    """Return whether vLLM has a compatible bundled FA kernel for ``device``."""
-    if not HAS_VLLM_FLASH_ATTN or device.type != "cuda":
-        return False
-    try:
-        from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
-
-        resolve_vllm_flash_attn_version()
-        return True
-    except (ImportError, RuntimeError):
-        return False
+    return bundled_flash_attn_version(device) is not None
 
 
 def _can_use_fa3(device: torch.device) -> bool:

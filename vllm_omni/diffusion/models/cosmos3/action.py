@@ -15,7 +15,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from .utils import VIDEO_RES_SIZE_INFO
+from vllm_omni.diffusion.models.cosmos3.resolution import (  # noqa: F401
+    VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
+)
 
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -181,21 +184,3 @@ def load_action_tensor(action: Any = None) -> torch.Tensor:
     if tensor.ndim != 2:
         raise ValueError(f"Cosmos3 action must have shape [T, D], got {tuple(tensor.shape)}.")
     return tensor
-
-
-def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
-    key = str(resolution)
-    if key not in VIDEO_RES_SIZE_INFO:
-        raise ValueError(
-            f"Unknown Cosmos3 action resolution={resolution!r}; expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
-        )
-    input_ratio = h / w
-    best_size = None
-    best_diff = float("inf")
-    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
-        diff = abs(input_ratio - cand_h / cand_w)
-        if diff < best_diff:
-            best_diff = diff
-            best_size = (cand_w, cand_h)
-    assert best_size is not None
-    return best_size

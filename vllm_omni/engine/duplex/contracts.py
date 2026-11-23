@@ -130,6 +130,9 @@ class DuplexOutputContext:
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
 
+    def check_session_availability(self, session_id: str) -> None:
+        """Check for a live replica group without reserving a slot. Legacy ports do nothing."""
+
     def reserve_session(self, session_id: str) -> None:
         """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""
 

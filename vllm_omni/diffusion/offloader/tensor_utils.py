@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared tensor utilities for distributed layerwise offload.
 
 These helpers are used by both DistributedLayerwiseOffloadHook and
@@ -18,6 +18,8 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+_PACKED_FP4_DTYPES = frozenset({torch.float4_e2m1fn_x2})
+
 
 @dataclass(frozen=True)
 class TensorStorageSpec:
@@ -33,6 +35,27 @@ class TensorStorageSpec:
 def dtype_size(dtype: torch.dtype) -> int:
     """Return element size in bytes for a torch.dtype."""
     return torch.empty(1, dtype=dtype).element_size()
+
+
+def zeros_for_storage(
+    numel: int,
+    dtype: torch.dtype,
+    *,
+    device: torch.device | str = "cpu",
+    pin_memory: bool = False,
+) -> torch.Tensor:
+    """Allocate a zeroed transport buffer, using byte storage for packed FP4."""
+    if dtype in _PACKED_FP4_DTYPES:
+        return torch.zeros(numel, dtype=torch.uint8, device=device, pin_memory=pin_memory).view(dtype)
+    return torch.zeros(numel, dtype=dtype, device=device, pin_memory=pin_memory)
+
+
+def zero_tensor_storage(tensor: torch.Tensor) -> None:
+    """Zero a tensor without requiring a fill kernel for packed FP4 dtypes."""
+    if tensor.dtype in _PACKED_FP4_DTYPES:
+        tensor.view(torch.uint8).zero_()
+    else:
+        tensor.zero_()
 
 
 def group_named_tensors_by_dtype(
@@ -61,7 +84,7 @@ def flatten_physical_storage(
     if tensor.is_contiguous():
         return tensor.flatten()
     storage_numel = physical_storage_numel(tensor) if storage_numel is None else storage_numel
-    storage = torch.zeros(storage_numel, dtype=tensor.dtype, device=tensor.device)
+    storage = zeros_for_storage(storage_numel, tensor.dtype, device=tensor.device)
     torch.as_strided(storage, size=tensor.shape, stride=tensor.stride()).copy_(tensor)
     return storage
 

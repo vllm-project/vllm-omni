@@ -53,9 +53,9 @@ EDIT_TURBO_MODEL = "Boogu/Boogu-Image-0.1-Edit-Turbo"
 EDIT_TURBO_REVISION = "hotfix-1k-20260708"
 EDIT_PROMPT = "Change the style to a colored pencil drawing."
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
-PARALLEL_3_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=3)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+PARALLEL_3_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3)
 
 
 def _get_diffusion_feature_cases(model: str):

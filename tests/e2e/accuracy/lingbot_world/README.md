@@ -73,6 +73,9 @@ videos from the semantic
 tests. Server/cleanup failures remain failures. Generation hardware, source,
 model and workload are separate from the CUDA evaluator hardware.
 
+Capture records the installed vLLM and PyTorch versions in `model.json` and
+`generation.json`. NPU capture also records `torch-npu` and `vllm-ascend`.
+
 CUDA generation uses two H100 GPUs with Ulysses/SP=2. NPU uses the existing
 four-device A2 configuration, followed by the same scorers on a CUDA worker.
 Evaluator dependencies, source revisions and weight checksums remain pinned.

@@ -622,16 +622,16 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-For this source checkout, build the frozen vLLM 0.33.0 ROCm runtime from
-source using the repository Dockerfile, from the Omni repository root:
+For this source checkout, build the image with the matching vLLM 0.34.0
+ROCm runtime from the Omni repository root:
 
 ```bash
-docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v034-source .
 ```
 
 See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
 for source/runtime details. Container and native H3 validation on ROCm remain
-pending for this checkout; an older ROCm wheel cannot provide its 0.33 APIs.
+pending for this checkout; an older ROCm wheel cannot provide its 0.34 APIs.
 
 Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
@@ -1480,7 +1480,7 @@ storyboard prompts into this six-section format.
 
 ### Turbo LoRA
 
-The eight Diffusers-layout LightX2V Turbo artifacts are supported. The
+The nine Diffusers-layout LightX2V Turbo artifacts below are supported. The
 filename records the contract, so the server reads the step count, task family
 and flow shift from it and validates each request against the artifact that is
 loaded. It does not rewrite request or deploy-config sampling values: the
@@ -1495,6 +1495,7 @@ rejected.
 | `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 4 | 6 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 6 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 128 |
 | `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 4 | 12 | 8 |
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 8 | 6 | 8 |
 
@@ -1511,6 +1512,14 @@ request-level `scale` is a further multiplier on top of it.
 > rank`, so the `alpha=8` rows drive at 1/16 the strength of the `alpha=128`
 > rows. 8 is the default of LightX2V's reference script, which never reads the
 > metadata; its documented `v0.1` command does not override that default.
+>
+> `8step_v1.2` is the one artifact that also adapts the timestep modulation:
+> it adds a rank-16 pair on the AdaLN projection of each of the 50 DiT blocks
+> and of the output layer, and stores an alpha tensor next to every pair. Those
+> 51 pairs are applied at their own `scale * alpha / rank` (16 / 16), not at
+> the rank-128 pairs' value. It is also the one `_768p` artifact that runs at
+> `flow_shift` 12: LightX2V's reference configs use 12 for it and 6 for the
+> other `_768p` files.
 
 Every artifact except `minimax_h3_fl2v_turbo_4step_v0.1` also ships a
 `_comfyui_` export of the same weights. Those fuse Q/K/V into one projection

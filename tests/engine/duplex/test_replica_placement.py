@@ -88,6 +88,7 @@ def test_lazy_join_matches_explicit_product_admission(counts, capacity) -> None:
             else:
                 assert implicit.reserve(session) == expected
         actual_state, expected_state = implicit.snapshot(), explicit.snapshot()
+        assert implicit.live_group_count == explicit.live_group_count
         assert actual_state["reserved"] == expected_state["reserved"]
         assert actual_state["sessions"] == expected_state["sessions"]
         assert actual_state["unavailable"] == expected_state["unavailable"]
@@ -129,6 +130,7 @@ def test_join_can_route_across_indexes_when_aligned_paths_are_unavailable() -> N
     placement = DuplexReplicaPlacement(stage_replica_counts=[2, 2], max_sessions_per_replica=1)
     placement.mark_unavailable(0, 0)
     placement.mark_unavailable(1, 1)
+    assert placement.live_group_count == 1
     reservation = placement.reserve("session")
     assert dict(reservation.replicas) == {0: 1, 1: 0}
     assert placement.reserve("session") is reservation
@@ -139,6 +141,33 @@ def test_join_can_route_across_indexes_when_aligned_paths_are_unavailable() -> N
     placement.release("session")
     assert not any(placement.snapshot()["reserved"].values())
     assert dict(placement.reserve("replacement").replicas) == {0: 1, 1: 0}
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["implicit", "explicit"])
+def test_live_group_count_tracks_only_this_frontends_replicas(explicit: bool) -> None:
+    groups = [{0: 0}, {0: 1}] if explicit else None
+    frontends = [
+        DuplexReplicaPlacement(
+            stage_replica_counts=[2],
+            max_sessions_per_replica=1,
+            replica_groups=groups,
+            frontend_count=2,
+            frontend_index=index,
+        )
+        for index in range(2)
+    ]
+    for placement in frontends:
+        placement.mark_unavailable(0, 0)
+    unavailable, healthy = frontends
+    assert unavailable.live_group_count == 0
+    with pytest.raises(DuplexSessionError) as rejected:
+        unavailable.reserve("first")
+    assert rejected.value.code == "replica_unavailable" and rejected.value.retryable
+    assert healthy.reserve("first").replicas[0] == 1
+    assert healthy.live_group_count == 1
+    with pytest.raises(DuplexSessionError) as full:
+        healthy.reserve("overflow")
+    assert full.value.code == "resource_exhausted" and full.value.retryable
 
 
 def test_round_robin_ties_advance_even_when_sessions_release_immediately() -> None:
