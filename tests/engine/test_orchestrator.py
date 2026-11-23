@@ -467,11 +467,13 @@ def _build_harness(
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
     weight_sharing: SharingRuntime | None = None,
+    dit_load_aware_config: list[dict[str, Any]] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
     Accepts either pre-built ``stage_pools`` or flat lists of single-replica
-    clients/processors.
+    clients/processors. ``dit_load_aware_config`` enables the DTPS pair
+    wiring at construction time (same path as production startup).
     """
     if stage_pools is None:
         # Wrap flat lists into per-stage single-replica lists.
@@ -502,6 +504,7 @@ def _build_harness(
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,
                 log_stats=log_stats,
+                dit_load_aware_config=dit_load_aware_config,
             )
             orchestrator.weight_sharing = weight_sharing
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))

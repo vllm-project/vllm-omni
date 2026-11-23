@@ -232,6 +232,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     max_num_running_reqs: int
     max_num_scheduled_tokens: int
 
+    _dtps: DTPSScheduler | None = None
+
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:

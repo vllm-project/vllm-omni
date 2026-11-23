@@ -11,16 +11,23 @@ Covers review-requested scenarios:
 - budget math with threshold = DiT max_num_seqs + 1
 - blind in-flight eviction (seen-in-DiT and timeout)
 - derive_dtps_config topology rejection (no DiT, multi-DiT)
+- production ``_free_request`` hook wiring (classify before evict, aborted
+  requests never register, registration independent of the KV-transfer
+  predicate)
 """
 
 from __future__ import annotations
 
 import time
+from types import MethodType
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.dtps_scheduler import DTPSScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.engine.dit_load_state import DitLoadSnapshot, DitLoadState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -41,6 +48,7 @@ class _StubRequest:
         ar_only: bool = True,
         arrival_time: float | None = None,
         num_prompt_tokens: int = 0,
+        status: RequestStatus | None = None,
     ) -> None:
         self.request_id = request_id
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
@@ -50,6 +58,14 @@ class _StubRequest:
             "omni_final_stage_id": 0 if ar_only else 1,
             "omni_force_kv_transfer": False,
         }
+        # Production _free_request attributes
+        self.status = status
+        self.client_index = 0
+        self.output_token_ids: list[int] = []
+        self.kv_transfer_params = None
+
+    def is_finished(self) -> bool:
+        return self.status is not None and bool(RequestStatus.is_finished(self.status))
 
 
 class _StubWaitingQueue:
@@ -462,7 +478,7 @@ class TestDitLoadStateEviction:
         """Evicting a replica that never supplied data still produces a
         valid (empty) snapshot. The remove() call is a no-op but the
         snapshot should reflect num_replicas=0, fresh=False."""
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         # Never call state.update() — replica has no data
         removed = state.remove(stage_id=0, replica_id=0)
         assert removed is False  # nothing to remove
@@ -472,7 +488,7 @@ class TestDitLoadStateEviction:
 
     def test_evict_replica_with_prior_data(self):
         """Evicting a replica that had data removes it from the snapshot."""
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         state.update(stage_id=0, replica_id=0, waiting=3, running=1)
         snap_before = state.snapshot()
         assert snap_before["num_replicas"] == 1
@@ -486,7 +502,7 @@ class TestDitLoadStateEviction:
 
     def test_evict_one_of_two_replicas(self):
         """Evicting one replica out of two adjusts the aggregate snapshot."""
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         state.update(stage_id=0, replica_id=0, waiting=5, running=1)
         state.update(stage_id=0, replica_id=1, waiting=2, running=0)
 
@@ -511,7 +527,7 @@ class TestDitLoadStateEviction:
         3. Subsequent failures retry dirty push
         4. Retry succeeds → dirty=False
         """
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         state.update(stage_id=0, replica_id=0, waiting=3, running=1)
 
         # Simulate push results (True = success, False = failure)
@@ -559,7 +575,7 @@ class TestDitLoadStateEviction:
 
     def test_dirty_not_set_when_eviction_push_succeeds(self):
         """When eviction push succeeds, dirty stays False — no retry needed."""
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         state.update(stage_id=0, replica_id=0, waiting=3, running=1)
 
         removed = state.remove(stage_id=0, replica_id=0)
@@ -598,7 +614,7 @@ class TestStageIsolation:
     def test_snapshot_filters_by_stage_id(self):
         """DitLoadState.snapshot(stage_id=D) only includes replicas from
         stage D, excluding data from other DiT stages."""
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         # DiT1 (stage 1): 3 waiting
         state.update(stage_id=1, replica_id=0, waiting=3, running=1)
         # DiT3 (stage 3): 5 waiting
@@ -623,7 +639,7 @@ class TestStageIsolation:
     def test_snapshot_stage_id_with_no_data(self):
         """snapshot(stage_id=X) returns empty snapshot when no replicas
         exist for that stage."""
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         state.update(stage_id=1, replica_id=0, waiting=3, running=1)
 
         snap = state.snapshot(stage_id=99)
@@ -663,7 +679,7 @@ class TestStageIsolation:
     def test_unrelated_dit_stage_excluded_from_snapshot(self):
         """Regression: changing load on an unrelated DiT stage must not
         affect the snapshot of the paired DiT stage."""
-        state = DitLoadState(dit_load_threshold=2)
+        state = DitLoadState()
         # Paired DiT (stage 1): idle
         state.update(stage_id=1, replica_id=0, waiting=0, running=0)
         # Unrelated DiT (stage 3): very busy
@@ -674,3 +690,93 @@ class TestStageIsolation:
         assert paired_snap["num_replicas"] == 1
         # The unrelated stage's load must not appear
         assert paired_snap["total_waiting"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Production finish-hook wiring (_free_request -> DTPS)
+# ---------------------------------------------------------------------------
+
+
+def _make_finish_hook_scheduler(
+    dtps: DTPSScheduler,
+    *,
+    kv_transfer: bool = False,
+) -> OmniARScheduler:
+    """Run the production ``_free_request`` against a minimal scheduler.
+
+    Only the attributes the real hook touches are populated; heavyweight
+    vLLM machinery (connectors, encoder cache, block freeing) is stubbed.
+    The DTPS wiring (classify -> evict -> conditional register) is the
+    production code under test.
+    """
+    sched = object.__new__(OmniARScheduler)
+    sched._omits_kv_transfer_cache = {}
+    sched._inflight_prefills = set()
+    sched._held_token_ids = {}
+    sched._discarded_req_ids = set()
+    sched._connector_finished = lambda request: (False, None)
+    sched.ec_connector = None
+    sched.encoder_cache_manager = MagicMock()
+    sched.finished_req_ids = set()
+    sched.finished_req_ids_dict = None
+    sched._new_prompt_len_snapshot = {}
+    sched._finished_req_output_token_ids = {}
+    sched.num_spec_tokens = 0
+    sched.chunk_transfer_adapter = None
+    sched._should_transfer_kv_for_request = lambda request_id: kv_transfer
+    sched._free_blocks = MagicMock()
+    sched._dtps = dtps
+    # Bind the real helpers so the exercised path is production code.
+    sched._record_full_payload_discard = MethodType(OmniSchedulerMixin._record_full_payload_discard, sched)
+    sched._free_input_coordinator_request = MethodType(OmniSchedulerMixin._free_input_coordinator_request, sched)
+    sched._free_request = MethodType(OmniARScheduler._free_request, sched)
+    return sched
+
+
+class TestFreeRequestHook:
+    """DTPS wiring inside the production ``OmniARScheduler._free_request``.
+
+    Review asks (PR #9634): an AR-only request must not register blind
+    in-flight, an AR+DiT request must — even when the KV-transfer predicate
+    is false —, cancellation (FINISHED_ABORTED) must never register, and
+    freed requests must not re-enter the classification cache.
+    """
+
+    def test_ar_only_not_registered_and_cache_stays_clean(self):
+        dtps = _make_scheduler(threshold=2)
+        sched = _make_finish_hook_scheduler(dtps, kv_transfer=False)
+
+        for rid in ("req-ar-1", "req-ar-2"):
+            request = _StubRequest(rid, ar_only=True, status=RequestStatus.FINISHED_STOPPED)
+            sched._free_request(request)
+            assert rid in sched.finished_req_ids
+            assert rid not in dtps._dit_inflight_ids
+
+        # Classify-before-evict: freed requests never linger in the cache.
+        assert dtps._ar_only_cache == {}
+
+    def test_ar_downstream_registers_blind_inflight_without_kv_transfer(self):
+        """Registration is tied to the downstream handoff, not to the
+        KV-transfer predicate: it must happen even when the predicate is
+        false (non-KV-transfer deployments)."""
+        dtps = _make_scheduler(threshold=2)
+        sched = _make_finish_hook_scheduler(dtps, kv_transfer=False)
+
+        request = _StubRequest("req-mix", ar_only=False, status=RequestStatus.FINISHED_STOPPED)
+        sched._free_request(request)
+
+        assert "req-mix" in dtps._dit_inflight_ids
+        assert dtps._ar_only_cache == {}
+        sched._free_blocks.assert_called_once_with(request)
+
+    def test_aborted_downstream_not_registered(self):
+        """A cancelled request never reaches DiT, so it must not occupy a
+        blind in-flight slot (which would shrink the priority budget)."""
+        dtps = _make_scheduler(threshold=2)
+        sched = _make_finish_hook_scheduler(dtps, kv_transfer=False)
+
+        request = _StubRequest("req-cancel", ar_only=False, status=RequestStatus.FINISHED_ABORTED)
+        sched._free_request(request)
+
+        assert "req-cancel" not in dtps._dit_inflight_ids
+        assert dtps._ar_only_cache == {}
