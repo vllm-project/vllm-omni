@@ -269,6 +269,8 @@ class StagePool:
             "reset_mm_cache",
         }
     )
+    _DIT_LOAD_PUSH_TIMEOUT_S: float = 0.5
+
 
     def __init__(
         self,
@@ -2051,7 +2053,8 @@ class StagePool:
         if check_fn is None:
             return True
         try:
-            return bool(check_fn())
+            check_fn()
+            return True
         except Exception:
             return False
 

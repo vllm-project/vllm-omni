@@ -493,6 +493,8 @@ class OrchestratorBase:
     _dit_load_aware: bool = False
     _dit_load_fail_count: dict[tuple[int, int], int] | None = None
     _dit_load_dirty: bool = False
+    _DIT_LOAD_POLL_INTERVAL_S: float = 0.1
+    _DIT_LOAD_EVICT_THRESHOLD: int = 5
 
     def __init__(
         self,
@@ -1441,6 +1443,7 @@ class OrchestratorBase:
             if (now - last) < self._DIT_LOAD_POLL_INTERVAL_S:
                 return
         self._dit_load_last_poll[key] = now
+        logger.debug("[DTPS] throttle passed, polling s=%d r=%d state=%s", stage_id, replica_id, state is not None)
 
         if not pool.check_dit_health(replica_id):
             try:
@@ -1470,6 +1473,7 @@ class OrchestratorBase:
             return
         self._dit_load_fail_count[(stage_id, replica_id)] = 0
         waiting, running, waiting_ids, running_ids = load
+        logger.debug("[DTPS] poll OK s=%d r=%d w=%d run=%d", stage_id, replica_id, waiting, running)
         try:
             changed = state.update(
                 stage_id,

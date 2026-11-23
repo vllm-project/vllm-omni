@@ -638,6 +638,9 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
+    # AR-stage DiT-load-aware scheduling: when True, the AR scheduler
+    # reorders its waiting queue by task type + downstream DiT load.
+    dit_load_aware: bool | None = None
     # Hybrid-mamba stages (e.g. the NemotronVoiceChat thinker's NemotronH
     # backbone) pin the SSM state dtype; projected onto vLLM CacheConfig.
     mamba_ssm_cache_dtype: str | None = None
