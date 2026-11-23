@@ -211,18 +211,110 @@ def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses
         handler.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("model_class_name", "preencode_flag"),
+    [("WanPipeline", {"preencode_mp4": True}), ("MiniMaxH3Pipeline", {})],
+    ids=["explicit-flag", "model-default"],
+)
 @pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
-def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
+def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames, model_class_name, preencode_flag):
     engine = FakeAsyncOmni()
+    engine.model_class_name = model_class_name
     handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
     request = VideoGenerationRequest(
-        prompt="test", extra_params={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+        prompt="test", extra_params={**preencode_flag, "preencode_batch_frames": batch_frames}
     )
     try:
         with pytest.raises(HTTPException, match="preencode_batch_frames") as exc:
             asyncio.run(handler.generate_video_bytes(request, "invalid-batch"))
         assert exc.value.status_code == 400
         assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+def test_preencode_opt_out_skips_batch_frame_validation(mocker: MockerFixture):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"fake-video")
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params={"preencode_mp4": False, "preencode_batch_frames": 0})
+    try:
+        asyncio.run(handler.generate_video_bytes(request, "opt-out"))
+        assert engine.captured_sampling_params_list[0].extra_args["preencode_mp4"] is False
+    finally:
+        handler.shutdown()
+
+
+def test_preencode_rejects_frame_interpolation_before_generation():
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(
+        prompt="test", enable_frame_interpolation=True, extra_params={"preencode_mp4": True}
+    )
+    try:
+        with pytest.raises(HTTPException, match="enable_frame_interpolation") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "interpolated"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("request_fields", "expect_worker_mp4", "expected_fps"),
+    [
+        ({}, True, 24),
+        ({"fps": 24}, True, 24),
+        ({"fps": 12}, False, 12),
+        ({"fps": 12, "extra_params": {"preencode_mp4": False}}, False, 12),
+        ({"extra_params": {"preencode_mp4": False}}, False, 24),
+    ],
+)
+def test_h3_default_preencode_keeps_the_requested_frame_rate(
+    mocker: MockerFixture, request_fields, expect_worker_mp4, expected_fps
+):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    frames = np.zeros((6, 24, 32, 3), dtype=np.uint8)
+    captured = {}
+
+    async def fake_run_generation(prompt, gen_params, request_id, **kwargs):
+        captured["extra_args"] = dict(gen_params.extra_args)
+        # Like the H3 worker, a pre-encoded MP4 is always muxed at the model's native 24 fps.
+        if gen_params.extra_args.get("preencode_mp4"):
+            video = mux_video_audio_bytes(frames, fps=24, video_codec_options={"preset": "ultrafast"})
+        else:
+            video = frames
+        return MockVideoResult([video], multimodal_output={"video": [video], "metadata": {"video": {"fps": 24.0}}})
+
+    mocker.patch.object(handler, "_run_generation", side_effect=fake_run_generation)
+    try:
+        result = asyncio.run(
+            handler.generate_video_bytes(VideoGenerationRequest(prompt="test", **request_fields), "fps")
+        )
+        assert bool(captured["extra_args"].get("preencode_mp4")) is expect_worker_mp4
+        with av.open(io.BytesIO(result.video_bytes)) as container:
+            stream_fps = float(container.streams.video[0].average_rate)
+        assert stream_fps == expected_fps
+        assert result.video_metadata["fps"] == expected_fps
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("interpolate", [False, True])
+def test_h3_default_preencode_skips_frame_interpolation_requests(mocker: MockerFixture, interpolate):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"fake-video")
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", enable_frame_interpolation=interpolate)
+    try:
+        asyncio.run(handler.generate_video_bytes(request, "interp"))
+        assert engine.captured_sampling_params_list[0].extra_args.get("preencode_mp4") is (
+            None if interpolate else True
+        )
     finally:
         handler.shutdown()
 
