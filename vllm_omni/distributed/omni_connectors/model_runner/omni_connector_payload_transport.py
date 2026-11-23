@@ -1283,11 +1283,24 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         )
         return True
 
-    def _remember_recv_claim_key(self, req_id: str, connector_get_key: str | None) -> None:
-        if not connector_get_key:
-            return
+    def _remember_recv_claim_key(self, req_id: str, connector_get_key: str | None) -> bool:
+        """Save the claim key only if this receive is still pending.
+
+        Returns False when runner cleanup already dropped the receive. The
+        caller must skip the connector get in that case so a late empty get
+        cannot leave a claim that neither expiry nor the abandon queue will
+        see.
+        """
         with self._lock:
-            self._active_recv_claim_keys[req_id] = connector_get_key
+            pending = getattr(self, "_pending_load_reqs", None)
+            if pending is None or req_id not in pending:
+                return False
+            if connector_get_key:
+                claim_keys = getattr(self, "_active_recv_claim_keys", None)
+                if claim_keys is None:
+                    claim_keys = self._active_recv_claim_keys = {}
+                claim_keys[req_id] = connector_get_key
+            return True
 
     def _drain_recv_claim_abandons(self) -> None:
         """Drop queued read claims on the receive thread."""
@@ -1483,8 +1496,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         )
         # Retain the key before get: a lost handshake reply leaves a claim on
         # this thread, and runner cleanup may remove the pending receive before
-        # the next poll can recompute the key.
-        self._remember_recv_claim_key(req_id, connector_get_key)
+        # the next poll can recompute the key. Recheck pending under the same
+        # lock; if cleanup already won, skip the get entirely.
+        if not self._remember_recv_claim_key(req_id, connector_get_key):
+            return False
 
         if self._async_chunk:
             result = self._recv_async_chunk_result(

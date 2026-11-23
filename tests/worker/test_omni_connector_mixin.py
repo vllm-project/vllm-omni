@@ -2268,6 +2268,48 @@ def test_cancel_pending_receive_abandons_claim_left_by_empty_get():
         host.shutdown_omni_connectors()
 
 
+def test_poll_skips_get_when_receive_canceled_before_claim_key():
+    """Cleanup between key derivation and remember must not enter the connector."""
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=1, async_chunk=False))
+    gets: list[str] = []
+
+    class _MustNotGet:
+        def get(self, *args, **kwargs):
+            gets.append("get")
+            raise AssertionError("canceled receive must not call get")
+
+        def get_with_deadline(self, from_stage, to_stage, key, metadata=None, *, deadline):
+            gets.append("get_with_deadline")
+            raise AssertionError("canceled receive must not call get_with_deadline")
+
+        def abandon_get(self, key):
+            raise AssertionError("no claim key should have been retained")
+
+    host._omni_connector = _MustNotGet()
+    host._stage_id = 1
+    host._async_chunk = False
+    request = _make_request("req-race")
+    remember = type(host)._remember_recv_claim_key
+
+    def cancel_then_remember(req_id, connector_get_key):
+        # Runner cleanup wins the window after the poll derived the key and
+        # before it registers that key under the lock.
+        host.cleanup_finished_request(req_id)
+        return remember(host, req_id, connector_get_key)
+
+    host._remember_recv_claim_key = cancel_then_remember
+    try:
+        host.register_chunk_recv(request)
+        assert host._poll_single_request("req-race") is False
+        assert gets == []
+        assert "req-race" not in host._pending_load_reqs
+        assert "req-race" not in host._active_recv_claim_keys
+        assert list(host._recv_claim_abandons) == []
+    finally:
+        host.shutdown_omni_connectors()
+
+
 def test_permanent_recv_error_fails_on_first_get():
     from vllm_omni.distributed.omni_connectors.connectors.base import PermanentTransferError
 
