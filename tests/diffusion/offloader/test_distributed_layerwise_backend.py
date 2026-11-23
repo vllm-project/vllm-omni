@@ -1754,6 +1754,11 @@ class TestMmapWeightLoading:
                 },
             ),
             torch.device("cpu"),
+            host_weight_plan=HostWeightPlan(
+                backing_kind="checkpoint_mmap",
+                bindings={},
+                planned_source_prefixes=frozenset({"text_encoder."}),
+            ),
         )
         backend._using_mmap = True
 
@@ -1772,6 +1777,44 @@ class TestMmapWeightLoading:
 
         assert backend._component_mmap_eligible(encoder, TEXT_ENCODER_COMPONENT)
         assert not backend._component_mmap_eligible(dit, DIT_COMPONENT)
+
+    def test_encoder_mmap_eligibility_requires_plan_coverage(self, patched_offload_runtime):
+        """An encoder the loader's plan does not own must not stream from mmap.
+
+        A legacy DLO flag resolves ``components={dit}`` on the loader side while
+        the plan resolver still honors the model declaration; without this gate
+        the backend moves the ordinary-loaded encoder to ``meta`` and the
+        remaining-tensor check aborts startup.
+        """
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=1,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=HostWeightPlan(
+                backing_kind="checkpoint_mmap",
+                bindings={},
+                planned_source_prefixes=frozenset({"transformer."}),
+            ),
+        )
+        backend._using_mmap = True
+
+        encoder = ResolvedComponent(
+            path="text_encoder",
+            module=nn.Identity(),
+            selected=True,
+            backing=BackingKind.CHECKPOINT_MMAP,
+        )
+        assert not backend._component_mmap_eligible(encoder, TEXT_ENCODER_COMPONENT)
+
+        backend.host_weight_plan = HostWeightPlan(
+            backing_kind="checkpoint_mmap",
+            bindings={},
+            planned_source_prefixes=frozenset({"transformer.", "text_encoder."}),
+        )
+        assert backend._component_mmap_eligible(encoder, TEXT_ENCODER_COMPONENT)
 
     def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
         """A warm HWR plan uses the existing two-slot rank-local transport."""

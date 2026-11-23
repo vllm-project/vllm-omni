@@ -1699,13 +1699,25 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         must hold for this component's own transport group. A rank-local
         encoder therefore stays eligible even when the DiT streams via a
         multi-rank AllGather.
+
+        An encoder additionally requires the loader's checkpoint-mmap plan to
+        own its weights: the loader only plans the components its own
+        resolution selected, so a legacy DLO flag (``components={dit}`` on the
+        loader side, while the plan resolver still honors the model
+        declaration) must leave the ordinary-loaded encoder unstreamed instead
+        of moving it to ``meta`` with no bindings to fill it from.
         """
-        return (
+        if not (
             component.selected
             and self._using_mmap
             and component.backing is BackingKind.CHECKPOINT_MMAP
             and self._component_transport(component_type)[1] <= 1
-        )
+        ):
+            return False
+        if component_type is TEXT_ENCODER_COMPONENT:
+            plan = self.host_weight_plan
+            return plan is not None and f"{component.path}." in plan.planned_source_prefixes
+        return True
 
     def _install_hook_group(
         self,
