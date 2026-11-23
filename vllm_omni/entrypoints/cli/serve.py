@@ -1050,8 +1050,9 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Decode a VAE's spatial tiles as one batch where the model supports it (default). "
-                "--no-vae-stack-tiles decodes one tile at a time, which lowers peak decode memory."
+                "Decode a rank's VAE spatial tiles in batches of up to 7 (default). Currently only the "
+                "MiniMax-H3 video VAE reads this flag; other models ignore it. --no-vae-stack-tiles "
+                "decodes one tile at a time."
             ),
         )
         omni_config_group.add_argument(
