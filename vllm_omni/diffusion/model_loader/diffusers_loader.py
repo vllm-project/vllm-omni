@@ -900,7 +900,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
                             and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
                         ),
-                        dit_mmap_ready=not dit_uses_allgather or data_parallel_size <= 1,
                     )
                     if dit_mmap_modules or encoder_mmap_modules:
                         plan_result = build_checkpoint_mmap_plan(
@@ -1058,7 +1057,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         use_hsdp: bool,
         dp_size: int,
         uses_allgather: bool,
-        dit_mmap_ready: bool = True,
     ) -> tuple[tuple[str, nn.Module], ...]:
         """Encoders whose declaration the loader can serve from checkpoint mmap.
 
@@ -1066,17 +1064,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         so an encoder never joins the plan with a backing the backend will
         refuse to stream; every other encoder keeps the ordinary loader.
 
-        The backend enables rank-local mmap from the DiT transport, and a
-        multi-rank AllGather DiT group releases the mmap handles after loading.
-        An encoder added to the plan in that topology would therefore skip its
-        ordinary weight source without anyone realizing it from the plan, so
-        ``dit_mmap_ready`` keeps the encoder on the ordinary loader instead.
+        Eligibility is per-component: the encoder's own transport decides, so a
+        rank-local encoder still streams even when the DiT uses a multi-rank
+        AllGather transfer. The backend resolves each component's transport
+        independently of the DiT.
 
         A rank that owns no encoder shard holds a weight-less stub. It has no
         weight source to plan from, and planning it would fail the whole plan,
         the DiT included, so the stub stays on the ordinary loader.
         """
-        if plan is None or not selected or not dit_mmap_ready:
+        if plan is None or not selected:
             return ()
         selected_encoders: list[tuple[str, nn.Module]] = []
         for name, encoder in zip(modules.encoder_names, modules.encoders):

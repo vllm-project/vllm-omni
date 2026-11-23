@@ -35,6 +35,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 from vllm_omni.diffusion.offloader import plan_resolver
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.chunked_transport import build_part_manifest, pack_local_shard
+from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, DLOTransfer
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -46,6 +47,7 @@ from vllm_omni.diffusion.offloader.host_registration import (
 )
 from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 from vllm_omni.diffusion.offloader.offload_plan import (
+    BackingKind,
     OffloadPlan,
     get_offload_plan,
 )
@@ -1738,6 +1740,38 @@ class TestMmapWeightLoading:
             for rank in range(2):
                 assert torch.equal(ranks[rank][0].transformer.blocks[index].qkv.weight, ordinary[index])
         assert not pending
+
+    def test_component_mmap_eligibility_is_resolved_per_component(self, patched_offload_runtime):
+        """A rank-local encoder stays mmap-eligible under a multi-rank AllGather DiT."""
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                dlo_transfers={
+                    DIT_COMPONENT: DLOTransfer.ALLGATHER,
+                    TEXT_ENCODER_COMPONENT: DLOTransfer.RANK_LOCAL,
+                },
+            ),
+            torch.device("cpu"),
+        )
+        backend._using_mmap = True
+
+        encoder = ResolvedComponent(
+            path="text_encoder",
+            module=nn.Identity(),
+            selected=True,
+            backing=BackingKind.CHECKPOINT_MMAP,
+        )
+        dit = ResolvedComponent(
+            path="transformer",
+            module=nn.Identity(),
+            selected=True,
+            backing=BackingKind.CHECKPOINT_MMAP,
+        )
+
+        assert backend._component_mmap_eligible(encoder, TEXT_ENCODER_COMPONENT)
+        assert not backend._component_mmap_eligible(dit, DIT_COMPONENT)
 
     def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
         """A warm HWR plan uses the existing two-slot rank-local transport."""

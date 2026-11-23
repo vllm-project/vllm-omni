@@ -57,7 +57,6 @@ def _select(encoder: nn.Module, plan: OffloadPlan, **overrides) -> tuple[tuple[s
         "use_hsdp": False,
         "dp_size": 1,
         "uses_allgather": False,
-        "dit_mmap_ready": True,
     }
     arguments.update(overrides)
     return DiffusersPipelineLoader._mmap_encoder_modules(_modules(encoder), plan, **arguments)
@@ -79,19 +78,13 @@ def test_loader_fails_closed_for_multi_rank_allgather() -> None:
     assert _select(nn.Identity(), _declaration(), dp_size=2, uses_allgather=True) == ()
 
 
-def test_loader_keeps_encoder_on_ordinary_loader_when_dit_allgather_disables_mmap() -> None:
-    # The backend ties rank-local mmap to the DiT transport, so a multi-rank
-    # AllGather DiT group cannot realize a planned rank-local encoder.
-    assert (
-        _select(
-            nn.Identity(),
-            _declaration(),
-            dp_size=2,
-            uses_allgather=False,
-            dit_mmap_ready=False,
-        )
-        == ()
-    )
+def test_loader_plans_rank_local_encoder_when_dit_uses_multirank_allgather() -> None:
+    # The encoder's own rank-local transport decides eligibility, so it still
+    # streams from checkpoint mmap under a multi-rank AllGather DiT instead of
+    # inheriting the DiT topology.
+    encoder = nn.Identity()
+
+    assert _select(encoder, _declaration(), dp_size=2, uses_allgather=False) == ((ENCODER_PATH, encoder),)
 
 
 def test_loader_ignores_encoders_the_user_did_not_select() -> None:

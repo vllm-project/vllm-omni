@@ -1685,20 +1685,27 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         components = self.config.components or frozenset({DIT_COMPONENT})
         return self.dp_size > 1 and any(self.config.uses_allgather(component) for component in components)
 
-    def _component_mmap_eligible(self, component: ResolvedComponent) -> bool:
+    def _component_mmap_eligible(self, component: ResolvedComponent, component_type: str) -> bool:
         """Whether a resolved component streams its checkpoint-mmap source rank-locally.
 
         This selects the transport only.  The plan's checkpoint transforms are
         required by every transport, because the loader skipped ordinary
         loading for every planned tensor.
 
-        This composes the loader-side rank-local preflight (TP=1, non-quantized,
-        HSDP-free, single-rank transfer) that ``_using_rank_local_mmap`` already
-        encodes with the resolver-side ``backing`` declaration. A component that
-        resolved to a non-mmapped backing is ineligible even when the loader
-        produced a plan.
+        Eligibility is resolved per component, not inherited from the DiT
+        transport. The loader-side rank-local preflight (TP=1, non-quantized,
+        HSDP-free, single-rank transfer) is encoded by ``self._using_mmap`` plus
+        the resolver-side ``backing`` declaration, while single-rank transfer
+        must hold for this component's own transport group. A rank-local
+        encoder therefore stays eligible even when the DiT streams via a
+        multi-rank AllGather.
         """
-        return component.selected and self._using_rank_local_mmap and component.backing is BackingKind.CHECKPOINT_MMAP
+        return (
+            component.selected
+            and self._using_mmap
+            and component.backing is BackingKind.CHECKPOINT_MMAP
+            and self._component_transport(component_type)[1] <= 1
+        )
 
     def _install_hook_group(
         self,
@@ -1742,7 +1749,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.comm_stream,
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
-                    rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
+                    rank_local_mmap=use_dit_mmap and self._component_transport(component)[1] <= 1,
                     tensor_transforms=self._mmap_transforms_by_tensor_id,
                     fused_sources=self._mmap_fused_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
@@ -1778,7 +1785,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self._install_hook_group(
                     blocks,
                     TEXT_ENCODER_COMPONENT,
-                    use_dit_mmap=self._component_mmap_eligible(component),
+                    use_dit_mmap=self._component_mmap_eligible(component, TEXT_ENCODER_COMPONENT),
                 )
             )
         # Track the module before placement, which may fail, so outer rollback
@@ -1815,7 +1822,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Keep the submodule's own non-block state resident by block identity,
         # so an attribute aliasing a streamed block is not placed with it.
         move_non_block_state_to_device(component.module, (stack.blocks,), self.device)
-        self._install_hook_group(stack.blocks, DIT_COMPONENT, use_dit_mmap=self._component_mmap_eligible(component))
+        self._install_hook_group(
+            stack.blocks, DIT_COMPONENT, use_dit_mmap=self._component_mmap_eligible(component, DIT_COMPONENT)
+        )
 
     def _prepare_dit_non_block_modules(
         self,
@@ -1955,7 +1964,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self._load_weights_via_mmap(
                     pipeline,
                     tuple(component for component in resolved.dits if component.selected)
-                    + tuple(component for component in resolved.encoders if self._component_mmap_eligible(component)),
+                    + tuple(
+                        component
+                        for component in resolved.encoders
+                        if self._component_mmap_eligible(component, TEXT_ENCODER_COMPONENT)
+                    ),
                     host_weight_plan,
                 )
             else:
@@ -2015,7 +2028,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 logger.info("All blocks for %s are resident; no streaming hooks required", component.path)
                 continue
 
-            self._install_hook_group(streaming, DIT_COMPONENT, use_dit_mmap=self._component_mmap_eligible(component))
+            self._install_hook_group(
+                streaming, DIT_COMPONENT, use_dit_mmap=self._component_mmap_eligible(component, DIT_COMPONENT)
+            )
         if self._resident_blocks:
             self._resident_layer_group = PinnedResidentLayerGroup(
                 self._resident_blocks,
@@ -2048,7 +2063,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         unified_shard_buffers = self._allocate_shared_shard_buffers(allgather_hooks) if allgather_hooks else None
         unified_cpu_staging = None
         cpu_staging_events = None
-        if self._using_rank_local_mmap and not self._using_registered_mmap:
+        if mmap_hooks and not self._using_registered_mmap:
             unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
                 mmap_hooks,
                 self._resident_layer_group,
