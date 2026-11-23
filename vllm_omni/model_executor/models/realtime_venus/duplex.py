@@ -43,9 +43,14 @@ class VenusDataPlane(MiniCPMO45DataPlaneSession):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self._delegations: dict[str, tuple[object, DelegateParser]] = {}
+        self._backend_ready: dict[str, bool] = {}
+
+    def backend_ready(self, request_id: str) -> bool:
+        return self._backend_ready.get(request_id, True)
 
     def close_request(self, request_id: str) -> None:
         self._delegations.pop(request_id, None)
+        self._backend_ready.pop(request_id, None)
         super().close_request(request_id)
 
     def project_output(
@@ -54,6 +59,10 @@ class VenusDataPlane(MiniCPMO45DataPlaneSession):
         for result in super().project_output(output, context=context):
             request_id = result.get("data_plane_request_id")
             if isinstance(request_id, str):
+                # A closed delegate span can precede the foreground turn's
+                # final tokens. Injecting its result before that boundary
+                # lets the old turn's EOS consume the new answer context.
+                self._backend_ready[request_id] = result.get("is_listen") is True or result.get("end_of_turn") is True
                 turn_id = result.get("model_turn_id", context.turn_id if context is not None else None)
                 previous = self._delegations.get(request_id)
                 if previous is None or previous[0] != turn_id:
@@ -183,7 +192,7 @@ class RealtimeVenusDuplexPlugin(MiniCPMO45DuplexPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        records = _records(runtime_config)
+        records = _records(runtime_config) if self.data_plane.backend_ready(request_id) else []
         if records:
             runtime_config = {
                 **runtime_config,

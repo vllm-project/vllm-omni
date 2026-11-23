@@ -87,6 +87,25 @@ def test_tool_result_is_reserved_and_transferred_only_after_submit(plugin):
     assert current["venus_function_results"][0]["generation"] == 1
 
 
+@pytest.mark.parametrize("boundary", [{"end_of_turn": True}, {"is_listen": True}])
+def test_result_waits_for_foreground_boundary(plugin, monkeypatch, boundary):
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane.MiniCPMO45DataPlaneSession.project_output",
+        lambda self, output, **kw: iter([output]),
+    )
+    plane = plugin.data_plane
+    list(plane.project_output({"data_plane_request_id": "request", "text": "<delegate>lookup</delegate>"}))
+    current = result(plugin, {})
+    pending = plan(plugin, current)
+    assert plugin.runtime_patch_for_submitted_prompt(pending.prompt) is None
+    assert "duplex_append_text_token_ids" not in pending.prompt["model_intermediate_buffer"]["duplex"]["runtime_config"]
+    list(plane.project_output({"data_plane_request_id": "request", **boundary}))
+    ready = plan(plugin, current)
+    assert plugin.runtime_patch_for_submitted_prompt(ready.prompt) is not None
+    plane.close_request("request")
+    assert plane.backend_ready("request")
+
+
 def test_cancel_discards_queued_results_without_reusing_generation(plugin):
     current = result(plugin, {})
     retired = plugin.retire_pending_function_output(DuplexSessionConfig(model="venus"), current)

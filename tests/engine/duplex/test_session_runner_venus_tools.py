@@ -7,7 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.engine.duplex.test_session_runner import append_audio, close_harness, open_harness, tts_output, types
+from tests.engine.duplex.test_session_runner import (
+    append_audio,
+    close_harness,
+    listen_output,
+    open_harness,
+    tts_output,
+    types,
+)
 from tests.engine.duplex.test_session_runner_nemotron_voicechat import answer, error_codes
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallState
@@ -71,6 +78,9 @@ async def test_result_reaches_one_append_and_duplicate_cannot_replay_it():
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.PENDING
         assert error_codes(await answer(h, call_id, "42")) == []
         await h.run(append_audio())
+        assert not any(submitted_results(h))  # The delegate turn is still speaking.
+        await h.deliver_and_settle(listen_output(h.stage0_request_id()), stage_id=0, segment_finished=True)
+        await h.run(append_audio())
         assert submitted_results(h).count(list(b"<backend>42</backend>")) == 1
         assert h.session.runtime_config["venus_function_results"] == []
         assert error_codes(await answer(h, call_id, "WRONG")) == ["invalid_function_call_output"]
@@ -97,5 +107,6 @@ async def test_rejected_result_can_be_corrected():
         assert error_codes(await answer(h, call_id, "x" * 4001)) == ["invalid_function_call_output"]
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.PENDING
         assert error_codes(await answer(h, call_id, "42")) == []
+        await h.deliver_and_settle(listen_output(h.stage0_request_id()), stage_id=0, segment_finished=True)
         await h.run(append_audio())
         assert submitted_results(h).count(list(b"<backend>42</backend>")) == 1

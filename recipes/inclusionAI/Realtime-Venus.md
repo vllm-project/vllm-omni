@@ -179,7 +179,8 @@ remains in text output and is excluded from speech.
 
 The application executes the task and returns a `function_call_output` with
 the matching `call_id`. The server wraps the result in `<backend>...</backend>`
-and appends it after the next input unit's media, in the same Thinker KV cache.
+and waits for the foreground turn to end or return to listening. The next input
+unit then carries it after the media, in the same Thinker KV cache.
 The model can then speak the answer. Input continues while the tool runs;
 no `response.create` is needed. The server also schedules a silence continuation
 when a result arrives. Applications should keep streaming input or silence so

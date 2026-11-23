@@ -1834,8 +1834,10 @@ repeat suppression and interruption policy. MiniCPM-o continues to advertise
 `tool_mode: none`.
 
 Accepted Venus results are tokenized as `<backend>result</backend>` into a
-bounded private runtime queue. The next append reserves their exact token count
-and feeds them after that unit's media in the existing Thinker KV. They also
+bounded private runtime queue. Results wait for a projected turn-end or listen
+boundary; closing a delegate span alone does not end the foreground turn.
+The next append reserves their exact token count and feeds them after that
+unit's media in the existing Thinker KV. They also
 belong to the unit's sliding-window history and reopen the speech gate after a
 completed turn. Ownership transfers to the stage only on successful submission;
 the commit removes only the submitted generations, retaining newer arrivals.
