@@ -181,6 +181,26 @@ def _configure_official_gemma4_rope_compatibility() -> None:
     )
 
 
+def _official_proportional_rope_parameters(
+    config: Gemma4UnifiedTextConfig,
+    device: torch.device | None = None,
+    seq_len: int | None = None,
+    layer_type: str | None = None,
+    head_dim_key: str = "head_dim",
+) -> tuple[torch.Tensor, float]:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
+
+    if (
+        isinstance(config, Gemma4UnifiedTextConfig)
+        and layer_type == "full_attention"
+        and head_dim_key == "global_head_dim"
+    ):
+        # Transformers now exposes the full-attention width as the layer's head_dim.
+        head_dim_key = "head_dim"
+    return ROPE_INIT_FUNCTIONS["proportional"](config, device, seq_len, layer_type, head_dim_key)
+
+
 def _configure_official_vocoder_determinism() -> None:
     """Make the pinned official LTX-2.5 vocoder a stable reference."""
     from ltx_core.model.audio_vae.vocoder import VocoderWithBWE
@@ -300,7 +320,13 @@ def _prepare_official_runtime(args: argparse.Namespace) -> None:
     if args.official_root is None:
         raise ValueError("Official backend requires --official-root")
     _insert_official_paths(args.official_root)
+    from ltx_core.text_encoders.gemma.encoders import encoder_configurator
+
     _configure_official_gemma4_rope_compatibility()
+    encoder_configurator.ROPE_INIT_FUNCTIONS = {
+        **encoder_configurator.ROPE_INIT_FUNCTIONS,
+        "proportional": _official_proportional_rope_parameters,
+    }
     _configure_official_vocoder_determinism()
     # Keep Gemma on the same SDPA path in both subprocesses. DiT attention is
     # still pinned independently to the explicit cuDNN backend below.

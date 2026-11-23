@@ -213,6 +213,29 @@ def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pyt
     assert Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters is installed
 
 
+def test_ltx_reference_runner_preserves_full_attention_rope_width() -> None:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedTextRotaryEmbedding
+
+    from .run_ltx25_reference import _official_proportional_rope_parameters
+
+    config = Gemma4UnifiedTextConfig(
+        hidden_size=3840,
+        num_attention_heads=16,
+        num_hidden_layers=2,
+        layer_types=["sliding_attention", "full_attention"],
+        global_head_dim=512,
+    )
+    rotary = Gemma4UnifiedTextRotaryEmbedding(config)
+    inv_freq, scaling = _official_proportional_rope_parameters(
+        config, layer_type="full_attention", head_dim_key="global_head_dim"
+    )
+
+    assert inv_freq.shape == (256,)
+    torch.testing.assert_close(inv_freq, rotary.full_attention_inv_freq)
+    assert scaling == rotary.full_attention_attention_scaling
+
+
 def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
     from .run_ltx25_reference import _connector_weight_files
 
