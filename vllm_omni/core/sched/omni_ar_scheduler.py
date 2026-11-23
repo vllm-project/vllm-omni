@@ -2856,8 +2856,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.finished_req_ids.add(request_id)
 
         if self._dtps is not None:
+            is_ar_only = self._dtps.request_is_ar_only(request)
             self._dtps.evict_request(request_id)
-            if not self._dtps.request_is_ar_only(request):
+            if not is_ar_only and request.status != RequestStatus.FINISHED_ABORTED:
                 self._dtps.register_finished_downstream(request_id)
 
         if (

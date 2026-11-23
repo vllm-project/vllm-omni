@@ -846,7 +846,11 @@ class OrchestratorBase:
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
-                if self._dit_load_aware and self._dit_load_state is not None and msg.stage_id in {p["dit_stage_id"] for p in self._dtps_pairs}:
+                if (
+                    self._dit_load_aware
+                    and self._dit_load_state is not None
+                    and msg.stage_id in {p["dit_stage_id"] for p in self._dtps_pairs}
+                ):
                     pool = self.stage_pools[msg.stage_id]
                     if pool.stage_type == "diffusion":
                         replica_id = pool.get_replica_id_by_addr(msg.input_addr)
@@ -1538,14 +1542,6 @@ class OrchestratorBase:
                     # evicted rather than tearing down every stage (#4285).
                     try:
                         if pool.stage_type == "diffusion":
-                            diffusion_output = pool.poll_diffusion_output(replica_id)
-                            if diffusion_output is None:
-                                continue
-
-                            if self._absorb_diffusion_metrics(stage_id, replica_id, diffusion_output):
-                                idle = False
-                                continue
-
                             if self._dit_load_aware and stage_id in {p["dit_stage_id"] for p in self._dtps_pairs}:
                                 try:
                                     await self._poll_dit_load_throttled(
@@ -1560,6 +1556,15 @@ class OrchestratorBase:
                                         replica_id,
                                         exc_info=True,
                                     )
+
+                            diffusion_output = pool.poll_diffusion_output(replica_id)
+                            if diffusion_output is None:
+                                continue
+
+                            if self._absorb_diffusion_metrics(stage_id, replica_id, diffusion_output):
+                                idle = False
+                                continue
+
                             if not is_diffusion_request_started_output(diffusion_output):
                                 diffusion_output = await pool.process_diffusion_output(diffusion_output)
                                 pool.record_output_timestamps([diffusion_output])
