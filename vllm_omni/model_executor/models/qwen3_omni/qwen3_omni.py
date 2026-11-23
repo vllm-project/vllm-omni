@@ -43,6 +43,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
@@ -75,6 +76,7 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, 
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -85,12 +87,33 @@ if TYPE_CHECKING:
 # first key would silently switch the default to a different (female) voice.
 DEFAULT_SPEAKER = "ethan"
 
+# Keep the residual-codebook RNG independent from codebook 0 when both are
+# derived from the Talker stage seed. The value is the ASCII tag ``QWEN3MTP``.
+_QWEN3_OMNI_MTP_SEED_DOMAIN = 0x5157_454E_334D_5450
+_TORCH_SEED_MASK = 0x7FFF_FFFF_FFFF_FFFF
+
 
 def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
     """Return the speaker key used for requests that do not name one."""
     if DEFAULT_SPEAKER in speaker_token_ids:
         return DEFAULT_SPEAKER
     return next(iter(speaker_token_ids))
+
+
+def get_qwen3_omni_mtp_seed(sampling_params: SamplingParams | None) -> int | None:
+    """Resolve the request-local RNG seed for residual codec codebooks.
+
+    ``tts_local_seed`` is already an explicit model-local stream selector and
+    therefore takes precedence. Otherwise the Talker stage seed, which owns
+    codebook 0 sampling, is domain-separated before it seeds codebooks 1..N.
+    """
+    local_seed = get_tts_local_seed(sampling_params)
+    if local_seed is not None:
+        return local_seed
+    stage_seed = getattr(sampling_params, "seed", None) if sampling_params is not None else None
+    if stage_seed is None:
+        return None
+    return (int(stage_seed) ^ _QWEN3_OMNI_MTP_SEED_DOMAIN) & _TORCH_SEED_MASK
 
 
 # Special token IDs for Qwen3 Omni MoE
@@ -204,6 +227,9 @@ class Qwen3OmniMoeForConditionalGeneration(
     eager_frames_active = False
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False
+    # Residual codebooks must not consume the process-global RNG: otherwise
+    # identical seeded Talker requests diverge with batch order or scheduling.
+    get_mtp_seed = staticmethod(get_qwen3_omni_mtp_seed)
 
     def create_omni_model_state(
         self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
@@ -363,11 +389,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             # Codebook 0 uses V1's per-request CUDA generator (see
-            # Qwen3OmniTalkerSampler). Residual codebooks draw inside talker_mtp,
-            # which is also what V1 captures: replay advances Philox, so each
-            # step gets a fresh stream. An external uniform buffer is a different
-            # stream and, together with MRv2's murmur3 codebook-0 sampler, raises
-            # Seed-TTS word error by about 0.4 percentage points.
+            # Qwen3OmniTalkerSampler). Residual codebooks receive their own
+            # request-local generator through get_mtp_seed. Keep the external
+            # uniform buffer disabled: explicit generators bypass the outer MTP
+            # graph while the predictor's inner graphs remain available, and
+            # switching to whole-span uniforms would change the sampling stream.
             self.mtp_sample_uniforms = False
             self.mrv2_custom_sampler = mrv2_talker_sampler
             self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)

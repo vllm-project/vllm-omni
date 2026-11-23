@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from vllm.config.compilation import CUDAGraphMode
@@ -906,6 +907,16 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         finally:
             narrow.restore()
 
+    def _set_lora_inputs(self, input_batch: InputBatch) -> None:
+        """Activate the step's adapters: one adapter id per scheduled token and one per logits row."""
+        lora_inputs = self.lora_state.make_lora_inputs(
+            input_batch.req_ids,
+            input_batch.idx_mapping_np,
+            input_batch.num_scheduled_tokens,
+            np.diff(input_batch.cu_num_logits_np),
+        )
+        self._set_active_loras(*lora_inputs)
+
     @torch.inference_mode()
     @staged_writes.runner_context
     def execute_model(
@@ -1028,12 +1039,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             )
 
             if self.lora_config:
-                lora_inputs = self.lora_state.make_lora_inputs(
-                    input_batch.req_ids,
-                    input_batch.idx_mapping_np,
-                    input_batch.num_scheduled_tokens,
-                )
-                self._set_active_loras(*lora_inputs)
+                self._set_lora_inputs(input_batch)
             # Encode vision and audio before language-model attention metadata.
             # A long video's ViT FlashAttention workspace and the prefill's FA3
             # scheduler workspace do not fit together; V1 runs the encoder first.
@@ -1314,6 +1320,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        lifecycle_hook = getattr(type(self.model_state), "get_request_lifecycle", None)
+        lifecycle = lifecycle_hook(self.model_state, scheduler_output) if lifecycle_hook is not None else None
+        if lifecycle is not None and lifecycle.reset_req_ids:
+            # Keep scheduler-owned completion metadata unchanged. Only the
+            # worker resets the old phase before add_requests admits its reuse.
+            scheduler_output = replace(
+                scheduler_output,
+                finished_req_ids=scheduler_output.finished_req_ids | lifecycle.reset_req_ids,
+            )
         # IMPORTANT: Must query req_id_to_index BEFORE super().finish_requests()
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
@@ -1342,3 +1357,6 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        if lifecycle is not None:
+            for req_id in sorted(lifecycle.release_req_ids - all_done):
+                self._remove_request(req_id)

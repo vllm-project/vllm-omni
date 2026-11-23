@@ -73,6 +73,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
+
 
 def _pathway_quant_config(
     components: dict[str, QuantizationConfig | None],
@@ -240,6 +242,22 @@ def _validate_mixed_precision_runtime(
             raise ValueError("Cosmos3 mixed precision with HSDP does not support CPU offload")
 
 
+def _validate_moe_mixed_precision_runtime(od_config: OmniDiffusionConfig) -> None:
+    # Routed experts switch precision through a per-object quant_method.apply
+    # override, which these features bypass or replace without notice.
+    if getattr(od_config, "lora_path", None):
+        raise ValueError(
+            "Cosmos3 mixed precision on routed experts does not support LoRA "
+            "because the LoRA MoE wrapper replaces the expert quant method"
+        )
+    cache_backend = getattr(od_config, "cache_backend", None)
+    if cache_backend not in (None, "none"):
+        raise ValueError(
+            "Cosmos3 mixed precision on routed experts does not support Cache-DiT "
+            f"or other step caches (cache_backend={cache_backend!r})"
+        )
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -330,12 +348,19 @@ def compute_mrope_position_ids_vision(
     base_temporal_compression_factor: int | None = None,
     enable_fps_modulation: bool = True,
     start_frame_offset: int = 0,
+    temporal_position_period: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
     Creates a (t, h, w) position grid with spatial indices reset per segment
-    (Qwen3VL-style). Flattened in t-major order.
+    (Qwen3VL-style). Flattened in t-major order. When
+    ``temporal_position_period`` is set, camera-major frame indexes wrap at
+    that period before optional FPS scaling so corresponding views align.
     """
+    if temporal_position_period is not None and temporal_position_period <= 0:
+        raise ValueError(f"Cosmos3 temporal_position_period must be positive, got {temporal_position_period}.")
+    if fps is not None and (not math.isfinite(fps) or fps <= 0):
+        raise ValueError(f"Cosmos3 vision FPS must be finite and positive, got {fps!r}.")
     fps_modulation = enable_fps_modulation and fps is not None
 
     if fps_modulation:
@@ -347,6 +372,8 @@ def compute_mrope_position_ids_vision(
         )
         base_tps = base_fps / effective_base_tcf
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
             ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
@@ -354,10 +381,11 @@ def compute_mrope_position_ids_vision(
             .flatten()
         )
     else:
+        frame_indices = torch.arange(grid_t, dtype=torch.long)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
-            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
-            + int(temporal_offset)
-            + start_frame_offset
+            frame_indices.view(-1, 1).expand(-1, grid_h * grid_w).flatten() + int(temporal_offset) + start_frame_offset
         )
 
     h_index = torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -490,6 +518,22 @@ def _apply_rotary_pos_emb(
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def _broadcast_und_kv(
+    cached_kv: list[tuple[torch.Tensor, torch.Tensor]],
+    batch_size: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Expand batch-1 UND K/V to the GEN batch as views; return other caches unchanged.
+
+    T2I ``num_outputs_per_prompt > 1`` encodes the shared prompt once, so
+    the cache stays batch 1 while the GEN pathway runs ``batch_size`` latents.
+    """
+    if batch_size == 1 or not cached_kv or cached_kv[0][0].shape[0] != 1:
+        return cached_kv
+    return [
+        (key.expand(batch_size, *key.shape[1:]), value.expand(batch_size, *value.shape[1:])) for key, value in cached_kv
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +885,18 @@ class Cosmos3CrossAttention(nn.Module):
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
 
+    def _forward_multiview(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        multiview_layout: Any,
+    ) -> torch.Tensor:
+        del q, k, v, k_und, v_und, multiview_layout
+        raise TypeError("The base Cosmos3 transformer does not support multiview attention layouts.")
+
     def _forward_multi_control(
         self,
         q: torch.Tensor,
@@ -907,12 +963,14 @@ class Cosmos3CrossAttention(nn.Module):
         freqs_sin: torch.Tensor,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [B, S_gen_local, hidden_size] (may be sequence-sharded)
-            k_und: [B, S_und, H_kv_local, D] pre-computed UND keys (TP-sharded, post-norm/RoPE)
-            v_und: [B, S_und, H_kv_local, D] pre-computed UND values (TP-sharded)
+            k_und: [B, S_und, H_kv_local, D] pre-computed UND keys (TP-sharded, post-norm/RoPE);
+                may be a batch-1 cache expanded to B as a view
+            v_und: [B, S_und, H_kv_local, D] pre-computed UND values (TP-sharded); same as k_und
             freqs_cos: [B, S_gen_local, 1, D]
             freqs_sin: [B, S_gen_local, 1, D]
         """
@@ -930,7 +988,11 @@ class Cosmos3CrossAttention(nn.Module):
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if control_token_sizes is not None or control_weights is not None:
+        if multiview_layout is not None:
+            if control_token_sizes is not None or control_weights is not None:
+                raise ValueError("Cosmos3 multiview attention cannot use the multi-control attention path.")
+            out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
+        elif control_token_sizes is not None or control_weights is not None:
             if control_token_sizes is None or control_weights is None:
                 raise ValueError("Cosmos3 multi-control attention requires both control token sizes and weights.")
             out = self._forward_multi_control(
@@ -1067,6 +1129,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         if cached_kv is not None:
             if self.layer_idx is None:
@@ -1088,6 +1151,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=freqs_sin,
             control_token_sizes=control_token_sizes,
             control_weights=control_weights,
+            multiview_layout=multiview_layout,
         )
         hidden_states = self._add_residual(hidden_states, residual)
 
@@ -1547,6 +1611,8 @@ class Cosmos3VFMTransformer(nn.Module):
         if mixed_precision_config is not None:
             self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
             self.mixed_precision_runtime.install(self)
+            if self.mixed_precision_runtime.has_routed_experts:
+                _validate_moe_mixed_precision_runtime(od_config)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps) if is_pp_last_rank else PPMissingLayer()
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
@@ -2007,6 +2073,7 @@ class Cosmos3VFMTransformer(nn.Module):
         gather_output: bool = True,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """Run the shared GEN stack, including sequence parallelism and cache-dit wrappers.
 
@@ -2019,12 +2086,16 @@ class Cosmos3VFMTransformer(nn.Module):
         # joint_key/value for Ulysses head-slicing in the attention backend.
         if self.cached_kv is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        # A local view: the stored cache (CFG branches, session state, PP
+        # transport) stays batch 1.
+        und_kv = _broadcast_und_kv(self.cached_kv, hidden_gen.shape[0])
         if freqs_gen is None:
             hidden_gen, freqs_gen = self._shard_gen_inputs(hidden_gen)
         freqs_cos, freqs_sin = freqs_gen
         layer_kwargs = {
             "control_token_sizes": control_token_sizes,
             "control_weights": control_weights,
+            "multiview_layout": multiview_layout,
         }
         if len(self.gen_layers) == len(self.cached_kv):
             # Under PP, gen_layers carries make_layers' PPMissingLayer padding so
@@ -2033,10 +2104,10 @@ class Cosmos3VFMTransformer(nn.Module):
             # e.g. by tests or cache wrappers).
             if _pp_parallel_active():
                 own_layers = self.gen_layers[self.start_layer : self.end_layer]
-                own_kv = self.cached_kv[self.start_layer : self.end_layer]
+                own_kv = und_kv[self.start_layer : self.end_layer]
             else:
                 own_layers = self.gen_layers
-                own_kv = self.cached_kv
+                own_kv = und_kv
             for layer, (k_und, v_und) in zip(own_layers, own_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,
