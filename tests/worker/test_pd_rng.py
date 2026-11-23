@@ -291,3 +291,45 @@ def test_schedule_wrapper_transfers_rng_to_worker(monkeypatch, scheduler_cls):
     consumer = runner._create_request_generator(data)
     assert torch.equal(consumer.get_state(), producer.get_state())
     assert _sample(consumer, [first]) == _sample(producer, [first])
+
+
+def test_worker_generator_rejects_continuation_longer_than_y1(monkeypatch):
+    """GPU: a preempted PD request that advanced past its y1 anchor cannot be
+    recreated from the initial producer state (torch-vanilla generators have no
+    usable Philox offset). NPU covers the >y1 case via offset advance instead."""
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
+    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+    runner.device = torch.device("cpu")
+    p = torch.Generator().manual_seed(7)
+    first = _sample(p, [])
+    # RNG export is defined for the single-y1 anchor, so capture [first] only.
+    anchor_state = _capture(_producer(p, [first]), [first])["req"]
+    # D continued sampling past y1 before a preemption; re-admission carries a
+    # longer output history than the anchor, which the vanilla generator cannot
+    # resume deterministically.
+    data = SimpleNamespace(
+        req_id="req",
+        sampling_params=_params(seed=7),
+        initial_output_token_ids=[first, 13],
+        pd_rng_state=anchor_state,
+    )
+    with pytest.raises(ValueError, match="Cannot recreate a PD generator from its initial state"):
+        runner._create_request_generator(data)
+
+
+def test_worker_generator_restores_after_y1_with_exact_state(monkeypatch):
+    """GPU: the single-token (y1) anchor restores the exact producer stream."""
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
+    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+    runner.device = torch.device("cpu")
+    p = torch.Generator().manual_seed(11)
+    first = _sample(p, [])
+    data = SimpleNamespace(
+        req_id="req",
+        sampling_params=_params(seed=11),
+        initial_output_token_ids=[first],
+        pd_rng_state=_capture(_producer(p, [first]), [first])["req"],
+    )
+    d = runner._create_request_generator(data)
+    assert torch.equal(d.get_state(), p.get_state())
+    assert _sample(d, [first]) == _sample(p, [first])

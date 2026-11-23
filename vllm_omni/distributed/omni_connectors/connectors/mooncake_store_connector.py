@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import time
 from typing import Any
@@ -62,7 +62,7 @@ class MooncakeStoreConnector(OmniConnectorBase):
                 raise RuntimeError(f"Mooncake setup failed: {rc}")
 
             self.pin = ReplicateConfig()
-            self.pin.with_soft_pin = True
+            # mooncake-transfer-engine 0.3.14 removed with_soft_pin; default is fine.
             logger.info("MooncakeStoreConnector initialized successfully")
         except Exception as e:
             logger.error("Failed to initialize Mooncake store: %s", e)
@@ -195,4 +195,5 @@ class MooncakeStoreConnector(OmniConnectorBase):
                 self.store = None
                 logger.info("MooncakeStoreConnector closed")
             except Exception as e:
-                logger.error("Error closing Mooncake store: %s", e)
+                if logger is not None:  # module may be unloaded during interpreter shutdown
+                    logger.error("Error closing Mooncake store: %s", e)

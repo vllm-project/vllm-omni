@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -32,8 +33,8 @@ from vllm_omni.core.sched.utils import (
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.pd_continuation import (
-    PD_PREFILL_KEY,
     PD_RNG_STATE_KEY,
+    is_pd_prefill_params,
     needs_pd_rng_state,
     prepend_initial_output,
 )
@@ -218,7 +219,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return
         params = request.sampling_params
         is_pd_resume = getattr(request, "pd_continuation", None) is not None
-        is_pd_prefill = params is not None and (getattr(params, "extra_args", None) or {}).get(PD_PREFILL_KEY)
+        is_pd_prefill = params is not None and not is_pd_resume and is_pd_prefill_params(params)
+        # Y3: a PD continuation already has its prompt KV delivered
+        # by the worker-layer pipeline (pd_kv_y3), so the scheduler must treat
+        # the whole prompt as computed and skip re-prefill.
+        if is_pd_resume:
+            request.num_computed_tokens = request.pd_continuation.prompt_len
+            logging.getLogger("vllm_omni.hy3_pdkv").debug(
+                "pd_kv sched num_computed set req=%s nc=%d", request.request_id, request.num_computed_tokens
+            )
         if is_pd_resume or is_pd_prefill:
             parallel = self.vllm_config.parallel_config
             # P's one-sample budget is enforced when its output arrives, so
@@ -246,7 +255,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _update_request_with_output(self, request: Request, new_token_ids: list[int], *args, **kwargs):
         token_ids, stopped = super()._update_request_with_output(request, new_token_ids, *args, **kwargs)
         params = request.sampling_params
-        if params is not None and (getattr(params, "extra_args", None) or {}).get(PD_PREFILL_KEY) and token_ids:
+        if (
+            params is not None
+            and getattr(request, "pd_continuation", None) is None
+            and is_pd_prefill_params(params)
+            and token_ids
+        ):
             # This is an execution boundary, not the user's logical stop rule.
             # Keep the actual first-token sampler masks, but satisfy Mooncake's
             # length-finished contract so it retains the prompt blocks for D.
@@ -266,7 +280,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         if not any(getattr(req, "pd_continuation", None) is not None for req in self.requests.values()):
             return
-        queues = (self.waiting, self.skipped_waiting)
+        _skipped_waiting = getattr(self, "skipped_waiting", None)
+        queues = (self.waiting,) if _skipped_waiting is None else (self.waiting, _skipped_waiting)
         seen = set()
         for queue in queues:
             for request in list(queue):
@@ -330,6 +345,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         continuation = getattr(request, "pd_continuation", None)
         if continuation is not None and request.request_id in self.failed_recving_kv_req_ids:
             raise RuntimeError("PD continuation prompt KV load failed; cannot resume with incomplete KV")
+        # [P0 fix] Gate is enforced at the worker layer, not here:
+        # npu_ar_model_runner writes the received prompt KV into kv_caches
+        # (per-request once, D-side block table only) on the first decode
+        # forward, retrying until success, so a continuation request must NOT
+        # block here on the AscendStore recv signal. We still hard-fail on
+        # producer-side send failures (failed_recving_kv_req_ids above).
+        if continuation is not None:
+            self.finished_recving_kv_req_ids.add(request.request_id)
+            logging.getLogger("vllm_omni.hy3_pdkv").debug(
+                "pd_kv sched release pd_continuation req=%s nc=%s", request.request_id, request.num_computed_tokens
+            )
         result = super()._update_waiting_for_remote_kv(request)
         if continuation is not None and request.num_computed_tokens != continuation.prompt_len:
             raise RuntimeError("PD continuation expected complete prompt KV, without tail recomputation")
@@ -1120,7 +1146,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
-
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
             async_output_is_stale = bool(generated_token_ids and stale_async_tokens > 0)
             if async_output_is_stale:
@@ -1442,7 +1467,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     params = request.sampling_params
                     if (
                         params is not None
-                        and (getattr(params, "extra_args", None) or {}).get(PD_PREFILL_KEY)
+                        and getattr(request, "pd_continuation", None) is None
+                        and is_pd_prefill_params(params)
                         and needs_pd_rng_state(params)
                     ):
                         rng_state = (getattr(model_runner_output, "pd_rng_states", None) or {}).get(req_id)

@@ -47,6 +47,9 @@ class _StubRequest:
         self.client_index = 0
         self.stop_reason = None
         self.trace_headers = None
+        # vLLM 0.32 Request surface that OmniScheduler mixins read.
+        self.sampling_params = None
+        self.pd_continuation = None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

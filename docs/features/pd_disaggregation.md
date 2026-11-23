@@ -11,7 +11,10 @@
 Use `vllm_omni/deploy/hunyuan_image_3_moe_pd.yaml` for AR prefill (P, stage 0),
 AR decode (D, stage 1), and DiT (stage 2). The NPU layout uses four devices per
 stage: 0–3, 4–7, and 8–11. P and D use MooncakeConnector for prompt KV transfer;
-D and DiT use SharedMemoryConnector on the same host. The non-PD counterpart is
+D and DiT use SharedMemoryConnector on the same host. A shared-memory-only
+variant (no Mooncake master/service required), which is the primary template
+shipped with this change, is `vllm_omni/deploy/hunyuan_image_3_moe_pd_mc.yaml`.
+The non-PD counterpart is
 `vllm_omni/deploy/hunyuan_image_3_moe.yaml`.
 
 The decode configuration enables `extra_args.pd_resume_from_prefill`. P samples
@@ -28,8 +31,9 @@ of D's effective parameters after request overrides. For random sampling,
 `temperature > 0` requires a fixed seed. After accepting its first token, P
 exports each TP rank's request generator state; D restores the corresponding
 rank's state before sampling the second token. The configured seed must match
-the handoff state and does not replace it. The default AR seed is 42, and an
-explicit request seed (including 0) overrides it in both PD and non-PD modes.
+the handoff state and does not replace it. PD deployments set the default AR
+seed to 42 in their yaml; non-PD deployments do not set a default seed unless
+a platform overlay or an explicit request seed (including 0) supplies one.
 
 P requires `async_scheduling: false`; D supports synchronous or asynchronous
 scheduling. Continuation supports one completion (`n=1`), matching TP layouts
@@ -53,18 +57,18 @@ Qwen3-Omni pipeline.
 flowchart LR
     client["Client request"] --> orchestrator["Omni Orchestrator"]
     orchestrator -->|"original prompt<br/>max_tokens = 1"| prefill["Thinker prefill<br/>KV producer"]
+    prefill -->|"first token + per-rank RNG state"| orchestrator
     prefill -->|"KV blocks"| connector[("vLLM KV connector")]
-    prefill -->|"KV routing metadata"| orchestrator
-    orchestrator -->|"original prompt<br/>remote KV parameters"| decode["Thinker decode<br/>KV consumer"]
-    connector -->|"remote KV load"| decode
+    orchestrator -->|"continuation (transfer_id)<br/>prompt + first token"| decode["Thinker decode<br/>KV consumer"]
+    connector -->|"shared KV load"| decode
     decode -->|"generated text"| client
 ```
 
 The orchestrator owns the request lifecycle, while the vLLM KV connector owns
-the bulk KV transfer. The original prompt is submitted to both Thinker stages:
-the decode worker still needs the request tokens and multimodal features to
-construct its request, while the imported KV cache prevents it from repeating
-the completed prefill computation.
+the bulk KV transfer. P samples the first token and stops; the orchestrator
+hands off the shared prompt KV (identified by `transfer_id`) together with the
+sample to D, which resumes generation after importing the KV cache without
+recomputing the finished prefill.
 
 For the full Qwen3-Omni pipeline, splitting the Thinker adds one logical stage:
 
@@ -88,9 +92,11 @@ output of Code2Wav.
    `kv_transfer_params`. This makes prefill finish by length after exporting KV.
 3. When prefill finishes, the orchestrator captures its KV routing metadata and
    Qwen multimodal output under the original request ID.
-4. The orchestrator submits the original prompt to decode with consumer-side
-   `kv_transfer_params`. Those parameters identify the transfer, prefill engine,
-   bootstrap endpoint, and, when required by the connector, remote request.
+4. The orchestrator rebuilds the decode input from the processed prefill
+   request (prompt tokens and multimodal fields captured at stage 0) and
+   submits it to decode with consumer-side `kv_transfer_params`. Those
+   parameters identify the transfer, prefill engine, bootstrap endpoint, and,
+   when required by the connector, remote request.
 5. The decode engine imports the KV cache and continues generation. The normal
    Omni stage path then carries Thinker conditioning through Talker and
    Code2Wav.
@@ -102,7 +108,7 @@ not interchangeable.
 
 | Path | Payload | Owner |
 | --- | --- | --- |
-| PD control path | Request ID, original prompt, `transfer_id`, bootstrap address, engine ID, and connector-specific request metadata | Omni Orchestrator |
+| PD control path | Request ID, processed prefill request fields, `transfer_id`, bootstrap address, engine ID, and connector-specific request metadata | Omni Orchestrator |
 | PD data path | Thinker attention KV blocks | vLLM KV connector |
 | Downstream model path | Thinker hidden states and embeddings, Talker codec codes, and audio tensors | vLLM-Omni stage connectors and processors |
 
@@ -131,7 +137,7 @@ fails during engine initialization.
 | Prefill-to-decode routing | Implemented in the current Orchestrator |
 | Deploy-based configuration | Not yet migrated; the supported `stages:` deploy schema cannot currently expand Qwen3-Omni into the four-stage PD topology |
 | Qwen3 Thinker-to-Talker handoff | Bridge state and embedding-merge helpers exist, but the merge is not wired into the live stage processor |
-| Connector compatibility | Incomplete; the Orchestrator currently requires `remote_request_id`, while the pinned Mooncake connector completes prefill without returning that metadata |
+| Connector compatibility | The Orchestrator requires a `transfer_id` for continuation; `remote_engine_id`/`remote_bootstrap_addr` are needed only for native vLLM KV connectors (Mooncake/AscendStore) |
 | Validation coverage | PD entrypoint tests and the PD deploy overlay in online end-to-end tests are temporarily disabled during migration |
 | Performance | No non-regression or throughput/latency result is established for the current path |
 

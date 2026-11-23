@@ -595,6 +595,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
             if needs_pd_rng_state(sampling_params):
                 if len(new_req_data.initial_output_token_ids) != 1:
+                    # torch-vanilla generators have no usable offset to resume a
+                    # pure stream; NPU covers this case in
+                    # npu_ar_model_runner via Philox offset advance.
                     raise ValueError("Cannot recreate a PD generator from its initial state after further decode")
                 tp = get_tp_group()
                 restore_pd_rng_state(

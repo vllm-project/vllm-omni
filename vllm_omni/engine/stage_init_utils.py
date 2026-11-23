@@ -551,7 +551,10 @@ def inject_omni_kv_connector_config(
     omni_kv = engine_args_dict.get("omni_kv_config") or {}
     if not isinstance(omni_kv, dict):
         omni_kv = dict(omni_kv)
-    omni_kv["connector_config"] = omni_conn_cfg
+    # A connector_config written explicitly in the deploy yaml wins;
+    # only fall back to the resolved edge spec when the yaml did not pick one.
+    # This lets P->D use MooncakeConnector while D->DiT keeps shared memory.
+    omni_kv.setdefault("connector_config", omni_conn_cfg)
     omni_kv["omni_from_stage"] = omni_from
     omni_kv["omni_to_stage"] = omni_to
     omni_kv.setdefault("stage_id", stage_id)

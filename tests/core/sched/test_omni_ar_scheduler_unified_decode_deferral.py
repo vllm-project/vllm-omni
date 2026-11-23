@@ -81,6 +81,7 @@ def _make_scheduler(
     sched.vllm_config = SimpleNamespace(model_config=model_config)
     # Upstream ``Scheduler.__init__`` always creates ``kv_holding_waiting``; the
     # abort sweep at the top of ``schedule()`` reads it.
+    sched.requests = {}
     sched.kv_holding_waiting = _MockQueue()
     sched.deferred_waiting = set()
     return sched

@@ -192,10 +192,15 @@ class PDDisaggregationMixin:
         d_stage = self.stage_configs[d_id]
 
         def _get_kv_cfg(stage: Any) -> dict[str, Any]:
-            ea = stage.engine_args
-            cfg = getattr(ea, "kv_transfer_config", None)
+            ea = getattr(stage, "engine_args", None)
+            cfg = getattr(ea, "kv_transfer_config", None) if ea is not None else None
+            if cfg is None and ea is not None and hasattr(ea, "get"):
+                cfg = ea.get("kv_transfer_config", None)
             if cfg is None:
-                cfg = ea.get("kv_transfer_config", None) if hasattr(ea, "get") else None
+                # New stage-config schema carries native kv_transfer_config on
+                # connector_config (legacy schema used engine_args / a plain dict).
+                connector_config = getattr(stage, "connector_config", None)
+                cfg = getattr(connector_config, "kv_transfer_config", None)
             if cfg is None:
                 raise ValueError(f"Stage-{stage.stage_id} is marked for PD but has no 'kv_transfer_config'")
             cfg_dict = self._kv_cfg_to_dict(cfg)
@@ -203,8 +208,14 @@ class PDDisaggregationMixin:
                 raise ValueError(f"Stage-{stage.stage_id} kv_transfer_config could not be parsed")
             return cfg_dict
 
-        p_cfg = _get_kv_cfg(p_stage)
-        d_cfg = _get_kv_cfg(d_stage)
+        try:
+            p_cfg = _get_kv_cfg(p_stage)
+            d_cfg = _get_kv_cfg(d_stage)
+        except ValueError:
+            # PD pair exists but the KV plane is carried by omni_kv_config with
+            # per-edge connectors (e.g. MooncakeConnector for P->D, SharedMemory
+            # for D->DiT): no native kv_transfer_config to validate against.
+            return
 
         p_role = p_cfg.get("kv_role")
         d_role = d_cfg.get("kv_role")

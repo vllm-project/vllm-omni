@@ -766,19 +766,32 @@ class StageRuntime:
                 roles[plan.stage_id] = config.get("kv_role") if isinstance(config, Mapping) else config.kv_role
         if not roles:
             return
-        if (
-            self._async_chunk
-            or len(plans) != 2
-            or roles != {0: "kv_producer", 1: "kv_consumer"}
-            or plans[0].replicas[0].metadata.stage_type != "llm"
-            or plans[1].replicas[0].metadata.stage_type != "diffusion"
-            or list(plans[1].replicas[0].metadata.engine_input_source or []) != [0]
-        ):
-            raise ValueError(
-                "Native AR-to-DiT KV transfer currently supports only a two-stage "
-                "0 (kv_producer) -> 1 (diffusion kv_consumer, engine_input_source=[0]) "
-                "pipeline with async_chunk=False"
+        # Native Mooncake roles describe an AR->DiT KV graph. Two shapes are
+        # supported:
+        #   A) classic AR->DiT: 0 (llm kv_producer) -> 1 (diffusion
+        #      kv_consumer, engine_input_source=[0]);
+        #   B) HunyuanImage-3.0 PD: 0 (llm kv_producer) -> 1 (llm kv_consumer)
+        #      forms the P->D Mooncake pair, and D -> DiT (stage 2) goes over
+        #      Omni SharedMemory (no native role). Both must be async_chunk-
+        #      free. Anything else is rejected before Workers launch.
+        stages = [plan.replicas[0].metadata.stage_type for plan in plans]
+        if roles == {0: "kv_producer", 1: "kv_consumer"}:
+            two_plan_native = (
+                len(plans) == 2
+                and stages[0] == "llm"
+                and stages[1] == "diffusion"
+                and list(plans[1].replicas[0].metadata.engine_input_source or []) == [0]
             )
+            pd_three_plan = len(plans) == 3 and stages[0] == "llm" and stages[1] == "llm" and stages[2] == "diffusion"
+            if not self._async_chunk and (two_plan_native or pd_three_plan):
+                return
+        raise ValueError(
+            "Native AR-to-DiT KV transfer supports either a two-stage "
+            "0 (kv_producer) -> 1 (diffusion kv_consumer, engine_input_source=[0]) "
+            "pipeline, or the HunyuanImage-3.0 PD shape "
+            "0 (kv_producer) -> 1 (kv_consumer) -> 2 (diffusion); "
+            "both require async_chunk=False"
+        )
 
     @staticmethod
     def _prepare_replica_stage_config(

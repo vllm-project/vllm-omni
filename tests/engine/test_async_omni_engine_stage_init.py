@@ -2820,6 +2820,10 @@ def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, 
     [
         (["kv_producer", "kv_consumer"], [0], False, True),
         (["kv_producer", "kv_consumer"], [0], True, False),
+        # HunyuanImage-3.0 PD: P (0) -> D (1) over Mooncake, D -> DiT (2) Omni.
+        (["kv_producer", "kv_consumer", None], [0], False, True),
+        (["kv_producer", "kv_consumer", None], [0], True, False),
+        (["kv_producer", "kv_consumer", "kv_consumer"], [0], False, False),
         ([None, "kv_consumer"], [0], False, False),
         (["kv_producer", None], [0], False, False),
         ([None, "kv_producer", "kv_consumer"], [1], False, False),

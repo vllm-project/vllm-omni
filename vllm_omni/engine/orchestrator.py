@@ -264,6 +264,7 @@ def _update_stale_request_metadata(
         # Written raw so the request's other tensors are not decoded.
         request.additional_information.entries[RETURN_STAGE_PAYLOAD_KEY] = return_stage_payload_entry
 
+
 def _pd_decode_input_from_prefill_prompt(prefill_prompt: Any) -> tuple[dict[str, Any], list | None]:
     """Extract the processed stage-0 request fields needed by a PD decode."""
     if isinstance(prefill_prompt, dict):
@@ -386,6 +387,22 @@ class StreamingInputState:
         """
         segment = self.segments.get(stage_id) if stage_id is not None else None
         return segment if segment is not None else StreamingSegmentState()
+
+
+def _apply_pd_sampling_intent(sp, extra_args):
+    """Apply client sampling intent carried in extra_args.
+
+    The images protocol has no top-level ``temperature`` field; the client
+    signals random sampling via ``extra_params['temperature']``. Propagate it
+    onto the P (prefill) and rebuilt D (decode) sampling params so the
+    first-token draw and the continuation stream use the intended temperature.
+    """
+    raw_temperature = (extra_args or {}).get("temperature")
+    if raw_temperature is not None and getattr(sp, "temperature", None) == 0:
+        try:
+            sp.temperature = float(raw_temperature)
+        except Exception:
+            pass
 
 
 class OrchestratorBase:
@@ -2774,9 +2791,11 @@ class OrchestratorBase:
         if not decode_kv_params.get("transfer_id"):
             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
 
-        missing = [
-            key for key in ("remote_engine_id", "remote_bootstrap_addr", "transfer_id") if not decode_kv_params.get(key)
-        ]
+        # omni KV channel (SharedMemory) keys the handoff by
+        # transfer_id alone; remote_engine_id / remote_bootstrap_addr are only
+        # meaningful for the native KVConnector (Mooncake/AscendStore) channel.
+        # Do not hard-fail when the deploy config does not declare them.
+        missing = [key for key in ("transfer_id",) if not decode_kv_params.get(key)]
         if missing:
             raise RuntimeError(
                 f"[Orchestrator][PD] Missing decode kv_transfer_params fields for req={req_id}: {', '.join(missing)}"
@@ -3037,7 +3056,9 @@ class OrchestratorBase:
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
             if req_state.pd_prefill_prompt is None:
                 raise RuntimeError(f"[Orchestrator][PD] Missing processed prefill prompt for req={req_id}")
+            _apply_pd_sampling_intent(params, (params.extra_args or {}))
             params = self._build_pd_decode_params(req_id, params, req_state.pd_prefill_prompt)
+            _apply_pd_sampling_intent(params, (params.extra_args or {}))
             pd_decode_prompt, pd_decode_mm_features = _pd_decode_input_from_prefill_prompt(req_state.pd_prefill_prompt)
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,

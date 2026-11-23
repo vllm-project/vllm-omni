@@ -17,7 +17,7 @@ from transformers import CLIPModel, CLIPProcessor
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
 from vllm_omni.config.omni_config import (
     VllmOmniARStageConfig,
@@ -32,15 +32,7 @@ from vllm_omni.platforms import current_omni_platform
 PROMPT = "A brown and white dog is running on the grass"
 MODEL_NAME = os.environ.get("HUNYUAN_IMAGE3_MODEL", "tencent/HunyuanImage-3.0-Instruct")
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
-_PRODUCTION_DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image_3_moe.yaml")
-# Keep the production Mooncake connector, but use its TCP transport for this
-# single-host test.  The shared server's RDMA device is not usable reliably;
-# TCP still exercises the Mooncake AR→DiT data plane without changing deploy
-# semantics in production.
-DEPLOY_CONFIG_PATH = modify_stage_config(
-    _PRODUCTION_DEPLOY_CONFIG_PATH,
-    updates={"connectors.rdma_connector.extra.protocol": "tcp"},
-)
+DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image_3_moe.yaml")
 
 pytestmark = [
     pytest.mark.advanced_model,
@@ -322,14 +314,14 @@ def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
     assert ar_stage.model_stage == "AR"
     assert ar_stage.final_output_type == "text"
     assert ar_stage.runtime_config.devices == "0,1"
-    assert ar_stage.connector_config.output_connectors == {"to_stage_1": "rdma_connector"}
+    assert ar_stage.connector_config.output_connectors == {"to_stage_1": "shared_memory_connector"}
     assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
     assert diffusion_stage.stage_id == 1
     assert diffusion_stage.model_stage == "dit"
     assert diffusion_stage.final_output_type == "image"
     assert diffusion_stage.input_sources == [0]
     assert diffusion_stage.runtime_config.devices == "2,3"
-    assert diffusion_stage.connector_config.input_connectors == {"from_stage_0": "rdma_connector"}
+    assert diffusion_stage.connector_config.input_connectors == {"from_stage_0": "shared_memory_connector"}
 
     # Stage 0 is materialized as the VllmConfig actually passed to its engine.
     ar_vllm_config, diffusion_vllm_config = engine.stage_vllm_configs

@@ -213,6 +213,7 @@ def test_generate_watermarking_opt_out_disables_every_stage():
         assert not diffusion_params.watermarking
         assert pooling_params is defaults[2]
         assert (defaults[0].watermarking, defaults[1].watermarking) == (None, None)
+
     asyncio.run(run())
 
 
@@ -232,7 +233,7 @@ def test_generate_propagates_bare_sampling_params_to_pd_decode():
         omni.engine.stage_configs = [SimpleNamespace(stage_id=i) for i in range(3)]
         omni.sampling_constraints_list = [{}, {}, {}]
         omni._pd_separation_pair = (0, 1)
-        decode_default = SamplingParams(max_tokens=8192, temperature=0.9)
+        decode_default = SamplingParams(max_tokens=8192, temperature=0.9, extra_args={"pd_resume_from_prefill": True})
         diffusion_default = SimpleNamespace(num_inference_steps=50)
         omni.default_sampling_params_list = [
             SamplingParams(max_tokens=8192),
@@ -253,11 +254,15 @@ def test_generate_propagates_bare_sampling_params_to_pd_decode():
         prefill_params, decode_params, diffusion_params = submitted_params[0]
         assert prefill_params is not user_params
         assert prefill_params.max_tokens == 1
-        assert decode_params is user_params
+        assert decode_params is not user_params
         assert decode_params.max_tokens == 64
         assert decode_params.temperature == 0.2
+        # The yaml PD contract must survive the bare-param propagation.
+        assert decode_params.extra_args.get("pd_resume_from_prefill") is True
+        assert (user_params.extra_args or {}).get("pd_resume_from_prefill") is not True
         assert diffusion_params is diffusion_default
         assert decode_default.max_tokens == 8192
+
     asyncio.run(run())
 
 

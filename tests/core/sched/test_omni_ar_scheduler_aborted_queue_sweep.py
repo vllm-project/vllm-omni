@@ -56,6 +56,7 @@ def _make_scheduler(policy: SchedulingPolicy, *, waiting=(), kv_holding_waiting=
     for req in waiting:
         scheduler.waiting.add_request(req)
     scheduler.kv_holding_waiting = create_request_queue(policy)
+    scheduler.requests = {}
     scheduler.deferred_waiting = set()
     for req in kv_holding_waiting:
         scheduler.kv_holding_waiting.add_request(req)

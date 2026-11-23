@@ -739,6 +739,34 @@ def test_hunyuan_image3_build_ar_stage_inputs_t2i_string_fallback() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_pd_names_decode_stage() -> None:
+    """PD disaggregation splits the AR stage: the builder must name the Decode
+    stage too, or the shared offline scripts would never apply the Hunyuan
+    stop ids to D (leaving Decode to run to max_tokens, see review item 7)."""
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    ar = build_ar_stage_inputs(
+        prompt="a red panda",
+        tokenizer=None,
+        extra_body={"bot_task": "recaption"},
+        num_images=0,
+        height=1024,
+        width=1024,
+        pd_decode_stage_index=1,
+    )
+    # Both P (prefill, stage 0) and D (decode, stage 1) receive the stop ids.
+    assert ar.stage_indices == [0, 1]
+    # Non-PD callers keep the original contract.
+    assert build_ar_stage_inputs(
+        prompt="a red panda",
+        tokenizer=None,
+        extra_body={"bot_task": "recaption"},
+        num_images=0,
+    ).stage_indices == [0]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_hunyuan_image3_build_ar_stage_inputs_t2i_tokenizer_parity() -> None:
     from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens
     from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs

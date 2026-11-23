@@ -455,6 +455,23 @@ def parse_args() -> argparse.Namespace:
     return build_parser().parse_args()
 
 
+def _pd_decode_stage_index(engine) -> int | None:
+    """Return the Decode stage index when engine is PD-disaggregated, else None.
+
+    Detecting the pair here (instead of inside _apply_ar_stage_inputs) keeps
+    the example model-agnostic: only engines that actually split the AR stage
+    (P -> D) report a pair, and only then do the shared scripts name the
+    Decode stage for Hunyuan stop ids.
+    """
+    get_pair = getattr(engine, "_get_pd_separation_pair", None)
+    pair = get_pair() if callable(get_pair) else getattr(engine, "_pd_separation_pair", None)
+    if pair is None:
+        return None
+    # pair = (prefill_stage_id, decode_stage_id); the decode stage is the
+    # target of the AR stop tokens (prefill stops after one sample).
+    return pair[1]
+
+
 def _apply_ar_stage_inputs(
     ar_input_builder: Any,
     *,
@@ -470,6 +487,7 @@ def _apply_ar_stage_inputs(
     trust_remote_code: bool = False,
     validate_tokenizer: Any | None = None,
     allow_tokenizer_fallback: bool = False,
+    pd_decode_stage_index: int | None = None,
 ) -> None:
     """Apply a model's declared AR-stage inputs to the request in place.
 
@@ -519,6 +537,7 @@ def _apply_ar_stage_inputs(
         height=height,
         width=width,
         text_output=text_output,
+        pd_decode_stage_index=pd_decode_stage_index,
     )
 
     if ar_inputs.prompt_token_ids is not None:
@@ -813,6 +832,7 @@ def main():
             trust_remote_code=args.trust_remote_code,
             validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
             allow_tokenizer_fallback=args.allow_tokenizer_fallback,
+            pd_decode_stage_index=_pd_decode_stage_index(omni),
         )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)

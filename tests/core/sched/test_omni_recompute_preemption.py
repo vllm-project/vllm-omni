@@ -39,6 +39,7 @@ def _scheduler(mode="fail", requires_kv_delivery=False, auxiliary=False, block_s
         supports_multimodal_inputs=False,
         return_sampling_mask=False,
         recompute_preemption=mode,
+        enforce_eager=False,
     )
     config.scheduler_config = SchedulerConfig(
         max_model_len=64,

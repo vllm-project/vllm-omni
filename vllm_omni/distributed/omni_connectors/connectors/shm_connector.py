@@ -330,7 +330,6 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._pending_keys.pop(key, None)
             try:
                 self._unlink_segment(self._shm_name(key))
-                logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
                 unlinked = True
             except FileNotFoundError:
                 pass

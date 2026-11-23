@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
@@ -130,6 +130,10 @@ class OmniKVCacheConfig:
     """Configuration for OmniKVTransferManager."""
 
     connector_config: dict[str, Any] | None = None
+    # Per-edge send connector: when set, the send path (to_stage edge)
+    # uses this connector while the receive path (from_stage edge) keeps using
+    # connector_config. Enables e.g. Mooncake P->D + SharedMemory D->DiT in one stage.
+    send_connector_config: dict[str, Any] | None = None
     from_stage: str | None = None
     to_stage: str | None = None
     stage_id: str | int | None = None
@@ -359,6 +363,7 @@ class OmniKVTransferManager:
     def __init__(self, config: OmniKVCacheConfig, *, async_prefetch: bool = False):
         self.config = config
         self._connector = None
+        self._send_connector = None
 
         # Pre-calculate send stages (from_stage, to_stage)
         self.send_stages = (
@@ -452,6 +457,7 @@ class OmniKVTransferManager:
         return cls(
             OmniKVCacheConfig(
                 connector_config=cfg.get("connector_config"),
+                send_connector_config=cfg.get("send_connector_config"),
                 from_stage=cfg.get("omni_from_stage"),
                 to_stage=cfg.get("omni_to_stage"),
                 stage_id=cfg.get("stage_id"),
@@ -552,7 +558,7 @@ class OmniKVTransferManager:
                             replica_id=replica_id,
                         )
 
-                        if self.config.need_send_cache:
+                        if self.config.need_send_cache and not self.config.send_connector_config:
                             c_extra["role"] = "sender"
                             c_extra["zmq_port"] = zmq_port
                         elif self.config.need_recv_cache:
@@ -585,6 +591,45 @@ class OmniKVTransferManager:
         return self._connector if self._connector else None
 
     get_connector = property(lambda self: self.connector)
+
+    @property
+    def send_connector(self):
+        """Lazy connector used by the send (to_stage) edge.
+
+        Falls back to connector when no explicit per-edge send connector
+        is configured, preserving the historic single-connector behaviour.
+        """
+        if self._send_connector is False:
+            return None
+
+        if self._send_connector is None:
+            cfg = self.config.send_connector_config or self.config.connector_config
+            if cfg and (c_type := cfg.get("type")):
+                try:
+                    c_extra = {k: v for k, v in cfg.items() if k != "type"}
+                    c_extra["role"] = "sender"
+                    if c_type in TRANSFER_ENGINE_CONNECTOR_NAMES:
+                        c_extra["from_stage"] = str(self.config.from_stage or "0")
+                        c_extra["to_stage"] = str(self.config.to_stage or "1")
+                        if self.config.need_recv_cache:
+                            c_extra.pop("zmq_port", None)
+                    logger.info(
+                        "Initializing OmniConnector type=%s role=sender (explicit send connector) "
+                        "send_cfg=%s recv_cfg=%s",
+                        c_type,
+                        self.config.send_connector_config,
+                        self.config.connector_config,
+                    )
+                    self._send_connector = OmniConnectorFactory.create_connector(
+                        ConnectorSpec(name=c_type, extra=c_extra)
+                    )
+                except Exception:
+                    logger.exception("Failed to initialize send OmniConnector")
+                    self._send_connector = False
+            else:
+                self._send_connector = False
+
+        return self._send_connector if self._send_connector else None
 
     def _build_topo_config(self) -> _TransferTopoConfig:
         """Build the parallel topology snapshot (called once at init)."""
@@ -1160,7 +1205,6 @@ class OmniKVTransferManager:
 
         serialization_ms = (time.perf_counter() - serialization_start) * 1000
         logger.info("KV cache serialized for %s in %.1f ms", transfer_req_id, serialization_ms)
-
         transfer_start = time.perf_counter()
         total_size = 0
         all_succeeded = True
@@ -1206,7 +1250,8 @@ class OmniKVTransferManager:
         """
         for attempt in range(max_retries):
             try:
-                success, size, metadata = self.connector.put(
+                sender = self.send_connector or self.connector
+                success, size, metadata = sender.put(
                     from_stage=from_stage, to_stage=to_stage, put_key=put_key, data=data
                 )
                 if success:
@@ -1459,7 +1504,6 @@ class OmniKVTransferManager:
             to_stage,
             len(recv_key_pairs),
         )
-
         try:
             while True:
                 link_start = time.perf_counter()

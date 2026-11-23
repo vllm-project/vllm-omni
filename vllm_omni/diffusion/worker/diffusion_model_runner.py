@@ -680,7 +680,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
         req.kv_recv_ms = kv_recv_ms
         logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
-
         # Kick off the next request's prefetch (+ H2D) to overlap this forward.
         if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_job is not None:
             self.kv_transfer_manager.start_prefetch(kv_prefetch_job, self._target_device)
@@ -810,7 +809,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     kv_prefetch_job=kv_prefetch_job,
                     use_prefetch=allow_single_output,
                 )
-
             self._refresh_cache_for_requests(reqs, od_config=od_config)
 
             batch = DiffusionRequestBatch(requests=reqs)

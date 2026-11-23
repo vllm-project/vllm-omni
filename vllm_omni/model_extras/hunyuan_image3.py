@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -60,9 +60,11 @@ class ARStageInputs:
     scripts apply them by explicit index, not by scanning for "whichever
     stage isn't a diffusion stage." HunyuanImage-3.0's topology always puts
     its single AR stage at index 0 (see
-    ``vllm_omni.model_executor.models.hunyuan_image3.pipeline``); a future
-    model with multiple AR/understanding stages would declare its own
-    indices here instead of relying on type-based inference.
+    ``vllm_omni.model_executor.models.hunyuan_image3.pipeline``); under PD
+    disaggregation the decode half of the split AR stage is the target, and
+    ``build_ar_stage_inputs`` accepts a ``pd_decode_stage_index`` for that
+    case. A future model with multiple AR/understanding stages would declare
+    its own indices here instead of relying on type-based inference.
     """
 
     prompt: str | None
@@ -82,6 +84,7 @@ def build_ar_stage_inputs(
     height: int | None = None,
     width: int | None = None,
     text_output: bool = False,
+    pd_decode_stage_index: int | None = None,
 ) -> ARStageInputs:
     """Resolve HunyuanImage-3.0 AR-stage inputs declaratively.
 
@@ -134,8 +137,12 @@ def build_ar_stage_inputs(
         use_system_prompt=resolved.system_prompt_type,
         stop_token_ids=resolved.stop_token_ids,
         # HunyuanImage-3.0's AR stage is always stage 0 (see pipeline.py's
-        # HUNYUAN_IMAGE3_PIPELINE / _AR_PIPELINE topologies).
-        stage_indices=[0],
+        # HUNYUAN_IMAGE3_PIPELINE / _AR_PIPELINE topologies). Under PD
+        # disaggregation the prefill half stops after one sample, so the
+        # Decode stage (pd_decode_stage_index) is the actual target of the
+        # stop tokens; name it explicitly so the shared offline scripts apply
+        # them there too.
+        stage_indices=[0] if pd_decode_stage_index is None else [0, pd_decode_stage_index],
     )
 
 

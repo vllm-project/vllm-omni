@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
 from collections.abc import Mapping
 from copy import copy
@@ -20,6 +21,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import logger
+from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import (
@@ -115,6 +117,7 @@ class ExecuteModelState(NamedTuple):
     # Omni: prefix-cache step id; its context must be consumed exactly
     # once (materialize or discard_step) in sample_tokens.
     prefix_cache_step_id: int | None = None
+
 
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
@@ -349,6 +352,43 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         super().initialize_kv_cache(*args, **kwargs)
         validate_duplex_kv_cache(self)
 
+
+    def _create_request_generator(self, new_req_data):
+        """Initialize a new worker request; existing requests retain their RNG.
+
+        PD D-side continuation requests restore the producer RNG state captured
+        on P (mirrors worker/gpu_model_runner.py). NPU port.
+        """
+        sampling_params = new_req_data.sampling_params
+        if sampling_params is None or sampling_params.sampling_type != SamplingType.RANDOM_SEED:
+            return None
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(sampling_params.seed)
+        if getattr(new_req_data, "initial_output_token_ids", None):
+            from vllm.distributed.parallel_state import get_tp_group
+
+            from vllm_omni.engine.pd_continuation import needs_pd_rng_state
+            from vllm_omni.worker.pd_rng import restore_pd_rng_state
+
+            if needs_pd_rng_state(sampling_params):
+                # NPU RNG is a pure Philox(seed, offset) stream. A recomputed D
+                # request (preemption recovery) can skip tokens already sampled
+                # from the y1 anchor instead of raising: the
+                # anchor export offset points at the next draw, so advancing it
+                # by the sampled prefix reproduces the original stream.
+                consumed_tokens = len(new_req_data.initial_output_token_ids)
+                tp = get_tp_group()
+                restore_pd_rng_state(
+                    generator,
+                    getattr(new_req_data, "pd_rng_state", None),
+                    seed=sampling_params.seed,
+                    tp_rank=tp.rank_in_group,
+                    tp_size=tp.world_size,
+                    req_id=new_req_data.req_id,
+                    consumed_tokens=consumed_tokens,
+                )
+        return generator
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
@@ -487,6 +527,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if cached is not None:
             return cached
         final_stage_id = self._request_final_stage_id(req_id)
+        if final_stage_id is None:
+            # Conservative default while the marker is missing: keep the
+            # payload, but do NOT memoize - the marker arrives via
+            # model_intermediate_buffer, which may be unpopulated on the first
+            # call (memoizing here pinned the request forever). Matches the
+            # GPU runner.
+            return True
         current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
         needs_payload = request_needs_downstream_stage(final_stage_id, current_stage_id)
         self._downstream_payload_cache[req_id] = needs_payload
@@ -554,6 +601,22 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        # Y3: producer defers the actual send until after this step's
+        # forward (P's prefill KV is written during the forward; sending before it
+        # ships a zero/empty payload).
+        # PD role from omni_kv_config (pure-config); env kept as fallback.
+        _km_cfg = getattr(getattr(self, "kv_transfer_manager", None), "config", None)
+        _omni_send = bool(getattr(_km_cfg, "need_send_cache", False)) if _km_cfg is not None else False
+        _omni_recv = bool(getattr(_km_cfg, "need_recv_cache", False)) if _km_cfg is not None else False
+        _is_pd_prefill_producer = _omni_send and str(getattr(_km_cfg, "to_stage", "") or "") == "1"
+        _is_pd_consumer = bool(_omni_recv)
+        _env_role = os.getenv("HY3_PDKV_ROLE", "")
+        if not _is_pd_prefill_producer and _env_role == "producer":
+            _is_pd_prefill_producer = True
+        if not _is_pd_consumer and _env_role == "consumer":
+            _is_pd_consumer = True
+        if _is_pd_prefill_producer:
+            self._pd_deferred_finished = dict(finished_reqs)
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
             for req_id, data in finished_reqs.items():
                 try:
@@ -571,13 +634,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         data["custom_metadata"] = existing
                 except Exception as e:
                     logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
-        self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=finished_reqs,
-            kv_caches=self.kv_caches,
-            block_size=self.cache_config.block_size,
-            cache_dtype=str(self.cache_config.cache_dtype),
-            request_id_resolver=self._resolve_global_request_id,
-        )
+        if not _is_pd_prefill_producer:
+            self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
+                finished_reqs=finished_reqs,
+                kv_caches=self.kv_caches,
+                block_size=self.cache_config.block_size,
+                cache_dtype=str(self.cache_config.cache_dtype),
+                request_id_resolver=self._resolve_global_request_id,
+            )
         #  -------------------------------------- Omni-new -------------------------------------------------
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
@@ -610,6 +674,23 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         self._begin_omni_aux_output_step(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # Y3: producer sends the real (already-written by a previous
+        # prefill step) KV for finished requests here, before any early return.
+        # Deferred send below is required for PD resume with SHM KV.
+        try:
+            _fin = getattr(self, "_pd_deferred_finished", None)
+            if _is_pd_prefill_producer and _fin:
+                self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
+                    finished_reqs=_fin,
+                    kv_caches=self.kv_caches,
+                    block_size=self.cache_config.block_size,
+                    cache_dtype=str(self.cache_config.cache_dtype),
+                    request_id_resolver=self._resolve_global_request_id,
+                )
+                self._pd_deferred_finished = None
+        except Exception as e7:  # noqa: BLE001
+            logging.getLogger("vllm_omni.hy3_pdkv").warning(
+                "pd_kv deferred send err: %s %s", type(e7).__name__, e7)
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -853,6 +934,128 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
+        # D-side omni recv+apply (need_recv_cache), inlined (no instrument hook).
+        # PD P->D KV: P publishes (deferred send above); D pulls here via the
+        # omni kv_transfer_manager and writes all 32 layers back into kv_caches
+        # before the first decode forward.
+        # [P0 fix] per-request once semantics (persistent applied set, per-request
+        # error isolation, no whole-batch rollback), D-side block table only
+        # (never fall back to P-side block ids; unsafe rows are deferred and
+        # retried), and explicit .clone() so decode never aliases a mooncake
+        # recv buffer that a later request may overwrite.
+        try:
+            if _is_pd_consumer:
+                _km = getattr(self, "kv_transfer_manager", None)
+                _kvc = getattr(self, "kv_caches", None)
+                _ib = getattr(self, "input_batch", None)
+                if not hasattr(self, "_pd_applied_reqs"):
+                    self._pd_applied_reqs = set()
+                if _km is not None and _kvc and _ib is not None and _ib.num_reqs:
+                    _resolver = getattr(self, "_resolve_global_request_id", None)
+                    _req_ids = list(_ib.req_ids)
+                    _ri_map = getattr(_ib, "req_id_to_index", None) or {}
+                    _max_blk = _kvc[0][0].shape[0] if (_kvc and len(_kvc) > 0 and len(_kvc[0]) > 0) else -1
+                    for _r in _req_ids:
+                        _gid = _resolver(_r) if callable(_resolver) else _r
+                        if _gid in self._pd_applied_reqs:
+                            continue
+                        # Resolve D-side block row by request id (no index-order assumption).
+                        _drow = None
+                        try:
+                            _ri = _ri_map.get(_r) if hasattr(_ri_map, "get") else _ri_map.get(_r)
+                            if _ri is None:
+                                _ri = _req_ids.index(_r)
+                            _mg = getattr(_ib, "block_table", None)
+                            if _mg is not None and hasattr(_mg, "block_tables") and _mg.block_tables:
+                                _gt = _mg.block_tables[0]
+                                _row_np = _gt.block_table.np[_ri]
+                                _n = int(_gt.num_blocks_per_row[_ri])
+                                _drow = [int(x) for x in _row_np[:_n]]
+                        except Exception as e_bt:
+                            logging.getLogger("vllm_omni.hy3_pdkv").warning(
+                                "pd_kv mgrow err req=%s %s", _gid, type(e_bt).__name__)
+                            _drow = None
+                        try:
+                            _rc = _km.receive_kv_cache_for_request(
+                                _gid, target_device=getattr(self, "device", None)
+                            )
+                            if isinstance(_rc, tuple):
+                                _data, _rcsz = _rc
+                            else:
+                                _data, _rcsz = _rc, 0
+                        except Exception as e_r:
+                            logging.getLogger("vllm_omni.hy3_pdkv").warning(
+                                "pd_kv recv exc req=%s %s", _gid, e_r)
+                            _df = getattr(self, "_pd_kv_defer", {})
+                            _df[_gid] = _df.get(_gid, 0) + 1
+                            self._pd_kv_defer = _df
+                            if _df[_gid] >= 3:
+                                raise RuntimeError(f"PD KV receive failed repeatedly for {_gid}")
+                            continue
+                        if not _data or not isinstance(_data, dict) or "layer_blocks" not in _data:
+                            _df = getattr(self, "_pd_kv_defer", {})
+                            _df[_gid] = _df.get(_gid, 0) + 1
+                            self._pd_kv_defer = _df
+                            if _df[_gid] >= 3:
+                                raise RuntimeError(f"PD KV unavailable for {_gid} after 3 attempts")
+                            continue
+                        _lbs = _data.get("layer_blocks") or {}
+                        _nb = len(_data.get("block_ids") or [])
+                        # D-side logical block table only; never fall back to P-side block ids.
+                        if _drow is None or len(_drow) < _nb:
+                            logging.getLogger("vllm_omni.hy3_pdkv").warning(
+                                "pd_kv dst unsafe req=%s nb=%d drow=%s -> defer",
+                                _gid, _nb, _drow)
+                            _df = getattr(self, "_pd_kv_defer", {})
+                            _df[_gid] = _df.get(_gid, 0) + 1
+                            self._pd_kv_defer = _df
+                            if _df[_gid] >= 3:
+                                raise RuntimeError(f"PD KV dst unavailable for {_gid} after 3 attempts")
+                            continue
+                        _dst = [int(x) for x in _drow[:_nb]]
+                        if _max_blk >= 0 and any(b >= _max_blk for b in _dst):
+                            logging.getLogger("vllm_omni.hy3_pdkv").warning(
+                                "pd_kv dst oob req=%s dst=%s max=%d -> defer",
+                                _gid, _dst, _max_blk)
+                            _df = getattr(self, "_pd_kv_defer", {})
+                            _df[_gid] = _df.get(_gid, 0) + 1
+                            self._pd_kv_defer = _df
+                            if _df[_gid] >= 3:
+                                raise RuntimeError(f"PD KV dst OOB for {_gid} after 3 attempts")
+                            continue
+                        _dev = getattr(self, "device", None) or torch.device("npu")
+                        _bs = self.cache_config.block_size
+                        _ok = True
+                        for _l in range(len(_kvc)):
+                            _k = _lbs.get("key_cache", [None] * len(_kvc))[_l]
+                            _v = _lbs.get("value_cache", [None] * len(_kvc))[_l]
+                            if _k is None or _v is None:
+                                _ok = False
+                                break
+                            try:
+                                _aa = _k.to(_dev, _kvc[_l][0].dtype).clone()
+                                _bb = _v.to(_dev, _kvc[_l][1].dtype).clone()
+                            except Exception as e_c:
+                                logging.getLogger("vllm_omni.hy3_pdkv").warning(
+                                    "pd_kv copy err req=%s l=%d %s", _gid, _l, e_c)
+                                _ok = False
+                                break
+                            if _aa.ndim == 3:
+                                # payload layer block is [prompt_len, tail...]; pad to a
+                                # multiple of block_size, then pack into [nb, bs, tail...].
+                                _tail = tuple(_aa.shape[1:])
+                                _pad = (-_aa.shape[0]) % _bs
+                                if _pad:
+                                    _aa = torch.cat([_aa, _aa.new_zeros(_pad, *_tail)], dim=0)
+                                    _bb = torch.cat([_bb, _bb.new_zeros(_pad, *_tail)], dim=0)
+                                _aa = _aa.reshape(-1, _bs, *_tail)
+                                _bb = _bb.reshape(-1, _bs, *_tail)
+                            _kvc[_l][0][_dst] = _aa
+                            _kvc[_l][1][_dst] = _bb
+                        if _ok:
+                            self._pd_applied_reqs.add(_gid)
+        except Exception as e:
+            logging.getLogger("vllm_omni.hy3_pdkv").warning("pd_kv recv err: %s %s", type(e).__name__, e)
         # Run forward pass
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output

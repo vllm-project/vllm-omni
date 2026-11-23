@@ -268,10 +268,17 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     default[0] = sampling_params
                     pd_pair = self._get_pd_separation_pair()
                     if pd_pair is not None and pd_pair[0] == 0:
-                        # A bare SamplingParams describes logical stage 0. Mirror it
-                        # to Decode when that AR stage is split, which also prepares
-                        # the public generate/completions path for pure AR PD pipelines.
-                        default[pd_pair[1]] = sampling_params
+                        # A bare SamplingParams describes logical stage 0. Mirror a
+                        # *clone* into Decode when that AR stage is split, keeping the
+                        # yaml-level PD contract (pd_resume_from_prefill, seed, ...)
+                        # instead of discarding it.
+                        decode_params = sampling_params.clone()
+                        merged_extra = dict(decode_params.extra_args or {})
+                        for key, value in (default[pd_pair[1]].extra_args or {}).items():
+                            merged_extra.setdefault(key, value)
+                        if merged_extra:
+                            decode_params.extra_args = merged_extra
+                        default[pd_pair[1]] = decode_params
                     sampling_params_list = default
 
             # Expand sampling params for PD disaggregation (user may provide N-1 params)

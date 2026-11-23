@@ -2125,6 +2125,7 @@ class HunyuanImage3Pipeline(
         state.scheduler = req_scheduler
         cfg_factor = request_layout_utils.hunyuan_cfg_factor(image_info, guidance_scale)
         state.do_true_cfg = cfg_factor > 1
+        _ar_kv_snap = self._snapshot_injected_ar_kv()
         state.extra = {
             _STEP_MODEL_KWARGS: model_kwargs,
             _STEP_INPUT_IDS: input_ids,
@@ -2133,7 +2134,7 @@ class HunyuanImage3Pipeline(
             _STEP_CFG_FACTOR: cfg_factor,
             _STEP_OUTPUT_SIZE: (target_height, target_width),
             _STEP_COT_TEXT_LIST: cot_text_list,
-            _STEP_AR_KV: self._snapshot_injected_ar_kv(),
+            _STEP_AR_KV: _ar_kv_snap,
         }
         return state
 

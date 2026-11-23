@@ -984,9 +984,12 @@ def _scoped_replica_compile_cache_env(stage_id: int | None, replica_id: int | No
 def _get_stage_runtime_cfg(stage_config: Any) -> Any:
     if stage_config is None:
         return None
+    # Structured stages carry runtime overrides (devices/env/...) under
+    # ``runtime_config``; fall back to the legacy ``runtime`` key so spawned
+    # EngineCore processes inherit VLLM_HOST_IP / VLLM_MOONCAKE_BOOTSTRAP_PORT.
     if hasattr(stage_config, "get"):
-        return stage_config.get("runtime")
-    return getattr(stage_config, "runtime", None)
+        return stage_config.get("runtime_config") or stage_config.get("runtime")
+    return getattr(stage_config, "runtime_config", None) or getattr(stage_config, "runtime", None)
 
 
 @contextlib.contextmanager

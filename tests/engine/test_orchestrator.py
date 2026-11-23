@@ -695,7 +695,10 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
             request_id="req-llm",
             prompt=request,
             original_prompt={"prompt": "hello"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -1099,7 +1102,10 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
             request_id="req-bypass",
             prompt=raw_prompt,
             original_prompt=raw_prompt,
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
             entry_stage_id=1,
             lora_request=lora,
@@ -1241,7 +1247,10 @@ async def test_pd_decode_replays_processed_prefill_prompt(orchestrator_factory) 
             request_id="req-pd-replay",
             prompt=processed_prompt,
             original_prompt=original_prompt,
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stage0.add_request_calls) == 1)
@@ -1253,12 +1262,15 @@ async def test_pd_decode_replays_processed_prefill_prompt(orchestrator_factory) 
         await orchestrator._forward_to_next_stage_unguarded(
             "req-pd-replay",
             0,
-            SimpleNamespace(request_id="req-pd-replay"),
+            _build_request_output("req-pd-replay", token_ids=[1], finished=True, finish_reason="length"),
             req_state,
         )
 
         assert len(stage1.add_request_calls) == 1
         decode_request = stage1.add_request_calls[0][0]
+        assert decode_request.pd_continuation is not None, "PD resume contract must be established"
+        assert decode_request.pd_continuation.token_ids == [1]
+        assert decode_request.pd_continuation.prompt_len == 3
         assert decode_request.prompt_token_ids == [101, 102, 103]
         assert decode_request.mm_features == ["processed-image-features"]
         assert decode_request.cache_salt == "processed-cache-salt"
@@ -1318,8 +1330,11 @@ async def test_run_hunyuan_image3_pd_prefill_decode_to_diffusion(orchestrator_fa
 
     stage2.custom_process_input_func = ar2diffusion_bridge
     processors = [
-        # MooncakeConnector.request_finished() currently returns no metadata.
-        FakeOutputProcessor(request_outputs=[_build_request_output("req-hy-pd", token_ids=[1], finished=True)]),
+        # The PD producer must finish by length so PDContinuation.from_output
+        # accepts the handoff (end-to-end resume contract).
+        FakeOutputProcessor(
+            request_outputs=[_build_request_output("req-hy-pd", token_ids=[1], finished=True, finish_reason="length")]
+        ),
         FakeOutputProcessor(request_outputs=[_build_request_output("req-hy-pd", token_ids=[201, 202], finished=True)]),
         FakeOutputProcessor(),
     ]
@@ -1358,7 +1373,11 @@ async def test_run_hunyuan_image3_pd_prefill_decode_to_diffusion(orchestrator_fa
             request_id="req-hy-pd",
             prompt=processed_prompt,
             original_prompt=original_prompt,
-            sampling_params_list=[_sampling_params(1), _sampling_params(), diffusion_params],
+            sampling_params_list=[
+                _sampling_params(1),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+                diffusion_params,
+            ],
             final_stage_id=2,
         )
         await _wait_for(lambda: len(stage0.add_request_calls) == 1)
@@ -1367,6 +1386,9 @@ async def test_run_hunyuan_image3_pd_prefill_decode_to_diffusion(orchestrator_fa
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
 
         decode_request = stage1.add_request_calls[0][0]
+        assert decode_request.pd_continuation is not None, "PD resume contract must be established"
+        assert decode_request.pd_continuation.token_ids == [1]
+        assert decode_request.pd_continuation.prompt_len == 3
         assert decode_request.prompt_token_ids == [101, 102, 103]
         assert decode_request.mm_features == ["processed-image-features"]
         assert decode_request.model_intermediate_buffer == {"mrope_position_delta": 7}
@@ -1739,7 +1761,10 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
             request_id="req-async",
             prompt=request,
             original_prompt={"prompt": "hello async"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -1785,7 +1810,10 @@ async def test_async_chunk_raw_terminal_without_processed_output_finishes_reques
             request_id=request.request_id,
             prompt=request,
             original_prompt={"prompt": "stream audio"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -1834,7 +1862,10 @@ async def test_async_chunk_data_then_raw_terminal_finishes_once(orchestrator_fac
             request_id=request_id,
             prompt=request,
             original_prompt={"prompt": "stream audio"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -1888,7 +1919,10 @@ async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orc
             request_id=request_id,
             prompt=request,
             original_prompt={"prompt": "stream audio"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -1935,7 +1969,10 @@ async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orches
             request_id=request_id,
             prompt=request,
             original_prompt={"prompt": "stream audio"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -2039,7 +2076,10 @@ async def test_async_chunk_raw_terminal_length_keeps_empty_fallback(orchestrator
             request_id=request_id,
             prompt=request,
             original_prompt={"prompt": "stream audio"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -2083,7 +2123,10 @@ async def test_async_chunk_non_final_stage_error_fails_request(orchestrator_fact
             request_id=request_id,
             prompt=request,
             original_prompt={"prompt": "stream audio"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
 
@@ -2140,7 +2183,10 @@ async def test_run_abort(orchestrator_factory) -> None:
             request_id="req-abort",
             prompt=request,
             original_prompt={"prompt": "cancel me"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
@@ -2180,7 +2226,10 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
             request_id="req-ack",
             prompt=request,
             original_prompt={"prompt": "cancel with ack"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
@@ -2309,7 +2358,10 @@ async def test_multi_replica_round_robin_distribution(orchestrator_factory) -> N
             request_id="req-0",
             prompt=SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
             original_prompt={"prompt": "hello 0"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
@@ -2321,7 +2373,10 @@ async def test_multi_replica_round_robin_distribution(orchestrator_factory) -> N
             request_id="req-1",
             prompt=SimpleNamespace(request_id="req-1", prompt_token_ids=[5, 6]),
             original_prompt={"prompt": "hello 1"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
@@ -2369,7 +2424,10 @@ async def test_multi_replica_abort_broadcasts_to_all_replicas(orchestrator_facto
             request_id="req-abort-mr",
             prompt=SimpleNamespace(request_id="req-abort-mr", prompt_token_ids=[1]),
             original_prompt={"prompt": "cancel"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
+            sampling_params_list=[
+                _sampling_params(),
+                SamplingParams(max_tokens=4, temperature=0, extra_args={"pd_resume_from_prefill": True}),
+            ],
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)

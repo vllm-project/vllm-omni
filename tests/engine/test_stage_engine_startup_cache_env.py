@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for per-replica compile-cache isolation at spawn time.
 
 Replicas of the same stage compile the same model concurrently, and vLLM
@@ -45,3 +45,37 @@ def test_missing_ids_leave_env_untouched(monkeypatch):
     monkeypatch.delenv("VLLM_CACHE_ROOT", raising=False)
     with scoped_spawn_device_env(None, None):
         assert "VLLM_CACHE_ROOT" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# _get_stage_runtime_cfg: structured stages carry env/device overrides under
+# runtime_config; legacy mapping keeps them under runtime. The engine spawn
+# path must honor both.
+# ---------------------------------------------------------------------------
+
+
+def test_get_stage_runtime_cfg_prefers_runtime_config() -> None:
+    from vllm_omni.engine.stage_engine_startup import _get_stage_runtime_cfg
+
+    cfg = {"runtime": {"env": {"A": "1"}}, "runtime_config": {"env": {"B": "2"}}}
+    assert _get_stage_runtime_cfg(cfg) == {"env": {"B": "2"}}
+
+
+def test_get_stage_runtime_cfg_falls_back_to_runtime() -> None:
+    from vllm_omni.engine.stage_engine_startup import _get_stage_runtime_cfg
+
+    class LegacyCfg:
+        runtime = {"env": {"A": "1"}}
+
+    assert _get_stage_runtime_cfg(LegacyCfg()) == {"env": {"A": "1"}}
+
+    class StructuredCfg:
+        runtime_config = {"env": {"B": "2"}}
+
+    assert _get_stage_runtime_cfg(StructuredCfg()) == {"env": {"B": "2"}}
+
+
+def test_get_stage_runtime_cfg_none() -> None:
+    from vllm_omni.engine.stage_engine_startup import _get_stage_runtime_cfg
+
+    assert _get_stage_runtime_cfg(None) is None

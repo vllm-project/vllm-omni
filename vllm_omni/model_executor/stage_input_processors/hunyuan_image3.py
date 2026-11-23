@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage input processor for HunyuanImage3: AR to Diffusion transition.
 
 In IT2I (image editing) mode:
@@ -180,7 +180,6 @@ def ar2diffusion(
         width,
         f"AR ratio_idx={ratio_idx}" if ar_predicted else "from prompt (no AR ratio token)",
     )
-
     diffusion_input: dict[str, Any] = {
         "prompt": text_prompt,
         "height": height,

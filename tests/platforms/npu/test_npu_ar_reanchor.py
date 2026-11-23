@@ -172,3 +172,48 @@ def test_cache_validation_follows_allocation(backend):
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "initialize_kv_cache")
     assert "super().initialize_kv_cache" in ast.unparse(method.body[0])
     assert "validate_duplex_kv_cache(self)" in ast.unparse(method.body[1])
+
+
+class TestDownstreamPayloadMemoization:
+    """RFC #5450 C7 parity for NPUARModelRunner: must not memoize before the
+    deciding final-stage marker exists (mirrors the GPU runner test)."""
+
+    @staticmethod
+    def _make_runner():
+        root = Path(__file__).resolve().parents[3]
+        path = root / "vllm_omni/platforms/npu/worker/npu_ar_model_runner.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        runner_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "NPUARModelRunner")
+        method = next(
+            n
+            for n in runner_class.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_request_needs_downstream_stage_payload"
+        )
+        cls = ast.ClassDef(name="Runner", bases=[], keywords=[], body=[method], decorator_list=[])
+        from vllm_omni.engine.serialization import request_needs_downstream_stage
+
+        namespace: dict[str, Any] = {"request_needs_downstream_stage": request_needs_downstream_stage}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), str(path), "exec"), namespace)
+        runner = namespace["Runner"]()
+        runner._downstream_payload_cache = {}
+        runner.vllm_config = type("C", (), {"model_config": type("MC", (), {"stage_id": 0})()})()
+        return runner
+
+    def test_missing_marker_defaults_true_without_memoizing(self):
+        runner = self._make_runner()
+        stages = {"r1": None}
+        runner._request_final_stage_id = lambda rid: stages[rid]
+        assert runner._request_needs_downstream_stage_payload("r1") is True
+        assert "r1" not in runner._downstream_payload_cache
+        stages["r1"] = 0
+        assert runner._request_needs_downstream_stage_payload("r1") is False
+        assert runner._downstream_payload_cache["r1"] is False
+
+    def test_memoizes_once_marker_known(self):
+        runner = self._make_runner()
+        stages = {"r1": 2}
+        runner._request_final_stage_id = lambda rid: stages[rid]
+        assert runner._request_needs_downstream_stage_payload("r1") is True
+        assert runner._downstream_payload_cache["r1"] is True
+        stages["r1"] = 0
+        assert runner._request_needs_downstream_stage_payload("r1") is True

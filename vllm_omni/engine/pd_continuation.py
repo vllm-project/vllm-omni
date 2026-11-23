@@ -16,6 +16,17 @@ def needs_pd_rng_state(params) -> bool:
     return params is not None and getattr(params, "temperature", 0) != 0
 
 
+def is_pd_prefill_params(params) -> bool:
+    """True when the request acts as the PD prefill (P) side.
+
+    The resumable-decode client flag (pd_resume_from_prefill) doubles as the
+    P-side marker: the producer of a resume-KV handoff is by definition the
+    prefill. single source of truth for P-side PD semantics.
+    """
+    extra = getattr(params, "extra_args", None) or {}
+    return bool(extra.get(PD_PREFILL_KEY) or extra.get(PD_RESUME_KEY))
+
+
 class PDContinuation(msgspec.Struct):
     prompt_len: int
     token_ids: list[int]

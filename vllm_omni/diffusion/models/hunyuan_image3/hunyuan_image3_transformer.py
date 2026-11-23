@@ -3213,7 +3213,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             generator=generator,
             latents=latents,
         )
-
         # Prepare extra step kwargs.
         _scheduler_step_extra_kwargs = self.prepare_extra_func_kwargs(self.scheduler.step, {"generator": generator})
 

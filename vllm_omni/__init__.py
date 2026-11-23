@@ -19,6 +19,19 @@ Architecture:
 # are not using the same major + minor version (if vLLM is installed).
 # We should do this before applying patch, because vLLM imports might
 # throw in patch if the versions differ.
+# mooncake-transfer-engine 0.3.14: dlopen of libmooncake_py.so
+# segfaults once vllm_omni's patch chain has loaded conflicting NPU symbols
+# (repro: import vllm_omni; import mooncake).  Preload mooncake before the
+# patch chain runs so every vllm_omni process (APIServer + workers) has the
+# store .so mapped with a still-clean symbol table.  Optional dependency:
+# environments without mooncake are unaffected.
+try:
+    import mooncake  # noqa: F401
+    import mooncake.store  # noqa: F401
+    from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: F401
+except Exception:
+    pass
+
 from .version import __version__, __version_tuple__  # isort:skip # noqa: F401
 
 try:

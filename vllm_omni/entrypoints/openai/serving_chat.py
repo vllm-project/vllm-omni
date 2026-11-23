@@ -3413,11 +3413,36 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 ar_width = int((ar_prompt_info.get("ar_width") or [0])[0])
                 ar_height = int((ar_prompt_info.get("ar_height") or [0])[0])
                 ar_grid_budget = ar_grid_max_tokens(ar_width, ar_height)
-                if ar_grid_budget is not None and hasattr(default_stage_params, "max_tokens"):
+                # [AR-BUDGET] an explicit request max_tokens wins over the AR grid
+                # budget derived from the prompt resolution.
+                _req_max = None
+                try:
+                    if isinstance(extra_body, dict):
+                        _req_max = extra_body.get("max_tokens")
+                    if _req_max is None and isinstance(extra_body, dict):
+                        _ep = extra_body.get("extra_params")
+                        if isinstance(_ep, dict):
+                            _req_max = _ep.get("max_tokens")
+                except Exception:
+                    _req_max = None
+                if _req_max is not None and hasattr(default_stage_params, "max_tokens") and str(_req_max).strip() != "":
+                    default_stage_params.max_tokens = int(_req_max)
+                elif ar_grid_budget is not None and hasattr(default_stage_params, "max_tokens"):
                     default_stage_params.max_tokens = ar_grid_budget
 
             if idx in ar_seed_indices and seed is not None and hasattr(default_stage_params, "seed"):
                 default_stage_params.seed = seed
+            # Mirror the client sampling intent onto the PD AR
+            # stages (P prefill and D decode both live in ar_seed_indices).
+            # PD keys the P->D rng-state handoff off params.temperature
+            # (needs_pd_rng_state) and samples the decode stream with it.
+            _ar_temp = extra_body.get("temperature")
+            if _ar_temp is None:
+                _ar_ep = extra_body.get("extra_params")
+                if isinstance(_ar_ep, dict):
+                    _ar_temp = _ar_ep.get("temperature")
+            if _ar_temp is not None and idx in ar_seed_indices and hasattr(default_stage_params, "temperature"):
+                default_stage_params.temperature = _ar_temp
 
             # Inject target_h/w into AR stage for M-RoPE position pre-computation
             # (e.g. GLM-Image). max_tokens comes from deploy YAML.

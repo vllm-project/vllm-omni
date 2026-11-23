@@ -2309,7 +2309,13 @@ async def generate_images(
                 extra_body["return_stage_metrics"] = request.return_stage_metrics
             for extra_key, extra_value in (request.model_extra or {}).items():
                 extra_body.setdefault(extra_key, extra_value)
-
+            # bridge client sampling intent into extra_params so the
+            # engine request carries it in sampling_params.extra_args (the AR /
+            # PD pipelines read intent from there).
+            bridge = extra_body.setdefault("extra_params", {})
+            if isinstance(bridge, dict):
+                if "temperature" in request.model_extra and "temperature" not in bridge:
+                    bridge["temperature"] = request.model_extra["temperature"]
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
                 extra_body=extra_body,

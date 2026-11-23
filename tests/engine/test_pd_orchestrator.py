@@ -63,12 +63,16 @@ def test_pd_decode_params_preserve_optional_prefill_output() -> None:
         ("_pd_bootstrap_addr", "remote_bootstrap_addr"),
     ],
 )
-def test_pd_decode_params_require_mooncake_routing_fields(attribute: str, missing_field: str) -> None:
+def test_pd_decode_params_omit_optional_mooncake_routing_fields(attribute: str, missing_field: str) -> None:
+    # The shared-memory PD channel keys the handoff by transfer_id alone;
+    # remote routing fields are optional connector metadata, not required
+    # for continuation.
     orchestrator = _make_pd_orchestrator(None)
     setattr(orchestrator, attribute, None)
 
-    with pytest.raises(RuntimeError, match=missing_field):
-        orchestrator._build_pd_decode_params("req", SamplingParams(max_tokens=2))
+    dec_params = orchestrator._build_pd_decode_params("req", SamplingParams(max_tokens=2))
+    assert missing_field not in dec_params.extra_args["kv_transfer_params"]
+    assert dec_params.extra_args["kv_transfer_params"]["transfer_id"] == "xfer-req"
 
 
 @pytest.mark.parametrize("prompt_type", [dict, SimpleNamespace])
@@ -200,3 +204,50 @@ async def test_pd_forward_carries_processed_stop_metadata(resume):
         assert decode_request.pd_continuation.token_ids == [5]
     else:
         assert decode_request.pd_continuation is None
+
+
+class TestMooncakeBootstrapFromStageEnv:
+    """Stage-level env resolution for the Mooncake bootstrap address.
+
+    Migrated out of the skipped PD entrypoint module so the stage-env fallback
+    (VLLM_HOST_IP / VLLM_MOONCAKE_BOOTSTRAP_PORT) stays covered on core_model CI.
+    """
+
+    def test_extracts_bootstrap_addr_from_stage_env(self) -> None:
+        stage = SimpleNamespace(
+            stage_id=0,
+            engine_args={
+                "kv_transfer_config": {
+                    "kv_connector": "mooncake_connector",
+                    "kv_connector_extra_config": None,
+                    "kv_ip": None,
+                }
+            },
+            runtime={
+                "env": {
+                    "VLLM_HOST_IP": "10.0.0.8",
+                    "VLLM_MOONCAKE_BOOTSTRAP_PORT": "26001",
+                }
+            },
+        )
+        assert PDDisaggregationMixin.get_mooncake_bootstrap_addr(stage) == "http://10.0.0.8:26001"
+
+    def test_runtime_config_env_is_honored(self) -> None:
+        # Structure stages keep overrides under runtime_config, not runtime.
+        stage = SimpleNamespace(
+            engine_args={
+                "kv_transfer_config": {
+                    "kv_connector": "mooncake_connector",
+                    "kv_connector_extra_config": None,
+                    "kv_ip": None,
+                }
+            },
+            runtime=None,
+            runtime_config={
+                "env": {
+                    "VLLM_HOST_IP": "10.1.2.3",
+                    "VLLM_MOONCAKE_BOOTSTRAP_PORT": "27001",
+                }
+            },
+        )
+        assert PDDisaggregationMixin.get_mooncake_bootstrap_addr(stage) == "http://10.1.2.3:27001"
