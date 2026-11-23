@@ -437,15 +437,17 @@ def test_padded_upsample_reuses_kernel_across_resolutions(monkeypatch):
     assert len(kernels) == 3 and kernels[0] is not None and all(k is kernels[0] for k in kernels)
 
 
+@pytest.mark.parametrize("channels_last", [False, True], ids=["lossless", "channels_last"])
 @torch.inference_mode()
-def test_channels_last_kernels_reuse_binary_across_shard_heights(mocker):
+def test_kernels_reuse_binary_across_shard_heights(mocker, channels_last):
     from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
 
-    cat_pad = mocker.spy(dm._cat_pad_pixels_kernel, "run")
-    residual = mocker.spy(dm._dup_up3d_add_pixels_kernel, "run")
+    cat_pad = mocker.spy(dm._cat_pad_pixels_kernel if channels_last else dm._cat_pad_rows_kernel, "run")
+    residual = mocker.spy(dm._dup_up3d_add_pixels_kernel if channels_last else dm._dup_up3d_add_rows_kernel, "run")
     for height in (16, 17):
         x = torch.randn(1, 32, 2, height, 32, device="cuda", dtype=torch.bfloat16)
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+        if channels_last:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         assert dm.cat_pad_5d(x, None, (1, 1, 1, 1, 0, 0)) is not None
         assert dm.dup_up3d_add(x, x, 1, 1, 1, False) is not None
         if height == 16:

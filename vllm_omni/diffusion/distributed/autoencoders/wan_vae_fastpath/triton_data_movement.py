@@ -112,7 +112,7 @@ if HAS_TRITON:
                 keep_plane = (batch * channels_outer + channel) * keep_frames + (frame - keep_start)
                 tl.store(keep_ptr + keep_plane * plane_size + offsets, values, mask=mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["height", "out_height", "row_blocks"])
     def _cat_pad_rows_kernel(
         x_ptr,
         cache_ptr,
@@ -314,7 +314,7 @@ if HAS_TRITON:
                     keep_offsets = keep_pixels[:, None] + chans[None, :] * stride_keep_channel
                     tl.store(keep_ptr + keep_offsets, values, mask=load_mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["out_height", "row_blocks"])
     def _dup_up3d_add_rows_kernel(
         main_ptr,
         source_ptr,
