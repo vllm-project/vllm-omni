@@ -441,6 +441,7 @@ def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path
 
     class Transformer(nn.Module):
         _hsdp_shard_conditions = [lambda name, module: name == "block"]
+        _hsdp_pre_sharded_block_load = True
         _hsdp_ignored_modules = ["time_embedder"]
 
         def __init__(self):
