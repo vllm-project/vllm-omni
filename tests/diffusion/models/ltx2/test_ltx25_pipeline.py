@@ -230,7 +230,7 @@ def test_ltx_vocoder_loader_uses_profile_fallback(monkeypatch):
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
     calls: dict[str, Any] = {"components": []}
-    natten_processor = object()
+    neighborhood_processor = object()
 
     class FakeDiffusionDecoder:
         def set_attn_processor(self, processor):
@@ -303,8 +303,8 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     monkeypatch.setattr(ltx2_components, "load_transformer_config", fake_transformer_config)
     monkeypatch.setattr(
         ltx2_components,
-        "LTX2VideoVaeNeighborhoodNattenProcessor",
-        lambda: natten_processor,
+        "_create_ltx25_neighborhood_processor",
+        lambda: neighborhood_processor,
     )
     monkeypatch.setattr(
         ltx2_components,
@@ -337,7 +337,7 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         od_config.model,
         {"local_files_only": False, "dtype": torch.bfloat16, "revision": revision},
     )
-    assert calls["diffusion_decoder_processor"] is natten_processor
+    assert calls["diffusion_decoder_processor"] is neighborhood_processor
     assert calls["diffusion_decoder_tiling"] is True
     assert calls["diffusion_decoder_parallel"] == (2, "tile")
     assert calls["transformer_config"] == (
