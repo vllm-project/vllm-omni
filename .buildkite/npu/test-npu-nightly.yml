@@ -60,8 +60,6 @@ steps:
           # The wheel bundles the CPU VAD weights used when the ONNX cache is empty.
           - >-
             python3 -m pip install --no-deps silero-vad==6.2.3
-            --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-            --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
           - >-
@@ -189,8 +187,6 @@ steps:
           # The wheel bundles the CPU VAD weights used when the ONNX cache is empty.
           - >-
             python3 -m pip install --no-deps silero-vad==6.2.3
-            --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-            --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
           - |
