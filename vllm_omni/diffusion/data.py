@@ -40,6 +40,7 @@ from vllm_omni.diffusion.attention.schedule import (
     validate_attention_schedule,
     validate_attention_sigma_schedule,
 )
+from vllm_omni.diffusion.attention.sol_config import parse_sol_block_ranges, parse_sol_tau_profile
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
@@ -2466,6 +2467,29 @@ class BlockSparseSpec:
 
 
 @dataclass
+class SolAttnSpec:
+    """SOL quality controls; kernel selection and KV splitting are automatic."""
+
+    tau: float = 1.0
+    min_tokens: int = 0
+    dense_blocks: str = ""
+    tau_profile: str = ""
+    sink_conditioning: str = "exact_kv_and_rows"
+
+    def __post_init__(self) -> None:
+        self.tau = _in_range(self.tau, "sol_attn.tau", 0.0, None) or 0.0
+        if type(self.min_tokens) is not int or self.min_tokens < 0:
+            raise ValueError(f"sol_attn.min_tokens must be a non-negative integer; got {self.min_tokens!r}.")
+        parse_sol_block_ranges(self.dense_blocks)
+        parse_sol_tau_profile(self.tau_profile)
+        if self.sink_conditioning not in ("exact_kv_and_rows", "off"):
+            raise ValueError(
+                "sol_attn.sink_conditioning must be 'exact_kv_and_rows' or 'off'. "
+                "The current kernel cannot protect only KV columns; 'exact_kv' is unsupported."
+            )
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
@@ -2477,6 +2501,7 @@ class AttentionSpec:
     fastvideo_vsa_precision: str = "bf16"
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
+    sol_attn: SolAttnSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -2486,6 +2511,7 @@ class AttentionSpec:
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.sol_attn = self._coerce(self.sol_attn, SolAttnSpec, "sol_attn")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -2524,6 +2550,11 @@ class AttentionSpec:
             raise ValueError(
                 f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
                 f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
+            )
+        if self.sol_attn is not None and self.backend.upper() != "SOL_ATTN":
+            raise ValueError(
+                f"sol_attn is only supported by the SOL_ATTN backend, but backend={self.backend!r}. "
+                "Remove sol_attn or set backend to SOL_ATTN."
             )
 
     @staticmethod
@@ -2581,7 +2612,15 @@ class AttentionSpec:
             kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
-
+        if self.sol_attn is not None:
+            sol = self.sol_attn
+            kw["sol_attn"] = {
+                "tau": sol.tau,
+                "min_tokens": sol.min_tokens,
+                "dense_blocks": sol.dense_blocks,
+                "tau_profile": sol.tau_profile,
+                "sink_conditioning": sol.sink_conditioning,
+            }
         return kw or None
 
 
@@ -2660,13 +2699,14 @@ class AttentionConfig:
             "fastvideo_vsa_precision",
             "sparge",
             "block_sparse",
+            "sol_attn",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
             if not node_keys <= spec_keys:
                 raise ValueError(
-                    f"Invalid per_role entry for role {role!r}: cannot mix backend/skip_softmax with nested role keys."
+                    f"Invalid per_role entry for role {role!r}: cannot mix backend config with nested role keys."
                 )
             normalized[role] = node_dict
             return
@@ -2681,18 +2721,32 @@ class AttentionConfig:
         self,
         role: str = "self",
         role_category: str | None = None,
+        *,
+        inherited_backend_overrides: Mapping[str, AttentionSpec] | None = None,
     ) -> tuple[AttentionSpec | None, str | None]:
-        """Resolve the AttentionSpec and report which config entry matched."""
+        """Resolve a role, preserving exact user choices over model-owned defaults.
+
+        Model overrides map uppercase inherited backend names to complete specs.
+        They apply to category/global selections, not exact-role or platform
+        defaults, and never merge backend options or mutate user configuration.
+        """
         spec = self.per_role.get(role)
         if spec is not None:
             return spec, f"attention_config.per_role[{role!r}]"
+        source = None
         if role_category is not None:
             spec = self.per_role.get(role_category)
-            if spec is not None:
-                return spec, f"attention_config.per_role[{role_category!r}] (role_category fallback)"
-        if self.default is not None:
-            return self.default, "attention_config.default"
-        return None, None
+            source = (
+                f"attention_config.per_role[{role_category!r}] (role_category fallback)" if spec is not None else None
+            )
+        if spec is None and self.default is not None:
+            spec, source = self.default, "attention_config.default"
+        if spec is not None and inherited_backend_overrides:
+            replacement = inherited_backend_overrides.get(spec.backend.upper())
+            if replacement is not None:
+                source = f"{source} (model override {spec.backend.upper()} -> {replacement.backend})"
+                spec = replacement
+        return spec, source
 
 
 @dataclass

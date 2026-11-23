@@ -71,10 +71,11 @@ unstructured keyword dictionaries:
 
 - `quant` is consumed by FlashInfer and TRTLLM with backend-specific value
   validation;
-- `skip_softmax` is consumed by TRTLLM; and
-- `block_sparse` is consumed by block-sparse backends such as RainFusion; and
-- `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
-- `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend.
+- `skip_softmax` is consumed by TRTLLM;
+- `block_sparse` is consumed by block-sparse backends such as RainFusion;
+- `fastvideo_vsa_topk` is consumed by FastVideo VSA;
+- `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend; and
+- `sol_attn` is consumed by the CUDA Sol-Attn backend.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend
@@ -87,6 +88,21 @@ broader category. Model-specific roles permit precise overrides; categories
 preserve common `self` or `cross` policies. A model also decides whether its
 path is compatible with automatic TRTLLM selection, because only the model
 knows whether masking and packing satisfy the kernel contract.
+
+### Model-owned inherited backend policy
+
+`Attention(..., inherited_backend_overrides={backend_name: AttentionSpec(...)})`
+maps uppercase inherited backend names to complete replacement specs.
+It applies only to category/global selections: exact per-role choices win,
+and platform defaults and unmatched backends are unchanged. User configuration
+is not mutated or merged into the replacement.
+
+`AttentionConfig.resolve_with_source()` applies the policy before platform
+validation, consistently for baseline selection, independent schedule profiles,
+and capability queries supplied with the same policy.
+
+H3 uses this to keep its token refiner on `TORCH_SDPA` when SOL is inherited,
+while the main DiT (`self`) uses SOL. Users need no internal role configuration.
 
 ### Model-owned implementation specializations
 
@@ -120,6 +136,39 @@ provider-specific sparse metadata, transport padding and execution. The cuDNN
 provider consumes tile64 or tile128 directly; selecting it does not change
 the model's top-k policy. Startup checks and execution use the same provider
 resolution path.
+
+SOL delegates routing and omitted-block approximation directly to the upstream
+Sol-Attn kernel. H3 supplies a global block64 `ConditioningBlockMask`
+matching the valid sequence length; it is passed as upstream `exact_block_mask`
+so marked Q rows and KV columns stay exact in the fused kernel. There is no SOL
+provider switch or separate BSA/residual composition in Omni.
+Missing required conditioning metadata or stale supplied metadata fails explicitly. `PackedPaddingMetadata` excludes
+structural suffix padding before attention. See the
+[SOL guide](../../user_guide/diffusion/attention_backends/sol_attn.md) for defaults,
+supported execution modes, and limitations.
+
+SOL resolves `dense_blocks` and ordered `tau_profile` rules once at layer
+construction. Relative block indices require the model-owned `layer_count` of
+that attention stack; they are never inferred from checkpoint names. H3's DiT
+and token-refiner stacks supply their own counts. Base and scheduled
+implementations receive the same count. `min_tokens` compares the valid sequence length after removing
+structural padding; capability reporting and execution use the same guard.
+SOL exposes only `tau`, `tau_profile`, `dense_blocks`, `min_tokens`, and
+`sink_conditioning`. The latter defaults to `exact_kv_and_rows`; `off` is an
+explicit opt-out of model-owned conditioning protection. `exact_kv` is rejected
+because the current kernel cannot protect KV columns without also protecting
+Q rows. Threshold selection and KV splitting are internal; denoising windows
+use the shared schedule owner, with no SOL-specific step counter.
+
+SOL consumes the model-independent `ConditioningBlockMask`, optionally built
+from a valid-token Boolean mask by `from_token_mask`. An ordinary stack with
+no conditioning metadata uses SOL without protection. A model declares
+`requires_conditioning_mask=True` when omitting that metadata would change its
+protection contract; this declaration and `layer_count` reach both base and
+scheduled implementations. H3 is the only adapter added in this change and
+requires its text/audio protection by default. Protection does not express
+causal or pairwise visibility; existing attention masks retain their separate
+semantics and SOL capability restrictions.
 
 Qwen-Image-2.1 publishes a zero-based denoising index in
 `ForwardContext.denoise_step_idx` before running the transformer. Both CFG

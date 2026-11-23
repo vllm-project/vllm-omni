@@ -33,6 +33,13 @@ last_reviewed: 2026-07-16
 Diffusion model integration owns pipeline contracts, registration, checkpoint
 loading, adapters, shared layers, and model-specific processing.
 
+MiniMax-H3 keeps its token refiner dense for inherited SOL selections and builds
+one global block64 `TextAudioBlockMask` per request branch from packed text and
+reference/target audio positions. The mask is reused across denoising steps and
+pure Ulysses; visual references are not protected as a whole. See
+[attention backend selection](../../feature/attention_backend_selection.md)
+for selection and metadata contracts.
+
 ## Candidate invariants
 
 ### DIFF-MODEL-INV-001: Pipelines implement one runtime contract

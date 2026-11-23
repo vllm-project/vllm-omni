@@ -160,6 +160,11 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper == "SOL_ATTN":
+                if not compute_supported:
+                    raise ValueError("SOL_ATTN requires an SM80+ CUDA GPU.")
+                if head_size > 0 and head_size != 128:
+                    raise ValueError(f"SOL_ATTN requires head_dim=128, got {head_size}.")
             # Architecture / package probes for optional kernels must run before
             # validate_diffusion_attn_backend, which imports the backend module
             # and would otherwise load sageattention / sageattn3 on unsupported GPUs.

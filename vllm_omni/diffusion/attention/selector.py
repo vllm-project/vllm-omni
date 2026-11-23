@@ -11,6 +11,7 @@ This module resolves diffusion attention backends from:
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from functools import cache
 from typing import TYPE_CHECKING
 
@@ -104,6 +105,7 @@ def get_attn_backend_for_role(
     attention_config: AttentionConfig | None = None,
     role_category: str | None = None,
     allow_trtllm_default: bool = True,
+    inherited_backend_overrides: Mapping[str, AttentionSpec] | None = None,
 ) -> tuple[type[AttentionBackend], AttentionSpec | None]:
     """
     Get attention backend for a specific attention role.
@@ -122,6 +124,8 @@ def get_attn_backend_for_role(
             If None, falls back to platform default behavior.
         role_category: Optional category for fallback (e.g. "cross" for
             "ltx2.audio_to_video")
+        inherited_backend_overrides: Model-owned complete specs keyed by inherited
+            backend name. Exact per-role user selections always take precedence.
 
     Returns:
         Tuple of (backend_class, AttentionSpec or None).
@@ -134,6 +138,7 @@ def get_attn_backend_for_role(
         spec, source = attention_config.resolve_with_source(
             role=role,
             role_category=role_category,
+            inherited_backend_overrides=inherited_backend_overrides,
         )
 
     if spec is not None:
@@ -161,6 +166,7 @@ def get_attn_backend_for_capability(
     role: str,
     attention_config: AttentionConfig | None = None,
     role_category: str | None = None,
+    inherited_backend_overrides: Mapping[str, AttentionSpec] | None = None,
 ) -> type[AttentionBackend]:
     """Resolve the backend class for capability queries such as mask support.
 
@@ -175,6 +181,7 @@ def get_attn_backend_for_capability(
         spec, _ = attention_config.resolve_with_source(
             role=role,
             role_category=role_category,
+            inherited_backend_overrides=inherited_backend_overrides,
         )
     if spec is not None:
         from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
