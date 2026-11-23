@@ -830,6 +830,75 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         self.streaming_cfg = streaming_cfg
 
+    def streaming_post_process(self, rets, keep_all_outputs=True):
+        """Apply NeMo's cache-aware output trimming contract."""
+        if len(rets) == 2:
+            return rets[0], rets[1], None, None, None
+
+        encoded, encoded_len, cache_channel, cache_time, cache_channel_len = rets
+        if cache_channel is not None and self.streaming_cfg.last_channel_cache_size >= 0:
+            if self.streaming_cfg.last_channel_cache_size > 0:
+                cache_channel = cache_channel[:, :, -self.streaming_cfg.last_channel_cache_size :, :]
+
+        if self.streaming_cfg.valid_out_len > 0 and (not keep_all_outputs or self.att_context_style == "regular"):
+            encoded = encoded[:, :, : self.streaming_cfg.valid_out_len]
+            encoded_len = torch.clamp(encoded_len, max=self.streaming_cfg.valid_out_len)
+
+        return encoded, encoded_len, cache_channel, cache_time, cache_channel_len
+
+    def get_initial_cache_state(
+        self,
+        batch_size=1,
+        dtype=torch.float32,
+        device=None,
+        max_dim=0,
+    ):
+        """Create the channel/time caches used by cache-aware streaming."""
+        if self.streaming_cfg is None:
+            self.setup_streaming_params()
+        if device is None:
+            device = next(self.parameters()).device
+        create_tensor = torch.randn if max_dim > 0 else torch.zeros
+        cache_last_channel = create_tensor(
+            (
+                len(self.layers),
+                batch_size,
+                self.streaming_cfg.last_channel_cache_size,
+                self.d_model,
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        cache_last_time = create_tensor(
+            (
+                len(self.layers),
+                batch_size,
+                self.d_model,
+                self.conv_context_size[0],
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        if max_dim > 0:
+            cache_last_channel_len = torch.randint(
+                0,
+                min(max_dim, self.streaming_cfg.last_channel_cache_size),
+                (batch_size,),
+                device=device,
+                dtype=torch.int64,
+            )
+            for i in range(batch_size):
+                cache_last_channel[:, i, cache_last_channel_len[i] :, :] = 0
+                if cache_last_channel_len[i] == 0:
+                    cache_last_time[:, i, :, :] = 0
+        else:
+            cache_last_channel_len = torch.zeros(
+                batch_size,
+                device=device,
+                dtype=torch.int64,
+            )
+        return cache_last_channel, cache_last_time, cache_last_channel_len
+
     def change_subsampling_conv_chunking_factor(self, subsampling_conv_chunking_factor: int):
         """
         Update the conv_chunking_factor (int)

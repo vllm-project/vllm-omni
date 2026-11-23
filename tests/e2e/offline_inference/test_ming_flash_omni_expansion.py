@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
@@ -14,6 +14,7 @@ from tests.helpers.media import (
     generate_synthetic_video,
 )
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.platforms import current_omni_platform
 
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
@@ -34,6 +35,7 @@ def build_prompt(user_text: str) -> str:
 
 _CI_DEPLOY_THINKER_ONLY = get_deploy_config_path("ci/ming_flash_omni_thinker_only.yaml")
 _CI_DEPLOY = get_deploy_config_path("ci/ming_flash_omni.yaml")
+MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S = 1800
 
 
 def get_eager_config_thinker():
@@ -45,15 +47,21 @@ def get_eager_config():
     return modify_stage_config(_CI_DEPLOY, updates={"stages": {0: {"enforce_eager": True}}})
 
 
-test_params_thinker = [(m, c) for m in models for c in [get_eager_config_thinker()]]
-test_params = [(m, c) for m in models for c in [get_eager_config()]]
+# Ming's 194 GiB checkpoint can need more than the fixture's default 600-second
+# stage-readiness deadline when the ROCm worker cache is backed by shared NFS.
+# Keep CUDA on the default deadline so this allowance is platform-specific.
+_ROCM_STAGE_INIT_KWARGS = (
+    {"stage_init_timeout": MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S} if current_omni_platform.is_rocm() else {}
+)
+test_params_thinker = [(m, c, _ROCM_STAGE_INIT_KWARGS) for m in models for c in [get_eager_config_thinker()]]
+test_params = [(m, c, _ROCM_STAGE_INIT_KWARGS) for m in models for c in [get_eager_config()]]
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
-def test_text_to_text(omni_runner, omni_runner_handler) -> None:
+def test_text_to_text(omni_runner, offline_client) -> None:
     """
     Test text-only input processing and text output generation.
     Input Modal: text
@@ -62,14 +70,14 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt("请详细介绍鹦鹉的生活习性。")
     request_config = {"prompts": prompt, "modalities": ["text"]}
 
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
-def test_image_to_text(omni_runner, omni_runner_handler) -> None:
+def test_image_to_text(omni_runner, offline_client) -> None:
     """
     Test image understanding with text output.
     Input Modal: image + text
@@ -79,14 +87,14 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{IMAGE_TOKEN}Describe this image briefly.")
     request_config = {"prompts": prompt, "images": image, "modalities": ["text"]}
 
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
-def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
+def test_audio_to_text(omni_runner, offline_client) -> None:
     """
     Test audio understanding with text output.
     Input Modal: audio + text
@@ -98,14 +106,14 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{AUDIO_TOKEN}Please recognize the language of this speech and transcribe it. Format: oral.")
     request_config = {"prompts": prompt, "audios": audio, "modalities": ["text"]}
 
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
-def test_video_to_text(omni_runner, omni_runner_handler) -> None:
+def test_video_to_text(omni_runner, offline_client) -> None:
     """
     Test video understanding with text output.
     Input Modal: video + text
@@ -115,14 +123,14 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{VIDEO_TOKEN}Describe what is happening in this video.")
     request_config = {"prompts": prompt, "videos": video, "modalities": ["text"]}
 
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
-def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:
+def test_mixed_to_text(omni_runner, offline_client) -> None:
     """
     Test mixed modality input (image + audio) with text output.
     Input Modal: image + audio + text
@@ -135,14 +143,14 @@ def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{IMAGE_TOKEN}{AUDIO_TOKEN}Describe the image and transcribe the audio.")
     request_config = {"prompts": prompt, "images": image, "audios": audio, "modalities": ["text"]}
 
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
+def test_text_to_audio(omni_runner, offline_client) -> None:
     """
     Test text input with audio output via the thinker+talker pipeline.
     Input Modal: text
@@ -151,14 +159,14 @@ def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt("请简单介绍一下北京。")
     request_config = {"prompts": prompt, "modalities": ["audio"]}
 
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_image_to_audio(omni_runner, omni_runner_handler) -> None:
+def test_image_to_audio(omni_runner, offline_client) -> None:
     """
     Test image + text input with audio output via the thinker+talker pipeline.
     Input Modal: image + text
@@ -168,4 +176,4 @@ def test_image_to_audio(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{IMAGE_TOKEN}Describe this image briefly.")
     request_config = {"prompts": prompt, "images": image, "modalities": ["audio"]}
 
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)

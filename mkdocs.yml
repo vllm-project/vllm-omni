@@ -83,7 +83,9 @@ plugins:
         design/feature/diffusion_request_level_batching.md: design/feature/diffusion_continuous_batching.md
         design/feature/diffusion_step_execution.md: design/feature/diffusion_continuous_batching.md
         design/feature/cpu_offloading.md: design/feature/offloader/README.md
-        design/feature/model_level_offload.md: design/feature/offloader/cpu_offload.md
+        user_guide/diffusion/offloader/cpu_offload.md: user_guide/diffusion/offloader/module_offload.md
+        design/feature/model_level_offload.md: design/feature/offloader/module_offload.md
+        design/feature/offloader/cpu_offload.md: design/feature/offloader/module_offload.md
         design/feature/layerwise_offload.md: design/feature/offloader/layerwise_offload.md
         design/feature/distributed_layerwise_offload.md: design/feature/offloader/distributed_layerwise_offload.md
   - glightbox
@@ -137,15 +139,16 @@ plugins:
             show_source: false
           inventories:
           - https://docs.python.org/3/objects.inv
-          - https://typing-extensions.readthedocs.io/en/latest/objects.inv
+          # Read the Docs rate-limits these external inventories in strict builds.
+          # - https://typing-extensions.readthedocs.io/en/latest/objects.inv
           # Disabled because Read the Docs strict builds fail if this
           # external inventory intermittently resets the connection.
           # - https://docs.aiohttp.org/en/stable/objects.inv
-          - https://pillow.readthedocs.io/en/stable/objects.inv
+          # - https://pillow.readthedocs.io/en/stable/objects.inv
           - https://numpy.org/doc/stable/objects.inv
           # Temporarily disabled due to decompression errors
           # - https://pytorch.org/docs/stable/objects.inv
-          - https://psutil.readthedocs.io/stable/objects.inv
+          # - https://psutil.readthedocs.io/stable/objects.inv
 
 markdown_extensions:
   - attr_list

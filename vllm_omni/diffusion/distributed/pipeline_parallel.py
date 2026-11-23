@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
+from vllm_omni.diffusion.distributed.cfg_parallel import (
+    CFGParallelMixin,
+    _slice_pred,
+    _unwrap,
+    _wrap,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -72,9 +78,15 @@ class AsyncLatents:
         return func(*args, **kwargs)
 
 
-class PipelineParallelMixin:
+class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  # type: ignore[misc,valid-type]
     """
     Mixin providing Pipeline Parallelism for diffusion pipelines.
+
+    Extends CFGParallelMixin: the PP-aware ``predict_noise_maybe_with_cfg`` /
+    ``scheduler_step_maybe_with_cfg`` overrides delegate to the CFG versions via
+    ``super()``, so hosts must list this mixin before CFGParallelMixin
+    (enforced in ``__init_subclass__``). The base is only declared under
+    TYPE_CHECKING to keep the runtime import graph unchanged.
 
     All PP ranks run the full denoising loop in `forward()`.
     `predict_noise_maybe_with_cfg` and `scheduler_step_maybe_with_cfg` encapsulate all inter-rank communication.
@@ -119,7 +131,7 @@ class PipelineParallelMixin:
                 if vae is not None and hasattr(vae, "decode"):
                     self._wrapped_vae_decode()
 
-            cls.__init__ = wrapped_init
+            cls.__init__ = wrapped_init  # type: ignore[method-assign]
 
         diffuse = cls.__dict__.get("diffuse")
         if callable(diffuse):
@@ -134,7 +146,11 @@ class PipelineParallelMixin:
                 finally:
                     self._sync_pp_send()
 
-            cls.diffuse = wrapped_diffuse
+            cls.diffuse = wrapped_diffuse  # type: ignore[method-assign]
+
+    if TYPE_CHECKING:
+        # Provided by the concrete pipeline host (checked in __init_subclass__).
+        vae: Any
 
     def _wrapped_vae_decode(self) -> None:
         vae, orig_decode = self.vae, self.vae.decode
@@ -196,6 +212,9 @@ class PipelineParallelMixin:
             CFGParallelMixin.predict_noise_maybe_with_cfg exactly.
           - PP only, no CFG: cond branch only.
 
+        Also sets ``self.transformer.do_true_cfg`` (via CFGParallelMixin) before
+        predicting, matching the non-PP CFG helper path for TeaCache.
+
         Returns:
             noise_pred on the last PP rank (all CFG ranks when CFG-parallel is active).
             None on all other ranks.
@@ -205,6 +224,8 @@ class PipelineParallelMixin:
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
 
+        CFGParallelMixin._set_transformer_do_true_cfg(self, do_true_cfg)
+
         self._sync_pp_send()
 
         pp_group = get_pp_group()
@@ -212,10 +233,14 @@ class PipelineParallelMixin:
         cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
         if cfg_parallel_ready:
             # Each PP pipeline carries exactly one CFG branch determined by cfg_rank.
-            all_kwargs = [positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs]
+            all_kwargs: list[dict[str, Any] | None] = [
+                positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs
+            ]
         else:
             # Sequential CFG (or no CFG): this PP pipeline handles all branches.
-            all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
+            all_kwargs = [positive_kwargs]
+            if do_true_cfg:
+                all_kwargs.append(negative_kwargs)
 
         # Non-first ranks receive intermediate tensors asynchronously
         n = len(all_kwargs)
@@ -237,23 +262,26 @@ class PipelineParallelMixin:
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine
             # on all CFG ranks so every last PP rank has an identical noise_pred.
-            local_pred = noise_preds[0]
+            local_pred = _wrap(noise_preds[0])
             if output_slice is not None:
-                local_pred = local_pred[:, :output_slice]
-            gathered = get_cfg_group().all_gather(local_pred, separate_tensors=True)
-            return self.combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
+                local_pred = _slice_pred(local_pred, output_slice)
+            gathered = [get_cfg_group().all_gather(p, separate_tensors=True) for p in local_pred]
+            positive_noise_pred = tuple(g[0] for g in gathered)
+            negative_noise_pred = tuple(g[1] for g in gathered)
+            return self.combine_cfg_noise(positive_noise_pred, negative_noise_pred, true_cfg_scale, cfg_normalize)
 
         # Sequential CFG or no-CFG path.
         if do_true_cfg:
-            pos, neg = noise_preds[0], noise_preds[1]
+            pos = _wrap(noise_preds[0])
+            neg = _wrap(noise_preds[1])
             if output_slice is not None:
-                pos = pos[:, :output_slice]
-                neg = neg[:, :output_slice]
+                pos = _slice_pred(pos, output_slice)
+                neg = _slice_pred(neg, output_slice)
             return self.combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
-        pred = noise_preds[0]
+        pred = _wrap(noise_preds[0])
         if output_slice is not None:
-            pred = pred[:, :output_slice]
-        return pred
+            pred = _slice_pred(pred, output_slice)
+        return _unwrap(pred)
 
     def scheduler_step_maybe_with_cfg(
         self,

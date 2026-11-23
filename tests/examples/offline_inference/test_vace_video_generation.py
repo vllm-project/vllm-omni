@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """VACE coverage through the shared text-to-video and image-to-video examples."""
 
 from pathlib import Path
@@ -14,18 +17,18 @@ pytestmark = [
     pytest.mark.full_model,
     pytest.mark.diffusion,
     pytest.mark.example,
-    *hardware_marks(res={"cuda": "H100"}),
+    *hardware_marks(res={"cuda": ["H100", "B200"]}),
 ]
 
 TEXT_TO_VIDEO_README = EXAMPLES / "offline_inference" / "text_to_video" / "text_to_video.md"
 IMAGE_TO_VIDEO_README = EXAMPLES / "offline_inference" / "image_to_video" / "README.md"
 EXAMPLE_OUTPUT_SUBFOLDER = "example_offline_vace"
 
-TEXT_TO_VIDEO_SNIPPET = next(
+TEXT_TO_VIDEO_SNIPPETS = [
     snippet
     for snippet in ReadmeSnippet.extract_readme_snippets(TEXT_TO_VIDEO_README)
     if "vace_t2v_output.mp4" in snippet.code
-)
+]
 CONDITIONAL_OUTPUTS = (
     "vace_i2v_output.mp4",
     "vace_v2lf_output.mp4",
@@ -71,9 +74,10 @@ def vace_asset_dir(tmp_path: Path) -> Path:
     return asset_dir
 
 
-def test_vace_text_to_video_shared_example(example_runner: ExampleRunner) -> None:
-    snippet = TEXT_TO_VIDEO_SNIPPET._replace(
-        code=TEXT_TO_VIDEO_SNIPPET.code.replace("--num-frames 81", "--num-frames 5").replace(
+@pytest.mark.parametrize("snippet", TEXT_TO_VIDEO_SNIPPETS, ids=lambda snippet: snippet.test_id)
+def test_vace_text_to_video_shared_example(snippet: ReadmeSnippet, example_runner: ExampleRunner) -> None:
+    snippet = snippet._replace(
+        code=snippet.code.replace("--num-frames 81", "--num-frames 5").replace(
             "--num-inference-steps 30", "--num-inference-steps 2"
         )
     )

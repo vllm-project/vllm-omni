@@ -37,7 +37,6 @@ GENERAL_EXAMPLE_SLUGS = frozenset(
         "text_to_speech",
         "text_to_video",
         "x_to_text",
-        "x_to_video_audio",
     }
 )
 

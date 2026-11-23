@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiMo Audio pipeline topology (frozen).
 
 Stage 0: fused thinker+talker — multimodal understanding + text + RVQ codes.
@@ -34,6 +34,7 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="fused_thinker_talker",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             final_output=True,
             final_output_type="text",
@@ -53,12 +54,14 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            supports_native_mrv2_data_plane=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
             sync_process_input_func=f"{_PROC}.llm2code2wav_token_only",
             sampling_constraints={"detokenize": False},
+            requires_full_payload_input=True,
         ),
     ),
 )

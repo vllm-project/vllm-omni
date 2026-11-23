@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
+import functools
 import math
 
 import torch
+
+from vllm_omni.diffusion.attention.backends.utils.fa import vllm_flash_attn_dense_with_lse
 
 from .ring_globals import (
     HAS_AITER,
@@ -12,6 +16,7 @@ from .ring_globals import (
     HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
+    bundled_flash_attn_version,
     fa3_fwd_func,
     fa4_attn_func,
 )
@@ -40,6 +45,55 @@ if HAS_FLASHINFER:
     _LOG2_E = math.log2(math.e)
 
 
+@functools.cache
+def _xpu_has_aten_flash() -> bool:
+    """Whether this torch build has the XPU aten flash SDPA op (it needs SYCL-TLA; some builds lack it)."""
+    q = torch.zeros(1, 1, 16, 64, device="xpu", dtype=torch.bfloat16)
+    try:
+        _scaled_dot_product_flash_attention(q, q, q)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _xpu_sdpa_op_type(
+    op_type: str, dtype: torch.dtype, causal: bool, q_len: int, kv_len: int, has_flash: bool = True
+) -> str:
+    """Pick the aten SDPA op that returns a usable LSE on XPU.
+
+    XPU's ``_scaled_dot_product_efficient_attention`` returns a correct output but an all-zero
+    log-sum-exp, which silently breaks the ring merge. Its flash op returns the right fp32 LSE, but
+    only for fp16/bf16, aligns a causal mask to the bottom-right when ``q_len != kv_len`` (the
+    efficient op aligns it to the top-left), and is missing from torch builds without SYCL-TLA.
+    Those cases use the fp32 ``"math"`` path instead.
+    """
+    if op_type != "efficient":
+        return op_type
+    if has_flash and dtype in (torch.float16, torch.bfloat16) and (not causal or q_len == kv_len):
+        return "flash"
+    return "math"
+
+
+def _math_attn_with_lse(q, k, v, softmax_scale, causal, q_chunk: int = 1024):
+    """Reference attention in fp32 on (B, H, S, D) tensors: returns (out, lse) like the aten SDPA ops.
+
+    Query rows are processed ``q_chunk`` at a time, so the fp32 score block stays at
+    ``B * H * q_chunk * kv_len`` instead of the full ``q_len * kv_len``.
+    """
+    q_len, kv_len = q.shape[-2], k.shape[-2]
+    kf, vf = k.float(), v.float()
+    outs, lses = [], []
+    for start in range(0, q_len, q_chunk):
+        scores = torch.matmul(q[..., start : start + q_chunk, :].float(), kf.transpose(-2, -1)) * softmax_scale
+        if causal:
+            rows = torch.arange(start, start + scores.shape[-2], device=scores.device).view(-1, 1)
+            keep = rows >= torch.arange(kv_len, device=scores.device).view(1, -1)  # top-left, like the efficient op
+            scores = scores.masked_fill(~keep, float("-inf"))
+        lses.append(torch.logsumexp(scores, dim=-1))
+        outs.append(torch.matmul(torch.softmax(scores, dim=-1), vf).to(q.dtype))
+    return torch.cat(outs, dim=-2), torch.cat(lses, dim=-1)
+
+
 def pytorch_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -59,10 +113,8 @@ def pytorch_attn_forward(
     k shape (bs, seqlen, nhead, hs)
     v shape (bs, seqlen, nhead, hs)
     """
-    # Fallback logic: Flash Attention does not support float32.
-    # If op_type is 'flash' but dtype is float32, force 'efficient'.
     if op_type == "flash" and q.dtype == torch.float32:
-        op_type = "efficient"
+        raise ValueError("The explicitly requested Flash ring kernel does not support float32.")
 
     # Volta (V100, sm70) does not have native bf16 support for the efficient
     # SDPA kernel. When running Ring attention in bf16 on such GPUs, the
@@ -96,7 +148,16 @@ def pytorch_attn_forward(
         k = k.repeat_interleave(n_rep, dim=1)
         v = v.repeat_interleave(n_rep, dim=1)
 
-    if op_type == "flash":
+    if q.device.type == "xpu":
+        op_type = _xpu_sdpa_op_type(op_type, q.dtype, causal, q.shape[2], k.shape[2], _xpu_has_aten_flash())
+
+    if op_type == "math":
+        if dropout_p:
+            raise ValueError("The math ring kernel does not support dropout.")
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        out, lse = _math_attn_with_lse(q, k, v, softmax_scale, causal)
+    elif op_type == "flash":
         out, lse = _scaled_dot_product_flash_attention(
             q,
             k,
@@ -123,6 +184,7 @@ def pytorch_attn_forward(
     # Keep LSE in fp32 for numerical stability when accumulating across ring
     # steps (update_out_and_lse uses sigmoid/logsigmoid on LSE diffs).
     # Casting LSE down to fp16/bf16 can introduce NaNs on some GPUs/shapes.
+    # PyTorch SDPA returns LSE as (B, H, S).
     lse = lse.to(torch.float32)
 
     if out.dtype != orig_dtype:
@@ -173,15 +235,17 @@ def flash_attn_forward(
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax,
         )
+    # FA2 softmax_lse is (B, H, S), optionally padded on S.
     return block_out, block_lse
 
 
 def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax):
     """FA3 forward pass for inference.
 
-    FA3 supports Ampere, Ada, and Hopper GPUs. Dropout is ignored since FA3 is inference-only.
-    Uses low-level API (_flash_attn_forward) which always returns softmax_lse,
-    required for Ring Attention's correct accumulation.
+    This optional source-built FA3 fallback supports Hopper GPUs. Dropout is
+    ignored since FA3 is inference-only. Its low-level API
+    (``_flash_attn_forward``) always returns the softmax LSE required for Ring
+    Attention's correct accumulation.
     """
     assert HAS_FA3, "FA3 is not available"
     assert fa3_fwd_func is not None, "FA3 low-level API (fa3_fwd_func) not available"
@@ -198,11 +262,93 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
         softcap=softcap if softcap else 0.0,
     )
 
+    # FA3 softmax_lse is (B, H, S).
     return out, softmax_lse
+
+
+@torch.library.custom_op("vllm_omni::bundled_fa4_ring_attention", mutates_args=())
+def _bundled_fa4_ring_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float | None, causal: bool, softcap: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return vllm_flash_attn_dense_with_lse(q, k, v, softmax_scale=scale, causal=causal, softcap=softcap, fa_version=4)
+
+
+@_bundled_fa4_ring_attention.register_fake
+def _bundled_fa4_ring_attention_fake(q, k, v, scale, causal, softcap):
+    batch, seq, heads, _ = q.shape
+    out = q.new_empty((batch, seq, heads, v.shape[-1]))
+    lse = q.new_empty((heads, batch, seq), dtype=torch.float32).transpose(0, 1)
+    return out, lse
+
+
+def vllm_flash_attn_forward(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=None,
+    alibi_slopes=None,
+    return_softmax=False,
+):
+    """vLLM-bundled FlashAttention forward pass with ring-compatible LSE."""
+    del dropout_p, window_size, alibi_slopes, return_softmax
+    if torch.compiler.is_compiling() and not torch.is_grad_enabled() and bundled_flash_attn_version(q.device) == 4:
+        return _bundled_fa4_ring_attention(q, k, v, softmax_scale, causal, softcap or 0.0)
+    return vllm_flash_attn_dense_with_lse(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap or 0.0,
+    )
 
 
 # Legacy alias for backward compatibility
 flash_attn3_func_forward = fa3_forward
+
+
+if not hasattr(torch.ops.vllm_omni, "fa4_ring_attention"):
+
+    @torch.library.custom_op("vllm_omni::fa4_ring_attention", mutates_args=())
+    def _fa4_ring_attention_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        softmax_scale: float | None,
+        causal: bool,
+        window_left: int,
+        window_right: int,
+        softcap: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The CuTe Python launcher is opaque; its attention arithmetic is unchanged.
+        if fa4_attn_func is None:
+            raise RuntimeError("CuTe FlashAttention-4 is unavailable")
+        out, lse = fa4_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=(None if window_left == -1 else window_left, None if window_right == -1 else window_right),
+            softcap=softcap,
+            return_lse=True,
+        )
+        return out, lse
+
+    @_fa4_ring_attention_op.register_fake
+    def _fa4_ring_attention_op_fake(q, k, v, softmax_scale, causal, window_left, window_right, softcap):
+        # Match FA4's contiguous BSHD output and contiguous FP32 BHS LSE.
+        return (
+            torch.empty((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]), dtype=q.dtype, device=q.device),
+            torch.empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device),
+        )
+
+
+_fa4_ring_attention_op = torch.ops.vllm_omni.fa4_ring_attention
 
 
 def flash_attn4_func_forward(
@@ -223,6 +369,8 @@ def flash_attn4_func_forward(
     assert fa4_attn_func is not None, "FA4 high-level API is not available"
 
     left, right = window_size if window_size else (-1, -1)
+    if torch.compiler.is_compiling() and not torch.is_grad_enabled():
+        return _fa4_ring_attention_op(q, k, v, softmax_scale, causal, left, right, softcap or 0.0)
     out, softmax_lse = fa4_attn_func(
         q,
         k,
@@ -236,6 +384,7 @@ def flash_attn4_func_forward(
         softcap=softcap or 0.0,
         return_lse=True,
     )
+    # FA4 CuTe softmax_lse is (B, H, S).
     return out, softmax_lse
 
 
@@ -264,6 +413,7 @@ def flash_attn_forward_aiter(
         return_lse=True,
     )
 
+    # Aiter softmax_lse is (B, H, S), matching FA2.
     return block_out, block_lse
 
 
@@ -293,7 +443,7 @@ def flashinfer_attn_forward(
             window_left=window_size[0],
             return_lse=True,
         )
-        lse = lse.transpose(0, 1)
+        # FlashInfer unbatched LSE is (H, S). Canonical ring layout is (B, H, S).
         out, lse = out.unsqueeze(0), lse.unsqueeze(0)
     elif q.ndim == 3:
         out, lse = single_prefill_with_kv_cache(
@@ -306,7 +456,7 @@ def flashinfer_attn_forward(
             window_left=window_size[0],
             return_lse=True,
         )
-        lse = lse.transpose(0, 1)
+        # Unbatched (H, S) matches canonical heads-major layout without a batch dim.
     else:
         raise ValueError(f"Invalid input shape: {q.shape}")
     lse = lse / _LOG2_E

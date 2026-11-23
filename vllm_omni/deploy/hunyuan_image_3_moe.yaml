@@ -30,15 +30,6 @@ connectors:
 
 stages:
   - stage_id: 0
-    # ``is_comprehension`` in vllm-omni names the tokenizer-owning AR stage
-    # (see config/stage_config.py + serving_chat AR-stage lookup), independent
-    # of whether the AR's task is comprehension (i2t/t2t) or generation
-    # (it2i/t2i). HunyuanImage-3.0's stage-0 owns the tokenizer and emits the
-    # cot+ratio token sequence consumed by stage-1, so it must be marked True
-    # for the serving path to set AR seed/stop_token_ids on this stage.
-    is_comprehension: true
-    final_output: true
-    final_output_type: text
     max_num_seqs: 1
     gpu_memory_utilization: 0.95
     enforce_eager: true
@@ -80,12 +71,6 @@ stages:
       num_inference_steps: 50
       guidance_scale: 0
 
-edges:
-  - from: 0
-    to: 1
-    window_size: -1
-    max_inflight: 1
-
 platforms:
   npu:
     stages:
@@ -106,11 +91,14 @@ platforms:
 
   xpu:
     stages:
+      # Both stages stay resident, so they cannot share cards.
       - stage_id: 0
         gpu_memory_utilization: 0.95
-        devices: "0,1,2,3,4,5,6,7"
-        tensor_parallel_size: 8
-        max_num_batched_tokens: 32784
+        devices: "0,1,2,3"
+        tensor_parallel_size: 4
+        # fp8 AR weights leave under 1 GiB for KV; 22800 tokens will not fit.
+        max_num_batched_tokens: 8192
+        max_model_len: 8192
         quantization: fp8
         enable_expert_parallel: true
         worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
@@ -120,12 +108,12 @@ platforms:
           repetition_penalty: 1.1
       - stage_id: 1
         gpu_memory_utilization: 0.9
-        devices: "0,1,2,3,4,5,6,7"
+        devices: "4,5,6,7"
         quantization: fp8
         parallel_config:
           pipeline_parallel_size: 1
           data_parallel_size: 1
-          tensor_parallel_size: 8
+          tensor_parallel_size: 4
           enable_expert_parallel: true
           sequence_parallel_size: 1
           ulysses_degree: 1

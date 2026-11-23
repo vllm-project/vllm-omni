@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
 import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, init_none_hash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheTensor,
 )
 from vllm.v1.request import RequestStatus
 
+from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVContext, DiffusionKVRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -47,6 +49,51 @@ def test_request_exposes_native_request_and_diffusion_semantics() -> None:
     assert request.skip_reading_prefix_cache is True
     assert request.shared_prefix_boundary == 0
     assert request.status is RequestStatus.WAITING
+
+
+def test_request_builds_only_full_prefix_block_hashes() -> None:
+    hash_function = get_hash_fn_by_name("sha256")
+    init_none_hash(hash_function)
+    request = _request(
+        prefix_len=6,
+        target_len=2,
+        cache_token_ids=range(6),
+        mm_features=[
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="tail",
+                mm_position=PlaceholderRange(offset=4, length=2),
+            )
+        ],
+    )
+
+    request.build_block_hashes(BLOCK_SIZE, hash_function)
+
+    assert len(request.block_hashes) == 1
+    assert request.skip_reading_prefix_cache is False
+
+
+def test_changed_multimodal_identity_changes_the_block_hash() -> None:
+    hash_function = get_hash_fn_by_name("sha256")
+    init_none_hash(hash_function)
+    first = _request(cache_token_ids=range(4))
+    second = _request(
+        cache_token_ids=range(4),
+        mm_features=[
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-a",
+                mm_position=PlaceholderRange(offset=2, length=2),
+            )
+        ],
+    )
+
+    first.build_block_hashes(BLOCK_SIZE, hash_function)
+    second.build_block_hashes(BLOCK_SIZE, hash_function)
+
+    assert first.block_hashes != second.block_hashes
 
 
 @pytest.mark.parametrize(
@@ -119,7 +166,7 @@ def _manager(*, enable_caching: bool) -> KVCacheManager:
     group = KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)
     config = KVCacheConfig(
         num_blocks=8,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 8, shared_by=["layer0"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, 8, ["layer0"])],
         kv_cache_groups=[group],
     )
     return KVCacheManager(

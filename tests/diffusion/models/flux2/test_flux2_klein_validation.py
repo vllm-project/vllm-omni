@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -7,6 +7,7 @@ import torch
 from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import (
     Flux2KleinPipeline,
 )
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -78,3 +79,15 @@ def test_rejects_none_without_embeds():
 def test_accepts_none_with_prompt_embeds():
     pipe = _make_pipeline()
     _check(pipe, None, prompt_embeds=torch.randn(1, 256, 4096))
+
+
+@pytest.mark.parametrize(("height", "width", "dimension"), [(16, 1, "width"), (1, 16, "height")])
+def test_check_inputs_rejects_empty_output_grid(height, width, dimension):
+    with pytest.raises(OmniClientError, match=rf"{dimension}.*at least 16") as exc:
+        _make_pipeline().check_inputs(prompt="valid prompt", height=height, width=width)
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(("height", "width"), [(16, 16), (205, 333), (None, None)])
+def test_check_inputs_accepts_nonempty_or_default_dimensions(height, width):
+    _make_pipeline().check_inputs(prompt="valid prompt", height=height, width=width)

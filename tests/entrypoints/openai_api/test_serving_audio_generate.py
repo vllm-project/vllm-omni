@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import asyncio
 import logging
 from inspect import Signature, signature
 from types import SimpleNamespace
@@ -18,6 +22,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import (
     OmniOpenAIServingAudioGenerate,
 )
+from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -80,7 +85,12 @@ def _make_server(engine_client=None):
 
 
 @pytest.fixture
-def test_app():
+def test_app(monkeypatch):
+    # Exercise seeded request wiring with a CPU generator in this CPU API test.
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform",
+        SimpleNamespace(device_type="cpu"),
+    )
     server = _make_server()
 
     original_fn = server.create_audio_generate
@@ -91,7 +101,7 @@ def test_app():
     async def patched_create_audio_generate(*args, **kwargs):
         return await original_fn(*args, **kwargs)
 
-    patched_create_audio_generate.__signature__ = new_sig
+    setattr(patched_create_audio_generate, "__signature__", new_sig)
     server.create_audio_generate = patched_create_audio_generate
 
     app = FastAPI()
@@ -192,6 +202,36 @@ class TestRequestValidation:
         req = OpenAICreateAudioGenerateRequest(input="test", stream_format="audio")
         assert req.stream_format == "audio"
 
+    def test_audio_length_must_be_positive(self):
+        with pytest.raises(Exception):
+            OpenAICreateAudioGenerateRequest(input="test", audio_length=0.0)
+
+    def test_exact_num_frames_and_frame_rate_are_accepted(self):
+        req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, frame_rate=24.0)
+        assert req.num_frames == 121
+        assert req.frame_rate == 24.0
+
+    def test_model_specific_audio_parameters_are_accepted(self):
+        sigmas = [1.0, 0.5, 0.0]
+        req = OpenAICreateAudioGenerateRequest(
+            input="test",
+            extra_params={
+                "audio_cfg_scale": 7.0,
+                "audio_stg_scale": 0.0,
+                "audio_rescale_scale": 0.0,
+                "audio_stg_blocks": [28],
+                "sigmas": sigmas,
+            },
+        )
+
+        assert req.extra_params == {
+            "audio_cfg_scale": 7.0,
+            "audio_stg_scale": 0.0,
+            "audio_rescale_scale": 0.0,
+            "audio_stg_blocks": [28],
+            "sigmas": sigmas,
+        }
+
 
 # Constructor & Class Methods
 class TestConstructor:
@@ -244,6 +284,13 @@ class TestParameterWiring:
         assert call_kwargs["output_modalities"] == ["audio"]
 
     @pytest.mark.asyncio
+    async def test_watermarking_opt_out_wiring(self, server_and_engine):
+        server, engine = server_and_engine
+        await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="rain", watermarking=False))
+
+        assert engine.generate.call_args[1]["watermarking"] is False
+
+    @pytest.mark.asyncio
     async def test_negative_prompt_wiring(self, server_and_engine):
         server, engine = server_and_engine
         req = OpenAICreateAudioGenerateRequest(input="a calm ocean", negative_prompt="noise distortion")
@@ -271,6 +318,7 @@ class TestParameterWiring:
         sp = call_kwargs["sampling_params_list"][0]
         assert isinstance(sp, OmniDiffusionSamplingParams)
         assert sp.guidance_scale == 12.0
+        assert sp.guidance_scale_provided
 
     @pytest.mark.asyncio
     async def test_num_inference_steps_wiring(self, server_and_engine):
@@ -315,6 +363,75 @@ class TestParameterWiring:
         sp = engine.generate.call_args[1]["sampling_params_list"][0]
         assert sp.extra_args["audio_start_in_s"] == 2.0
         assert sp.extra_args["audio_end_in_s"] == 12.0  # start + length
+        assert sp.extra_args["audio_length"] == 10.0
+
+    @pytest.mark.asyncio
+    async def test_exact_num_frames_wiring(self, server_and_engine):
+        server, engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, frame_rate=24.0)
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args["num_frames"] == 121
+        assert sp.frame_rate == 24.0
+
+    @pytest.mark.asyncio
+    async def test_model_specific_audio_parameters_are_forwarded(self, server_and_engine):
+        server, engine = server_and_engine
+        engine.model_type = "LTX2TextToAudioPipeline"
+        sigmas = [1.0, 0.5, 0.0]
+        req = OpenAICreateAudioGenerateRequest(
+            input="test",
+            num_frames=121,
+            extra_params={
+                "audio_cfg_scale": 7.0,
+                "audio_stg_scale": 0.0,
+                "audio_rescale_scale": 0.0,
+                "audio_stg_blocks": [28],
+                "sigmas": sigmas,
+            },
+        )
+
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args == {
+            "num_frames": 121,
+            "audio_cfg_scale": 7.0,
+            "audio_stg_scale": 0.0,
+            "audio_rescale_scale": 0.0,
+            "audio_stg_blocks": [28],
+            "sigmas": sigmas,
+        }
+
+    @pytest.mark.asyncio
+    async def test_unregistered_model_specific_parameter_is_rejected(self, server_and_engine):
+        server, _engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", extra_params={"unknown": 1})
+
+        response = await server.create_audio_generate(req)
+
+        assert "Unsupported model-specific audio parameters: unknown" in response.error.message
+
+    @pytest.mark.asyncio
+    async def test_duplicate_common_and_model_specific_parameter_is_rejected(self, server_and_engine):
+        server, _engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, extra_params={"num_frames": 97})
+
+        response = await server.create_audio_generate(req)
+
+        assert "Audio parameters were provided more than once: num_frames" in response.error.message
+
+    @pytest.mark.asyncio
+    async def test_audio_length_and_num_frames_are_both_forwarded(self, server_and_engine):
+        server, engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", audio_length=5.0, num_frames=121)
+
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args["audio_length"] == 5.0
+        assert sp.extra_args["num_frames"] == 121
 
     @pytest.mark.asyncio
     async def test_audio_length_default_start(self, server_and_engine):
@@ -405,6 +522,35 @@ class TestAudioResponseFormat:
 
         audio_obj = mock_create_audio.call_args[0][0]
         assert audio_obj.sample_rate == 44100  # Stable Audio default
+
+    @pytest.mark.asyncio
+    async def test_audio_sample_rate_metadata_takes_precedence_over_legacy_sr(self):
+        engine = MagicMock()
+        engine.errored = False
+        engine.model_type = "LTX2TextToAudioPipeline"
+        engine.default_sampling_params_list = [{}]
+
+        async def generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="ltx-t2a",
+                images=[],
+                prompt=None,
+                metrics={},
+                multimodal_output={
+                    "audio": torch.zeros(16),
+                    "audio_sample_rate": 48000,
+                    "sr": 44100,
+                },
+            )
+
+        engine.generate = MagicMock(side_effect=generate)
+        server = _make_server(engine)
+        response = MagicMock(audio_data=b"audio", media_type="audio/wav")
+        server.create_audio = MagicMock(return_value=response)
+
+        await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="test"))
+
+        assert server.create_audio.call_args[0][0].sample_rate == 48000
 
 
 # Error Handling
@@ -501,7 +647,11 @@ class TestErrorHandling:
     @pytest.mark.parametrize(
         ("exc", "expected_message", "expected_stage_id"),
         [
-            (OmniEngineDeadError("engine dead", error_stage_id=2), "engine dead", 2),
+            (
+                OmniEngineDeadError("engine dead", error_stage_id=2),
+                OmniEngineDeadError.CLIENT_MESSAGE,
+                2,
+            ),
             (EngineGenerateError("engine generate failed"), "engine generate failed", None),
         ],
     )
@@ -515,7 +665,7 @@ class TestErrorHandling:
         handler.create_audio_generate = AsyncMock(side_effect=exc)
         app = _make_api_server_test_app(handler)
 
-        with patch.object(api_server_module, "terminate_if_errored") as terminate_mock:
+        with patch.object(serve_errors, "terminate_if_errored") as terminate_mock:
             with TestClient(app) as client:
                 response = client.post("/v1/audio/generate", json={"input": "Hello"})
 
@@ -553,7 +703,7 @@ class TestAudioGenerateAPI:
         assert response.headers["content-type"] == "audio/wav"
 
     def test_missing_input_rejected(self, client):
-        payload = {}
+        payload: dict[str, object] = {}
         response = client.post("/v1/audio/generate", json=payload)
         assert response.status_code == 422
 
@@ -562,3 +712,26 @@ class TestAudioGenerateAPI:
         response = client.post("/v1/audio/generate", json=payload)
         # Pydantic v2 ignores extra fields by default
         assert response.status_code == 200
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_audio_generation_inherits_engine_defaults(explicit: bool) -> None:
+    engine = _make_engine_client()
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+        guidance_scale=3.0,
+        seed=42,
+        extra_args={"stage_default": "keep"},
+    )
+    engine.default_sampling_params_list = [defaults]
+    server = _make_server(engine)
+    for override in (explicit, False):
+        request = OpenAICreateAudioGenerateRequest(input="rain", **({"guidance_scale": 0.0} if override else {}))
+        asyncio.run(server.create_audio_generate(request))
+        params = engine.generate.call_args.kwargs["sampling_params_list"][0]
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.num_inference_steps == 50
+        assert params.seed == 42
+        assert params.extra_args["stage_default"] == "keep"
+        params.extra_args["stage_default"] = "mutated"
+    assert defaults.extra_args == {"stage_default": "keep"}

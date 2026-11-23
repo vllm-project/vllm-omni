@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
+import json
 import logging
 import re
 import sys
@@ -58,6 +59,10 @@ class _FlexibleArgumentParser(ArgumentParser):
         group = self._FlexibleArgumentGroup(self, *args, **kwargs)
         self._action_groups.append(group)
         return group
+
+    def maybe_override_argument(self, group, option_string, *, argument_type, default, help):
+        # The docs parser is built fresh, so there is never an existing argument to override
+        return group.add_argument(option_string, type=argument_type, default=default, help=help)
 
 
 logger = logging.getLogger("mkdocs")
@@ -124,6 +129,11 @@ def extract_omni_serve_subparser_init():
                         "make_arg_parser": lambda parser: parser,  # no-op for doc
                         "_ensure_vllm_platform": lambda: None,  # no-op for doc
                         "_nonneg_finite_float": float,
+                        "_json_object": json.loads,
+                        "_parse_stage_overrides": __import__("json").loads,
+                        "_parse_stage_id": int,
+                        "_parse_watermark_config": json.loads,
+                        "_WATERMARK_CONFIG_HELP": "JSON watermark configuration.",
                         "VLLM_SUBCMD_PARSER_EPILOG": "",
                         "logger": logger,
                         "DummySubparsers": DummySubparsers,

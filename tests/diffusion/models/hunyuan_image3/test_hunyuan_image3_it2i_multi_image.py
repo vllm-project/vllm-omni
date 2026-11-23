@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Multi-image input regression for HunyuanImage3 IT2I prompt construction.
 
 The official HunyuanImage-3.0-Instruct supports up to 3 reference images
@@ -41,7 +41,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class FakeTokenizer:
-    """Recording fake tokenizer mirroring the one in test_prompt_utils.
+    """Recording fake tokenizer mirroring the one in test_hunyuan_image3_prompt_utils.
 
     Special token ids: `<|startoftext|>`=1, `<img>`=2, `<think>`=3,
     `<recaption>`=4. encode() returns one id per character starting at

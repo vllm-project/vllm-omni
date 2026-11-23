@@ -9,21 +9,80 @@ LoRA adapters are lightweight, model-specific fine-tuning weights that can be ap
 - **PEFT backend** (`--lora-backend peft`, default): Loads a PEFT-format adapter folder via `DiffusionLoRAManager`. Adapters are cached (LRU) and activated per request via `LoRARequest`. It uses a unified LoRA handling mechanisms similar to vLLM with LRU cache management.
 - **Distill backend** (`--lora-backend distill`): Calls `pipeline.load_lora_weights` once at initialization to fuse one or more concrete checkpoint files directly into the base weights. Typically used for distilled few-step LoRAs (e.g. Lightning, LightX2V).
 
+### Global merged policy
+
+`--lora-application merged` with `--lora-backend peft` merges a single startup
+`--lora-path` into unquantized dense weights. Requests use the merged policy
+without attaching a `LoRARequest`; per-request adapter selection is rejected.
+Removing the adapter restores the exact base weights. Runtime application is
+the default. Fixed-model adapters, MoE, HSDP and inference weight offloading are
+not supported by this generic path.
+
+For adapter-only RL updates and memory/validation requirements, see
+[engine-side LoRA merge](../weight_transfer.md#engine-side-lora-merge).
+
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
+
 A typical PEFT-format LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
 ```
 
 The `adapter_config.json` file contains metadata about the LoRA adapter, including:
+
 - `r`: LoRA rank
 - `lora_alpha`: LoRA alpha scaling factor
 - `target_modules`: List of module names to apply LoRA to
+
+Every module supplied by a PEFT adapter must bind successfully when the adapter
+is activated. If any module cannot bind, activation raises an error naming the
+unbound modules and resets the LoRA layers to avoid leaving the adapter partly
+active. An adapter may still target only some projections of a fused layer, such
+as Q and V without K, as long as all supplied modules bind.
+
+Previously, some adapters activated even when unmatched modules were silently
+dropped. Those adapters now fail at activation. For example, in-memory tensor
+adapters for Qwen-Image, Boogu-Image, and Wan can contain checkpoint keys such
+as `to_out.0` where the engine expects `to_out`. PEFT checkpoints with extra
+unbound keys also fail at activation if those keys pass the loader's earlier
+validation; unsupported module suffixes may already fail during loading.
+Checkpoint-to-engine name mapping is tracked in [#8001](https://github.com/vllm-project/vllm-omni/issues/8001);
+until it is available, adapter keys must resolve to supported engine modules.
+
+## LoRA scale semantics
+
+The request-level `lora_scale` is a multiplier applied on top of the adapter's
+own PEFT scaling, not a replacement for it. The applied weight delta is:
+
+```text
+delta = lora_scale × (lora_alpha / r) × (B @ A)
+```
+
+At load time the `lora_alpha / r` factor is folded into the adapter weights
+(upstream `LoRALayerWeights.optimize`); `lora_scale` is applied when the adapter
+is activated. This is the same convention as diffusers'
+`cross_attention_kwargs={"scale": s}` and LightX2V's `--lora-scale`: to
+reproduce a reference invocation, pass the same numeric value here.
+
+Do **not** pass the already-multiplied effective strength `scale × alpha /
+rank`. That applies `alpha / r` a second time and shrinks the adapter by that
+factor.
+
+!!! example "MiniMax-H3 Turbo"
+    LightX2V's reference script drives
+    `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` (rank 128,
+    declared `alpha` 8) with `--lora-scale 1.3`, an effective strength of
+    `1.3 × 8 / 128 = 0.08125`. Passing `0.08125` as vLLM-Omni's `lora_scale`
+    yields `0.08125 × 8 / 128 ≈ 0.005` — 1/16 of the intended strength. An
+    8-step distilled sampler running at 1/16 adapter strength produces blurred
+    output. Pass `1.3`, the same number the reference uses. See the
+    [Turbo LoRA table](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#turbo-lora)
+    for the declared `alpha` of every published artifact.
 
 ## Quick Start
 
@@ -35,6 +94,7 @@ Load a PEFT-format LoRA adapter at initialization. The adapter is pre-loaded int
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 lora_path = "/path/to/lora_adapter"
@@ -52,22 +112,72 @@ lora_request = LoRARequest(
 )
 
 outputs = omni.generate(
-    prompt="A piece of cheesecake",
-    lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
+    "A piece of cheesecake",
+    OmniDiffusionSamplingParams(
+        lora_request=lora_request,
+        lora_scale=2.0,  # optional arg, default 1.0
+    ),
 )
 ```
+
+#### PEFT backend: stacking multiple LoRAs in one request
+
+A single request can activate several LoRA adapters at once, each with its own
+scale. The adapters are composed into a single adapter whose per-layer rank is
+the sum of the individual ranks; the composed adapter is cached and activated
+like any other adapter, and requests with different LoRA combinations (or
+different scales) are scheduled into separate batches.
+
+Constraints:
+
+- The summed rank of the stacked adapters must not exceed **512** per layer.
+  Two or three typical LoRAs (rank 4-64) fit comfortably.
+- Adapters with a scale of approximately 0 are skipped.
+- Packed-projection stacking requires a compatible loader and packed-module mapping; MiniMax-H3 supports its fused QKV and MLP projections.
+- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen cannot be composed with other adapters.
+- FastH3 Omni accepts ordinary adapters with independent scales, including under distributed layerwise offload; Turbo and native distilled adapters remain unsupported with this checkpoint.
+
+Offline: pass a list of `LoRARequest` objects together with a matching list of
+scales:
+
+```python
+outputs = omni.generate(
+    prompt="A piece of cheesecake",
+    lora_request=[lora_request_a, lora_request_b],
+    lora_scale=[0.8, 0.6],
+)
+```
+
+Online: the `lora` request field accepts an array of objects instead of a
+single object (a single object remains valid):
+
+```json
+"lora": [
+  {"name": "style", "local_path": "/path/to/style.safetensors", "scale": 0.8, "int_id": 1},
+  {"name": "character", "local_path": "/path/to/character.safetensors", "scale": 0.6, "int_id": 2}
+]
+```
+
+`int_id` is optional; when omitted it is derived from `local_path`.
 
 #### Distill backend: fuse distilled LoRA at init
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
+
+For Qwen-Image pipelines, single-file `lora_A`/`lora_B` weights may include the `.default` adapter suffix (for example `<module>.lora_A.default.weight`). Bias deltas are named `<module>.bias` and do not use the `.default` suffix. Both may omit the `transformer.` prefix. These names are normalized before fusion. If no weights match the transformer, loading raises an error instead of registering the adapter as fused.
+
+With tensor parallelism, the fusion loader selects each rank's portion of the
+adapter delta to match the base linear weights. Packed QKV and merged column
+projections are split per projection before being packed for each rank.
+Replicated weights and row-parallel biases keep the full delta. Unloading an
+adapter uses the same partitioning.
 
 ##### Supported pipelines
 
 For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
 
 | Pipeline | Supported distilled LoRA repo | Notes |
-|----------|--------------------------------|-------|
+| ---------- | -------------------------------- | ------- |
 | `QwenImagePipeline` | `lightx2v/Qwen-Image-2512-Lightning` | Used with Qwen-Image-2512 Lightning-style few-step inference. |
 | `Wan22Pipeline` | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Wan2.1 uses one LoRA file. For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 | `Wan22I2VPipeline` | `lightx2v/Wan2.2-Distill-Loras` | For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
@@ -85,7 +195,7 @@ omni = Omni(
     lora_backend="distill",
 )
 
-outputs = omni.generate(prompt="A piece of cheesecake")
+outputs = omni.generate("A piece of cheesecake")
 ```
 
 Multi-file example (Wan2.2 MoE, high + low noise):
@@ -240,6 +350,63 @@ Notes:
 - Output quality and speed depend on the replacement checkpoints and sampling params you choose.
 - If you only need to fuse distilled LoRAs into a Wan2.2 checkpoint at load time (without the full LightX2V convert + assemble pipeline), you can instead pass them directly via `--lora-backend distill --lora-path <high>.safetensors <low>.safetensors`. See the [Distill backend](#distill-backend-fuse-distilled-lora-at-init) section above.
 
+## MiniMax-H3 adapter-declared schedules
+
+MiniMax-H3 counts `num_inference_steps` as denoising updates: requesting `8`
+produces eight updates using nine sigma boundaries, including the terminal zero.
+Earlier uniform-schedule requests counted boundaries instead; to reproduce an
+old N-point schedule, request N-1 steps. This also changes Turbo requests from
+`5`/`9` to `4`/`8`, preserving their sampling grids. Checkpoint-pinned and native
+LoRA schedules already count updates and are unchanged.
+
+MiniMax-H3 supports the following few-step mechanisms:
+
+- **Checkpoint-pinned schedule**: a merged release writes `base_schedule` into
+  `model_index.json`. Requests must pass `num_inference_steps` as the interval
+  count (for example `4` for `[1.0, 0.7, 0.4, 0.15, 0.0]`).
+- **Runtime Turbo LoRA**: each LightX2V Turbo artifact carries its own contract,
+  read from its filename. A four-step artifact requests `num_inference_steps=4`
+  and an eight-step one requests `8`; the scheduler adds the terminal sigma
+  boundary. The 768p retrains enforce `flow_shift=6` and the
+  544p artifacts `flow_shift=12`. `audio_flow_shift=3` across the family. A
+  request that does not match the loaded artifact is rejected by name. Alpha
+  comes from the artifact's metadata, or 8 when it declares none. `ref2v`
+  artifacts require `--task-type ref2va`; `fl2v` artifacts serve T2VA and FL2VA.
+  The ComfyUI exports use a fused-QKV layout and are not supported.
+- **Runtime native LoRA**: FlashGen-style artifacts declare
+  `key_format=minimax-h3-native` and embed `base_schedule` in safetensors
+  metadata. When active, the adapter schedule overrides the base checkpoint and
+  requests must use the interval-count contract (`num_inference_steps=4`).
+  Request-mode generation may omit the field and take the count from the adapter
+  schedule; step execution requires it explicitly, because the step scheduler
+  derives the total step count from the request before the adapter schedule is
+  known.
+
+FlashGen native adapters require `--lora-application runtime` (the default).
+The loader rejects `merged` application before reading adapter tensors,
+because a globally merged policy does not select the adapter-declared schedule
+or validate its request contract. Native adapters cannot be stacked with other
+active adapters, including cold-loaded sources that are used transiently
+for composition without entering the adapter cache.
+
+Native v2 FL2VA/Ref2VA exports require request `scale=1.0`, `flow_shift=12`
+and `audio_flow_shift=3`. A zero scale disables the adapter and its sampling
+constraints. See the [MiniMax-H3 recipe](gh-file:recipes/MiniMaxAI/MiniMax-H3.md#flashgen-native-lora)
+for base partitions and the validated conditioning scope.
+
+Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
+`qkv_proj` LoRA rows with the same `_reorder_grouped_qkv_to_qkv` helper used for
+base-weight loading, then binds the packed Q/K/V slices through the PEFT
+manager.
+
+Both runtime adapters run with distributed layerwise offload in request-mode
+generation, where the manager keeps the LoRA A/B buffers resident on the compute
+device while DLO streams the base blocks. MiniMax-H3 step execution still
+rejects DLO, so `--step-execution` cannot be combined with
+`--enable-distributed-layerwise-offload`. Model-level CPU offload and standard
+layerwise offload are rejected in every mode, because the dynamic LoRA tensors
+are neither parameters nor registered buffers and therefore do not participate
+in those weight lifecycles.
 
 ## See Also
 

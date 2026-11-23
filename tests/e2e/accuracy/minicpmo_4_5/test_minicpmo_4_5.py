@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Daily-Omni + Seed-TTS accuracy regression coverage.
 
 Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
-~78% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
-text modalities, and server ``--interleave-mm-strings`` + 1fps / 128-frame
-media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
+~77% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
+text modalities, and interleaved multimodal strings with video at 1 fps and
+128 frames on stage 0, also pinned in ``minicpmo_4_5.yaml``).
+
+Seed-TTS WER, speaker similarity (SIM), and UTMOS are gated over
+``/v1/chat/completions`` (whole-utterance TTS) on the duplex deploy config
+with the stock Code2Wav. The UTMOS checkpoint is retargeted onto CUDA or NPU.
+The numeric MOS floor is applied on CUDA and skipped on NPU until an A3 run
+measures one.
+The native per-unit full-duplex path is not gated here: the checkpoint's own
+per-unit boundaries split words across Talker conditions, so that path scores
+~0.075 WER on this benchmark (the HF ``MiniCPMODuplex`` reference scores
+~0.14) and cannot meet the 0.05 WER gate.
 """
 
 from __future__ import annotations
@@ -16,15 +27,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.qwen3_omni import run_qwen_omni_acc_benchmark as _acc_bench
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
-    build_acc_benchmark_cli_argv,
-    find_vllm_cli,
-)
-from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import SERVER_PARAMS as DUPLEX_TEST_PARAMS
+from tests.e2e.accuracy import helpers as _acc_bench
+from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_cli
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
 _MODEL = os.environ.get("VLLM_TEST_MINICPMO_4_5_MODEL", "openbmb/MiniCPM-o-4_5")
 _DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
@@ -35,8 +43,21 @@ _RESULT_DIR = Path(
     )
 )
 
-_MIN_DAILY_OMNI_ACCURACY = 0.78
+# The 0.78 gate (934/1197) sits 1 item above the observed NPU mean
+# (~933/1197) and inside the observed 932~940 spread, so it flips nightly -
+# 3 failures in the latest 7 dated NPU nightlies (#6887). 0.77 (922/1197)
+# sits 10 items below the observed minimum (932) while still failing a
+# >=1pp real accuracy regression.
+_MIN_DAILY_OMNI_ACCURACY = 0.77
 _MAX_SEED_TTS_MEAN_WER = 0.05
+# English Seed-TTS, 1088 utterances. 2026-10-08 mean SIM 0.865 (median 0.869),
+# WER 0.021. 2026-10-20 L20X stock and bfloat16-cache runs scored SIM 0.8655
+# and 0.8652, UTMOS 3.3684 and 3.3685, WER 0.0211 and 0.0214. Three 32-utterance
+# checks on 2026-10-06 scored SIM 0.855, 0.855, and 0.856. 0.80 is 0.055
+# below the lowest SIM. UTMOS 3.10 is 0.268 below the L20X means. That floor
+# stays off NPU until an A3 run measures MOS.
+_MIN_SEED_TTS_MEAN_SIM = 0.80
+_MIN_SEED_TTS_MEAN_UTMOS = 3.10
 # Match the validated Daily-Omni client body from daily_omni_bench.sh.
 _DAILY_EXTRA_BODY = {
     "modalities": ["text"],
@@ -49,15 +70,12 @@ _SEED_EXTRA_BODY = {
         "use_tts_template": True,
     },
 }
-# Server flags required for MiniCPM interleaved image/audio packs (Daily-Omni only).
-# Do not reuse these for Seed-TTS: ``--interleave-mm-strings`` + TTS ref_audio can trip
-# msgspec ValidationError and kill the orchestrator mid-suite.
-# Also pinned in ``minicpmo_4_5.yaml`` stage 0 so they survive config-path routing.
+# Daily-Omni's interleaved image/audio packs are handled by the Thinker.
+# Interleaving TTS ref_audio can raise a msgspec ValidationError in the orchestrator.
 _DAILY_OMNI_SERVER_ARGS = [
     "--trust-remote-code",
-    "--interleave-mm-strings",
-    "--media-io-kwargs",
-    '{"video":{"fps":1,"num_frames":128}}',
+    "--stage-overrides",
+    '{"0":{"interleave_mm_strings":true,"media_io_kwargs":{"video":{"fps":1,"num_frames":128}}}}',
 ]
 _SEED_TTS_SERVER_ARGS = [
     "--trust-remote-code",
@@ -114,7 +132,7 @@ def _inline_daily_omni_media(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @requires_daily_omni_deps
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", daily_test_params, indirect=True)
 def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
@@ -147,9 +165,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", seed_test_params, indirect=True)
-def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
+def _run_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()
     pytest.importorskip("huggingface_hub")
 
@@ -164,45 +180,21 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
             str(_RESULT_DIR),
             "--max-seed-tts-mean-wer",
             str(_MAX_SEED_TTS_MEAN_WER),
+            "--min-seed-tts-mean-sim",
+            str(_MIN_SEED_TTS_MEAN_SIM),
             "--seed-extra-body-json",
             json.dumps(_SEED_EXTRA_BODY, separators=(",", ":")),
+            "--omni-fail-fast-on-timeout",
             "--trust-remote-code",
         ]
     )
+    if current_omni_platform.is_cuda():
+        argv.extend(["--min-seed-tts-mean-utmos", str(_MIN_SEED_TTS_MEAN_UTMOS)])
 
     assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", DUPLEX_TEST_PARAMS, indirect=True)
-def test_minicpmo_4_5_duplex_seed_tts_wer_bench(omni_server) -> None:
-    """Gate Seed-TTS WER through the explicit Realtime TTS contract."""
-    _require_vllm_cli()
-    pytest.importorskip("huggingface_hub")
-
-    argv = build_acc_benchmark_cli_argv(
-        omni_server,
-        skip_seed=False,
-        skip_daily=True,
-        num_prompts=50,
-        max_concurrency=1,
-    )
-    argv.extend(
-        [
-            "--result-dir",
-            str(_RESULT_DIR),
-            "--max-seed-tts-mean-wer",
-            str(_MAX_SEED_TTS_MEAN_WER),
-            "--seed-extra-body-json",
-            json.dumps({"save_duplex_request_metrics": True}, separators=(",", ":")),
-            "--seed-backend",
-            "openai-realtime-tts",
-            "--seed-endpoint",
-            "/v1/realtime",
-            "--seed-tts-turns-per-session",
-            "4",
-            "--trust-remote-code",
-        ]
-    )
-
-    assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", seed_test_params, indirect=True)
+def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
+    _run_seed_tts_wer_bench(omni_server)

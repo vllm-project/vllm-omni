@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OpenAI-compatible client for Qwen3-TTS via /v1/audio/speech endpoint.
 
 This script demonstrates how to use the OpenAI-compatible speech API
@@ -5,25 +8,28 @@ to generate audio from text using Qwen3-TTS models.
 
 Examples:
     # CustomVoice task (predefined speaker)
-    python openai_speech_client.py --text "Hello, how are you?" --voice vivian
+    python openai_speech_client.py --text "Hello, how are you?" --speaker vivian
 
     # CustomVoice with emotion instruction
-    python openai_speech_client.py --text "I'm so happy!" --voice vivian \
+    python openai_speech_client.py --text "I'm so happy!" --speaker vivian \
         --instructions "Speak with excitement"
 
     # VoiceDesign task (voice from description)
     python openai_speech_client.py --text "Hello world" \
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
         --task-type VoiceDesign \
         --instructions "A warm, friendly female voice"
 
     # Base task (voice cloning)
     python openai_speech_client.py --text "Hello world" \
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
         --task-type Base \
         --ref-audio "https://example.com/reference.wav" \
         --ref-text "This is the reference transcript"
 
     # Base task with pre-computed speaker embedding
     python openai_speech_client.py --text "Hello world" \
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
         --task-type Base \
         --speaker-embedding embedding.json
 """
@@ -74,6 +80,8 @@ def run_tts_generation(args) -> None:
         "voice": args.speaker,
         "response_format": args.response_format,
     }
+    if args.sample_rate is not None:
+        payload["sample_rate"] = args.sample_rate
 
     # Add optional parameters
     if args.instructions:
@@ -245,6 +253,13 @@ def parse_args():
         default="wav",
         choices=["wav", "mp3", "flac", "pcm", "aac", "opus"],
         help="Audio output format (default: wav)",
+    )
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=None,
+        choices=[8000, 24000],
+        help="Output sample rate in Hz (default: model native)",
     )
     parser.add_argument(
         "--output",

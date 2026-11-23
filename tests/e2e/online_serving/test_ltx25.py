@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Online serving smokes for all four canonical LTX-2.5 pipelines."""
 
 import os
 
 import pytest
+import torch
 
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
@@ -21,17 +21,8 @@ MODEL_REVISION = os.getenv("VLLM_TEST_LTX25_MODEL_REVISION", DEFAULT_REVISION if
 PROMPT = "A red fox walks through a snowy forest while the camera remains fixed."
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-
-
-@pytest.fixture(scope="module", autouse=True)
-def require_ltx25_model_access() -> None:
-    if not os.path.isdir(MODEL):
-        skip_if_gated_repo_inaccessible(
-            MODEL,
-            revision=MODEL_REVISION or None,
-            filename="model_index.json",
-        )
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+ATTENTION_BACKEND = "TORCH_SDPA" if torch.version.hip is not None else "CUDNN_ATTN"
 
 
 def _server(model_class_name: str) -> OmniServerParams:
@@ -44,7 +35,7 @@ def _server(model_class_name: str) -> OmniServerParams:
             "--enforce-eager",
             "--enable-layerwise-offload",
             "--diffusion-attention-backend",
-            "CUDNN_ATTN",
+            ATTENTION_BACKEND,
         ],
     )
 
@@ -73,8 +64,8 @@ def test_ltx25_pipeline_entries(
                 "form_data": {
                     "model": omni_server.model,
                     "prompt": PROMPT,
-                    "height": 128,
-                    "width": 128,
+                    "height": 256,
+                    "width": 256,
                     "num_frames": 9,
                     "fps": 24,
                     "num_inference_steps": num_inference_steps,

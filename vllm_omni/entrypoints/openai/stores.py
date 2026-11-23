@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 from typing import Any, Generic, TypeVar
 
@@ -64,6 +67,11 @@ class AsyncDictStore(Generic[T]):
     async def pop(self, key: str) -> T | None:
         async with self._lock:
             return self._items.pop(key, None)
+
+    async def remove_many(self, keys: list[str]) -> None:
+        async with self._lock:
+            for key in keys:
+                self._items.pop(key, None)
 
     async def list_values(self) -> list[T]:
         async with self._lock:

@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/diffusers_pipeline_adapter>.
 
-
 vLLM-Omni supports running diffusion models with the diffusers backend, directly serving any 🤗 Diffusers pipeline online without implementing them natively.
 
 ## Limitations
@@ -16,6 +15,7 @@ implemented with clear Diffusers or vLLM-Omni behavior.
 - Sequence parallel execution
 - TeaCache / Cache-DiT acceleration
 - Step-wise execution (continuous batching)
+- Component-selective `diffusion_offload_config` (the legacy whole-pipeline CPU-offload options remain supported)
 
 For these features, it is recommended to use natively supported pipelines instead.
 
@@ -50,7 +50,13 @@ After launching the model, users send a request as usual. Refer to other documen
 
 ### `--diffusers-load-kwargs`
 
-Passed as-is to `DiffusionPipeline.from_pretrained()`.
+Passed to `DiffusionPipeline.from_pretrained()`.
+
+For Diffusers 0.42+, `dduf_file` is materialized locally before loading.
+This requires additional temporary disk space of the uncompressed archive size
+for each live pipeline in each worker. The directory is released with the pipeline
+or on load failure; normal process exit also cleans it. A forced kill can leave
+files for operating-system cleanup. Older versions retain native DDUF loading.
 
 This is suitable for model-specific configurations not available through the vLLM-Omni interface.
 For example: `--diffusers-load-kwargs '{"use_safetensors": true}'`.

@@ -1,24 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
+import gc
 import multiprocessing as mp
 import queue
 import threading
 import time
+from collections import OrderedDict
 from multiprocessing import shared_memory
+from multiprocessing.connection import Connection
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
+import vllm_omni.diffusion.ipc as diffusion_ipc
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import (
     _SHM_TENSOR_THRESHOLD,
     DIFFUSION_RPC_RESULT_ENVELOPE,
     _pack_value_if_large,
+    _tensor_from_shm,
+    _tensor_to_shm,
     _unpack_if_shm_handle,
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -29,7 +36,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _large_numel(dtype: torch.dtype) -> int:
-    return (_SHM_TENSOR_THRESHOLD // torch.empty((), dtype=dtype).element_size()) + 1
+    return int(_SHM_TENSOR_THRESHOLD // torch.empty((), dtype=dtype).element_size()) + 1
 
 
 def _cleanup_shm_handle(value: object) -> None:
@@ -38,7 +45,7 @@ def _cleanup_shm_handle(value: object) -> None:
             _unpack_if_shm_handle(value)
 
 
-def _result_queue_worker(connection, rank: int) -> None:
+def _result_queue_worker(connection: Connection, rank: int) -> None:
     """Send one nested NumPy result through a worker-owned MessageQueue."""
     result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
     try:
@@ -107,6 +114,7 @@ def test_per_worker_result_queues_release_nested_numpy_shm_and_processes() -> No
         executor._rpc_futures = {}
         executor._output_futures = {}
         executor._completed_outputs = {}
+        executor._dropped_output_ids = OrderedDict()
         executor._batch_split_map = {}
         executor._start_result_pump()
 
@@ -180,7 +188,7 @@ def test_diffusion_output_dict_tensors_round_trip_through_shm() -> None:
 
 
 def test_diffusion_output_tuple_tensors_round_trip_through_shm() -> None:
-    # LTX2 / DreamID return (video, audio) tuples as DiffusionOutput.output.
+    # LTX2 returns (video, audio) tuples as DiffusionOutput.output.
     video = torch.arange(300_000, dtype=torch.float32)
     audio = torch.arange(300_000, dtype=torch.float32) * 3
     output = DiffusionOutput(output=(video, audio))
@@ -235,6 +243,77 @@ def test_numpy_object_array_stays_inline() -> None:
     packed = _pack_value_if_large(values)
 
     assert packed is values
+
+
+@pytest.mark.parametrize("writeable", [True, False])
+def test_nested_non_native_endian_numpy_round_trips_through_shm(writeable: bool) -> None:
+    dtype = np.dtype(np.float32).newbyteorder("S")
+    values = np.arange(300_000, dtype=dtype).reshape(600, 500)
+    values.flags.writeable = writeable
+    output = DiffusionOutput(output={"nested": [values]})
+    created = []
+
+    try:
+        pack_diffusion_output_shm(output)
+        handle = output.output["nested"][0]
+        created.append(handle)
+        assert handle["__ndarray_shm__"] is True
+        assert handle["numpy_dtype"] == str(dtype)
+
+        unpack_diffusion_output_shm(output)
+        restored = output.output["nested"][0]
+        assert restored.dtype == dtype
+        assert restored.shape == values.shape
+        np.testing.assert_array_equal(restored, values)
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=handle["name"])
+    finally:
+        diffusion_ipc._unlink_shm_handles(created)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_numpy_packing_failure_unlinks_all_allocations(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
+) -> None:
+    first = np.arange(300_000, dtype=np.float32)
+    second = first.copy()
+    payload = {"nested": [first, second]}
+    output = DiffusionOutput(output=payload)
+    segments = []
+    real_new_shm_array = diffusion_ipc._new_shm_array
+
+    def track_allocation(shape, dtype):
+        shm, array, handle = real_new_shm_array(shape, dtype)
+        segments.append(shm)
+        return shm, array, handle
+
+    error = error_type("injected packing failure")
+
+    def fail_second_copy(*args, **kwargs):
+        if len(segments) == 2:
+            raise error
+        return real_copy(*args, **kwargs)
+
+    real_copy = np.copyto
+    monkeypatch.setattr(diffusion_ipc, "_new_shm_array", track_allocation)
+    monkeypatch.setattr(np, "copyto", fail_second_copy)
+
+    try:
+        with pytest.raises(error_type, match="injected packing failure") as raised:
+            pack_diffusion_output_shm(output)
+
+        assert raised.value is error
+        assert output.output is payload
+        assert len(segments) == 2
+        for segment in segments:
+            assert segment.buf is None
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=segment.name)
+    finally:
+        for segment in segments:
+            segment.close()
+            with contextlib.suppress(FileNotFoundError):
+                segment.unlink()
 
 
 def test_rpc_result_envelope_diffusion_output_round_trips_through_shm() -> None:
@@ -309,11 +388,9 @@ def test_per_request_views_of_a_batch_tensor_do_not_ship_whole_storage() -> None
     """Regression: per-request slices used to pickle the whole batch storage.
 
     Each view is under the packing threshold, but pickle writes the entire
-    shared storage per view, so a batch's message grew by the full batch
-    tensor once per request and overflowed the ring buffer.
+    shared storage per view. Packing must key off storage nbytes so those
+    views become SHM handles instead of going on the wire.
     """
-    import pickle
-
     num_requests = 16
     # Each row stays under the threshold; the shared storage is well over it.
     row_numel = _SHM_TENSOR_THRESHOLD // (2 * torch.empty((), dtype=torch.float32).element_size())
@@ -321,6 +398,13 @@ def test_per_request_views_of_a_batch_tensor_do_not_ship_whole_storage() -> None
     per_request = batch[0]
     assert per_request.nelement() * per_request.element_size() <= _SHM_TENSOR_THRESHOLD
     assert per_request.untyped_storage().nbytes() > _SHM_TENSOR_THRESHOLD
+
+    packed_view = _pack_value_if_large(per_request)
+    try:
+        assert isinstance(packed_view, dict)
+        assert packed_view["__tensor_shm__"] is True
+    finally:
+        _cleanup_shm_handle(packed_view)
 
     output = BatchRunnerOutput.from_list(
         [
@@ -332,16 +416,10 @@ def test_per_request_views_of_a_batch_tensor_do_not_ship_whole_storage() -> None
             for i in range(num_requests)
         ]
     )
-    unpacked_size = len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL))
 
     pack_diffusion_output_shm(output)
-    packed_size = len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL))
 
     assert output.runner_outputs[0].result.trajectory_latents["__tensor_shm__"] is True
-    # Whole storage per request before; handles only after.
-    storage_bytes = per_request.untyped_storage().nbytes()
-    assert unpacked_size > num_requests * storage_bytes / 2
-    assert packed_size < _SHM_TENSOR_THRESHOLD
 
     unpack_diffusion_output_shm(output)
     for i in range(num_requests):
@@ -380,31 +458,37 @@ def test_pack_value_recurses_nested_dicts_and_lists_without_mutating_inline_valu
     large = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
     small = torch.arange(8, dtype=torch.float32)
     list_tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    original_list = [list_tensor]
     payload = {
         "media": {
             "large": large,
             "small": small,
         },
-        "list_value": [list_tensor],
+        "list_value": original_list,
         "metadata": {"prompt": "keep inline"},
     }
 
     packed = _pack_value_if_large(payload)
 
     try:
+        assert isinstance(packed, dict)
         assert packed is not payload
-        assert packed["media"] is not payload["media"]
-        assert packed["media"]["large"]["__tensor_shm__"] is True
-        assert packed["media"]["small"] is small
+        media = packed["media"]
+        list_value = packed["list_value"]
+        assert isinstance(media, dict)
+        assert isinstance(list_value, list)
+        assert media is not payload["media"]
+        assert media["large"]["__tensor_shm__"] is True
+        assert media["small"] is small
         # Lists are recursed too: the large tensor inside is packed and a new
         # list is returned, while the input payload is left untouched.
-        assert packed["list_value"] is not payload["list_value"]
-        assert packed["list_value"][0]["__tensor_shm__"] is True
-        assert payload["list_value"][0] is list_tensor
+        assert list_value is not original_list
+        assert list_value[0]["__tensor_shm__"] is True
+        assert original_list[0] is list_tensor
         assert packed["metadata"] == {"prompt": "keep inline"}
 
-        torch.testing.assert_close(_unpack_if_shm_handle(packed["media"]["large"]), large)
-        torch.testing.assert_close(_unpack_if_shm_handle(packed["list_value"][0]), list_tensor)
+        torch.testing.assert_close(_unpack_if_shm_handle(media["large"]), large)
+        torch.testing.assert_close(_unpack_if_shm_handle(list_value[0]), list_tensor)
     finally:
         if isinstance(packed, dict):
             _cleanup_shm_handle(packed.get("media", {}).get("large"))
@@ -422,12 +506,77 @@ def test_pack_value_preserves_dtype_shape_and_values_for_bfloat16() -> None:
         assert packed["__tensor_shm__"] is True
         assert packed["shape"] == list(tensor.shape)
         assert packed["torch_dtype"] == "torch.bfloat16"
-        assert packed["numpy_dtype"] == "float32"
+        assert packed["numpy_dtype"] == "uint16"
 
         unpacked = _unpack_if_shm_handle(packed)
         assert isinstance(unpacked, torch.Tensor)
         assert unpacked.dtype == torch.bfloat16
-        torch.testing.assert_close(unpacked, tensor)
+        assert torch.equal(unpacked.view(torch.uint16), tensor.view(torch.uint16))
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+@pytest.mark.parametrize("enable_registered_shm", [False, True])
+def test_plain_path_host_tensors_never_borrow_shm_on_unpack(enable_registered_shm: bool) -> None:
+    # The opt-in only borrows on the CUDA-registered path. A tensor that falls
+    # back to the plain path (here: a host tensor) keeps copy-and-unlink, so
+    # /dev/shm is not held by live outputs on ROCm / NPU / XPU or host tensors.
+    tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    packed = diffusion_ipc._tensor_to_shm(tensor, enable_registered_shm=enable_registered_shm)
+
+    try:
+        assert not packed.get("borrow_on_unpack")
+        segment = shared_memory.SharedMemory(name=packed["name"])
+        try:
+            unpacked = _unpack_if_shm_handle(packed)
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=packed["name"])
+            # Write through the unlinked segment: a copied-out tensor must not see it.
+            np.ndarray(tensor.shape, dtype=np.float32, buffer=segment.buf)[0] = -1.0
+            assert unpacked[0].item() == 0.0
+        finally:
+            segment.close()
+        # A view, like a per-request batch split, keeps the data valid alone.
+        tail = unpacked[1:]
+        del unpacked
+        gc.collect()
+        torch.testing.assert_close(tail, tensor[1:])
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+class _UnusableStream:
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"host tensors must not use the D2H stream (accessed {name!r})")
+
+
+def test_host_tensor_with_d2h_stream_skips_staging_copy() -> None:
+    tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    output = DiffusionOutput(output=tensor)
+
+    pack_diffusion_output_shm(output, d2h_stream=_UnusableStream())
+    packed = output.output
+    try:
+        assert isinstance(packed, dict) and packed["__tensor_shm__"] is True
+        unpack_diffusion_output_shm(output)
+        torch.testing.assert_close(output.output, tensor)
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+def test_bfloat16_nan_payloads_round_trip_bit_exact() -> None:
+    # Quiet and signalling NaNs with payloads and both signs, plus -inf and the
+    # smallest subnormal. An fp32 round trip would collapse every NaN to 0x7fc0.
+    special = torch.tensor([0x7FC1, 0xFFA5, 0x7F81, 0x7FC0, 0xFF80, 0x0001], dtype=torch.int32).to(torch.uint16)
+    bits = special.repeat(_large_numel(torch.bfloat16) // special.numel() + 1)
+    tensor = bits.view(torch.bfloat16)
+    packed = _pack_value_if_large(tensor)
+
+    try:
+        assert isinstance(packed, dict) and packed["numpy_dtype"] == "uint16"
+        unpacked = _unpack_if_shm_handle(packed)
+        assert unpacked.dtype == torch.bfloat16
+        assert torch.equal(unpacked.view(torch.uint16), bits)
     finally:
         _cleanup_shm_handle(packed)
 
@@ -448,3 +597,92 @@ def test_pack_value_packs_non_contiguous_large_tensor_values() -> None:
         torch.testing.assert_close(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
+
+
+class _DeviceTensorDouble:
+    """Test double for a device tensor inside the cpu-marked suite.
+
+    ``_tensor_to_shm`` stages only non-CPU tensors (#9487), so the d2h tests
+    wrap a real host tensor and report a non-CPU device instead; ``detach()``
+    still yields host storage the staging ``copy_`` can read.
+    """
+
+    def __init__(self, values: torch.Tensor):
+        self._values = values
+        self.dtype = values.dtype
+        self.device = SimpleNamespace(type="npu")
+
+    def detach(self) -> torch.Tensor:
+        return self._values
+
+
+def _drive_d2h(monkeypatch: pytest.MonkeyPatch, *, pin_error: Exception | None = None):
+    """Run _tensor_to_shm's non-CPU d2h staging branch with the accelerator
+    stream faked out (this suite is cpu-marked; no real device exists).
+
+    Returns (attempts, fake_stream) where attempts records the pin_memory
+    flag of every staging allocation the branch made, in call order.
+    """
+
+    class FakeStream:
+        def synchronize(self) -> None:
+            pass
+
+    attempts: list[bool] = []
+    real_empty = torch.empty
+
+    def fake_empty(shape, dtype=None, pin_memory=False, **kwargs):
+        attempts.append(pin_memory)
+        if pin_memory and pin_error is not None:
+            raise pin_error
+        return real_empty(shape, dtype=dtype)
+
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda *a, **k: None)
+    monkeypatch.setattr(torch.accelerator, "set_stream", lambda *a, **k: None)
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    # Drive the fallback contract (pinned attempt, then pageable) regardless
+    # of how the host resolves PIN_MEMORY. raising=False keeps this file
+    # runnable against a pre-PIN_MEMORY ipc.py for base comparisons.
+    monkeypatch.setattr(diffusion_ipc, "PIN_MEMORY", True, raising=False)
+    return attempts, FakeStream()
+
+
+def test_d2h_pinned_failure_falls_back_to_pageable(monkeypatch):
+    """A host-page OOM on the pinned staging buffer degrades to a pageable
+    copy with identical bytes and dtype (the #9957 fallback)."""
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    attempts, stream = _drive_d2h(
+        monkeypatch,
+        pin_error=torch.OutOfMemoryError("aclrtMallocHostWithCfg failed: MallocHost out of memory"),
+    )
+
+    handle = _tensor_to_shm(_DeviceTensorDouble(x), stream, created=[])
+
+    assert attempts == [True, False]
+    # _tensor_from_shm consumes the segment (opens, reads and unlinks it), so
+    # no separate unlink is needed here.
+    restored = _tensor_from_shm(handle)
+    assert restored.dtype == x.dtype
+    assert torch.equal(restored, x)
+
+
+def test_d2h_re_raises_unrelated_pinned_allocation_errors(monkeypatch):
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    attempts, stream = _drive_d2h(monkeypatch, pin_error=RuntimeError("nvme controller wedged"))
+
+    with pytest.raises(RuntimeError, match="nvme controller wedged"):
+        _tensor_to_shm(_DeviceTensorDouble(x), stream, created=[])
+
+    assert attempts == [True]
+
+
+def test_d2h_uses_pinned_buffer_when_available(monkeypatch):
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    attempts, stream = _drive_d2h(monkeypatch)
+
+    handle = _tensor_to_shm(_DeviceTensorDouble(x), stream, created=[])
+
+    assert attempts == [True]
+    restored = _tensor_from_shm(handle)
+    assert restored.dtype == x.dtype
+    assert torch.equal(restored, x)

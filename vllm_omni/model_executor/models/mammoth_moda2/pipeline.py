@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MammothModa2 pipeline topology (frozen).
 
 Stage 0: AR  — multimodal understanding + latent generation
@@ -8,6 +8,7 @@ Stage 1: DiT — latent → image
 For text/image understanding tasks (text output only), use MAMMOTH_MODA2_AR_PIPELINE.
 """
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -21,6 +22,13 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
     default_deploy_config_name="mammoth_moda2.yaml",
     model_arch="MammothModa2ForConditionalGeneration",
     hf_architectures=("Mammothmoda2Model", "MammothModa2ForConditionalGeneration"),
+    endpoint_restrictions=(
+        EndpointRestriction(
+            OmniServingCapability.IMAGE_EDITS,
+            "MammothModa2 image editing (img2img) is not supported. "
+            "Use /v1/images/generations for text-to-image requests.",
+        ),
+    ),
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -35,14 +43,15 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="dit",
-            execution_type=StageExecutionType.LLM_GENERATION,
+            execution_type=StageExecutionType.DIFFUSION,
             input_sources=(0,),
             final_output=True,
             final_output_type="image",
             owns_tokenizer=False,
             requires_multimodal_data=False,
-            engine_output_type="image",
-            custom_process_input_func=f"{_PROC}.ar2dit",
+            model_arch="MammothModa2DiTPipeline",
+            custom_process_input_func=f"{_PROC}.ar2diffusion",
+            omni_kv_config={"need_recv_cache": False},
         ),
     ),
 )

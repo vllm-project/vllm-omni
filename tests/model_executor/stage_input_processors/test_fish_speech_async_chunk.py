@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -18,7 +21,7 @@ def _make_transfer_manager(
     left_context: int = 1,
     initial_chunk_frames: int = 0,
     single_initial_chunk: bool = False,
-    backlog_chunk_frames: int = 0,
+    backlog_chunk_frames: int | str = 0,
     backlog_load_threshold: float = 0.75,
     max_num_seqs: int = 1,
 ):
@@ -227,3 +230,77 @@ def test_invalid_backlog_config_fails_loudly():
             {"audio_codes": torch.tensor([[1, 2, 3]])},
             request,
         )
+
+
+@pytest.mark.parametrize("single_initial_chunk", [False, True])
+@pytest.mark.parametrize("initial_chunk_frames", [0, 4, 10])
+@pytest.mark.parametrize("tensor_payload", [False, True])
+@pytest.mark.parametrize("pattern", ["steady", "drop_at_finish", "rise_midstream", "oscillate"])
+def test_backlog_changes_preserve_every_frame_once(single_initial_chunk, initial_chunk_frames, tensor_payload, pattern):
+    tm = _make_transfer_manager(
+        tensor_payload=tensor_payload,
+        chunk_frames=25,
+        left_context=25,
+        initial_chunk_frames=initial_chunk_frames,
+        single_initial_chunk=single_initial_chunk,
+        backlog_chunk_frames=50,
+        max_num_seqs=64,
+    )
+    request = _make_request()
+    emitted = []
+    for frame in range(1, 141):
+        high = (
+            pattern == "steady"
+            or (pattern == "drop_at_finish" and frame < 140)
+            or (pattern == "rise_midstream" and frame >= 37)
+            or (pattern == "oscillate" and (frame // 13) % 2 == 0)
+        )
+        others = 63 if high else 1
+        tm.code_prompt_token_ids = defaultdict(list, {"req": tm.code_prompt_token_ids["req"]})
+        for idx in range(others):
+            tm.code_prompt_token_ids[f"other-{idx}"] = [None] * 50
+        out = slow_ar_to_dac_decoder_async_chunk(
+            tm,
+            {"audio_codes": torch.tensor([[frame, frame + 1000]]), "audio_code_valid": torch.tensor([True])},
+            request,
+        )
+        if out is not None:
+            codes = out.codes.audio.reshape(2, -1)
+            emitted.extend(codes[0, out.meta.left_context_size :].tolist())
+            tm.put_req_chunk["req"] += 1
+    # EOS may arrive in a separate callback after the last valid frame.
+    out = slow_ar_to_dac_decoder_async_chunk(tm, {}, request, is_finished=True)
+    if out is not None and out.codes.audio.numel():
+        emitted.extend(out.codes.audio.reshape(2, -1)[0, out.meta.left_context_size :].tolist())
+    assert emitted == list(range(1, 141))
+    assert slow_ar_to_dac_decoder_async_chunk(tm, {}, request, is_finished=True) is None
+
+
+def test_final_backlog_drop_flushes_entire_pending_tail():
+    tm = _make_transfer_manager(
+        tensor_payload=True,
+        chunk_frames=25,
+        left_context=25,
+        initial_chunk_frames=4,
+        single_initial_chunk=True,
+        backlog_chunk_frames=50,
+        max_num_seqs=64,
+    )
+    request = _make_request()
+    emitted = []
+    for frame in range(1, 41):
+        if frame < 40:
+            for idx in range(63):
+                tm.code_prompt_token_ids[f"other-{idx}"] = [None] * 30
+        else:
+            for idx in range(32, 63):
+                tm.code_prompt_token_ids.pop(f"other-{idx}")
+        out = slow_ar_to_dac_decoder_async_chunk(
+            tm,
+            {"audio_codes": torch.tensor([[frame]])},
+            request,
+            is_finished=frame == 40,
+        )
+        if out is not None:
+            emitted.extend(out.codes.audio[0, out.meta.left_context_size :].tolist())
+    assert emitted == list(range(1, 41))

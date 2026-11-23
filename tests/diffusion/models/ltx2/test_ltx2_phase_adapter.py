@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for the fixed LTX refinement-phase adapter."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -148,10 +149,13 @@ def test_ltx_phase_adapter_selects_execution_from_quantization(
 ):
     pipeline = _pipeline(dtype=dtype, quantization_config=quantization_config)
     manifest = object()
-    captured = {}
+    captured: dict[str, Any] = {}
 
     def resolve_artifact(*_args, **kwargs):
-        assert not kwargs
+        assert kwargs == {
+            "model_revision": None,
+            "artifact_revision": None,
+        }
         return "adapter"
 
     def parse(transformer, path):

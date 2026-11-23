@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import time
 
@@ -24,6 +27,7 @@ def test_create_orch_monitor_disabled_returns_null_singleton():
     assert monitor is _NULL_ORCH_MONITOR
     assert create_orch_monitor(enabled=False, replica_sampler=lambda: {}) is monitor
     monitor.note_loop(idle=True)
+    assert monitor.snapshot() is None
     monitor.flush()
 
 
@@ -45,6 +49,8 @@ def test_note_loop_and_flush_json(tmp_path, monkeypatch):
     monitor.register_replica(0, 0)
 
     monitor.note_loop(idle=False)
+    monitor.set_dispatch_queue_size(9)
+    monitor.set_dispatch_queue_size(7)
     monitor.note_loop(idle=True)
 
     now[0] = 1.5
@@ -54,8 +60,74 @@ def test_note_loop_and_flush_json(tmp_path, monkeypatch):
     assert payload["configured_window_s"] == monitor_mod._WINDOW_S
     assert payload["windows"]["loop_idle"] == [1]
     assert payload["windows"]["loop_active"] == [1]
+    assert payload["windows"]["dispatch_queue_size"] == [7]
+    assert payload["windows"]["dispatch_queue_high_water"] == [9]
     assert payload["replicas"]["stage=0,replica=0"]["outputs_queue_size"] == [5]
     assert payload["replicas"]["stage=0,replica=0"]["inflight"] == [10]
+
+
+def test_snapshot_keeps_current_and_run_high_water(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    sample = {replica_key(2, 0): (3, 4)}
+    monitor = OrchestratorMonitor(replica_sampler=lambda: sample)
+    monitor.register_replica(2, 0)
+    monitor.set_dispatch_queue_size(7)
+    monitor.set_dispatch_queue_size(2)
+
+    first = monitor.snapshot()
+    assert first == {
+        "dispatch_queue_size": 2,
+        "dispatch_queue_high_water": 7,
+        "replicas": {
+            "stage=2,replica=0": {
+                "outputs_queue_size": 3,
+                "outputs_queue_high_water": 3,
+                "inflight": 4,
+                "inflight_high_water": 4,
+            }
+        },
+    }
+
+    sample[replica_key(2, 0)] = (9, 6)
+    now[0] = monitor_mod._WINDOW_S
+    monitor.note_loop(idle=False)
+    sample[replica_key(2, 0)] = (1, 2)
+    monitor.set_dispatch_queue_size(1)
+
+    second = monitor.snapshot()
+    assert second["dispatch_queue_high_water"] == 7
+    assert second["replicas"]["stage=2,replica=0"] == {
+        "outputs_queue_size": 1,
+        "outputs_queue_high_water": 9,
+        "inflight": 2,
+        "inflight_high_water": 6,
+    }
+
+
+@pytest.mark.parametrize("drain", [False, True])
+def test_dispatch_backlog_carries_across_windows(tmp_path, monkeypatch, drain):
+    out_path = tmp_path / "orch_monitor.json"
+    monkeypatch.setenv("VLLM_OMNI_ORCH_MONITOR_PATH", str(out_path))
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monitor = OrchestratorMonitor(replica_sampler=lambda: {})
+    monitor.set_dispatch_queue_size(3)
+    monitor.set_dispatch_queue_size(1)
+
+    now[0] = monitor_mod._WINDOW_S
+    monitor.note_loop(idle=False)
+    if drain:
+        monitor.set_dispatch_queue_size(0)
+    now[0] += monitor_mod._WINDOW_S
+    monitor.note_loop(idle=False)
+    now[0] += monitor_mod._WINDOW_S
+    monitor.flush()
+
+    windows = json.loads(out_path.read_text())["windows"]
+    remaining = 0 if drain else 1
+    assert windows["dispatch_queue_size"] == [1, remaining, remaining]
+    assert windows["dispatch_queue_high_water"] == [3, 1, remaining]
 
 
 def test_register_replica_backfills_prior_windows(tmp_path, monkeypatch):

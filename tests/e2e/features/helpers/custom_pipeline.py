@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Test doubles for custom-pipeline E2E and RLHF integration.
 
@@ -290,6 +290,36 @@ class vLLMOmniColocateWorkerExtensionForTest(CustomPipelineWorkerExtension):
         """Return a stable identifier for assertions in unit tests."""
         return "vllm-omni-colocate-worker-extension-for-test"
 
+    def start_counting_synchronize_device(self) -> bool:
+        """Count pause-barrier runs on this rank (test-only)."""
+        self._synchronize_device_calls = 0
+        inner = type(self).synchronize_device
+
+        def _counted(timeout=None):
+            self._synchronize_device_calls += 1
+            return inner(self, timeout=timeout)
+
+        self.synchronize_device = _counted
+        return True
+
+    def synchronize_device_seen(self) -> bool:
+        """True from every rank only when each rank ran the barrier at least once."""
+        return getattr(self, "_synchronize_device_calls", 0) > 0
+
+    def set_synchronize_device_failure(self, rank: int, fail: bool) -> bool:
+        """Make (or stop making) the pause barrier fail on ``rank`` (test-only)."""
+        if self.rank != rank:
+            return True
+        if fail:
+
+            def _fail(timeout=None):
+                raise RuntimeError(f"injected barrier failure on rank {rank}")
+
+            self.synchronize_device = _fail
+        else:
+            self.__dict__.pop("synchronize_device", None)
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Pipeline layer
@@ -304,6 +334,9 @@ def _maybe_to_cpu(v):
 
 class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
     supports_request_batch = False
+    # Consumes OmniCustomPrompt.prompt_ids verbatim in forward(); declaring it
+    # keeps engine admission explicit for this RL-rollout style pipeline.
+    supports_pre_tokenized_prompt_ids = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)

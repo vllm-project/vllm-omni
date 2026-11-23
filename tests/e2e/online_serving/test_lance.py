@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end online serving test for Lance (single-stage).
 
 Verifies that the Lance pipeline can serve text-to-image and image-edit
@@ -100,7 +100,7 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_lance_text2img_online(omni_server, openai_client) -> None:
+def test_lance_text2img_online(omni_server, online_client) -> None:
     """Lance text2img via the OpenAI-compatible chat completions API."""
     request_config = {
         "model": omni_server.model,
@@ -115,7 +115,7 @@ def test_lance_text2img_online(omni_server, openai_client) -> None:
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.core_model
@@ -123,7 +123,7 @@ def test_lance_text2img_online(omni_server, openai_client) -> None:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_lance_img2img_online(omni_server, openai_client) -> None:
+def test_lance_img2img_online(omni_server, online_client) -> None:
     """Lance image_edit via the OpenAI-compatible chat completions API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
@@ -141,4 +141,4 @@ def test_lance_img2img_online(omni_server, openai_client) -> None:
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

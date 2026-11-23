@@ -7,7 +7,7 @@ thinker generates interleaved 4-codebook <audiocodec_N> RVQ tokens under an
 RVQ phase mask, and the external XCodec1 checkpoint decodes them to a 16 kHz
 mono WAV.
 
-(For DIFFUSION text-to-audio models — Stable Audio Open, AudioX — use
+(For DIFFUSION text-to-audio models — Stable Audio Open — use
 ``examples/offline_inference/text_to_audio/text_to_audio.py`` instead; Audex
 TTA is a two-stage autoregressive pipeline with a different interface.)
 

@@ -1,0 +1,926 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""CPU tests of Ray placement, rank assignment, RPC output, and cleanup."""
+
+import threading
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.executor import ray_executor as ray_module
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_cross_node_workers_get_global_rank_and_explicit_rendezvous(monkeypatch):
+    monkeypatch.setenv("NCCL_SOCKET_IFNAME", "eth-test")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,4,5")
+    actors = []
+    for ip in ["10.0.0.2", "10.0.0.1", "10.0.0.2"]:
+        actor = Mock()
+        actor.get_node_ip.remote.return_value = ip
+        actor.get_open_port.remote.return_value = 23456
+        actors.append(actor)
+    factory = Mock()
+    factory.remote.side_effect = actors
+    fake_ray = Mock()
+    fake_ray.remote.return_value = lambda cls: factory
+    fake_ray.get.side_effect = lambda values, **kwargs: values
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    monkeypatch.setattr(ray_module, "get_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(ray_module, "PlacementGroupSchedulingStrategy", Mock())
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor.od_config = SimpleNamespace(num_gpus=3, ray_worker_env={"CUSTOM_PLUGIN_SETTING": "enabled"})
+    executor.workers = []
+    executor._init_workers(object())
+    assert fake_ray.remote.call_args.kwargs["max_concurrency"] == 1
+    assert fake_ray.remote.call_args.kwargs["concurrency_groups"] == {
+        "health": 1,
+        "monitor": 1,
+        "cancel": 1,
+    }
+    worker_env = fake_ray.remote.call_args.kwargs["runtime_env"]["env_vars"]
+    assert worker_env["NCCL_SOCKET_IFNAME"] == "eth-test"
+    assert worker_env["CUSTOM_PLUGIN_SETTING"] == "enabled"
+    assert "CUDA_VISIBLE_DEVICES" not in worker_env
+    assert len(fake_ray.get.call_args_list) == 3
+    assert all(call.kwargs["timeout"] == ray_module._WORKER_INIT_TIMEOUT_S for call in fake_ray.get.call_args_list)
+    assert [worker.ip for worker in executor.workers] == ["10.0.0.1", "10.0.0.2", "10.0.0.2"]
+    for rank, metadata in enumerate(executor.workers):
+        metadata.worker.init_worker.remote.assert_called_once_with(executor.od_config, rank, "tcp://10.0.0.1:23456")
+
+
+def test_worker_env_forwards_stage_overrides_without_driver_identity(monkeypatch):
+    from unittest.mock import patch
+
+    driver_env = {
+        "HF_TOKEN": "test-token",
+        "VLLM_PLUGINS": "test-plugin",
+        "NCCL_DEBUG": "WARN",
+        "DIFFUSION_ATTENTION_BACKEND": "FLASH_ATTN",
+        "PYTHONPATH": "/test/modules",
+        "UNRELATED_SECRET": "do-not-copy",
+        "HOME": "/driver/home",
+    }
+    protected = {
+        "CUDA_VISIBLE_DEVICES": "7",
+        "VLLM_HOST_IP": "10.0.0.1",
+        "VLLM_HOST_PORT": "1234",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "10.0.0.1",
+        "LOCAL_RANK": "7",
+        "RANK": "7",
+        "WORLD_SIZE": "8",
+        "MASTER_ADDR": "driver-host",
+        "MASTER_PORT": "1234",
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+    }
+    config = SimpleNamespace(ray_worker_env={**protected, "NCCL_DEBUG": "INFO", "CUSTOM_PLUGIN_SETTING": "stage"})
+    with patch.dict(ray_module.os.environ, {**driver_env, **protected}, clear=True):
+        env = ray_module._worker_env(config)
+        assert env == {key: value for key, value in driver_env.items() if key not in {"UNRELATED_SECRET", "HOME"}} | {
+            "NCCL_DEBUG": "INFO",
+            "CUSTOM_PLUGIN_SETTING": "stage",
+        }
+        assert ray_module.os.environ["NCCL_DEBUG"] == "WARN"
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_collective_executes_all_ranks_but_only_output_rank_returns_tensors(rank):
+    actor = ray_module.RayDiffusionWorkerWrapper(rank)
+    value = torch.ones(2, requires_grad=True)
+    actor.worker = Mock()
+    actor.worker.execute_method.return_value = DiffusionOutput(output=value)
+    result = actor.execute_rpc("execute_model", output_rank=0, exec_all_ranks=True)
+    actor.worker.execute_method.assert_called_once()
+    assert result["replied"] == (rank == 0)
+    if rank == 0:
+        assert not result["result"].output.requires_grad
+        torch.testing.assert_close(result["result"].output, value)
+    else:
+        assert result["result"] is None
+
+
+def test_finalizer_kills_workers_without_waiting_and_releases_owned_group(monkeypatch):
+    events = []
+    fake_ray = Mock()
+    fake_ray.get.side_effect = lambda futures, **kw: events.append("wait")
+    fake_ray.kill.side_effect = lambda worker, **kw: events.append("kill")
+    fake_ray.util.remove_placement_group.side_effect = lambda group: events.append("remove")
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actor = Mock()
+    actor.shutdown.remote.side_effect = lambda: events.append("shutdown")
+    resources = ray_module._RayExecutorResources([ray_module._RayWorkerMetadata(actor)], object(), True)
+    resources()
+    assert events == ["kill", "remove"]
+    fake_ray.kill.assert_called_once_with(actor, no_restart=True)
+    actor.shutdown.remote.assert_not_called()
+    fake_ray.get.assert_not_called()
+    resources()
+    assert events == ["kill", "remove"]
+    assert resources.workers == []
+
+
+def test_wrapper_shutdown_releases_worker_once():
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    worker = Mock()
+    actor.worker = worker
+    actor.shutdown()
+    actor.shutdown()
+    worker.shutdown.assert_called_once_with()
+    assert not actor.check_alive()
+
+
+def _make_executor(fake_ray, actors, group=None, owns_group=True):
+    from collections import OrderedDict
+
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._is_failed = False
+    executor._state_lock = threading.Lock()
+    executor._failure_callbacks = []
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    executor._chunk_queue = None
+    executor._chunk_pump_stop = threading.Event()
+    executor._chunk_pump_thread = None
+    executor.workers = [ray_module._RayWorkerMetadata(actor, rank=rank) for rank, actor in enumerate(actors)]
+    executor._resources = ray_module._RayExecutorResources(executor.workers, group, owns_group)
+    executor._finalizer = executor._resources
+    return executor
+
+
+@pytest.mark.parametrize("stuck_rank", [None, 1])
+def test_shutdown_drains_workers_before_killing_them(monkeypatch, stuck_rank):
+    events = []
+    actors = [Mock(), Mock()]
+    refs = []
+    for rank, actor in enumerate(actors):
+        ref = f"shutdown-{rank}"
+        refs.append(ref)
+
+        def shutdown_ref(ref=ref):
+            events.append(ref)
+            return ref
+
+        actor.shutdown.remote.side_effect = shutdown_ref
+    fake_ray = Mock()
+
+    def wait(pending, num_returns, timeout):
+        events.append("wait")
+        assert num_returns == len(pending)
+        assert timeout == ray_module._WORKER_SHUTDOWN_TIMEOUT_S
+        return [ref for ref in pending if ref != f"shutdown-{stuck_rank}"], [
+            ref for ref in pending if ref == f"shutdown-{stuck_rank}"
+        ]
+
+    fake_ray.wait.side_effect = wait
+    fake_ray.kill.side_effect = lambda worker, **kw: events.append("kill")
+    fake_ray.util.remove_placement_group.side_effect = lambda group: events.append("remove")
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    executor = _make_executor(fake_ray, actors, group=object())
+    callback = Mock()
+    executor._failure_callbacks = [callback]
+
+    executor.shutdown()
+
+    assert events == [*refs, "wait", "kill", "kill", "remove"]
+    assert [call.args[0] for call in fake_ray.get.call_args_list] == [
+        ref for ref in refs if ref != f"shutdown-{stuck_rank}"
+    ]
+    assert executor._closed
+    assert not executor._is_failed
+    callback.assert_not_called()
+    executor.shutdown()
+    assert fake_ray.kill.call_count == len(actors)
+
+
+def test_shutdown_kills_workers_when_drain_fails(monkeypatch):
+    fake_ray = Mock()
+    fake_ray.wait.side_effect = RuntimeError("Ray is shutting down")
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actors = [Mock(), Mock()]
+    executor = _make_executor(fake_ray, actors)
+    executor.shutdown()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
+
+
+def test_shutdown_preserves_borrowed_placement_group(monkeypatch):
+    fake_ray = Mock()
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    ray_module._RayExecutorResources([], object(), False)()
+    fake_ray.util.remove_placement_group.assert_not_called()
+
+
+@pytest.mark.parametrize("failure_kind", ["GetTimeoutError", "RayActorError", "RayTaskError"])
+@pytest.mark.parametrize("output_rank", [None, 0])
+def test_rpc_failure_kills_peers_and_rejects_subsequent_work(monkeypatch, failure_kind, output_rank):
+    fake_ray = Mock()
+    fake_ray.exceptions = SimpleNamespace(
+        **{name: type(name, (Exception,), {}) for name in ("GetTimeoutError", "RayActorError", "RayTaskError")}
+    )
+    failure = getattr(fake_ray.exceptions, failure_kind)("rank failed while peers are still running")
+    fake_ray.get.side_effect = failure
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actors = [Mock(), Mock()]
+    group = object()
+    executor = _make_executor(fake_ray, actors, group=group)
+    callback = Mock()
+    executor._failure_callbacks = [callback]
+
+    expected_error = TimeoutError if failure_kind == "GetTimeoutError" else ray_module.EngineDeadError
+    with pytest.raises(expected_error) as raised:
+        executor.collective_rpc("execute_model", unique_reply_rank=output_rank, exec_all_ranks=True)
+
+    assert raised.value.__cause__ is failure
+    assert executor.is_dead
+    assert executor._is_failed
+    assert executor._closed
+    callback.assert_called_once_with()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+    # Peers may be stuck in a collective, so failure skips the graceful drain.
+    fake_ray.wait.assert_not_called()
+    for actor in actors:
+        actor.shutdown.remote.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        executor.collective_rpc("execute_model", unique_reply_rank=output_rank, exec_all_ranks=True)
+    for actor in actors:
+        actor.execute_rpc.remote.assert_called_once()
+    fake_ray.get.assert_called_once()
+    executor.shutdown()
+    assert fake_ray.kill.call_count == len(actors)
+    callback.assert_called_once_with()
+
+
+def test_actor_death_during_shutdown_does_not_report_failure():
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = True
+    executor._is_failed = False
+    executor._state_lock = threading.Lock()
+    executor._finalizer = Mock()
+    callback = Mock()
+    executor._failure_callbacks = [callback]
+    executor._fail(RuntimeError("actor terminated"))
+    assert not executor._is_failed
+    callback.assert_not_called()
+    executor._finalizer.assert_not_called()
+
+
+class _InlineThread:
+    """Run the monitor synchronously so tests observe its effects."""
+
+    def __init__(self, target, **kwargs):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+@pytest.mark.parametrize("closed_first", [False, True])
+def test_worker_monitor_fails_executor_when_idle_actor_dies(monkeypatch, closed_first):
+    fake_ray = Mock()
+    death = RuntimeError("actor died")
+    actors = [Mock(), Mock()]
+    sentinels = [actor.wait_for_exit.options.return_value.remote.return_value for actor in actors]
+
+    def wait(refs, num_returns):
+        assert refs == sentinels
+        assert num_returns == 1
+        if closed_first:
+            executor._closed = True
+        return [sentinels[1]], [sentinels[0]]
+
+    fake_ray.wait.side_effect = wait
+    fake_ray.get.side_effect = death
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    monkeypatch.setattr(ray_module.threading, "Thread", _InlineThread)
+    group = object()
+    executor = _make_executor(fake_ray, actors, group=group)
+    callback = Mock()
+    executor.register_failure_callback(callback)
+
+    executor._start_worker_monitor()
+
+    for actor in actors:
+        actor.wait_for_exit.options.assert_called_once_with(concurrency_group="monitor")
+    if closed_first:
+        assert not executor._is_failed
+        callback.assert_not_called()
+        fake_ray.kill.assert_not_called()
+        return
+    fake_ray.get.assert_called_once_with(sentinels[1])
+    assert executor._is_failed
+    assert executor._closed
+    callback.assert_called_once_with()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+    fake_ray.wait.assert_called_once()
+    with pytest.raises(RuntimeError, match="closed"):
+        executor.check_health()
+
+
+def test_worker_monitor_does_not_keep_executor_alive(monkeypatch):
+    fake_ray = Mock()
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    started = []
+
+    def capture_thread(target, **kwargs):
+        started.append(target)
+        return SimpleNamespace(start=lambda: None)
+
+    monkeypatch.setattr(ray_module.threading, "Thread", capture_thread)
+    executor = _make_executor(fake_ray, [Mock()])
+    executor._start_worker_monitor()
+    (monitor,) = started
+    assert all(executor is not cell.cell_contents for cell in monitor.__closure__ or ())
+
+
+@pytest.mark.parametrize(
+    "bundles, required, error",
+    [
+        ([{"GPU": 1}] * 4, 4, None),
+        ([{"GPU": 1}] * 8, 4, None),
+        ([{"CPU": 1}, {"GPU": 0.5}, {"GPU": 1}], 1, None),
+        ([{"GPU": 1}] * 2, 4, "requires 4 full GPUs.*only 2"),
+        ([{"GPU": 0.5}] * 4, 4, "requires 4 full GPUs.*only 0"),
+        ([{"CPU": 4}], 1, "requires 1 full GPUs.*only 0"),
+        ([{"GPU": 4}], 4, None),
+        ([{"GPU": 2}, {"GPU": 2}], 4, None),
+        ([{"GPU": 1.5}, {"GPU": 1.5}], 3, "requires 3 full GPUs.*only 2"),
+    ],
+)
+def test_reused_placement_group_requires_full_gpu_capacity(monkeypatch, bundles, required, error):
+    group = SimpleNamespace(bundle_specs=bundles)
+    fake_ray = Mock()
+    fake_ray.util.get_current_placement_group.return_value = group
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor.od_config = SimpleNamespace(num_gpus=required)
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            executor._get_or_create_placement_group()
+    else:
+        actual_group, owned = executor._get_or_create_placement_group()
+        assert actual_group is group
+        assert not owned
+
+    fake_ray.util.placement_group.assert_not_called()
+    fake_ray.util.remove_placement_group.assert_not_called()
+
+
+@pytest.mark.parametrize("failure_phase", ["creation", "discovery", "port", "initialization"])
+def test_worker_startup_failure_cleans_up_registered_actors(monkeypatch, failure_phase):
+    actors = [Mock(), Mock()]
+    for actor in actors:
+        actor.get_node_ip.remote.return_value = "10.0.0.1"
+        actor.get_open_port.remote.return_value = 23456
+    factory = Mock()
+    error = RuntimeError("startup failed")
+    factory.remote.side_effect = [actors[0], error] if failure_phase == "creation" else actors
+    fake_ray = Mock()
+    fake_ray.is_initialized.return_value = True
+    fake_ray.remote.return_value = lambda cls: factory
+    call_count = 0
+
+    def get(values, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        assert kwargs["timeout"] == ray_module._WORKER_INIT_TIMEOUT_S
+        if call_count == {"discovery": 1, "port": 2, "initialization": 3}.get(failure_phase):
+            raise error
+        return values
+
+    fake_ray.get.side_effect = get
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    monkeypatch.setattr(ray_module, "get_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(ray_module, "PlacementGroupSchedulingStrategy", Mock())
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor.od_config = SimpleNamespace(num_gpus=2)
+    group = object()
+    executor._get_or_create_placement_group = Mock(return_value=(group, True))
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        executor._init_executor()
+
+    expected = actors[:1] if failure_phase == "creation" else actors
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == expected
+    for actor in expected:
+        actor.shutdown.remote.assert_not_called()
+        actor.wait_for_exit.options.assert_not_called()
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+    assert executor.workers == []
+    assert executor._closed
+
+
+@pytest.mark.parametrize("failure_type", [TimeoutError, RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_placement_group_wait_failure_cleans_up_and_preserves_error(monkeypatch, failure_type, cleanup_fails):
+    fake_ray = Mock()
+    fake_ray.exceptions.GetTimeoutError = TimeoutError
+    fake_ray.util.get_current_placement_group.return_value = None
+    group = fake_ray.util.placement_group.return_value
+    original_error = failure_type("readiness failed")
+    fake_ray.get.side_effect = original_error
+    if cleanup_fails:
+        fake_ray.util.remove_placement_group.side_effect = RuntimeError("cleanup failed")
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor.od_config = SimpleNamespace(num_gpus=2)
+
+    expected_type = ValueError if failure_type is TimeoutError else failure_type
+    with pytest.raises(expected_type) as raised:
+        executor._get_or_create_placement_group()
+
+    if failure_type is TimeoutError:
+        assert raised.value.__cause__ is original_error
+        assert "Cannot reserve 2 Ray GPU bundle(s)" in str(raised.value)
+    else:
+        assert raised.value is original_error
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+
+
+def test_health_probes_use_separate_concurrency_group(monkeypatch):
+    fake_ray = Mock()
+    fake_ray.get.return_value = [True, True]
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actors = [Mock(), Mock()]
+    executor = _make_executor(fake_ray, actors)
+
+    executor.check_health()
+
+    for actor in actors:
+        actor.check_alive.options.assert_called_once_with(concurrency_group="health")
+        actor.check_alive.options.return_value.remote.assert_called_once_with()
+        actor.check_alive.remote.assert_not_called()
+    fake_ray.get.assert_called_once_with(
+        [actor.check_alive.options.return_value.remote.return_value for actor in actors],
+        timeout=ray_module._HEALTH_CHECK_TIMEOUT_S,
+    )
+    assert not executor._is_failed
+
+
+@pytest.mark.parametrize("probe_result", ["error", "not_alive"])
+def test_health_failure_releases_actors_and_notifies(monkeypatch, probe_result):
+    fake_ray = Mock()
+    if probe_result == "error":
+        fake_ray.get.side_effect = RuntimeError("actor died")
+    else:
+        fake_ray.get.return_value = [True, False]
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actors = [Mock(), Mock()]
+    group = object()
+    executor = _make_executor(fake_ray, actors, group=group)
+    callback = Mock()
+    executor.register_failure_callback(callback)
+
+    with pytest.raises(ray_module.EngineDeadError):
+        executor.check_health()
+
+    assert executor._is_failed
+    assert executor._closed
+    callback.assert_called_once_with()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+
+
+def _make_request_executor(monkeypatch, prompts, component="text_encoder", allgather=True):
+    from collections import OrderedDict
+
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._is_failed = False
+    executor._state_lock = threading.Lock()
+    executor._failure_callbacks = []
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    executor._chunk_queue = None
+    executor._chunk_pump_stop = threading.Event()
+    executor._chunk_pump_thread = None
+    executor._finalizer = Mock()
+    executor.od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=len(prompts)),
+        diffusion_attention_schedule=None,
+        streaming_output=False,
+        step_execution=False,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": [component],
+            "layer_options": {component: {"weight_transfer": "allgather" if allgather else "rank-local"}},
+        },
+    )
+    monkeypatch.setattr(ray_module, "build_request_batch_sampling_params_key", lambda req, config=None: ())
+    requests = []
+    for index, prompt in enumerate(prompts):
+        request_id = str(index)
+        req = SimpleNamespace(request_id=request_id, prompt=prompt, sampling_params=SimpleNamespace(extra_args=None))
+        requests.append(SimpleNamespace(request_id=request_id, req=req, diffusion_kv_metadata=None))
+    return executor, SimpleNamespace(scheduled_new_reqs=requests, kv_prefetch_job=None)
+
+
+@pytest.mark.parametrize("field", ["prompt_embeds", "negative_prompt_embeds"])
+def test_text_encoder_allgather_rejects_mismatched_embedding_presence(monkeypatch, field):
+    executor, scheduled = _make_request_executor(monkeypatch, ["first", {"prompt": "second", field: object()}])
+    executor.collective_rpc = Mock()
+    with pytest.raises(ValueError, match="same positive/negative prompt embedding fields"):
+        executor.execute_request(scheduled)
+    executor.collective_rpc.assert_not_called()
+
+
+def test_text_encoder_allgather_accepts_matching_precomputed_embedding_paths(monkeypatch):
+    executor, scheduled = _make_request_executor(
+        monkeypatch, [{"prompt_embeds": object()}, {"prompt_embeds": object()}]
+    )
+    results = [DiffusionOutput(output="first"), DiffusionOutput(output="second")]
+    executor.collective_rpc = Mock(return_value=[{"dp_rank": rank, "output": out} for rank, out in enumerate(results)])
+    output = executor.execute_request(scheduled)
+    assert [item.result for item in output.runner_outputs] == results
+    executor.collective_rpc.assert_called_once()
+
+
+def _make_hsdp_request_executor(monkeypatch, prompts):
+    executor, scheduled = _make_request_executor(monkeypatch, prompts, allgather=False)
+    executor.od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=8, hsdp_data_parallel=True),
+        diffusion_attention_schedule=None,
+    )
+    return executor, scheduled
+
+
+def test_hsdp_data_parallel_wave_sends_all_envelopes_in_one_rpc(monkeypatch):
+    executor, scheduled = _make_hsdp_request_executor(monkeypatch, ["a", "b"])
+    results = [DiffusionOutput(output="first"), DiffusionOutput(output="second")]
+    executor.collective_rpc = Mock(return_value=[{"dp_rank": rank, "output": out} for rank, out in enumerate(results)])
+
+    output = executor.execute_request(scheduled)
+
+    assert [item.result for item in output.runner_outputs] == results
+    executor.collective_rpc.assert_called_once()
+    assert executor.collective_rpc.call_args.args == ("execute_model",)
+    assert executor.collective_rpc.call_args.kwargs["args"][0] is scheduled.scheduled_new_reqs
+
+
+def test_hsdp_data_parallel_execute_batch_skips_pipeline_batching(monkeypatch):
+    executor, scheduled = _make_hsdp_request_executor(monkeypatch, ["a", "b"])
+    executor.execute_request = Mock(return_value="per-request")
+    executor.collective_rpc = Mock()
+
+    assert executor.execute_batch(scheduled) == "per-request"
+
+    executor.execute_request.assert_called_once_with(scheduled)
+    executor.collective_rpc.assert_not_called()
+
+
+def test_dp_wave_key_resolves_attention_schedules_against_the_service(monkeypatch):
+    """The wave check must build the scheduler's key, which resolves each request's schedule.
+
+    Without the service config, explicit ranges would be resolved against no profiles and rejected,
+    failing a wave the scheduler formed.
+    """
+    executor, scheduled = _make_request_executor(monkeypatch, ["first", "second"])
+    service = object()
+    executor.od_config.diffusion_attention_schedule = service
+    received: list[object] = []
+
+    def _recording_key(req, attention_schedule_config=None):
+        received.append(attention_schedule_config)
+        return ()
+
+    monkeypatch.setattr(ray_module, "build_request_batch_sampling_params_key", _recording_key)
+    results = [DiffusionOutput(output="first"), DiffusionOutput(output="second")]
+    executor.collective_rpc = Mock(return_value=[{"dp_rank": rank, "output": out} for rank, out in enumerate(results)])
+    executor.execute_request(scheduled)
+
+    assert received == [service, service]
+
+
+@pytest.mark.parametrize("allgather", [False, True])
+def test_single_request_allgather_timeout_option(monkeypatch, allgather):
+    executor, scheduled = _make_request_executor(monkeypatch, ["prompt"], allgather=allgather)
+    executor.collective_rpc = Mock(return_value=DiffusionOutput(output="done"))
+    executor.execute_request(scheduled)
+    kwargs = executor.collective_rpc.call_args.kwargs
+    if allgather:
+        assert kwargs["timeout"] == ray_module._DLO_DP_WAVE_TIMEOUT_S
+    else:
+        assert "timeout" not in kwargs
+
+
+def test_single_request_allgather_timeout_fails_executor_and_cleans_up(monkeypatch):
+    executor, scheduled = _make_request_executor(monkeypatch, ["prompt"])
+    callback = Mock()
+    executor.register_failure_callback(callback)
+    executor.collective_rpc = Mock(side_effect=TimeoutError("AllGather timed out"))
+    output = executor.execute_request(scheduled)
+    assert executor._is_failed
+    assert executor._closed
+    executor._finalizer.assert_called_once()
+    callback.assert_called_once()
+    assert "AllGather timed out" in output.runner_outputs[0].result.error
+
+
+@pytest.mark.parametrize("wrapper", ["media", "output", "batch"])
+def test_move_to_cpu_handles_typed_video_media(wrapper):
+    from vllm_omni.diffusion.media import (
+        DiffusionMediaOutput,
+        VideoMediaOutput,
+        VideoTensorEncoding,
+        VideoTensorLayout,
+        VideoTensorSpec,
+        VideoValueRange,
+    )
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    tensor = torch.ones((1, 3, 2, 4, 4), requires_grad=True)
+    media = DiffusionMediaOutput(
+        video=VideoMediaOutput(
+            tensor=tensor,
+            spec=VideoTensorSpec(
+                layout=VideoTensorLayout.BCTHW,
+                encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                value_range=VideoValueRange.ZERO_TO_ONE,
+            ),
+        ),
+        prepared_for_transport=True,
+    )
+    value = media
+    if wrapper != "media":
+        value = DiffusionOutput(media=media, to_cpu=False)
+    if wrapper == "batch":
+        value = BatchRunnerOutput.from_list([RunnerOutput(request_id="video", finished=True, result=value)])
+
+    moved = ray_module._move_to_cpu(value)
+    if wrapper == "batch":
+        moved = moved.runner_outputs[0].result
+    if wrapper != "media":
+        moved = moved.media
+
+    moved.validate()
+    assert moved.video.tensor.device.type == "cpu"
+    assert not moved.video.tensor.requires_grad
+    assert moved.video.spec == media.video.spec
+    assert moved.prepared_for_transport
+    torch.testing.assert_close(moved.video.tensor, tensor.detach())
+    assert media.video.tensor is tensor
+    assert tensor.requires_grad
+
+
+def test_ray_wrapper_emits_chunk_ready_onto_queue_before_rpc_returns():
+    from vllm_omni.diffusion.data import AsyncOutputKind
+    from vllm_omni.diffusion.request_streaming import get_emit_chunk, request_chunk_emitter
+
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    actor.worker = Mock()
+    actor.worker.od_config = SimpleNamespace(streaming_output=True, step_execution=False)
+    chunks = []
+
+    class _Queue:
+        def put(self, message):
+            chunks.append(message)
+
+    actor.set_chunk_queue(_Queue())
+
+    def execute_method(method, *args, **kwargs):
+        del method, args, kwargs
+        with request_chunk_emitter([SimpleNamespace(request_id="req")], enabled=True):
+            emit = get_emit_chunk()
+            assert emit is not None
+            emit(DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2)))
+            assert len(chunks) == 1
+        return DiffusionOutput(finished=True, output=torch.ones(2))
+
+    actor.worker.execute_method.side_effect = execute_method
+    result = actor.execute_rpc("execute_model", output_rank=0, exec_all_ranks=True)
+    assert result["replied"] is True
+    assert chunks[0].kind is AsyncOutputKind.CHUNK_READY
+    assert chunks[0].request_id == "req"
+    assert chunks[0].async_output_id
+    assert chunks[0].output is not None
+    torch.testing.assert_close(chunks[0].output.output, torch.zeros(2))
+    assert result["result"].finished is True
+
+
+def test_ray_wrapper_non_reply_rank_does_not_emit_chunks():
+    from vllm_omni.diffusion.request_streaming import get_emit_chunk, request_chunk_emitter
+
+    actor = ray_module.RayDiffusionWorkerWrapper(1)
+    actor.worker = Mock()
+    actor.worker.od_config = SimpleNamespace(streaming_output=True, step_execution=False)
+    actor.set_chunk_queue(Mock())
+    seen = []
+
+    def execute_method(method, *args, **kwargs):
+        del method, args, kwargs
+        with request_chunk_emitter([SimpleNamespace(request_id="req")], enabled=True):
+            seen.append(get_emit_chunk())
+        return DiffusionOutput(finished=True)
+
+    actor.worker.execute_method.side_effect = execute_method
+    result = actor.execute_rpc("execute_model", output_rank=0, exec_all_ranks=True)
+    assert result["replied"] is False
+    assert result["result"] is None
+    assert seen == [None]
+
+
+def test_ray_executor_chunk_pump_caches_for_wait_output_ready():
+    from collections import OrderedDict
+
+    from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind
+
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    delivered = []
+
+    def handler(request_id, chunk_index, output, error):
+        delivered.append((request_id, chunk_index, output, error))
+
+    executor.register_chunk_ready_handler(handler)
+    payload = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(3), async_output_id="ray-chunk")
+    executor._deliver_chunk_ready(
+        AsyncDiffusionOutput(
+            kind=AsyncOutputKind.CHUNK_READY,
+            async_output_id="ray-chunk",
+            output=payload,
+            request_id="req",
+            chunk_index=0,
+        )
+    )
+    assert delivered == [("req", 0, payload, None)]
+    media = executor.wait_output_ready("ray-chunk").result(timeout=1)
+    assert media.async_output_id == "ray-chunk"
+    torch.testing.assert_close(media.output, torch.zeros(3))
+
+
+def test_collective_rpc_waits_for_chunk_barrier_before_returning(monkeypatch):
+    """RPC return must wait until the pump consumes the barrier (and prior chunks)."""
+    import queue
+    from collections import OrderedDict
+
+    from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind
+    from vllm_omni.diffusion.executor.ray_executor import _ChunkBarrier
+
+    # stdlib Queue raises queue.Empty; align with the pump's empty sentinel.
+    monkeypatch.setattr(ray_module, "RayQueueEmpty", queue.Empty)
+
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._is_failed = False
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    executor._chunk_barriers = {}
+    executor._chunk_barrier_lock = threading.Lock()
+    executor._chunk_queue = queue.Queue()
+    executor._chunk_pump_stop = threading.Event()
+    executor.workers = [
+        SimpleNamespace(worker=SimpleNamespace(execute_rpc=SimpleNamespace(remote=lambda **_kw: "fut")))
+    ]
+    delivered: list[tuple[str, int]] = []
+    executor.register_chunk_ready_handler(
+        lambda request_id, chunk_index, *_: delivered.append((request_id, chunk_index))
+    )
+
+    barrier_id = "barrier-rpc"
+    payload = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2), async_output_id="b0")
+    executor._chunk_queue.put(
+        AsyncDiffusionOutput(
+            kind=AsyncOutputKind.CHUNK_READY,
+            async_output_id="b0",
+            output=payload,
+            request_id="req",
+            chunk_index=0,
+        )
+    )
+    executor._chunk_queue.put(_ChunkBarrier(barrier_id=barrier_id))
+
+    fake_ray = Mock()
+    fake_ray.get.side_effect = lambda _futs, timeout=None: [
+        {"rank": 0, "replied": True, "result": "ok", "chunk_barrier_id": barrier_id}
+    ]
+    # Capture exceptions from ray.get's callers (GetTimeoutError etc. not used here).
+    fake_ray.exceptions = SimpleNamespace(
+        GetTimeoutError=TimeoutError,
+        RayActorError=RuntimeError,
+        RayTaskError=RuntimeError,
+    )
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+
+    rpc_done = threading.Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _run_rpc():
+        try:
+            results.append(executor.collective_rpc("execute_model", unique_reply_rank=0))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            rpc_done.set()
+
+    # Pump not running yet: collective_rpc must block on the barrier.
+    waiter = threading.Thread(target=_run_rpc, daemon=True)
+    waiter.start()
+    assert not rpc_done.wait(0.2)
+    assert delivered == []
+
+    pump = threading.Thread(target=executor._chunk_pump, daemon=True)
+    pump.start()
+    try:
+        assert rpc_done.wait(2.0)
+        assert errors == []
+        assert results == ["ok"]
+        assert delivered == [("req", 0)]
+    finally:
+        executor._chunk_pump_stop.set()
+        pump.join(timeout=2.0)
+        waiter.join(timeout=2.0)
+
+
+def test_ray_cancellation_flags_update_without_shm(monkeypatch):
+    from vllm_omni.diffusion.cancellation import (
+        RayRequestCancellationRegistry,
+        bind_ray_cancel_table,
+        check_request_cancellation,
+        request_cancellation_scope,
+        reset_ray_cancel_table,
+    )
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    registry = RayRequestCancellationRegistry(
+        lambda ids, cancelled=False, finish=False: actor.update_cancellation_flags(
+            ids, cancelled=cancelled, finish=finish
+        )
+    )
+    signal = registry.create("req-a")
+    token = bind_ray_cancel_table(actor._cancel_flags)
+    try:
+        with request_cancellation_scope([signal]):
+            check_request_cancellation()
+            registry.cancel(["req-a"])
+            with pytest.raises(DiffusionRequestAbortedError):
+                check_request_cancellation()
+    finally:
+        reset_ray_cancel_table(token)
+        registry.finish("req-a")
+
+
+def test_ray_fatal_worker_cleanup_kills_actor_instead_of_returning_rpc_error(monkeypatch):
+    fake_ray = Mock()
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    handle = fake_ray.get_runtime_context.return_value.current_actor
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    actor.worker = Mock()
+    actor.worker.od_config = SimpleNamespace(streaming_output=False, step_execution=False)
+    fatal = SystemExit("decoder did not stop")
+    actor.worker.execute_method.side_effect = fatal
+    with pytest.raises(SystemExit) as raised:
+        actor.execute_rpc("execute_model")
+    assert raised.value is fatal
+    assert not actor.check_alive()
+    fake_ray.kill.assert_called_once_with(handle, no_restart=True)
+
+
+@pytest.mark.parametrize("delivery", ["result", "error", "shutdown"])
+def test_ray_drop_preserves_live_waiter_ownership(delivery):
+    executor = _make_executor(Mock(), [])
+    waiter = executor.wait_output_ready("chunk")
+    executor.drop_output("chunk")
+    assert executor.wait_output_ready("chunk") is waiter
+    assert not waiter.done()
+    value = DiffusionOutput(output=torch.ones(1))
+    error = RuntimeError("pack failed")
+    if delivery == "shutdown":
+        executor.shutdown()
+        with pytest.raises(RuntimeError, match="shut down"):
+            waiter.result(timeout=1.0)
+    else:
+        with executor._futures_lock:
+            executor._finish_output(
+                "chunk", value if delivery == "result" else None, error if delivery == "error" else None
+            )
+        if delivery == "result":
+            assert waiter.result(timeout=1.0) is value
+        else:
+            with pytest.raises(RuntimeError, match="pack failed"):
+                waiter.result(timeout=1.0)
+        executor.shutdown()

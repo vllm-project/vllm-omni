@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Strict MiniCPM-o 4.5 Realtime duplex E2E scenario harness.
 
 This script is intentionally scenario-based instead of a generic chat client.
@@ -7,6 +10,8 @@ It has two explicit validation contracts:
    spoken response for each streamed user turn;
 2. ``response-required`` uses a known fixture and requires a complete audio
    response with an independent transcript for every requested turn.
+   Native-turn fixtures may opt into ``allow_extra_responses``: additional
+   responses, including audio-only output, must still finish and be acknowledged.
 
 Explicit serving-side barge-in is intentionally not part of this smoke test.
 MiniCPM-o native duplex currently exposes model-owned listen/speak switching,
@@ -34,8 +39,10 @@ import json
 import sys
 import time
 import wave
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
@@ -47,30 +54,125 @@ try:
 except ImportError as exc:  # pragma: no cover - demo dependency.
     raise SystemExit("Install websockets first: pip install websockets") from exc
 
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
-    RealtimeEventCollector,
+    EventCollector,
     build_realtime_url,
+    duplex_unit_boundary_ms,
     read_pcm16_wav,
     summarize_session_request_metrics,
 )
+from vllm_omni.clients.duplex import (  # noqa: E402
+    reference_audio_data_url as _ref_audio_data_url,
+)
+from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
+    concat_frames_b64,
+    unit_subframe_offsets,
+)
+from vllm_omni.metrics.definitions import compute_audio_rtf  # noqa: E402
 
-_url_with_model = build_realtime_url
+
+def _url_with_model(url, model, *, autostart=None):
+    return build_realtime_url(url, model, autostart=autostart)
+
+
 _read_wav_pcm16 = read_pcm16_wav
+DemoArgs = argparse.Namespace | SimpleNamespace
 
 
-def _ref_audio_data_url(path: str | None) -> str | None:
-    if path is None:
+def _audio_rtf_from_raw_metric(raw_metric: dict[str, object]) -> float | None:
+    """Derive audio RTF from the raw timings reported by the client."""
+    generation_ms = raw_metric.get("audio_generation_ms")
+    duration_ms = raw_metric.get("audio_duration_ms")
+    if not isinstance(generation_ms, int | float) or not isinstance(duration_ms, int | float) or duration_ms <= 0:
         return None
-    ref_path = Path(path).expanduser()
-    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
+    return round(compute_audio_rtf(float(generation_ms) / 1000.0, float(duration_ms) / 1000.0), 6)
+
+
+def _video_frames_from_file(
+    path: Path,
+    *,
+    fps: float = 1.0,
+    jpeg_quality: int = 70,
+    stack_frames: int = 1,
+) -> tuple[list[str], list[str | None]]:
+    """Decode ``path`` into base64 JPEG frames at the omni duplex cadence.
+
+    One frame per second matches what the realtime web client captures, so the
+    stream stays representative of a live camera. ``stack_frames > 1`` also
+    samples each unit's interior sub-frames and tiles them into one composite,
+    the official way to raise visual refresh rate without changing the audio
+    cadence. Returns ``(base_frames, stacked_frames)`` with the tracks parallel.
+    """
+    import cv2
+
+    offsets = unit_subframe_offsets(stack_frames)
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError(f"cannot open video: {path}")
+
+    def encode(frame_bgr, index: int) -> str:
+        ok, jpeg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+        if not ok:
+            raise ValueError(f"cannot JPEG-encode frame {index} of {path}")
+        return base64.b64encode(jpeg.tobytes()).decode("ascii")
+
+    try:
+        source_fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+        stride = max(1, round(source_fps / fps)) if source_fps > 0 else 1
+        # Sub-frame k of a unit sits ``offset * stride`` frames past its base.
+        sub_strides = {max(1, round(offset * stride)): position for position, offset in enumerate(offsets)}
+        frames: list[str] = []
+        interiors: list[list[str]] = []
+        index = 0
+        while True:
+            ok, frame_bgr = capture.read()
+            if not ok:
+                break
+            position, within_unit = divmod(index, stride)
+            if within_unit == 0:
+                frames.append(encode(frame_bgr, index))
+                interiors.append([])
+            elif within_unit in sub_strides and position < len(interiors):
+                interiors[position].append(encode(frame_bgr, index))
+            index += 1
+    finally:
+        capture.release()
+    if not frames:
+        raise ValueError(f"video has no decodable frames: {path}")
+    stacked = [concat_frames_b64(interior) if interior else None for interior in interiors]
+    return frames, stacked
+
+
+def _resolve_video_frames(args: DemoArgs) -> tuple[list[str], list[str | None]]:
+    """Base64 JPEG frames for the duplex camera track, newest last.
+
+    Returns the base track plus the parallel stacked composites. Only a video
+    source has sub-frames to stack; an explicit frame list or a still image
+    stacks nothing.
+    """
+    frames = list(getattr(args, "video_frames_b64", None) or [])
+    if frames:
+        stacked = list(getattr(args, "video_stacked_frames_b64", None) or [])
+        stacked += [None] * (len(frames) - len(stacked))
+        return frames, stacked[: len(frames)]
+    input_video = getattr(args, "input_video", None)
+    if input_video:
+        return _video_frames_from_file(
+            Path(input_video).expanduser(),
+            stack_frames=max(1, int(getattr(args, "stack_frames", 1) or 1)),
+        )
+    frame_image = getattr(args, "frame_image", None)
+    if frame_image:
+        return [base64.b64encode(Path(frame_image).expanduser().read_bytes()).decode("ascii")], [None]
+    return [], []
 
 
 @dataclass
 class DemoState:
     events: list[dict[str, object]] = field(default_factory=list)
-    timing_events: RealtimeEventCollector = field(default_factory=RealtimeEventCollector)
+    timing_events: EventCollector = field(default_factory=EventCollector)
     audio_deltas: list[bytes] = field(default_factory=list)
     response_audio_deltas: dict[str, list[bytes]] = field(default_factory=dict)
     response_ids: list[str] = field(default_factory=list)
@@ -106,7 +208,7 @@ class DemoState:
                 item_id = item.get("id")
                 if isinstance(item_id, str) and item_id not in self.assistant_item_ids:
                     self.assistant_item_ids.append(item_id)
-        elif event_type == "response.audio.delta":
+        elif event_type == "response.output_audio.delta":
             delta = event.get("delta") or event.get("audio")
             if isinstance(delta, str) and delta:
                 try:
@@ -187,6 +289,11 @@ class DemoState:
                 after_s=created_at_s,
                 input_committed_at_s=input_committed_at_s,
                 response_id=response_id,
+                measurement_origin={
+                    "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                    "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                    "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                },
             )
             timing["measurement_origin"] = {
                 "response": "response.created client receive",
@@ -206,14 +313,14 @@ class DemoState:
             metrics = timing.get("request_metrics")
             if not isinstance(metrics, dict):
                 continue
-            requests.append(
-                {
-                    "session_id": session_id,
-                    "request_index": request_index,
-                    "response_id": response_id,
-                    **metrics,
-                }
-            )
+            request_metrics = {
+                "session_id": session_id,
+                "request_index": request_index,
+                "response_id": response_id,
+                **metrics,
+                "rtf": _audio_rtf_from_raw_metric(metrics),
+            }
+            requests.append(request_metrics)
         return requests
 
     def session_metric_summary(
@@ -274,8 +381,8 @@ class DemoState:
             "response.output_item.added",
             "response.content_part.added",
             "response.speak",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.content_part.done",
             "response.output_item.done",
             "response.done",
@@ -290,8 +397,8 @@ class DemoState:
             )
             if index is None and event_type not in {
                 "response.speak",
-                "response.audio.delta",
-                "response.audio.done",
+                "response.output_audio.delta",
+                "response.output_audio.done",
             }:
                 return {}
             if index is not None:
@@ -339,13 +446,13 @@ class DemoState:
             "response.output_item.added",
             "response.content_part.added",
             "response.speak",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.content_part.done",
             "response.output_item.done",
             "response.done",
         ]
-        if "response.audio.delta" not in indices_by_type:
+        if "response.output_audio.delta" not in indices_by_type:
             listen_index = self.first_index(
                 "response.listen",
                 lambda event: (
@@ -374,17 +481,20 @@ class DemoState:
         commit_indices = [
             index for index, event in enumerate(self.events) if event.get("type") == "input_audio_buffer.committed"
         ]
-        decision_indices = [
-            index
-            for index, event in enumerate(self.events)
-            if event.get("type") == "response.created"
-            or (
-                event.get("type") == "response.listen"
-                and isinstance(event.get("response"), dict)
-                and isinstance(event["response"].get("metadata"), dict)
-                and event["response"]["metadata"].get("model_listen") is True
-            )
-        ]
+        decision_indices: list[int] = []
+        for index, event in enumerate(self.events):
+            event_type = event.get("type")
+            if event_type == "response.created":
+                decision_indices.append(index)
+                continue
+            if event_type != "response.listen":
+                continue
+            response = event.get("response")
+            if not isinstance(response, dict):
+                continue
+            metadata = response.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("model_listen") is True:
+                decision_indices.append(index)
         first_input_index = self.first_index("input_audio_buffer.speech_started")
         if first_input_index is None:
             first_input_index = commit_indices[0] if commit_indices else None
@@ -400,7 +510,7 @@ class DemoState:
 
     def model_speak_before_audio_ok(self) -> bool:
         speak_index = self.first_index("response.speak")
-        audio_index = self.first_index("response.audio.delta")
+        audio_index = self.first_index("response.output_audio.delta")
         return speak_index is not None and audio_index is not None and speak_index < audio_index
 
     def response_done(self, response_id: str | None) -> bool:
@@ -417,7 +527,7 @@ class DemoState:
         return sum(
             1
             for event in self.events
-            if event.get("type") == "response.audio.delta" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio.delta" and self._event_response_id(event) == response_id
         )
 
     def response_playback_sent_ms(self, response_id: str | None) -> int:
@@ -446,18 +556,42 @@ class DemoState:
                 return True
         return False
 
+    def response_playback_settled(self, response_id: str) -> bool:
+        if self.response_playback_history_committed(response_id):
+            return True
+        # An audio-only response has no answer text to commit. The server
+        # acknowledges its playback with history_committed=False.
+        if not self.response_done(response_id) or self.response_transcript_delta(response_id):
+            return False
+        sent_ms = self.response_playback_sent_ms(response_id)
+        if sent_ms <= 0:
+            return False
+        for event in self.events:
+            if event.get("type") != "playback.acknowledged":
+                continue
+            payload = event.get("event")
+            if not isinstance(payload, dict) or payload.get("item_id") != f"item_{response_id}":
+                continue
+            playback = payload.get("playback")
+            committed_ms = playback.get("committed_ms") if isinstance(playback, dict) else None
+            if isinstance(committed_ms, int | float) and committed_ms >= sent_ms:
+                return True
+        return False
+
     def response_transcript_delta(self, response_id: str) -> str:
         return "".join(
             str(event.get("delta", ""))
             for event in self.events
-            if event.get("type") == "response.audio_transcript.delta" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio_transcript.delta"
+            and self._event_response_id(event) == response_id
         )
 
     def response_transcript_done(self, response_id: str) -> list[str]:
         return [
             str(event.get("transcript", ""))
             for event in self.events
-            if event.get("type") == "response.audio_transcript.done" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio_transcript.done"
+            and self._event_response_id(event) == response_id
         ]
 
     def completed_response_ids(self) -> list[str]:
@@ -488,7 +622,7 @@ class DemoState:
             return 0
         stale = 0
         for index, event in enumerate(self.events):
-            if event.get("type") != "response.audio.delta":
+            if event.get("type") != "response.output_audio.delta":
                 continue
             metadata = event.get("metadata")
             if not isinstance(metadata, dict):
@@ -501,7 +635,7 @@ class DemoState:
         return stale
 
 
-def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
+def _session_update_event(args: DemoArgs) -> dict[str, object]:
     session_payload: dict[str, object] = {
         "model": args.model,
         "modalities": ["audio", "text"],
@@ -513,7 +647,6 @@ def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
         "playback_commit_policy": "ack_only",
         "extra_body": {
             "auto_response": True,
-            "minicpmo45_native_duplex": True,
             "force_listen_count": 0,
         },
     }
@@ -529,9 +662,6 @@ def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
         "type": "session.update",
         "session": session_payload,
     }
-    session_id = getattr(args, "session_id", None)
-    if session_id:
-        session_payload["session_id"] = session_id
     return event
 
 
@@ -683,9 +813,9 @@ def _all_audio_responses_have_transcript(state: DemoState, response_ids: list[st
     )
 
 
-def _all_response_playback_history_committed(state: DemoState, response_ids: list[str]) -> bool:
+def _all_response_playback_settled(state: DemoState, response_ids: list[str]) -> bool:
     return all(
-        state.response_playback_history_committed(response_id)
+        state.response_playback_settled(response_id)
         for response_id in response_ids
         if state.response_playback_sent_ms(response_id) > 0
     )
@@ -696,8 +826,11 @@ def _response_cardinality_ok(
     *,
     expected_turns: int,
     validation_mode: str,
+    allow_extra_responses: bool = False,
 ) -> bool:
     if validation_mode == "response-required":
+        if allow_extra_responses:
+            return len(completed_response_ids) >= expected_turns
         return len(completed_response_ids) == expected_turns
     return True
 
@@ -837,7 +970,8 @@ async def _send_pcm16(
     hints: dict[str, object] | None = None,
     first_chunk_hints: dict[str, object] | None = None,
     on_model_unit_ready=None,
-    frame_b64: str | None = None,
+    frames_b64: Sequence[str] | None = None,
+    stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> None:
     hints = hints or {}
     first_chunk_hints = first_chunk_hints or {}
@@ -845,6 +979,8 @@ async def _send_pcm16(
     model_unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     audio_ms = 0
     next_model_unit_bytes = model_unit_bytes
+    frames = list(frames_b64 or [])
+    stacked = list(stacked_frames_b64 or [])
     frames_sent = 0
     for offset in range(0, len(pcm16), chunk_bytes):
         chunk = pcm16[offset : offset + chunk_bytes]
@@ -853,9 +989,18 @@ async def _send_pcm16(
         chunk_hints = dict(hints)
         if offset == 0:
             chunk_hints.update(first_chunk_hints)
-        if frame_b64 is not None and audio_ms > frames_sent * 1000:
-            # Omni duplex cadence: one camera frame per 1 s of audio.
-            chunk_hints["video_frames"] = [frame_b64]
+        if frames and audio_ms >= duplex_unit_boundary_ms(frames_sent):
+            # Omni duplex cadence: one camera frame per model unit, riding the
+            # append that closes it, so the frame and the second of audio it was
+            # captured during enter the same unit. A video advances one frame per
+            # unit and holds its last frame when the audio outlives the clip; a
+            # still image is a one-element list and therefore repeats.
+            # A stacked composite of that unit's interior sub-frames rides the
+            # same append right after the base frame (wire maximum of 2).
+            index = min(frames_sent, len(frames) - 1)
+            composite = stacked[index] if index < len(stacked) else None
+            base = frames[index]
+            chunk_hints["video_frames"] = [base] if composite is None else [base, composite]
             frames_sent += 1
         await ws.send(
             json.dumps(
@@ -936,7 +1081,8 @@ async def _send_clean_turn(
     realtime_input: bool = False,
     model_policy_settle_s: float = 2.0,
     commit_input: bool = True,
-    frame_b64: str | None = None,
+    frames_b64: Sequence[str] | None = None,
+    stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> tuple[str | None, str]:
     before_created = state.count("response.created")
     before_model_listen = state.model_listen_count
@@ -958,9 +1104,28 @@ async def _send_clean_turn(
         chunk_ms=chunk_ms,
         realtime_delay=realtime_input,
         hints={"transcript": transcript} if send_transcript_hint else {},
-        frame_b64=frame_b64,
+        frames_b64=frames_b64,
+        stacked_frames_b64=stacked_frames_b64,
     )
     if commit_input:
+        # Native duplex can answer while the input is still streaming. Reserve
+        # those replies' history positions before commit advances the input
+        # sequence, otherwise the full playback ACK below is rejected as late.
+        # A zero ACK checkpoints ownership without claiming any audio was heard.
+        for early_response_id in state.response_ids[before_created:]:
+            if state.response_done(early_response_id) and state.response_audio_delta_count(early_response_id) == 0:
+                continue
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "playback.ack",
+                        "response_id": early_response_id,
+                        "item_id": f"item_{early_response_id}",
+                        "played_ms": 0,
+                        "committed_ms": 0,
+                    }
+                )
+            )
         state.input_commit_sent_at_s.append(time.monotonic())
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
     if validation_mode == "model-policy":
@@ -997,7 +1162,7 @@ async def _send_clean_turn(
             state,
             lambda: state.response_audio_delta_count(response_id) > 0,
             timeout_s=timeout_s,
-            label=f"{transcript} response.audio.delta",
+            label=f"{transcript} response.output_audio.delta",
         )
     await _wait_for(
         state,
@@ -1040,11 +1205,18 @@ async def _ack_response_playback(
             }
         )
     )
+
+    def playback_settled() -> bool:
+        errors = _unexpected_error_events(state)
+        if errors:
+            raise RuntimeError(f"{label} playback failed for {response_id}: {json.dumps(errors, ensure_ascii=False)}")
+        return state.playback_ack_count > before_ack and state.response_playback_settled(response_id)
+
     await _wait_for(
         state,
-        lambda: state.playback_ack_count > before_ack and state.response_playback_history_committed(response_id),
+        playback_settled,
         timeout_s=timeout_s,
-        label=f"{label} playback history committed",
+        label=f"{label} playback settled",
     )
 
 
@@ -1057,7 +1229,7 @@ async def _ack_all_completed_response_playback(
     for response_id in state.completed_response_ids():
         if state.response_playback_sent_ms(response_id) <= 0:
             continue
-        if state.response_playback_history_committed(response_id):
+        if state.response_playback_settled(response_id):
             continue
         await _ack_response_playback(
             ws,
@@ -1164,7 +1336,8 @@ async def _send_listen_only_overlap_pair(
     model_policy_settle_s: float,
     validation_mode: str,
     silence_ms: int,
-    frame_b64: str | None = None,
+    frames_b64: Sequence[str] | None = None,
+    stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> tuple[list[str | None], list[str], bool]:
     if not realtime_input:
         raise ValueError("listen-only-overlap requires --realtime-input")
@@ -1195,7 +1368,8 @@ async def _send_listen_only_overlap_pair(
         realtime_delay=True,
         hints={"transcript": transcripts[0]} if send_transcript_hint else {},
         on_model_unit_ready=continue_until_first_speak,
-        frame_b64=frame_b64,
+        frames_b64=frames_b64,
+        stacked_frames_b64=stacked_frames_b64,
     )
     state.input_commit_sent_at_s.append(time.monotonic())
     await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
@@ -1210,7 +1384,7 @@ async def _send_listen_only_overlap_pair(
         state,
         lambda: state.response_audio_delta_count(first_response_id) > 0,
         timeout_s=timeout_s,
-        label=f"{transcripts[0]} response.audio.delta",
+        label=f"{transcripts[0]} response.output_audio.delta",
     )
     if state.response_done(first_response_id):
         raise RuntimeError("first response completed before overlap input could start")
@@ -1234,7 +1408,8 @@ async def _send_listen_only_overlap_pair(
         realtime_delay=True,
         hints={"transcript": transcripts[1]} if send_transcript_hint else {},
         on_model_unit_ready=record_model_unit_ready,
-        frame_b64=frame_b64,
+        frames_b64=frames_b64,
+        stacked_frames_b64=stacked_frames_b64,
     )
     state.input_commit_sent_at_s.append(time.monotonic())
     await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
@@ -1298,10 +1473,8 @@ async def _send_listen_only_overlap_pair(
     return [first_response_id, second_response_id], ["speak", second_outcome], overlap_ok
 
 
-async def run_demo(args: argparse.Namespace) -> dict[str, object]:
-    demo_frame_b64: str | None = None
-    if getattr(args, "frame_image", None):
-        demo_frame_b64 = base64.b64encode(Path(args.frame_image).read_bytes()).decode("ascii")
+async def run_demo(args: DemoArgs) -> dict[str, object]:
+    demo_frames_b64, demo_stacked_b64 = _resolve_video_frames(args)
     turn_input_paths = _turn_input_paths(
         Path(args.input_wav),
         list(getattr(args, "turn_input_wav", []) or []),
@@ -1330,7 +1503,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         args.url,
         args.model,
         autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=getattr(args, "session_id", None),
     )
     state = DemoState()
     stop = asyncio.Event()
@@ -1351,6 +1523,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         try:
             await ws.send(json.dumps(_session_update_event(args)))
             await _wait_for(state, lambda: state.count("session.created") > 0, timeout_s=20, label="session.created")
+            start_barrier = getattr(args, "start_barrier", None)
+            if start_barrier is not None:
+                await start_barrier.wait()
 
             turn_transcripts = _turn_transcripts(args.first_turn_transcript, turns=args.turns)
             turn_specs = list(zip(turn_transcripts, turn_durations, strict=True))
@@ -1369,7 +1544,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                     validation_mode=validation_mode,
                     silence_ms=max(0, args.silence_ms),
-                    frame_b64=demo_frame_b64,
+                    frames_b64=demo_frames_b64,
+                    stacked_frames_b64=demo_stacked_b64,
                 )
                 for turn_index in range(2, len(turn_specs)):
                     transcript, duration_ms = turn_specs[turn_index]
@@ -1387,7 +1563,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         realtime_input=realtime_input,
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                         commit_input=not continuous_input,
-                        frame_b64=demo_frame_b64,
+                        frames_b64=demo_frames_b64,
+                        stacked_frames_b64=demo_stacked_b64,
                     )
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
@@ -1407,10 +1584,21 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         realtime_input=realtime_input,
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                         commit_input=not continuous_input,
-                        frame_b64=demo_frame_b64,
+                        frames_b64=demo_frames_b64,
+                        stacked_frames_b64=demo_stacked_b64,
                     )
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
+
+                    if getattr(args, "allow_extra_responses", False):
+                        # Finish and ACK every model response before committing
+                        # another input; one input can produce several replies.
+                        await _drain_model_policy_responses(
+                            ws,
+                            state,
+                            timeout_s=args.timeout_s,
+                            settle_s=max(0.0, args.model_policy_settle_ms / 1000),
+                        )
 
             if validation_mode == "model-policy":
                 await _drain_model_policy_responses(
@@ -1464,7 +1652,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         transcript_hints_enabled=transcript_hints_enabled and not continuous_input,
     )
     model_speak_event_ok = state.model_speak_before_audio_ok()
-    realtime_audio_lifecycle_ok = state.count("response.audio.delta") > 0 and state.count("response.audio.done") > 0
+    realtime_audio_lifecycle_ok = (
+        state.count("response.output_audio.delta") > 0 and state.count("response.output_audio.done") > 0
+    )
     completed_response_ids = state.completed_response_ids()
     observed_turn_response_ids = [response_id for response_id in turn_response_ids if isinstance(response_id, str)]
     expected_empty_response_ids = {
@@ -1489,11 +1679,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         state.count("response.created") == state.count("response.done")
         and len(state.response_ids) == len(completed_response_ids)
         and len(completed_response_ids) == len(set(completed_response_ids))
-        and state.count("response.audio.done") <= state.count("response.done")
+        and state.count("response.output_audio.done") <= state.count("response.done")
         and _response_cardinality_ok(
             completed_response_ids,
             expected_turns=expected_turns,
             validation_mode=validation_mode,
+            allow_extra_responses=getattr(args, "allow_extra_responses", False),
         )
     )
     turn_outcomes_ok = len(turn_outcomes) == expected_turns and (
@@ -1504,7 +1695,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         for response_id in observed_turn_response_ids
         if response_id not in expected_empty_response_ids
     )
-    playback_history_committed_ok = _all_response_playback_history_committed(
+    playback_settled_ok = _all_response_playback_settled(
         state,
         completed_response_ids,
     )
@@ -1534,6 +1725,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     )
     unexpected_error_events = _unexpected_error_events(state)
     continuous_input_ok = not continuous_input or state.count("input_audio_buffer.committed") == 0
+    # The server allocates every session id; label metrics with the one it announced.
+    created = state.events[0] if state.events else {}
+    created_session = created.get("session") if isinstance(created, dict) else None
+    server_session_id = created_session.get("id") if isinstance(created_session, dict) else None
     result = {
         "ok": terminal_activity_ok
         and state.count("session.closed") > 0
@@ -1560,7 +1755,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "model_speak_delta_count": state.model_speak_delta_count,
         "playback_ack_count": state.playback_ack_count,
         "playback_history_committed_count": state.playback_history_committed_count,
-        "playback_history_committed_ok": playback_history_committed_ok,
+        "playback_settled_ok": playback_settled_ok,
         "truncate_count": state.truncate_count,
         "input_transcription_count": state.input_transcription_count,
         "audio_marks_seen": state.audio_marks_seen,
@@ -1571,8 +1766,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "input_transcription_ok": input_transcription_ok,
         "completed_response_ids": completed_response_ids,
         "response_timings": state.response_timing_summaries(),
-        "request_metrics": state.session_request_metrics(session_id=args.session_id),
-        "session_metrics": state.session_metric_summary(session_id=args.session_id),
+        "request_metrics": state.session_request_metrics(session_id=server_session_id),
+        "session_metrics": state.session_metric_summary(session_id=server_session_id),
         "lifecycle_counts_ok": lifecycle_counts_ok,
         "validation_mode": validation_mode,
         "scenario": scenario,
@@ -1582,6 +1777,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "continuous_input": continuous_input,
         "continuous_input_ok": continuous_input_ok,
         "input_chunk_ms": args.chunk_ms,
+        "video_frame_count": len(demo_frames_b64),
+        "video_stacked_frame_count": sum(frame is not None for frame in demo_stacked_b64),
         "model_policy_settle_ms": args.model_policy_settle_ms,
         "turn_outcomes": turn_outcomes,
         "turn_outcomes_ok": turn_outcomes_ok,
@@ -1616,8 +1813,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and transcript_integrity["empty_turns_ok"]
         and transcript_integrity["nonempty_audio_has_transcript_ok"]
         and transcript_integrity["terminal_punctuation_ok"]
-        and all_audio_responses_have_transcript
-        and playback_history_committed_ok
+        and (all_audio_responses_have_transcript or getattr(args, "allow_extra_responses", False))
+        and playback_settled_ok
         and listen_only_overlap_ok
         and not unexpected_error_events
         and response_speak_contract["response_speak_contract_ok"]
@@ -1631,13 +1828,25 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
-    parser.add_argument("--session-id", help="Use an explicit public session ID, including for close/reopen tests.")
     parser.add_argument("--input-wav", required=True)
     parser.add_argument("--ref-audio", help="Optional WAV used as the MiniCPM-o voice prompt.")
     parser.add_argument(
         "--frame-image",
         default=None,
         help="Optional image file sent as an omni-duplex camera frame (one per 1 s of audio)",
+    )
+    parser.add_argument(
+        "--input-video",
+        default=None,
+        help="Optional video file streamed as omni-duplex camera frames (decoded at 1 fps, "
+        "overrides --frame-image; the last frame is held if the audio outlives the clip)",
+    )
+    parser.add_argument(
+        "--stack-frames",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Frames per append: 2 also resends the previous frame for motion context.",
     )
     parser.add_argument(
         "--turn-input-wav",

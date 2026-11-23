@@ -6,7 +6,7 @@ When you open a PR against vLLM-Omni, several CI checks run automatically:
 
 | Check | Platform | What it does |
 | ----- | -------- | ------------ |
-| **pre-commit** | GitHub Actions | Runs linting (Ruff), formatting, spell-checking (typos), and YAML validation. |
+| **pre-commit** | GitHub Actions | Runs Ruff, formatting, typos, YAML validation, forbidden imports, `torch.cuda`, TTS adapter ratchet, and Buildkite schema. Local-only gates (SPDX, shellcheck, markdownlint, mypy-3.10, test marks) are in the workflow `SKIP` env — see [Linting](../README.md#linting). |
 | **Build Wheel** | GitHub Actions | Builds Python wheels for Python 3.11 and 3.12 on Ubuntu. Skipped for docs-only or Markdown-only changes (controlled by `paths-ignore` in the workflow). |
 | **DCO** | GitHub | Verifies every commit has a `Signed-off-by` line. |
 | **docs/readthedocs.org:vllm-omni** | Read the Docs | Builds the MkDocs documentation site. |
@@ -28,6 +28,13 @@ pre-commit run --all-files
 ```
 
 Then commit the fixes and push.
+
+A green GitHub pre-commit job can still miss SPDX, shellcheck, mypy-3.10,
+markdownlint, and test-mark coverage because CI skips those IDs. If your
+**local** commit hook fails, follow [Linting](../README.md#linting) for the
+full hook list (forbidden imports, `torch.cuda`, TTS adapter ratchet, and
+Buildkite schema still run in GHA). Do not grow allowlists or raise
+`MAX_MODEL_TYPE_BRANCHES` without review.
 
 ### DCO failures
 

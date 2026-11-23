@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minimalist Product Ads"
+  short_description: "Direct product anchors, copy, motion, and audio"
+  default_prompt: "Use $minimalist-product-ad-generator to prepare the requested H3 prompts or video with the available tools."

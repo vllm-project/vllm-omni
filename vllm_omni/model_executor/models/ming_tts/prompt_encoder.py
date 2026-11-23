@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import json
@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .audio_prep import (
     _coerce_prompt_latents,
@@ -27,7 +28,12 @@ logger = init_logger(__name__)
 _PROMPT_ENCODER_LOAD_LOCK = threading.Lock()
 
 
-def _resolve_prompt_latents(wrapper: Any, info_dict: dict[str, Any]) -> dict[str, torch.Tensor] | None:
+def _resolve_prompt_latents(
+    wrapper: Any,
+    info_dict: dict[str, Any],
+    *,
+    generator: torch.Generator | None = None,
+) -> dict[str, torch.Tensor] | None:
     raw_latents = info_dict.get(KEY_PROMPT_LATENTS, info_dict.get("prompt_latents"))
     raw_waveform = info_dict.get("prompt_waveform", info_dict.get("prompt_waveforms"))
     if raw_latents is not None and raw_waveform is not None:
@@ -54,6 +60,7 @@ def _resolve_prompt_latents(wrapper: Any, info_dict: dict[str, Any]) -> dict[str
             wrapper,
             raw_waveform,
             info_dict.get("prompt_waveform_length"),
+            generator=generator,
         )
     return _coerce_prompt_latents(
         latents,
@@ -72,7 +79,7 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
             raise RuntimeError("Ming Stage-0 requires audio_tokenizer_config to encode prompt audio.")
 
         load_start = time.perf_counter()
-        encoder = AudioVAE(wrapper.ming_config.audio_tokenizer_config).eval()
+        encoder = AudioVAE(wrapper.ming_config.audio_tokenizer_config, build_decoder=False).eval()
         state_dict = encoder.state_dict()
         loaded = 0
         loaded_encoder_params = set()
@@ -103,8 +110,6 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
 
         dev = next(wrapper.parameters()).device
         try:
-            del encoder.decoder
-            encoder.decoder = None
             if dev.type != "cpu":
                 encoder.encoder.to(dev, dtype=getattr(wrapper.model, "fm_dtype", torch.bfloat16))
             else:
@@ -117,7 +122,13 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
 
 
 @torch.inference_mode()
-def _encode_prompt_waveform_to_latents(wrapper: Any, waveform: Any, waveform_length: Any = None) -> torch.Tensor:
+def _encode_prompt_waveform_to_latents(
+    wrapper: Any,
+    waveform: Any,
+    waveform_length: Any = None,
+    *,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     encoder = _load_prompt_encoder(wrapper)
     waveform = _normalize_prompt_waveform(waveform, target_sr=wrapper.ming_config.sample_rate)
     waveform = pad_prompt_waveform(
@@ -125,16 +136,28 @@ def _encode_prompt_waveform_to_latents(wrapper: Any, waveform: Any, waveform_len
         patch_size=wrapper.ming_config.patch_size,
         sample_rate=wrapper.ming_config.sample_rate,
     )
-    dev = next(encoder.encoder.parameters()).device
-    waveform = waveform.to(device=dev, dtype=next(encoder.encoder.parameters()).dtype)
+    # Lengths stay on the host: the encoder only validates them and derives
+    # frame counts, so a device copy would add a sync per prompt.
     if waveform_length is None:
-        waveform_length = torch.full((waveform.shape[0],), waveform.shape[-1], dtype=torch.int32, device=dev)
-    elif not isinstance(waveform_length, torch.Tensor):
-        waveform_length = torch.as_tensor(waveform_length, dtype=torch.int32, device=dev)
+        waveform_length = torch.full((waveform.shape[0],), waveform.shape[-1], dtype=torch.int32)
     else:
-        waveform_length = waveform_length.to(device=dev, dtype=torch.int32)
+        waveform_length = torch.as_tensor(waveform_length).to(device="cpu", dtype=torch.int32)
 
-    latents, _ = encoder.encode_latent(waveform, waveform_length)
+    # A model may supply the deterministic encoder output itself (computed
+    # ahead, cached or from a CUDA graph) from the host waveform; posterior
+    # sampling below still draws from the request generator.
+    encoder_forward = getattr(wrapper, "_prompt_encoder_forward", None)
+    encoder_output = encoder_forward(encoder, waveform) if callable(encoder_forward) else None
+    if encoder_output is None:
+        param = next(encoder.encoder.parameters())
+        # A blocking host copy would wait for all queued device work.
+        waveform = to_device_nonblocking(waveform, param.device).to(dtype=param.dtype)
+    latents, _ = encoder.encode_latent(
+        waveform,
+        waveform_length,
+        generator=generator,
+        encoder_output=encoder_output,
+    )
     if latents.ndim == 3 and latents.shape[0] == 1:
         latents = latents.squeeze(0)
     count_prompt_latent_patches(

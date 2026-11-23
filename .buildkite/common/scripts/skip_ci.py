@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared Buildkite skip-ci and CI-YAML level targeting logic.
 
 ``resolve_ci_decision(changed_files, ...)`` buckets explicit file lists (tests, dry-run).
@@ -10,12 +11,6 @@ CLI (for bootstrap scripts; exit code is the signal):
   python3 skip_ci.py gate <platform> <level>
       Exit 0 when bootstrap should stop (skip-all, or that L2/L3 target is off).
       Prints ``skip-all`` or ``skip-l23`` on stdout; logs the decision once.
-  python3 skip_ci.py check-skip-all
-      Exit 0 when only docs/skip-mark changes → bootstrap skips entire CI upload.
-  python3 skip_ci.py check-skip-l2-l3 <platform> <level>
-      Exit 0 when that L2/L3 pipeline should be skipped (CI config YAML-only diffs).
-  python3 skip_ci.py print-annotate
-      Print decision message for Buildkite annotation.
 """
 
 from __future__ import annotations
@@ -28,29 +23,16 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from ci_conditions import (
+    L2_YAML_FILES,
+    L3_YAML_FILES,
+    L23_LEVELS,
+    L45_YAML_FILES,
+    PLATFORMS,
+    is_release_line_branch,
+)
+
 LOG = "[skip-ci]"
-ROOT = Path(__file__).resolve().parent.parent.parent.parent
-
-PLATFORMS = ("cuda", "amd", "intel", "npu")
-L23_LEVELS = frozenset({"l2", "l3"})
-
-L2_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-ready.yml": "cuda",
-    ".buildkite/npu/test-npu-ready.yml": "npu",
-    ".buildkite/amd/test-amd-ready.yml": "amd",
-    ".buildkite/intel/pipeline-intel.yml": "intel",
-}
-
-L3_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-merge.yml": "cuda",
-    ".buildkite/amd/test-amd-merge.yml": "amd",
-}
-
-L45_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-nightly.yml": "cuda",
-    ".buildkite/cuda/test-weekly.yml": "cuda",
-    ".buildkite/npu/test-npu-nightly.yml": "npu",
-}
 
 
 def _empty_platform_buckets() -> dict[str, list[str]]:
@@ -258,11 +240,10 @@ class CiDecision:
 
 @dataclass(frozen=True)
 class CiContext:
-    """Skip-ci decision plus git diff inputs used to compute it."""
+    """Skip-ci decision plus changed files used for pipeline filtering."""
 
     decision: CiDecision
     changed_files: list[str] | None
-    diff_range: str | None
 
 
 def _log(message: str) -> None:
@@ -282,7 +263,7 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _resolve_diff_range() -> str | None:
-    """Return a git diff range for PR or main builds, or None when unavailable."""
+    """Return a git diff range for PR or release-line builds, or None when unavailable."""
     is_pr = os.environ.get("BUILDKITE_PULL_REQUEST", "false") != "false" and os.environ.get(
         "BUILDKITE_PULL_REQUEST", ""
     )
@@ -302,13 +283,13 @@ def _resolve_diff_range() -> str | None:
                 return None
         return f"{base_ref}...{commit}"
 
-    if os.environ.get("BUILDKITE_BRANCH", "") == "main":
+    if is_release_line_branch():
         if _git("rev-parse", "--verify", f"{commit}^").returncode != 0:
-            _log("main commit has no parent; using safe defaults")
+            _log("release-line commit has no parent; using safe defaults")
             return None
         return f"{commit}^..{commit}"
 
-    _log("not PR/main build; using safe defaults")
+    _log("not PR/release-line build; using safe defaults")
     return None
 
 
@@ -332,7 +313,7 @@ def resolve_ci_context_from_git() -> CiContext:
     diff_range = _resolve_diff_range()
     changed_files = _changed_files_for_diff_range(diff_range)
     decision = resolve_ci_decision(changed_files, diff_range=diff_range)
-    return CiContext(decision=decision, changed_files=changed_files, diff_range=diff_range)
+    return CiContext(decision=decision, changed_files=changed_files)
 
 
 # --- Doc / skip-mark helpers ---
@@ -571,23 +552,6 @@ def main() -> int:
     gate_parser.add_argument("platform", help="cuda, amd, intel, or npu")
     gate_parser.add_argument("level", choices=("l2", "l3"), help="test level")
 
-    subparsers.add_parser(
-        "check-skip-all",
-        help="exit 0 when docs/skip-mark-only diff should skip entire CI upload",
-    )
-
-    skip_parser = subparsers.add_parser(
-        "check-skip-l2-l3",
-        help="exit 0 when PLATFORM l2/l3 pipeline should be skipped (CI config YAML-only diffs)",
-    )
-    skip_parser.add_argument("platform", help="cuda, amd, intel, or npu")
-    skip_parser.add_argument("level", choices=("l2", "l3"), help="test level")
-
-    subparsers.add_parser(
-        "print-annotate",
-        help="print human-readable skip reason for Buildkite annotation",
-    )
-
     args = parser.parse_args()
     decision = resolve_ci_context_from_git().decision
 
@@ -599,16 +563,6 @@ def main() -> int:
             print("skip-l23")
             return 0
         return 1
-
-    if args.command == "check-skip-all":
-        return 0 if decision.skip_all else 1
-
-    if args.command == "check-skip-l2-l3":
-        return 0 if not decision.is_run(args.platform, args.level) else 1
-
-    if args.command == "print-annotate":
-        print(decision.message or "CI will run normally")
-        return 0
 
     return 1
 

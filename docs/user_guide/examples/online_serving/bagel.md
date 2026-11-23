@@ -60,12 +60,58 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
 
 See [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_single_stage.yaml) for configuration. The `pipeline: bagel_single_stage` field selects the single-stage topology from the pipeline registry.
 
-### Tensor Parallelism (TP)
+### Step Execution and Continuous Batching
 
-For larger models or multi-GPU environments, enable TP via CLI:
+Image generation supports step execution with all three BAGEL deploy configs.
+The global flag is applied only to diffusion stages:
+
+- With `bagel.yaml` or `bagel_think.yaml`, Stage 1 uses step execution and the
+  Stage 0 Thinker remains autoregressive.
+- With `bagel_single_stage.yaml`, image requests use step execution in Stage 0.
+  Explicit `text2text` and `img2text` requests use the same complete-request
+  text path as they do without `--step-execution`.
+
+Start with the deploy file's default diffusion capacity of one:
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --tensor-parallel-size 2
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel.yaml \
+    --step-execution
+```
+
+To enable step-wise continuous batching, override `max_num_seqs` on the
+diffusion stage. Use Stage 1 for either two-stage config:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel.yaml \
+    --step-execution \
+    --stage-overrides '{"1":{"max_num_seqs":4}}'
+```
+
+Use Stage 0 for the single-stage config:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel_single_stage.yaml \
+    --step-execution \
+    --stage-overrides '{"0":{"max_num_seqs":4}}'
+```
+
+BAGEL image requests require `num_inference_steps >= 2`: the original BAGEL
+schedule uses `num_inference_steps - 1` denoising updates. The scheduler batches
+only requests with compatible effective image sizes and BAGEL CFG/renormalization
+settings. Sequence parallelism and diffusion cache backends such as TeaCache or
+Cache-DiT are not currently supported together with BAGEL step execution.
+
+### Tensor Parallelism (TP)
+
+For larger models or multi-GPU environments, set TP on each stage that uses it.
+Set `devices` to match the requested TP degree:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --stage-overrides '{"0":{"tensor_parallel_size":2,"devices":"0,1"},"1":{"tensor_parallel_size":2,"devices":"0,1"}}'
 ```
 
 Or set `tensor_parallel_size` per stage in a custom deploy YAML.
@@ -137,6 +183,8 @@ To use Mooncake, create a custom deploy YAML that binds `output_connectors` / `i
 cd examples/online_serving/bagel
 ```
 
+Prompts are plain text. The server builds the context the way BAGEL was trained: every text segment is framed with `<|im_start|>` / `<|im_end|>`, image inputs are wrapped in `<|vision_start|>` / `<|vision_end|>`, and text generation starts from a fresh `<|im_start|>`. The two-stage deployment applies this formatting to image endpoints and chat completions. Requests should not add these tokens themselves. An explicit `--chat-template` takes precedence over the built-in template.
+
 ### Text to Image (text2img)
 
 **Python client:**
@@ -155,7 +203,7 @@ python openai_chat_client.py \
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>A beautiful sunset over mountains<|im_end|>"}]}],
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "A beautiful sunset over mountains"}]}],
     "modalities": ["image"],
     "height": 512,
     "width": 512,
@@ -186,7 +234,7 @@ cat <<EOF > payload.json
     "messages": [{
       "role": "user",
       "content": [
-        {"type": "text", "text": "<|im_start|>Make the cat stand up<|im_end|>"},
+        {"type": "text", "text": "Make the cat stand up"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${IMAGE_BASE64}"}}
       ]
     }],
@@ -202,6 +250,19 @@ curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d @payload.json
 ```
+
+When no output size is requested (`size=auto` on `/v1/images/edits`, or no
+`height`/`width` in a chat request), BAGEL img2img derives the canvas from the
+input image: it preserves the input aspect ratio, aligns dimensions to the
+latent stride (16 px), and applies the checkpoint size limit. An explicit
+`size`, `height`, or `width` is honored instead, in both the single-stage and
+the two-stage deployment; the input image is still resized to a stride-aligned
+size for the VAE/ViT prefill. The latent grid needs multiples of 16, so a
+requested side that is not one is floored to the next multiple (1000x700
+generates 992x688) and the server logs a warning; the response reports the
+generated size. A side above the checkpoint limit is rejected with HTTP 400.
+In step mode, the effective size is resolved before scheduler admission so
+requests with different resulting shapes are not combined.
 
 ### Image to Text (img2text)
 
@@ -224,7 +285,7 @@ cat <<EOF > payload.json
   "messages": [{
     "role": "user",
     "content": [
-      {"type": "text", "text": "<|im_start|>user\n<|image_pad|>\nDescribe this image in detail<|im_end|>\n<|im_start|>assistant\n"},
+      {"type": "text", "text": "Describe this image in detail"},
       {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${IMAGE_BASE64}"}}
     ]
   }],
@@ -253,7 +314,7 @@ python openai_chat_client.py \
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}],
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}],
     "modalities": ["text"]
   }'
 ```
@@ -267,8 +328,8 @@ curl http://localhost:8091/v1/chat/completions \
 | `--server` / `-s` | `http://localhost:8091` | Server URL |
 | `--image-url` / `-i` | `None` | Input image URL or local path (img2img/img2text) |
 | `--modality` / `-m` | `text2img` | `text2img`, `img2img`, `img2text`, `text2text` |
-| `--height` | `512` | Image height in pixels |
-| `--width` | `512` | Image width in pixels |
+| `--height` | `512` | Output height, a multiple of 16; omit both `--height` and `--width` to let img2img derive the size from the input image |
+| `--width` | `512` | Output width, a multiple of 16; omit both `--height` and `--width` to let img2img derive the size from the input image |
 | `--steps` | `25` | Number of inference steps |
 | `--seed` | `42` | Random seed |
 | `--negative` | `None` | Negative prompt for CFG |
@@ -293,6 +354,7 @@ python openai_chat_client.py \
 | File | Description |
 | :--- | :---------- |
 | [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel.yaml) | Two-stage default (Thinker + DiT on GPU 0) |
+| [`bagel_think.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_think.yaml) | Two-stage think mode (Thinker + DiT) |
 | [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_single_stage.yaml) | Single-stage (DiT only) |
 
 ### Key Deploy YAML Fields

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Prompt normalization follows the MiniMaxAI/MiniMax-Music3 input contract.
 # The transformations are reproduced byte-for-byte because any divergence
@@ -19,8 +19,9 @@ Both rows therefore have identical length and identical audio-start position.
 
 from __future__ import annotations
 
-import re
 from typing import Any
+
+import regex as re
 
 # Pinned by ``validate_tokenizer_ids``: a checkpoint whose tokenizer disagrees
 # is not this model, and silently producing noise is worse than failing.

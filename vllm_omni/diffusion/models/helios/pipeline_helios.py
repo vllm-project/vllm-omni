@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Helios (https://github.com/BestWishYsh/Helios)
 
 from __future__ import annotations
@@ -8,7 +8,8 @@ import json
 import logging
 import math
 import os
-from collections.abc import Iterable, Sequence
+import time
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -18,18 +19,25 @@ from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
+from typing_extensions import override
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.utils.math_utils import round_down
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.helios.conditioning_cache import (
+    HeliosConditioningCache,
+    request_conditioning_cache,
+)
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.prompt_update import PromptUpdateMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
@@ -41,6 +49,8 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = logging.getLogger(__name__)
+DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK = 9
+REQUEST_RESOLUTION_ALIGNMENT = 16
 
 
 def calculate_shift(
@@ -65,6 +75,41 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
+def _block_noise_cholesky_factor(
+    block_size: int,
+    gamma: float,
+    device: torch.device | str,
+) -> torch.Tensor:
+    # At the shipped gamma=1/3 and block_size=4 this covariance is singular.
+    # Its 1e-8 ridge is rounded away in float32, and Ascend's Cholesky kernel
+    # faults on the resulting zero pivot. Factor the tiny matrix on CPU in
+    # float64 for NPU so the ridge is representable, then transfer the factor.
+    use_npu_fallback = current_omni_platform.is_npu()
+    factor_device = torch.device("cpu") if use_npu_fallback else device
+    factor_dtype = torch.float64 if use_npu_fallback else torch.float32
+    eye = torch.eye(block_size, device=factor_device, dtype=factor_dtype)
+    cov = (
+        eye * (1 + gamma)
+        - torch.ones(
+            block_size,
+            block_size,
+            device=factor_device,
+            dtype=factor_dtype,
+        )
+        * gamma
+    )
+    cov += eye * 1e-8
+    try:
+        factor = torch.linalg.cholesky(cov)
+    except RuntimeError as exc:
+        if not use_npu_fallback or "requires compiling PyTorch with LAPACK" not in str(exc):
+            raise
+        # Some ROCm wheels omit LAPACK even though NumPy in the same image can
+        # factor this tiny CPU float64 matrix.
+        factor = torch.from_numpy(np.linalg.cholesky(cov.detach().numpy()))
+    return factor.to(device=device, dtype=torch.float32)
+
+
 def load_json_config(model_path: str, subfolder: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:
@@ -74,9 +119,9 @@ def load_json_config(model_path: str, subfolder: str, filename: str, local_files
                 return json.load(f)
     else:
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/{filename}",
             )
@@ -160,7 +205,7 @@ class HeliosPipeline(
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
-    PromptUpdateMixin,
+    InteractionMixin,
     SupportsComponentDiscovery,
 ):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
@@ -305,11 +350,11 @@ class HeliosPipeline(
         extra = getattr(state.sampling, "extra_args", {}) or {}
 
         history_sizes = sorted(extra.get("history_sizes", [16, 2, 1]), reverse=True)
-        num_latent_frames_per_chunk = int(extra.get("num_latent_frames_per_chunk", 9))
+        num_latent_frames_per_chunk = int(extra.get("num_latent_frames_per_chunk", DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK))
         keep_first_frame = bool(extra.get("keep_first_frame", True))
         frame_num = int(extra.get("frame_num", 132))
-        height = (int(state.sampling.height or extra.get("height", 384)) // 16) * 16
-        width = (int(state.sampling.width or extra.get("width", 640)) // 16) * 16
+        height = round_down(int(state.sampling.height or extra.get("height", 384)), REQUEST_RESOLUTION_ALIGNMENT)
+        width = round_down(int(state.sampling.width or extra.get("width", 640)), REQUEST_RESOLUTION_ALIGNMENT)
         num_frames = max(int(state.sampling.num_frames or frame_num), 1)
         num_steps = int(state.sampling.num_inference_steps or extra.get("num_inference_steps", 50))
         output_type = extra.get("output_type", "np")
@@ -533,10 +578,26 @@ class HeliosPipeline(
                 "zero_steps": int(extra.get("zero_steps", 1)),
             }
         )
-        self._prepare_next_chunk(state)
         return state
 
-    def _prepare_next_chunk(self, state: StepRequestState) -> None:
+    def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
+        """Expose this chunk's decoded media extent for interaction timelines."""
+        num_media_frames = int(state.extra["window_num_frames"])
+        num_latent_frames = int(state.extra["num_latent_frames_per_chunk"])
+        fps = state.sampling.fps
+        if fps is None or float(fps) <= 0:
+            raise ValueError(
+                "sampling.fps is required and must be > 0 for interaction modalities that use the "
+                f"chunk media timeline, got {fps!r} (request_id={state.request_id!r})"
+            )
+        return ChunkMediaSpec(
+            num_media_frames=num_media_frames,
+            fps=float(fps),
+            num_latent_frames=num_latent_frames,
+        )
+
+    @override
+    def prepare_next_chunk(self, state: StepRequestState) -> None:
         extra = state.extra
         k = state.chunk_index
         is_first_chunk = k == 0
@@ -668,9 +729,23 @@ class HeliosPipeline(
         if len(states) != 1:
             raise ValueError("Helios step execution supports a single request, not a batched request.")
         state = states[0]
-        if state.extra["is_enable_stage2"]:
-            return self._denoise_stage2_step(state)
-        return self._denoise_stage1_step(state, input_batch.latents, input_batch.timesteps)
+        cache = state.extra.get("helios_conditioning_cache")
+        if cache is None:
+            cache = HeliosConditioningCache(state.request_id)
+            state.extra["helios_conditioning_cache"] = cache
+        try:
+            with cache.activate():
+                if state.extra["is_enable_stage2"]:
+                    return self._denoise_stage2_step(state)
+                return self._denoise_stage1_step(state, input_batch.latents, input_batch.timesteps)
+        except BaseException:
+            self.release_step_request(state)
+            raise
+
+    def release_step_request(self, state: StepRequestState) -> None:
+        cache = state.extra.pop("helios_conditioning_cache", None)
+        if cache is not None:
+            cache.close()
 
     def _denoise_stage1_step(
         self,
@@ -703,6 +778,7 @@ class HeliosPipeline(
             )[0]
             noise_uncond = self.transformer(
                 encoder_hidden_states=state.negative_prompt_embeds,
+                conditioning_branch="negative",
                 **transformer_kwargs,
             )[0]
             positive_flat = noise_pred.view(batch_size, -1)
@@ -720,6 +796,7 @@ class HeliosPipeline(
         negative_kwargs = (
             {
                 "encoder_hidden_states": state.negative_prompt_embeds,
+                "conditioning_branch": "negative",
                 **transformer_kwargs,
             }
             if state.do_true_cfg
@@ -757,7 +834,9 @@ class HeliosPipeline(
         }
         noise_pred = self.transformer(encoder_hidden_states=state.prompt_embeds, **transformer_kwargs)[0]
         if state.do_true_cfg:
-            noise_uncond = self.transformer(encoder_hidden_states=state.negative_prompt_embeds, **transformer_kwargs)[0]
+            noise_uncond = self.transformer(
+                encoder_hidden_states=state.negative_prompt_embeds, conditioning_branch="negative", **transformer_kwargs
+            )[0]
             if extra["use_cfg_zero_star"]:
                 positive_flat = noise_pred.view(batch_size, -1)
                 negative_flat = noise_uncond.view(batch_size, -1)
@@ -900,14 +979,10 @@ class HeliosPipeline(
 
         output = current_latents if extra["output_type"] == "latent" else current_video
         completed_chunk_index = state.chunk_index
-        prompt_update_metadata = state.extra.pop("prompt_update_chunk_metadata", {})
         state.chunk_index += 1
         finished = state.request_denoise_completed
-        if not finished:
-            # Apply queued/advancing prompt updates before preparing the next chunk.
-            self._apply_prompt_update_at_chunk_boundary(state)
-            self._prepare_next_chunk(state)
-        else:
+        if finished:
+            self.release_step_request(state)
             self._current_timestep = None
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()
@@ -917,12 +992,10 @@ class HeliosPipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
             chunk_index=completed_chunk_index,
             total_chunks=state.total_chunks,
-            started_event_ids=prompt_update_metadata.get("started_event_ids", []),
-            active_event_ids=prompt_update_metadata.get("active_event_ids", []),
-            completed_event_ids=prompt_update_metadata.get("completed_event_ids", []),
             finished=finished,
         )
 
+    @request_conditioning_cache
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -940,7 +1013,7 @@ class HeliosPipeline(
         attention_kwargs: dict | None = None,
         # Helios-specific
         history_sizes: list | None = None,
-        num_latent_frames_per_chunk: int = 9,
+        num_latent_frames_per_chunk: int = DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK,
         keep_first_frame: bool = True,
         # I2V
         image: torch.Tensor | None = None,
@@ -1014,8 +1087,8 @@ class HeliosPipeline(
 
         self._guidance_scale = guidance_scale
 
-        height = (height // 16) * 16
-        width = (width // 16) * 16
+        height = round_down(height, REQUEST_RESOLUTION_ALIGNMENT)
+        width = round_down(width, REQUEST_RESOLUTION_ALIGNMENT)
         num_frames = max(num_frames, 1)
 
         device = self.device
@@ -1352,6 +1425,8 @@ class HeliosPipeline(
         """Single-stage denoising loop for one chunk."""
         batch_size = latents.shape[0]
         do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+        # Distilled (DMD) needs the chunk-start noise for renoise; mirror step_scheduler.
+        stage1_start_latents = latents
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
@@ -1380,6 +1455,7 @@ class HeliosPipeline(
 
                     noise_uncond = self.transformer(
                         encoder_hidden_states=negative_prompt_embeds,
+                        conditioning_branch="negative",
                         **transformer_kwargs,
                     )[0]
 
@@ -1401,6 +1477,7 @@ class HeliosPipeline(
                     if do_true_cfg:
                         negative_kwargs = {
                             "encoder_hidden_states": negative_prompt_embeds,
+                            "conditioning_branch": "negative",
                             **transformer_kwargs,
                         }
                     else:
@@ -1414,7 +1491,20 @@ class HeliosPipeline(
                         cfg_normalize=False,
                     )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if self.is_distilled:
+                    latents = self.scheduler.step(
+                        noise_pred,
+                        t,
+                        latents,
+                        return_dict=False,
+                        cur_sampling_step=i,
+                        dmd_noisy_tensor=stage1_start_latents,
+                        dmd_sigmas=self.scheduler.sigmas,
+                        dmd_timesteps=self.scheduler.timesteps,
+                        all_timesteps=timesteps,
+                    )[0]
+                else:
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
                 pbar.update()
 
@@ -1531,6 +1621,7 @@ class HeliosPipeline(
                     if do_true_cfg:
                         noise_uncond = self.transformer(
                             encoder_hidden_states=negative_prompt_embeds,
+                            conditioning_branch="negative",
                             **transformer_kwargs,
                         )[0]
 
@@ -1573,12 +1664,7 @@ class HeliosPipeline(
 
         device = generator.device if generator is not None else self.device
 
-        # Allocate directly on the execution device in float32 to use the device solver
-        # and avoid fp16/bf16 Cholesky on the covariance matrix.
-        eye = torch.eye(block_size, device=device, dtype=torch.float32)
-        cov = eye * (1 + gamma) - torch.ones(block_size, block_size, device=device, dtype=torch.float32) * gamma
-        cov += eye * 1e-8
-        L = torch.linalg.cholesky(cov)
+        L = _block_noise_cholesky_factor(block_size, gamma, device)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
         z = torch.randn(block_number, block_size, generator=generator, device=device)
         noise = z @ L.T
@@ -1694,6 +1780,77 @@ class HeliosPipeline(
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
+    def warmup_vae_profiles(self, profiles: Iterable[Mapping[str, int]]) -> None:
+        """Warm only explicitly configured, exact Helios request geometries."""
+        if isinstance(profiles, (str, bytes, Mapping)):
+            raise TypeError("helios_vae_warmup_profiles must be a sequence of profile mappings")
+
+        try:
+            configured_profiles = list(profiles)
+        except TypeError as exc:
+            raise TypeError("helios_vae_warmup_profiles must be a sequence of profile mappings") from exc
+        if not configured_profiles:
+            return
+
+        exact_profiles: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for index, profile in enumerate(configured_profiles):
+            if not isinstance(profile, Mapping) or set(profile) != {"height", "width"}:
+                raise ValueError(f"Helios VAE warmup profile {index} must contain exactly height and width")
+            geometry = (profile["height"], profile["width"])
+            if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in geometry):
+                raise ValueError(f"Helios VAE warmup profile {index} height and width must be positive integers")
+            height, width = geometry
+            if height % REQUEST_RESOLUTION_ALIGNMENT or width % REQUEST_RESOLUTION_ALIGNMENT:
+                raise ValueError(
+                    f"Helios VAE warmup profile {index} height and width must be multiples of "
+                    f"{REQUEST_RESOLUTION_ALIGNMENT} to match the request path without changing its geometry"
+                )
+            if geometry not in seen:
+                seen.add(geometry)
+                exact_profiles.append(geometry)
+
+        spatial_scale = self.vae_scale_factor_spatial
+        channels = self.vae.config.z_dim
+        total_started = time.perf_counter()
+        for height, width in exact_profiles:
+            latent_shape = (
+                1,
+                channels,
+                DEFAULT_NUM_LATENT_FRAMES_PER_CHUNK,
+                height // spatial_scale,
+                width // spatial_scale,
+            )
+            latents = output = None
+            try:
+                with torch.inference_mode():
+                    latents = torch.zeros(latent_shape, device=self.vae.device, dtype=self.vae.dtype)
+                    sync_device = (
+                        latents.device.type != "cpu" and getattr(current_omni_platform, "is_available", lambda: False)()
+                    )
+                    if sync_device:
+                        current_omni_platform.synchronize()
+                    profile_started = time.perf_counter()
+                    output = self.vae.decode(latents, return_dict=False)
+                    if sync_device:
+                        current_omni_platform.synchronize()
+                    elapsed = time.perf_counter() - profile_started
+                logger.info(
+                    "Helios VAE warmup: request profile=%dx%d latent_shape=%s elapsed=%.3fs",
+                    height,
+                    width,
+                    latent_shape,
+                    elapsed,
+                )
+            finally:
+                del output, latents
+
+        logger.info(
+            "Helios VAE warmup total: %d profiles elapsed=%.3fs",
+            len(exact_profiles),
+            time.perf_counter() - total_started,
+        )
+
     def prepare_image_latents(
         self,
         image: torch.Tensor,
@@ -1769,5 +1926,6 @@ class HeliosPipeline(
         return first_frame_latent.to(device=device, dtype=dtype), video_latents.to(device=device, dtype=dtype)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self.transformer.clear_cross_attention_cache()
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

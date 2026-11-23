@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import pytest
 
 from vllm_omni.diffusion.sched import DMD2SigmaSchedule
@@ -18,7 +18,8 @@ def test_step_count_is_intervals_not_boundaries():
     [
         [],
         [1.0],
-        [0.9, 0.5, 0.0],
+        [1.5, 0.5, 0.0],
+        [0.0, 0.5, 0.0],
         [1.0, 0.5, 0.1],
         [1.0, 0.4, 0.6, 0.0],
         [1.0, 0.5, 0.5, 0.0],
@@ -29,6 +30,15 @@ def test_step_count_is_intervals_not_boundaries():
 def test_malformed_positions_are_rejected(positions):
     with pytest.raises(ValueError):
         DMD2SigmaSchedule.from_positions(positions)
+
+
+def test_a_capped_first_position_is_a_schedule_not_a_malformed_one():
+    # A DMD2 student trained with max_timestep_ratio < 1 never sees pure noise,
+    # so its opening rung sits just below 1.0 (FastH3: 999/1000).
+    schedule = DMD2SigmaSchedule.from_positions([0.999, 0.749, 0.5, 0.25, 0.0])
+
+    assert schedule.base_schedule[0] == 0.999
+    assert schedule.num_inference_steps == 4
 
 
 def test_one_base_schedule_drives_several_shift_scales():

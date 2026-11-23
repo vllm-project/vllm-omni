@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 import torch
@@ -77,7 +80,7 @@ def _make_finished_sentinel() -> OmniPayloadStruct:
 
 def _flush_remaining_codes(
     transfer_manager: Any,
-    request_id: str,
+    request_id: str | None,
     chunk_size: int,
     left_context_size: int,
 ) -> OmniPayloadStruct:
@@ -111,20 +114,10 @@ def _flush_remaining_codes(
     )
 
 
-def _is_codes_empty(codes: Any) -> bool:
-    """Check whether code_predictor_codes should be treated as empty / invalid."""
-    if codes is None:
-        return True
-    if isinstance(codes, torch.Tensor):
-        return codes.numel() == 0 or not codes.any()
-    if hasattr(codes, "__len__") and len(codes) == 0:
-        return True
-    t = torch.tensor(codes, dtype=torch.long) if not isinstance(codes, torch.Tensor) else codes
-    return not t.any()
-
-
 def _to_code_tensor(codes: Any) -> torch.Tensor | None:
-    """Convert codes to a (B, 1, 8, 4) long tensor, or return None if shape is invalid."""
+    """Convert codes to a (B, 1, 8, 4) long tensor, or return None when absent or invalid."""
+    if codes is None:
+        return None
     code_tensor = codes.to(torch.long) if isinstance(codes, torch.Tensor) else torch.tensor(codes, dtype=torch.long)
     if code_tensor.ndim == 3:
         code_tensor = code_tensor.unsqueeze(0)

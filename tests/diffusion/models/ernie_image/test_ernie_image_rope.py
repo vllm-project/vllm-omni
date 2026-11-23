@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
 from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import (
     ErnieImageEmbedND3,
+    _apply_qk_rotary_emb,
     _apply_rotary_emb,
     rope,
 )
@@ -185,3 +189,30 @@ class TestErnieImageRopePositionEmbedding:
         out_diffusers = x * cos_ + rotated * sin_
 
         assert torch.allclose(out_vllm, out_diffusers, atol=1e-6), "vllm-omni and diffusers outputs should match"
+
+    def test_apply_qk_rotary_emb_uses_native_fallback(self, monkeypatch):
+        """Unsupported routes preserve both existing eager calls exactly."""
+        from vllm_omni.diffusion.models.ernie_image import (
+            ernie_image_transformer,
+        )
+
+        B, S, H, D = 2, 17, 3, 128
+        query = torch.randn(B, S, H, D)
+        key = torch.randn(B, S, H, D)
+        freqs_cos = torch.randn(B, S, D // 2)
+        freqs_sin = torch.randn(B, S, D // 2)
+        monkeypatch.setattr(
+            ernie_image_transformer,
+            "try_fused_qk_rotary_emb",
+            lambda *args: None,
+        )
+
+        actual_query, actual_key = _apply_qk_rotary_emb(query, key, freqs_cos, freqs_sin)
+        assert torch.equal(
+            actual_query,
+            _apply_rotary_emb(query, freqs_cos, freqs_sin),
+        )
+        assert torch.equal(
+            actual_key,
+            _apply_rotary_emb(key, freqs_cos, freqs_sin),
+        )

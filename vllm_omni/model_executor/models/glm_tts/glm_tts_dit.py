@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-TTS DiT (Diffusion Transformer) Model.
 
 Flow Matching model that converts speech tokens to mel-spectrogram.
@@ -305,6 +305,21 @@ class FeedForward(nn.Module):
         return self.ff(x)
 
 
+# These backends reject float32 Q/K/V. GLM-TTS runs its DiT stage in float32
+# (the wrapper keeps the Euler ODE state in float32), so automatically
+# selected incompatible backends must not receive its attention tensors.
+# This includes cuDNN and FlashInfer selected on Blackwell. Explicit backend
+# choices retain the shared layer's fail-fast contract instead of being
+# silently replaced here. Mirrors the MiniMax Music 3 fix (#7354).
+_FLOAT32_UNSUPPORTED_BACKENDS = {
+    "FLASH_ATTN",
+    "FLASH_ATTN_HUB",
+    "FLASH_ATTN_3_HUB",
+    "CUDNN_ATTN",
+    "FLASHINFER_ATTN",
+}
+
+
 class DiTAttention(nn.Module):
     """Attention module using diffusion infrastructure."""
 
@@ -326,6 +341,13 @@ class DiTAttention(nn.Module):
             head_size=dim_head,
             softmax_scale=self.scale,
             causal=False,
+        )
+        backend = getattr(self.attn, "attn_backend", None)
+        backend_name = backend.get_name() if backend is not None else None
+        self._auto_float32_sdpa = (
+            backend is not None
+            and not getattr(self.attn, "backend_explicit", False)
+            and backend_name in _FLOAT32_UNSUPPORTED_BACKENDS
         )
 
     def forward(
@@ -369,6 +391,23 @@ class DiTAttention(nn.Module):
                 is_causal=False,
             )
             out = out.permute(0, 2, 1, 3)  # [B, T, H, D]
+        elif self._auto_float32_sdpa and query.dtype == torch.float32:
+            # The automatically selected backend rejects float32 Q/K/V, and
+            # GLM-TTS decodes in float32, so route through SDPA for this input.
+            # Explicit backend choices keep the shared layer's fail-fast
+            # behavior (matches MiniMax Music 3, #7354).
+            q = query.transpose(1, 2)  # [B, H, T, D]
+            k = key.transpose(1, 2)
+            v = value.transpose(1, 2)
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scale,
+            )
+            out = out.transpose(1, 2)  # [B, T, H, D]
         else:
             out = self.attn(query, key, value, attn_metadata=None)
         out = out.view(batch_size, seq_len, self.inner_dim)
