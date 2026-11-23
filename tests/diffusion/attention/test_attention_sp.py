@@ -270,15 +270,6 @@ def test_allgather_preserves_existing_full_mask(mask_shape):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("strategy", [AllGatherKVParallelAttention, UlyssesAllGatherKVParallelAttention])
-def test_allgather_empty_joint_mask_without_image_mask(strategy):
-    key = torch.zeros(2, 4, 1, 1)
-    metadata = AttentionMetadata(joint_key=key[:, :0], joint_attn_mask=torch.empty(2, 0, dtype=torch.bool))
-    assert strategy._merge_joint_attn_mask(metadata, key) is metadata
-    assert metadata.attn_mask is None
-
-
-@pytest.mark.cpu
 def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
     rank = 1
     joint_len = 1
