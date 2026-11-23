@@ -50,11 +50,6 @@ def stop_frame_mask(codes: torch.Tensor, codebook_eos_token_id: int = 0) -> torc
     return (codes[..., :-1] == codebook_eos_token_id).all(dim=-1)
 
 
-def empty_frame_mask(codes: torch.Tensor, codebook_eos_token_id: int = 0) -> torch.Tensor:
-    """Frames where audio is cut: every codebook, including the last, is the EOS id."""
-    return (codes == codebook_eos_token_id).all(dim=-1)
-
-
 class CsmAudioEmbeddings(nn.Module):
     """Embeds an audio frame as the sum of its codebook embeddings."""
 
@@ -219,12 +214,16 @@ class CsmTalkerForConditionalGeneration(nn.Module):
         finally:
             self._forced_stop_mask = None
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+    def make_omni_output(
+        self,
+        model_outputs: torch.Tensor | OmniOutput,
+        request_token_spans: Sequence[tuple[int, int]] | None = None,
+        **_: Any,
+    ) -> OmniOutput:
         """Allocate this step's token-major frame outputs; the runner fills them after sampling."""
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
-        spans = kwargs.get("request_token_spans")
-        num_tokens = spans[-1][1] if spans else model_outputs.shape[0]
+        num_tokens = request_token_spans[-1][1] if request_token_spans else model_outputs.shape[0]
         device = model_outputs.device
         return OmniOutput(
             text_hidden_states=model_outputs,

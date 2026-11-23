@@ -23,7 +23,6 @@ from vllm_omni.model_executor.models.csm.csm_mimi import CODEC_PREFIX, codec_wei
 from vllm_omni.model_executor.models.csm.csm_talker import (
     REFERENCE_AUDIO_KEY,
     CsmTalkerForConditionalGeneration,
-    empty_frame_mask,
     stop_frame_mask,
 )
 
@@ -241,7 +240,7 @@ def test_prefix_caching_is_rejected_when_the_model_is_built(monkeypatch: pytest.
         _build_talker(_config(), monkeypatch, enable_prefix_caching=True)
 
 
-def test_stop_and_empty_frame_rules() -> None:
+def test_stop_frame_rule() -> None:
     num_codebooks = 32
     all_zero = torch.zeros(num_codebooks, dtype=torch.long)
     last_differs = all_zero.clone()
@@ -252,9 +251,8 @@ def test_stop_and_empty_frame_rules() -> None:
     middle_differs[10] = 3
     frames = torch.stack((all_zero, last_differs, first_is_zero, middle_differs))
 
-    # Generation stops on the first 31 codebooks; audio is cut only when all 32 are zero.
+    # Generation stops on the first 31 codebooks, whatever the last one is.
     assert stop_frame_mask(frames).tolist() == [True, True, False, False]
-    assert empty_frame_mask(frames).tolist() == [True, False, False, False]
     assert stop_frame_mask(frames[None]).shape == (1, 4)
 
 

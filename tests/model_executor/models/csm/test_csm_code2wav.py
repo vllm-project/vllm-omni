@@ -12,6 +12,7 @@ from transformers import CsmConfig, MimiModel
 from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmAdapter
 from vllm_omni.model_executor.models.csm.csm_code2wav import CsmCode2Wav
 from vllm_omni.model_executor.models.csm.csm_mimi import codec_weight_name
+from vllm_omni.model_executor.models.model_local_kv import ModelLocalKVScope, RowDriver
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.csm import talker2code2wav_async_chunk
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -63,9 +64,14 @@ def _checkpoint(reference: MimiModel, *, flat: bool) -> dict[str, torch.Tensor]:
     return state
 
 
-def _build(config: CsmConfig) -> CsmCode2Wav:
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=config))
-    return CsmCode2Wav(vllm_config=vllm_config).eval()
+def _build(config: CsmConfig, *, chunk_frames: int | None = None) -> CsmCode2Wav:
+    model_config = SimpleNamespace(hf_config=config)
+    if chunk_frames is not None:
+        model_config.stage_connector_config = {
+            "name": "SharedMemoryConnector",
+            "extra": {"codec_chunk_frames": chunk_frames},
+        }
+    return CsmCode2Wav(vllm_config=SimpleNamespace(model_config=model_config)).eval()
 
 
 @pytest.fixture
@@ -331,6 +337,38 @@ def test_connector_payload_takes_precedence_over_token_ids(model: CsmCode2Wav, r
     placeholder = torch.zeros(3, dtype=torch.long)
     output = model(input_ids=placeholder, model_intermediate_buffer=[{"codes": {"audio": _flat(codes)}}])
     _assert_same_audio(_audios(output)[0], _reference_audio(reference, codes))
+
+
+@pytest.mark.parametrize(("configured", "chunk"), [(None, 5), (3, 3)], ids=["default_chunk", "connector_chunk"])
+def test_declared_decoder_kv_is_what_a_long_request_holds(
+    config: CsmConfig, reference: MimiModel, configured: int | None, chunk: int
+) -> None:
+    model = _build(config, chunk_frames=configured)
+    model.load_weights(_checkpoint(reference, flat=True).items())
+    transformer = model._decoder.transformer.config
+    kept = transformer.sliding_window - 1
+    positions = kept + 2 * chunk
+    row_bytes = (
+        2 * transformer.num_hidden_layers * transformer.num_key_value_heads * transformer.head_dim * positions * 4
+    )
+
+    (spec,) = model.model_local_kv_specs()
+    assert spec.physical_capacity_positions == positions
+    assert spec.bytes_per_row == row_bytes
+    assert spec.scope is ModelLocalKVScope.REQUEST
+    assert spec.rows is RowDriver.MAX_NUM_SEQS
+    assert spec.peak_bytes(max_num_seqs=8) == 8 * row_bytes
+
+    # Enough frames to fill the window (two positions per frame), sent as the talker stage sends them.
+    codes = _codes(frames=1 + chunk * (kept // (2 * chunk) + 2), seed=15)
+    _decode(model, "a", codes[:1])
+    for start in range(1, codes.shape[0], chunk):
+        _decode(model, "a", codes[start : start + chunk])
+    layers = model._streams["a"].kv.layers
+    assert all(layer.keys.shape[-2] == kept for layer in layers)
+    # transformers keeps a view of its last concatenation, so the storage is larger than the kept positions.
+    held = sum(tensor.untyped_storage().nbytes() for layer in layers for tensor in (layer.keys, layer.values))
+    assert held == spec.bytes_per_row
 
 
 def test_non_sampling_stage_contract(model: CsmCode2Wav) -> None:

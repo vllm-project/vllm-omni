@@ -4,9 +4,8 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 
@@ -17,7 +16,7 @@ logger = init_logger(__name__)
 _GRAPH_WARMUP_ITERS = 2
 
 
-def depth_graph_buckets(vllm_config: Any) -> list[int]:
+def depth_graph_buckets(vllm_config: VllmConfig) -> list[int]:
     """Batch sizes whose frame step is captured; none for a stage that runs eagerly.
 
     These are vLLM's capture sizes below ``max_num_seqs`` (powers of two when
@@ -151,7 +150,7 @@ class CsmDepthDecoderGraphs:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local"):
                     outputs = self._step(rows)
-            except Exception:
+            except RuntimeError:
                 logger.warning(
                     "CSM depth decoder CUDA graph capture failed at %d rows; those frames run eagerly",
                     rows,

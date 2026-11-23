@@ -20,7 +20,14 @@ from vllm_omni.model_executor.models.csm.csm_mimi import (
     MimiDecoderState,
     rename_codec_weights,
 )
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.csm import DEFAULT_CHUNK_FRAMES
 
 logger = init_logger(__name__)
 
@@ -37,6 +44,13 @@ def _split_by_request(ids: torch.Tensor, seq_token_counts: Sequence[int] | None)
     return segments
 
 
+def _chunk_frames(vllm_config: VllmConfig) -> int:
+    """Frames in the largest chunk the talker stage sends, from this stage's connector config."""
+    connector = getattr(vllm_config.model_config, "stage_connector_config", None)
+    extra = connector.get("extra", connector) if isinstance(connector, Mapping) else {}
+    return int(extra.get("codec_chunk_frames") or DEFAULT_CHUNK_FRAMES)
+
+
 def _payload_codes(info: Any) -> torch.Tensor | None:
     """Codes delivered through the connector, which take precedence over placeholder token ids."""
     codes = info.get("codes") if isinstance(info, Mapping) else None
@@ -51,7 +65,6 @@ def _payload_codes(info: Any) -> torch.Tensor | None:
 class CsmCode2Wav(nn.Module):
     """Stage-1 model for ``sesame/csm-1b``: incremental Mimi decoding under the generation runner."""
 
-    input_modalities = "audio"
     requires_exact_input_shape = True
     # Decoder state is kept per scheduler request id.
     requires_request_ids = True
@@ -66,17 +79,16 @@ class CsmCode2Wav(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
-        self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
 
         codec_config = config.codec_config
         self.num_codebooks = int(config.num_codebooks)
         self.sample_rate = int(codec_config.sampling_rate)
-        self.samples_per_frame = round(codec_config.sampling_rate / codec_config.frame_rate)
         self.codec_vocab_size = int(codec_config.codebook_size)
         # The codec runs in float32 whatever dtype the stage is configured with.
         self.codec_model = MimiModel(codec_config).to(torch.float32)
         self._decoder = CsmMimiStreamingDecoder(self.codec_model)
+        self._chunk_frames = _chunk_frames(vllm_config)
         self._streams: dict[str, MimiDecoderState] = {}
         self._failed: set[str] = set()
 
@@ -111,7 +123,9 @@ class CsmCode2Wav(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         model_intermediate_buffer: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
+        request_ids: Sequence[str] | None = None,
+        seq_token_counts: Sequence[int] | None = None,
+        **_: Any,
     ) -> OmniOutput:
         """Decode each request's new frames and return only their audio (delta).
 
@@ -129,8 +143,8 @@ class CsmCode2Wav(nn.Module):
             return self._output([empty], [False], sample_rate)
 
         infos = runtime_additional_information or model_intermediate_buffer or []
-        request_ids = kwargs.get("request_ids") or []
-        segments = _split_by_request(input_ids.reshape(-1), kwargs.get("seq_token_counts"))
+        request_ids = request_ids or []
+        segments = _split_by_request(input_ids.reshape(-1), seq_token_counts)
         audios = [empty] * len(segments)
         failed = [False] * len(segments)
         for index, segment in enumerate(segments):
@@ -182,6 +196,31 @@ class CsmCode2Wav(nn.Module):
         for request_id in finished_req_ids:
             self._streams.pop(request_id, None)
             self._failed.discard(request_id)
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the decoder transformer's attention KV, which each request keeps between chunks."""
+        transformer = self._decoder.transformer
+        upsample = self._decoder.upsample
+        positions_per_frame = int(upsample.conv.stride[0]) if upsample is not None else 1
+        kept = int(transformer.config.sliding_window) - 1
+        return [
+            spec_from_hf_config(
+                transformer.config,
+                name="csm_mimi_decoder_kv",
+                physical_capacity_positions=kept + positions_per_frame * self._chunk_frames,
+                capacity_source=(
+                    "sliding_window - 1 positions kept by transformers' DynamicSlidingWindowLayer as a view of "
+                    "its last concatenation, whose storage also holds one chunk (codec_chunk_frames)"
+                ),
+                scope=ModelLocalKVScope.REQUEST,
+                dtype=next(transformer.parameters()).dtype,
+                rows=RowDriver.MAX_NUM_SEQS,
+                allocation_note=(
+                    "one DynamicCache per request in flight; retains_state_across_chunks keeps a waiting "
+                    "request's slot, so live caches do not exceed max_num_seqs"
+                ),
+            )
+        ]
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:
         """Return ``forward``'s output unchanged."""

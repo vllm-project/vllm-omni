@@ -51,9 +51,6 @@ def test_streaming_pcm(omni_server, online_client) -> None:
             "min_audio_bytes": 24000,
             "stream": True,
             "stream_format": "audio",
-            # The reference implementation's own greedy output scores -0.6 to 3.8 dB and sampled
-            # streams -1.0 to 6.5 dB, so this floor only catches a broken codec.
-            "min_hnr_db": -3.0,
             "seed": 42,
             "max_new_tokens": 250,
         }

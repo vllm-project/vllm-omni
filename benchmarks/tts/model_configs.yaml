@@ -204,3 +204,12 @@ models:
     trust_remote_code: true
     task_extra_body:
       default_voice: {}
+
+  # CSM-1B has no preset voices, so default_voice sends the text alone. The
+  # seed-tts voice_clone rows carry `language`, which a CSM request rejects.
+  sesame/csm-1b:
+    supported_tasks: [default_voice]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      default_voice: {}

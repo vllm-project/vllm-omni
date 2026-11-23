@@ -129,6 +129,31 @@ def test_indextts25_is_registered_in_shared_model_configs() -> None:
     assert config["task_extra_body"]["voice_clone"]["extra_params"]["lang"] == "en"
 
 
+def test_csm_is_registered_for_default_voice_only() -> None:
+    model = "sesame/csm-1b"
+    config = bench_tts.load_model_configs(bench_tts._DEFAULT_MODEL_CONFIGS)[model]
+    assert config["supported_tasks"] == ["default_voice"]
+
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8000,
+        model=model,
+        task="default_voice",
+        model_cfg=config,
+        locale="en",
+        num_prompts=20,
+        concurrency=1,
+        dataset_path="benchmarks/build_dataset/seed_tts_smoke",
+        wer_eval=False,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=[],
+    )
+    assert cmd[cmd.index("--dataset-name") + 1] == "seed-tts-text"
+    assert "--extra-body" not in cmd
+    assert "--trust-remote-code" not in cmd
+
+
 def test_build_bench_args_voice_clone(model_configs_path: Path) -> None:
     configs = bench_tts.load_model_configs(model_configs_path)
     cmd = bench_tts.build_bench_args(
