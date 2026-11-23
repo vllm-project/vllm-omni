@@ -1846,5 +1846,5 @@ cache-epoch/chunk-sequence deduplication as audio. It does not wait for later
 speech or replay the delegation text with the next audible unit.
 
 This filtering does not execute delegated work or supply the external Venus
-memory runtime. The [Realtime-Venus recipe](../../recipes/inclusionAI/Realtime-Venus.md)
+memory runtime. The [Realtime-Venus recipe](gh-file:recipes/inclusionAI/Realtime-Venus.md)
 defines the currently exposed serving scope and validation limitations.
