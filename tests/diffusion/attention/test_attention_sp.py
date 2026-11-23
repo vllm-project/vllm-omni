@@ -37,6 +37,7 @@ do not exercise the full model-registry pipeline.
 import os
 import pickle
 import tempfile
+from itertools import product
 from types import SimpleNamespace
 
 import pytest
@@ -46,7 +47,6 @@ import torch.distributed
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion import forward_context
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata, QueryRange
-from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
@@ -210,85 +210,84 @@ class _MockAllGatherSPGroup:
         return torch.cat(chunks, dim=dim)
 
 
-@pytest.mark.cpu
-@pytest.mark.parametrize(("rank", "joint_strategy"), [(0, "front"), (1, "rear")])
-@pytest.mark.parametrize(
-    ("mask_image", "mask_joint"),
-    [(False, True), (True, True), (True, False)],
-    ids=["text-padding", "both-padding", "image-padding"],
-)
-def test_allgather_joint_key_mask_reaches_sdpa(rank, joint_strategy, mask_image, mask_joint):
-    query = torch.zeros(1, 2, 1, 1)
-    keys = [torch.zeros_like(query) for _ in range(2)]
-    image_mask = torch.tensor([[True, True, True, not mask_image]])
-    joint_mask = torch.tensor([[True, not mask_joint]])
-    # Valid values are one and padding values zero, so masked SDPA must return one.
-    values = [chunk.float().view_as(query) for chunk in image_mask.chunk(2, dim=1)]
-    metadata = AttentionMetadata(
-        attn_mask=image_mask if mask_image else None,
-        joint_attn_mask=joint_mask if mask_joint else None,
-        joint_query=query,
-        joint_key=query,
-        joint_value=joint_mask.float().view_as(query),
-        joint_strategy=joint_strategy,
-    )
-    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=rank, gather_chunks=[keys, values]))
-    q, k, v, metadata, _ = strategy.pre_attention(query, keys[rank], values[rank], metadata)
-
-    output = SDPAImpl(num_heads=1, head_size=1, softmax_scale=1.0)._forward_impl(q, k, v, metadata)
-    torch.testing.assert_close(output, torch.ones_like(output))
-    assert metadata.attn_mask.shape == (1, k.shape[1])
-
-
-@pytest.mark.cpu
-@pytest.mark.parametrize("backend", ["FlashAttentionHubImpl", "FlashAttention3HubImpl"])
-@pytest.mark.parametrize(("sp_size", "rank"), [(1, 0), (2, 0), (2, 1)])
-@pytest.mark.parametrize("joint_strategy", ["front", "rear"])
-def test_allgather_joint_key_mask_reaches_flash_hub(monkeypatch, backend, sp_size, rank, joint_strategy):
+def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
     from vllm_omni.diffusion.attention.backends import flash_attn_hub
+    from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 
-    def varlen_sdpa(q, k, v, *, cu_seqlens_q, cu_seqlens_k, softmax_scale, **kwargs):
-        outputs = []
-        for qs, qe, ks, ke in zip(cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_k[:-1], cu_seqlens_k[1:]):
-            outputs.append(
-                torch.nn.functional.scaled_dot_product_attention(
-                    q[qs:qe].transpose(0, 1),
-                    k[ks:ke].transpose(0, 1),
-                    v[ks:ke].transpose(0, 1),
-                    scale=softmax_scale,
-                ).transpose(0, 1)
+    device = current_omni_platform.get_torch_device(rank)
+    current_omni_platform.set_device(device)
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=2, init_method=init_method)
+    try:
+        singletons = [torch.distributed.new_group([i]) for i in range(2)]
+        group = SequenceParallelGroupCoordinator(
+            [[0, 1]],
+            rank,
+            "nccl",
+            ulysses_group=singletons[rank],
+            ring_group=singletons[rank],
+            allgather_group=torch.distributed.group.WORLD,
+        )
+        strategy = AllGatherKVParallelAttention(group)
+        impl = getattr(flash_attn_hub, backend)(num_heads=1, head_size=64, softmax_scale=0.125)
+        query = torch.zeros(2, 2, 1, 64, device=device, dtype=torch.bfloat16)
+        joint = torch.zeros(2, 4, 1, 64, device=device, dtype=query.dtype)
+        for joint_strategy, (mask_image, mask_joint) in product(
+            ("front", "rear"), [(False, True), (True, True), (True, False)]
+        ):
+            image_mask = torch.tensor(
+                [[True, True, True, not mask_image], [True, not mask_image, True, True]], device=device
             )
-        output = torch.cat(outputs)
-        return (output, None) if backend == "FlashAttention3HubImpl" else output
+            joint_mask = torch.tensor(
+                [[True, True, True, not mask_joint], [True, not mask_joint, not mask_joint, not mask_joint]],
+                device=device,
+            )
+            local_image_mask = image_mask[:, 2 * rank : 2 * rank + 2]
+            metadata = AttentionMetadata(
+                attn_mask=image_mask if mask_image else None,
+                joint_attn_mask=joint_mask if mask_joint else None,
+                joint_query=joint,
+                joint_key=joint,
+                joint_value=joint_mask[:, :, None, None].expand_as(joint).to(query.dtype),
+                joint_strategy=joint_strategy,
+            )
+            value = local_image_mask[:, :, None, None].expand_as(query).to(query.dtype)
+            q, k, v, metadata, _ = strategy.pre_attention(query, query, value, metadata)
+            output = impl.forward_cuda(q, k, v, metadata)
+            valid_queries = torch.cat(
+                [joint_mask, local_image_mask] if joint_strategy == "front" else [local_image_mask, joint_mask],
+                dim=1,
+            )
+            # Every valid value is one and every padding value zero.
+            torch.testing.assert_close(output[valid_queries], torch.ones_like(output[valid_queries]))
+            # Equal Q/K lengths retain the existing query-padding behavior.
+            square_output = impl.forward_cuda(k, k, v, metadata)
+            torch.testing.assert_close(
+                square_output[metadata.attn_mask], torch.ones_like(square_output[metadata.attn_mask])
+            )
+            assert torch.count_nonzero(square_output[~metadata.attn_mask]) == 0
+    finally:
+        torch.distributed.destroy_process_group()
 
-    monkeypatch.setattr(
-        flash_attn_hub, "_get_hub_module", lambda _: SimpleNamespace(flash_attn_varlen_func=varlen_sdpa)
-    )
-    query = torch.zeros(2, 2, 1, 8)
-    keys = [torch.zeros_like(query) for _ in range(sp_size)]
-    values = [torch.ones_like(query) for _ in range(sp_size)]
-    joint = torch.zeros(2, 4, 1, 8)
-    joint_mask = torch.tensor([[True, True, True, False], [True, False, False, False]])
-    metadata = AttentionMetadata(
-        joint_attn_mask=joint_mask,
-        joint_query=joint,
-        joint_key=joint,
-        joint_value=joint_mask[:, :, None, None].expand_as(joint).float(),
-        joint_strategy=joint_strategy,
-    )
-    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=rank, gather_chunks=[keys, values]))
-    q, k, v, metadata, _ = strategy.pre_attention(query, keys[rank], values[rank], metadata)
-    impl = getattr(flash_attn_hub, backend)(num_heads=1, head_size=8, softmax_scale=1.0)
-    output = impl.forward_cuda(q, k, v, metadata)
-    expected = SDPAImpl(num_heads=1, head_size=8, softmax_scale=1.0)._forward_impl(q, k, v, metadata)
-    image_valid = torch.ones(2, 2, dtype=torch.bool)
-    valid_queries = torch.cat(
-        [joint_mask, image_valid] if joint_strategy == "front" else [image_valid, joint_mask], dim=1
-    )
-    torch.testing.assert_close(output[valid_queries], expected[valid_queries])
-    if sp_size == 1:
-        # Equal Q/K lengths retain the existing query-padding behavior.
-        torch.testing.assert_close(output[~valid_queries], torch.zeros_like(output[~valid_queries]))
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            "FlashAttentionHubImpl",
+            marks=hardware_marks(res={"cuda": ["L4", "RTX5090"]}, num_cards=2),
+        ),
+        pytest.param("FlashAttention3HubImpl", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
+    ],
+)
+def test_allgather_joint_key_mask_reaches_flash_hub(backend):
+    from vllm_omni.diffusion.attention.backends.utils.fa import _is_hopper
+
+    if not current_omni_platform.is_cuda() or current_omni_platform.get_device_count() < 2:
+        pytest.skip("Requires two CUDA GPUs")
+    if backend == "FlashAttention3HubImpl" and not _is_hopper():
+        pytest.skip("FA3 Hub requires Hopper GPUs")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        torch.multiprocessing.spawn(_joint_mask_hub_worker, args=(backend, f"file://{tmpdir}/store"), nprocs=2)
 
 
 @pytest.mark.cpu
