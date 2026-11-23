@@ -192,7 +192,9 @@ def test_default_cuda_graph_startup(omni_server) -> None:
 
     The process boots the shared ``tts_server_params`` overlay. Its default
     stage entries, not a host platform merge, must keep the shipped graph
-    settings (``enforce_eager`` and ``compilation_config`` included).
+    settings (``enforce_eager`` and ``compilation_config`` included). A
+    ``platforms.cuda`` stage override, if one is added later, must not set
+    ``enforce_eager``.
     """
     for stage_id in (0, 1):
         stage = get_deploy_config_stage("qwen3_tts.yaml", stage_id=stage_id)
@@ -209,6 +211,10 @@ def test_default_cuda_graph_startup(omni_server) -> None:
         assert launched_stage.get("compilation_config") == shipped_stages[stage_id].get("compilation_config")
         assert _stage_graph_view(launched_stage, stage_id) == _stage_graph_view(shipped_stages[stage_id], stage_id)
     assert launched_stages[0]["default_sampling_params"]["max_tokens"] == 500
+    cuda_platform = (launched.get("platforms") or {}).get("cuda") or {}
+    for stage in cuda_platform.get("stages") or []:
+        if stage.get("stage_id") in (0, 1):
+            assert stage.get("enforce_eager", False) is False
 
     assert omni_server.proc is not None
     assert omni_server.proc.poll() is None
