@@ -1501,6 +1501,40 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("mode", "sleep_enabled", "is_npu", "reject"),
+    [
+        ("cast", True, True, True),
+        ("reactor", True, True, True),
+        ("auto", True, True, False),
+        ("off", True, True, False),
+        ("cast", False, True, False),
+        ("reactor", False, True, False),
+        ("cast", True, False, False),
+    ],
+)
+def test_load_model_validates_npu_int8_nz_with_sleep(monkeypatch, mode, sleep_enabled, is_npu, reject):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.od_config = SimpleNamespace(enable_sleep_mode=sleep_enabled)
+    monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", mode)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "is_npu", lambda: is_npu)
+    continue_startup = Mock(side_effect=RuntimeError("startup continued"))
+    monkeypatch.setattr(runner, "_require_attention_schedule_pipeline", continue_startup)
+
+    if reject:
+        with pytest.raises(ValueError) as error:
+            runner.load_model()
+        assert "enable_sleep_mode" in str(error.value)
+        assert "VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE" in str(error.value)
+        continue_startup.assert_not_called()
+    else:
+        with pytest.raises(RuntimeError, match="startup continued"):
+            runner.load_model()
+        continue_startup.assert_called_once_with("default")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monkeypatch):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()

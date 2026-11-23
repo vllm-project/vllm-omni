@@ -160,8 +160,8 @@ requests must take the same execution path at every denoising step.
 INT8 linear layers. It applies after loading and quantization, so resident
 weights can come from an INT8 checkpoint or from online quantization. Scales,
 biases and floating-point weights keep their original layout. Other platforms
-ignore this setting. On NPU, an unknown value raises `ValueError`. A model
-without eligible weights can use any of the four modes.
+ignore this setting. On NPU, an unknown value raises `ValueError`. With sleep
+disabled, a model without eligible weights can use any of the four modes.
 
 The default `auto` converts resident weights to `FRACTAL_NZ` once on Ascend
 A2/A3 devices with a 910B, 910C or 910_93 SoC when internal formats are
@@ -173,8 +173,10 @@ If the probe detects unsupported conversion or matmul, the resident weights
 keep their original ND layout.
 
 With `enable_sleep_mode=True`, `auto` preserves the resident layout so sleep
-can reclaim the `weights` pool. Ordinary model-level and layer-wise CPU
-offload keep their existing layout.
+can reclaim the `weights` pool. Startup rejects explicit `cast` or `reactor`
+with sleep enabled before loading weights, even for models without eligible
+INT8 weights. Ordinary model-level and layer-wise CPU offload keep their
+existing layout in `auto`.
 
 For DLO, `auto` selects `reactor` for the streamed MiniMax-H3 DiT stacks
 `blocks` and `token_refiner.blocks` when online INT8 weights use the ordinary

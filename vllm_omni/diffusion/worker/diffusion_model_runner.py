@@ -382,6 +382,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if load_format == "dummy":
             return
 
+        if getattr(self.od_config, "enable_sleep_mode", False):
+            from vllm_omni.quantization.npu_int8_weight_nz import get_weight_nz_mode
+
+            if get_weight_nz_mode() in ("cast", "reactor"):
+                raise ValueError(
+                    "enable_sleep_mode is incompatible with VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE='cast' or 'reactor'; "
+                    "use 'auto' or 'off', or disable sleep mode"
+                )
+
         self._require_attention_schedule_pipeline(load_format)
 
         # Resolve environment overrides before model loading. Rank-local
