@@ -156,6 +156,10 @@ Content-Type: application/json
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 | `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
 
+For Step-Audio2, `max_new_tokens` overrides the first (Thinker) stage's token
+budget. Omitting it preserves deployment defaults; later stages keep their
+configured budgets. This is a token limit, not an audio-duration limit.
+
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
 #### Voice Clone Parameters (Base task)
@@ -383,10 +387,18 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ## Streaming Text Input (WebSocket)
 
 The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
-Its default `buffered` mode synthesizes all text received before `input.done` as
-one request. For the supported Qwen3-TTS Chinese/English scope, M1
-`commitment` mode can instead start an independent request whenever the
-semantic-readiness policy marks a boundary after accumulated raw text.
+Choose the input policy according to when synthesis should start:
+
+| `text_input_mode` | `split_granularity` | When a TTS request starts | Handling more text during synthesis |
+| --- | --- | --- | --- |
+| `buffered` (default) | `none` (default) | After `input.done`, using all accumulated text. | The handler waits for generation before processing another input message. |
+| `buffered` | `sentence` or `clause` | At each linguistic boundary, before `input.done`; remaining text is flushed at `input.done`. | The handler waits for each segment's generation before processing another input message. |
+| `commitment` | `none` (required) | Queued at each semantic-readiness boundary and synthesized in order; `input.done` closes and flushes the policy. | The reader can accept and queue later segments while the synthesis worker runs. M1 supports the documented Qwen3-TTS Chinese/English scope. |
+
+All three configurations submit independent TTS requests. None appends later
+text to the prompt of a model request that is already generating, or preserves
+acoustic/model state between segments. Reusing the WebSocket connection after
+`session.done` also does not imply reuse of a model generation session.
 
 !!! important
     Commitment mode is not a general sentence detector. Its strong-terminator
@@ -412,10 +424,15 @@ new stream with its own header. Do not feed all binary frames from a connection
 into a single WAV parser. Strict WAV readers that require finalized sizes
 should use a non-streaming response.
 
-In buffered mode, `split_granularity="sentence"` or `"clause"` enables the
-linguistic splitter and emits requests before EOF. Commitment mode requires
-`split_granularity="none"` because only the readiness policy may decide its
-irreversible boundaries.
+Enabling `stream_audio` changes audio delivery, not the input policy: with the
+default buffered configuration, the first synthesis request still waits for
+`input.done`. Commitment mode requires `split_granularity="none"` because only
+the readiness policy may decide its irreversible boundaries.
+
+For the separate turn-based audio input/output protocol, see the
+[`/v1/realtime` Realtime Audio API](realtime_openai_duplex_api.md). Its model-specific
+support does not make an arbitrary TTS backend support incremental prompt
+extension through `/v1/audio/speech/stream`.
 
 ### WebSocket Protocol
 
@@ -1069,6 +1086,10 @@ OmniVoice processes voice-cloning audio after decoding. It removes middle gaps o
 OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
 key, and value tensors are evaluated in BF16 even when the stage is configured with `dtype: float32`; the attention output is converted back to the model's
 hidden-state dtype before the output projection. Consequently, a float32 stage configuration does not imply FP32 attention arithmetic.
+When the selected diffusion attention backend cannot run packed variable-length attention, as with the cuDNN default on sm_12x Blackwell
+GPUs, OmniVoice runs vLLM's FlashAttention 2 varlen kernel when the device supports it and otherwise uses SDPA with a block mask.
+On those GPUs the FlashAttention 2 kernels are compiled from PTX at first use, which adds about 16 seconds to the first server start on an
+RTX 5070; the CUDA compute cache keeps them for later starts.
 
 OmniVoice splits long input into smaller text chunks and joins the decoded audio. You can change the split behavior for one request through `extra_params`:
 
@@ -1321,6 +1342,20 @@ MOSS-TTS Local uses a reference transcript for continuation conditioning; omitti
 it uses reference-audio conditioning instead. Keep this choice consistent when
 comparing benchmarks. Supplying inline `ref_audio` overrides the uploaded voice
 and does not use the named-voice cache shortcut.
+
+Ming-TTS (dense) can reuse a worker-cached speaker embedding for a single inline
+`ref_audio` when the resolver provides the same decoded-audio content key, even
+if the request text or audio locator changes. This avoids repeated speaker
+embedding extraction; the waveform is still resolved and sent to the worker.
+If the resolver provides no content key or the worker entry is evicted, the
+embedding is extracted again. Multi-reference requests retain their existing
+extraction behavior.
+
+Remote URLs are keyed by their raw URL string in the separate waveform resolve
+cache. A hit returns the cached waveform without fetching or decoding it again;
+the server does not check whether content at the same URL has changed. Ming's
+speaker cache uses the content key of the waveform returned by that resolver.
+It does not change remote URL refresh behavior.
 
 The separate decoded-waveform resolve cache defaults to **4 GiB and 2048 entries
 per speech server instance**. These are LRU limits, not preallocated memory or a

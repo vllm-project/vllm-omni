@@ -26,18 +26,23 @@
 
 {%- for message in messages %}
     {%- if message['role'] == 'assistant' %}
-        {{- '<|im_start|>assistant' }}
-        {%- set _sosp = '<|sosp|><|empty|><|eosp|>' -%}
         {%- set _text = message['content'] if message['content'] is string else '' -%}
-        {%- if _sosp in _text %}
-            {%- set _clean = _text | replace(_sosp, '') -%}
-            {%- set _body = _clean[1:] if (_clean and _clean[0] == '\n') else _clean -%}
-            {{- '\n<|sostm|>' + _body + '<|eot|><|empty|><|eostm|>' }}
-        {%- else %}
+        {%- if vllm_omni_output_modalities == ['text'] %}
             {%- set _body = _text[1:] if (_text and _text[0] == '\n') else _text -%}
-            {{- '\n<|sostm|>' + _body + '<|eot|><|eostm|>' }}
+            {{- '<|im_start|>assistant\n' + _body + '<|im_end|>\n' }}
+        {%- else %}
+            {{- '<|im_start|>assistant' }}
+            {%- set _sosp = '<|sosp|><|empty|><|eosp|>' -%}
+            {%- if _sosp in _text %}
+                {%- set _clean = _text | replace(_sosp, '') -%}
+                {%- set _body = _clean[1:] if (_clean and _clean[0] == '\n') else _clean -%}
+                {{- '\n<|sostm|>' + _body + '<|eot|><|empty|><|eostm|>' }}
+            {%- else %}
+                {%- set _body = _text[1:] if (_text and _text[0] == '\n') else _text -%}
+                {{- '\n<|sostm|>' + _body + '<|eot|><|eostm|>' }}
+            {%- endif %}
+            {{- '<|im_end|>\n' }}
         {%- endif %}
-        {{- '<|im_end|>\n' }}
 
     {%- elif message['role'] == 'user' %}
         {%- set _m = '<|sosp|><|empty|><|eosp|>' -%}
@@ -80,5 +85,9 @@
 {%- endfor %}
 
 {%- if add_generation_prompt %}
-    {{- '<|im_start|>assistant\n<|sostm|>' }}
+    {%- if vllm_omni_output_modalities == ['text'] %}
+        {{- '<|im_start|>assistant\n<think>\n\n</think>\n' }}
+    {%- else %}
+        {{- '<|im_start|>assistant\n<|sostm|>' }}
+    {%- endif %}
 {%- endif %}

@@ -500,43 +500,94 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
         }
 
 
-@pytest.mark.parametrize("returncode", [0, 1, -6])
-def test_qwen3_eval_keeps_existing_writer_behavior(tmp_path, monkeypatch, returncode):
+@pytest.mark.parametrize("evaluate", [False, True])
+def test_qwen3_record_only_accuracy_publication(tmp_path, monkeypatch, evaluate):
     from tests.dfx import conftest as dfx
 
     config = json.loads(_QWEN3_DFX.read_text())[0]
     params = config["benchmark_params"][0]
     assert params["duplex_eval_evaluate"] is True
     assert "duplex_eval_accuracy_config" not in params
-    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    perf_dir = tmp_path / "perf-results"
+    perf_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
     accuracy_dir = tmp_path / "accuracy"
     monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
+    monkeypatch.setenv("BUILDKITE_BRANCH", "test-branch")
+    accuracy = {
+        "status": "completed",
+        "total": params["num_prompts"][0],
+        "evaluated": params["num_prompts"][0],
+        "failed": 0,
+        "skipped": 0,
+        "pr": {"samples": params["num_prompts"][0], "mean_all_success": 0.75},
+    }
+    summary = {"published": params["num_prompts"][0], "artifact_errors": []}
+    if evaluate:
+        summary["accuracy"] = accuracy
+    payload = {
+        "model_id": config["server_params"]["model"],
+        "date": "20261119-104553",
+        "completed": params["num_prompts"][0],
+        "failed": 0,
+        "duration": 732.204,
+        "mean_ttft_ms": 130.5,
+        "mean_audio_rtf": 0.8,
+        "duplex_session_metrics": [{"client_ttft_ms": {"count": 1, "mean": 130.5}}],
+        "omni_duplex_eval": summary,
+    }
+    commands = []
 
     class BenchmarkProcess:
         def __init__(self, command, **kwargs):
+            commands.append(command)
             self.stdout = io.StringIO("")
             self.stderr = io.StringIO("")
             path = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
-            path.write_text(json.dumps({"completed": params["num_prompts"][0]}))
+            path.write_text(json.dumps(payload))
 
         def wait(self):
-            return returncode
+            return 0
 
     monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    args = [
+        "--model",
+        config["server_params"]["model"],
+        "--dataset-path",
+        params["dataset_path"],
+        "--max-concurrency",
+        str(params["max_concurrency"][0]),
+    ]
+    if evaluate:
+        args.append("--duplex-eval-evaluate")
     saved = dfx.run_benchmark(
-        [
-            "--model",
-            config["server_params"]["model"],
-            "--dataset-path",
-            params["dataset_path"],
-            "--duplex-eval-evaluate",
-        ],
+        args,
         test_name=config["test_name"],
         flow=params["max_concurrency"][0],
         dataset_name=params["dataset_name"],
         num_prompt=params["num_prompts"][0],
         resource_label="H100",
+        num_warmups=params["num_warmups"],
+        benchmark_params_name=params["name"],
     )
-    assert saved["completed"] == params["num_prompts"][0]
-    assert len(list(tmp_path.glob("result_*.json"))) == 1
-    assert not accuracy_dir.exists()
+    expected = {
+        **payload,
+        "baseline": {},
+        "Hardware": "H100",
+        "branch": "test-branch",
+        "test_name": config["test_name"],
+        "name": params["name"],
+    }
+    perf_paths = list(perf_dir.glob("result_*.json"))
+    assert len(commands) == len(perf_paths) == 1
+    assert saved == json.loads(perf_paths[0].read_text()) == expected
+    assert not list(perf_dir.glob("result_acc_*.json"))
+    if not evaluate:
+        assert not accuracy_dir.exists()
+        return
+    accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))
+    assert len(accuracy_paths) == 1
+    published = json.loads(accuracy_paths[0].read_text())
+    assert published["accuracy"] == accuracy
+    assert published["baseline"] == {}

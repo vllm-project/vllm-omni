@@ -163,8 +163,11 @@ Placement selects an eligible group by its highest reserved-to-capacity ratio,
 then its total reserved count, with round-robin tie-breaking. Sessions keep
 their group across turns, cancellation, epochs and reconnects. Idle sessions
 hold their slots, and closing sessions release them after cleanup completes.
-When no group has capacity, opening a session fails with the retryable
-`resource_exhausted` error containing `replica_capacity_exhausted`.
+If a complete group is still live but session capacity is exhausted, opening
+a session returns the retryable `resource_exhausted` error. If replica failures leave this frontend with no
+complete group, opening a session returns `replica_unavailable`. A frontend
+that starts in this state logs a warning and skips duplex warmup. With multiple
+frontends, the client can reconnect to try another frontend.
 
 `least_sessions` supports replicas attached through distributed runtimes,
 including multiple runtimes serving the same stage across hosts. Declare the

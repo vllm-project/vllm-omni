@@ -504,9 +504,9 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
 @pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Path) -> None:
-    """Compare official and Omni raw AV outputs from the same single-H100 request."""
+    """Compare official and Omni raw AV outputs on one qualified accelerator."""
     configured_artifact_root = os.environ.get("VLLM_TEST_LTX_ARTIFACT_ROOT")
     if configured_artifact_root:
         accuracy_artifact_root = Path(configured_artifact_root)
