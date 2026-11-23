@@ -45,13 +45,15 @@ _generation_tokens_family = Counter(
 
 _stage_gen_time_family = Histogram(
     defs.STAGE_GEN_TIME_S,
-    "Per-stage generation time in seconds for diffusion / image stages.",
+    "Per-stage time from stage submit to finished output, in seconds. "
+    "Excludes diffusion scheduler admission, which is stage_in_queue_s.",
     labelnames=list(defs.STAGE_GEN_TIME_LABELS),
     buckets=defs.SECONDS_BUCKETS,
 )
 _request_queue_wait_family = Histogram(
     defs.REQUEST_QUEUE_WAIT_S,
-    "Per-request queue wait between submit arrival and stage submit, in seconds.",
+    "Orchestrator admission plus the sum of diffusion stage_in_queue_s, in seconds. "
+    "Do not add this histogram to stage_in_queue_s. A present zero is recorded.",
     labelnames=_labelnames,
     buckets=defs.SECONDS_BUCKETS,
 )
@@ -83,7 +85,8 @@ _peak_memory_family = Gauge(
 )
 _stage_in_queue_family = Histogram(
     defs.STAGE_IN_QUEUE_S,
-    "Time in seconds from diffusion scheduler enqueue to initial execution admission. "
+    "Per-stage diffusion scheduler wait from enqueue to initial execution admission, in seconds. "
+    "The sum across stages is already included in request_queue_wait_s. "
     "Zero is the healthy low-load baseline and is counted.",
     labelnames=list(defs.DIFFUSION_LABELS),
     buckets=defs.SECONDS_FAST_BUCKETS,

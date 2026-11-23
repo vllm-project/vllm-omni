@@ -60,6 +60,28 @@ def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float 
     return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
 
 
+def diffusion_output_metrics(engine_output: object) -> dict[str, object]:
+    """Return the metrics dict on one engine output, or an empty dict."""
+    raw = getattr(engine_output, "metrics", None)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def extract_diffusion_scheduler_wait_ms(output: object) -> float | None:
+    """Diffusion scheduler admission on one output, in milliseconds.
+
+    A missing key means the stage did not measure it. A present ``0`` is a
+    real measurement.
+    """
+    wait_ms = diffusion_output_metrics(output).get(metric_defs.SCHEDULER_QUEUE_WAIT_MS)
+    if wait_ms is None:
+        return None
+    return float(wait_ms)
+
+
 def observe_stage_workload_metrics(
     prom_metrics: OmniPrometheusMetrics,
     *,

@@ -13,17 +13,18 @@ import pytest
 import torch
 import torch.nn as nn
 
-import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
-    BatchedToken2Wav,
-    _token2wav_sdpa_context,
-    plan_token2wav_encode_slices,
-    relpos_encode_token_budget,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav as token2wav_module
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     AttSlotPool,
     WholeEulerExecutionArena,
     _pack_att_cache,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+    BatchedToken2Wav,
+    PromptFeatures,
+    _token2wav_sdpa_context,
+    plan_token2wav_encode_slices,
+    relpos_encode_token_budget,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -194,6 +195,8 @@ class _FakeHiFT(nn.Module):
 
 
 class _FakeToken2Wav:
+    cold_setups: list[tuple[str, str]]
+
     def __init__(self):
         self.flow = _FakeFlow()
         self.hift = _FakeHiFT()
@@ -257,6 +260,7 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     if env is not None:
@@ -271,11 +275,37 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     assert model._cfm_graph_config["row_offset_merge"] is False
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({}, False),
+        ({"token2wav_float16": True}, True),
+        ({"cfm_float16": True}, True),
+        ({"cfm_fused_body": True}, True),
+        ({"cfm_fused_body": False, "token2wav_float16": True}, False),
+    ],
+)
+def test_cfm_fused_body_defaults_on_for_rocm_fp16(monkeypatch, extra, expected):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["fused_body"] is expected
+
+
 @pytest.mark.parametrize("extra,expected", [({}, True), ({"cfm_fused_body": False}, False)])
 def test_cfm_fused_body_defaults_on_for_npu(monkeypatch, extra, expected):
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     # NPU fusion does not use TF32, so the TF32 opt-out must not disable it.
@@ -1014,13 +1044,19 @@ def test_ragged_diffusion_batches_eight_rows_and_preserves_exact_results():
 
 def test_npu_patch_preserves_ragged_estimator_contract():
     script = r"""
+import sys
+
 import torch
+
+# Model import and NPU patching must work without loading vocoder assets.
+core_module = "vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav"
+sys.modules[core_module] = None
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
     _FakeToken2Wav,
     _enable_fake_ragged_kernel,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 import vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav as npu_patch
 
 
@@ -1030,6 +1066,7 @@ class _FailGraphRunner:
 
 
 npu_patch.apply_minicpmo_4_5_code2wav_patch()
+del sys.modules[core_module]
 adapter = BatchedToken2Wav(_FakeToken2Wav())
 _enable_fake_ragged_kernel(adapter)
 prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
@@ -1066,7 +1103,7 @@ def test_decode_cfm_enters_platform_sdpa_context(monkeypatch):
         entered.append("exit")
 
     monkeypatch.setattr(
-        batched_token2wav_module,
+        token2wav_module,
         "_token2wav_sdpa_context",
         lambda _device: recording_context(),
     )
@@ -1589,8 +1626,9 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     assert token2wav.flow.decoder.estimator.attention_cache_dtypes[-2:] == [torch.float32, torch.float32]
 
 
-def test_bfloat16_estimator_attention_cache_materializes_each_timestep():
-    adapter = BatchedToken2Wav(_FakeToken2Wav(), bfloat16_attention_cache=True)
+@pytest.mark.parametrize("options,dtype", [({}, torch.float32), ({"bfloat16_attention_cache": True}, torch.bfloat16)])
+def test_estimator_attention_cache_materializes_each_timestep(options, dtype):
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), **options)
 
     _, estimator_cnn, estimator_att = adapter._decode_cfm(
         torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
@@ -1601,24 +1639,7 @@ def test_bfloat16_estimator_attention_cache_materializes_each_timestep():
     )
 
     assert estimator_cnn.dtype == torch.float32
-    assert estimator_att.dtype == torch.bfloat16
-    # ``(n_t, depth, 2, rows, heads, frames, head_dim)`` on the split layout.
-    assert estimator_att.shape[:4] == (2, 1, 2, 4)
-
-
-def test_float32_estimator_attention_cache_materializes_each_timestep():
-    adapter = BatchedToken2Wav(_FakeToken2Wav())
-
-    _, estimator_cnn, estimator_att = adapter._decode_cfm(
-        torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
-        torch.ones((2, 1)),
-        torch.zeros((2, 1, 2)),
-        cnn_cache=None,
-        att_cache=None,
-    )
-
-    assert estimator_cnn.dtype == torch.float32
-    assert estimator_att.dtype == torch.float32
+    assert estimator_att.dtype == dtype
     # ``(n_t, depth, 2, rows, heads, frames, head_dim)`` on the split layout.
     assert estimator_att.shape[:4] == (2, 1, 2, 4)
 
@@ -1811,15 +1832,8 @@ def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, mon
     second_model, _ = _model(runtime_prompt_cache_size=0)
     reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
 
-    def runtime_ref_info(request_id: str):
-        info = _info(request_id, 0, [10, 11])
-        info["codes"]["ref"] = reference
-        info["meta"]["ref_audio_sr"] = 16000
-        info["meta"].pop("prompt_cache_id")
-        return info
-
-    _forward(first_model, [runtime_ref_info("voice-a")], request_ids=["internal-a"])
-    _forward(second_model, [runtime_ref_info("voice-b")], request_ids=["internal-b"])
+    _forward(first_model, [_runtime_ref_info("voice-a", reference)], request_ids=["internal-a"])
+    _forward(second_model, [_runtime_ref_info("voice-b", reference)], request_ids=["internal-b"])
 
     first_key = first_model._request_prompt_keys["internal-a"]
     second_key = second_model._request_prompt_keys["internal-b"]
@@ -2217,10 +2231,11 @@ def _padded_decode_adapter(bucket_frames: int) -> tuple[BatchedToken2Wav, int, i
 
 
 @pytest.mark.parametrize("disable_during_setup", [False, True], ids=["after-setup", "during-setup"])
-def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disable_during_setup):
+@pytest.mark.parametrize("grouped", [False, True], ids=["single-prompt", "grouped-prompts"])
+def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disable_during_setup, grouped):
     adapter, _, _ = _padded_decode_adapter(bucket_frames=16)
     adapter.flow.decoder.rand_noise = torch.randn(1, 1, 400)
-    prompt = batched_token2wav_module.PromptFeatures(
+    prompt = token2wav_module.PromptFeatures(
         cache_key=("voice", "voice.wav"),
         # The fake encoder consumes one of the three appended lookahead tokens.
         speech_tokens=torch.full((1, 298), 5, dtype=torch.long),
@@ -2238,8 +2253,11 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
 
         monkeypatch.setattr(wrapper, "replay", replay_then_disable)
 
+    def setup():
+        return adapter.setup_prompts([prompt], 4) if grouped else adapter.setup_batch(prompt, 1)
+
     with torch.no_grad():
-        padded = adapter.setup_batch(prompt, 1)
+        padded = setup()
         assert padded[0].flow_cache["estimator_att_cache"].shape[-2] == 304
         padded_keys = list(adapter._setup_cache)
         # has_cached_setup agrees with setup_batch's key, padding included.
@@ -2247,9 +2265,9 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
 
         wrapper.enabled = False
         assert not adapter.has_cached_setup(prompt)
-        unpadded = adapter.setup_batch(prompt, 1)
+        unpadded = setup()
         assert adapter.has_cached_setup(prompt)
-        reused = adapter.setup_batch(prompt, 1)
+        reused = setup()
 
     assert unpadded[0].flow_cache["estimator_att_cache"].shape[-2] == 300
     assert unpadded[0] is not padded[0]
@@ -2257,6 +2275,74 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
     assert adapter.flow.encoder.calls == [1, 1]
     assert padded_keys == [(prompt.cache_key, 16)]
     assert list(adapter._setup_cache) == [(prompt.cache_key, 0)]
+
+
+def test_grouped_setup_snapshots_padding_policy_per_microbatch(monkeypatch):
+    adapter, _, _ = _padded_decode_adapter(bucket_frames=16)
+    adapter.flow.decoder.rand_noise = torch.randn(1, 1, 400)
+    adapter._setup_cache_size = 3
+    prompts = [
+        PromptFeatures(
+            cache_key=(str(row), f"voice-{row}.wav"),
+            speech_tokens=torch.full((1, 298), 5, dtype=torch.long),
+            speaker_embedding=torch.ones(1, 1),
+            mels=torch.ones(1, 300, 1),
+        )
+        for row in range(3)
+    ]
+    wrapper = adapter._cfm_graph_wrapper
+    replay = wrapper.replay
+
+    def replay_then_disable(*args, **kwargs):
+        result = replay(*args, **kwargs)
+        wrapper.enabled = False
+        return result
+
+    monkeypatch.setattr(wrapper, "replay", replay_then_disable)
+    with torch.no_grad():
+        states = adapter.setup_prompts(prompts, 2)
+
+    assert adapter.flow.encoder.calls == [2, 1]
+    assert [state.flow_cache["estimator_att_cache"].shape[-2] for state in states] == [304, 304, 300]
+    assert list(adapter._setup_cache) == [
+        (prompt.cache_key, policy) for prompt, policy in zip(prompts, (16, 16, 0), strict=True)
+    ]
+    assert [adapter.has_cached_setup(prompt) for prompt in prompts] == [False, False, True]
+
+
+@pytest.mark.parametrize("with_graph_wrapper", [False, True], ids=["eager", "graph-contract"])
+def test_cfm_stream_does_not_use_upstream_attention_buffers(with_graph_wrapper):
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import drop_upstream_chunk_att_buffers
+
+    adapter, mel_frames, _ = _padded_decode_adapter(bucket_frames=0)
+    if not with_graph_wrapper:
+        adapter._cfm_graph_wrapper = None
+    decoder = adapter.flow.decoder
+    # The real DiT owns one buffer; stand in for the upstream CFM's other one.
+    decoder.register_buffer("att_cache_buffer", torch.ones(8), persistent=False)
+    mu = torch.randn(1, 1, mel_frames)
+    cond = torch.zeros_like(mu)
+    speakers = torch.randn(1, 1)
+
+    def decode_stream():
+        cnn = att = None
+        outputs = []
+        for _ in range(3):
+            result = adapter._decode_cfm(mu, speakers, cond, cnn_cache=cnn, att_cache=att)
+            _, cnn, att = result
+            # Retain snapshots across subsequent cache writes.
+            outputs.append(tuple(value.clone() for value in result))
+        return outputs
+
+    with torch.no_grad():
+        expected = decode_stream()
+        assert drop_upstream_chunk_att_buffers(adapter.flow) > 0
+        assert not hasattr(decoder, "att_cache_buffer")
+        assert not hasattr(decoder.estimator, "att_cache_buffer")
+        actual = decode_stream()
+    for actual_chunk, expected_chunk in zip(actual, expected, strict=True):
+        for actual_tensor, expected_tensor in zip(actual_chunk, expected_chunk, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
 def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():
@@ -2534,7 +2620,7 @@ def test_decode_replays_encoder_graph_in_capture_autocast(monkeypatch, ragged, a
 
 @pytest.mark.parametrize("graph_hit", [True, False])
 def test_cfm_padding_mask_is_deferred_until_graph_fallback(monkeypatch, graph_hit):
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import _build_capture_mask
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import _build_capture_mask
 
     adapter = BatchedToken2Wav(_FakeToken2Wav())
     adapter._cfm_graph_bucket_frames = 4
@@ -2695,3 +2781,34 @@ def test_eager_per_request_history_matches_stacked_history():
     peer = actual_rows[1].clone()
     actual_rows[0].zero_()
     assert torch.equal(actual_rows[1], peer)
+
+
+@pytest.mark.parametrize("capacity", [0, 1, 8])
+def test_grouped_reference_setup_preserves_order_and_ownership(capacity):
+    actual = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=capacity)
+    expected = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=capacity)
+    features = []
+    for i, length in enumerate((2, 3, 2, 2, 3)):
+        features.append(
+            PromptFeatures(
+                (str(i), str(i)),
+                torch.full((1, length), 5 + i, dtype=torch.long),
+                torch.ones(1, 1),
+                torch.ones(1, length + 2, 1) * (i + 1),
+            )
+        )
+    reference = [expected.setup_batch(f, 1)[0] for f in features]
+    result = actual.setup_prompts(features, 2)
+    for a, b in zip(result, reference, strict=True):
+        for field in ("flow_cache", "hift_cache"):
+            for key, x in getattr(a, field).items():
+                torch.testing.assert_close(x, getattr(b, field)[key], rtol=0, atol=0)
+    assert actual.flow.encoder.calls == [2, 1, 2], actual.flow.encoder.calls
+    calls = len(actual.flow.encoder.calls)
+    if capacity == 8:
+        retained = actual.setup_prompts(features, 2)
+        assert len(actual.flow.encoder.calls) == calls
+        assert all(a is b for a, b in zip(retained, result, strict=True))
+    before = result[2].flow_cache["estimator_att_cache"].clone()
+    result[0].flow_cache["estimator_att_cache"].fill_(123)
+    torch.testing.assert_close(result[2].flow_cache["estimator_att_cache"], before, rtol=0, atol=0)

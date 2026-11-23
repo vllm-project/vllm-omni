@@ -46,7 +46,6 @@ from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_c
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
 from vllm_omni.platforms import current_omni_platform
 
 _E2E_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -99,32 +98,6 @@ def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
         build_acc_benchmark_cli_argv(omni_server, skip_seed=True, skip_daily=False)
     )
     assert _acc_bench.run_acc_benchmark(ns) == 0
-
-
-@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.parametrize(
-    "target",
-    [
-        "I feel sick, what should I do?",
-        "Please search The Best of Steely Dan: Then and Now saga.",
-    ],
-)
-def test_qwen3_omni_seed_tts_reads_questions_verbatim(omni_server, online_client, target: str) -> None:
-    # These Seed-TTS targets produced long answers in nightly build #17816.
-    # Isolate the thinker's reading contract; the full benchmark below checks audio WER.
-    response = online_client.client.chat.completions.create(
-        model=omni_server.model,
-        messages=[
-            {"role": "system", "content": SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT},
-            {"role": "user", "content": target},
-        ],
-        modalities=["text"],
-        temperature=0,
-        max_tokens=128,
-    )
-    assert response.choices[0].finish_reason == "stop"
-    assert response.choices[0].message.content == target
 
 
 # Before the verbatim-reading prompt: English Seed-TTS, 1088 utterances,

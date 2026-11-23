@@ -247,7 +247,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Upload:** `buildkite-agent pipeline upload` (no `upload_pipeline.py` mirror expansion).
 
-    **Hardware in YAML:** inline `agents.queue` (for example `intel-gpu-omni`) on each step.
+    **Hardware in YAML:** inline `agents.queue` (for example `intel-gpu-omni`) on each step; the pr steps also pin `agents.cards` (`"1"` or `"2"`, matching the agents' `cards=N` tag).
 
     **Adding a job**
 
@@ -451,9 +451,7 @@ Benchmark CPU thread counts without changing reference inputs or tolerances:
 ```bash
 python tests/helpers/benchmark_cpu_threads.py --output /tmp/cpu-thread-trial -- \
   -q tests/model_executor/models/ming3_tts/test_ming3_batched_campplus.py::test_batched_campplus_matches_per_clip_pipeline \
-  tests/model_executor/models/kokoro/test_kokoro.py::test_speed_shortens_durations \
-  tests/model_executor/models/cosyvoice3/test_speaker_embedding_capture_failure.py::test_first_replay_failure_leaves_no_bucket \
-  tests/model_executor/models/kokoro/test_kokoro.py::test_network_is_deterministic_per_generator
+  tests/model_executor/models/cosyvoice3/test_speaker_embedding_capture_failure.py::test_first_replay_failure_leaves_no_bucket
 ```
 
 Use the CI image and its quota; the script interleaves 1/2/4 threads, with one

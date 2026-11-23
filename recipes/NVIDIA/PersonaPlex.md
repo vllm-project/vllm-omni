@@ -1,7 +1,7 @@
 # PersonaPlex
 
-> Live full-duplex speech-to-speech (the model listens while it speaks) with
-> persona and voice control, on the native vLLM-Omni engine.
+> On vLLM 0.34, use the `personaplex_duplex_mrv2.yaml` profile. Stage 0 MRv2 requires duplex mode with `async_chunk` enabled.
+> The measurements below are from the historical V1 deployment.
 
 ## Summary
 
@@ -15,9 +15,9 @@
   (`/v1/duplex` and `/v1/realtime?duplex=1`)
 - Maintainer: [`@linyueqian`](https://github.com/linyueqian)
 
-## When to use this recipe
+## Historical integration
 
-Use this recipe to run `nvidia/personaplex-7b-v1` as a live voice agent on one GPU.
+This recipe records the earlier `nvidia/personaplex-7b-v1` live voice agent integration on one GPU.
 The integration is **moshi-free**: the temporal transformer, depformer, and
 streaming Mimi codec are all native vLLM-Omni modules (Mimi runs on
 `transformers.MimiModel`), so no vendored fork is installed. Decoding is greedy,
@@ -87,7 +87,10 @@ duplex (`is_enabled()` is unconditionally true). Turn-based models
 Verified on GPU (Hopper-class). The shipped deploy config runs the Stage 0
 talker with CUDA graphs and replays the streaming Mimi encode (Stage 0) and
 decode (Stage 1) frame steps from model-local CUDA graphs, bitwise equal to
-eager. Other CUDA GPUs with enough memory are expected to work.
+eager. Other CUDA GPUs with enough memory are expected to work. For a single
+16 GB consumer GPU, use the
+[RTX 5080 Laptop 16 GB profile](./PersonaPlex-RTX5080-Laptop-16GB.md), which uses
+FP8 for eligible Stage 0 layers and adjusts the memory budget to fit within the 16 GB limit.
 
 ## GPU
 
@@ -102,8 +105,7 @@ eager. Other CUDA GPUs with enough memory are expected to work.
   `nvidia/personaplex-7b-v1` repo (accept the license on the model page)
 
 First run auto-downloads from the model repo: `model.safetensors`,
-`tokenizer_spm_32k_3.model`, `voices.tgz`, and the Mimi reference checkpoint;
-`kyutai/mimi` is fetched via `transformers` for the codec module graph.
+`tokenizer_spm_32k_3.model`, `voices.tgz`, and the Mimi reference checkpoint.
 
 #### Command
 
@@ -113,7 +115,7 @@ Live duplex serving through the unified stack:
 HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
   /path/to/personaplex-7b-v1 \
   --omni \
-  --deploy-config vllm_omni/deploy/personaplex.yaml
+  --deploy-config vllm_omni/deploy/personaplex_duplex_mrv2.yaml
 ```
 
 This exposes `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`): the OpenAI
@@ -156,5 +158,7 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
 - Run the client near the server. The 80 ms cadence is sensitive to
   network jitter; over a high-latency link playback can stutter regardless of
   engine speed. On localhost it is smooth.
-- Sliding window is 3000 frames (~4 min). The ring KV recycles beyond that;
-  very long sessions keep running with a rolling context.
+- Sliding window is 3000 frames (~4 min). Stage 0 frees the KV behind the
+  window, so a call keeps running with a rolling context, up to one hour by
+  default; the comment in `vllm_omni/deploy/personaplex.yaml` shows how to
+  change the cap.

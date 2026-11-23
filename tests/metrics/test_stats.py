@@ -269,3 +269,69 @@ def test_logged_stage_table_has_no_phase_split_rows_when_unobserved(monkeypatch)
 
     assert "stage_gen_time_ms" in rows
     assert not set(_PHASE_FIELDS) & set(rows)
+
+
+def test_stage_snapshot_merges_bounded_queue_and_engine_diagnostics() -> None:
+    agg = OrchestratorAggregator(num_stages=3, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=2)
+    common = {
+        "batch_id": 1,
+        "batch_size": 1,
+        "num_tokens_in": 0,
+        "num_tokens_out": 4,
+        "stage_stats": StageStats(),
+    }
+    agg.on_stage_metrics(
+        2,
+        "r1",
+        StageRequestStats(
+            **common,
+            stage_gen_time_ms=10.0,
+            rx_transfer_bytes=100,
+            rx_decode_time_ms=1.0,
+            rx_in_flight_time_ms=2.0,
+            scheduler_queue_wait_ms=5.0,
+            vllm_queued_ms=2.0,
+            vllm_prefill_ms=3.0,
+            vllm_decode_ms=4.0,
+            vllm_num_preemptions=1,
+            orchestrator_dispatch_wait_ms=6.0,
+            orchestrator_dispatch_wait_max_ms=6.0,
+            orchestrator_dispatch_batches=1,
+            pipeline_timings={"queue_wait_ms": 1.0},
+            orchestrator_snapshot={"dispatch_queue_high_water": 3},
+        ),
+    )
+    agg.on_stage_metrics(
+        2,
+        "r1",
+        StageRequestStats(
+            **common,
+            stage_gen_time_ms=20.0,
+            rx_transfer_bytes=200,
+            rx_decode_time_ms=3.0,
+            rx_in_flight_time_ms=4.0,
+            scheduler_queue_wait_ms=7.0,
+            vllm_decode_ms=8.0,
+            orchestrator_dispatch_wait_ms=10.0,
+            orchestrator_dispatch_wait_max_ms=8.0,
+            orchestrator_dispatch_batches=2,
+            pipeline_timings={"queue_wait_ms": 9.0},
+            orchestrator_snapshot={"dispatch_queue_high_water": 9},
+        ),
+    )
+
+    stage = agg._build_stage_metrics_snapshot("r1")["2"]
+    assert stage["stage_gen_time_ms"] == pytest.approx(30.0)
+    assert stage["rx_transfer_bytes"] == 300
+    assert stage["rx_decode_time_ms"] == pytest.approx(4.0)
+    assert stage["rx_in_flight_time_ms"] == pytest.approx(6.0)
+    assert stage["scheduler_queue_wait_ms"] == pytest.approx(12.0)
+    assert stage["vllm_queued_ms"] == pytest.approx(2.0)
+    assert stage["vllm_prefill_ms"] == pytest.approx(3.0)
+    assert stage["vllm_decode_ms"] == pytest.approx(12.0)
+    assert stage["vllm_num_preemptions"] == 1
+    assert stage["orchestrator_dispatch_wait_ms"] == pytest.approx(16.0)
+    assert stage["orchestrator_dispatch_wait_max_ms"] == pytest.approx(8.0)
+    assert stage["orchestrator_dispatch_batches"] == 3
+    assert stage["pipeline_timings"] == {"queue_wait_ms": 9.0}
+    assert stage["orchestrator_snapshot"] == {"dispatch_queue_high_water": 9}

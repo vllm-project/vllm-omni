@@ -18,12 +18,15 @@ from .utils.types import (
     MAX_REFERENCE_IMAGES,
     MAX_REFERENCE_VIDEOS,
     MAX_TIMELINE_GUIDES,
+    MINIMAX_H3_CONTROL_TYPES,
     AudioFormat,
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
     FastH3Deployment,
     H3TimelineGuides,
     LatentMaskEditing,
+    MiniMaxH3Control,
+    MiniMaxH3ControlType,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
     VideoReferences,
@@ -32,6 +35,7 @@ from .utils.types import (
 )
 from .utils.validators import (
     add_sampling_parameters_to_stage,
+    validate_minimax_h3_control,
     validate_model_and_sampling_params_types,
 )
 
@@ -226,6 +230,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "latent_edit": ("LATENT_MASK_EDITING",),
                 # Append new ports last so links in saved workflows keep their slots.
                 "timeline_guides": ("H3_TIMELINE_GUIDES",),
+                "control": ("MINIMAX_H3_CONTROL",),
             },
         }
 
@@ -242,8 +247,10 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         first_frame=None,
         last_frame=None,
         references=None,
+        control=None,
         fast_h3=None,
         timeline_guides=None,
+        latent_edit=None,
         **_kwargs,
     ) -> str | Literal[True]:
         base = super().VALIDATE_INPUTS(url, model)
@@ -257,10 +264,23 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return "Provide either first_frame/last_frame or references, not both."
         if fast_h3 is not None and timeline_guides is not None:
             return _FASTH3_GUIDES_ERROR
-        if fast_h3 is not None and any(value is not None for value in (frame, first_frame, last_frame, references)):
+        if (
+            fast_h3 is not None
+            and fast_h3.get("variant", "Preview") == "Preview"
+            and any(value is not None for value in (frame, first_frame, last_frame, references))
+        ):
             return (
                 "FastH3 Preview supports T2VA only; disconnect frame, first_frame, last_frame, and references inputs."
             )
+        if control is not None and any(
+            value is not None for value in (frame, first_frame, last_frame, references, latent_edit)
+        ):
+            return "MiniMax-H3 control cannot be combined with frame, keyframes, references, or latent-mask editing."
+        if control is not None:
+            try:
+                validate_minimax_h3_control(control)
+            except ValueError as exc:
+                return str(exc)
         return True
 
     async def generate(
@@ -277,6 +297,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         first_frame: torch.Tensor | None = None,
         last_frame: torch.Tensor | None = None,
         references: dict | None = None,
+        control: MiniMaxH3Control | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
@@ -297,12 +318,14 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         if fast_h3 is not None:
             if timeline_guides is not None:
                 raise ValueError(_FASTH3_GUIDES_ERROR)
-            if any(value is not None for value in (frame, first_frame, last_frame, references)):
+            if fast_h3.get("variant", "Preview") == "Preview" and any(
+                value is not None for value in (frame, first_frame, last_frame, references)
+            ):
                 raise ValueError(
                     "FastH3 Preview supports T2VA only; disconnect frame, first_frame, "
                     "last_frame, and references inputs."
                 )
-            if lora is not None:
+            if fast_h3.get("variant", "Preview") == "Preview" and lora is not None:
                 raise ValueError(
                     "FastH3 is already fused into the selected server; disconnect the request-level LoRA input."
                 )
@@ -324,13 +347,15 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 sampling_params = sampling_params[0].__class__(sampling_params[0])
             else:
                 sampling_params = sampling_params.__class__(sampling_params)
-            sampling_params["num_inference_steps"] = FASTH3_INFERENCE_STEPS
+            sampling_params["num_inference_steps"] = (
+                8 if fast_h3.get("variant", "Preview") == "Omni" else FASTH3_INFERENCE_STEPS
+            )
 
             # FastH3 owns both modality shifts. Sending the ordinary H3 values
             # from a connected H3 Params node would turn a deployment choice
             # into a request-level override, which the server intentionally
             # rejects when it differs from the fused adapter contract.
-            if model_params is not None:
+            if fast_h3.get("variant", "Preview") == "Preview" and model_params is not None:
                 model_params = model_params.__class__(model_params)
                 model_params.pop("flow_shift", None)
                 model_params.pop("audio_flow_shift", None)
@@ -356,7 +381,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         # if model_params is not None:
         #     model_params.pop("type", None)  # internal fields
 
-        client = VLLMOmniClient(url)
+        # Video generation is asynchronous: keep HTTP requests short while allowing long job polling.
+        client = VLLMOmniClient(url, timeout=300, max_poll_duration=3 * 60 * 60)
         output = await client.generate_video(
             model=model,
             spec_model=spec_model,
@@ -365,6 +391,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             first_frame=first_frame,
             last_frame=last_frame,
             references=references,
+            control=control,
             width=width,
             height=height,
             num_frames=num_frames,
@@ -954,11 +981,12 @@ class VLLMOmniRemoteLoRA:
                         "tooltip": "0 means it is not set and the server can derive it.",
                     },
                 ),
-            }
+            },
+            "optional": {"lora": ("REMOTE_LORA",), "enabled": ("BOOLEAN", {"default": True})},
         }
 
-    RETURN_TYPES = ("REMOTE_LORA",)
-    RETURN_NAMES = ("lora",)
+    RETURN_TYPES = ("REMOTE_LORA", "BOOLEAN")
+    RETURN_NAMES = ("lora", "enabled")
     FUNCTION = "get_lora"
     CATEGORY = "vLLM-Omni"
 
@@ -968,16 +996,21 @@ class VLLMOmniRemoteLoRA:
             return "Both local_path and name must be provided."
         return True
 
-    def get_lora(self, local_path: str, name: str, scale: float, int_id: int):
+    def get_lora(
+        self, local_path: str, name: str, scale: float, int_id: int, lora: dict | None = None, enabled: bool = True
+    ):
         local_path = local_path.strip()
         name = name.strip()
-        lora = {
+        adapter = {
             "local_path": local_path or None,
             "name": name or None,
-            "scale": float(scale),
+            "scale": float(scale) if enabled else 0.0,
             "int_id": int(int_id) if int_id > 0 else None,
         }
-        return (lora,)
+        if lora is not None:
+            adapters = lora.get("adapters", [lora])
+            return ({"adapters": [*adapters, adapter]}, adapter["scale"] > 0)
+        return (adapter, adapter["scale"] > 0)
 
 
 class VLLMOmniFastH3Deployment:
@@ -1001,7 +1034,8 @@ class VLLMOmniFastH3Deployment:
                         "tooltip": "Model name exposed by the FastH3 deployment.",
                     },
                 ),
-            }
+            },
+            "optional": {"variant": (["Preview", "Omni"],), "enabled": ("BOOLEAN", {"default": True})},
         }
 
     RETURN_TYPES = ("FASTH3_DEPLOYMENT",)
@@ -1009,21 +1043,26 @@ class VLLMOmniFastH3Deployment:
     FUNCTION = "get_deployment"
     CATEGORY = "vLLM-Omni"
     DESCRIPTION = (
-        "Selects a server with FastH3 fused at startup. The connected Generate Video node uses T2VA, "
-        "four inference steps, and 24 FPS without sending a request-level LoRA."
+        "Selects an existing FastH3 service. Omni uses eight steps and accepts references. Preview uses T2VA, "
+        "four inference steps, and 24 FPS without sending a request-level LoRA. "
+        "Disable this node to use the Generate Video service fields. Omni LoRA compatibility is checked by the server."
     )
 
     @classmethod
-    def VALIDATE_INPUTS(cls, url, model) -> str | Literal[True]:
+    def VALIDATE_INPUTS(cls, url, model, enabled=True, **_kwargs) -> str | Literal[True]:
+        if not enabled:
+            return True
         try:
             _resolve_fast_h3_deployment({"url": url, "model": model})
         except ValueError as exc:
             return str(exc)
         return True
 
-    def get_deployment(self, url: str, model: str):
+    def get_deployment(self, url: str, model: str, variant: str = "Preview", enabled: bool = True):
+        if not enabled:
+            return (None,)
         url, model = _resolve_fast_h3_deployment({"url": url, "model": model})
-        return (FastH3Deployment({"url": url, "model": model}),)
+        return (FastH3Deployment({"url": url, "model": model, "variant": variant}),)
 
 
 class VLLMOmniQwenTTSParams:
@@ -1105,7 +1144,28 @@ class VLLMOmniMiniMaxH3Params:
                         ),
                     },
                 ),
-            }
+            },
+            "optional": {
+                "long_video": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Enable H3 long-video mode selection."},
+                ),
+                "long_video_mode": (
+                    ["full", "continuation"],
+                    {"tooltip": "full: whole-target generation. continuation: overlapping Ref2VA windows."},
+                ),
+                "continuation_window_frames": ("INT", {"default": 311, "min": 107, "max": 345, "step": 17}),
+                "continuation_overlap_frames": ("INT", {"default": 39, "min": 5, "max": 328, "step": 17}),
+                "latent_upscale": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "step": 0.1,
+                        "tooltip": "0: disabled. 2: double width and height. Requires a server-loaded latent upscaler.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("VIDEO_PARAMS",)
@@ -1113,10 +1173,107 @@ class VLLMOmniMiniMaxH3Params:
     FUNCTION = "get_params"
     CATEGORY = "vLLM-Omni/Video Params"
 
-    def get_params(self, **kwargs):
+    def get_params(
+        self,
+        long_video: bool = False,
+        long_video_mode: Literal["full", "continuation"] = "full",
+        continuation_window_frames: int = 311,
+        continuation_overlap_frames: int = 39,
+        latent_upscale: float = 0.0,
+        **kwargs,
+    ) -> tuple[MiniMaxH3ModelSpecificParams]:
         params = MiniMaxH3ModelSpecificParams(kwargs)
+        if long_video:
+            params["long_video"] = True
+            params["long_video_mode"] = long_video_mode
+            if long_video_mode == "continuation":
+                params.update(
+                    continuation_window_frames=continuation_window_frames,
+                    continuation_overlap_frames=continuation_overlap_frames,
+                )
+        params["latent_upscale"] = latent_upscale if latent_upscale > 0 else False
         params["type"] = "minimax_h3"
         return (params,)
+
+
+class VLLMOmniReverseImageBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",)}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "reverse"
+    CATEGORY = "vLLM-Omni/Media"
+
+    def reverse(self, images: torch.Tensor) -> tuple[torch.Tensor]:
+        return (images.flip(0),)
+
+
+class VLLMOmniMiniMaxH3Control:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "control_type": (list(MINIMAX_H3_CONTROL_TYPES),),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Controls the selected mode's conditioning strength.",
+                    },
+                ),
+            },
+            "optional": {
+                "control_video": (
+                    "VIDEO",
+                    {"tooltip": "Required for structure modes; optional for inpaint."},
+                ),
+                "source_video": (
+                    "VIDEO",
+                    {"tooltip": "Optional source video; requires mask or mask_video."},
+                ),
+                "mask": (
+                    "MASK",
+                    {"tooltip": "Static mask; white/1 marks areas to regenerate. Do not combine with mask_video."},
+                ),
+                "mask_video": (
+                    "VIDEO",
+                    {"tooltip": "Temporal mask video; do not combine with mask."},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MINIMAX_H3_CONTROL",)
+    RETURN_NAMES = ("control",)
+    FUNCTION = "get_control"
+    CATEGORY = "vLLM-Omni/Video Params"
+
+    def get_control(
+        self,
+        control_type: MiniMaxH3ControlType,
+        strength: float,
+        control_video: VideoInput | None = None,
+        source_video: VideoInput | None = None,
+        mask: torch.Tensor | None = None,
+        mask_video: VideoInput | None = None,
+    ):
+        control = MiniMaxH3Control(
+            control_type=control_type,
+            control_context_scale=strength,
+        )
+        if control_video is not None:
+            control["control_video"] = control_video
+        if source_video is not None:
+            control["source_video"] = source_video
+        if mask is not None:
+            control["mask"] = mask
+        if mask_video is not None:
+            control["mask_video"] = mask_video
+        validate_minimax_h3_control(control)
+        return (control,)
 
 
 class VLLMOmniVideoReferences:

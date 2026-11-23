@@ -9,17 +9,72 @@ import math
 from types import SimpleNamespace
 
 import pytest
+from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
 from vllm.benchmarks.serve import TaskType
 
 from vllm_omni.benchmarks.metrics.metrics import (
+    _build_stage_metrics_from_outputs,
     aggregate_stage_durations,
     calculate_metrics,
+    metric_result_fields,
     print_stage_durations_metrics,
+    print_stage_metrics,
 )
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 from vllm_omni.metrics.definitions import stage_modality_flags
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def test_shared_video_aggregation_uses_native_samples_and_excludes_failed_requests():
+    """Per-rollout observations and pooled steady gaps have distinct populations."""
+    from vllm_omni.benchmarks.realtime_video.serving import RealtimeVideoRequestOutput
+    from vllm_omni.metrics import definitions as defs
+
+    first = RealtimeVideoRequestOutput(
+        success=True,
+        latency=0.4,
+        video_frames=9,
+        video_duration=0.75,
+        video_ttfc=0.0,
+        video_fps=12.0,
+        video_rtf=0.5,
+        video_steady_intervals=[0.3, 0.5],
+    )
+    second = RealtimeVideoRequestOutput(
+        success=True,
+        latency=0.8,
+        video_frames=9,
+        video_duration=0.75,
+        video_ttfc=0.2,
+        video_fps=8.0,
+        video_rtf=1.0,
+        video_steady_intervals=[0.7],
+    )
+    failed = RealtimeVideoRequestOutput(success=False, video_ttfc=999, video_fps=999, video_steady_intervals=[999])
+    metrics, lengths = calculate_metrics(
+        [],
+        [first, second, failed],
+        2.0,
+        None,
+        [50.0, 99.0],
+        {},
+        TaskType.GENERATION,
+        ["e2el", defs.VIDEO_TTFC, defs.VIDEO_STEADY_INTERVAL],
+        None,
+        float("inf"),
+        2.0,
+    )
+    assert lengths == [0, 0, 0] and metrics.total_output == 0
+    assert metrics.completed == 2 and metrics.failed == 1
+    assert metrics.num_video_ttfc_samples == 2 and metrics.num_video_steady_interval_samples == 3
+    assert metric_result_fields(metrics, "e2el")["p50_e2el_ms"] == pytest.approx(600)
+    assert metric_result_fields(metrics, defs.VIDEO_TTFC)["mean_video_ttfc_ms"] == pytest.approx(100)
+    steady = metric_result_fields(metrics, defs.VIDEO_STEADY_INTERVAL)
+    assert steady["mean_video_steady_interval_ms"] == pytest.approx(500)
+    assert steady["p99_video_steady_interval_ms"] == pytest.approx(696)
+    assert getattr(metrics, defs.MIN_VIDEO_FPS) == 8
+    assert getattr(metrics, defs.MEAN_VIDEO_RTF) == pytest.approx(0.75)
 
 
 def test_stage_modality_flags_match_print_stage():
@@ -649,6 +704,48 @@ def test_image_with_generated_text_still_reports_text_result(capsys):
     assert " Image Result " in out
 
 
+@pytest.mark.parametrize("by_response", [None, {}, {"resp-1": {"0": {"num_tokens_out": 20}}}])
+def test_stage_metrics_selects_one_snapshot_source(by_response):
+    output = MixRequestFuncOutput(success=True)
+    snapshot = {"stage_name": "thinker", "final_output_type": "text", "num_tokens_out": 99}
+    output.stage_metrics = {"0": snapshot}
+    output.stage_metrics_by_response = by_response
+    if by_response:
+        by_response["resp-1"]["0"] = {**snapshot, "num_tokens_out": 20}
+    stages = _build_stage_metrics_from_outputs([output])
+    expected_tokens = [] if by_response == {} else [99 if by_response is None else 20]
+    assert [stage.total_output for stage in stages] == expected_tokens
+
+
+def test_stage_metrics_tolerates_plain_outputs_and_excludes_failed_sessions():
+    plain = RequestFuncOutput(success=True)
+    failed = MixRequestFuncOutput(success=False)
+    failed.stage_metrics_by_response = {"resp-1": {"0": {"final_output_type": "text", "num_tokens_out": 20}}}
+    assert _build_stage_metrics_from_outputs([plain, failed]) == []
+
+
+@pytest.mark.parametrize("duplex", [False, True])
+def test_stage_timing_excludes_missing_values_but_retains_measured_zero(duplex):
+    outputs = []
+    timings: list[dict[str, float | None]] = [
+        {},
+        {"stage_gen_time_ms": None},
+        {"stage_gen_time_ms": 0.0},
+        {"stage_gen_time_ms": 100.0, "postprocess_time_ms": 5.0},
+    ]
+    for index, timing in enumerate(timings):
+        output = MixRequestFuncOutput(success=True)
+        snapshot: dict[str, dict[str, object]] = {"0": {"final_output_type": "text", **timing}}
+        if duplex:
+            output.stage_metrics_by_response = {f"resp-{index}": snapshot}
+        else:
+            output.stage_metrics = snapshot
+        outputs.append(output)
+    stage = _build_stage_metrics_from_outputs(outputs)[0]
+    assert stage.stage_gen_times_ms == [0.0, 100.0]
+    assert stage.postprocess_times_ms == [5.0]
+
+
 def test_aggregate_stage_durations_mean_p50_p99() -> None:
     ok_a = MixRequestFuncOutput()
     ok_a.success = True
@@ -788,3 +885,28 @@ def test_duplex_zero_measurements_are_distinct_from_missing_timings(aggregation)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+@pytest.mark.parametrize("duplex", [False, True])
+def test_complete_stage_timings_keep_zero_samples_in_printed_statistics(duplex, capsys):
+    outputs = []
+    for index, duration in enumerate((0.0, 100.0)):
+        output = MixRequestFuncOutput(success=True)
+        snapshot = {"0": {"stage_gen_time_ms": duration, "postprocess_time_ms": duration / 10}}
+        if duplex:
+            output.stage_metrics_by_response = {f"r{index}": snapshot}
+        else:
+            output.stage_metrics = snapshot
+        outputs.append(output)
+    stage = _build_stage_metrics_from_outputs(outputs)[0]
+    assert stage.stage_gen_times_ms == [0.0, 100.0]
+    assert stage.postprocess_times_ms == [0.0, 10.0]
+    print_stage_metrics(TaskType.GENERATION, [], [99.0], stage)
+    printed = capsys.readouterr().out
+    for label, expected in (
+        ("Mean stage_gen_time (ms):", "50.00"),
+        ("Median stage_gen_time (ms):", "50.00"),
+        ("P99 stage_gen_time (ms):", "99.00"),
+        ("Mean postprocess (ms):", "5.00"),
+    ):
+        assert next(line for line in printed.splitlines() if line.startswith(label)).split()[-1] == expected
