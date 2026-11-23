@@ -80,6 +80,7 @@ NIGHTLY_BLOCKING_COLLECTIVE_JOBS = (
 )
 NIGHTLY_BLOCKING_FULL_MODEL_LABELS = (
     "Qwen3-TTS Base Full-Model Expansion",
+    "Qwen3-TTS CustomVoice Full-Model Expansion",
     "MiniCPM-o Offline Full-Model Modalities",
     "MiniCPM-o Online Full-Model Modalities",
 )
