@@ -262,16 +262,10 @@ def test_allgather_joint_key_mask_reaches_flash_hub(backend, tmp_path):
 @pytest.mark.cpu
 @pytest.mark.parametrize("mask_shape", [(2, 4), (1, 6), (1, 2, 6)])
 def test_allgather_preserves_existing_full_mask(mask_shape):
-    query = torch.zeros(1, 2, 1, 1)
-    chunks = [query, query]
+    key = torch.zeros(1, mask_shape[-1], 1, 1)
     mask = torch.ones(mask_shape, dtype=torch.bool)
-    mask[..., -1] = False
-    metadata = AttentionMetadata(attn_mask=mask)
-    if mask_shape[-1] == 6:
-        metadata.joint_key = metadata.joint_value = query
-    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=0, gather_chunks=[chunks, chunks]))
-    _, _, _, metadata, _ = strategy.pre_attention(query, query, query, metadata)
-
+    metadata = AttentionMetadata(attn_mask=mask, joint_key=key[:, :2] if mask_shape[-1] == 6 else None)
+    assert AllGatherKVParallelAttention._merge_joint_attn_mask(metadata, key) is metadata
     assert metadata.attn_mask is mask
 
 

@@ -57,6 +57,8 @@ class UlyssesAllGatherKVParallelAttention(AllGatherKVParallelAttention):
     slicing.
     """
 
+    _strict_mask_validation = True
+
     def __init__(
         self,
         sp_group: SequenceParallelGroupCoordinator,
@@ -117,12 +119,6 @@ class UlyssesAllGatherKVParallelAttention(AllGatherKVParallelAttention):
                 "shardable across the SP group. Choose a sequence length divisible by "
                 "ulysses_degree * allgather_degree, or enable auto_pad in the model's _sp_plan."
             )
-
-    def _prepare_attn_mask(
-        self, attn_metadata: AttentionMetadata | None, key: torch.Tensor
-    ) -> AttentionMetadata | None:
-        # Preserve the composed strategy's existing mask validation.
-        return self._merge_joint_attn_mask(attn_metadata, key)
 
     def pre_attention(
         self,
