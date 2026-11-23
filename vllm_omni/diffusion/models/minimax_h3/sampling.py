@@ -158,6 +158,7 @@ class MiniMaxH3ModelBatch:
         )
 
     def __call__(self, evaluations: Sequence[ModelEvaluation]):
+        from .adaln_plan import adaln_step_key
         from .batched_packing import minimax_h3_batched_forward_kwargs
         from .denoise_loop import minimax_h3_publish_denoise_progress
 
@@ -207,6 +208,11 @@ class MiniMaxH3ModelBatch:
                     video_target_timesteps=[p[1][0][1] for p in prepared],
                     audio_target_timesteps=[p[1][1][1] for p in prepared],
                 )
+            adaln_plan = getattr(getattr(models[0].transformer, "adaln_cache", None), "plan", None)
+            if adaln_plan is not None:
+                # Host-side step identity; edits set per-row target timesteps the plan does not model.
+                plain = len(models) == 1 and all(row[1] is None for row in prepared[0][1])
+                adaln_plan.select(adaln_step_key(models[0].branch, *prepared[0][2:]) if plain else None)
             if pdd:
                 kwargs["pdd_step"] = evaluations[0].state.step_index
             reference_kv_state = kwargs.get("reference_kv_state")

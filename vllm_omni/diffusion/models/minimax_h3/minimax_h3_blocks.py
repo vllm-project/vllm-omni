@@ -758,15 +758,20 @@ class MiniMaxH3AdalnProj(nn.Module):
 
     @torch.compiler.disable
     def _project_cached(self, t_emb: torch.Tensor) -> torch.Tensor:
-        # Cache decisions, TP hit voting and CPU storage rebinding are host
+        # Plan lookups, cache decisions, TP hit voting and CPU storage rebinding are host
         # control flow. Keep this small boundary eager while the surrounding
         # norms, attention projections and MLP remain eligible for compilation.
+        plan = self._adaln_cache.plan if self._adaln_cache is not None else None
+        if plan is not None:
+            planned = plan.lookup(self)
+            if planned is not None:
+                return planned
         return self._project(t_emb)
 
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
         use_cache_boundary = self._adaln_cache is not None and (
-            self._adaln_cache.max_bytes > 0 or self._offload_weights
+            self._adaln_cache.max_bytes > 0 or self._offload_weights or self._adaln_cache.plan_enabled
         )
         x = self._project_cached(t_emb) if use_cache_boundary else self._project(t_emb)
         m = x.shape[0]

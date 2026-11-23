@@ -48,9 +48,12 @@ PAYLOAD_NAMES = frozenset({"plan_timesteps", "plan_lengths", "time_embeddings", 
 class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
     """Exact projection caching with optional H3 schedule-bound sidecar results."""
 
-    def __init__(self, *, max_bytes: int = 256 * 1024**2, offload_weights: bool = False) -> None:
+    def __init__(self, *, max_bytes: int = 256 * 1024**2, offload_weights: bool = False, plan: bool = False) -> None:
         super().__init__(max_bytes=max_bytes)
         self.offload_weights = offload_weights
+        # Request-level projections (adaln_plan.py); set by the denoise loop for one request.
+        self.plan_enabled = plan
+        self.plan = None
         self.sidecar: MiniMaxH3AdalnCache | None = None
         self._sidecar_signatures: dict[str, Any] = {}
         self._sidecar_plan: int | None = None
@@ -58,6 +61,7 @@ class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
     def clear(self) -> None:
         super().clear()
         self.sidecar = None
+        self.plan = None
         self._sidecar_signatures.clear()
         self._sidecar_plan = None
 

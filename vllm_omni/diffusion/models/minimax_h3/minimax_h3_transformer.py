@@ -811,6 +811,13 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         if type(enabled) is not bool:
             raise ValueError("minimax_h3_adaln_cache must be a boolean")
+        plan = (
+            cache_config.get("minimax_h3_adaln_plan", True)
+            if isinstance(cache_config, Mapping)
+            else getattr(cache_config, "minimax_h3_adaln_plan", True)
+        )
+        if type(plan) is not bool:
+            raise ValueError("minimax_h3_adaln_plan must be a boolean")
         offload = resolve_offload(od_config)
         conflicting_offload = (
             offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)
@@ -849,7 +856,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 raise ValueError("MiniMax H3 AdaLN offload cannot be combined with DiT offload or HSDP")
             logger.info("MiniMax H3 AdaLN weights remain on CPU; projections stage on cache misses only")
         self.adaln_cache = MiniMaxH3RuntimeAdalnCache(
-            max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
+            max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln, plan=plan and not offload_adaln
         )
         self.od_config = od_config
         if reference_isolation_enabled(od_config) or getattr(od_config, "kv_offload_config", None) is not None:
@@ -1657,6 +1664,8 @@ class MiniMaxH3DiTModel(nn.Module):
             )
         if getattr(self, "adaln_cache", None) is not None:
             self.adaln_cache.prepare(t_emb)
+            if self.adaln_cache.plan is not None:
+                self.adaln_cache.plan.bind(t_emb)
 
         last_block = len(self.blocks) - 1
         handover = {}
