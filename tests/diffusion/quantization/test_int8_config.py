@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Int8 quantization config."""
 
+import math
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -16,7 +18,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available.")
 
-cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
+gpu_available = pytest.mark.skipif(
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm()),
+    reason="CUDA or ROCm platform not available.",
+)
 
 
 def test_int8_config_creation():
@@ -100,25 +105,32 @@ def test_quantization_config_string_and_dict_equivalent():
     assert config_str.quantization_config.activation_scheme == config_dict.quantization_config.activation_scheme
 
 
-def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
-    """Test for get_quant_method method for GPU"""
-    from vllm_omni.quantization.int8_config import Int8OnlineLinearMethod
+@pytest.mark.parametrize("platform", ["cuda", "rocm"])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, platform, serialized):
+    """Both GPU backends delegate online and serialized INT8 to vLLM."""
+    from vllm_omni.quantization.int8_config import Int8LinearMethod, Int8OnlineLinearMethod
 
-    config = build_quant_config("int8")
-
-    def _fake_init(self, quant_config):
-        pass
+    config = build_quant_config("int8", is_checkpoint_int8_serialized=serialized)
+    kernel = mocker.Mock()
+    init_kernel = mocker.patch("vllm_omni.quantization.int8_config.init_int8_linear_kernel", return_value=kernel)
 
     layer = mocker.Mock(spec=LinearBase)
-    mocker.patch.object(Int8OnlineLinearMethod, "__init__", _fake_init)
-
     prefix = "test_layer"
 
-    # Mock the platform to be GPU
-    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: platform == "cuda")
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: platform == "rocm")
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     method = config.get_quant_method(layer, prefix)
-    assert isinstance(method, Int8OnlineLinearMethod)
+    expected_method = Int8LinearMethod if serialized else Int8OnlineLinearMethod
+    assert type(method) is expected_method
+    assert method.int8_linear is kernel
+    init_kernel.assert_called_once_with(
+        is_channelwise=False,
+        is_static_input_scheme=False,
+        input_symmetric=True,
+        module_name=expected_method.__name__,
+    )
 
     # Test skipping quantization for a layer
     config.ignored_layers = [prefix]
@@ -137,6 +149,7 @@ def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyP
 
     # Mock the platform to be NPU
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     method = config.get_quant_method(layer, prefix)
     assert isinstance(method, NPUInt8OnlineLinearMethod)
@@ -156,6 +169,7 @@ def test_fused_layer_can_be_ignored_by_its_prefix(monkeypatch: pytest.MonkeyPatc
     from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     config = build_quant_config("int8", ignored_layers=["blocks.0.attn.qkv_proj"])
     layer = mocker.Mock(spec=LinearBase)
@@ -428,18 +442,35 @@ class TestInt8LinearMethod:
         method.process_weights_after_loading(layer)
         patch_deps.process_weights_after_loading.assert_called_once_with(layer)
 
-    def test_apply(self, patch_deps, mock_quant_config):
+    @pytest.mark.parametrize("shape", [(128,), (2, 128), (2, 3, 128), (2, 3, 4, 128)])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_apply(self, patch_deps, mock_quant_config, shape, with_bias):
         from vllm_omni.quantization.int8_config import Int8LinearMethod
 
         method = Int8LinearMethod(mock_quant_config)
         layer = Module()
-        x = torch.randn(1, 128)
-        bias = torch.randn(128)
+        # Strided inputs exercise the same boundary as batched diffusion states.
+        x = torch.arange(2 * math.prod(shape), dtype=torch.float32).reshape(*shape[:-1], 256)[..., ::2]
+        weight = torch.arange(128 * 10, dtype=torch.float32).reshape(128, 10) / 128
+        bias = torch.arange(10, dtype=torch.float32) if with_bias else None
+
+        def matrix_kernel(actual_layer, matrix, actual_bias):
+            assert actual_layer is layer
+            assert matrix.ndim == 2
+            assert matrix.is_contiguous()
+            assert actual_bias is bias
+            output = matrix @ weight
+            return output if actual_bias is None else output + actual_bias
+
+        patch_deps.apply_weights.side_effect = matrix_kernel
 
         output = method.apply(layer, x, bias)
 
-        patch_deps.apply_weights.assert_called_once_with(layer, x, bias)
-        assert isinstance(output, torch.Tensor)
+        expected = x @ weight
+        if bias is not None:
+            expected = expected + bias
+        torch.testing.assert_close(output, expected)
+        patch_deps.apply_weights.assert_called_once()
 
 
 class TestInt8OnlineLinearMethod:
@@ -609,13 +640,13 @@ class TestNPUInt8Smoke:
         assert output.dtype == torch.float16
 
 
-@cuda_available
-class TestCudaInt8Smoke:
-    """Smoke tests using real CUDA kernels, only on CUDA"""
+@gpu_available
+class TestGPUInt8Smoke:
+    """Smoke tests using the upstream CUDA or ROCm INT8 kernels."""
 
     @pytest.fixture
     def real_layer(self):
-        """Create a real linear layer with fp16 weights on CUDA"""
+        """Create a real linear layer with fp16 weights on the active GPU."""
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(
             torch.randn(128, 64, dtype=torch.float16, device="cuda"),
@@ -627,7 +658,7 @@ class TestCudaInt8Smoke:
         layer.orig_dtype = torch.float16
         return layer
 
-    def test_real_cuda_scaled_int8_quant_shape_contract(self, quant_config):
+    def test_real_gpu_scaled_int8_quant_shape_contract(self, quant_config):
         """Smoke test: verify scaled_int8_quant returns correct shapes."""
         from vllm import _custom_ops as ops
 
@@ -638,8 +669,8 @@ class TestCudaInt8Smoke:
         assert qweight.dtype == torch.int8
         assert scale.shape == (weight.shape[0], 1)
 
-    def test_real_cuda_online_process_weights_after_loading(self, quant_config, real_layer):
-        """Smoke test: full process_weights_after_loading with real CUDA ops."""
+    def test_real_gpu_online_process_weights_after_loading(self, quant_config, real_layer):
+        """Smoke test: full process_weights_after_loading with real GPU ops."""
         from vllm_omni.quantization.int8_config import Int8OnlineLinearMethod
 
         method = Int8OnlineLinearMethod(quant_config)
@@ -650,8 +681,8 @@ class TestCudaInt8Smoke:
         assert real_layer.weight.dtype == torch.int8
         assert hasattr(real_layer, "weight_scale")
 
-    def test_real_cuda_int8_apply_forward(self, quant_config):
-        """Smoke test: forward pass with real CUDA int8 kernel."""
+    def test_real_gpu_int8_apply_forward(self, quant_config):
+        """Smoke test: batched forward pass with the real GPU INT8 kernel."""
         from vllm import _custom_ops as ops
 
         from vllm_omni.quantization.int8_config import Int8LinearMethod
@@ -676,3 +707,7 @@ class TestCudaInt8Smoke:
 
         assert output.shape == (2, 16, 128)
         assert output.dtype == torch.float16
+
+        qx, x_scale, _ = ops.scaled_int8_quant(x.reshape(-1, 64), scale=None)
+        expected = (qx.float() @ qweight.float().t()) * x_scale * scale.t()
+        torch.testing.assert_close(output, expected.reshape(2, 16, 128).to(output.dtype), rtol=1e-2, atol=1e-2)

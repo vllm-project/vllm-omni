@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""PersonaPlex profiles still require a retired V1 Talker stage.
-
-Keep the profile metadata checks and verify that full-workflow admission fails.
-The V2 Code2Wav component alone does not qualify the complete model.
-"""
+"""Verify the PersonaPlex duplex MRv2 deployment profile."""
 
 import pytest
 
@@ -28,12 +24,11 @@ def _resolve_cuda_stages(monkeypatch):
     return config
 
 
-def test_personaplex_duplex_mrv2_profile_rejects_v1_talker(monkeypatch) -> None:
+def test_personaplex_duplex_mrv2_profile_enables_both_stages(monkeypatch) -> None:
     config = _resolve_cuda_stages(monkeypatch)
     assert config.session_mode == "duplex"
-    assert config.stages[0].model_runner == "v1"
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)
+    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
 
 
 @pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
@@ -59,6 +54,3 @@ def test_personaplex_duplex_mrv2_profile_preserves_pipeline_attributes(monkeypat
     assert config.stages[1].max_num_seqs == 10
     assert config.stages[1].engine_extras["hf_overrides"]["mimi_cuda_graphs"] is True
     assert config.stages[1].engine_extras["hf_overrides"]["mimi_decode_tf32"] is True
-
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        merge_pipeline_deploy(PERSONAPLEX_PIPELINE, config)

@@ -1,5 +1,8 @@
 # Common dependencies for all platforms
 opentelemetry-api>=1.45.1
+# Realtime sessions use RealtimeReasoning and the session reasoning field,
+# which were added in the OpenAI Python client 2.36.0.
+openai>=2.36.0
 # Match the vLLM 0.34 release range; CUDA selects its exact tested version
 # in cuda-runtime.txt.
 # MOSS-TTS-Nano's list/set weight-loading compatibility is handled by

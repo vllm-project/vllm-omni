@@ -1,7 +1,8 @@
-# CUDA codec profile on top of the default Model Runner V2 deploy. The default
+# Model Runner V2 codec profile on top of the default deploy. The default
 # qwen3_omni_moe.yaml already selects model_runner v2 for Thinker, Talker and
-# Code2Wav. This overlay adds first-frame delivery, the codec chunk ramp,
-# length-grouped Code2Wav graphs, and fused decoder blocks.
+# Code2Wav on CUDA and ROCm. This overlay adds the codec chunk ramp and
+# length-grouped CUDA/HIP graphs, plus CUDA-only first-frame delivery and
+# fused blocks.
 #
 # On MRv2 the Thinker hands each generated token's embedding to the Talker with
 # the step that sampled it (one Thinker step earlier than its next forward would
@@ -28,7 +29,7 @@ connectors:
       talker_first_audio: true
       codec_chunk_ramp: [1, 2, 4, 8, 16, 25]
       # Code2Wav decodes a streaming step as a few length groups on multi-row
-      # CUDA graphs instead of one eager call padded to its longest window
+      # CUDA/HIP graphs instead of one eager call padded to its longest window
       # (with the ramp, over half of those padded frames were waste).
       codec_graph_batch_sizes: [2, 3, 4, 6, 8, 12, 16]
       codec_fused_snake: true
@@ -48,8 +49,6 @@ stages:
 
 platforms:
   npu:
-    model_runner: v1
-  rocm:
     model_runner: v1
   musa:
     model_runner: v1

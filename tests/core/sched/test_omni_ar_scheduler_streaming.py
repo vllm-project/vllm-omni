@@ -25,7 +25,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -93,6 +93,98 @@ def _make_request() -> Request:
         arrival_time=100.0,
         block_hasher=None,
     )
+
+
+@pytest.mark.parametrize("request_finished", [False, True])
+def test_native_talker_waiting_for_prompt_consumes_boundary_without_decode(request_finished):
+    from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+    from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+
+    sched = _make_scheduler(stage_id=1)
+    req = _make_request()
+    req.resumable = True
+    req._omni_waiting_native_prompt = True
+    req.num_computed_tokens = 4
+    req_id = req.request_id
+    sched._native_resumable = True
+    sched.requests = {req_id: req}
+    sched.waiting = []
+    sched.running = []
+    sched._pending_data_plane_terminal_req_ids = set()
+    sched._resume_chunk_receivers = set()
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
+    sched.finish_requests = MagicMock()
+    sched._latest_omni_connector_output = OmniConnectorOutput(
+        chunk_ready_req_ids={req_id},
+        chunk_finished_req_ids={req_id} if request_finished else set(),
+        request_metadata={
+            req_id: SchedulingMetadataUpdate(input_terminal=request_finished, segment_finished=not request_finished)
+        },
+    )
+
+    sched._consume_pending_connector_output("ar")
+
+    assert req_id not in sched.input_coordinator.requests_with_ready_chunks
+    assert req_id not in sched.input_coordinator.finished_requests
+    if request_finished:
+        sched.finish_requests.assert_called_once_with(req_id, RequestStatus.FINISHED_STOPPED)
+        assert sched._pending_data_plane_terminal_req_ids == {req_id}
+    else:
+        sched.finish_requests.assert_not_called()
+        assert sched._resume_chunk_receivers == {req_id}
+
+
+def test_ordinary_native_talker_prefills_when_first_chunk_and_terminal_coalesce():
+    from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+    from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+
+    sched = _make_scheduler(stage_id=1)
+    req = _make_request()
+    req_id = req.request_id
+    sched._native_resumable = True
+    sched.requests = {req_id: req}
+    sched.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.waiting.add_request(req)
+    sched.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.running = []
+    sched._pending_data_plane_terminal_req_ids = set()
+    sched.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
+    sched.finish_requests = MagicMock()
+    sched._latest_omni_connector_output = OmniConnectorOutput(
+        chunk_ready_req_ids={req_id},
+        chunk_finished_req_ids={req_id},
+        request_metadata={req_id: SchedulingMetadataUpdate(input_terminal=True)},
+    )
+
+    sched._consume_pending_connector_output("ar")
+
+    sched.finish_requests.assert_not_called()
+    assert list(sched.waiting) == [req]
+    assert sched.input_coordinator.requests_with_ready_chunks == {req_id}
+    assert sched.input_coordinator.finished_requests == {req_id}
+
+
+@pytest.mark.parametrize(
+    ("status", "computed", "expected"),
+    [
+        (RequestStatus.WAITING_FOR_STREAMING_REQ, 3, []),
+        (RequestStatus.WAITING, 2, []),
+        (RequestStatus.RUNNING, 3, [40, 41]),
+    ],
+)
+def test_post_step_drafts_do_not_cross_streaming_segment(status, computed, expected):
+    sched = _make_scheduler()
+    request = _make_request()
+    request.resumable = True
+    request.status = status
+    request.num_computed_tokens = computed
+    sched.requests = {request.request_id: request}
+    sched.structured_output_manager = SimpleNamespace(trim_spec_tokens=lambda req, tokens: tokens)
+    sched._talker_kstep_armed = lambda: False
+
+    sched.update_draft_token_ids(DraftTokenIds([request.request_id], [[40, 41]]))
+
+    assert request.spec_token_ids == expected
 
 
 def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
@@ -332,6 +424,35 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
         confirmed_num_computed_tokens=26,
         segment_generation=0,
     )
+
+
+def test_dflash_boundary_send_keeps_the_previous_prompt():
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.append_output_token_ids([7, 8])
+    adapter = MagicMock()
+    adapter.uses_dflash = True
+    adapter._confirmed_num_computed_tokens.return_value = 3
+    adapter._snapshot_processor_request.side_effect = OmniChunkTransferAdapter._snapshot_processor_request
+
+    def install_next_prompt(request):
+        request.prompt_token_ids.extend([8, 9])
+        request._output_token_ids.clear()
+        return False
+
+    _run_resumable_segment_stop(
+        session,
+        handle_stopped=install_next_prompt,
+        chunk_transfer_adapter=adapter,
+        inter_stage_output={"meta": {"decode_span": True}},
+    )
+
+    _, snapshot, segment_finished = adapter.save_async.call_args.args
+    assert segment_finished
+    assert snapshot.prompt_token_ids == [1, 2, 3]
+    assert list(snapshot.output_token_ids) == [7, 8]
+    assert session.prompt_token_ids == [1, 2, 3, 8, 9]
 
 
 @pytest.mark.parametrize(
@@ -1458,6 +1579,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     session = _make_request()
     session.resumable = True
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session._omni_segment_generation = 0
 
     def queue(*requests):
         result = MagicMock()
@@ -1487,6 +1609,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
 
     assert session.status == RequestStatus.WAITING
     assert session in sched.waiting.requests
+    assert session._omni_segment_generation == 1
     assert session not in sched.kv_holding_waiting.requests
     assert sched.num_waiting_for_streaming_input == 0
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
@@ -1506,6 +1629,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     """Only duplex connector-driven receivers resume without an update."""
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session._omni_segment_generation = 0
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
@@ -1521,6 +1645,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched._resume_downstream_chunk_receiver(session)
 
     assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert session._omni_segment_generation == 0
     assert sched.num_waiting_for_streaming_input == 1
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.kv_holding_waiting.remove_requests.assert_not_called()

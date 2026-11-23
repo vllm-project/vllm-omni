@@ -116,6 +116,7 @@ class OmniInteractCaseResult:
     output_tokens: int = 0
     duplex_request_metrics: list[dict[str, object]] = field(default_factory=list)
     duplex_session_metrics: dict[str, object] = field(default_factory=dict)
+    error_code: str | None = None
     _artifact_context: _DeferredArtifactContext | None = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
@@ -535,7 +536,15 @@ def _raise_if_session_terminated(
         and not _correlates_to_request(event, tolerated_related_event_ids)
     ]
     if fatal:
-        raise RuntimeError(str(fatal[-1]))
+        event = fatal[-1]
+        code = _error_code(event)
+        if code in {"server_vad_unavailable", "semantic_vad_unavailable"}:
+            from vllm_omni.clients.duplex import DuplexProtocolError
+
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            raise DuplexProtocolError(str(message or code), code=code, raw=event)
+        raise RuntimeError(str(event))
     if warnings is not None:
         for event in errors:
             if _correlates_to_request(event, tolerated_related_event_ids):
@@ -1093,6 +1102,10 @@ class _RealtimeSession:
             raise ConnectionError("Realtime event consumer was cancelled")
         error = task.exception()
         if error is not None:
+            from vllm_omni.clients.duplex import DuplexProtocolError
+
+            if isinstance(error, DuplexProtocolError):
+                raise error
             raise ConnectionError("Realtime session failed") from error
         raise ConnectionError("Realtime session closed before the requested event arrived")
 
@@ -1185,6 +1198,8 @@ async def run_omniinteract_case(
     capture_artifacts: bool = True,
     prepared_input: OmniInteractPreparedInput | None = None,
 ) -> OmniInteractCaseResult:
+    from vllm_omni.clients.duplex import DuplexProtocolError
+
     if config.turn_detection not in TURN_DETECTION_MODES:
         raise ValueError(f"turn_detection must be one of {TURN_DETECTION_MODES}")
     for name, value in (
@@ -1340,6 +1355,10 @@ async def run_omniinteract_case(
         result.success = result.eligible_for_official_eval = False
         if "case_failed" not in result.official_eval_ineligible_reasons:
             result.official_eval_ineligible_reasons.append("case_failed")
-        result.error = str(exc)
+        if isinstance(exc, DuplexProtocolError):
+            result.error_code = exc.code
+            result.error = f"{exc.code}: {exc}"
+        else:
+            result.error = str(exc)
         result.latency_s = max(0.0, time.monotonic() - started_at)
     return result

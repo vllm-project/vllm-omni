@@ -24,6 +24,7 @@ import torch
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.utils.network_utils import get_file_store_init_method
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v as s2v_pipeline_module
 import vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer as s2v_transformer_module
@@ -216,13 +217,17 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    from tests.helpers.runtime import assign_ephemeral_master_port
-
-    assign_ephemeral_master_port()
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+    )
+    try:
+        initialize_model_parallel()
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
 
 
 _NUM_LAYERS = 2

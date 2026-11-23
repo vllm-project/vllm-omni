@@ -215,6 +215,34 @@ class TestLTXDiffusionDecoder:
         assert fast_path_calls[0][3:] == ((11, 11, 11), (11, 11, 11))
         assert not fallback_calls
 
+    def test_triton_processor_uses_bounded_na3d_without_natten(self):
+        from vllm_omni.diffusion.models.ltx2.vae import decoder as diffvae_modules
+
+        processor = object.__new__(diffvae_modules.LTX2VideoVaeNeighborhoodTritonProcessor)
+        hidden_states = torch.randn(1, 11, 11, 11, 256, dtype=torch.bfloat16)
+        projected = hidden_states.view(1, 11, 11, 11, 4, 64)
+        calls = []
+
+        def na3d(query, key, value, **kwargs):
+            calls.append((query, key, value, kwargs))
+            return query
+
+        processor._na3d = na3d
+        attention = _AttentionProbe(
+            kernel_size=(11, 11, 11),
+            head_dim=64,
+            to_out=(torch.nn.Identity(),),
+            projected=projected,
+        )
+
+        output = processor(attention, hidden_states)
+
+        assert torch.equal(output, hidden_states)
+        assert len(calls) == 1
+        query, key, value, kwargs = calls[0]
+        assert query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
+        assert kwargs == {"kernel_size": (11, 11, 11), "scale": 1.0}
+
     @pytest.mark.parametrize("reason", ["device", "head_dim", "channels", "dtype", "tilelang_missing", "kernel"])
     def test_natten_processor_keeps_natten_when_fast_path_does_not_apply(self, monkeypatch, reason):
         from vllm_omni.diffusion.models.ltx2.vae import decoder as ops
