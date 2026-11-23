@@ -20,9 +20,17 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.delegation import filter_delegate_condition
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.delegation import (
+    delegate_speech_boundary,
+    filter_delegate_condition,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import (
+    SPEECH_FLUSH_KEY,
+    SPEECH_MUTED_KEY,
+    pack_handoff_tensor,
+    unpack_handoff_tensor,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
 logger = init_logger(__name__)
@@ -42,6 +50,7 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     duplex_epoch: int | None = None
     segment_end: bool | None = None
     turn_end: bool | None = None
+    speech_muted: bool | None = None
     tts_is_last_chunk: bool | None = None
 
 
@@ -308,6 +317,8 @@ def tts2code2wav_async_chunk(
     if not isinstance(segment_text_utf8, torch.Tensor):
         segment_text_utf8 = None
     turn_end = bool(_coerce_int(output_meta.get("turn_end")))
+    speech_flush = bool(_coerce_int(output_meta.get(SPEECH_FLUSH_KEY)))
+    speech_muted = bool(_coerce_int(output_meta.get(SPEECH_MUTED_KEY)))
     duplex_turn_key = (duplex_epoch, duplex_turn_id)
 
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -413,7 +424,7 @@ def tts2code2wav_async_chunk(
     # (initial_codec_chunk_frames) used to shorten the first payload, but with
     # the steady window itself at 25 frames it only added a seam.
     flush_pending = finished
-    last_chunk = bool(flush_pending and (not native_duplex or turn_end))
+    last_chunk = bool(flush_pending and (not native_duplex or turn_end or speech_flush))
     if not flush_pending and len(pending) < chunk_frames:
         return None
 
@@ -442,7 +453,7 @@ def tts2code2wav_async_chunk(
         output_codes = []
     state["codec_end"] = codec_end
     code_flat_numel = len(output_codes)
-    if native_duplex and code_flat_numel > 0:
+    if native_duplex and (code_flat_numel > 0 or (speech_muted and finished)):
         segment_text_utf8 = torch.tensor(pending_text_utf8, dtype=torch.uint8)
         pending_text_utf8.clear()
     if native_duplex and finished:
@@ -493,13 +504,15 @@ def tts2code2wav_async_chunk(
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
+            speech_muted=speech_muted,
             replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,
         ),
         request_id=request_id,
     )
     if last_chunk and native_duplex:
-        record["last_terminal_turn"] = duplex_turn_key
+        if turn_end:
+            record["last_terminal_turn"] = duplex_turn_key
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         _drop_codec_state(transfer_manager, request_id)
@@ -769,6 +782,8 @@ def _native_duplex_segment_output_ids(
         # _native_duplex_append_turn_text).
         state["turn_text_tail"] = ""
         state["delegate_muted"] = False
+        state["delegate_preflushed"] = False
+        state["delegate_speech_active"] = False
     return segment_ids, segment_text, turn_start
 
 
@@ -1184,6 +1199,10 @@ def llm2tts(
                     tts_hidden_slice = thinker_hidden_states[:0]
                     thinker_text = ""
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
+        native_turn_end_handoff = bool(
+            is_native_duplex_handoff and handoff_ids and handoff_ids[-1] == special_token_ids.get("turn_eos_token_id")
+        )
+        speech_flush = speech_restart = skip_speech = False
         spoken_text = None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
@@ -1208,6 +1227,16 @@ def llm2tts(
                     spoken_text = _decode_native_duplex_token_ids(
                         speech_ids, _streaming_context, request_id=str(llm_output.request_id)
                     )
+                if special_token_ids.get("delegate_open_token_id", -1) >= 0:
+                    speech_flush, speech_restart, skip_speech = delegate_speech_boundary(
+                        handoff_ids,
+                        speech_ids,
+                        turn_end_id=special_token_ids.get("turn_eos_token_id"),
+                        state=handoff_state,
+                    )
+                    if skip_speech:
+                        speech_ids = []
+                        tts_hidden_slice = tts_hidden_slice[:0]
                 handoff_ids = speech_ids
         if spoken_text:
             _native_duplex_append_turn_text(_streaming_context, request_id=str(llm_output.request_id), text=spoken_text)
@@ -1238,7 +1267,9 @@ def llm2tts(
                 # The Talker retains the EOS embedding in its condition, but
                 # only a condition ending in EOS closes the turn.
                 meta["turn_eos_token_id"] = int(turn_eos_id)
-            meta["turn_start"] = native_turn_start
+            meta["turn_start"] = native_turn_start or speech_restart
+            meta[SPEECH_FLUSH_KEY] = speech_flush
+            meta[SPEECH_MUTED_KEY] = skip_speech
             if native_segment_end:
                 meta["segment_end"] = True
         ref_audio = reference_audio_by_request_id.get(llm_output.request_id)
@@ -1254,11 +1285,8 @@ def llm2tts(
                 ref_sr,
             )
         handoff_hidden = _to_transport_list(tts_hidden_slice) if is_native_duplex_handoff else tts_hidden_slice
-        native_turn_end_handoff = False
         turn_text_ends_sentence = False
         if is_native_duplex_handoff:
-            turn_eos_id = special_token_ids.get("turn_eos_token_id")
-            native_turn_end_handoff = bool(handoff_ids and handoff_ids[-1] == turn_eos_id)
             if handoff_ids is None:
                 continue
         set_tts_handoff(
@@ -1285,7 +1313,10 @@ def llm2tts(
         if handoff_ids is not None and handoff_hidden is not None:
             # The condition ends with <audio_bos>; offline and closed turn-end
             # conditions put <text_eos> before it.
-            if is_native_duplex_handoff and handoff_ids:
+            if speech_flush:
+                # Venus drains existing speech using only <audio_bos>.
+                condition_suffix_length = 1
+            elif is_native_duplex_handoff and handoff_ids:
                 condition_suffix_length = 2 if turn_text_ends_sentence else 1
             else:
                 # Empty conditions use Talker's two boundary embeddings.
@@ -1300,7 +1331,7 @@ def llm2tts(
             if is_native_duplex_handoff:
                 handoff_meta["next_stage_generation_tokens"] = (
                     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
-                    if native_turn_end_handoff
+                    if native_turn_end_handoff and not speech_flush
                     else MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
                 )
                 bridge_states = getattr(_streaming_context, "bridge_states", None)
@@ -1319,7 +1350,7 @@ def llm2tts(
                 handoff_meta["streaming_condition_seq"] = condition_sequence_value
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
-            if not is_native_duplex_handoff or native_turn_start:
+            if not is_native_duplex_handoff or native_turn_start or speech_restart:
                 handoff_meta["replace_streaming_prompt"] = True
         else:
             scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(

@@ -1,0 +1,4 @@
+# Realtime-Venus continuous audio/video sessions over /v1/realtime?duplex=1.
+# Keep the checkpoint's 10-step FP32 Flow recipe from the turn deployment.
+base_config: realtime_venus_omni.yaml
+session_mode: duplex

@@ -8,7 +8,7 @@ import torch
 def speech_condition_indices(
     token_ids: list[int], *, open_id: int, close_id: int, turn_end_id: int | None, muted: bool
 ) -> tuple[list[int], bool]:
-    """Return aligned token/hidden rows, retaining EOS to drain pending speech.
+    """Return the speech rows selected by the released Venus duplex model.
 
     The model's text stream is unchanged. An unterminated delegation span ends
     at the assistant turn boundary so it cannot mute the following turn.
@@ -19,11 +19,12 @@ def speech_condition_indices(
             muted = True
         elif token == close_id:
             muted = False
-        elif token == turn_end_id:
-            keep.append(index)
-            muted = False
         elif not muted:
             keep.append(index)
+    # EOS remains in the text/control stream even when delegation masks its
+    # speech row. Reset after the unit, matching the reference implementation.
+    if turn_end_id in token_ids:
+        muted = False
     return keep, muted
 
 
@@ -46,3 +47,28 @@ def filter_delegate_condition(
         return token_ids, hidden
     indices = torch.tensor(keep, dtype=torch.long, device=hidden.device)
     return [token_ids[i] for i in keep], hidden.index_select(0, indices)
+
+
+def delegate_speech_boundary(
+    token_ids: list[int], speech_ids: list[int], *, turn_end_id: int | None, state: dict
+) -> tuple[bool, bool, bool]:
+    """Return (flush, restart, skip) without closing the dialogue turn.
+
+    A fully delegated unit drains the previous speech once. Later silent
+    units and a bare turn terminator do not invoke synthesis; newly spoken
+    content starts with fresh Talker and vocoder state.
+    """
+    preflushed = bool(state.get("delegate_preflushed", False))
+    fully_muted = bool(token_ids) and not speech_ids
+    bare_end = bool(speech_ids) and all(token == turn_end_id for token in speech_ids)
+    flush = fully_muted and bool(state.get("delegate_speech_active", False))
+    skip = fully_muted or (preflushed and bare_end)
+    restart = preflushed and not skip and bool(speech_ids)
+    if flush:
+        state["delegate_preflushed"] = True
+        state["delegate_speech_active"] = False
+    elif restart:
+        state["delegate_preflushed"] = False
+    if speech_ids and not skip:
+        state["delegate_speech_active"] = True
+    return flush, restart, skip

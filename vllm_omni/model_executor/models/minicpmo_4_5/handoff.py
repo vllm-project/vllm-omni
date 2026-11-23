@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Owned CPU tensor snapshots for the untyped turn-mode request envelope."""
+"""Model-owned stage metadata and CPU tensor snapshots for request handoff."""
 
 import torch
 
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+
+# Speech boundaries are independent of dialogue turn boundaries.
+SPEECH_FLUSH_KEY = "speech_flush"
+SPEECH_MUTED_KEY = "speech_muted"
 
 
 def pack_handoff_tensor(value: torch.Tensor) -> bytes:

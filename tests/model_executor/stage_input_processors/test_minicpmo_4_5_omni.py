@@ -997,8 +997,69 @@ def test_venus_delegation_state_crosses_units_and_resets_at_turn_end():
     assert ids == [22, 23]
     assert torch.equal(rows, hidden[2:])
     ids, rows = filter_delegate_condition([9400, 34, 35, 9310], hidden, special, state)
-    assert ids == [9310]
+    assert ids == []
+    assert rows.shape == (0, 4)
     assert not state["delegate_muted"]
     ids, rows = filter_delegate_condition([21, 22, 23, 24], hidden, special, state)
     assert ids == [21, 22, 23, 24]
     assert rows is hidden
+
+
+@pytest.mark.parametrize("resume_speech", [False, True])
+def test_venus_muted_units_flush_once_and_keep_dialogue_open(resume_speech):
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}},
+        source_token_decoder=lambda ids, **_: "".join(
+            {21: "Hello.", 31: "secret", 22: "Again."}.get(i, "") for i in ids
+        ),
+    )
+    cumulative = []
+
+    def handoff(content):
+        unit = [9304, *content, 9308]
+        cumulative.extend(unit)
+        source, _ = _native_source([101], list(cumulative), [101, *unit])
+        source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+        return llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    first = handoff([21])
+    assert first["ids"]["tts"] == [21]
+    muted = handoff([9400, 31])
+    assert muted["ids"]["tts"] == []
+    assert muted["meta"]["speech_flush"] is True
+    assert muted["meta"]["turn_end"] is False
+    assert muted["meta"]["next_stage_prompt_len"] == 1
+    assert muted["meta"]["native_duplex_segment_text"] == "secret"
+    again = handoff([31])
+    assert again["ids"]["tts"] == []
+    assert again["meta"]["speech_flush"] is False
+    assert context.bridge_states["duplex"]["model_turn_id"] == 0
+
+    if resume_speech:
+        resumed = handoff([9401, 22])
+        assert resumed["ids"]["tts"] == [22]
+        assert resumed["meta"]["turn_start"] is True
+        assert resumed["meta"]["replace_streaming_prompt"] is True
+    terminal = handoff([9310])
+    assert terminal["meta"]["turn_end"] is True
+    assert terminal["meta"]["speech_flush"] is False
+    assert terminal["ids"]["tts"] == ([9310] if resume_speech else [])
+    assert context.bridge_states["duplex"]["model_turn_id"] == 1
+    following = handoff([22])
+    assert following["ids"]["tts"] == [22]
+    assert following["meta"]["turn_start"] is True
+
+
+def test_venus_delegation_only_turn_is_silent_and_new_request_resets_mask():
+    context = StreamingInputState(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}})
+    source, _ = _native_source([101], [9304, 9400, 31, 9308], [101, 9304, 9400, 31, 9308])
+    source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == []
+    assert info["meta"]["speech_flush"] is False
+    # An aborted/replaced request must not inherit the old request's mute state.
+    source, _ = _native_source([101], [9304, 21, 9308], [101, 9304, 21, 9308])
+    source.request_id = "replacement"
+    source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [21]

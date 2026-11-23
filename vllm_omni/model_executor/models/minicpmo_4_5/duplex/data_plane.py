@@ -16,6 +16,7 @@ from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneConte
 from vllm_omni.model_executor.common.request_outputs import coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import SPEECH_MUTED_KEY
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -345,6 +346,29 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     yield from pending_audio
                     return
                 request_state.pending_audio_without_text = pending_audio
+
+        if tts_segment_end and _bool_metadata(mm_output, (SPEECH_MUTED_KEY,), default=False) and text:
+            # A delegation-only unit intentionally has no waveform. Publish
+            # its text at this unit boundary instead of waiting for speech.
+            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
+            result = runtime_result(
+                stage_role="tts",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                text=delta_text,
+                audio_data="",
+                audio_duration_ms=0,
+                audio_format=context.response_format,
+                audio_text_mark=False,
+                end_of_turn=unit_end_of_turn,
+                abort_data_plane_request=True,
+            )
+            if output_turn_id is not None:
+                result["model_turn_id"] = output_turn_id
+            if delta_text and text_turn_state is not None:
+                text_turn_state.has_text = True
+            yield result
+            return
 
         if tts_segment_end:
             if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:

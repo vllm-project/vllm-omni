@@ -74,6 +74,42 @@ def _codes(payload) -> list[int]:
     return payload.codes.audio.tolist()
 
 
+def test_venus_delegate_flush_drains_pending_codes_without_closing_dialogue():
+    manager = _manager()
+    request = _request("delegate")
+    request.sampling_params = SimpleNamespace(stop_token_ids=[1])
+    request.sampled_token_ids = [1]
+    # A short previous unit is still held for the vocoder's minimum body size.
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(11, 12), request)
+    assert first.meta.codec_chunk_frames == 0
+    tail = _duplex_delta(13, 14)
+    tail["meta"]["speech_flush"] = torch.tensor(True)
+    flushed = tts2code2wav_async_chunk(manager, tail, request)
+    assert _codes(flushed) == [4218, 4218, 4218, 11, 12, 13, 14]
+    assert flushed.meta.last_chunk is True
+    assert flushed.meta.turn_end is False
+    assert flushed.meta.finished.item() is False
+    # A real turn EOS still propagates after the speech-only flush.
+    terminal = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request)
+    assert terminal.meta.turn_end is True
+    assert terminal.meta.cache_epoch == 1
+    assert terminal.meta.code_flat_numel == 0
+
+
+def test_venus_muted_text_is_delivered_without_waiting_for_or_replaying_in_speech():
+    manager = _manager()
+    request = _request("delegate")
+    muted = _duplex_delta(text="secret")
+    muted["meta"]["speech_muted"] = torch.tensor(True)
+    first = tts2code2wav_async_chunk(manager, muted, request, True)
+    assert first.meta.code_flat_numel == 0
+    assert first.meta.speech_muted is True
+    assert bytes(first.meta.llm_output_text_utf8.tolist()) == b"secret"
+    spoken = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="spoken"), request)
+    assert bytes(spoken.meta.llm_output_text_utf8.tolist()) == b"spoken"
+    assert spoken.meta.speech_muted is False
+
+
 def test_empty_full_payload_releases_consumer_wait_gate() -> None:
     payload = tts2code2wav_full_payload(_manager(), None, _request("req"))
 

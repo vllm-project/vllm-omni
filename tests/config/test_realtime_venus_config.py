@@ -140,12 +140,13 @@ def test_legacy_processor_registration_restored_on_failure(monkeypatch):
     assert registered == [RealtimeVenusOmniConfig]
 
 
-def test_venus_deploy_preserves_reference_flow_settings():
+@pytest.mark.parametrize("mode,suffix", [("turn", ""), ("duplex", "_duplex")])
+def test_venus_deploy_preserves_reference_flow_settings(mode, suffix):
     from vllm_omni.config.stage_config import resolve_deploy_yaml
 
-    config = resolve_deploy_yaml("vllm_omni/deploy/realtime_venus_omni.yaml")
+    config = resolve_deploy_yaml(f"vllm_omni/deploy/realtime_venus_omni{suffix}.yaml")
     assert config["pipeline"] == "realtime_venus_omni"
-    assert config["session_mode"] == "turn"
+    assert config["session_mode"] == mode
     assert config["connectors"]["connector_of_shared_memory"]["extra"]["token2wav_n_timesteps"] == 10
     cuda = config["platforms"]["cuda"]
     assert cuda["connectors"]["connector_of_shared_memory"]["extra"]["token2wav_float16"] is False

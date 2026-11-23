@@ -64,6 +64,22 @@ def test_new_input_does_not_rearm_an_already_delivered_boundary():
     assert _project(plane, _boundary(4))
 
 
+@pytest.mark.parametrize("turn_end", [False, True])
+def test_venus_muted_unit_emits_text_once_without_audio(turn_end):
+    plane = MiniCPMO45DataPlaneSession(lambda *args: "")
+    output = _boundary(0)
+    output.outputs[0].text = "<delegate>look up the weather</delegate>"
+    output.multimodal_output["meta.speech_muted"] = True
+    output.multimodal_output["meta.turn_end"] = turn_end
+    events = _project(plane, output)
+    assert len(events) == 1
+    assert events[0]["text"] == output.outputs[0].text
+    assert events[0]["audio_data"] == ""
+    assert events[0]["end_of_turn"] is turn_end
+    assert events[0]["abort_data_plane_request"] is True
+    assert _project(plane, output) == []
+
+
 def test_chunk_sequence_can_restart_in_a_new_audio_cache_epoch():
     plane = MiniCPMO45DataPlaneSession(
         lambda audio, *args: "audio" if audio is not None and np.asarray(audio).size else ""

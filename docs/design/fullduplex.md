@@ -1814,8 +1814,28 @@ plugin's special-token metadata. At the native Thinker-to-Talker handoff,
 the bridge removes delegation delimiters and their enclosed token/hidden-state
 rows from speech conditioning while preserving the complete text output.
 The mask is request-local, continues across units, and resets at a new turn
-or the turn-end token. The turn-end row is retained to drain pending speech.
+or the turn-end token. Delegation can also mask the turn-end speech row;
+dialogue termination is derived from the original Thinker unit.
 Models without these optional IDs retain their existing handoff.
+
+A fully muted unit following speech sets model-owned `meta.speech_flush`.
+The Talker appends only its audio-begin embedding to the existing condition,
+with a 26-token maximum and no minimum. The codec bridge drains pending frames
+and closes the vocoder stream, but does not set the dialogue `turn_end` or mark
+that dialogue turn as already terminal. These flags travel with the condition's
+sequence identity so delayed outputs cannot flush a later condition. The flag
+is explicitly false on subsequent units; it cannot stick through metadata merge.
+
+Repeated muted units and a bare turn terminator after the flush produce no new
+codec tokens. Speech resuming in the same dialogue turn replaces the Talker
+prompt/KV and starts a fresh vocoder stream. A new turn or request resets all
+delegation state. This keeps speech lifecycle independent of dialogue lifecycle.
+
+`meta.speech_muted` carries intentionally silent text units through Talker and
+Code2Wav. The codec bridge consumes their pending text even when no audio frames
+exist; the data plane emits that text once at the unit boundary, using the same
+cache-epoch/chunk-sequence deduplication as audio. It does not wait for later
+speech or replay the delegation text with the next audible unit.
 
 This filtering does not execute delegated work or supply the external Venus
 memory runtime. The [Realtime-Venus recipe](../../recipes/inclusionAI/Realtime-Venus.md)

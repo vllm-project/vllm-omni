@@ -44,14 +44,42 @@ weights. It does not inherit the MiniCPM Seed-TTS recipe's 5-step/FP16 Flow
 changes. CUDA graph execution and the existing Talker multi-frame decode are
 reused without duplicating model kernels.
 
+## Full duplex
+
+Select the duplex profile for continuous, one-second audio/video input units
+and model-controlled listening/speaking over WebSocket:
+
+```bash
+vllm serve ./Realtime-Venus/Realtime-Venus-Omni \
+  --omni --trust-remote-code \
+  --deploy-config vllm_omni/deploy/realtime_venus_omni_duplex.yaml \
+  --host 127.0.0.1 --port 8091
+```
+
+Connect to `ws://127.0.0.1:8091/v1/realtime?duplex=1` using the existing
+[DuplexClient](../../docs/serving/realtime_duplex_api.md) or
+[MiniCPM-o duplex client](../../examples/online_serving/minicpmo/realtime_duplex_demo.py)
+with the Venus model path. Use mono PCM16 at 16 kHz for input and 24 kHz for
+output, `overlap_policy="listen_only"`, and
+`playback_commit_policy="ack_only"`. Report audio actually played with
+`playback.ack`; attach camera frames to their corresponding audio units.
+Incoming audio continues while the model speaks. The model owns listen/speak
+decisions; client-forced destructive cancellation remains subject to the
+session's advertised capabilities.
+
+Delegated text remains available in the text stream but is excluded from
+speech. A fully delegated unit drains preceding speech once, without closing
+the dialogue turn. Further delegated units stay silent; resumed speech starts
+with fresh synthesis state, and a terminator-only unit cannot replay the tail.
+The duplex profile preserves the same 10-step FP32 Flow settings as turn mode.
+
 ## Scope
 
-- The default is turn-based serving. The shared duplex bridge additionally
-  filters `<delegate>…</delegate>` token/hidden rows from speech conditioning,
-  carries the mask across units, and clears it at the turn boundary.
+- Both turn-based serving (the default) and the explicit full-duplex profile
+  use the shared Thinker, Talker and Code2Wav stages.
 - The external Realtime-Venus delegation harness, asynchronous tool-result
   orchestration and long-video memory adapter are not integrated. Backbone
-  compatibility does not establish those features or full duplex parity.
+  compatibility does not establish those external features.
 - The Audio-only checkpoint is a separate configuration and is not covered by
   this recipe. Other devices and distributed layouts need separate validation.
 - Validation coverage and measured performance are reported in the linked PR
