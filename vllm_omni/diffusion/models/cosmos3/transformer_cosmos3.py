@@ -2113,7 +2113,7 @@ class Cosmos3VFMTransformer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video = self.proj_in(self.patchify(hidden, *shape))
         time_embed = self._embed_timestep(step, hidden.dtype)
-        return torch.cat([video + time_embed.unsqueeze(1)], dim=1), time_embed
+        return video + time_embed.unsqueeze(1), time_embed
 
     def _run_gen_layers(
         self,
