@@ -420,21 +420,22 @@ SDPA rounding; lossless keeps full-frame attention. Padded convolution outputs
 are masked in place only during inference, before any deferred bias
 can affect invalid positions.
 
-An earlier revision using paired halo kernels measured the following chunk-size
-tradeoff on four GB300 GPUs (Cosmos3-Nano VAE, BF16, 1280×720×189, width sharding):
+The following measurements use the Cosmos3-Nano VAE with vLLM-Omni revision
+`386caef06`. Four GB300 GPUs decoded a 1280×720, 189-frame video using BF16,
+width sharding and the eager `channels_last` fast path with Triton kernels
+(vLLM 0.34.0, PyTorch 2.14.0+cu130, Diffusers 0.40.0).
 
-| Latent frames per chunk | Median decode | Peak allocated memory per GPU |
+| Latent frames per chunk | Median decode (min–max) | Peak allocated memory per GPU |
 | --- | --- | --- |
-| 4 (default) | 618 ms | 8.42 GiB |
-| 8 | 603 ms | 13.49 GiB |
-| 16 | 600 ms | 23.64 GiB |
+| 4 (default) | 602 ms (600–605) | 8.44 GiB |
+| 8 | 581 ms (579–583) | 13.52 GiB |
+| 16 | 575 ms (573–576) | 23.67 GiB |
 
-These are 15 warm decode measurements per size with seeded latents, PyTorch
-2.13.0+cu130 and Diffusers 0.40.0, not end-to-end generation timings. Chunk 4
-balances latency and memory on this workload. Halo packing and masking preserve
-bits; local-query attention measured 64.75 dB PSNR against full-query
-channels-last attention. Chunking changes rounding independently. Measurements
-on seeded latents do not establish perceptual quality on generated videos.
+Each size used the same seeded latents, one warmup and three timed decodes on
+the same node. Memory is the maximum across ranks. Repeating chunk 4 after
+chunk 16 gave a 605 ms median and the same output hash. Against chunk 4,
+chunks 8 and 16 both had an RMSE of 0.00112 and a maximum absolute difference
+of 0.02832 in the decoded pixels.
 
 ## Decoder benchmarking
 
