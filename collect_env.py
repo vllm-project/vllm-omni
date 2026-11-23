@@ -338,13 +338,12 @@ def get_musa_gpu_info():
 
 
 def get_musa_package_version():
-    for distribution in ("torch-musa", "torch_musa"):
-        try:
-            return importlib_metadata.version(distribution)
-        except importlib_metadata.PackageNotFoundError:
-            continue
-        except (ImportError, OSError, RuntimeError, AttributeError):
-            return None
+    try:
+        return importlib_metadata.version("torch-musa")
+    except importlib_metadata.PackageNotFoundError:
+        pass
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return None
 
     try:
         import torch_musa
@@ -695,6 +694,7 @@ def get_env_info():
     vllm_omni_version = get_vllm_omni_version(run_lambda)
     vllm_build_flags = summarize_vllm_build_flags()
     gpu_topo = get_gpu_topo(run_lambda)
+
     return SystemEnv(
         torch_version=version_str,
         is_debug_build=debug_mode_str,
@@ -743,10 +743,10 @@ musa_info_fmt = """
          MUSA Info
 ==============================
 MUSA available               : {musa_available}
-MUSA runtime version         : {musa_runtime_version}
+MUSA build version (raw)     : {musa_runtime_version}
 torch-musa package version   : {musa_package_version}
 torchada package version     : {torchada_package_version}
-mthreads-ml-py package version: {mthreads_ml_py_package_version}
+mthreads-ml-py version       : {mthreads_ml_py_package_version}
 MUSA driver version          : {musa_driver_version}
 MUSA GPU models              : {musa_gpu_models}
 MUSA visible devices         : {musa_visible_devices}
@@ -789,7 +789,8 @@ cuDNN version                : {cudnn_version}
 HIP runtime version          : {hip_runtime_version}
 MIOpen runtime version       : {miopen_runtime_version}
 Is XNNPACK available         : {is_xnnpack_available}
-{musa_info}==============================
+{musa_info}
+==============================
           CPU Info
 ==============================
 {cpu_info}
@@ -883,9 +884,9 @@ def pretty_str(envinfo):
         if mutable_dict[field] is None:
             mutable_dict[field] = "None"
     if has_musa_info:
-        mutable_dict["musa_info"] = "\n{}\n\n".format(musa_info_fmt.format(**mutable_dict))
+        mutable_dict["musa_info"] = "\n{}\n".format(musa_info_fmt.format(**mutable_dict))
     else:
-        mutable_dict["musa_info"] = "\n"
+        mutable_dict["musa_info"] = ""
 
     # If the machine doesn't have CUDA, report some fields as 'No CUDA'
     dynamic_cuda_fields = [

@@ -39,15 +39,13 @@ class FakeCuda:
 def load_collect_env(monkeypatch, musa=FakeMusa()):
     fake_vllm = ModuleType("vllm")
     fake_vllm_envs = ModuleType("vllm.envs")
-    fake_vllm_envs.environment_variables = {}
-    fake_vllm.envs = fake_vllm_envs
+    fake_vllm_envs.__dict__["environment_variables"] = {}
+    fake_vllm.__dict__["envs"] = fake_vllm_envs
 
     fake_torch = ModuleType("torch")
-    fake_torch.__version__ = "2.7.0"
-    fake_torch.version = FakeTorchVersion()
-    fake_torch.cuda = FakeCuda()
+    fake_torch.__dict__.update(__version__="2.7.0", version=FakeTorchVersion(), cuda=FakeCuda())
     if musa is not None:
-        fake_torch.musa = musa
+        fake_torch.__dict__["musa"] = musa
 
     monkeypatch.setitem(sys.modules, "regex", re)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
@@ -57,11 +55,11 @@ def load_collect_env(monkeypatch, musa=FakeMusa()):
     monkeypatch.delitem(sys.modules, "torch_musa", raising=False)
 
     module_name = "collect_env_under_test"
-    monkeypatch.delitem(sys.modules, module_name, raising=False)
     path = Path(__file__).parents[1] / "collect_env.py"
     spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -205,15 +203,18 @@ def test_conda_inventory_excludes_musa_specific_packages_by_default(monkeypatch)
 def test_musa_package_version_falls_back_to_module_version(monkeypatch):
     collect_env = load_collect_env(monkeypatch)
     torch_musa = ModuleType("torch_musa")
-    torch_musa.__version__ = "2.11.0.post1+musa5.2.0"
+    torch_musa.__dict__["__version__"] = "2.11.0.post1+musa5.2.0"
     monkeypatch.setitem(sys.modules, "torch_musa", torch_musa)
+    requested = []
 
-    def missing_distribution(_):
+    def missing_distribution(name):
+        requested.append(name)
         raise collect_env.importlib_metadata.PackageNotFoundError
 
     monkeypatch.setattr(collect_env.importlib_metadata, "version", missing_distribution)
 
     assert collect_env.get_musa_package_version() == "2.11.0.post1+musa5.2.0"
+    assert requested == ["torch-musa"]
 
 
 def test_musa_import_attribute_error_does_not_abort_package_probe(monkeypatch):
@@ -341,8 +342,8 @@ def test_get_env_info_collects_musa_fields_once(monkeypatch):
         "get_cpu_info": "cpu",
         "get_env_vars": "",
     }
-    for name, value in simple_probes.items():
-        monkeypatch.setattr(collect_env, name, lambda *_args, _value=value: _value)
+    for name, probe_value in simple_probes.items():
+        monkeypatch.setattr(collect_env, name, lambda *_args, _value=probe_value: _value)
 
     env = collect_env.get_env_info()
 
@@ -360,11 +361,12 @@ def test_get_env_info_collects_musa_fields_once(monkeypatch):
     assert {"torchada", "mthreads-ml-py"}.isdisjoint(collected_patterns["conda"])
 
 
-def test_pretty_str_includes_labeled_musa_block(monkeypatch):
+@pytest.mark.parametrize("build_version", [None, "40305", "5.2.0"])
+def test_pretty_str_includes_labeled_musa_block(monkeypatch, build_version):
     collect_env = load_collect_env(monkeypatch)
     env = collect_env.SystemEnv(*(["value"] * len(collect_env.SystemEnv._fields)))._replace(
         musa_available="True",
-        musa_runtime_version=None,
+        musa_runtime_version=build_version,
         musa_package_version="2.11.0.post1+musa5.2.0",
         musa_driver_version="3.3.6-server",
         musa_gpu_models="MTT S5000",
@@ -376,13 +378,17 @@ def test_pretty_str_includes_labeled_musa_block(monkeypatch):
     output = collect_env.pretty_str(env)
 
     assert "MUSA available               : True" in output
-    assert "MUSA runtime version         : None" in output
+    assert f"MUSA build version (raw)     : {build_version}" in output
     assert "torch-musa package version   : 2.11.0.post1+musa5.2.0" in output
     assert "torchada package version     : 1.0.0" in output
-    assert "mthreads-ml-py package version: 2.0.0" in output
+    assert "mthreads-ml-py version       : 2.0.0" in output
     assert "MUSA driver version          : 3.3.6-server" in output
     assert "MUSA GPU models              : MTT S5000" in output
-    assert "MUSA visible devices         : MTHREADS_VISIBLE_DEVICES=1,2,3" in output
+    assert (
+        "MUSA visible devices         : MTHREADS_VISIBLE_DEVICES=1,2,3\n\n"
+        "==============================\n"
+        "          CPU Info"
+    ) in output
 
 
 def test_pretty_str_omits_musa_block_without_musa_signals(monkeypatch):
