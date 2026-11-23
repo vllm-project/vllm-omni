@@ -74,6 +74,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
+    "phonon",
     "qwen3_tts",
     "voxcpm2",
     "voxtral_tts",
@@ -881,6 +882,49 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     assert prepared.model_type == "covo_audio"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("limit", [None, 7, 8192])
+def test_covo_audio_request_budget_reaches_engine(limit, stream):
+    server = object.__new__(OmniOpenAIServingSpeech)
+    default = SamplingParams(max_tokens=256, temperature=0.8, extra_args={"sentinel": 17})
+    decoder_default = SamplingParams(max_tokens=1)
+    seen = []
+
+    def record_generate(**kwargs):
+        seen.append(kwargs)
+        return iter(())
+
+    server._diffusion_mode = False
+    server._tts_model_type = "covo_audio"
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=[default, decoder_default], generate=record_generate
+    )
+    server._adapter = CovoAudioAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._adapter._tokenizer = SimpleNamespace(apply_chat_template=lambda *_args, **_kwargs: [11, 12, 13])
+    server._refresh_uploaded_speakers = lambda: None
+    server._validate_speech_sample_rate = lambda _request: None
+    server._log_request = lambda *_args: None
+    server._speech_output_policies = {}
+    server.request_logger = None
+
+    asyncio.run(
+        server._prepare_speech_generation(
+            OpenAICreateSpeechRequest(input="Hello", max_new_tokens=limit, stream=stream, response_format="pcm"),
+            request_id="covo-budget",
+        )
+    )
+
+    assert len(seen) == 1
+    observed = seen[0]["sampling_params_list"]
+    assert observed[0].max_tokens == (limit if limit is not None else 256)
+    assert observed[0].temperature == 0.8 and observed[0].extra_args == {"sentinel": 17}
+    assert observed[1].max_tokens == 1
+    assert seen[0]["prompt"]["prompt_token_ids"] == [11, 12, 13]
+    assert default.max_tokens == 256 and default.extra_args == {"sentinel": 17}
+    assert decoder_default.max_tokens == 1
+
+
 @pytest.mark.parametrize("voice", [None, "DB30"])
 def test_ming_flash_omni_build_constructs_prepared_request(voice):
     server = SimpleNamespace(uploaded_speakers={})
@@ -980,6 +1024,41 @@ def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected
     )
     assert prepared.tts_params == {}
     assert prepared.model_type == "step_audio2"
+
+
+@pytest.mark.parametrize("limit", [None, 7, 8192])
+def test_step_audio2_request_budget_reaches_engine(limit):
+    server = object.__new__(OmniOpenAIServingSpeech)
+    default = SamplingParams(max_tokens=256)
+    decoder_default = SamplingParams(max_tokens=1)
+    seen = []
+
+    def record_generate(**kwargs):
+        seen.append(kwargs)
+        return iter(())
+
+    server._diffusion_mode = False
+    server._tts_model_type = "step_audio2"
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=[default, decoder_default], generate=record_generate
+    )
+    server._adapter = StepAudio2Adapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._refresh_uploaded_speakers = lambda: None
+    server._validate_speech_sample_rate = lambda _request: None
+    server._log_request = lambda *_args: None
+    server._speech_output_policies = {}
+    server.request_logger = None
+    request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=limit)
+
+    asyncio.run(server._prepare_speech_generation(request, request_id="step-budget"))
+
+    assert len(seen) == 1
+    observed = seen[0]["sampling_params_list"]
+    assert observed[0].max_tokens == (limit if limit is not None else 256)
+    assert observed[1].max_tokens == 1
+    assert default.max_tokens == 256
+    assert decoder_default.max_tokens == 1
 
 
 def test_voxtral_prompt_builder_is_sync():
@@ -1769,3 +1848,39 @@ def test_ming3_tts_defaults_to_ip_voice_without_reference():
     assert info["prompt_audio_mode"] == "none"
     assert info["speaker_conditioning"] == "mute"
     assert "reference_audio" not in info
+
+
+@pytest.mark.parametrize("budget", [None, 1, 2000, 4096])
+def test_phonon_forwards_request_budget(mocker, budget):
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
+
+    mocker.patch.object(PhononAdapter, "_load_assets", return_value=(SimpleNamespace(encode=lambda text: [1, 2]), 3))
+    defaults = [SamplingParams(max_tokens=1500)]
+    server = mocker.Mock()
+    server.engine_client = SimpleNamespace(
+        errored=False, default_sampling_params_list=defaults, generate=mocker.Mock(return_value=object())
+    )
+    server.model_config = SimpleNamespace(async_chunk=True)
+    server._tts_model_type = "phonon"
+    server._validate_speech_sample_rate.return_value = None
+    server.request_logger = None
+    server._speech_output_policies = {}
+    adapter = PhononAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+    server._get_tts_adapter.return_value = adapter
+    request = OpenAICreateSpeechRequest(input="Hello", voice="default", max_new_tokens=budget)
+    asyncio.run(OmniOpenAIServingSpeech._prepare_speech_generation(server, request, request_id="test"))
+    forwarded = server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+    assert forwarded[0].max_tokens == (1500 if budget is None else budget)
+    assert defaults[0].max_tokens == 1500
+
+
+@pytest.mark.parametrize("budget", [0, 4097])
+def test_phonon_rejects_invalid_request_budget(budget):
+    from vllm_omni.entrypoints.openai.tts_adapters.phonon import PhononAdapter
+
+    adapter = PhononAdapter.__new__(PhononAdapter)
+    request = SimpleNamespace(
+        input="Hello", voice="default", ref_audio=None, speaker_embedding=None, max_new_tokens=budget
+    )
+    assert "max_new_tokens" in adapter.validate(request)

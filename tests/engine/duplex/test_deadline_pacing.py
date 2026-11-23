@@ -18,7 +18,7 @@ import pytest
 from vllm_omni.engine.duplex.session.runner import (
     compute_silence_continuation_deadline,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
     MiniCPMO45ServingSessionState,
 )
 

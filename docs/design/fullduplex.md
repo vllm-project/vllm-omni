@@ -1432,9 +1432,11 @@ embeddings even when they do not add a pooled token.
 The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
 on CUDA, ROCm and NPU. The ROCm override changes runner selection while
 preserving the shared duplex session, async-chunk, device, connector and stage
-topology contracts. The CUDA-only reference-attention, FlashAttention, graph,
-speculation and fused-kernel behavior described below does not apply to ROCm;
-runner selection alone does not establish ROCm runtime or quality qualification.
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph
+and speculation behavior described below does not apply to ROCm. A ROCm FP16
+Code2Wav configuration may select the shared fused CFM body with its SDPA
+fallback; it does not enable NVIDIA tiled attention. Runner selection and this
+dispatch coverage alone do not establish ROCm runtime or quality qualification.
 
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
@@ -1592,6 +1594,28 @@ budgets the JoyAI prompt against JoyAI's generation settings. Session model conf
 comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
+
+JoyAI keeps an empty assistant message for a retained visual observation's
+response when cancellation leaves no committed speech. This preserves the turn
+boundary in both direct and ASR-handoff prompts without restoring unheard text
+or treating cancellation as a model silence decision. The boundary follows the
+existing recent-history budget and disappears when its history item is deleted.
+The ASR handoff retains frame timestamps and observation-to-history references,
+so an old frame precedes its reply boundary and the new transcript accompanies
+only the current observation. Both paths apply the image limit before selecting
+recent history. An empty boundary is omitted when none of its observation's
+frames survives prompt assembly; pending consolidation records alone do not
+keep it alive. Non-empty committed replies
+still referenced by the observation ledger remain eligible at the recent-history
+boundary even after their frames leave the prompt.
+Frame eviction removes only the standalone generated timestamp paired with the
+frame; neighboring user text remains, even when it ends with a timestamp.
+
+For a speech-only follow-up without a new or working-window frame, the ASR
+handoff includes the latest frame still awaiting visual consolidation. It keeps
+that frame's original timestamp and observation-to-history references, before
+the new transcript's turn. Once the frame has been summarized, the summary
+provides its context instead of restoring the cached raw frame.
 
 While idle, JoyAI retains the latest camera frame and one input chunk of audio
 pre-roll. Once speech starts, it keeps the utterance until commit. An idle

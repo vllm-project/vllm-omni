@@ -61,6 +61,8 @@ class OrchestratorMonitorBase(Protocol):
 
     def set_dispatch_queue_size(self, size: int) -> None: ...
 
+    def snapshot(self) -> dict[str, object] | None: ...
+
     def flush(self) -> None: ...
 
 
@@ -73,6 +75,9 @@ class _NullOrchestratorMonitor:
 
     def set_dispatch_queue_size(self, size: int) -> None:
         return
+
+    def snapshot(self) -> dict[str, object] | None:
+        return None
 
     def flush(self) -> None:
         return
@@ -107,6 +112,7 @@ class OrchestratorMonitor:
         self._dispatch_queue_high_water = 0
         self._dispatch_queue_high_water_buf: list[int] = []
         self._replicas: dict[str, _ReplicaSeries] = {}
+        self._replica_high_water: dict[str, ReplicaSample] = {}
 
     def register_replica(self, stage_id: int, replica_id: int) -> None:
         self._ensure_replica(replica_key(stage_id, replica_id))
@@ -123,6 +129,27 @@ class OrchestratorMonitor:
         size = max(int(size), 0)
         self._dispatch_queue_size = size
         self._dispatch_queue_high_water = max(self._dispatch_queue_high_water, size)
+
+    def snapshot(self) -> dict[str, object]:
+        """Return bounded current/high-water diagnostics for one response."""
+        sampled = self._sample_replicas()
+
+        replicas: dict[str, dict[str, int]] = {}
+        for key in sorted(self._replicas):
+            outputs_queue_size, inflight = sampled.get(key, (0, 0))
+            outputs_queue_high_water, inflight_high_water = self._replica_high_water.get(key, (0, 0))
+            replicas[key] = {
+                "outputs_queue_size": int(outputs_queue_size),
+                "outputs_queue_high_water": outputs_queue_high_water,
+                "inflight": int(inflight),
+                "inflight_high_water": inflight_high_water,
+            }
+
+        return {
+            "dispatch_queue_size": self._dispatch_queue_size,
+            "dispatch_queue_high_water": max([self._dispatch_queue_high_water, *self._dispatch_queue_high_water_buf]),
+            "replicas": replicas,
+        }
 
     def flush(self) -> None:
         if self._flushed:
@@ -159,17 +186,14 @@ class OrchestratorMonitor:
             "outputs_queue_size": [0] * n,
             "inflight": [0] * n,
         }
+        self._replica_high_water[key] = (0, 0)
 
     def _roll_window_if_needed(self, now_mono: float) -> None:
         if now_mono - self._window_start_mono >= _WINDOW_S:
             self._roll_window(now_mono)
 
     def _roll_window(self, now_mono: float) -> None:
-        try:
-            sampled = self._replica_sampler()
-        except Exception:
-            logger.exception("[OrchestratorMonitor] replica sampling failed")
-            sampled = {}
+        sampled = self._sample_replicas()
         self._duration_s.append(max(now_mono - self._window_start_mono, 1e-9))
         self._loop_idle_buf.append(self._loop_idle)
         self._loop_active_buf.append(self._loop_active)
@@ -185,6 +209,21 @@ class OrchestratorMonitor:
         # Queued work carries into the next window even without new arrivals.
         self._dispatch_queue_high_water = self._dispatch_queue_size
         self._window_start_mono = now_mono
+
+    def _sample_replicas(self) -> dict[str, ReplicaSample]:
+        try:
+            sampled = self._replica_sampler()
+        except Exception:
+            logger.exception("[OrchestratorMonitor] replica sampling failed")
+            return {}
+        for key, (outputs_queue_size, inflight) in sampled.items():
+            self._ensure_replica(key)
+            queue_high_water, inflight_high_water = self._replica_high_water[key]
+            self._replica_high_water[key] = (
+                max(queue_high_water, int(outputs_queue_size)),
+                max(inflight_high_water, int(inflight)),
+            )
+        return sampled
 
     def _log_summary(self, output_path: str) -> None:
         loop_idle = sum(self._loop_idle_buf)

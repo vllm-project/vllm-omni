@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from vllm_omni.model_executor.models.minicpmo_4_5 import config_flags
-from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
+from vllm_omni.model_executor.models.minicpmo_4_5 import config as minicpmo_config
+from vllm_omni.model_executor.models.minicpmo_4_5.config import (
     Token2WavTrtConfig,
     resolve_token2wav_trt_config,
 )
@@ -32,7 +32,7 @@ def warnings(monkeypatch) -> list[str]:
     for name in _ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     messages: list[str] = []
-    monkeypatch.setattr(config_flags.logger, "warning_once", lambda msg, *args: messages.append(msg))
+    monkeypatch.setattr(minicpmo_config.logger, "warning_once", lambda msg, *args: messages.append(msg))
     return messages
 
 

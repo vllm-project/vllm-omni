@@ -41,7 +41,8 @@ def request_memory_tolerant(
     if current_platform.is_integrated_gpu(init_snapshot.device_.index):
         return request_memory(init_snapshot, cache_config)
 
-    requested_memory = math.ceil(init_snapshot.total_memory * cache_config.gpu_memory_utilization)
+    utilization = cache_config.resolved_gpu_memory_utilization
+    requested_memory = math.ceil(init_snapshot.total_memory * utilization)
 
     if init_snapshot.free_memory < requested_memory:
         capped = init_snapshot.free_memory
@@ -55,7 +56,7 @@ def request_memory_tolerant(
             init_snapshot.device_,
             format_gib(init_snapshot.free_memory),
             format_gib(init_snapshot.total_memory),
-            cache_config.gpu_memory_utilization,
+            utilization,
             format_gib(requested_memory),
             format_gib(capped),
         )

@@ -3334,9 +3334,10 @@ class TestPlatformOverrides:
         """The only stochastic Qwen3-Omni stage must stay reproducible.
 
         Dropping this seed (as #4986 did) leaves the talker sampling codec
-        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
-        nightly failures in #6090. Pin it so a cleanup cannot remove it again
-        without failing here.
+        tokens unseeded at temperature 0.9, including both codebook 0 and the
+        residual codebooks. That reopened the audio-vs-text nightly failures
+        in #6090. Pin it so a cleanup cannot remove it again without failing
+        here.
         """
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
@@ -3379,6 +3380,23 @@ class TestPlatformOverrides:
         assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
         assert structured.stage_by_id(0).cache_config.enable_prefix_caching is False
         assert structured.stage_by_id(2).model_config.enforce_eager is True
+
+    def test_qwen3_omni_npu_uses_mrv2(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert npu.model_runner == "v2"
+
+        legacy = merge_pipeline_deploy(pipeline, npu)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
+
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=npu)
+        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
 
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
