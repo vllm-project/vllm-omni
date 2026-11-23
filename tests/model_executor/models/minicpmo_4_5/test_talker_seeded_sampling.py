@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MRv2 Talker codec ids match V1's seeded sampler on the same logits."""
+"""MRv2 Talker codec ids preserve per-request seeded exponential sampling."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import torch
 from vllm.v1.sample.ops import topk_topp_sampler
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 
-from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import draw_seeded_codec_ids
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -49,7 +49,7 @@ def _sampling_states(temperature, top_k, top_p):
     return states
 
 
-def _v1_sample(
+def _reference_sample(
     logits: torch.Tensor,
     *,
     temperature: torch.Tensor,
@@ -57,7 +57,7 @@ def _v1_sample(
     top_p: torch.Tensor | None,
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    """The V1 sampler tail: temperature, top-k/top-p, seeded exponential draw."""
+    """The reference sampler tail: temperature, top-k/top-p, seeded exponential draw."""
     # The removed runner is not needed as an oracle: retain its model-domain
     # Torch draw, using native filtering and explicit ordered generators.
     greedy = temperature < 1e-5
@@ -82,10 +82,10 @@ def _mrv2_sample(
     top_p: torch.Tensor | None,
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    """Scale like the MRv2 logit pipeline, then the shared V1 draw."""
+    """Scale like the MRv2 logit pipeline, then the seeded exponential draw."""
     scale = torch.where(temperature < 1e-5, torch.ones_like(temperature), temperature)
     processed = logits / scale.unsqueeze(1)
-    return draw_v1_codec_ids(
+    return draw_seeded_codec_ids(
         processed,
         top_k=top_k,
         top_p=top_p,
@@ -95,29 +95,33 @@ def _mrv2_sample(
     )
 
 
-def test_seeded_codec_ids_match_v1_across_steps():
+def test_seeded_codec_ids_match_reference_across_steps():
     temperature = torch.tensor([0.8, 0.8])
     top_k = torch.tensor([8, 8])
     top_p = torch.tensor([0.85, 0.85])
-    v1_generators = _generators(2, 42)
+    reference_generators = _generators(2, 42)
     mrv2_generators = _generators(2, 42)
     for step in range(6):
         logits = torch.arange(_VOCAB, dtype=torch.float32).repeat(2, 1)
         logits = logits + torch.randn(2, _VOCAB).mul_(step + 1)
-        v1_ids = _v1_sample(logits, temperature=temperature, top_k=top_k, top_p=top_p, generators=v1_generators)
+        reference_ids = _reference_sample(
+            logits, temperature=temperature, top_k=top_k, top_p=top_p, generators=reference_generators
+        )
         mrv2_ids = _mrv2_sample(logits, temperature=temperature, top_k=top_k, top_p=top_p, generators=mrv2_generators)
-        assert torch.equal(v1_ids, mrv2_ids), step
+        assert torch.equal(reference_ids, mrv2_ids), step
 
 
-def test_mixed_greedy_rows_match_v1_and_keep_the_generator():
+def test_mixed_greedy_rows_match_reference_and_keep_the_generator():
     temperature = torch.tensor([0.0, 0.8])
     top_k = torch.tensor([5, 5])
     top_p = torch.tensor([1.0, 0.9])
     logits = torch.randn(2, _VOCAB)
-    v1_ids = _v1_sample(logits, temperature=temperature, top_k=top_k, top_p=top_p, generators=_generators(2, 7))
+    reference_ids = _reference_sample(
+        logits, temperature=temperature, top_k=top_k, top_p=top_p, generators=_generators(2, 7)
+    )
     mrv2_ids = _mrv2_sample(logits, temperature=temperature, top_k=top_k, top_p=top_p, generators=_generators(2, 7))
-    assert torch.equal(v1_ids, mrv2_ids)
-    assert int(v1_ids[0]) == int(logits[0].argmax())
+    assert torch.equal(reference_ids, mrv2_ids)
+    assert int(reference_ids[0]) == int(logits[0].argmax())
 
     # An all-greedy step must not consume the generator: the next seeded draw
     # matches a generator that never saw that step.
@@ -179,7 +183,7 @@ def test_talker_sampler_uses_upstream_logprobs_contract(mocker, num_logprobs, st
     )
     logits = torch.tensor([[0.0, 1.0, 2.0], [2.0, 1.0, 0.0]])
     sampler = tts.MiniCPMO45TalkerSampler(base, SimpleNamespace())
-    output = sampler._sample_like_v1(logits, batch)
+    output = sampler._sample_seeded(logits, batch)
     if num_logprobs == -1 and stock_feature is None:
         base.assert_not_called()
         assert output.sampled_token_ids.tolist() == [[2], [0]]
@@ -198,7 +202,6 @@ def test_partial_prefill_preserves_seeded_streams_with_upstream_sampling_states(
     from vllm.v1.worker.gpu.sample.sampler import Sampler as Mrv2Sampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_tts as tts
-    from vllm_omni.model_executor.models.minicpmo_4_5 import talker_mrv2_sampling as draw
 
     base = Mrv2Sampler.__new__(Mrv2Sampler)
     base.sampling_states = _sampling_states([1.0, 1.0], top_k, top_p)
@@ -215,7 +218,7 @@ def test_partial_prefill_preserves_seeded_streams_with_upstream_sampling_states(
     wrapped = tts.MiniCPMO45TalkerSampler(base, talker)
     actual = _generators(2, 42)
     reference = _generators(2, 42)
-    wrapped._v1_generators = {"prefill": actual[0], "decode": actual[1]}
+    wrapped._seeded_generators = {"prefill": actual[0], "decode": actual[1]}
     # Reorder slots so the prefill mask must follow batch rows, not slot ids.
     batch = SimpleNamespace(
         num_reqs=2,
@@ -233,7 +236,7 @@ def test_partial_prefill_preserves_seeded_streams_with_upstream_sampling_states(
         return (seq_lens >= prefill[mapping]).to(torch.int32), torch.zeros_like(ones)
 
     mocker.patch.object(tts, "get_num_sampled_and_rejected", side_effect=counts)
-    filtering = mocker.spy(draw, "apply_top_k_top_p")
+    filtering = mocker.spy(topk_topp_sampler, "apply_top_k_top_p")
     expected_topp_only = any(k >= _VOCAB and p < 1.0 for k, p in zip(top_k, top_p))
     logits = torch.linspace(-1, 1, _VOCAB).repeat(2, 1)
     # Two discarded chunks, final prefill, then decode: only the decode row
@@ -243,7 +246,7 @@ def test_partial_prefill_preserves_seeded_streams_with_upstream_sampling_states(
         batch.seq_lens = torch.tensor([8, computed + 2])
         batch.has_prefill = computed < 6
         before = reference[0].get_state()
-        expected = _v1_sample(
+        expected = _reference_sample(
             logits,
             temperature=torch.ones(2),
             top_k=torch.tensor(top_k).flip(0),
@@ -262,7 +265,7 @@ def test_partial_prefill_preserves_seeded_streams_with_upstream_sampling_states(
 
 def test_talker_sampler_keeps_seeded_generator_until_the_request_finishes(mocker):
     """MRv2 re-adds a request after preemption and on streaming-input updates;
-    V1 keeps the request's generator across both and drops it on finish."""
+    The request's generator survives both and is dropped on finish."""
     from types import SimpleNamespace
 
     from vllm.sampling_params import SamplingParams
@@ -274,14 +277,14 @@ def test_talker_sampler_keeps_seeded_generator_until_the_request_finishes(mocker
     sampler = tts.MiniCPMO45TalkerSampler(base, SimpleNamespace())
     sampler.add_request(0, SamplingParams(seed=5))
     sampler.add_request(1, SamplingParams())
-    generator = sampler._v1_generators["seeded"]
-    assert sampler._v1_generators["plain"] is None
+    generator = sampler._seeded_generators["seeded"]
+    assert sampler._seeded_generators["plain"] is None
     first = torch.empty(4).exponential_(generator=generator)
 
     # Resume in another slot: the stream continues instead of restarting.
     base.req_states.index_to_req_id = {2: "seeded"}
     sampler.add_request(2, SamplingParams(seed=5))
-    assert sampler._v1_generators["seeded"] is generator
+    assert sampler._seeded_generators["seeded"] is generator
     reference = torch.Generator().manual_seed(5)
     torch.empty(4).exponential_(generator=reference)
     assert torch.equal(
@@ -290,10 +293,10 @@ def test_talker_sampler_keeps_seeded_generator_until_the_request_finishes(mocker
     assert base.add_request.call_count == 3
 
     sampler.forget_requests({"seeded", "plain"})
-    assert sampler._v1_generators == {}
+    assert sampler._seeded_generators == {}
     # A resubmitted id starts a fresh stream.
     sampler.add_request(2, SamplingParams(seed=5))
-    assert torch.equal(torch.empty(4).exponential_(generator=sampler._v1_generators["seeded"]), first)
+    assert torch.equal(torch.empty(4).exponential_(generator=sampler._seeded_generators["seeded"]), first)
 
 
 def test_talker_sampler_warmup_does_not_create_request_generators(mocker):
@@ -308,11 +311,11 @@ def test_talker_sampler_warmup_does_not_create_request_generators(mocker):
     for slot in range(3):
         sampler.add_request(slot, params)
     assert base.add_request.call_args_list == [mocker.call(slot, params) for slot in range(3)]
-    assert sampler._v1_generators == {}
+    assert sampler._seeded_generators == {}
     base.req_states.index_to_req_id[0] = "real"
     sampler.add_request(0, SamplingParams(seed=42))
-    assert set(sampler._v1_generators) == {"real"}
-    assert torch.equal(sampler._v1_generators["real"].get_state(), torch.Generator().manual_seed(42).get_state())
+    assert set(sampler._seeded_generators) == {"real"}
+    assert torch.equal(sampler._seeded_generators["real"].get_state(), torch.Generator().manual_seed(42).get_state())
 
 
 def test_seeded_talker_sampler_requires_the_request_slot_first(mocker):
@@ -351,7 +354,7 @@ def test_runner_finish_path_drops_finished_generators_and_keeps_preempted(mocker
     talker._mrv2_sampler = sampler
     sampler.add_request(0, SamplingParams(seed=1))
     sampler.add_request(1, SamplingParams(seed=2))
-    paused = sampler._v1_generators["paused"]
+    paused = sampler._seeded_generators["paused"]
 
     # The stage model is the Omni wrapper, which forwards to the Talker.
     wrapper = SimpleNamespace(model=talker)
@@ -366,5 +369,5 @@ def test_runner_finish_path_drops_finished_generators_and_keeps_preempted(mocker
     monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: None)
     runner.finish_requests(SimpleNamespace(finished_req_ids={"done"}, preempted_req_ids={"paused"}))
 
-    assert sampler._v1_generators == {"paused": paused}
+    assert sampler._seeded_generators == {"paused": paused}
     assert talker._deferred_cleanup_ids == {"done"}

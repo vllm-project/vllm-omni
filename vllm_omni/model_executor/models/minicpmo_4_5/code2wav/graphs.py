@@ -210,14 +210,6 @@ class HiFTGraphWrapper:
         if self._eager_fallback_total % _EAGER_FALLBACK_SUMMARY_EVERY == 0:
             logger.info("Eager HiFT fallback census (%d total): %s", self._eager_fallback_total, self._eager_fallbacks)
 
-    def eager_fallback_counts(self) -> dict[tuple[int, int, int], int]:
-        """Cumulative eager fallbacks keyed by the request shape they came from.
-
-        The key width is the request's mel width before any width padding:
-        one merged census per request width, whatever replay shape served it.
-        """
-        return dict(self._eager_fallbacks)
-
     def _chunk_mel_frames(self, codec_frames: int) -> int:
         return (int(codec_frames) + self.codec_left_context_frames - self.pre_lookahead_len) * self.flow_upsample_rate
 
@@ -1049,7 +1041,6 @@ class WholeEulerExecutionArena:
         # Attention storage is ``(n_t, depth, 2, 2 * B, heads, frames, head_dim)``:
         # dim 2 is the K/V half, so each half is fully contiguous for the op.
         self.head_dim = int(block0.attn.head_dim)
-        self.att_width = 2 * self.head_dim
 
         # Static staging buffers, shared by every graph that stages the same shape.
         self._buffers: dict[tuple, torch.Tensor] = {}
