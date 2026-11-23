@@ -1224,9 +1224,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # An unheard visual reply still separates observations after cancellation.
             # Retain its empty Session item without inventing speech or restoring a deletion.
             if text or (role == "assistant" and item_key in response_refs):
+                content = text
+                if role == "assistant":
+                    # Even unheard replies need JoyAI's action token to close the
+                    # previous observation in the model's conversation format.
+                    content = "</response>" + (f" {text}" if text else "")
                 message = {
                     "role": role,
-                    "content": ("</response> " if role == "assistant" and text else "") + text,
+                    "content": content,
                     "_item_key": item_key,
                 }
                 if role == "user":

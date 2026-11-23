@@ -1595,11 +1595,13 @@ comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
 
-JoyAI keeps an empty assistant message for a retained visual observation's
-response when cancellation leaves no committed speech. This preserves the turn
-boundary in both direct and ASR-handoff prompts without restoring unheard text
-or treating cancellation as a model silence decision. The boundary follows the
-existing recent-history budget and disappears when its history item is deleted.
+JoyAI renders a retained visual observation's unheard response as an assistant
+message containing only `</response>`. The Session history item remains empty;
+the model prompt keeps JoyAI's action marker to close the previous observation.
+This preserves the turn boundary in both direct and ASR-handoff prompts without
+restoring unheard text or treating cancellation as a model silence decision.
+The boundary follows the existing recent-history budget and disappears when
+its history item is deleted.
 The ASR handoff retains frame timestamps and observation-to-history references,
 so an old frame precedes its reply boundary and the new transcript accompanies
 only the current observation. Both paths apply the image limit before selecting
