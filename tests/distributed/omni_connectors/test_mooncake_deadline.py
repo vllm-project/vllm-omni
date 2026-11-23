@@ -257,6 +257,47 @@ def test_sender_checks_tcp_completion_before_native_submission(connectors, monke
         ctx.term()
 
 
+@pytest.mark.parametrize("peer_capability", [0, 1, 2])
+def test_rdma_force_hca_requires_acknowledged_completion_before_native_submission(
+    connectors, monkeypatch, peer_capability
+):
+    """Treat build-dependent rdma+MC_FORCE_HCA paths as completion-uncertain."""
+    monkeypatch.setenv("MC_FORCE_HCA", "1")
+    sender = connectors("sender", protocol="rdma", native_tcp_proto_version=2)
+    publish(sender)
+    key = sender._make_key("key", "0", "1")
+    sources, lengths = sender._local_buffers[key][:2]
+    expected = [ctypes.string_at(address, size) for address, size in zip(sources, lengths)]
+    destinations = [ctypes.create_string_buffer(size) for size in lengths]
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, 2000)
+    try:
+        sock.connect(f"tcp://127.0.0.1:{sender.zmq_port}")
+        request = module.MooncakeAgentMetadata(
+            "127.0.0.1",
+            1,
+            key,
+            [ctypes.addressof(buffer) for buffer in destinations],
+            lengths,
+            protocol_version=2,
+            native_tcp_proto_version=peer_capability,
+        )
+        sock.send(msgspec.msgpack.encode(request))
+        reply = sock.recv()
+        if peer_capability == 2:
+            assert reply == module.TRANS_DONE
+            assert len(sender.engine.calls) == 1
+            assert [buffer.raw for buffer in destinations] == expected
+        else:
+            assert reply == module.TRANS_NOT_SUBMITTED
+            assert not sender.engine.calls
+            assert key in sender._local_buffers
+    finally:
+        sock.close(linger=0)
+        ctx.term()
+
+
 def test_rdma_rejects_missing_hca(connectors, monkeypatch):
     monkeypatch.setattr(Engine, "topology", "{}")
     with pytest.raises(RuntimeError, match="available HCA"):

@@ -231,9 +231,16 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._init_listener(config)
 
     def _requires_tcp_completion(self) -> bool:
-        """Return whether the effective native path may use TCP."""
+        """Return whether the effective native path may use TCP.
+
+        ``MC_FORCE_HCA`` skips the Python topology probe, but does not prove
+        that every Mooncake build will install an RDMA transport.  EFA/CXI
+        builds can select TCP for an ``rdma`` request, so both forced paths
+        require the acknowledged-completion capability handshake.
+        """
         return self.protocol.lower() == "tcp" or (
-            self.protocol.lower() == "rdma" and "MC_FORCE_TCP" in os.environ
+            self.protocol.lower() == "rdma"
+            and ("MC_FORCE_TCP" in os.environ or "MC_FORCE_HCA" in os.environ)
         )
 
     def _validate_rdma_transport(self) -> None:
@@ -244,8 +251,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 "unset MC_FORCE_TCP or configure protocol='tcp' with "
                 "native_tcp_proto_version=2"
             )
-        # MC_FORCE_HCA makes the native engine fail closed if no HCA is
-        # available, so no topology probe is needed in that mode.
+        # MC_FORCE_HCA requests HCA-backed initialization, but some native
+        # builds may still select TCP for an ``rdma`` request.  Skip the
+        # Python topology probe here; _requires_tcp_completion() treats this
+        # path as uncertain and enforces the capability handshake.
         if "MC_FORCE_HCA" in os.environ:
             return
         get_topology = getattr(self.engine, "get_local_topology", None)
