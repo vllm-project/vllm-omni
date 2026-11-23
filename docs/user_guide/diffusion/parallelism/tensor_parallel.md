@@ -6,6 +6,7 @@
 - [Quick Start](#quick-start)
 - [Example Script](#example-script)
 - [Text Encoder Tensor Parallelism](#text-encoder-tensor-parallelism)
+- [FLUX.1 Single-Block MLP](#flux1-single-block-mlp)
 - [Configuration Parameters](#configuration-parameters)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
@@ -103,6 +104,21 @@ Constraints:
 - `N` must divide the number of ranks in one data-parallel replica (world size / `data_parallel_size`) and the encoder's attention and KV head counts (Qwen2.5-VL-7B: 28 heads, 4 KV heads, so `N` ∈ {1, 2, 4}; Qwen-Image-2.1's Qwen3-VL: 32 heads, 8 KV heads, so `N` ∈ {1, 2, 4, 8}).
 - The groups tile each data-parallel replica (`[0..N-1], [N..2N-1], ...`) and never span replicas. Every rank gets the full encoder output, so no broadcast is needed.
 - MiniMax-H3 uses its own sharded Qwen3-VL encoder for this option; other pipelines ignore it.
+
+---
+
+## FLUX.1 Single-Block MLP
+
+Under tensor parallelism, FLUX.1's single transformer blocks split their MLP the way
+vLLM splits an MLP: `proj_mlp` is column-parallel, and `proj_out` is row-parallel over
+each rank's attention heads and MLP channels, with one all-reduce per block. Each rank
+holds 1/TP of these weights instead of a full copy.
+
+The split is off, and the layers stay replicated, when a startup LoRA (`--lora-path`),
+merged LoRA (`--lora-application merged`), quantization or CPU offloading is configured. LoRA adapters loaded per request
+cannot target the single blocks' `proj_out` when the split is on: activating such an
+adapter fails with an incomplete-binding error. Serve those adapters with
+`--lora-path` so the split stays off, or use TP size 1.
 
 ---
 

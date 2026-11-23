@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +41,7 @@ from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNormZeroSingle,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+from vllm_omni.diffusion.offloader.config import offload_enabled
 
 logger = init_logger(__name__)
 
@@ -132,9 +133,14 @@ class FluxAttention(torch.nn.Module):
         pre_only: bool = False,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        gather_output: bool = True,
     ):
         super().__init__()
 
+        # A pre-only attention (the single blocks') returns its heads; under TP each rank
+        # computes its own. ``gather_output`` all-gathers them for a replicated consumer; a
+        # row-parallel consumer reads this rank's heads as its slice instead.
+        self.gather_output = gather_output
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
@@ -276,7 +282,7 @@ class FluxAttention(torch.nn.Module):
 
             return hidden_states, encoder_hidden_states
         else:
-            if get_tensor_model_parallel_world_size() > 1:
+            if self.gather_output and get_tensor_model_parallel_world_size() > 1:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
 
@@ -372,6 +378,89 @@ class FluxTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+def rank_major_columns(weight: torch.Tensor, attention: int, mlp: int, world: int, dim: int = -1) -> torch.Tensor:
+    """``weight``'s ``[attention | mlp]`` columns along ``dim``, reordered rank by rank.
+
+    Rank ``r``'s attention columns ``[r * a, (r + 1) * a)`` then its MLP columns
+    ``attention + [r * m, (r + 1) * m)`` (``a = attention / world``, ``m = mlp / world``),
+    so a contiguous split into ``world`` blocks hands each rank the columns of its own
+    heads and its own MLP channels. The identity at one rank.
+    """
+    if world == 1:
+        return weight
+    a, m = attention // world, mlp // world
+    index = torch.cat(
+        [
+            torch.cat([torch.arange(r * a, (r + 1) * a), attention + torch.arange(r * m, (r + 1) * m)])
+            for r in range(world)
+        ]
+    ).to(weight.device)
+    return weight.index_select(dim, index)
+
+
+class _HeadsAndMlpRowParallelLinear(RowParallelLinear):
+    """``proj_out`` of a sharded single block: row-parallel over ``cat([attention, mlp], -1)``.
+
+    Each rank's input is its own attention heads followed by its own MLP channels, which is
+    not a contiguous slice of the checkpoint's ``[attention | mlp]`` columns. The loader puts
+    the columns in rank-major order before vLLM's contiguous split takes this rank's block;
+    the bias is whole and added once, as ``RowParallelLinear`` does.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        attention_size: int,
+        bias: bool = True,
+        return_bias: bool = False,
+        prefix: str = "",
+    ):
+        super().__init__(
+            input_size,
+            output_size,
+            bias=bias,
+            input_is_parallel=True,
+            return_bias=return_bias,
+            prefix=prefix,
+        )
+        self.attention_size = attention_size
+
+    def _rank_major(self, param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> torch.Tensor:
+        dim = getattr(param, "input_dim", None)
+        if dim is None or loaded_weight.dim() == 0 or loaded_weight.shape[dim] != self.input_size:
+            return loaded_weight
+        return rank_major_columns(
+            loaded_weight, self.attention_size, self.input_size - self.attention_size, self.tp_size, dim
+        )
+
+    def weight_loader(self, param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        super().weight_loader(param, self._rank_major(param, loaded_weight))
+
+    def weight_loader_v2(self, param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        super().weight_loader_v2(param, self._rank_major(param, loaded_weight))
+
+
+def _shard_single_block_mlp(od_config: OmniDiffusionConfig | None) -> bool:
+    """Whether the single blocks' MLP is split over the TP group.
+
+    Like FLUX.2 Klein's local TP, the split is off when a startup LoRA, merged LoRA,
+    quantization or offloading is configured: the row-parallel ``proj_out`` has no
+    LoRA wrapper and its rank-major column order is not defined for quantized layouts.
+    (HSDP cannot be combined with TP.)
+    """
+    if od_config is None:
+        return False
+    return (
+        od_config.parallel_config.tensor_parallel_size > 1
+        and od_config.quantization_config is None
+        and od_config.lora_path is None
+        and od_config.lora_application != "merged"
+        and not offload_enabled(od_config)
+    )
+
+
 class FluxSingleTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -381,28 +470,51 @@ class FluxSingleTransformerBlock(nn.Module):
         mlp_ratio: float = 4.0,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        shard_mlp: bool = False,
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
+        tp_size = get_tensor_model_parallel_world_size() if shard_mlp else 1
+        # Split proj_mlp column-parallel and proj_out row-parallel over this rank's heads and
+        # MLP channels (one all-reduce, no gather), as vLLM splits an MLP.
+        self.shard_mlp = shard_mlp and tp_size > 1 and quant_config is None
 
         self.norm = AdaLayerNormZeroSingle(dim, quant_config=safe_quant_config(quant_config), prefix=f"{prefix}.norm")
-        self.proj_mlp = ReplicatedLinear(
-            dim,
-            self.mlp_hidden_dim,
-            bias=True,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj_mlp",
-        )
+        if self.shard_mlp:
+            self.proj_mlp = ColumnParallelLinear(
+                dim,
+                self.mlp_hidden_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                prefix=f"{prefix}.proj_mlp",
+            )
+            self.proj_out = _HeadsAndMlpRowParallelLinear(
+                dim + self.mlp_hidden_dim,
+                dim,
+                attention_size=dim,
+                bias=True,
+                return_bias=False,
+                prefix=f"{prefix}.proj_out",
+            )
+        else:
+            self.proj_mlp = ReplicatedLinear(
+                dim,
+                self.mlp_hidden_dim,
+                bias=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj_mlp",
+            )
+            self.proj_out = ReplicatedLinear(
+                dim + self.mlp_hidden_dim,
+                dim,
+                bias=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj_out",
+            )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = ReplicatedLinear(
-            dim + self.mlp_hidden_dim,
-            dim,
-            bias=True,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj_out",
-        )
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -414,6 +526,7 @@ class FluxSingleTransformerBlock(nn.Module):
             pre_only=True,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            gather_output=not self.shard_mlp,
         )
 
     def forward(
@@ -595,6 +708,7 @@ class FluxTransformer2DModel(nn.Module):
                     attention_head_dim=attention_head_dim,
                     quant_config=quant_config,
                     prefix=f"single_transformer_blocks.{i}",
+                    shard_mlp=_shard_single_block_mlp(od_config),
                 )
                 for i in range(num_single_layers)
             ]

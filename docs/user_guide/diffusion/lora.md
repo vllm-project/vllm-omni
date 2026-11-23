@@ -21,6 +21,14 @@ not supported by this generic path.
 For adapter-only RL updates and memory/validation requirements, see
 [engine-side LoRA merge](../weight_transfer.md#engine-side-lora-merge).
 
+### FLUX.1 under tensor parallelism
+
+Under tensor parallelism, FLUX.1's single-block `proj_out` is split across
+ranks unless a startup `--lora-path`, merged LoRA, quantization or CPU
+offloading is configured. Per-request adapters that target
+`single_transformer_blocks.*.proj_out` then fail at activation. See
+[FLUX.1 single-block MLP](parallelism/tensor_parallel.md#flux1-single-block-mlp).
+
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
