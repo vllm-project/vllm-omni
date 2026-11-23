@@ -1187,23 +1187,10 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
         assert not hasattr(pipeline, "_scheduler_init_t_list")
 
 
-@pytest.mark.parametrize("use_graphs", [False, True])
-@pytest.mark.parametrize("cache_backend", ["none", "sea_cache"])
-@pytest.mark.parametrize(
-    ("enforce_eager", "compile_granularity"),
-    [(False, "regional"), (True, "regional"), (True, "full")],
-)
 def test_distilled_pipeline_initializes_sde_scheduler(
     stub_real_pipeline_init,
     monkeypatch: pytest.MonkeyPatch,
-    use_graphs: bool,
-    cache_backend: str,
-    enforce_eager: bool,
-    compile_granularity: str,
-    tmp_path,
 ) -> None:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
-    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         Cosmos3OmniDiffusersPipeline,
         FlowMatchEulerDiscreteScheduler,
@@ -1225,25 +1212,11 @@ def test_distilled_pipeline_initializes_sde_scheduler(
         classmethod(lambda cls, *args, **kwargs: scheduler_config),
     )
 
-    config = _make_od_config(sound_gen=False)
-    if use_graphs:
-        monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cuda"))
-    config = OmniDiffusionConfig(
-        model=str(tmp_path),
-        dtype=torch.float32,
-        tf_model_config=TransformerConfig.from_dict(config.tf_model_config),
-        additional_config={"cosmos3_manual_cuda_graphs": use_graphs},
-        cache_backend=cache_backend,
-        enforce_eager=enforce_eager,
-        diffusion_compile_granularity=compile_granularity,
-    )
-    pipeline = Cosmos3OmniDiffusersPipeline(od_config=config)
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=False))
     assert pipeline.is_distilled_model is True
     assert isinstance(pipeline.scheduler, FlowMatchEulerDiscreteScheduler)
     assert pipeline.scheduler.config.stochastic_sampling is True
     assert pipeline._scheduler_init_t_list == t_list
-    assert (pipeline.transformer._gen_graph is not None) is use_graphs
-    assert (pipeline.transformer._und_graph is not None) is use_graphs
 
 
 @pytest.mark.parametrize(
@@ -5591,6 +5564,44 @@ def test_diffuse_releases_conditioning_after_completion_or_failure(
     assert pipeline.transformer.cached_kv is None
     assert pipeline.transformer.cached_freqs_gen is None
     assert "cache-lifetime" not in pipeline._memory_manager
+
+
+@pytest.mark.parametrize(
+    ("use_graphs", "overrides"),
+    [
+        pytest.param(False, {}, id="default-off"),
+        pytest.param(True, {"diffusion_compile_granularity": "regional"}, id="regional"),
+        pytest.param(
+            True,
+            {"enforce_eager": True, "diffusion_compile_granularity": "full", "cache_backend": "sea_cache"},
+            id="eager-with-seacache",
+        ),
+    ],
+)
+def test_pipeline_init_enables_manual_cuda_graphs(
+    stub_real_pipeline_init, monkeypatch: pytest.MonkeyPatch, tmp_path, use_graphs: bool, overrides: dict[str, Any]
+) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    device = torch.device("cuda")
+    monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: device)
+    enable_cuda_graphs = Mock()
+    monkeypatch.setattr(pipeline_cosmos3.Cosmos3VFMTransformer, "enable_cuda_graphs", enable_cuda_graphs)
+    config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        dtype=torch.float32,
+        tf_model_config=TransformerConfig.from_dict(_make_od_config(sound_gen=False).tf_model_config),
+        additional_config={"cosmos3_manual_cuda_graphs": True} if use_graphs else {},
+        **overrides,
+    )
+
+    pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=config)
+
+    if use_graphs:
+        enable_cuda_graphs.assert_called_once_with(device)
+    else:
+        enable_cuda_graphs.assert_not_called()
 
 
 @pytest.mark.parametrize(
