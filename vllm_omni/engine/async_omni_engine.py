@@ -51,7 +51,15 @@ class AsyncOmniEngine(OmniEngineBase):
     """Turn-based engine used by ``Omni`` / ``AsyncOmni``."""
 
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
-        orchestrator_kwargs.setdefault("dit_load_aware_config", self._detect_dit_load_aware_config())
+        dtps_config = self._detect_dit_load_aware_config()
+        orchestrator_kwargs.setdefault("dit_load_aware_config", dtps_config)
+        if dtps_config:
+            logger.info("[OmniDTPS] Orchestrator DTPS pairs enabled: %s", dtps_config)
+        else:
+            logger.warning(
+                "[OmniDTPS] No DTPS pair detected; DiT-load polling stays off "
+                "(check dit_load_aware on AR stage deploy configs)"
+            )
         return Orchestrator(**orchestrator_kwargs)
 
     def _detect_dit_load_aware_config(self) -> list[dict[str, Any]] | None:

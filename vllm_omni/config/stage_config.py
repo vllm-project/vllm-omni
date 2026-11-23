@@ -981,6 +981,10 @@ _STAGE_RESERVED_KEYS = frozenset(
         "engine_extras",
         "engine_args",
         "runtime",
+        # DTPS deploy switch: consumed by derive_dtps_config() to emit
+        # ``dit_load_aware_config`` for the AR stage; the raw bool must not
+        # propagate into engine args (OmniStageModelConfig has no such field).
+        "dit_load_aware",
     }
 )
 
@@ -1065,6 +1069,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
 
     kwargs["async_chunk"] = stage_data.get("async_chunk")
     kwargs["model_runner"] = stage_runner
+    kwargs["dit_load_aware"] = stage_data.get("dit_load_aware")
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")

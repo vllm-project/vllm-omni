@@ -242,7 +242,6 @@ class _ModelEngineOverrides(TypedDict, total=False):
     generation_config: str
     override_generation_config: dict[str, Any]
     enable_prompt_embeds: bool
-    dit_load_aware: bool | None
     dit_load_aware_config: dict[str, Any] | None
 
 

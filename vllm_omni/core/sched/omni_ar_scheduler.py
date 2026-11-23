@@ -552,6 +552,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def update_dit_load(self, dit_load: DitLoadSnapshot) -> None:
         """Receive DiT load snapshot from the Orchestrator."""
         if self._dtps is not None:
+            logger.info(
+                "[OmniDTPS] AR scheduler received dit_load: waiting=%s running=%s fresh=%s",
+                dit_load.get("total_waiting") if isinstance(dit_load, dict) else None,
+                dit_load.get("total_running") if isinstance(dit_load, dict) else None,
+                dit_load.get("fresh") if isinstance(dit_load, dict) else None,
+            )
             self._dtps.update_dit_load(dit_load)
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:

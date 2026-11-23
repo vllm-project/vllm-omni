@@ -292,6 +292,7 @@ class StageEngineCoreProc(EngineCoreProc):
 
         scheduler = getattr(self, "scheduler", None)
         if scheduler is None:
+            logger.warning("[OmniDTPS] omni_update_dit_load dropped: engine has no scheduler yet")
             return
         update_fn = getattr(scheduler, "update_dit_load", None)
         if update_fn is not None:

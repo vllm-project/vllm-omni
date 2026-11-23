@@ -1465,6 +1465,11 @@ class OrchestratorBase:
         self._dit_load_last_poll[key] = now
 
         if not pool.check_dit_health(replica_id):
+            logger.warning(
+                "[OmniDTPS] DiT health check failed for stage-%s rep-%s; evicting its load entry",
+                stage_id,
+                replica_id,
+            )
             try:
                 state.remove(stage_id, replica_id)
             except Exception:
@@ -1482,6 +1487,12 @@ class OrchestratorBase:
             key = (stage_id, replica_id)
             self._dit_load_fail_count[key] = self._dit_load_fail_count.get(key, 0) + 1
             if self._dit_load_fail_count[key] >= self._DIT_LOAD_EVICT_THRESHOLD:
+                logger.warning(
+                    "[OmniDTPS] DiT load poll returned None %d times for stage-%s rep-%s; evicting its load entry",
+                    self._DIT_LOAD_EVICT_THRESHOLD,
+                    stage_id,
+                    replica_id,
+                )
                 state.remove(stage_id, replica_id)
                 self._dit_load_fail_count[key] = 0
                 success = await self._push_dit_load_to_ar(state)
@@ -1511,6 +1522,14 @@ class OrchestratorBase:
             return
 
         if changed or self._dit_load_dirty:
+            logger.info(
+                "[OmniDTPS] poll stage-%s rep-%s: waiting=%d running=%d (changed=%s)",
+                stage_id,
+                replica_id,
+                waiting,
+                running,
+                changed,
+            )
             success = await self._push_dit_load_to_ar(state)
             self._dit_load_dirty = not success
 
