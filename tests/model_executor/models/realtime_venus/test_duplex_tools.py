@@ -87,7 +87,9 @@ def test_tool_result_is_reserved_and_transferred_only_after_submit(plugin):
     assert current["venus_function_results"][0]["generation"] == 1
 
 
-@pytest.mark.parametrize("boundary", [{"end_of_turn": True}, {"is_listen": True}])
+@pytest.mark.parametrize(
+    "boundary", [{"end_of_turn": True}, {"is_listen": True}, {"text": "<delegate>lookup</delegate>"}]
+)
 def test_result_waits_for_foreground_boundary(plugin, monkeypatch, boundary):
     monkeypatch.setattr(
         "vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane.MiniCPMO45DataPlaneSession.project_output",

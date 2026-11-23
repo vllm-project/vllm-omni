@@ -16,6 +16,7 @@ class DelegateParser:
     pending: str = ""
     opened: bool = False
     completed_query: str | None = None
+    completed_spans: int = 0
     failed: bool = False
 
     OPEN = "<delegate>"
@@ -61,6 +62,7 @@ class DelegateParser:
         self.pending = self.pending[end + len(self.CLOSE) :]
         self.opened = False
         self.completed_query = query
+        self.completed_spans += 1
         # Validate any second span in the same delta before executing the first.
         self.feed("", end_of_turn=end_of_turn)
         # Native generation may repeat the same span while awaiting a backend

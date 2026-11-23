@@ -69,6 +69,7 @@ class VenusDataPlane(MiniCPMO45DataPlaneSession):
                     previous = (turn_id, DelegateParser())
                     self._delegations[request_id] = previous
                 text = result.get("text")
+                completed_before = previous[1].completed_spans
                 try:
                     query = previous[1].feed(
                         text if isinstance(text, str) else "", end_of_turn=result.get("end_of_turn") is True
@@ -76,6 +77,12 @@ class VenusDataPlane(MiniCPMO45DataPlaneSession):
                 except ValueError as exc:
                     yield {"data_plane_request_id": request_id, "error_code": "invalid_delegate", "error": str(exc)}
                 else:
+                    if completed_before and previous[1].completed_spans > completed_before:
+                        # A model waiting for its backend may keep repeating
+                        # the completed task instead of emitting turn_eos.
+                        # Resume at that control boundary without executing it
+                        # again or stranding an already accepted result.
+                        self._backend_ready[request_id] = True
                     if query is not None:
                         yield {
                             "data_plane_request_id": request_id,

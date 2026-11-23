@@ -1836,6 +1836,8 @@ repeat suppression and interruption policy. MiniCPM-o continues to advertise
 Accepted Venus results are tokenized as `<backend>result</backend>` into a
 bounded private runtime queue. Results wait for a projected turn-end or listen
 boundary; closing a delegate span alone does not end the foreground turn.
+An identical completed span repeated in a later unit also permits injection,
+so a model waiting for its backend cannot strand the accepted result in a loop.
 The next append reserves their exact token count and feeds them after that
 unit's media in the existing Thinker KV. They also
 belong to the unit's sliding-window history and reopen the speech gate after a

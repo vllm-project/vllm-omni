@@ -62,16 +62,10 @@ def submitted_results(h):
 
 
 @pytest.mark.asyncio
-async def test_result_reaches_one_append_and_duplicate_cannot_replay_it():
+@pytest.mark.parametrize("repeat", [False, True])
+async def test_result_reaches_one_append_and_duplicate_cannot_replay_it(repeat):
     async with venus_session() as h:
         call_id = await delegate(h)
-        repeated = tts_output(
-            h.stage0_request_id(), text="<delegate>12 + 30</delegate>", samples=0, tts_is_last_chunk=True
-        )
-        repeated.multimodal_output.update({SPEECH_MUTED_KEY: True, "meta.duplex_audio_chunk_seq": 1})
-        events = await h.deliver_and_settle(repeated)
-        assert error_codes(events) == []
-        assert "response.function_call_arguments.done" not in types(events)
         count = len(h.port.submissions)
         await h.run(append_audio())
         assert len(h.port.submissions) > count  # Input continues during the call.
@@ -79,7 +73,18 @@ async def test_result_reaches_one_append_and_duplicate_cannot_replay_it():
         assert error_codes(await answer(h, call_id, "42")) == []
         await h.run(append_audio())
         assert not any(submitted_results(h))  # The delegate turn is still speaking.
-        await h.deliver_and_settle(listen_output(h.stage0_request_id()), stage_id=0, segment_finished=True)
+        if repeat:
+            repeated = tts_output(
+                h.stage0_request_id(), text="<delegate>12 + 30</delegate>", samples=0, tts_is_last_chunk=True
+            )
+            repeated.multimodal_output.update(
+                {SPEECH_MUTED_KEY: True, "meta.duplex_audio_cache_epoch": 0, "meta.duplex_audio_chunk_seq": 1}
+            )
+            events = await h.deliver_and_settle(repeated)
+            assert error_codes(events) == []
+            assert "response.function_call_arguments.done" not in types(events)
+        else:
+            await h.deliver_and_settle(listen_output(h.stage0_request_id()), stage_id=0, segment_finished=True)
         await h.run(append_audio())
         assert submitted_results(h).count(list(b"<backend>42</backend>")) == 1
         assert h.session.runtime_config["venus_function_results"] == []

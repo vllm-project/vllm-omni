@@ -181,6 +181,8 @@ The application executes the task and returns a `function_call_output` with
 the matching `call_id`. The server wraps the result in `<backend>...</backend>`
 and waits for the foreground turn to end or return to listening. The next input
 unit then carries it after the media, in the same Thinker KV cache.
+If the model repeats the completed delegation while waiting, that control
+boundary also admits the result without executing the tool again.
 The model can then speak the answer. Input continues while the tool runs;
 no `response.create` is needed. The server also schedules a silence continuation
 when a result arrives. Applications should keep streaming input or silence so
@@ -254,7 +256,7 @@ python -m vllm_omni.clients.tool_calls \
 Run the same command with:
 
 ```bash
---initial-user-text 'Delegate a lookup of the current widget inventory to the backend. Do not guess the count.'
+--initial-user-text 'Ask the backend to look up the widget inventory count. Delegate the lookup instead of answering it yourself.'
 ```
 
 The handler reads `inventory.json`; the returned count is 73. Changing that
