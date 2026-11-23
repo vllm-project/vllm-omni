@@ -8,6 +8,7 @@ import torch
 
 from vllm_omni.outputs import StagePostWarmupMemoryStats
 from vllm_omni.worker.base import OmniGPUWorkerBase
+from vllm_omni.worker.memory_utils import GPUMemoryBudgetSnapshot
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -50,6 +51,25 @@ def test_get_stage_post_warmup_memory_stats_omits_nonzero_rank():
     worker.model_runner = SimpleNamespace(get_model=lambda: pytest.fail("non-reporting rank must not read the model"))
 
     assert worker.get_stage_post_warmup_memory_stats() is None
+
+
+def test_get_gpu_memory_budget_snapshot_returns_scalar_rpc_payload():
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker._gpu_memory_budget_snapshot = GPUMemoryBudgetSnapshot(
+        stage_id=3,
+        rank=1,
+        device="cuda:0",
+        requested_memory_bytes=20,
+        available_kv_cache_memory_bytes=7,
+        accounting_mode="automatic",
+    )
+
+    payload = worker.get_gpu_memory_budget_snapshot()
+
+    assert payload is not None
+    assert payload["stage_id"] == 3
+    assert payload["rank"] == 1
+    assert payload["available_kv_cache_memory_bytes"] == 7
 
 
 class _QuantMethod:

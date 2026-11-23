@@ -92,18 +92,30 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
+            self._record_initial_gpu_memory_budget_snapshot()
+            try:
+                self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
+            except Exception as exc:
+                self._record_gpu_memory_budget_failure(
+                    f"initial memory budget calculation failed: {type(exc).__name__}"
+                )
+                raise
+            self._record_initial_gpu_memory_budget_snapshot()
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
-        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
+        try:
+            # Initialize workspace manager
+            num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+            init_workspace_manager(self.device, num_ubatches)
 
-        logger.info("Using MR v2 OmniGenerationModelRunner for generation stage.")
-        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+            logger.info("Using MR v2 OmniGenerationModelRunner for generation stage.")
+            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"worker initialization failed: {type(exc).__name__}")
+            raise
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -115,6 +127,11 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         import time
 
         start = time.perf_counter()
-        self.model_runner.profile_run()
-        self._capture_auxiliary_graphs()
+        try:
+            self.model_runner.profile_run()
+            self._capture_auxiliary_graphs()
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"model warmup failed: {type(exc).__name__}")
+            raise
+        self._record_no_kv_cache_snapshot()
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)

@@ -208,6 +208,25 @@ profiling's `non_kv_cache_memory` is not used, because it also counts memory
 the caching allocator reserves without allocating, such as graph pools
 captured at model load; co-located stage budgets are tuned without it.
 
+Each GPU worker retains an immutable `GPUMemoryBudgetSnapshot` after its
+startup memory state is known. Automatic KV sizing records the same integer
+components used by the allocator: weights, pre-profile buffers,
+`torch_peak_increase`, non-torch memory, CUDA graph memory and auxiliary graph
+memory. `transient_peak_headroom` is retained separately because it feeds the
+upstream warm-up recommendation but is not the activation component subtracted
+from the KV budget. It also records the uncapped utilization target and whether
+the effective request was capped below that target. A profiled usage greater
+than the requested budget is represented with a positive shortfall and zero
+available KV bytes.
+
+Explicit `kv_cache_memory_bytes` is reported as an explicit override; profile
+components are absent because the existing path does not run the memory
+profile for that sizing decision. Generation stages without a KV cache and
+platforms without this device-level probe report an explicit mode or `None`.
+The snapshot is read through the control plane at readiness and remote replica
+attachment when `log_stats` is enabled. It is a diagnostic record and does not
+change allocation, sizing, request output, or per-step metrics.
+
 MRv2 asynchronous output snapshots reuse one capacity buffer per dtype/device
 group in each ring slot. The slot waits for its previous device-to-host copy
 event before reuse or growth. Shorter outputs publish and copy only the live

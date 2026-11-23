@@ -42,6 +42,10 @@ class OmniNPUWorkerBase(NPUWorker):
         """NPU workers do not provide the optional CUDA warmup snapshot."""
         return None
 
+    def get_gpu_memory_budget_snapshot(self) -> None:
+        """NPU workers do not provide the optional GPU budget snapshot."""
+        return None
+
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
         self._capture_auxiliary_graphs()

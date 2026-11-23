@@ -116,33 +116,45 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = sharing_memory_request(
-                sharing_budget,
-                role="provider",
-                rank=self.rank,
-                kv_cache_bytes=self.cache_config.kv_cache_memory_bytes,
-                free_bytes=init_snapshot.free_memory,
-            )
-            if self.requested_memory is None:
-                self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
+            self._record_initial_gpu_memory_budget_snapshot()
+            try:
+                self.requested_memory = sharing_memory_request(
+                    sharing_budget,
+                    role="provider",
+                    rank=self.rank,
+                    kv_cache_bytes=self.cache_config.kv_cache_memory_bytes,
+                    free_bytes=init_snapshot.free_memory,
+                )
+                if self.requested_memory is None:
+                    self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
+            except Exception as exc:
+                self._record_gpu_memory_budget_failure(
+                    f"initial memory budget calculation failed: {type(exc).__name__}"
+                )
+                raise
+            self._record_initial_gpu_memory_budget_snapshot()
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
-        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
+        try:
+            # Initialize workspace manager
+            num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+            init_workspace_manager(self.device, num_ubatches)
 
-        model_stage = getattr(self.model_config, "model_stage", None)
-        stage_id = getattr(self.model_config, "stage_id", None)
+            model_stage = getattr(self.model_config, "model_stage", None)
+            stage_id = getattr(self.model_config, "stage_id", None)
 
-        logger.info(
-            "Using MR v2 OmniARModelRunner for omni AR stage (stage_id=%s model_stage=%s).",
-            stage_id,
-            model_stage,
-        )
-        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+            logger.info(
+                "Using MR v2 OmniARModelRunner for omni AR stage (stage_id=%s model_stage=%s).",
+                stage_id,
+                model_stage,
+            )
+            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"worker initialization failed: {type(exc).__name__}")
+            raise
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -152,23 +164,31 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         result = super().load_model(*args, **kwargs)
         from vllm_omni.distributed.weight_sharing.worker_session import install_runner_session
 
-        install_runner_session(
-            self.model_runner,
-            self.vllm_config,
-            role="provider",
-            rank=self.rank,
-            device_index=self.device.index,
-            detach=lambda: None,
-        )
+        try:
+            install_runner_session(
+                self.model_runner,
+                self.vllm_config,
+                role="provider",
+                rank=self.rank,
+                device_index=self.device.index,
+                detach=lambda: None,
+            )
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"model load failed: {type(exc).__name__}")
+            raise
         return result
 
     def compile_or_warm_up_model(self):
         # Runs before the upstream warmup so the prefill fused-MoE configs and
         # the seeded-sampling Triton kernel are compiled before vLLM activates
         # its JIT monitor (#9069).
-        warm_up_moe_prefill_kernels(self)
-        register_top_k_top_p_warmup(self)
-        return super().compile_or_warm_up_model()
+        try:
+            warm_up_moe_prefill_kernels(self)
+            register_top_k_top_p_warmup(self)
+            return super().compile_or_warm_up_model()
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"model warmup failed: {type(exc).__name__}")
+            raise
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         """

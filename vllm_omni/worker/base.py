@@ -11,6 +11,7 @@ import math
 import os
 import time
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
 
 import torch
 from vllm import envs
@@ -27,6 +28,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.memory_utils import GPUMemoryBudgetSnapshot
 
 logger = init_logger(__name__)
 
@@ -144,26 +146,34 @@ class OmniGPUWorkerBase(GPUWorker):
         return auxiliary_graph_memory
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        result = super().compile_or_warm_up_model()
-        self._capture_auxiliary_graphs()
-        return result
+        try:
+            result = super().compile_or_warm_up_model()
+            self._capture_auxiliary_graphs()
+            return result
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"model warmup failed: {type(exc).__name__}")
+            raise
 
     def load_model(self, *args, **kwargs):
-        weight_transfer = self.vllm_config.weight_transfer_config
-        is_merged_lora = weight_transfer is not None and weight_transfer.backend == "omni_lora_ipc"
-        if is_merged_lora and self.vllm_config.lora_config is not None:
-            raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
-        with self._maybe_get_memory_pool_context("weights"):
-            res = super().load_model(*args, **kwargs)
-            if is_merged_lora:
-                from vllm_omni.lora.capability import resolve_merged_lora_spec
+        try:
+            weight_transfer = self.vllm_config.weight_transfer_config
+            is_merged_lora = weight_transfer is not None and weight_transfer.backend == "omni_lora_ipc"
+            if is_merged_lora and self.vllm_config.lora_config is not None:
+                raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
+            with self._maybe_get_memory_pool_context("weights"):
+                res = super().load_model(*args, **kwargs)
+                if is_merged_lora:
+                    from vllm_omni.lora.capability import resolve_merged_lora_spec
 
-                model = self.model_runner.get_model()
-                if isinstance(model, torch.nn.Module):
-                    resolve_merged_lora_spec(model, stage="ar")
-            current_omni_platform.synchronize()
-            gc.collect()
-            return res
+                    model = self.model_runner.get_model()
+                    if isinstance(model, torch.nn.Module):
+                        resolve_merged_lora_spec(model, stage="ar")
+                current_omni_platform.synchronize()
+                gc.collect()
+                return res
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"model load failed: {type(exc).__name__}")
+            raise
 
     def start_weight_update_with_id(self, update_id: str) -> None:
         """Start an AR weight update session tagged with a caller-supplied ``update_id``."""
@@ -320,8 +330,92 @@ class OmniGPUWorkerBase(GPUWorker):
             "reserved_bytes": stats.reserved_bytes,
         }
 
+    def _new_gpu_memory_budget_snapshot(
+        self,
+        *,
+        accounting_mode: str,
+        reason: str | None,
+    ) -> GPUMemoryBudgetSnapshot:
+        """Build a snapshot from the memory state currently known by this worker."""
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        init_snapshot = getattr(self, "init_snapshot", None)
+        device = getattr(self, "device", None) or getattr(init_snapshot, "device_", None)
+        requested_memory = getattr(self, "requested_memory", None)
+        cache_config = getattr(self, "cache_config", None)
+        gpu_memory_utilization = getattr(cache_config, "gpu_memory_utilization", None)
+        total_memory = getattr(init_snapshot, "total_memory", None)
+        uncapped_requested_memory = (
+            math.ceil(total_memory * gpu_memory_utilization)
+            if total_memory is not None and gpu_memory_utilization is not None
+            else None
+        )
+        budget_was_capped = (
+            accounting_mode in {"pending", "automatic", "initialization_failed"}
+            and requested_memory is not None
+            and uncapped_requested_memory is not None
+            and int(requested_memory) < uncapped_requested_memory
+        )
+        return GPUMemoryBudgetSnapshot(
+            stage_id=getattr(model_config, "stage_id", None),
+            rank=getattr(self, "rank", None),
+            device=str(device) if device is not None else None,
+            total_memory_bytes=total_memory,
+            free_memory_bytes=getattr(init_snapshot, "free_memory", None),
+            uncapped_requested_memory_bytes=uncapped_requested_memory,
+            requested_memory_bytes=int(requested_memory) if requested_memory is not None else None,
+            budget_was_capped=budget_was_capped if requested_memory is not None else None,
+            accounting_mode=accounting_mode,
+            reason=reason,
+        )
+
+    def _record_initial_gpu_memory_budget_snapshot(self) -> None:
+        """Retain the known device budget before model profiling starts."""
+        self._gpu_memory_budget_snapshot = self._new_gpu_memory_budget_snapshot(
+            accounting_mode="pending",
+            reason="profile has not completed",
+        )
+
+    def _record_no_kv_cache_snapshot(self) -> None:
+        """Mark a generation stage whose model does not own an automatic KV budget."""
+        snapshot = getattr(self, "_gpu_memory_budget_snapshot", None)
+        if snapshot is None:
+            snapshot = self._new_gpu_memory_budget_snapshot(
+                accounting_mode="no_kv_cache",
+                reason="stage has no KV cache",
+            )
+        model_memory_usage = getattr(getattr(self, "model_runner", None), "model_memory_usage", None)
+        self._gpu_memory_budget_snapshot = replace(
+            snapshot,
+            weights_memory_bytes=int(model_memory_usage) if model_memory_usage is not None else None,
+            accounting_mode="no_kv_cache",
+            reason="stage has no KV cache",
+        )
+
+    def _record_gpu_memory_budget_failure(self, reason: str) -> None:
+        """Retain a partial snapshot when startup fails after device probing."""
+        snapshot = getattr(self, "_gpu_memory_budget_snapshot", None)
+        if snapshot is not None and snapshot.accounting_mode == "initialization_failed":
+            return
+        if snapshot is None:
+            snapshot = self._new_gpu_memory_budget_snapshot(
+                accounting_mode="initialization_failed",
+                reason=reason,
+            )
+        self._gpu_memory_budget_snapshot = replace(
+            snapshot,
+            accounting_mode="initialization_failed",
+            reason=reason,
+        )
+        logger.warning("GPU memory budget snapshot before initialization failure: %s", self._gpu_memory_budget_snapshot)
+
+    def get_gpu_memory_budget_snapshot(self) -> dict[str, object] | None:
+        """Return the saved budget snapshot for this worker rank, if available."""
+        snapshot = getattr(self, "_gpu_memory_budget_snapshot", None)
+        return snapshot.as_dict() if snapshot is not None else None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._gpu_memory_budget_snapshot: GPUMemoryBudgetSnapshot | None = None
 
         # Replace vLLM's profiler with platform-specific profiler
         profiler_config = self.vllm_config.profiler_config
@@ -446,33 +540,55 @@ class OmniGPUWorkerBase(GPUWorker):
             ``gpu_memory_utils`` are retained for diffusion memory reporting.
         """
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            self.model_runner.profile_run()
-            if current_omni_platform.is_rocm():
-                torch.accelerator.synchronize()
+            snapshot = getattr(self, "_gpu_memory_budget_snapshot", None)
+            if snapshot is None:
+                snapshot = self._new_gpu_memory_budget_snapshot(
+                    accounting_mode="explicit",
+                    reason="explicit kv_cache_memory_bytes",
+                )
+            self._gpu_memory_budget_snapshot = replace(
+                snapshot,
+                available_kv_cache_memory_bytes=int(kv_cache_memory_bytes),
+                budget_was_capped=False,
+                accounting_mode="explicit",
+                reason="explicit kv_cache_memory_bytes",
+            )
+            try:
+                self.model_runner.profile_run()
+                if current_omni_platform.is_rocm():
+                    torch.accelerator.synchronize()
+            except Exception as exc:
+                self._record_gpu_memory_budget_failure(f"explicit KV profile failed: {type(exc).__name__}")
+                raise
             return kv_cache_memory_bytes
 
-        with memory_profiling(
-            self.init_snapshot,
-            weights_memory=int(self.model_runner.model_memory_usage),
-        ) as profile_result:
-            self.model_runner.profile_run()
+        try:
+            with memory_profiling(
+                self.init_snapshot,
+                weights_memory=int(self.model_runner.model_memory_usage),
+            ) as profile_result:
+                self.model_runner.profile_run()
 
-        cudagraph_memory_estimate = 0
-        if (
-            envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            and current_omni_platform.is_cuda_alike()
-            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
-            cudagraph_memory_estimate = max(0, self.model_runner.profile_cudagraph_memory())
+            cudagraph_memory_estimate = 0
+            if (
+                envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                and current_omni_platform.is_cuda_alike()
+                and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            ):
+                cudagraph_memory_estimate = max(0, self.model_runner.profile_cudagraph_memory())
 
-        auxiliary_graph_memory = 0
-        if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS and current_omni_platform.is_cuda_alike():
-            auxiliary_graph_memory = self._profile_auxiliary_graph_memory()
+            auxiliary_graph_memory = 0
+            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS and current_omni_platform.is_cuda_alike():
+                auxiliary_graph_memory = self._profile_auxiliary_graph_memory()
+        except Exception as exc:
+            self._record_gpu_memory_budget_failure(f"GPU memory profile failed: {type(exc).__name__}")
+            raise
 
         # Compared with what capture_model() reports, so it leaves out the
         # auxiliary graphs, which warmup captures after it.
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
-        self.non_torch_memory = profile_result.non_torch_increase
+        non_torch_memory = profile_result.non_torch_increase
+        self.non_torch_memory = non_torch_memory
         # Upstream adds the applied estimate here as well, then adds the actual
         # graph size again when it suggests --kv-cache-memory in
         # compile_or_warm_up_model. Keep the activation peak alone so that
@@ -492,11 +608,32 @@ class OmniGPUWorkerBase(GPUWorker):
             weights_memory
             + preprofile_buffers
             + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
+            + non_torch_memory
             + cudagraph_memory_estimate
             + auxiliary_graph_memory
         )
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
+        snapshot = getattr(self, "_gpu_memory_budget_snapshot", None)
+        if snapshot is None:
+            snapshot = self._new_gpu_memory_budget_snapshot(
+                accounting_mode="automatic",
+                reason=None,
+            )
+        self._gpu_memory_budget_snapshot = replace(
+            snapshot,
+            weights_memory_bytes=weights_memory,
+            preprofile_buffers_bytes=preprofile_buffers,
+            activation_peak_bytes=profile_result.torch_peak_increase,
+            transient_peak_headroom_bytes=profile_result.transient_peak_headroom,
+            non_torch_memory_bytes=non_torch_memory,
+            cuda_graph_memory_bytes=cudagraph_memory_estimate,
+            auxiliary_graph_memory_bytes=auxiliary_graph_memory,
+            profiled_usage_bytes=profiled_usage,
+            available_kv_cache_memory_bytes=self.available_kv_cache_memory_bytes,
+            shortfall_bytes=max(0, profiled_usage - self.requested_memory),
+            accounting_mode="automatic",
+            reason=None,
+        )
         logger.debug(
             "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
             os.getpid(),
