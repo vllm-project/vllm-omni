@@ -150,14 +150,17 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def load_model(self, *args, **kwargs):
         weight_transfer = self.vllm_config.weight_transfer_config
-        if (
-            weight_transfer is not None
-            and weight_transfer.backend == "omni_lora_ipc"
-            and self.vllm_config.lora_config is not None
-        ):
+        is_merged_lora = weight_transfer is not None and weight_transfer.backend == "omni_lora_ipc"
+        if is_merged_lora and self.vllm_config.lora_config is not None:
             raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
         with self._maybe_get_memory_pool_context("weights"):
             res = super().load_model(*args, **kwargs)
+            if is_merged_lora:
+                from vllm_omni.lora.capability import resolve_merged_lora_spec
+
+                model = self.model_runner.get_model()
+                if isinstance(model, torch.nn.Module):
+                    resolve_merged_lora_spec(model, stage="ar")
             current_omni_platform.synchronize()
             gc.collect()
             return res
@@ -173,7 +176,13 @@ class OmniGPUWorkerBase(GPUWorker):
         except Exception:
             if isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine):
                 self._weight_update_active = False
-                self.weight_transfer_engine.reset_weight_update_target()
+                try:
+                    self.weight_transfer_engine.reset_weight_update_target()
+                except Exception:
+                    logger.warning(
+                        "Failed to reset weight update target while cleaning up a failed merged LoRA session.",
+                        exc_info=True,
+                    )
             raise
 
     def remove_lora(self, lora_id: int) -> bool:

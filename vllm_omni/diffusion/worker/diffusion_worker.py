@@ -1166,7 +1166,13 @@ class DiffusionWorker:
         try:
             engine.start_weight_update()
         except BaseException:
-            engine.reset_weight_update_target()
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target while cleaning up a failed start_weight_update.",
+                    exc_info=True,
+                )
             raise
         self._weight_update_active = True
 
@@ -1183,7 +1189,13 @@ class DiffusionWorker:
             engine.update_weights(update_info)
         except BaseException:
             self._weight_update_active = False
-            engine.reset_weight_update_target()
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                logger.warning(
+                    "Failed to reset weight update target while cleaning up a failed update_weights.",
+                    exc_info=True,
+                )
             raise
 
     def finish_weight_update(self) -> None:
@@ -1194,8 +1206,16 @@ class DiffusionWorker:
         try:
             engine.finish_weight_update()
         finally:
-            engine.reset_weight_update_target()
             self._weight_update_active = False
+            try:
+                engine.reset_weight_update_target()
+            except Exception:
+                # Never turn an already-committed finish_weight_update into a
+                # false failure, and never mask a pre-existing finish exception.
+                logger.warning(
+                    "Failed to reset weight update target while finishing a weight update session.",
+                    exc_info=True,
+                )
 
     def execute_model(
         self,

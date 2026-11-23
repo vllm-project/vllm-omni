@@ -218,6 +218,12 @@ class Qwen3OmniMoeForConditionalGeneration(
     )
     packed_modules_mapping = Qwen3OmniMoeThinkerForConditionalGeneration.packed_modules_mapping
 
+    def merged_lora_spec(self):
+        """Expose merged-LoRA capability derived from upstream SupportsLoRA declarations."""
+        from vllm_omni.lora.capability import merged_lora_spec_from_ar_model
+
+        return merged_lora_spec_from_ar_model(self)
+
     def _maybe_apply_model_mapping(self) -> None:
         apply_outer_quant_config_mapping(self)
 
