@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 
 from tests.engine.duplex.test_session_manager import FakePlugin, FakeStagePort, Harness
-from tests.engine.duplex.test_session_runner import _fake_encode_audio, close_harness, open_harness
+from tests.engine.duplex.test_session_runner import _fake_encode_audio, append_audio, close_harness, open_harness
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import (
     DuplexCapabilities,
@@ -399,8 +399,9 @@ def test_text_history_appends_input_when_response_placeholder_is_missing():
 
 @pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
 @pytest.mark.parametrize("conversation", ["auto", "none"])
+@pytest.mark.parametrize("budget_spent", [False, True])
 @pytest.mark.asyncio
-async def test_terminal_native_listen_preserves_text_without_waiting_for_audio_ack(policy, conversation):
+async def test_terminal_native_listen_preserves_text_without_waiting_for_audio_ack(policy, conversation, budget_spent):
     h = await open_harness(plugin=_text_plugin(), stage_count=1)
     try:
         h.session.replace_config(replace(h.session.config, playback_commit_policy=policy))
@@ -410,6 +411,9 @@ async def test_terminal_native_listen_preserves_text_without_waiting_for_audio_a
         response = h.session.active_response_id
         assert response is not None
         assert any(event.type == "response.output_text.delta" for event in first)
+        if budget_spent:
+            h.runner.model_state.continuation_owner_id = f"response:{response}"
+            h.runner.model_state.continuation_units = h.runner.model._AUTO_RESPONSE_MAX_CONTINUATION_UNITS
         await h.runner.model._send_one_model_output_event({"is_listen": True, "end_of_turn": True, "model_turn_id": 0})
         terminal = await h.settle()
         assert not any(event.type == "error" for event in first + terminal)
@@ -471,5 +475,126 @@ async def test_terminal_native_listen_keeps_speech_history_waiting_for_playback_
         assert not any(event.type == "error" for event in events)
         assert h.session.history == ({"role": "assistant", "content": "spoken reply"},)
         assert not h.session.pending_history_item_ids
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
+@pytest.mark.asyncio
+async def test_capped_three_stage_listen_discards_unplayed_text(policy):
+    h = await open_harness(stage_count=3)
+    try:
+        h.session.replace_config(replace(h.session.config, playback_commit_policy=policy))
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.runner.model._send_one_model_output_event(
+            {
+                "data_plane_request_id": request_id,
+                "model_turn_id": h.session.turn_id,
+                "stage_role": "tts",
+                "text": "not yet spoken",
+            }
+        )
+        await h.settle()
+        response = h.session.active_response_id
+        assert response is not None
+        assert h.session.capabilities.emits_audio
+        assert max(h.session.playback.sent_ms, h.session.playback.generated_ms) == 0
+        h.runner.model_state.continuation_owner_id = f"response:{response}"
+        h.runner.model_state.continuation_units = h.runner.model._AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+        await h.runner.model._send_one_model_output_event(
+            {"data_plane_request_id": request_id, "model_turn_id": h.session.turn_id, "is_listen": True}
+        )
+        terminal = await h.settle()
+        done = [event for event in terminal if event.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response
+        assert not any(message.get("role") == "assistant" for message in h.session.history)
+        assert not h.session.pending_history_item_ids
+        assert response not in h.session._conversation.assistant_response_snapshots
+        assert response not in h.session._playback.by_response
+        history = h.session.history
+        ack = await h.run(commands.AckPlayback(response_id=response, played_ms=0))
+        assert len(ack) == 1 and ack[0].type == "error"
+        assert ack[0].code == "playback_item_not_found"
+        assert h.session.history == history
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
+@pytest.mark.parametrize("plugin_factory", [_text_plugin, pytest.param(lambda: None, id="speech")])
+@pytest.mark.asyncio
+async def test_normal_completion_releases_zero_audio_conversation_none(policy, plugin_factory):
+    h = await open_harness(plugin=plugin_factory(), stage_count=1)
+    try:
+        h.session.replace_config(replace(h.session.config, playback_commit_policy=policy))
+        h.session.reserve_response_options(ResponseCreateOptions.from_realtime({"conversation": "none"}))
+        await h.runner.model._send_one_model_output_event({"text": "ephemeral reply", "model_turn_id": 0})
+        await h.settle()
+        response = h.session.active_response_id
+        assert response is not None
+        await h.runner.model._send_one_model_output_event({"model_turn_id": 0, "end_of_turn": True})
+        terminal = await h.settle()
+        done = [event for event in terminal if event.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response
+        assert h.session.active_response_id is None
+        assert h.session.history == ()
+        assert not h.session.pending_history_item_ids
+        assert not h.session._conversation.history_item_placeholders
+        assert not h.session._conversation.assistant_response_snapshots
+        assert not h.session._playback.by_response
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
+@pytest.mark.parametrize("plugin_factory", [_text_plugin, pytest.param(lambda: None, id="speech")])
+@pytest.mark.asyncio
+async def test_future_model_turn_releases_zero_audio_conversation_none(policy, plugin_factory):
+    h = await open_harness(plugin=plugin_factory(), stage_count=1)
+    try:
+        h.session.replace_config(replace(h.session.config, playback_commit_policy=policy))
+        h.session.reserve_response_options(ResponseCreateOptions.from_realtime({"conversation": "none"}))
+        await h.runner.model._send_one_model_output_event({"text": "ephemeral reply", "model_turn_id": 0})
+        await h.settle()
+        response = h.session.active_response_id
+        assert response is not None
+        h.runner.model._end_active_response_before_future_model_turn(model_turn_id=1)
+        terminal = await h.settle()
+        done = [event for event in terminal if event.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response
+        assert h.session.active_response_id is None
+        assert h.session.history == ()
+        assert not h.session.pending_history_item_ids
+        assert not h.session._conversation.history_item_placeholders
+        assert not h.session._conversation.assistant_response_snapshots
+        assert not h.session._playback.by_response
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
+@pytest.mark.parametrize("plugin_factory", [_text_plugin, pytest.param(lambda: None, id="speech")])
+@pytest.mark.asyncio
+async def test_nonresumable_completion_releases_zero_audio_conversation_none(policy, plugin_factory):
+    h = await open_harness(plugin=plugin_factory(), stage_count=1)
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)
+        h.session.replace_config(replace(h.session.config, playback_commit_policy=policy))
+        h.session.reserve_response_options(ResponseCreateOptions.from_realtime({"conversation": "none"}))
+        await h.runner.model._send_one_model_output_event({"text": "ephemeral reply", "model_turn_id": 0})
+        await h.settle()
+        response = h.session.active_response_id
+        assert response is not None
+        await h.runner.model.maybe_continue_response(expected_epoch=h.session.epoch, expected_response_id=response)
+        terminal = await h.settle()
+        done = [event for event in terminal if event.type == "response.done"]
+        assert len(done) == 1 and done[0].response_id == response
+        assert h.session.active_response_id is None
+        assert h.session.history == ()
+        assert not h.session.pending_history_item_ids
+        assert not h.session._conversation.history_item_placeholders
+        assert not h.session._conversation.assistant_response_snapshots
+        assert not h.session._playback.by_response
     finally:
         await close_harness(h)

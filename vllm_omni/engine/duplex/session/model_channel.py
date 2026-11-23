@@ -1133,7 +1133,8 @@ class ModelChannel:
                         completed_turn_id = session.active_response_turn_id
                     if completed_turn_id is not None:
                         session.complete_model_turn(completed_turn_id)
-            should_commit = self.should_commit_response_to_history(session, response_id)
+            continuation_limited = auto_response and ended_turn_id is None and not auto_continuations_remaining
+            should_commit = not continuation_limited and self.should_commit_response_to_history(session, response_id)
             committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
             committed = self._settle_finished_response(
                 session,
@@ -1141,11 +1142,6 @@ class ModelChannel:
                 should_commit=should_commit,
                 committed_message=committed_message,
             )
-            if not should_commit:
-                playback = session.playback_for_response(response_id)
-                if max(playback.sent_ms, playback.generated_ms) == 0:
-                    session.release_response_history_snapshot(response_id)
-                    session.release_response_playback(response_id)
             self._out.emit(
                 {
                     "type": "response.done",
@@ -1690,6 +1686,12 @@ class ModelChannel:
                 )
                 or committed
             )
+        else:
+            playback = session.playback_for_response(response_id)
+            if max(playback.sent_ms, playback.generated_ms) == 0:
+                # No audio can be acknowledged to release a discarded reply.
+                session.release_response_history_snapshot(response_id)
+                session.release_response_playback(response_id)
         settle_response_runtime(
             self._ctx.plugin,
             session,

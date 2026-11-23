@@ -67,9 +67,11 @@ on completion or cancellation regardless of playback policy, and release
 playback bookkeeping without ACKs. Whitespace-only output creates no assistant
 history item or snapshot; meaningful emitted text is preserved verbatim.
 A response that starts while its user input is still being received binds to
-that input's next commit. History places that owning input before the reserved
-assistant slot, and later user input after it. A terminal native LISTEN settles
-emitted text through the normal response completion path. With
+that input's next commit. On text-only deployments, history places that owning
+input before the reserved assistant slot, and later user input after it.
+A terminal native LISTEN settles emitted text through the normal response
+completion path. A non-terminal LISTEN that exhausts the auto-response
+continuation budget does not commit unplayed text. With
 `conversation: "none"`, the text remains in protocol output without entering
 history, and zero-audio response bookkeeping is released without an ACK.
 The unconditional bypass is deployment-scoped. On audio-capable deployments,

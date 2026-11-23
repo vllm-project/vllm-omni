@@ -1223,10 +1223,13 @@ remain accepted for client compatibility. Text replies commit the emitted text
 without playback ACKs even under `ack_only`; cancellation retains the emitted
 prefix and discards stale output. Whitespace-only replies are not stored as
 assistant turns; meaningful text retains its emitted whitespace verbatim.
-When a reply starts before its input commits, history places the owning input
-before that reply and subsequent input after it. A terminal native LISTEN
-commits emitted reply text using the same history policy as normal completion;
+On text-only deployments, when a reply starts before its input commits, history
+places the owning input before that reply and subsequent input after it.
+A terminal native LISTEN commits emitted reply text using the same history
+policy as normal completion;
 `conversation: "none"` keeps it out of history while completing cleanup.
+A non-terminal LISTEN that exhausts the auto-response continuation budget does
+not commit unplayed text.
 The unconditional playback-policy bypass applies to deployments without audio
 output. On speech deployments, text replies with zero generated/sent audio and
 no audio-completion dependency commit without an ACK. Text that depends on
