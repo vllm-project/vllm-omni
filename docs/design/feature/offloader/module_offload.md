@@ -24,6 +24,16 @@ The hook moves parameters and buffers without recursively calling
 other transformer blocks. Host tensors are pinned when configured; DTensors
 are not pinned through the ordinary tensor path.
 
+A pipeline can declare immutable DiTs in `OffloadPlan.cpu_master_dit_paths`.
+For selected DiTs on CUDA with supported tensor storage, the sequential hook
+stages parameters and buffers from one CPU master and releases device storage
+on offload without a device-to-host copy. The usual move path handles HSDP and
+unsupported tensor layouts. Decode graphs retain their own fixed device
+staging policy so captured weight addresses stay valid.
+Pipelines can also opt immutable encoder parameters in via
+`OffloadPlan.cpu_master_encoder_paths`. Encoder buffers use regular device
+moves so updates made during forward survive offload and reload.
+
 Before forward returns control to the model, the hook synchronizes the active
 platform so compute cannot race the transfer. XPU uses blocking device-to-host
 copies because its allocator cannot safely evict storage while an asynchronous

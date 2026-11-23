@@ -100,6 +100,7 @@ class PinnedModuleStager:
     after each forward. In inference the weights are immutable, so retain one
     pinned CPU master instead. ``load`` materializes device storage from that
     master; ``offload`` only rebinds Parameters and buffers to the master.
+    Set ``include_buffers=False`` when the caller manages mutable buffers.
 
     A module iterable is treated as one staging group. It uses one copy stream
     and one reusable completion event. Tensors sharing storage keep their
@@ -121,6 +122,7 @@ class PinnedModuleStager:
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
         retain_device_storage: bool = False,
+        include_buffers: bool = True,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -131,8 +133,9 @@ class PinnedModuleStager:
         self._ready_event = current_omni_platform.Event()
         self.cache_retention = cache_retention
         self.retain_device_storage = retain_device_storage
+        self.include_buffers = include_buffers
         self.loaded = False
-        self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
+        self._groups = self._snapshot_groups(modules, pin_memory=pin_memory, include_buffers=include_buffers)
         self._device_storages: list[torch.Tensor] = []
         self._restore_masters()
 
@@ -146,10 +149,13 @@ class PinnedModuleStager:
         modules: tuple[nn.Module, ...],
         *,
         pin_memory: bool,
+        include_buffers: bool,
     ) -> list[_StorageGroup]:
         targets: list[torch.Tensor] = []
         seen_targets: set[int] = set()
-        for target in chain.from_iterable(chain(item.parameters(), item.buffers()) for item in modules):
+        for target in chain.from_iterable(
+            chain(item.parameters(), item.buffers()) if include_buffers else item.parameters() for item in modules
+        ):
             if id(target) not in seen_targets:
                 seen_targets.add(id(target))
                 targets.append(target)

@@ -24,6 +24,7 @@ import json
 import os
 from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from typing import Any, ClassVar, cast
 
 import PIL.Image
@@ -241,6 +242,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
     _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+        cpu_master_dit_paths=frozenset({"transformer"}),
         resident_dit_paths=frozenset({"transformer"}),
         block_attrs={"transformer": ("single_stream_layers", "double_stream_layers")},
     )
@@ -294,6 +296,17 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             revision=od_config.revision,
         )
         self.mllm = self._load_mllm(model, local_files_only, mllm_quant_config, boogu_subfolders)
+        if isinstance(self.mllm, Qwen3VLModel):
+            config = self.mllm.config
+            quantization = getattr(config, "quantization_config", None)
+            method = (
+                quantization.get("quant_method")
+                if isinstance(quantization, dict)
+                else getattr(quantization, "quant_method", None)
+            )
+            rope = getattr(config.text_config, "rope_parameters", None) or {}
+            if method == "fp8" and rope.get("rope_type", "default") == "default":
+                self._offload_plan = replace(self._offload_plan, cpu_master_encoder_paths=frozenset({"mllm"}))
 
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,

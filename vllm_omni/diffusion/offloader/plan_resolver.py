@@ -70,6 +70,8 @@ class ResolvedComponent:
     means the pipeline owns its residency through ``load_to_device`` /
     ``offload_to_cpu``; a VAE staged by a legacy model plan is ``on_demand``
     without being selectable through the public component grammar.
+    ``cpu_master`` opts a selected component into immutable host-backed staging
+    during model-level offload.
     """
 
     path: str
@@ -80,6 +82,7 @@ class ResolvedComponent:
     # Submodules of a DiT that are large enough to own their residency instead
     # of staying resident with the rest of its non-block state.
     children: tuple[ResolvedComponent, ...] = ()
+    cpu_master: bool = False
 
 
 @dataclass(frozen=True)
@@ -362,6 +365,12 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
                 selected=dit_selected,
                 stacks=stacks,
                 children=children,
+                cpu_master=(
+                    dit_selected
+                    and config.strategy is OffloadStrategy.MODEL_LEVEL
+                    and declaration is not None
+                    and path in declaration.cpu_master_dit_paths
+                ),
             )
         )
 
@@ -392,6 +401,12 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
                 selected=selected,
                 stacks=stacks,
                 on_demand=on_demand,
+                cpu_master=(
+                    selected
+                    and config.strategy is OffloadStrategy.MODEL_LEVEL
+                    and declaration is not None
+                    and path in declaration.cpu_master_encoder_paths
+                ),
             )
         )
 
