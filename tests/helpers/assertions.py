@@ -951,15 +951,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     response_format=request_config.get("response_format"),
                 )
         if "text" in modalities:
-            text_content = response.text_content
-            if request_config.get("allow_reasoning", False):
-                content = (text_content or "").strip()
-                reasoning = (response.reasoning_content or "").strip()
-                text_content = content or reasoning
-                assert text_content, "No text output is generated"
-            else:
-                assert text_content is not None, "No text output is generated"
-            print(f"text content is: {text_content}")
+            assert response.text_content is not None, "No text output is generated"
+            print(f"text content is: {response.text_content}")
 
         # Verify keywords in output
         word_types = ["text", "image", "audio", "video"]
@@ -968,7 +961,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
             keywords = keywords_dict.get(word_type)
             if "text" in modalities:
                 if keywords:
-                    text_lower = text_content.lower()
+                    text_lower = response.text_content.lower()
                     assert any(str(kw).lower() in text_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
