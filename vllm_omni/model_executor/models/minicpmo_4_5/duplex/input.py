@@ -195,6 +195,14 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     def has_pending(self) -> bool:
         return bool(self._buffer or self._vision_queue)
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        if self._vision_queue:
+            return True
+        if self._sample_rate_hz is None:
+            return False
+        min_samples = max(1, int(self._sample_rate_hz * max(1, int(chunk_period_ms)) / 1000))
+        return len(self._buffer) >= min_samples * 4
+
     def has_reserved(self) -> bool:
         return bool(self._reservations)
 

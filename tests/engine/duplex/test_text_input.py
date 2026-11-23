@@ -4,12 +4,20 @@
 """Native text appends share ordering, admission, and cancellation with media."""
 
 import asyncio
+import base64
 
 import pytest
 import torch
 
 from tests.engine.duplex.test_minicpmo_window_plugin import _stub_tokenizer
-from tests.engine.duplex.test_session_runner import append_audio, close_harness, listen_output, open_harness, types
+from tests.engine.duplex.test_session_runner import (
+    append_audio,
+    close_harness,
+    listen_output,
+    open_harness,
+    tts_output,
+    types,
+)
 from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime
 from tests.model_executor.models.minicpmo_4_5.test_native_duplex_sampling import (
     LISTEN,
@@ -62,11 +70,15 @@ async def test_text_fragments_prefill_in_order_with_audio_without_flushing_parti
 
 
 @pytest.mark.asyncio
-async def test_unforced_text_continues_after_an_empty_model_unit():
+@pytest.mark.parametrize("buffered_samples", [0, 8000])
+async def test_unforced_text_continues_after_an_empty_model_unit(buffered_samples):
     h = await open_harness()
     try:
         await h.run(commands.AppendText(text="Remember blue whale.", force_listen=True))
         assert h.session.active_response_id is None
+        if buffered_samples:
+            await h.run(append_audio(samples=buffered_samples))
+        assert h.session.pending_input_bytes == buffered_samples * 4
         events = await h.run(commands.AppendText(text="Say it now."))
         assert "response.created" in types(events)
         response_id = h.session.active_response_id
@@ -88,6 +100,119 @@ async def test_unforced_text_continues_after_an_empty_model_unit():
         assert len(h.port.submissions) == 3
         assert h.runner.model_state.continuation_units == 1
         assert h.session.active_response_id == response_id
+        assert (
+            h.session.pending_input_bytes
+            == h.runner.model_state.audio_buffer.pending_byte_count
+            == buffered_samples * 4
+        )
+
+        # A subsequent speech unit also continues without consuming the partial
+        # microphone input, and the model's terminal closes the same response.
+        await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), text="blue whale", tts_is_last_chunk=True, finished=True)
+        )
+        assert len(h.port.submissions) == 4
+        events = await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), text="blue whale", tts_is_last_chunk=True, turn_end=True, finished=True)
+        )
+        done = [event for event in events if event.type == "response.done"]
+        assert len(done) == 1
+        assert done[0].response_id == response_id
+        assert done[0].status == "completed"
+        assert h.session.pending_input_bytes == buffered_samples * 4
+        if buffered_samples:
+            tail = append_audio(samples=16000 - buffered_samples, value=0.1)
+            await h.run(tail)
+            payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+            assert base64.b64decode(payload["audio"]) == append_audio(samples=buffered_samples).audio + tail.audio
+            assert h.session.pending_input_bytes == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_text_continuation_rearms_after_queued_audio_stays_partial(monkeypatch):
+    h = await open_harness()
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        await h.run(append_audio(samples=4000))
+        await h.run(commands.AppendText(text="Answer now."))
+        response_id = h.session.active_response_id
+        original = h.runner.control.run_turn_detection
+
+        async def blocked_turn_detection(event):
+            entered.set()
+            await release.wait()
+            return await original(event)
+
+        monkeypatch.setattr(h.runner.control, "run_turn_detection", blocked_turn_detection)
+        h.submit(append_audio(samples=4000))
+        h.submit(append_audio(samples=4000))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await h.runner.model.maybe_continue_response(expected_epoch=h.session.epoch, expected_response_id=response_id)
+        assert len(h.port.submissions) == 1
+        assert h.runner._deferred_silence is not None
+        # A rearm that races another queued append must retain the retry even
+        # though the buffer already contains part of a microphone unit.
+        await h.runner._rearm_deferred_silence()
+        assert h.runner._deferred_silence is not None
+        release.set()
+        events = await h.settle()
+        assert "error" not in types(events)
+        assert len(h.port.submissions) == 2
+        assert h.runner.model_state.continuation_units == 1
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 12000 * 4
+        payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert set(base64.b64decode(payload["audio"])) == {0}
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_text_continuation_does_not_skip_a_complete_buffered_audio_unit():
+    h = await open_harness()
+    try:
+        await h.run(append_audio(samples=32000))
+        await h.run(commands.AppendText(text="Answer now."))
+        assert h.session.pending_input_bytes == 16000 * 4
+        await h.runner.model.maybe_continue_response(
+            expected_epoch=h.session.epoch, expected_response_id=h.session.active_response_id
+        )
+        assert len(h.port.submissions) == 2
+        assert h.runner.model_state.continuation_units == 0
+        assert h.session.pending_input_bytes == 16000 * 4
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_text_continuation_exception_does_not_apply_to_a_later_audio_response():
+    h = await open_harness()
+    try:
+        await h.run(append_audio(samples=8000))
+        await h.run(commands.AppendText(text="Answer now."))
+        text_response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(h.stage0_request_id(), tts_is_last_chunk=True, turn_end=True, finished=True)
+        )
+        assert h.session.active_response_id is None
+        # One new audio unit is submitted, with the original half-unit's size
+        # left buffered. It must block the audio-only response as before.
+        await h.run(append_audio())
+        await h.deliver_and_settle(
+            tts_output(
+                h.stage0_request_id(),
+                samples=48000,  # Audio snapshots accumulate across model turns.
+                turn_id=h.session.turn_id,
+                tts_is_last_chunk=True,
+                finished=True,
+            )
+        )
+        assert h.session.active_response_id not in (None, text_response_id)
+        assert len(h.port.submissions) == 2
+        assert h.runner.model_state.continuation_units == 0
+        assert h.session.pending_input_bytes == 8000 * 4
     finally:
         await close_harness(h)
 

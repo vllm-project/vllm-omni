@@ -159,6 +159,14 @@ class PcmAppendBuffer(ABC):
     @abstractmethod
     def has_pending(self) -> bool: ...
 
+    def has_ready_unit(self, *, chunk_period_ms: int) -> bool:
+        """Whether buffered input can precede a text response's continuation.
+
+        Buffers that distinguish incomplete media from ready units may override
+        this; otherwise every pending input keeps priority over generated silence.
+        """
+        return self.has_pending()
+
     @abstractmethod
     def has_reserved(self) -> bool: ...
 

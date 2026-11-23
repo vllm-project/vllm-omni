@@ -2246,7 +2246,13 @@ and audio events, then release it on the final text fragment. The low-level
 
 Text and completed media units use the same ordered append queue. A partial
 microphone unit stays buffered while a text unit is prefilled; text does not
-advance the audio clock or consume the partial PCM. Text is subject to the
+advance the audio clock or consume the partial PCM. With the default silence
+continuation enabled, that partial unit does not block the text-triggered
+response from continuing. The buffered audio reaches the model only when
+later audio completes its unit or an audio commit flushes it. To include all
+microphone samples in the answer, finish or commit the audio before releasing
+the final text fragment. Queued appends and complete media units retain
+priority over generated silence. Text is subject to the
 session's pending-input byte limit, counted as UTF-8. Empty text and manual
 `auto_response: false` sessions are rejected. This capability is separate from
 `supports_text_only_turn`, which controls `conversation.item.create` followed

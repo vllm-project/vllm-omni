@@ -290,6 +290,9 @@ class DuplexSessionRunner:
         # too, even before it reaches the PCM buffer. Continuations must not
         # insert a synthetic frame ahead of that already-received audio.
         self._pending_input_appends = 0
+        # Only this response may continue past an incomplete microphone unit;
+        # a later audio-only response must retain the usual input priority.
+        self._text_response_id: str | None = None
         # Set when a continuation bails because of that counter, and replayed
         # only if the append then submits nothing (overlap drop / ack /
         # continue_output). A real submission clears it.
@@ -1191,6 +1194,8 @@ class DuplexSessionRunner:
                     final=False,
                     precreate_response=command.force_listen is not True,
                 )
+                if command.force_listen is not True:
+                    self._text_response_id = session.active_response_id
                 release = reservation.pop_all().close
                 task.add_done_callback(lambda _done: release())
         elif isinstance(command, Commit):
@@ -2146,11 +2151,15 @@ class DuplexSessionRunner:
 
     def _real_input_waiting(self) -> bool:
         self._clear_completed_pending_silence()
-        return (
-            self._pending_input_appends > 0
-            or self.model_state.audio_buffer.has_pending()
-            or self.model_state.audio_buffer.has_reserved()
-        )
+        buffer = self.model_state.audio_buffer
+        if self._pending_input_appends > 0 or buffer.has_reserved():
+            return True
+        if self._text_response_id is not None and self._text_response_id == self.session.active_response_id:
+            # Text can release a reply without an audio commit. Keep partial PCM
+            # buffered and charged, but do not let it stall that reply forever.
+            # Complete audio/vision units still precede generated silence.
+            return buffer.has_ready_unit(chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000)
+        return buffer.has_pending()
 
     async def _start_append(
         self,
@@ -2427,8 +2436,9 @@ class DuplexSessionRunner:
         deferred = self._deferred_silence
         if deferred is None or self.run.closing:
             return
-        buffer = self.model_state.audio_buffer
-        if self._pending_input_appends > 0 and not (buffer.has_pending() or buffer.has_reserved()):
+        if self._pending_input_appends > 0:
+            # The final queued append will rearm us. It may leave only partial
+            # PCM, which no longer blocks a text-opened response.
             return
         # A model-turn continuation stored no response id. A response that
         # began since then (queued stage output can begin_response before this

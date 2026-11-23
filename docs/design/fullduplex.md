@@ -57,6 +57,12 @@ assistant turn once during prefill, since text has no microphone silence
 marking the end of input. The runner creates its response before submission;
 an empty `<|chunk_eos|>` unit returns directly to the session to advance the
 normal continuation clock instead of waiting for nonexistent Talker output.
+For a response released by unforced text, incomplete buffered PCM does not
+block that clock. The PCM remains charged and unconsumed; queued appends,
+reserved input, and complete audio or vision units retain priority over
+generated silence. This exception belongs to that response ID and does not
+carry over to a later audio-only response. Disabling silence continuation or
+using the input clock still prevents synthetic units.
 The Talker handoff skips those completed control units in cumulative output
 before aligning the next speech unit's text and hidden states.
 Replayed prefill cannot reopen an ended reply. This does not change the separate
