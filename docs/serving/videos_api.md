@@ -257,8 +257,12 @@ acceleration, including `quality=high`, when using Heun.
 
 ### MiniMax H3 control and inpainting
 
-MiniMax H3 FL2VA accepts preprocessed control videos when the server is
+MiniMax H3 FL2VA (T2VA requests) and the FastH3 Omni checkpoint (Ref2VA requests
+with references) accept preprocessed control videos when the server is
 started with `--controlnet-model-path /absolute/path/to/control.safetensors`.
+A control request may include `input_reference`/`input_references` or other
+reference inputs only when `extra_params.task` is `ref2va`; keyframes,
+latent-mask editing and continuation are rejected with control.
 Use the original MiniMax H3 Fun ControlNet Union checkpoint. The checkpoint
 is loaded at startup; requests cannot select or download weights.
 
@@ -453,10 +457,11 @@ curl -s http://localhost:8091/v1/videos/sync \
   output canvas and shortened to `5 + 17k` frames (1-4 frames keep the first
   frame); the result must fit in `[start, N)`. Audio starts at the same frame
   and is cropped to the remaining timeline.
-- Guided requests need base H3 weights, `quality=lossless`, and the media
-  encoder in the diffusion stage. Cache acceleration, FastH3, LoRA/Turbo,
-  distilled schedules, continuation, latent refine/upscale, latent-mask editing,
-  and `audio_mode=lock_source` are rejected. With first/last frames, the FL2VA
+- Guided requests need base H3 weights or the FastH3 Omni checkpoint (Ref2VA,
+  on its pinned eight-step schedule), `quality=lossless`, and the media encoder
+  in the diffusion stage. Cache acceleration, FastH3 Preview/V2, LoRA/Turbo,
+  other distilled schedules, continuation, latent refine/upscale, latent-mask
+  editing, and `audio_mode=lock_source` are rejected. With first/last frames, the FL2VA
   keyframes are packed as image guides; with references, references are scaled
   down to the output area.
 
