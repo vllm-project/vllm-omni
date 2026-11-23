@@ -17,14 +17,16 @@ vLLM-Omni currently recommends using the Docker image setup steps below.
 vLLM-Omni is built on vLLM. The XPU builds of vLLM and PyTorch are not on PyPI,
 and `requirements/xpu.txt` does not install them. Install vLLM for XPU first,
 following the
-[vLLM XPU installation guide](https://docs.vllm.ai/en/v0.33.0/getting_started/installation/gpu/index.html)
+[vLLM XPU installation guide](https://github.com/vllm-project/vllm/blob/v0.34.0/docs/getting_started/installation/gpu.xpu.inc.md)
 for the version that `docker/Dockerfile.xpu` targets (`VLLM_VERSION`, currently
-v0.33.0), including the oneAPI runtime packages it lists for XPU graph support.
+v0.34.0), including the oneAPI runtime packages it lists for XPU graph support.
 
 #### Installation of vLLM-Omni
 
 XPU wheels of vLLM-Omni are published to their own index, separate from the
-default (CUDA) wheels. Replace `<version>` with the release, for example `0.33.0`:
+default (CUDA) wheels. Replace `<version>` with a published Omni release and
+install that release's matching vLLM XPU runtime first. To use this source
+checkout with vLLM 0.34, follow the source installation or Docker steps below:
 
 ```bash
 uv pip install vllm-omni --extra-index-url https://wheels.vllm.ai/omni/v<version>/xpu \
@@ -64,13 +66,13 @@ XPU runtime acceptance remains pending.
 #### Build docker image
 
 ```bash
-export VLLM_VERSION=v0.33.0
+export VLLM_VERSION=v0.34.0
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.xpu -t vllm-omni-xpu --shm-size=4g \
   --build-arg VLLM_VERSION="$VLLM_VERSION" .
 ```
 
 This layers vLLM-Omni on top of the selected `vllm/vllm-openai-xpu:<VLLM_VERSION>`
-base image. The Dockerfile targets the published v0.33.0 tag; if the image
+base image. The Dockerfile targets the published v0.34.0 tag; if the image
 cannot be fetched, build the upstream source image at that tag as shown below. Keep its
 PyTorch and Triton packages paired. The Dockerfile retains the upstream runtime instead of
 replacing Triton with the older `triton-xpu` package, and checks installed

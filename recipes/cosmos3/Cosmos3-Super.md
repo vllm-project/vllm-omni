@@ -19,6 +19,15 @@ recommended parallelism differ. Mode is selected per request (T2I →
 `/v1/images/generations`; T2V/I2V/V2V → `/v1/videos/sync`; add
 `generate_sound=true` for audio).
 
+T2I with `n > 1` keeps the serial per-image loop under tensor, sequence, CFG or
+pipeline parallelism, HSDP and cache backends, which covers every command below.
+Other configurations, including the data-parallel commands in
+[Cosmos3-DistOffload](./Cosmos3-DistOffload.md), run the images as one batched
+denoising loop, so they can differ from earlier releases for the same seed,
+usually slightly. With layerwise offload under `torch.compile`, they can also
+differ slightly from batched images without offload. Start the server with `--additional-config '{"cosmos3_batch_t2i_outputs": false}'`
+to keep the serial loop everywhere.
+
 ## References
 
 - Model card (authoritative usage + example assets): <https://huggingface.co/nvidia/Cosmos3-Super>
