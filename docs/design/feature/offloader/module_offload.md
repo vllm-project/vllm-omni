@@ -46,6 +46,12 @@ Pipelines can also opt immutable encoder parameters in via
 `OffloadPlan.cpu_master_encoder_paths`. Encoder buffers use regular device
 moves so updates made during forward survive offload and reload.
 
+Compatible CUDA hooks can retain a bounded subset of immutable storages across
+swaps. The stager selects whole physical storages largest first and counts
+aliases once. Uncached storages still load from the CPU master on demand. On a
+load OOM, the stager releases its cached weights and retries once without
+retention. Fixed-address staging for decode graphs uses a separate policy.
+
 Before forward returns control to the model, the hook synchronizes the active
 platform so compute cannot race the transfer. XPU uses blocking device-to-host
 copies because its allocator cannot safely evict storage while an asynchronous

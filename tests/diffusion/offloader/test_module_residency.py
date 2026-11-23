@@ -165,6 +165,32 @@ def test_staging_transitions_are_idempotent_and_reuse_one_event(patched_runtime,
     retention.release_if_needed.assert_called_once_with(force=False)
 
 
+def test_residency_budget_keeps_one_physical_storage(patched_runtime):
+    left, right = _aliased_modules()
+    weight_storage = left.weight.untyped_storage()
+    master_pointer = weight_storage.data_ptr()
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=False,
+        resident_weight_bytes=weight_storage.nbytes(),
+    )
+    stager.load()
+    resident_pointer = left.weight.untyped_storage().data_ptr()
+    assert resident_pointer != master_pointer
+    stager.offload()
+
+    assert left.weight.untyped_storage().data_ptr() == master_pointer
+    assert [storage.data_ptr() for storage in stager._resident_storages.values()] == [resident_pointer]
+    assert not stager._device_storages
+
+    stager.load()
+    assert left.weight.untyped_storage().data_ptr() == resident_pointer
+    assert right.weight.untyped_storage().data_ptr() == resident_pointer
+    assert (left.weight.storage_offset(), right.weight.storage_offset()) == (0, 4)
+    torch.testing.assert_close(left.weight, torch.arange(8, dtype=torch.float32).reshape(2, 4))
+
+
 def test_failed_load_restores_master_and_forces_cache_release(monkeypatch, patched_runtime, mocker):
     module = nn.Linear(2, 2)
     expected = module.weight.detach().clone()
@@ -193,7 +219,8 @@ def test_failed_load_restores_master_and_forces_cache_release(monkeypatch, patch
     retention.release_if_needed.assert_called_once_with(force=True)
 
 
-def test_out_of_memory_releases_cache_and_retries_once(monkeypatch, patched_runtime, mocker):
+@pytest.mark.parametrize("resident_weight_bytes", [0, 16])
+def test_out_of_memory_releases_cache_and_retries_once(monkeypatch, patched_runtime, mocker, resident_weight_bytes):
     module = nn.Linear(2, 2)
     retention = mocker.Mock(spec=BoundedAllocatorCache)
     stager = PinnedModuleStager(
@@ -201,7 +228,12 @@ def test_out_of_memory_releases_cache_and_retries_once(monkeypatch, patched_runt
         torch.device("cpu"),
         pin_memory=False,
         cache_retention=retention,
+        resident_weight_bytes=resident_weight_bytes,
     )
+    stager.load()
+    stager.offload()
+    assert bool(stager._resident_storages) == bool(resident_weight_bytes)
+    retention.reset_mock()
     load_once = stager._load_once
     attempts = 0
 
@@ -217,6 +249,8 @@ def test_out_of_memory_releases_cache_and_retries_once(monkeypatch, patched_runt
 
     assert stager.loaded
     assert attempts == 2
+    assert not stager._resident_storages
+    assert not stager._resident_indices
     retention.release_if_needed.assert_called_once_with(force=True)
 
 

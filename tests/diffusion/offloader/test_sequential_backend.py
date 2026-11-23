@@ -391,10 +391,21 @@ def test_model_level_cpu_master_reuses_host_storage(
         stager_type = sequential_backend.PinnedModuleStager
 
         def stage_on_cpu(
-            module: nn.Module, device: torch.device, *, pin_memory: bool, include_buffers: bool
+            module: nn.Module,
+            device: torch.device,
+            *,
+            pin_memory: bool,
+            include_buffers: bool,
+            resident_weight_bytes: int,
         ) -> sequential_backend.PinnedModuleStager:
             assert device == cuda
-            return stager_type(module, cpu, pin_memory=pin_memory, include_buffers=include_buffers)
+            return stager_type(
+                module,
+                cpu,
+                pin_memory=pin_memory,
+                include_buffers=include_buffers,
+                resident_weight_bytes=resident_weight_bytes,
+            )
 
         patch_offload_runtime(monkeypatch, current_omni_platform, synchronize=True)
         monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda: 0)
@@ -435,8 +446,11 @@ def test_model_level_cpu_master_reuses_host_storage(
     assert dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME) is None
 
 
-def test_model_level_encoder_cpu_master_preserves_mutable_buffers(accelerator_device: torch.device) -> None:
-    if accelerator_device.type != "cuda":
+@pytest.mark.parametrize("resident_mib", [0, 1])
+def test_model_level_encoder_cpu_master_preserves_mutable_buffers(
+    accelerator_device: torch.device, resident_mib: int
+) -> None:
+    if not current_omni_platform.is_cuda():
         pytest.skip("CUDA required for encoder CPU master staging")
 
     class Encoder(nn.Module):
@@ -453,7 +467,9 @@ def test_model_level_encoder_cpu_master_preserves_mutable_buffers(accelerator_de
     pipeline.text_encoder = encoder = Encoder()
     pipeline.transformer = nn.Identity()
     pipeline._offload_plan = OffloadPlan(cpu_master_encoder_paths=frozenset({"text_encoder"}))
-    backend = ModelLevelOffloadBackend(OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL), accelerator_device)
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, resident_mib_per_module=resident_mib), accelerator_device
+    )
     backend.enable(pipeline)
 
     hook = encoder._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
@@ -467,6 +483,7 @@ def test_model_level_encoder_cpu_master_preserves_mutable_buffers(accelerator_de
         assert encoder.counter.item() == counter
         assert encoder.weight.data_ptr() == master_ptr
         assert not hook._stager._device_storages
+        assert len(hook._stager._resident_storages) == bool(resident_mib)
 
     backend.disable()
 

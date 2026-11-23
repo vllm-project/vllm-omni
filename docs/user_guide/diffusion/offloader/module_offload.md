@@ -44,6 +44,24 @@ lifecycles do not need to migrate until equivalent component coverage exists.
 For example, MiniMax-H3's compatibility lifecycle also stages its VAEs, while
 the compact selector intentionally covers only `dit` and `text_encoder`.
 
+### Keep some weights on the GPU
+
+For Boogu-Image on CUDA, `resident_mib_per_module` in the module offload
+configuration can trade extra GPU memory for fewer weight transfers on repeated
+requests. The default is `0`. It applies to the DiT and to the supported FP8
+Qwen3-VL encoder. Set it only if you have VRAM headroom during inference.
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Base-fp8 \
+  --omni \
+  --diffusion-quantization-config '{"transformer":{"method":"torchao_float8_weight_only"}}' \
+  --diffusion-offload-config '{"mode":"module","components":["dit","text_encoder"],"resident_mib_per_module":4096}'
+```
+
+The value caps retained weights **per module**. With both modules selected,
+each can retain up to that amount while offloaded. Activations, workspace,
+and allocator overhead also count toward total GPU usage.
+
 ## Model integration
 
 Pipelines should implement `SupportsComponentDiscovery`:

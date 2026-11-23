@@ -852,6 +852,19 @@ class TestLayerwiseComponentConfig:
         assert config.strategy is OffloadStrategy.LAYER_WISE
         assert config.components is None
 
+    def test_module_resident_mib_is_forwarded_to_the_backend(self):
+        config = _resolve_offload_config(
+            {"mode": "module", "components": ["dit", "text_encoder"], "resident_mib_per_module": 4096}
+        )
+
+        assert config.strategy is OffloadStrategy.MODEL_LEVEL
+        assert config.resident_mib_per_module == 4096
+
+    @pytest.mark.parametrize(("mode", "budget"), [("module", True), ("module", -1), ("layer", 1)])
+    def test_invalid_module_residency_budget_is_rejected(self, mode, budget):
+        with pytest.raises(ValueError, match="resident_mib_per_module"):
+            _resolve_offload_config({"mode": mode, "components": ["dit"], "resident_mib_per_module": budget})
+
     def test_offload_resolution_is_cached_for_runtime_accessors(self, monkeypatch):
         import vllm_omni.diffusion.offloader.config as config_module
 

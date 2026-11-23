@@ -61,7 +61,7 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears
-from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
@@ -243,6 +243,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
 
     _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
         cpu_master_dit_paths=frozenset({"transformer"}),
+        encoder_component_types={"mllm": TEXT_ENCODER_COMPONENT},
         resident_dit_paths=frozenset({"transformer"}),
         block_attrs={"transformer": ("single_stream_layers", "double_stream_layers")},
     )

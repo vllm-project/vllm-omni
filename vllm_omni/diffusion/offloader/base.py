@@ -78,6 +78,7 @@ class OffloadConfig:
     # a frozenset is an explicit compact-API selection.
     components: frozenset[str] | None = None
     dlo_transfers: dict[str, DLOTransfer] | None = None
+    resident_mib_per_module: int = 0
 
     def __post_init__(self) -> None:
         if self.components is not None:
@@ -219,6 +220,7 @@ class OffloadConfig:
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
             components=components,
             dlo_transfers=dlo_transfers,
+            resident_mib_per_module=public_config.resident_mib_per_module if public_config is not None else 0,
         )
 
 

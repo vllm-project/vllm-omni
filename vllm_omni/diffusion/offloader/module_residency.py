@@ -448,6 +448,8 @@ class PinnedModuleStager:
     immutable, so no H2D copy repeats). The stable storage addresses keep
     CUDA-graph-captured weight pointers valid across offload/load swaps, at
     the cost of keeping the device storage resident while offloaded.
+    ``resident_weight_bytes`` instead retains a bounded subset of whole storage
+    groups and reloads the rest from the CPU master.
     """
 
     def __init__(
@@ -460,10 +462,13 @@ class PinnedModuleStager:
         cache_retention: BoundedAllocatorCache | None = None,
         retain_device_storage: bool = False,
         include_buffers: bool = True,
+        resident_weight_bytes: int = 0,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
             raise ValueError("PinnedModuleStager requires at least one nn.Module")
+        if resident_weight_bytes and retain_device_storage:
+            raise ValueError("A resident weight budget cannot be combined with fixed device staging")
 
         self.device = device
         self.copy_stream = copy_stream if copy_stream is not None else current_omni_platform.Stream()
@@ -479,6 +484,20 @@ class PinnedModuleStager:
             include_buffers=include_buffers,
         )
         self._device_storages: list[torch.Tensor] = []
+        self._resident_indices: list[int] = []
+        self._resident_storages: dict[int, torch.Tensor] = {}
+        if resident_weight_bytes:
+            remaining = resident_weight_bytes
+            sizes = [group.master.numel() for group in self._groups]
+            for index in sorted(range(len(sizes)), key=sizes.__getitem__, reverse=True):
+                if 0 < sizes[index] <= remaining:
+                    self._resident_indices.append(index)
+                    remaining -= sizes[index]
+            logger.info(
+                "Model-level offload can retain %d bytes for %s between swaps",
+                resident_weight_bytes - remaining,
+                type(modules[0]).__name__,
+            )
         self._restore_masters()
 
     @staticmethod
@@ -536,12 +555,17 @@ class PinnedModuleStager:
             self.cache_retention.release_if_needed(force=force)
 
     def _load_once(self) -> None:
-        device_storages = [torch.empty_like(group.master, device=self.device) for group in self._groups]
+        resident = self._resident_storages
+        device_storages = [
+            resident[index] if index in resident else torch.empty_like(group.master, device=self.device)
+            for index, group in enumerate(self._groups)
+        ]
         compute_stream = current_omni_platform.current_stream()
         self.copy_stream.wait_stream(compute_stream)
         with current_omni_platform.stream(self.copy_stream):
-            for device_storage, group in zip(device_storages, self._groups):
-                device_storage.copy_(group.master, non_blocking=group.master.is_pinned())
+            for index, (device_storage, group) in enumerate(zip(device_storages, self._groups)):
+                if index not in resident:
+                    device_storage.copy_(group.master, non_blocking=group.master.is_pinned())
             self._ready_event.record(self.copy_stream)
 
         self._bind(device_storages)
@@ -556,6 +580,7 @@ class PinnedModuleStager:
             logger.debug("Device synchronization failed while cleaning up module staging", exc_info=True)
         self._restore_masters()
         self._device_storages.clear()
+        self._resident_storages.clear()
         self.loaded = False
         self._release_cache(force=True)
 
@@ -574,6 +599,7 @@ class PinnedModuleStager:
             # A retained cache is normally reusable by this process, but an
             # explicit flush gives external memory pressure one bounded retry.
             self._cleanup_failed_load()
+            self._resident_indices.clear()
             try:
                 self._load_once()
             except BaseException:
@@ -594,10 +620,12 @@ class PinnedModuleStager:
             self._restore_masters()
         except BaseException:
             self._device_storages.clear()
+            self._resident_storages.clear()
             self.loaded = False
             self._release_cache(force=True)
             raise
         if not self.retain_device_storage:
+            self._resident_storages = {index: self._device_storages[index] for index in self._resident_indices}
             self._device_storages.clear()
         self.loaded = False
         self._release_cache()

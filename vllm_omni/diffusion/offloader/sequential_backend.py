@@ -66,6 +66,7 @@ class SequentialOffloadHook(ModelHook):
         persistent_staging: bool = False,
         cpu_master: bool = False,
         stage_buffers: bool = True,
+        resident_weight_bytes: int = 0,
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
@@ -76,6 +77,7 @@ class SequentialOffloadHook(ModelHook):
         self.persistent_staging = persistent_staging
         self.cpu_master = cpu_master and device.type == "cuda" and not use_hsdp
         self.stage_buffers = stage_buffers
+        self.resident_weight_bytes = resident_weight_bytes
         self._stager: PinnedModuleStager | None = None
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
@@ -99,7 +101,11 @@ class SequentialOffloadHook(ModelHook):
             for tensor in chain(module.parameters(), module.buffers() if self.stage_buffers else ())
         ):
             self._stager = PinnedModuleStager(
-                module, self.device, pin_memory=self.pin_memory, include_buffers=self.stage_buffers
+                module,
+                self.device,
+                pin_memory=self.pin_memory,
+                include_buffers=self.stage_buffers,
+                resident_weight_bytes=self.resident_weight_bytes,
             )
             logger.info("Model-level offload uses CPU master staging for %s", type(module).__name__)
         return module
@@ -212,6 +218,7 @@ def apply_sequential_offload(
     persistent_dit_staging: bool = False,
     cpu_master_dit_modules: Collection[nn.Module] = (),
     cpu_master_encoder_modules: Collection[nn.Module] = (),
+    resident_weight_bytes: int = 0,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -238,6 +245,8 @@ def apply_sequential_offload(
             immutable CPU masters, with device storage released on offload.
         cpu_master_encoder_modules: Selected encoders eligible for parameter-only
             CPU staging. Their buffers keep the ordinary move semantics.
+        resident_weight_bytes: Maximum retained device weight bytes per
+            CPU-master-staged module after an offload.
 
     Example:
         >>> apply_sequential_offload(
@@ -274,6 +283,7 @@ def apply_sequential_offload(
                 offload_after_context=id(dit_mod) in selected_dit_ids,
                 persistent_staging=persistent_dit_staging,
                 cpu_master=id(dit_mod) in cpu_master_dit_ids,
+                resident_weight_bytes=resident_weight_bytes,
             )
             registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
             logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
@@ -291,6 +301,7 @@ def apply_sequential_offload(
                 offload_after_context=id(enc) in selected_encoder_ids,
                 cpu_master=id(enc) in cpu_master_encoder_ids,
                 stage_buffers=False,
+                resident_weight_bytes=resident_weight_bytes,
             )
             registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
             logger.debug("Registered offload hook for %s", enc.__class__.__name__)
@@ -389,6 +400,15 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.warning("ModelLevelOffloadBackend already enabled")
             return
 
+        resident_weight_bytes = self.config.resident_mib_per_module * 1024**2
+        if resident_weight_bytes and (
+            not current_omni_platform.is_cuda()
+            or self.device.type != "cuda"
+            or self.config.use_hsdp
+            or isinstance(pipeline, SupportsModelCpuOffload)
+        ):
+            raise ValueError("resident_mib_per_module requires CUDA model-level hooks without HSDP")
+
         # Pipelines with non-forward component entry points own their complete
         # mutual-exclusion lifecycle. Delegate through the explicit protocol.
         if isinstance(pipeline, SupportsModelCpuOffload):
@@ -427,6 +447,14 @@ class ModelLevelOffloadBackend(OffloadBackend):
         residents = [component.module for component in resolved.residents]
         selected_dits = [component.module for component in resolved.dits if component.selected]
         selected_encoders = [component.module for component in resolved.encoders if component.selected]
+        cpu_master_dits = [component.module for component in resolved.dits if component.cpu_master]
+        cpu_master_encoders = [component.module for component in resolved.encoders if component.cpu_master]
+        # Decode graphs keep fixed device storage so captured pointers stay valid.
+        persistent_dit_staging = self.device.type == "cuda" and any(
+            getattr(dit, "enable_cuda_graph_decode", False) for dit in dits
+        )
+        if resident_weight_bytes and (persistent_dit_staging or not (cpu_master_dits or cpu_master_encoders)):
+            raise ValueError("resident_mib_per_module requires CPU-master staging without fixed decode graphs")
 
         all_modules = [*dits, *encoders, *vaes, *residents]
         initial_devices = _capture_tensor_devices(all_modules)
@@ -460,15 +488,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
                 use_hsdp=self.config.use_hsdp,
                 offload_dit_modules=selected_dits,
                 offload_encoder_modules=selected_encoders,
-                cpu_master_dit_modules=[component.module for component in resolved.dits if component.cpu_master],
-                cpu_master_encoder_modules=[
-                    component.module for component in resolved.encoders if component.cpu_master
-                ],
-                # Fixed DiT staging keeps decode-graph weight pointers valid;
-                # only models that capture weight pointers opt into it.
-                persistent_dit_staging=(
-                    self.device.type == "cuda" and any(getattr(dit, "enable_cuda_graph_decode", False) for dit in dits)
-                ),
+                cpu_master_dit_modules=cpu_master_dits,
+                cpu_master_encoder_modules=cpu_master_encoders,
+                persistent_dit_staging=persistent_dit_staging,
+                resident_weight_bytes=resident_weight_bytes,
             )
         except BaseException:
             try:
