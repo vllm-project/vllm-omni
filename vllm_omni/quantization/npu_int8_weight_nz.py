@@ -7,13 +7,16 @@ weights are cast after device placement; offload owners use the packing and
 view helpers to preserve NZ across their own storage transitions.
 """
 
-from collections.abc import Sequence, Set
+from collections.abc import Callable, Sequence, Set
 from functools import cache
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 _NZ_FORMAT = 29
 _ROW_BLOCK = 16
@@ -41,17 +44,20 @@ def _internal_format_enabled() -> bool:
     return get_option is not None and get_option("ALLOW_INTERNAL_FORMAT") == b"enable"
 
 
-def _auto_cast_available(device: torch.device) -> bool:
+def _auto_resident_cast(device: torch.device, *, allow_a5_auto: bool) -> Callable[[torch.Tensor], torch.Tensor] | None:
     import torch_npu
 
-    # A2/A3 accept the finalized [K, N] right operand in FRACTAL_NZ.
     soc = torch_npu.npu.get_device_name(device).lower()
-    return (
-        soc.startswith(("ascend910b", "ascend910c", "ascend910_93"))
-        and _internal_format_enabled()
-        and callable(getattr(torch_npu, "empty_with_format", None))
-        and callable(getattr(torch_npu, "get_npu_format", None))
-    )
+    if soc.startswith(("ascend910b", "ascend910c", "ascend910_93")):
+        if (
+            _internal_format_enabled()
+            and callable(getattr(torch_npu, "empty_with_format", None))
+            and callable(getattr(torch_npu, "get_npu_format", None))
+        ):
+            return cast_weight_to_nz
+    elif allow_a5_auto and soc.startswith("ascend950") and _probe_a5_resident_nz(device):
+        return _cast_a5_weight_to_nz
+    return None
 
 
 def auto_reactor_available() -> bool:
@@ -79,7 +85,7 @@ def int8_weight_names(model: nn.Module, *, online_only: bool = False) -> set[str
 
 
 class _NZFormatUnavailableError(RuntimeError):
-    """The allocator returned ordinary storage after a request for NZ."""
+    """The runtime cannot provide the requested INT8 NZ weight layout."""
 
 
 def cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
@@ -97,24 +103,92 @@ def cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def prepare_resident_weights(model: nn.Module, excluded_parameter_ids: Set[int] = frozenset()) -> None:
+def _cast_a5_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
+    import torch_npu
+
+    if torch_npu.get_npu_format(weight) == _NZ_FORMAT:
+        return weight
+    try:
+        converted = torch_npu.npu_format_cast(weight, _NZ_FORMAT)
+    except RuntimeError as exc:
+        if isinstance(exc, NotImplementedError) or "aclnnNpuFormatCast does not exist" in str(exc):
+            raise _NZFormatUnavailableError("A5 INT8 NZ format conversion is unavailable") from exc
+        raise
+    if torch_npu.get_npu_format(converted) != _NZ_FORMAT:
+        raise _NZFormatUnavailableError("A5 format conversion did not return FRACTAL_NZ")
+    if converted.shape != weight.shape or converted.dtype != weight.dtype:
+        raise _NZFormatUnavailableError("A5 format conversion changed the logical weight shape or dtype")
+    # Keep the original weight bound until its replacement is ready.
+    torch_npu.npu.current_stream(weight.device).synchronize()
+    return converted
+
+
+@torch.inference_mode()
+def _probe_a5_resident_nz(device: torch.device) -> bool:
+    import torch_npu
+
+    if not _internal_format_enabled() or not all(
+        callable(getattr(torch_npu, name, None)) for name in ("npu_format_cast", "get_npu_format", "npu_quant_matmul")
+    ):
+        logger.info("A5 resident INT8 NZ unavailable on %s; keeping ND", device)
+        return False
+
+    # Match H3's W8A8 contract: ND activations, FP32 scales and BF16 output.
+    m, k, n = 16, 128, 128
+    x = torch.ones((m, k), dtype=torch.int8, device=device)
+    weight = torch.ones((k, n), dtype=torch.int8, device=device)
+    token_scale = torch.ones(m, dtype=torch.float32, device=device)
+    weight_scale = torch.ones(n, dtype=torch.float32, device=device)
+    try:
+        weight_nz = _cast_a5_weight_to_nz(weight)
+        output = torch_npu.npu_quant_matmul(
+            x, weight_nz, weight_scale, pertoken_scale=token_scale, output_dtype=torch.bfloat16
+        ).cpu()
+    except RuntimeError as exc:
+        symbols = "aclnnQuantMatmulWeightNz or aclnnQuantMatmulWeightNzGetWorkspaceSize"
+        if not isinstance(exc, (_NZFormatUnavailableError, NotImplementedError)) and (
+            f"Get {symbols} failed" not in str(exc) and f"{symbols} not in " not in str(exc)
+        ):
+            raise
+        logger.info("A5 resident INT8 NZ unavailable on %s; keeping ND: %s", device, str(exc).split("\n", 1)[0])
+        return False
+    if output.shape != (m, n) or output.dtype != torch.bfloat16 or not (output == k).all().item():
+        logger.warning("A5 resident INT8 NZ probe returned unexpected output on %s; keeping ND", device)
+        return False
+    logger.info("A5 resident INT8 NZ probe passed on %s", device)
+    return True
+
+
+def prepare_resident_weights(
+    model: nn.Module, excluded_parameter_ids: Set[int] = frozenset(), *, allow_a5_auto: bool = True
+) -> None:
     """Cast finalized resident weights, leaving offloader-owned parameters alone."""
     mode = get_weight_nz_mode()
     if mode is None:
         return
-    # Query each device at most once per model load, after finding an eligible weight.
-    auto_cast_available = cache(_auto_cast_available)
+    auto_cast = cache(_auto_resident_cast)
     for name in int8_weight_names(model):
         weight = model.get_parameter(name)
         if id(weight) in excluded_parameter_ids or weight.device.type != "npu":
             continue
-        if mode == "auto" and not auto_cast_available(weight.device):
-            continue
+        cast = cast_weight_to_nz
+        if mode == "auto":
+            auto_fn = auto_cast(weight.device, allow_a5_auto=allow_a5_auto)
+            if auto_fn is None:
+                continue
+            cast = auto_fn
+            # A5 requires all dimensions of the right matrix and its per-channel scale to exceed one.
+            if cast is _cast_a5_weight_to_nz and (
+                weight.ndim != 2 or min(weight.shape) <= 1 or weight.dtype != torch.int8 or not weight.is_contiguous()
+            ):
+                continue
         try:
-            weight.data = cast_weight_to_nz(weight.data)
-        except _NZFormatUnavailableError:
+            weight.data = cast(weight.data)
+        except _NZFormatUnavailableError as exc:
             if mode != "auto":
                 raise
+            if cast is _cast_a5_weight_to_nz:
+                logger.info("Keeping A5 resident INT8 weight %s in ND: %s", name, exc)
 
 
 def nz_storage_numel(shape: Sequence[int]) -> int:

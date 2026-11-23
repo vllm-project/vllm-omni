@@ -164,9 +164,16 @@ without eligible weights can use any of the four modes.
 
 The default `auto` converts resident weights to `FRACTAL_NZ` once on Ascend
 A2/A3 devices with a 910B, 910C or 910_93 SoC when internal formats are
-enabled and the runtime provides NZ allocation. With `enable_sleep_mode=True`,
-`auto` preserves the resident layout so sleep can reclaim the `weights` pool.
-Ordinary model-level and layer-wise CPU offload keep their existing layout.
+enabled and the runtime provides NZ allocation. On Ascend 950 series (A5)
+with offloading disabled, `auto` probes each device with a public
+`torch_npu.npu_format_cast` to `FRACTAL_NZ` (format 29) and an INT8 matmul
+using the converted weight. Only weights supported by that path are converted.
+If the probe detects unsupported conversion or matmul, the resident weights
+keep their original ND layout.
+
+With `enable_sleep_mode=True`, `auto` preserves the resident layout so sleep
+can reclaim the `weights` pool. Ordinary model-level and layer-wise CPU
+offload keep their existing layout.
 
 For DLO, `auto` selects `reactor` for the streamed MiniMax-H3 DiT stacks
 `blocks` and `token_refiner.blocks` when online INT8 weights use the ordinary

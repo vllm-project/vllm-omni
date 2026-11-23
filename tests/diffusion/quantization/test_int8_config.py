@@ -555,6 +555,90 @@ def test_npu_int8_resident_weight_nz(mocker: MockerFixture, monkeypatch: pytest.
     assert output.shape == (1, 2, 64)
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["supported", "nd_format", "missing_kernel", "bad_output", "unsupported_weight", "oom", "off", "dlo"],
+)
+def test_a5_resident_nz_auto_startup(mocker, monkeypatch, case):
+    from vllm_omni.diffusion import offloader
+    from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+    logical_weight = torch.arange(64 * 32).reshape(64, 32).to(torch.int8)
+    model = torch.nn.Sequential(Module(), Module())
+    for layer in model:
+        layer.quant_method = mocker.Mock(spec=NPUInt8LinearMethod)
+        layer.weight = Parameter(logical_weight.clone(), requires_grad=False)
+        layer.weight_scale = Parameter(torch.ones(32), requires_grad=False)
+    original_ptrs = [layer.weight.data_ptr() for layer in model]
+    original_scales = [layer.weight_scale for layer in model]
+
+    backend = mocker.Mock(spec=offloader.DistributedLayerwiseOffloadBackend) if case == "dlo" else None
+    if backend is not None:
+        backend.weight_nz_owned_parameter_ids.return_value = {id(model[0].weight)}
+    mocker.patch.object(offloader, "get_offload_backend", return_value=backend)
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+    npu = mocker.Mock()
+    mocker.patch.dict("sys.modules", {"torch_npu": npu})
+    npu.npu.get_device_name.return_value = "Ascend950" if case == "supported" else "Ascend950DT"
+    npu._C._npu_getOption.return_value = b"enable"
+    mock_device = mocker.Mock(type="npu")
+    nz_weights = {}
+
+    def cast(weight, fmt):
+        assert fmt == 29
+        if case == "nd_format":
+            return weight
+        if case == "unsupported_weight" and weight.shape == logical_weight.shape:
+            raise RuntimeError("aclnnNpuFormatCast does not exist")
+        converted = weight.clone()
+        nz_weights[converted.data_ptr()] = converted
+        return converted
+
+    def matmul(x, weight, scale, *, pertoken_scale, output_dtype):
+        assert x.dtype == weight.dtype == torch.int8
+        assert scale.dtype == pertoken_scale.dtype == torch.float32
+        assert x.shape[-1] == weight.shape[0]
+        assert scale.shape == (weight.shape[1],)
+        assert pertoken_scale.shape == (x.shape[0],)
+        assert npu.get_npu_format(weight) == 29
+        assert output_dtype == torch.bfloat16
+        if case == "missing_kernel":
+            raise RuntimeError("Get aclnnQuantMatmulWeightNz or aclnnQuantMatmulWeightNzGetWorkspaceSize failed")
+        if case == "oom":
+            raise torch.OutOfMemoryError("device out of memory")
+        value = 0 if case == "bad_output" else x.shape[1]
+        return torch.full((x.shape[0], weight.shape[1]), value, dtype=output_dtype)
+
+    npu.npu_format_cast.side_effect = cast
+    npu.get_npu_format.side_effect = lambda weight: 29 if weight.data_ptr() in nz_weights else 2
+    npu.npu_quant_matmul.side_effect = matmul
+    if case == "off":
+        monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "off")
+    else:
+        monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", raising=False)
+
+    cpu_ones = torch.ones
+    config = mocker.Mock(enable_sleep_mode=False)
+    with monkeypatch.context() as npu_tensors:
+        npu_tensors.setattr(torch.Tensor, "device", property(lambda _: mock_device))
+        npu_tensors.setattr(torch, "ones", lambda shape, *, dtype, device: cpu_ones(shape, dtype=dtype))
+        if case == "oom":
+            with pytest.raises(torch.OutOfMemoryError, match="device out of memory"):
+                offloader.enable_offload_backend(config, model)
+        else:
+            assert offloader.enable_offload_backend(config, model) == (model, backend)
+
+    if case in ("off", "dlo", "nd_format"):
+        npu.npu_quant_matmul.assert_not_called()
+    else:
+        npu.npu_quant_matmul.assert_called_once()
+    for layer, original_ptr, original_scale in zip(model, original_ptrs, original_scales):
+        assert npu.get_npu_format(layer.weight) == (29 if case == "supported" else 2)
+        assert (layer.weight.data_ptr() != original_ptr) is (case == "supported")
+        assert torch.equal(layer.weight, logical_weight)
+        assert layer.weight_scale is original_scale
+
+
 @pytest.mark.parametrize("sleep_mode", [False, True])
 def test_npu_int8_auto_respects_sleep_weight_pool(mocker, monkeypatch, sleep_mode):
     from vllm_omni.diffusion import offloader

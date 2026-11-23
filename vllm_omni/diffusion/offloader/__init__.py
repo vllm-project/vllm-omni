@@ -196,7 +196,7 @@ def enable_offload_backend(
                     if isinstance(backend, DistributedLayerwiseOffloadBackend)
                     else frozenset()
                 )
-                prepare_resident_weights(model, excluded_parameter_ids=owned)
+                prepare_resident_weights(model, excluded_parameter_ids=owned, allow_a5_auto=backend is None)
             return backend
         except Exception:
             if backend is not None:
