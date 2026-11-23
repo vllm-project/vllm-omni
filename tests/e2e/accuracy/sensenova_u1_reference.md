@@ -1,6 +1,6 @@
 # SenseNova-U1 platform pixel references
 
-The weekly SenseNova H100 and MI325 jobs run the same smoke and pixel-accuracy
+The weekly SenseNova H100 and MI300 jobs run the same smoke and pixel-accuracy
 contracts. All model tests use the `slow` mark and run from the platform weekly
 pipelines, outside merge CI. The smoke invocation checks generation and output
 dimensions and excludes `pixel_accuracy` tests. Each accuracy case then runs in
@@ -11,7 +11,7 @@ artifacts and fail if the smoke invocation or either accuracy case fails.
 The accuracy tests resolve `SenseNova/SenseNova-U1-8B-MoT` at the immutable
 revision `bfa9b436503cb8aed4f2bc60e3236710cc77468d` before loading the model.
 `sensenova_u1_reference.json` is the reviewed H100 reference and
-`sensenova_u1_reference_mi325.json` is the reviewed MI325 reference. Each file
+`sensenova_u1_reference_mi300.json` is the reviewed MI300 reference. Each file
 records the same input contract, sampled pixels, output PNG hash, GPU, driver,
 software versions, source hashes and capture image. Platform references are not
 interchangeable; a ROCm run must never compare against or refresh the H100 file.
@@ -28,7 +28,7 @@ verify the evidence rather than infer it from metadata.
 
 ## Capture a platform candidate
 
-Use a real H100 or MI325 and the corresponding recorded CI image, with the
+Use a real H100 or MI300 and the corresponding recorded CI image, with the
 repository's test dependencies installed. Run from the repository root. Set
 `SENSENOVA_U1_CI_IMAGE` to the actual capture image reference, preferably
 including its immutable digest. Confirm that the checkout and environment
@@ -39,9 +39,9 @@ changes are intentional before capturing. Choose exactly one selector:
 export SENSENOVA_U1_MARKER='slow and diffusion and cuda and H100 and cards_1'
 export SENSENOVA_U1_REFERENCE_FILE=tests/e2e/accuracy/sensenova_u1_reference.json
 
-# MI325
-# export SENSENOVA_U1_MARKER='slow and diffusion and rocm and MI325 and cards_1'
-# export SENSENOVA_U1_REFERENCE_FILE=tests/e2e/accuracy/sensenova_u1_reference_mi325.json
+# MI300
+# export SENSENOVA_U1_MARKER='slow and diffusion and rocm and MI300 and cards_1'
+# export SENSENOVA_U1_REFERENCE_FILE=tests/e2e/accuracy/sensenova_u1_reference_mi300.json
 ```
 
 ```bash
@@ -89,7 +89,7 @@ cases = {
 }
 for case, record in cases.items():
     assert record["case"] == case
-    assert record["environment"]["reference_hardware"] in {"H100", "MI325"}
+    assert record["environment"]["reference_hardware"] in {"H100", "MI300"}
     assert len(record["reference_pixels"]) == 10
 candidate_path = candidate_dir / "sensenova_u1_reference.candidate.json"
 with candidate_path.open("x") as handle:

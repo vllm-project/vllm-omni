@@ -2137,7 +2137,7 @@ _BAGEL_ONLINE_WEEKLY_JOBS = (
         "1",
         "Blocking",
         "rocm-bagel-online-weekly-1gpu",
-        "slow and diffusion and rocm and MI325 and cards_1",
+        "slow and diffusion and rocm and MI300 and cards_1",
         (
             "tests/e2e/online_serving/test_bagel.py::test_bagel_text2img_online[omni_server0]",
             "tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]",
@@ -2157,7 +2157,7 @@ _BAGEL_ONLINE_WEEKLY_JOBS = (
         "2",
         "NonBlocking",
         "rocm-bagel-online-weekly-2gpu",
-        "slow and diffusion and rocm and MI325 and cards_2",
+        "slow and diffusion and rocm and MI300 and cards_2",
         tuple(
             f"tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[{case}]"
             for case in (
@@ -2175,7 +2175,7 @@ _BAGEL_ONLINE_WEEKLY_JOBS = (
         "4",
         "NonBlocking",
         "rocm-bagel-multi-replica-weekly-4gpu",
-        "slow and diffusion and rocm and MI325 and cards_4",
+        "slow and diffusion and rocm and MI300 and cards_4",
         (
             "tests/e2e/online_serving/test_bagel_multi_replicas.py::"
             "test_multi_stage_diffusion_uses_multi_replica_dit_stage[omni_server0]",
@@ -2256,12 +2256,12 @@ def test_bagel_online_weekly_has_exact_rocm_owners() -> None:
     assert "init_timeout=2700" in params_source
     assert "stage_init_timeout=1800" not in params_source
     assert "init_timeout=2100" not in params_source
-    assert source.count('@hardware_test(res={"cuda": "H100", "rocm": "MI325"})') >= 4
+    assert source.count('@hardware_test(res={"cuda": "H100", "rocm": "MI300"})') >= 4
     expansion = Path("tests/e2e/online_serving/test_bagel_expansion.py").read_text(encoding="utf-8")
-    assert 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})' in expansion
-    assert expansion.count('hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)') == 2
+    assert 'hardware_marks(res={"cuda": "H100", "rocm": "MI300"})' in expansion
+    assert expansion.count('hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)') == 2
     multi_replica = Path("tests/e2e/online_serving/test_bagel_multi_replicas.py").read_text(encoding="utf-8")
-    assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)' in multi_replica
+    assert '@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=4)' in multi_replica
 
 
 _BAGEL_OFFLINE_WEEKLY_NODES = (
@@ -2291,7 +2291,7 @@ def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
     assert step["timeout_in_minutes"] == 180
     assert step["source_file_dependencies"] == "diffusion_bagel_offline_weekly"
     assert step["artifact_paths"] == ["artifacts/rocm-bagel-offline-weekly/**/*"]
-    assert "slow and diffusion and rocm and MI325 and cards_1" in command
+    assert "slow and diffusion and rocm and MI300 and cards_1" in command
     assert "--run-level full_model" in command
     assert "timeout --signal=TERM --kill-after=2m 165m" in command
     assert "Expected exactly three shared offline Bagel ROCm nodes" in command
@@ -3072,7 +3072,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-sana-video-weekly-1gpu",
-        "slow and diffusion and rocm and MI325 and cards_1",
+        "slow and diffusion and rocm and MI300 and cards_1",
         "diffusion_sana_video_weekly",
         _SANA_VIDEO_WEEKLY_NODES,
     ),
@@ -3083,7 +3083,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-mammoth-moda2-weekly-1gpu",
-        "slow and diffusion and rocm and MI325 and cards_1",
+        "slow and diffusion and rocm and MI300 and cards_1",
         "diffusion_mammoth_moda2_weekly",
         (
             "tests/e2e/offline_inference/test_mammoth_moda2_expansion.py::test_mammothmoda2_t2i_e2e[omni_runner0]",
@@ -3098,7 +3098,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-helios-weekly-1gpu",
-        "slow and diffusion and rocm and MI325 and cards_1",
+        "slow and diffusion and rocm and MI300 and cards_1",
         "diffusion_helios_weekly",
         (
             "tests/e2e/accuracy/test_video_streaming_output_similarity.py::"
@@ -3112,7 +3112,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "465m",
         480,
         "rocm-glm-image-weekly-2gpu",
-        "slow and diffusion and rocm and MI325 and cards_2",
+        "slow and diffusion and rocm and MI300 and cards_2",
         "diffusion_glm_image_weekly",
         _GLM_IMAGE_WEEKLY_NODES,
     ),
@@ -3123,7 +3123,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-dreamzero-weekly-2gpu",
-        "slow and diffusion and rocm and MI325 and cards_2",
+        "slow and diffusion and rocm and MI300 and cards_2",
         "diffusion_dreamzero_weekly",
         ("tests/e2e/online_serving/test_dreamzero_expansion.py::test_dreamzero_openpi_online[omni_server0]",),
     ),
@@ -3134,7 +3134,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-hidream-o1-weekly-2gpu",
-        "slow and diffusion and rocm and MI325 and cards_2",
+        "slow and diffusion and rocm and MI300 and cards_2",
         "diffusion_hidream_o1_weekly",
         ("tests/e2e/accuracy/test_hidream_o1_image.py::test_hidream_o1_image_tp2_matches_baseline",),
     ),
@@ -3145,7 +3145,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-magi2-weekly-4gpu",
-        "slow and diffusion and rocm and MI325 and cards_4",
+        "slow and diffusion and rocm and MI300 and cards_4",
         "diffusion_magi2_weekly",
         ("tests/e2e/online_serving/test_magi2.py::test_magi2_preview_serving_smoke[resident_sp4_272p_one_step]",),
     ),
@@ -3156,7 +3156,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-portable-diffusion-weekly-1gpu",
-        "slow and diffusion and rocm and MI325 and cards_1",
+        "slow and diffusion and rocm and MI300 and cards_1",
         "diffusion_portable_1gpu_weekly",
         _PORTABLE_DIFFUSION_1GPU_NODES,
     ),
@@ -3167,7 +3167,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "285m",
         300,
         "rocm-portable-diffusion-weekly-2gpu",
-        "slow and diffusion and rocm and MI325 and cards_2",
+        "slow and diffusion and rocm and MI300 and cards_2",
         "diffusion_portable_2gpu_weekly",
         _PORTABLE_DIFFUSION_2GPU_NODES,
     ),
@@ -3178,7 +3178,7 @@ _FINAL_DIFFUSION_PARITY_WEEKLY_JOBS = (
         "345m",
         360,
         "rocm-portable-diffusion-weekly-4gpu",
-        "slow and diffusion and rocm and MI325 and cards_4",
+        "slow and diffusion and rocm and MI300 and cards_4",
         "diffusion_portable_4gpu_weekly",
         _PORTABLE_DIFFUSION_4GPU_NODES,
     ),
@@ -3233,6 +3233,11 @@ def test_final_diffusion_parity_weekly_jobs_are_exact_nonblocking_qualifiers() -
         marker_index = args.index("-m")
         assert tuple(args[4:marker_index]) == nodes
         assert args[marker_index + 1] == marker
+        if label == "HiDream-O1 accuracy · 2-GPU":
+            assert (
+                'HIDREAM_O1_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/'
+                'rocm-hidream-o1-weekly-2gpu/accuracy"' in step["commands"][0]
+            )
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")
 
@@ -3293,26 +3298,26 @@ def test_final_diffusion_parity_weekly_jobs_are_exact_nonblocking_qualifiers() -
 
     mark_fragments = {
         "tests/e2e/online_serving/test_sana_video_expansion.py": (
-            'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})',
+            'hardware_marks(res={"cuda": "H100", "rocm": "MI300"})',
         ),
         "tests/e2e/online_serving/test_glm_image_expansion.py": (
-            'hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)',
+            'hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)',
         ),
         "tests/e2e/online_serving/test_magi2.py": (
-            'hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)',
+            'hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=4)',
         ),
         "tests/e2e/online_serving/test_flux_kontext_expansion.py": (
-            'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})',
+            'hardware_marks(res={"cuda": "L4", "rocm": "MI300"})',
         ),
-        "tests/e2e/online_serving/test_nextstep_expansion.py": ('res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}',),
+        "tests/e2e/online_serving/test_nextstep_expansion.py": ('res={"cuda": "L4", "rocm": "MI300", "xpu": "B60"}',),
         "tests/e2e/online_serving/test_flux2_expansion.py": (
-            'hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)',
+            'hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=4)',
         ),
         "tests/e2e/online_serving/test_sd3_expansion.py": (
-            'hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)',
+            'hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=4)',
         ),
         "tests/e2e/online_serving/test_zimage_expansion.py": (
-            'hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)',
+            'hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=4)',
         ),
     }
     for source_path, fragments in mark_fragments.items():
@@ -3357,7 +3362,7 @@ def test_sensenova_weekly_captures_both_platform_specific_accuracy_candidates() 
     assert "1 1 150m rocm-sensenova-u1-weekly-i2i" in command
     for node in (*_SENSENOVA_U1_SMOKE_NODES, *_SENSENOVA_U1_ACCURACY_NODES):
         assert node in command
-    assert command.count("slow and diffusion and rocm and MI325 and cards_1") == 3
+    assert command.count("slow and diffusion and rocm and MI300 and cards_1") == 3
     assert "set +e" in command
     assert command.count("run_status=$$?") == 3
     assert 'exit "$$status"' in command
@@ -3370,10 +3375,10 @@ def test_sensenova_weekly_captures_both_platform_specific_accuracy_candidates() 
         "vllm_omni/diffusion/models/sensenova_u1/",
         "tests/e2e/accuracy/sensenova_u1.py",
         "tests/e2e/accuracy/sensenova_u1_reference.json",
-        "tests/e2e/accuracy/sensenova_u1_reference_mi325.json",
+        "tests/e2e/accuracy/sensenova_u1_reference_mi300.json",
     } <= set(dependencies)
 
-    decorator = '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})'
+    decorator = '@hardware_test(res={"cuda": "H100", "rocm": "MI300"})'
     assert decorator in Path("tests/e2e/offline_inference/test_sensenova_u1_expansion.py").read_text(encoding="utf-8")
     for source_path in (
         "tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py",
@@ -3381,8 +3386,8 @@ def test_sensenova_weekly_captures_both_platform_specific_accuracy_candidates() 
     ):
         assert Path(source_path).read_text(encoding="utf-8").count(decorator) == 3
     helper = Path("tests/e2e/accuracy/sensenova_u1.py").read_text(encoding="utf-8")
-    assert 'MI325_REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference_mi325.json")' in helper
-    assert 'return "MI325", name' in helper
+    assert 'MI300_REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference_mi300.json")' in helper
+    assert 'return "MI300", name' in helper
     assert "normal accuracy runs do not create or refresh references" in helper
 
 
@@ -3470,7 +3475,7 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
         "rocm-cosmos3-weekly",
         *_COSMOS3_WEEKLY_NODES,
         "-m",
-        "slow and diffusion and rocm and MI325 and cards_1",
+        "slow and diffusion and rocm and MI300 and cards_1",
     ]
 
     dependency_paths = flatten_paths(dependencies["diffusion_cosmos3_function"])
@@ -3483,8 +3488,8 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
 
     source = Path("tests/e2e/online_serving/test_cosmos3.py").read_text(encoding="utf-8")
     transfer_source = Path("tests/e2e/online_serving/test_cosmos3_transfer_auto.py").read_text(encoding="utf-8")
-    assert 'SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})' in source
-    assert 'TRANSFER_AUTO_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})' in transfer_source
+    assert 'SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"})' in source
+    assert 'TRANSFER_AUTO_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"})' in transfer_source
 
     nightly_source = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
     assert "Cosmos3 T2I Function" not in nightly_source

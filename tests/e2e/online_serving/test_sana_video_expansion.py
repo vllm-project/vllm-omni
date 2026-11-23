@@ -26,7 +26,7 @@ MODEL_720P = os.environ.get(
 PROMPT = "A cat walking on grass toward the camera. motion score: 30."
 NEGATIVE_PROMPT = "blurry, low quality, temporal artifacts"
 
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"})
 
 
 def _t2v_backend_cases():

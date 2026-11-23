@@ -41,7 +41,7 @@ T2I_PROMPT = "A Vincent van Gogh style impressionist painting."
 I2I_PROMPT = "Transform this modern, geometric image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, unnatural colors"
 
-TWO_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+TWO_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
 
 GLM_DEPLOY = get_deploy_config_path("glm_image.yaml")
 GLM_CACHEDIT_DEPLOY = modify_stage_config(

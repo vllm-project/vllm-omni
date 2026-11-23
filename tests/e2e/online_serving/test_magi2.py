@@ -24,7 +24,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "sand-ai/MAGI-2-preview"
 PROMPT = "A red fox walks through fresh snow while wind moves the pine branches."
 
-FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
+FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI300"}, num_cards=4)
 NPU_FOUR_CARD_MARKS = hardware_marks(res={"npu": "A5"}, num_cards=4)
 
 

@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 # CUDA, ROCm, and XPU weekly owners use two cards with TP=2.
 FOUR_CARD_MARKS = hardware_marks(
-    res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"},
+    res={"cuda": "L4", "rocm": "MI300", "xpu": "B60"},
     num_cards={"cuda": 2, "rocm": 2, "xpu": 2},
 )
 

@@ -112,6 +112,34 @@ def test_online_fp8_substring_match_mode_covers_text_encoder_subtrees():
     assert isinstance(config.get_quant_method(layer, "lm_head"), UnquantizedLinearMethod)
 
 
+def test_online_fp8_rocm_keeps_only_non_aligned_linear_inputs_unquantized(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    import vllm_omni.quantization.fp8_config as fp8_config_module
+    from vllm_omni.quantization import build_quant_config
+
+    class _RocmPlatform:
+        @staticmethod
+        def is_rocm() -> bool:
+            return True
+
+    monkeypatch.setattr(fp8_config_module, "current_platform", _RocmPlatform())
+    config = build_quant_config("fp8")
+    linear_cls = _online_linear_cls()
+    layer = linear_cls.__new__(linear_cls)
+    layer.input_size = 2520
+    layer.input_size_per_partition = 2520
+
+    method = config.get_quant_method(layer, "gen_transformer.context_refiner.0.attn.to_q")
+
+    assert isinstance(method, UnquantizedLinearMethod)
+    assert config._reported_rocm_alignment_fallback
+
+    layer.input_size = 2520
+    layer.input_size_per_partition = 2528
+    assert not config._requires_rocm_alignment_fallback(layer)
+
+
 def test_build_quant_config_upstream_online_fp8_shorthand():
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
     from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym

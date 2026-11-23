@@ -1737,7 +1737,7 @@ source_file_dependencies:
     - tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py
     - tests/e2e/accuracy/sensenova_u1.py
     - tests/e2e/accuracy/sensenova_u1_reference.json
-    - tests/e2e/accuracy/sensenova_u1_reference_mi325.json
+    - tests/e2e/accuracy/sensenova_u1_reference_mi300.json
     - tests/helpers/
     - tests/conftest.py
 

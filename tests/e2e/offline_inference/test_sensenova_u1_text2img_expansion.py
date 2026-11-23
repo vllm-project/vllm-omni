@@ -122,7 +122,7 @@ def _generate_sensenova_u1_image(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_text2img():
     """Smoke-test think-mode text2img generation and output dimensions."""
     with OmniRunner("SenseNova/SenseNova-U1-8B-MoT") as runner:
@@ -131,7 +131,7 @@ def test_sensenova_u1_text2img():
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_text2img_pixel_accuracy():
     """Compare pinned output with the platform's reviewed weekly golden."""
     with OmniRunner(accuracy.accuracy_model_path()) as runner:
@@ -149,7 +149,7 @@ def test_sensenova_u1_text2img_pixel_accuracy():
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.cache
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_text2img_cache_dit():
     """Test SenseNova-U1 text2img with Cache-DiT enabled."""
     with OmniRunner(

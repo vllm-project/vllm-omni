@@ -131,7 +131,7 @@ def _generate_sensenova_u1_img2img(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_img2img():
     """Smoke-test think-mode image editing and output dimensions."""
     input_image = _load_input_image()
@@ -141,7 +141,7 @@ def test_sensenova_u1_img2img():
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_img2img_pixel_accuracy():
     """Compare pinned output with the platform's reviewed weekly golden."""
     input_image = _load_input_image()
@@ -161,7 +161,7 @@ def test_sensenova_u1_img2img_pixel_accuracy():
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.cache
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"})
 def test_sensenova_u1_img2img_cache_dit():
     """Test SenseNova-U1 img2img with Cache-DiT enabled."""
     input_image = _load_input_image()

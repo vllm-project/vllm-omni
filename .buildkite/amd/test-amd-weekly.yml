@@ -974,7 +974,7 @@ steps:
 
   # Exact-node owners close the remaining CUDA weekly diffusion contracts.
   # New owners remain nonblocking until their selectors pass on exact-head
-  # MI325 hardware with zero skips, retries, or leaked processes.
+  # MI300 hardware with zero skips, retries, or leaked processes.
   - group: "Diffusion E2E Weekly"
     steps:
       - label: "Bagel online · 1-GPU"
@@ -1003,7 +1003,7 @@ steps:
             'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[single_card_teacache]'
             'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[single_card_cache_dit]'
             'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[single_card_layerwise_offload]'
-            -m 'slow and diffusion and rocm and MI325 and cards_1'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
 
       - label: "Bagel online · 2-GPU"
         agent_pool: mi300_2
@@ -1028,7 +1028,7 @@ steps:
             'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[sp_ring_2]'
             'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[sp_ulysses_2]'
             'tests/e2e/online_serving/test_bagel_expansion.py::test_bagel[tp_vae_patch_parallel_2]'
-            -m 'slow and diffusion and rocm and MI325 and cards_2'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
 
       - label: "Bagel multi-replica · 4-GPU"
         agent_pool: mi300_4
@@ -1049,9 +1049,9 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
             4 1 285m rocm-bagel-multi-replica-weekly-4gpu
             'tests/e2e/online_serving/test_bagel_multi_replicas.py::test_multi_stage_diffusion_uses_multi_replica_dit_stage[omni_server0]'
-            -m 'slow and diffusion and rocm and MI325 and cards_4'
+            -m 'slow and diffusion and rocm and MI300 and cards_4'
 
-      # These offline understanding and LoRA cases explicitly declare MI325.
+      # These offline understanding and LoRA cases explicitly declare MI300.
       # Keep them in one bounded job to avoid consuming three accelerator slots.
       - label: "Bagel offline shared · 1-GPU"
         agent_pool: mi300_1
@@ -1074,7 +1074,7 @@ steps:
             set +e
             pytest --collect-only -q "$${nodes[@]}" \
               --shard-id=0 --num-shards=1 \
-              -m "slow and diffusion and rocm and MI325 and cards_1" \
+              -m "slow and diffusion and rocm and MI300 and cards_1" \
               --run-level full_model \
               > "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt" 2>&1
             collection_status=$$?
@@ -1109,7 +1109,7 @@ steps:
               timeout --signal=TERM --kill-after=2m 165m \
                 pytest -s -v -ra "$${nodes[@]}" \
                 --shard-id=0 --num-shards=1 \
-                -m "slow and diffusion and rocm and MI325 and cards_1" \
+                -m "slow and diffusion and rocm and MI300 and cards_1" \
                 --run-level full_model --durations=20 \
                 --junitxml="$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.xml" \
                 2>&1 | tee "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.log"
@@ -1176,7 +1176,7 @@ steps:
             'tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001[default]'
             'tests/e2e/online_serving/test_cosmos3.py::test_video_generation_modes_001[default]'
             'tests/e2e/online_serving/test_cosmos3_transfer_auto.py::test_transfer_auto_uploaded_control_001[transfer_auto]'
-            -m 'slow and diffusion and rocm and MI325 and cards_1'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
 
       - label: "SANA-Video online and alignment · 1-GPU"
         agent_pool: mi300_1
@@ -1208,7 +1208,7 @@ steps:
             'tests/e2e/accuracy/sana_video/test_sana_video_pipeline_alignment.py::test_sana_video_quick_pipeline_stages_match_diffusers[None-720p]'
             'tests/e2e/accuracy/sana_video/test_sana_video_i2v_alignment.py::test_sana_video_i2v_first_frame_latents_match_diffusers[None-480p]'
             'tests/e2e/accuracy/sana_video/test_sana_video_i2v_alignment.py::test_sana_video_i2v_first_frame_latents_match_diffusers[None-720p]'
-            -m 'slow and diffusion and rocm and MI325 and cards_1'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
 
       - label: "SenseNova-U1 functional and accuracy · 1-GPU"
         agent_pool: mi300_1
@@ -1235,7 +1235,7 @@ steps:
               tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img_cache_dit \
               tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img \
               tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img_cache_dit \
-              -m 'slow and diffusion and rocm and MI325 and cards_1'
+              -m 'slow and diffusion and rocm and MI300 and cards_1'
             run_status=$$?
             if [[ "$$status" -eq 0 && "$$run_status" -ne 0 ]]; then status=$$run_status; fi
 
@@ -1244,7 +1244,7 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
               1 1 150m rocm-sensenova-u1-weekly-t2i \
               tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img_pixel_accuracy \
-              -m 'slow and diffusion and rocm and MI325 and cards_1'
+              -m 'slow and diffusion and rocm and MI300 and cards_1'
             run_status=$$?
             if [[ "$$status" -eq 0 && "$$run_status" -ne 0 ]]; then status=$$run_status; fi
 
@@ -1253,7 +1253,7 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
               1 1 150m rocm-sensenova-u1-weekly-i2i \
               tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img_pixel_accuracy \
-              -m 'slow and diffusion and rocm and MI325 and cards_1'
+              -m 'slow and diffusion and rocm and MI300 and cards_1'
             run_status=$$?
             if [[ "$$status" -eq 0 && "$$run_status" -ne 0 ]]; then status=$$run_status; fi
             set -e
@@ -1279,7 +1279,7 @@ steps:
             1 2 285m rocm-mammoth-moda2-weekly-1gpu
             'tests/e2e/offline_inference/test_mammoth_moda2_expansion.py::test_mammothmoda2_t2i_e2e[omni_runner0]'
             tests/diffusion/models/mammoth_moda2/test_mammoth_moda2_dit_quantization_quality.py::test_mammoth_moda2_dit_online_fp8_quality_and_memory
-            -m 'slow and diffusion and rocm and MI325 and cards_1'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
 
       - label: "Helios streaming similarity · 1-GPU"
         agent_pool: mi300_1
@@ -1301,7 +1301,7 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
             1 1 285m rocm-helios-weekly-1gpu
             'tests/e2e/accuracy/test_video_streaming_output_similarity.py::test_helios_streaming_output_matches_non_streaming[helios_distilled]'
-            -m 'slow and diffusion and rocm and MI325 and cards_1'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
 
       - label: "GLM-Image online and AutoRound · 2-GPU"
         agent_pool: mi300_2
@@ -1333,7 +1333,7 @@ steps:
             'tests/e2e/online_serving/test_glm_image_expansion.py::test_glm_image[sequence_parallel_2-i2i]'
             'tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py::test_glm_image_autoround_w4a16_generates_image[omni_runner0]'
             'tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py::test_glm_image_autoround_w4a16_image_to_image[omni_runner0]'
-            -m 'slow and diffusion and rocm and MI325 and cards_2'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
 
       - label: "DreamZero OpenPI · 2-GPU"
         agent_pool: mi300_2
@@ -1354,7 +1354,7 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
             2 1 285m rocm-dreamzero-weekly-2gpu
             'tests/e2e/online_serving/test_dreamzero_expansion.py::test_dreamzero_openpi_online[omni_server0]'
-            -m 'slow and diffusion and rocm and MI325 and cards_2'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
 
       - label: "HiDream-O1 accuracy · 2-GPU"
         agent_pool: mi300_2
@@ -1373,10 +1373,11 @@ steps:
           - tests/e2e/accuracy/results/result_acc_*.json
         commands:
           - >-
+            HIDREAM_O1_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hidream-o1-weekly-2gpu/accuracy"
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
             2 1 285m rocm-hidream-o1-weekly-2gpu
             tests/e2e/accuracy/test_hidream_o1_image.py::test_hidream_o1_image_tp2_matches_baseline
-            -m 'slow and diffusion and rocm and MI325 and cards_2'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
 
       - label: "MAGI-2 serving smoke · 4-GPU"
         agent_pool: mi300_4
@@ -1397,7 +1398,7 @@ steps:
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
             4 1 285m rocm-magi2-weekly-4gpu
             'tests/e2e/online_serving/test_magi2.py::test_magi2_preview_serving_smoke[resident_sp4_272p_one_step]'
-            -m 'slow and diffusion and rocm and MI325 and cards_4'
+            -m 'slow and diffusion and rocm and MI300 and cards_4'
 
       # Mirror the CUDA weekly Qwen-Image Edit/Layered single-card contract.
       # Keep online and accuracy owners separate so numerical comparisons do
@@ -1844,7 +1845,7 @@ steps:
             tests/e2e/online_serving/test_ltx.py
             -m 'slow and diffusion and rocm and MI325 and cards_2'
 
-      # CUDA's broad L4 sweeps are represented by exact MI325 whitelists so
+      # CUDA's broad L4 sweeps are represented by exact MI300 whitelists so
       # unrelated L4 additions cannot silently expand AMD capacity or runtime.
       - label: "Portable diffusion contracts · 1-GPU"
         agent_pool: mi300_1
@@ -1877,7 +1878,7 @@ steps:
             'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_image_edit_no_negative[base]'
             'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_high_resolution[base]'
             'tests/e2e/online_serving/test_flux_kontext_expansion.py::test_flux_kontext_multiple_outputs[base]'
-            -m 'slow and diffusion and rocm and MI325 and cards_1'
+            -m 'slow and diffusion and rocm and MI300 and cards_1'
 
       - label: "Portable diffusion contracts · 2-GPU"
         agent_pool: mi300_2
@@ -1901,7 +1902,7 @@ steps:
             'tests/e2e/online_serving/test_ernie_image_expansion.py::test_ernie_image[tp_2_cpu_offload]'
             'tests/e2e/online_serving/test_nextstep_expansion.py::test_nextstep_11[nextstep_tp2_cpu_offload]'
             'tests/e2e/online_serving/test_nextstep_expansion.py::test_nextstep_11[nextstep_tp4_pipeline]'
-            -m 'slow and diffusion and rocm and MI325 and cards_2'
+            -m 'slow and diffusion and rocm and MI300 and cards_2'
 
       - label: "Portable diffusion contracts · 4-GPU"
         agent_pool: mi300_4
@@ -1935,7 +1936,7 @@ steps:
             'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[layerwise_ulysses2_ring2]'
             'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[layerwise_tp2]'
             'tests/e2e/online_serving/test_zimage_expansion.py::test_zimage[layerwise_hsdp]'
-            -m 'slow and diffusion and rocm and MI325 and cards_4'
+            -m 'slow and diffusion and rocm and MI300 and cards_4'
 
       # Block the exact CUDA-owned Wan2.1 VACE nodes after two clean ROCm
       # hardware runs with exact counts, zero skips/leaks, and no retry masking.

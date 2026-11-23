@@ -26,10 +26,10 @@ if TYPE_CHECKING:
 MODEL_ID = "SenseNova/SenseNova-U1-8B-MoT"
 MODEL_REVISION = "bfa9b436503cb8aed4f2bc60e3236710cc77468d"
 H100_REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference.json")
-MI325_REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference_mi325.json")
+MI300_REFERENCE_PATH = Path(__file__).with_name("sensenova_u1_reference_mi300.json")
 REFERENCE_PATHS = {
     "H100": H100_REFERENCE_PATH,
-    "MI325": MI325_REFERENCE_PATH,
+    "MI300": MI300_REFERENCE_PATH,
 }
 # Keep the original public constant for CPU contract tests and downstream tools.
 REFERENCE_PATH = H100_REFERENCE_PATH
@@ -47,9 +47,9 @@ def require_reference_hardware() -> tuple[str, str]:
         return "H100", name
     if current_omni_platform.is_rocm():
         name = current_omni_platform.get_device_name()
-        assert "MI325" in name, f"SenseNova ROCm pixel accuracy requires an MI325, got {name}"
-        return "MI325", name
-    raise AssertionError("SenseNova pixel accuracy requires an H100 or MI325 accelerator")
+        assert "MI300" in name, f"SenseNova ROCm pixel accuracy requires an MI300, got {name}"
+        return "MI300", name
+    raise AssertionError("SenseNova pixel accuracy requires an H100 or MI300 accelerator")
 
 
 def reference_path_for_current_hardware() -> Path:

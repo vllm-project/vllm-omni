@@ -30,11 +30,15 @@ SSIM_THRESHOLD = 0.8
 PSNR_THRESHOLD = 19.0
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI300"}, num_cards=2)
 def test_hidream_o1_image_tp2_matches_baseline(
     accuracy_artifact_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    configured_artifact_root = os.environ.get("HIDREAM_O1_ACCURACY_ARTIFACT_DIR")
+    if configured_artifact_root:
+        accuracy_artifact_root = Path(configured_artifact_root)
+        accuracy_artifact_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
     model = os.environ.get("HIDREAM_O1_IMAGE_MODEL", MODEL_ID)
     with OmniRunner(
