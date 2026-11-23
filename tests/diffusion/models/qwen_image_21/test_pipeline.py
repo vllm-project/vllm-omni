@@ -820,3 +820,22 @@ def test_generator_dummy_profiles_configured_maximum_text_length(max_sequence_le
     assert conditioning["prompt_embeds"].shape == (1, expected, 4)
     assert conditioning["negative_prompt_embeds"].shape == (1, expected, 4)
     assert request.sampling_params.max_sequence_length == max_sequence_length
+
+
+def test_online_fp8_ignored_layers_become_name_patterns() -> None:
+    """Both quant switches reach an online FP8 config, which matches full prefixes by default."""
+    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
+        _exclude_text_encoder_subtrees_from_quant,
+    )
+    from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
+        _enable_pattern_ignored_layers,
+    )
+    from vllm_omni.quantization import build_quant_config
+
+    dit_config = build_quant_config("fp8", ignored_layers=["img_mlp"])
+    assert _enable_pattern_ignored_layers(dit_config) is dit_config
+    assert dit_config.ignored_layers_match_mode == "substring"
+
+    text_encoder_config = _exclude_text_encoder_subtrees_from_quant(build_quant_config("fp8"))
+    assert text_encoder_config.ignored_layers == ["model.visual", "lm_head"]
+    assert text_encoder_config.ignored_layers_match_mode == "substring"
