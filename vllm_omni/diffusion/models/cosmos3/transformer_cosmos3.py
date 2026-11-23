@@ -493,6 +493,33 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Qwen3-style RoPE: (x * cos) + (rotate_half(x) * sin).
+
+    Sim-Bimanual imports this helper directly to retain its native RoPE path.
+
+    Args:
+        q: [B, S, h, D]
+        k: [B, S, H_kv, D]
+        cos: [1, S, 1, D] or broadcastable
+        sin: [1, S, 1, D] or broadcastable
+    """
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 def _broadcast_und_kv(
     cached_kv: list[tuple[torch.Tensor, torch.Tensor]],
     batch_size: int,
