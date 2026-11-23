@@ -889,6 +889,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 od_config=self.od_config,
                 sampling_params=sampling_params,
             )
+        if output.release_cache_before_transport:
+            # Model execution has returned, so its temporary tensors can no longer
+            # keep allocator blocks live when the next stage starts on this device.
+            current_omni_platform.empty_cache()
         return output
 
     def _runner_output_from_outputs(

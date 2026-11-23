@@ -4437,6 +4437,7 @@ class MiniMaxH3Pipeline(
                 "metadata": {"minimax_h3_decode": decode_options},
             },
             to_cpu=True,
+            release_cache_before_transport=self.device.type == "npu",
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
 
