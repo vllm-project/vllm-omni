@@ -155,6 +155,19 @@ def _exclude_text_encoder_subtrees_from_quant(
     return config
 
 
+def _with_quantization_config(
+    od_config: OmniDiffusionConfig, quant_config: "QuantizationConfig | None"
+) -> OmniDiffusionConfig:
+    """Copy ``od_config`` with ``quant_config`` for a component other than the transformer.
+
+    ``dataclasses.replace`` reruns ``__post_init__``, which puts a pre-quantized transformer's
+    checkpoint config back over a generic FP8 or NVFP4 config, so the value is set again afterwards.
+    """
+    config = dataclasses.replace(od_config, quantization_config=quant_config)
+    config.quantization_config = quant_config
+    return config
+
+
 def get_qwen_image_21_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -398,9 +411,8 @@ class QwenImage21Pipeline(
             text_encoder_config = AutoConfig.from_pretrained(
                 model, subfolder="text_encoder", local_files_only=local_files_only
             )
-            encoder_od_config = dataclasses.replace(
-                od_config,
-                quantization_config=_exclude_text_encoder_subtrees_from_quant(text_encoder_quant_config),
+            encoder_od_config = _with_quantization_config(
+                od_config, _exclude_text_encoder_subtrees_from_quant(text_encoder_quant_config)
             )
             self.text_encoder = create_transformers_model(
                 AutoModelForImageTextToText,
@@ -415,6 +427,8 @@ class QwenImage21Pipeline(
                     prefix="text_encoder.",
                 )
             )
+        # The pipeline reads hidden states; vocabulary logits are never used.
+        self.text_encoder.lm_head = nn.Identity()
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage21.from_pretrained,
             model,
@@ -1681,5 +1695,5 @@ class QwenImage21Pipeline(
         return self._decode_latents(state.latents, height, width, output_type)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["text_encoder.lm_head."])
         return loader.load_weights(weights)
