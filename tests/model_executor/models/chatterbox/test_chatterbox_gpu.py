@@ -51,7 +51,7 @@ from vllm_omni.request import OmniRequest
 from vllm_omni.transformers_utils.configs.chatterbox import START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, ChatterboxConfig
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
-pytestmark = [pytest.mark.core_model]
+pytestmark = [pytest.mark.advanced_model]
 
 # Room for every request a test schedules; the deploy files' budget is for a whole GPU.
 KV_CACHE_BYTES = 1 << 30
