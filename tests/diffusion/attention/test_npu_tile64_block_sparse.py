@@ -119,6 +119,35 @@ def test_tile64_query_tile_without_a_valid_key_returns_zeros(operator_calls):
     assert output[:, 64:].abs().sum() == 0
 
 
+@pytest.mark.parametrize("scaled_logit", [-4.0, -12.0, -18.0, -24.0, -40.0])
+def test_tile64_recovers_a_padded_block_whose_only_valid_logit_is_far_below_the_padding(operator_calls, scaled_logit):
+    """One valid key beside 127 padded rows must still resolve to that key.
+
+    Padding with zeros scores logit zero, which is unbounded above the real
+    mass: ``exp(lse) = 127 + exp(-24)`` rounds to 127 in fp32, the correction
+    recovers nothing, and the output collapses towards zero while staying
+    finite. Padding with one of the block's own valid keys bounds the removed
+    mass by ``P * M`` instead, so the correction holds at any logit.
+    """
+    sizes = [0, 1]  # tile 0 is entirely padding, tile 1 holds exactly one valid key
+    heads, query_scale = 1, 16.0
+    query, key, value = (torch.zeros(1, len(sizes) * 64, heads, 128) for _ in range(3))
+    query[0, :64, 0, 0] = query_scale
+    key[0, 64, 0, 0] = scaled_logit / (query_scale * SCALE)
+    value[0, 64, 0] = 1.0  # the one attendable value
+    query, key, value = (t.to(torch.bfloat16) for t in (query, key, value))
+    block_map = torch.zeros(1, heads, len(sizes), len(sizes), dtype=torch.bool)
+    block_map[0, 0, 0, 1] = True  # query tile 0 selects the tile holding that key
+
+    output = npu_tile64_block_sparse_attention(
+        query, key, value, block_map, torch.tensor(sizes, dtype=torch.int32), SCALE
+    )
+
+    # a softmax over a single key puts all its weight there, whatever the logit
+    torch.testing.assert_close(output[0, :64].float(), torch.ones(64, heads, 128), atol=2e-3, rtol=2e-3)
+    assert output[0, 64:].abs().sum() == 0  # the other query tile selected nothing
+
+
 def test_pair_key_tiles_folds_an_odd_tile_count_onto_whole_key_blocks():
     block_map = torch.tensor([[[[True, False, False, False, True], [False, False, True, False, False]]]])
     pair_map, pair_valid = pair_key_tiles(block_map, torch.tensor([64, 3, 0, 64, 10], dtype=torch.int32))

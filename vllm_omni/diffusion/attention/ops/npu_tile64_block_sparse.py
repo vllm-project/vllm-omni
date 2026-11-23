@@ -10,10 +10,24 @@ tile when that tile selected either of them. Every query attends a superset of
 the tiles it selected -- its selection plus their pair partners -- and never
 loses one.
 
-The operator has no per-key mask. A zero-padded key scores zero, so it adds
-one to the softmax denominator and nothing to the numerator. The operator
-returns the log-sum-exp of each query row, which lets that contribution be
-removed exactly afterwards.
+The operator has no per-key mask, so a padded key row still enters the
+softmax. Its contribution is removed afterwards from the log-sum-exp the
+operator returns, and what the row is padded *with* decides whether that
+subtraction survives fp32.
+
+A zero row scores logit zero, which is unbounded above the real mass: a block
+holding one valid key at a scaled logit of -24 beside 127 zero rows gives
+``exp(lse) = 127 + 3.8e-11``, which rounds to 127, and the real mass is gone
+before the correction runs. Each padded row is therefore filled with one of
+its own key block's valid keys. That row scores ``e* <= M``, because the key it
+copies is itself one of the keys summed in ``M``, so the removed mass is at
+most ``P * M`` and
+
+    real_mass = M / (M + sum_b P_b e*_b)  >=  1 / (1 + P)
+
+for any valid logits at all -- four orders of magnitude clear of the fp32
+cancellation at ``2**-24`` even when ``P`` runs to thousands. Padded rows of
+``value`` stay zero, so they still add nothing to the numerator.
 """
 
 from __future__ import annotations
@@ -47,6 +61,23 @@ def pair_key_tiles(block_map: torch.Tensor, block_sizes: torch.Tensor) -> tuple[
     return block_map.unflatten(-1, (-1, 2)).any(dim=-1), block_sizes.view(-1, 2).sum(dim=-1)
 
 
+def pad_rows_with_a_valid_key(key: torch.Tensor, tile_sizes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fill every padded key row with a valid key from its own 128-token block.
+
+    Returns the rebuilt key and the row index of each block's representative.
+    Blocks without a valid key keep their rows and get index 0; the caller
+    drops them from the map, so that index is never used.
+    """
+    rows = key.shape[1]
+    blocks = rows // KEY_BLOCK
+    row = torch.arange(rows, device=key.device)
+    valid = (row % TILE) < tile_sizes[row // TILE]
+    low_tile_has_a_key = tile_sizes.view(blocks, 2)[:, 0] > 0
+    representative = torch.arange(blocks, device=key.device) * KEY_BLOCK + torch.where(low_tile_has_a_key, 0, TILE)
+    source = torch.where(valid, row, representative[row // KEY_BLOCK])
+    return key.index_select(1, source), representative
+
+
 def npu_tile64_block_sparse_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -57,8 +88,10 @@ def npu_tile64_block_sparse_attention(
 ) -> torch.Tensor:
     """Run tile64 block-sparse attention on BSHD tensors padded to whole tiles.
 
-    Rows past a tile's ``block_sizes`` entry must be zero in ``key`` and
-    ``value``: the denominator correction relies on them scoring zero.
+    Rows past a tile's ``block_sizes`` entry must be zero in ``value``: they
+    contribute to the softmax denominator and the correction removes exactly
+    that, but nothing subtracts a padded numerator. Their ``key`` rows may hold
+    anything, because they are overwritten before the operator sees them.
     """
     import torch_npu
 
@@ -76,8 +109,15 @@ def npu_tile64_block_sparse_attention(
         raise ValueError("NPU VSA requires one valid-token count per 64-token tile")
 
     pair_map, pair_valid = pair_key_tiles(block_map, block_sizes)
+    tile_sizes = block_sizes
     if tiles % 2:
         key, value = (torch.nn.functional.pad(t, (0, 0, 0, 0, 0, TILE)) for t in (key, value))
+        tile_sizes = torch.nn.functional.pad(block_sizes, (0, 1))
+    # A key block holding no valid key has nothing to attend and no key to pad
+    # with. Dropping it cannot change the result and keeps every selected block
+    # supplied with a representative.
+    pair_map = pair_map & (pair_valid > 0)
+    key, representative = pad_rows_with_a_valid_key(key, tile_sizes)
     output, lse = torch_npu.npu_block_sparse_attention(
         query.transpose(1, 2).contiguous(),
         key.transpose(1, 2).contiguous(),
@@ -91,12 +131,20 @@ def npu_tile64_block_sparse_attention(
         inner_precise=0,
         softmax_lse_flag=1,
     )
-    # exp(lse) is the real mass plus one per zero-padded key the row was shown.
-    pad_keys = torch.matmul(pair_map.float(), (KEY_BLOCK - pair_valid).float())
-    pad_keys = pad_keys.repeat_interleave(TILE, dim=-1).unsqueeze(-1)
-    real_mass = 1 - pad_keys * torch.exp(-lse.float().reshape(batch, heads, rows, 1))
-    output = output.float() / real_mass
-    # A query tile whose enabled key blocks hold no valid key has nothing to attend.
-    has_keys = (pair_map & (pair_valid > 0)).any(dim=-1)
+    # Every padded row of a selected block scores that block's representative
+    # logit, so the mass to remove is that logit's weight times the number of
+    # padded rows. The logits are taken in fp32: the quotient below divides by
+    # a value that can sit at its 1/(1+P) floor, so an error here is amplified
+    # by 1/real_mass, and bfloat16 would not survive it.
+    lse = lse.float().reshape(batch, heads, rows, 1)
+    representative_key = key.index_select(1, representative).transpose(1, 2)
+    pad_mass = torch.matmul(query.transpose(1, 2).float(), representative_key.float().transpose(-1, -2)).mul_(
+        softmax_scale
+    )
+    pad_mass = pad_mass.sub_(lse).exp_().mul_((KEY_BLOCK - pair_valid).float())
+    pad_mass = pad_mass.mul_(pair_map.repeat_interleave(TILE, dim=-2)).sum(dim=-1, keepdim=True)
+    output = output.float() / (1 - pad_mass)
+    # A query tile that enabled no key block with a valid key has nothing to attend.
+    has_keys = pair_map.any(dim=-1)
     output = output.unflatten(2, (tiles, TILE)).masked_fill(~has_keys[..., None, None], 0).flatten(2, 3)
     return output.to(query.dtype).transpose(1, 2).contiguous()
