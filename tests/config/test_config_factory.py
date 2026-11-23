@@ -3087,7 +3087,9 @@ class TestBaseConfigInheritance:
         [
             ("rocm", ["0", "1", "1"], 0.3),
             ("cuda", ["0", "1", "2"], 0.4),
-            ("xpu", ["0", "1", "2"], 0.5),
+            # XPU shares the talker card with Code2Wav, as ROCm does, so the CI
+            # deploy fits the two-card agents.
+            ("xpu", ["0", "1", "1"], 0.5),
         ],
     )
     def test_qwen2_5_omni_ci_placement(self, monkeypatch, platform, expected_devices, talker_memory):
@@ -3100,6 +3102,28 @@ class TestBaseConfigInheritance:
 
         assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
         assert stages[1].yaml_engine_args["gpu_memory_utilization"] == talker_memory
+
+    @pytest.mark.parametrize("platform", ["cuda", "xpu"])
+    def test_qwen2_5_omni_1card_overlay_colocates_every_stage(self, monkeypatch, platform):
+        """The single-card overlay only tests colocation while the merge keeps all three stages together.
+
+        The base deploy's own ``platforms.xpu`` section moves Code2Wav to
+        device 1, so the overlay re-pins the devices. If that re-pin ever stops
+        winning the merge, the single-card lane would spread over three cards
+        instead of failing, and would silently stop covering colocation.
+        """
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(get_deploy_config_path("ci/qwen2_5_omni_1card.yaml"))
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen2_5_omni"), deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "0", "0"]
+        assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [0.45, 0.25, 0.15]
+        if platform == "xpu":
+            # The talker's native sampler workaround comes from the base
+            # platforms section and must survive the overlay.
+            assert stages[1].yaml_runtime["env"]["VLLM_XPU_USE_SAMPLER_KERNEL"] == "0"
 
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
@@ -3310,9 +3334,10 @@ class TestPlatformOverrides:
         """The only stochastic Qwen3-Omni stage must stay reproducible.
 
         Dropping this seed (as #4986 did) leaves the talker sampling codec
-        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
-        nightly failures in #6090. Pin it so a cleanup cannot remove it again
-        without failing here.
+        tokens unseeded at temperature 0.9, including both codebook 0 and the
+        residual codebooks. That reopened the audio-vs-text nightly failures
+        in #6090. Pin it so a cleanup cannot remove it again without failing
+        here.
         """
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
@@ -3356,6 +3381,23 @@ class TestPlatformOverrides:
         assert structured.stage_by_id(0).cache_config.enable_prefix_caching is False
         assert structured.stage_by_id(2).model_config.enforce_eager is True
 
+    def test_qwen3_omni_npu_uses_mrv2(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert npu.model_runner == "v2"
+
+        legacy = merge_pipeline_deploy(pipeline, npu)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [True, True, True]
+
+        structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=npu)
+        assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [True, True, True]
+
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
     def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -3398,6 +3440,8 @@ class TestPlatformOverrides:
             ("moss_tts_nano.yaml", "moss_tts_nano", "v2", ()),
             ("moss_tts_realtime.yaml", "moss_tts_realtime", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
+            ("minimax_music3.yaml", "minimax_music3", "v2", ()),
+            ("minimax_music3_2gpu.yaml", "minimax_music3", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3406,9 +3450,10 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # MOSS realtime and Nano inherit V2 on every platform; other profiles
-        # retain their explicit platform overrides.
+        # MOSS realtime, MOSS Nano and Music3 inherit V2 on every platform.
         all_platforms_mrv2 = filename in (
+            "minimax_music3.yaml",
+            "minimax_music3_2gpu.yaml",
             "moss_tts_nano.yaml",
             "moss_tts_realtime.yaml",
         )

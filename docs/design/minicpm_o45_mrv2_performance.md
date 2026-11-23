@@ -6,7 +6,7 @@ three duplex stages keep `async_chunk: true`. CUDA turn serving sends the
 completed Thinker payload to the Talker. Turn profiles inherit Thinker ngram
 speculation and disabled prefix caching. XPU and MUSA retain the deferred V1
 default and are rejected by vLLM 0.34 rather than being implicitly qualified
-for V2. Both V1 and MRv2 can restore cached Thinker outputs when an
+for V2. MRv2 can restore cached Thinker outputs when an
 overlay disables speculation and enables caching. MRv2 restores `latent`,
 `latent_input_ids` and `latent_positions` together. Duplex profiles keep
 caching disabled for their mutable KV window.
@@ -15,10 +15,7 @@ The MRv2 output-cache opt-in requires an explicit `session_mode: turn` on
 the Thinker model config. A missing mode does not advertise output-cache
 support. The output cache refuses stage-0 speculative decoding, so an MRv2
 Thinker with a `speculative_config` reuses native KV only and keeps prefix
-caching on (see "Thinker prefix cache with drafts" below). A V1 Thinker with
-speculation, including n-gram, is still refused while the cache is enabled;
-such overlays must set stage 0 `enable_prefix_caching: false` under
-`platforms.cuda`.
+caching on (see "Thinker prefix cache with drafts" below).
 
 Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
 latent metadata outside graph replay; Talker keeps codec history and EOS
@@ -61,13 +58,16 @@ The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
 The CUDA duplex profile uses MRv2 on all three stages.
 
-The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
-NPU, subject to architecture and attention-cache eligibility. CUDA accepts
-matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA also
-requires TF32 to be allowed; NPU fusion is independent of TF32. Set
+The shared Code2Wav backend defaults to the fused CFM body on CUDA and NPU,
+and on ROCm when FP16 CFM or full-flow precision is selected, subject to
+architecture and attention-cache eligibility. CUDA accepts matching FP32 or
+FP16 estimator/cache types; ROCm accepts matching FP16 types; NPU retains FP32
+eligibility. CUDA FP32 fusion requires TF32 to be allowed. With
+`token2wav_float16: true` or `cfm_float16: true`, CUDA and ROCm fusion is
+independent of TF32, as is NPU fusion. Set
 `cfm_fused_body: false` in the stage connector extra to restore the original
 body. On CUDA, disabling `token2wav_allow_tf32` or setting
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body` setting takes precedence. Startup precapture includes query
 buckets for final chunks with encoder lookahead, after steady-state buckets
 and within `cfm_max_graphs`. Capture logs report host warmup and capture times.
@@ -79,29 +79,29 @@ widths and cache offsets; there is no universal minimum such as 30 graphs.
 Check the startup precapture budget warning when tuning `cfm_max_graphs` for
 memory-constrained deployments.
 
-The shared asynchronous output snapshot and batched Talker preprocessing also
-apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
-therefore be included in end-to-end regression validation.
-
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
-allowed) and on NPU. NVIDIA SM80+ uses tiled TF32 attention; older CUDA devices
-use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
+allowed or FP16 CFM is selected), on ROCm when FP16 is selected, and on NPU.
+NVIDIA SM80+ uses the existing tiled attention kernel for both FP32 and FP16
+Q/K/V, including the non-pooled CFM arena. FP32 uses TF32 dots; FP16 uses FP16
+dots with FP32 accumulation. Older CUDA devices and ROCm use the fused body's
+SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts and cache types
 retain the original body. CUDA supports matching FP32 or FP16 estimator/cache
-types; NPU supports FP32. Other platforms retain their existing default.
+types; ROCm supports matching FP16 types; NPU supports FP32. Other platforms
+retain their existing default.
 Set `cfm_fused_body: false` in connector `extra` to restore the original body.
 On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body: true` overrides that choice and may use TF32 attention.
 Slot pooling and its `cfm_row_offset_merge` option remain opt-in. Fusion changes
 floating-point rounding and does not promise identical waveforms.
 
 ## Optional CFM precision and speaker replay
 
-`cfm_float16: true` in connector `extra` opts CUDA Code2Wav into FP16 for the
-CFM estimator, its random-noise table and attention caches. The flow encoder,
-speaker extraction and HiFT retain their existing precision. This differs
-from `token2wav_float16`, which affects the whole flow. FP16 CFM changes
+`cfm_float16: true` in connector `extra` opts CUDA or ROCm Code2Wav into FP16
+for the CFM estimator, its random-noise table and attention caches. The flow
+encoder, speaker extraction and HiFT retain their existing precision. This
+differs from `token2wav_float16`, which affects the whole flow. FP16 CFM changes
 rounding and requires speech-quality and service validation; it is off by
 default and does not reduce the number of flow steps.
 
@@ -157,9 +157,9 @@ stages:
       num_speculative_tokens: 7
 ```
 
-vLLM 0.33 resolves a draft config with `architectures: ["DSparkDraftModel"]`
+vLLM 0.34 resolves a draft config with `architectures: ["DSparkDraftModel"]`
 and `model_type: qwen3` to `Qwen3DSparkModel`. Drafters that read Thinker
-layers require the Thinker on MRv2; the V1 Thinker rejects them at load.
+layers use the Thinker MRv2 auxiliary-hidden-state interface.
 Validation covers CUDA turn sessions with greedy text and speech output.
 Duplex sessions keep their own sampler and are not covered. NPU and ROCm use
 MRv2 but do not inherit this CUDA drafter configuration; XPU and MUSA retain
@@ -171,9 +171,8 @@ with seven Ngram draft tokens for greedy Thinker requests. The scheduler
 drafts from committed token history and the NPU verifies the drafts. When
 a Thinker decode batch includes non-greedy sampling, MRv2 scheduler Ngram
 skips drafts for that step so sampled requests use the ordinary sampler.
-Native duplex batches use ordinary decoding on both runners so the duplex
-sampler receives one logit row per request. Ascend's `ngram_gpu` proposer uses MRv1
-and the same native duplex guard. Use `ngram` for MRv2.
+Native duplex batches use ordinary decoding so the duplex sampler receives
+one logit row per request. Ascend profiles use the scheduler `ngram` proposer.
 
 The CUDA profile also enables Thinker Ngram. In a duplex deployment, ordinary
 chat requests retain the stock rejection sampler alongside the duplex sampler;
@@ -303,9 +302,11 @@ or reference normalization policy.
 
 `minicpmo_4_5.yaml` selects MRv2 for the Thinker, Talker and Code2Wav on CUDA,
 ROCm and NPU. ROCm keeps the shared duplex topology, async chunks, devices and
-connector contract; it does not inherit the CUDA-only attention, speculation,
-graph or fused-kernel settings. This runner selection alone does not establish
-ROCm performance or quality qualification. The Thinker has no async producer,
+connector contract; it does not inherit CUDA-only attention, speculation or
+graph tuning. An explicit ROCm FP16 Code2Wav configuration selects the shared
+fused CFM body with its SDPA fallback, not NVIDIA tiled attention. This runner
+selection and dispatch coverage alone do not establish ROCm performance or
+quality qualification. The Thinker has no async producer,
 so the orchestrator hands each finished segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
 prefix until capacity; sliding recompute rebuilds the previous condition,
@@ -355,7 +356,7 @@ run-to-run variance, not a runner gap.
 
 ### Chunk-boundary probability precision
 
-The shared V1/MRv2 Thinker sampler draws the chunk boundary before applying
+The native duplex Thinker sampler draws the chunk boundary before applying
 text penalties and top-k/top-p filtering, as the released StreamDecoder does.
 Its probability must come from `softmax(logits)`. Computing it as
 `exp(logit_eos - logsumexp(logits))` materialized the intermediate reduction
@@ -424,6 +425,32 @@ transpose per body, instead of a per-block gather/transpose/copy or a per-block
 Triton kernel. The whole-block CNN cache is transposed to frames-major once per
 body rather than per block. CUDA and the unfused DiT body are unaffected.
 
+## NPU packed QKV normalization and cache writes
+
+The NPU fused CFM body reuses `qkv_head_layer_norm` for FP32 packed QKV with
+standard per-head LayerNorm. One Triton kernel reads the packed projection,
+normalizes Q/K in FP32 and writes Q plus the current K/V frames directly into
+the existing split cache. LayerNorm epsilon and affine parameters are retained;
+NPU launch disables implicit floating-point multiply/add contraction. Reduction
+rounding can differ from ACLNN, so this does not promise bitwise-identical audio.
+Unsupported types, partial affine parameters, indexed slot writes and environments
+without Triton retain the native operator path. CUDA launch behavior is unchanged.
+History copies, masked cache-gap clearing, attention masks and attention itself
+retain their existing semantics.
+
+Eligible NPU inputs automatically use the shared fused kernel; unsupported
+inputs use its native fallback. No deployment switch is required.
+
+Migration: the former stage-2 `additional_config.code2wav_fused_qkv_norm`
+key has been removed. A leftover value, including `false`, is ignored and
+does not disable fusion after restart. Remove this key from deployment and
+overlay YAML files. The NPU stage reader emits a one-time warning when it
+encounters the stale key; eligible FP32 inputs still automatically use fusion,
+and unsupported inputs retain the native fallback.
+
+NPU compilation, graph replay, numerical parity and service performance must be
+validated on the target stack; implementation alone does not establish a speedup.
+
 ## Reference prefetch at higher concurrency
 
 `token2wav_ref_prefetch_max_waiters` (connector extra, default `1`, minimum `1`)
@@ -447,9 +474,25 @@ uses this speaker. If `tensorrt` cannot be imported, startup logs a warning and
 keeps the Torch speaker, so CI images without TensorRT still load this profile.
 Set the flag to `false` in an overlay to keep Torch even when TensorRT is
 installed. Other platforms ignore the flag. An
-explicit `token2wav_trt: true`,
-`MINICPMO_TOKEN2WAV_TRT=1`, or `token2wav_device_spk: false` keeps the full
+explicit `token2wav_trt: true` or `token2wav_device_spk: false` keeps the full
 DiT TensorRT path or the CPU onnxruntime fallback and drops this flag.
+
+Full DiT TensorRT is configured with connector `extra` keys. Each key, when
+set, wins over its deprecated environment variable, including an explicit
+`token2wav_trt: false`. The environment variable applies only while its key is
+unset or `null`, and logs a one-time deprecation warning. Because TensorRT is
+CUDA-only, the environment variables are read only on CUDA, and the dtype and
+cache variables only when full DiT TensorRT is enabled.
+
+| Key | Values | Deprecated environment variable |
+| --- | --- | --- |
+| `token2wav_trt` | boolean, default `false` | `MINICPMO_TOKEN2WAV_TRT=1` |
+| `token2wav_trt_dtype` | `fp16` (default), `float16`, `fp32`, `float32` | `MINICPMO_TOKEN2WAV_TRT_DTYPE` |
+| `token2wav_trt_cache_dir` | path, default `$HF_HOME/vllm_omni/token2wav_trt` | `MINICPMO_TOKEN2WAV_TRT_CACHE` |
+
+Any other `token2wav_trt_dtype` fails at startup on every platform instead of
+silently selecting fp16. An invalid `MINICPMO_TOKEN2WAV_TRT_DTYPE` fails when
+it is used.
 The CAM++ TensorRT profile accepts 4 to 3000 fbank frames. The default 6 s
 window is 598 frames and stays on this path. A wider
 `ref_audio_max_seconds` is checked before the engine is installed: 31 s
@@ -505,7 +548,7 @@ overlay to disable that part.
 
 ## MRv2 Talker seeded sampling
 
-The MiniCPM-o MRv2 Talker uses V1's per-request exponential draws after
+The MiniCPM-o MRv2 Talker uses per-request seeded exponential draws after
 applying MRv2 logit processing. Its top-k/top-p adapter passes the actual
 logit vocabulary size to vLLM's sampling states and forwards the returned
 `has_topp_only_rows` predicate to native masking.
@@ -519,30 +562,8 @@ and are removed when requests finish. Batches requesting logprobs, sampling
 masks or trace replay keep the upstream sampler and its RNG semantics.
 
 Startup profiling also registers unseeded sampling slots before request ids
-exist. These slots initialize upstream sampling state without creating V1
+exist. These slots initialize upstream sampling state without creating per-request
 generators; seeded requests still require an admitted request id.
-
-## V1 Talker decode bookkeeping
-
-The CUDA V1 Talker uses the existing batch-preprocess row-fill hook for batches
-containing only one-token decode requests with initialized audio state. It
-checks the current request order, token offsets and prompt boundaries on every
-step; it does not cache metadata by batch size. New admissions, preemption
-resumes, mixed prefill/decode and K-step execution keep the generic path.
-The hook preserves condition metadata and updates only the live decode fields
-and the empty codec delta; the Talker still owns the sampled-id snapshot.
-
-For a full CUDA decode batch, codec ids, validity and completion flags stay
-batched until the runner's owned output snapshot has been copied. The output
-finalizer then restores per-request tensors and scalar completion flags.
-Mixed batches retain row-wise output. CPU placeholders are allocated only for
-rows without a device result. Snapshot ownership remains necessary even when
-all rows share one tensor: producer buffers may be overwritten on the next
-step.
-
-These shortcuts target V1. The default CUDA MRv2 Talker already skips identity
-decode preprocessing and emits device batches, so a V1 improvement alone does
-not establish a speedup for the default CUDA MRv2 deployment.
 
 ## Reference reuse across concurrent bursts
 
@@ -627,7 +648,7 @@ The runtime bundle includes:
   still feed an asynchronous device assertion. CPU, unsupported layouts/dtypes
   and widths outside 1–8192 retain native multinomial. Seeded token and generator
   parity is tested for both eager execution and CUDA graph replay. With Triton
-  available, this helper serves per-row CUDA K-step sampling, including V1 and
+  available, this helper serves per-row CUDA K-step sampling, including
   mixed greedy/stochastic batches. The default all-stochastic CUDA MRv2 K-step
   path uses upstream batched exponential noise and returns before this helper.
   Default-deployment throughput measurements therefore do not isolate or

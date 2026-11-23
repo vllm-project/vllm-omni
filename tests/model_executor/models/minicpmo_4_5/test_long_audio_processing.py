@@ -30,6 +30,7 @@ from vllm.multimodal.inputs import (
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMMultiModalProcessor,
+    MiniCPMO45OmniLLMProcessingInfo,
     MiniCPMOAudioFeatureInputs,
     MiniCPMOMultiModalDataParser,
     _minicpmo_field_config,
@@ -43,31 +44,21 @@ _FEAT_DIM = 128
 _CHUNK_FRAMES = 3000
 
 
-@pytest.mark.parametrize("version", [(2, 5), (4, 5)])
-def test_prompt_batching_delegates_upstream_without_tts_kwargs(version):
-    from unittest.mock import MagicMock
-
-    info = SimpleNamespace(
-        get_model_version=lambda: version,
-        get_hf_processor=MagicMock(return_value=object()),
-        ctx=SimpleNamespace(call_hf_processor=MagicMock()),
+def test_prompt_batching_delegates_upstream_without_tts_kwargs(mocker):
+    info = MiniCPMO45OmniLLMProcessingInfo(
+        SimpleNamespace(call_hf_processor=mocker.Mock(return_value={"features": [1, 2]}))
     )
-    info.ctx.call_hf_processor.side_effect = (
-        [{"features": [1]}, {"features": [2]}] if version == (2, 5) else [{"features": [1, 2]}]
-    )
+    processor = mocker.patch.object(info, "get_hf_processor", return_value=object())
     kwargs = {"use_tts": True, "sampling_rate": 16000}
     result = MiniCPMO45OmniLLMMultiModalProcessor._call_hf_processor_on_prompts(
         SimpleNamespace(info=info), ["one", "two"], {"audios": [10, 20]}, kwargs, out_keys={"features"}
     )
     assert result == {"features": [1, 2]}
     assert kwargs == {"use_tts": True, "sampling_rate": 16000}
-    for call in info.ctx.call_hf_processor.call_args_list:
-        assert call.args[2] == {"sampling_rate": 16000}
-    payloads = [call.args[1] for call in info.ctx.call_hf_processor.call_args_list]
-    assert payloads == (
-        [{"text": "one", "audios": 10}, {"text": "two", "audios": 20}]
-        if version == (2, 5)
-        else [{"text": ["one", "two"], "audios": [10, 20]}]
+    info.ctx.call_hf_processor.assert_called_once_with(
+        processor.return_value,
+        {"text": ["one", "two"], "audios": [10, 20]},
+        {"sampling_rate": 16000},
     )
 
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Launch vLLM-Omni server for Ming-omni-tts.
 #
 # Usage:
@@ -21,5 +24,5 @@ vllm-omni serve "$MODEL" \
     --deploy-config "$DEPLOY_CONFIG" \
     --host 0.0.0.0 \
     --port "$PORT" \
-    --enforce-eager \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
     --omni

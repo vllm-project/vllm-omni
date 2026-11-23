@@ -238,6 +238,8 @@ def _post_commit_definitive_refusal(
 def _post_commit_refusal_indexes(
     events: list[dict[str, object]],
     committed_index: int | None,
+    *,
+    end_index: int | None = None,
 ) -> frozenset[int]:
     """Positions of the refusal errors that answered the forced create.
 
@@ -249,7 +251,7 @@ def _post_commit_refusal_indexes(
         return frozenset()
     return frozenset(
         index
-        for index in range(committed_index + 1, len(events))
+        for index in range(committed_index + 1, len(events) if end_index is None else end_index)
         if events[index].get("type") == "error" and ErrorEvent(events[index]).code in DEFINITIVE_REFUSAL_CODES
     )
 
@@ -392,19 +394,25 @@ def _replay_tail_window(
     sample_rate: int,
     video_fps: float,
 ) -> tuple[int, int] | None:
-    """Convert a replay duration into (audio samples, video frames) tail sizes.
+    """Return tail sizes aligned to a common source frame boundary.
 
-    Returns ``None`` when either requested window would round to zero while
-    its input is nonempty: slicing with ``seq[-0:]`` keeps the *whole*
-    sequence, so a positive-but-tiny duration would otherwise pair a short
-    audio tail (or no audio at all) with every video frame. Skipping the
-    replay keeps the audio and video windows aligned or absent together.
+    Skip windows rounding to zero, which would otherwise slice with ``[-0:]``.
+    For video, round the start back to the preceding sampled frame so the
+    first audio unit and frame share the same source timestamp.
     """
-    samples = min(int(round(replay_seconds * sample_rate)), total_samples)
-    frames = min(int(round(replay_seconds * video_fps)), total_frames) if total_frames > 0 else 0
-    if samples <= 0 or (total_frames > 0 and frames <= 0):
+    if not math.isfinite(replay_seconds) or replay_seconds <= 0:
         return None
-    return samples, frames
+    replay_seconds = min(replay_seconds, total_samples / sample_rate)
+    samples = int(round(replay_seconds * sample_rate))
+    if samples <= 0:
+        return None
+    if total_frames <= 0:
+        return samples, 0
+    if round(min(replay_seconds, total_frames / video_fps) * video_fps) <= 0:
+        return None
+    start_frame = min(math.floor((total_samples - samples) * video_fps / sample_rate), total_frames - 1)
+    start_sample = round(start_frame * sample_rate / video_fps)
+    return total_samples - start_sample, total_frames - start_frame
 
 
 #: How long a forced final commit may take to open its response before the
@@ -912,6 +920,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     if input_wav is not None and not input_pcm16:
         raise ValueError("input WAV has no audio")
 
+    source_pcm16 = input_pcm16
     collector = _StreamingEventCollector(stream_writer)
     client = _TimedInputClient(
         args.url,
@@ -1086,6 +1095,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         except TimeoutError as exc:
             wait_error = str(exc)
         forced_response_fallback_sent = forced_response_fallback_sent or fallback_progress["sent"]
+        forced_response_windows: list[tuple[int, int]] = []
+        if final_create_response and committed_index is not None:
+            forced_response_windows.append((committed_index, len(collector.events)))
         # Native duplex can end the model's own answer mid-sentence: the
         # model samples <|turn_eos|> between units and the sentence never
         # finishes, and the forced post-commit response then answers the
@@ -1120,7 +1132,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             SENTENCE_FINAL_MARKS = ".!?;。！？；…"
             if transcript_so_far and transcript_so_far[-1] not in SENTENCE_FINAL_MARKS:
                 replay_window = _replay_tail_window(
-                    len(input_pcm16) // PCM16_BYTES_PER_SAMPLE,
+                    len(source_pcm16) // PCM16_BYTES_PER_SAMPLE,
                     len(video_frames),
                     post_commit_replay_seconds,
                     PCM16_SAMPLE_RATE,
@@ -1132,13 +1144,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     # whole stream; skip instead of misaligned windows.
                     post_commit_replay_error = f"replay window rounds to zero for {post_commit_replay_seconds}s"
                 else:
+                    replay_committed_index = None
                     try:
-                        input_format = client.config.input_audio
                         replay_samples = replay_window[0]
-                        # Keep the last N seconds of audio -- the same tail
-                        # window as video_frames[-replay_frame_count:] below,
-                        # so the replayed audio and video stay in sync.
-                        replay_pcm = input_pcm16[-replay_samples * PCM16_BYTES_PER_SAMPLE :]
+                        # Slice audio and frames from the original clip, before
+                        # synthetic tail silence was appended to the input stream.
+                        replay_pcm = source_pcm16[-replay_samples * PCM16_BYTES_PER_SAMPLE :]
                         replay_frames = None
                         replay_stacked = None
                         if video_frames:
@@ -1152,12 +1163,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                             realtime=not args.no_realtime_pacing,
                             video_frames=replay_frames,
                             stacked_video_frames=replay_stacked,
-                            # Continue the media clock after every appended
-                            # audio (input plus tail), but restart the frame
-                            # index so the replayed window shows its own first
-                            # frame on the first appended unit.
-                            media_origin_ms=input_format.duration_ms(len(input_pcm16)),
-                            unit_index=0,
+                            # Frame selection restarts locally; append_audio
+                            # keeps the session's wire media clock monotonic.
                         )
                         replay_commit_cursor = len(collector.events)
                         await _commit_input_after_playback_checkpoint(client, collector, create_response=True)
@@ -1180,6 +1187,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         )
                     except TimeoutError as exc:
                         post_commit_replay_error = str(exc)
+                        wait_error = f"Post-commit replay failed: {exc}"
+                    finally:
+                        if replay_committed_index is not None:
+                            forced_response_windows.append((replay_committed_index, len(collector.events)))
         await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
         await client.close(timeout_s=args.timeout_s)
@@ -1239,10 +1250,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         # refusals that arrived after the commit are forgiven: an earlier one
         # came from some other ask and still fails the run, as does every
         # other error.
-        forgiven_indexes = (
-            _post_commit_refusal_indexes(collector.events, committed_index)
-            if final_create_response and committed_index is not None
-            else frozenset()
+        forgiven_indexes = frozenset(
+            index
+            for start, end in forced_response_windows
+            for index in _post_commit_refusal_indexes(collector.events, start, end_index=end)
         )
         errors = collector.errors(exclude_indexes=forgiven_indexes)
         if wait_error:
@@ -1285,6 +1296,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "tail_video_frames_sent": tail_frames_sent,
             "post_commit": {
                 "input_committed_event_index": committed_index,
+                "forced_response_windows": forced_response_windows,
                 "decision": post_commit_decision,
                 "decision_required": wait_for_post_commit_decision,
                 "final_create_response": final_create_response,
@@ -1453,15 +1465,16 @@ def parse_args() -> argparse.Namespace:
             "When the post-commit forced response stays silent and the "
             "transcript stops mid-sentence, replay this many seconds of the "
             "input (audio plus the matching video frames), commit again and "
-            "drain one more forced response. 0 disables the replay."
+            "drain one more forced response. Video replay starts at the preceding "
+            "sampled-frame boundary. 0 disables the replay."
         ),
     )
     parser.add_argument("--require-audio", action="store_true")
     args = parser.parse_args()
     if args.tail_silence_s < 0:
         parser.error("--tail-silence-s must be nonnegative")
-    if args.post_commit_replay_seconds < 0:
-        parser.error("--post-commit-replay-seconds must be nonnegative")
+    if not math.isfinite(args.post_commit_replay_seconds) or args.post_commit_replay_seconds < 0:
+        parser.error("--post-commit-replay-seconds must be finite and nonnegative")
     if not 0 < args.basic_window_low_tokens < args.basic_window_high_tokens:
         parser.error("window watermarks must satisfy 0 < low < high")
     if args.context_max_units <= 0 or args.context_previous_max_tokens <= 0:

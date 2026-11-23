@@ -30,8 +30,7 @@ _DEPLOY = Path(get_deploy_config_path("ci/qwen3_omni_moe_multi_replicas_4gpu.yam
 
 
 class Qwen3OmniReplica(Qwen3Omni):
-    # Replica fault coverage is intentionally CUDA-only.
-    res = {"cuda": "H100"}
+    res = {"cuda": "H100", "rocm": "MI325"}
     num_cards = 4
     deploy_dir = _DEPLOY.parent
     replica_scenarios = [

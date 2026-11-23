@@ -38,13 +38,13 @@ BAGEL_STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 # (model, deploy_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
-# Cold ROCm AITER MHA builds can consume most of the default 600-second stage
-# deadline. Match the online BAGEL coverage so the compiled kernel can finish
-# and leave bounded headroom for the stage-ready handshake.
+# Cold ROCm AITER MHA builds have taken nearly 1,690 seconds under CI load.
+# Keep the offline weekly owner bounded while leaving headroom for import and
+# the stage-ready handshake after compilation completes.
 _OMNI_RUNNER_PARAM = (
     MODEL,
     BAGEL_STAGE_CONFIG,
-    {"stage_init_timeout": 1800, "init_timeout": 2100},
+    {"stage_init_timeout": 2400, "init_timeout": 2700},
 )
 
 

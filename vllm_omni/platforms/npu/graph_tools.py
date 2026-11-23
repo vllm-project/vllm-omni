@@ -47,10 +47,12 @@ class NPUExactGraphRunner:
         max_graphs: int = 32,
         component_name: str = "device graph",
         disable_config_hint: str = "disable graph capture",
+        use_shared_pool: bool = True,
     ) -> None:
         self.max_graphs = max(0, int(max_graphs))
         self.component_name = component_name
         self.disable_config_hint = disable_config_hint
+        self._use_shared_pool = use_shared_pool
         self._enabled = self.max_graphs > 0
         self._frozen = False
         self._graphs: dict[tuple[object, ...], CapturedDeviceGraph] = {}
@@ -113,9 +115,22 @@ class NPUExactGraphRunner:
         npu.synchronize()
         graph = npu.NPUGraph()
         if self._graph_pool is None:
-            from vllm.platforms import current_platform
+            if self._use_shared_pool:
+                from vllm.platforms import current_platform
 
-            self._graph_pool = current_platform.get_global_graph_pool()
+                self._graph_pool = current_platform.get_global_graph_pool()
+            else:
+                # run() keeps this runner eager when torch.npu cannot provide
+                # a dedicated pool handle, so reaching this line without one
+                # means capture() was called directly past that guard; fail
+                # loudly instead of silently sharing the global pool (the
+                # configuration this dedicated-pool mode exists to avoid).
+                if not hasattr(npu, "graph_pool_handle"):
+                    raise RuntimeError(
+                        f"{self.component_name}: torch.npu.graph_pool_handle is "
+                        "unavailable; refusing to share the global graph pool"
+                    )
+                self._graph_pool = torch.npu.graph_pool_handle()
         with torch.inference_mode(), npu.graph(graph, pool=self._graph_pool):
             static_outputs = compute(*static_inputs)
         npu.synchronize()
@@ -157,6 +172,15 @@ class NPUExactGraphRunner:
         # Prime lazy kernels and allocator state before capture. The next call
         # with the same exact tensor signature replays this graph.
         eager_outputs = compute(*inputs)
+        if not self._use_shared_pool and not hasattr(torch.npu, "graph_pool_handle"):
+            # This torch_npu cannot provide a dedicated graph pool. Sharing
+            # the global pool here is exactly the configuration the dedicated
+            # pool exists to avoid, so keep the runner eager and say so.
+            logger.warning_once(
+                "%s: torch.npu.graph_pool_handle unavailable; running eager instead of sharing the global graph pool",
+                self.component_name,
+            )
+            return eager_outputs
         if len(self._graphs) >= self.max_graphs:
             logger.warning_once(
                 "%s reached the %d-entry NPUGraph limit; new tensor shapes will use eager execution.",

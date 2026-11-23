@@ -108,6 +108,13 @@ top-k/top-p masking before the model's categorical draw with request-local Torch
 Unseeded and greedy rows keep upstream sampling. When mixed rows have already
 been masked, their upstream call disables repeated masking and fused sampling.
 
+Residual codebooks use a second request-owned generator that persists across
+frames and is independent of batch ordering. An explicit `tts_local_seed`
+takes precedence; otherwise the Talker stage seed is domain-separated from
+codebook 0. Seedless requests retain global-RNG sampling. Qwen3-Omni keeps the
+outer MTP uniform buffer disabled, so explicitly seeded rows execute that
+wrapper eagerly while the code predictor's inner device graphs remain usable.
+
 Custom samplers register their selected JIT kernels while the runner's startup
 registry is active. The Talker's seeded stream uses native top-k/top-p
 masking even when unseeded sampling selects FlashInfer, so it registers those
@@ -147,6 +154,22 @@ adapter, not injected through unrelated scheduler state.
 ### AR-INV-003: Workers execute assigned work
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
+
+## Model-owned request lifecycle
+
+Model states can implement `get_request_lifecycle(scheduler_output)` to return
+a `RequestLifecycleUpdate` before the runner admits new requests. Reset IDs
+clear both model-owned state and native slots before the same IDs enter a new
+phase. Release IDs free only native slots, leaving model-owned jobs alive.
+Real finished/aborted IDs still notify the model even after a slot was released.
+These worker transitions do not mutate the scheduler's completion metadata.
+
+`finalize_runner_output(output, idle=...)` runs on the AR worker thread after
+sampling and on no-forward steps, outside graph capture/profiling. It can
+publish work that outlives native slots. Ordinary model states preserve the
+original deferred output without synchronizing it. YuE2 uses these hooks for
+ABC phase replacement and request-keyed NAR/VAE completion, through the shared
+`OmniARModelRunner` and standard worker.
 
 ## Token-only output payloads
 
