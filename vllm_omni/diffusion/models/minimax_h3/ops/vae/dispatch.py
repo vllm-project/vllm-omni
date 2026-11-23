@@ -53,6 +53,10 @@ def _supports_cuda_capability(device: torch.device, expected: int) -> bool:
     return capability is not None and int(capability.to_int()) == expected
 
 
+def _supports_cuda_sm89(device: torch.device) -> bool:
+    return _supports_cuda_capability(device, 89)
+
+
 def _supports_cuda_sm90(device: torch.device) -> bool:
     return _supports_cuda_capability(device, 90)
 
@@ -68,6 +72,11 @@ def _supports_cuda_sm103(device: torch.device) -> bool:
 # Keep hardware selection flat: adding a backend means adding one operator set,
 # without changing the installer or the model execution path.
 H3_VAE_OPERATOR_TABLE: tuple[H3VAEOperatorSet, ...] = (
+    H3VAEOperatorSet(
+        supports=_supports_cuda_sm89,
+        qk_norm_rope=try_qk_norm_rope_exact,
+        scaled_residual=try_scaled_residual_exact,
+    ),
     H3VAEOperatorSet(
         supports=_supports_cuda_sm90,
         qk_norm_rope=try_qk_norm_rope_exact,

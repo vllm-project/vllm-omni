@@ -20,7 +20,12 @@ ASR_CLIP = Path(__file__).resolve().parents[2] / "assets" / "semantic_vad" / "co
 SERVER = OmniServerParams(
     model=MODEL,
     stage_config_path=get_deploy_config_path("lfm3_audio.yaml"),
-    server_args=["--trust-remote-code", "--async-chunk", "--limit-mm-per-prompt", '{"audio":1}'],
+    server_args=[
+        "--trust-remote-code",
+        "--async-chunk",
+        "--stage-overrides",
+        '{"0":{"limit_mm_per_prompt":{"audio":1}}}',
+    ],
 )
 
 

@@ -20,7 +20,6 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     PreparedRequest,
     TextCommitmentCapabilities,
-    TTSGenerationError,
     conditioning_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
@@ -31,11 +30,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
-
-QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_qwen3_tts_effective_max_tokens"
-# Set when the effective budget was derived from the input text rather than
-# requested by the caller, so a length finish is a runaway for every task.
-QWEN3_TTS_AUTO_BUDGET_KEY = "_qwen3_tts_auto_codec_budget"
 
 # Talker-stage ``additional_config`` keys that tune the text-scaled budget.
 # Each takes a number (applies to every task) or a ``{task_type: number}``
@@ -142,18 +136,12 @@ def _ref_audio_wire_waveform(waveform: np.ndarray) -> dict[str, Any]:
     return {"__ndarray__": True, "data": wav.tobytes(), "dtype": "float32", "shape": [int(wav.size)]}
 
 
-class Qwen3TTSCodecLimitError(TTSGenerationError):
-    """Qwen3-TTS exhausted its codec budget without emitting EOS."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, retryable=True)
-
-
 @register_tts_adapter
 class Qwen3TTSAdapter(ARTTSAdapter):
     """Adapter for Qwen3-TTS (AR ``engine_client`` backend)."""
 
-    validates_generation = True
+    # Length limits return the generated audio with a truncation signal.
+    reports_length_truncation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
     text_commitment = TextCommitmentCapabilities(
@@ -699,9 +687,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         effective_cap: int | None
 
         if request.max_new_tokens is not None:
-            # An explicit request budget is an opt-out from the automatic
-            # ceiling. It remains an upper bound; for Base a length finish is
-            # still surfaced as an incomplete generation rather than valid audio.
+            # An explicit request budget opts out of the automatic ceiling.
             effective_cap = int(request.max_new_tokens)
         elif budget is not None and budget.enabled:
             counted_text_tokens = server._count_usage_text_tokens(request.input)
@@ -725,11 +711,6 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 effective_cap,
             )
 
-        if additional_information is not None and effective_cap is not None:
-            additional_information[QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
-            if dynamic_cap is not None:
-                additional_information[QWEN3_TTS_AUTO_BUDGET_KEY] = [True]
-
         # Propagate the deploy/YAML stage seed to residual MTP sampling. The
         # generic serving layer applies an explicit request.seed afterwards,
         # so the request value still has higher precedence.
@@ -751,32 +732,3 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             effective_cap,
         )
         return sampling_params_list
-
-    def validate_generation(
-        self,
-        tts_params: Mapping[str, object],
-        *,
-        stage0_finish_reason: str | None,
-        output_tokens: int,
-    ) -> None:
-        if QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY not in tts_params:
-            return
-        if stage0_finish_reason != "length":
-            return
-        task_type = _first_value(tts_params.get("task_type"))
-        # Base rejects every length finish (#6728). Other tasks reject it only
-        # under the server-derived text budget, including when that budget is
-        # clamped to the configured stage limit; an explicit caller budget
-        # keeps returning the audio as before.
-        if task_type != "Base" and not _first_value(tts_params.get(QWEN3_TTS_AUTO_BUDGET_KEY)):
-            return
-
-        raw_limit = _first_value(tts_params.get(QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY))
-        try:
-            limit = int(raw_limit) if isinstance(raw_limit, (str, bytes, bytearray, int, float)) else 0
-        except (TypeError, ValueError):
-            limit = 0
-        raise Qwen3TTSCodecLimitError(
-            f"Qwen3-TTS {task_type} did not emit codec EOS before its token budget "
-            f"({output_tokens}/{limit} codec tokens); the generated audio is incomplete."
-        )

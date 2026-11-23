@@ -163,6 +163,9 @@ def test_executor_submits_prefetch_after_current_rank_barrier():
 
 def _config():
     return SimpleNamespace(
+        stage_role=None,
+        model_stage=None,
+        omni_kv_config={},
         kv_transfer_config=KVTransferConfig(
             kv_connector="MooncakeConnector",
             kv_role="kv_consumer",
@@ -172,6 +175,7 @@ def _config():
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
         max_num_seqs=1,
         model_class_name="TestDiffusionPipeline",
+        diffusion_attention_schedule=None,
     )
 
 
@@ -336,6 +340,8 @@ def test_abort_drains_b_before_releasing_pages(monkeypatch):
     assert "B" in scheduler._kv_draining_requests
     assert scheduler._diffusion_kv_manager.has_request("B")
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
+    engine._streaming_playback = None
     engine.scheduler = scheduler
     engine._remove_diffusion_kv_requests = Mock()
     engine.abort_queue = SimpleNamespace(empty=lambda: True)
@@ -430,6 +436,8 @@ def test_abort_timeout_keeps_target_pages(monkeypatch):
         scheduler.add_request(_request(rid))
     scheduler.schedule()
     engine = object.__new__(DiffusionEngine)
+    engine._request_chunk_states = {}
+    engine._streaming_playback = None
     engine.scheduler = scheduler
     engine.executor = SimpleNamespace(prepare_kv_for_forward=Mock(side_effect=TimeoutError("receive")))
     engine._fail_engine = Mock()

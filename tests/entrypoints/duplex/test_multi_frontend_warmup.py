@@ -60,6 +60,7 @@ class _Omni:
         self.placement = DuplexReplicaPlacement(
             stage_replica_counts=[replicas, replicas],
             max_sessions_per_replica=1,
+            replica_groups=[{0: replica, 1: replica} for replica in range(replicas)],
             frontend_count=frontends,
             frontend_index=index,
         )

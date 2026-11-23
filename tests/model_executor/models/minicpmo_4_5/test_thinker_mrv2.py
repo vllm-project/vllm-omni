@@ -50,17 +50,16 @@ def test_cuda_turn_inherits_mrv2_talker_kstep(monkeypatch):
     assert talker.yaml_runtime["cuda_mps"] is True
 
 
-def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_config=None):
+def _model(mocker, *, session="turn", async_chunk=False, speculative_config=None):
     thinker = torch.nn.Module()
     thinker.make_empty_intermediate_tensors = lambda: None
     mocker.patch.object(omni, "init_vllm_registered_model", return_value=thinker)
-    mocker.patch("vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config")
+    mocker.patch("vllm_omni.model_executor.models.minicpmo_4_5.config.patch_minicpmo_remote_config")
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(),
             multimodal_config=None,
             model_stage="llm",
-            use_v2_model_runner=v2,
             session_mode=session,
             async_chunk=async_chunk,
         ),
@@ -382,7 +381,7 @@ def test_mrv2_cancel_before_first_prefill_completes_frees_session(mocker):
 
 
 def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):
-    """MRv2 hands its prefill rows to the V1 cross-session ``preprocess_batch``."""
+    """MRv2 hands its prefill rows to the cross-session ``preprocess_batch``."""
     model = _model(mocker, session="duplex")
     batch = mocker.patch.object(model, "preprocess_batch")
     infos = [
@@ -400,15 +399,14 @@ def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):
     batch.assert_not_called()
 
 
-@pytest.mark.parametrize("v2,session,keeps", [(True, "duplex", True), (True, "turn", False), (False, "duplex", False)])
-def test_only_the_mrv2_duplex_thinker_keeps_native_multimodal_inputs(mocker, v2, session, keeps):
-    # Chat requests with media share the duplex Thinker; turn MRv2 has no preprocess and V1 encodes first.
-    assert _model(mocker, v2=v2, session=session).preprocess_keeps_mm_inputs is keeps
+@pytest.mark.parametrize("session,keeps", [("duplex", True), ("turn", False)])
+def test_only_the_mrv2_duplex_thinker_keeps_native_multimodal_inputs(mocker, session, keeps):
+    # Chat requests with media share the duplex Thinker; turn MRv2 has no preprocess.
+    assert _model(mocker, session=session).preprocess_keeps_mm_inputs is keeps
 
 
-@pytest.mark.parametrize("v2,session", [(True, "turn"), (False, "duplex")])
-def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker, v2, session):
-    assert not hasattr(_model(mocker, v2=v2, session=session), "preprocess_batch_mrv2")
+def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker):
+    assert not hasattr(_model(mocker, session="turn"), "preprocess_batch_mrv2")
 
 
 def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
@@ -450,11 +448,81 @@ def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
         model.set_aux_hidden_state_layers((1, 9, 17))
 
 
-def test_v1_thinker_refuses_drafter_layers(mocker):
-    model = _model(mocker, v2=False)
-    with pytest.raises(NotImplementedError, match="model_runner: v2"):
-        model.set_aux_hidden_state_layers((1, 9, 17))
-    assert model._returns_aux_hidden_states is False
+@pytest.mark.parametrize("stage", ["llm", "tts"])
+def test_mrv2_native_drafter_output_survives_runner_load_and_capture(mocker, monkeypatch, stage):
+    from vllm.model_executor.models.interfaces import EagleModelMixin
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+    from vllm_omni.worker_v2 import staged_writes
+
+    hidden = torch.randn(3, 4)
+
+    class Decoder(torch.nn.Module, EagleModelMixin):
+        start_layer = 0
+
+        def forward(self, **kwargs):
+            # Stand in for decoder attention/weights, retaining the native
+            # Eagle collector and its (hidden, target layers) return protocol.
+            self.aux: list[torch.Tensor] = []
+            for index in range(4):
+                self._maybe_add_hidden_state(self.aux, index, hidden + index, None)
+            return (hidden, self.aux) if self.aux else hidden
+
+    decoder = Decoder()
+    model = _model(mocker)
+    if stage == "llm":
+        language_model = torch.nn.Module()
+        language_model.model = decoder
+        model.thinker.get_language_model = lambda: language_model
+        model.thinker.forward = decoder.forward
+    else:
+        talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+        torch.nn.Module.__init__(talker)
+        talker._k_step_frames = 0
+        talker._deferred_cleanup_ids = set()
+        talker.vllm_config = model.vllm_config
+        talker.tts_model = decoder
+        model.model_stage = "tts"
+        model.talker = talker
+
+    ids, positions = torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2])
+    assert model(ids, positions) is hidden
+    model.set_aux_hidden_state_layers((3, 1, 3))
+    out_hidden, out_aux = model(ids, positions)
+    assert out_hidden is hidden and out_aux is decoder.aux
+    assert len(out_aux) == 2
+    torch.testing.assert_close(out_aux[0], hidden + 1)
+    torch.testing.assert_close(out_aux[1], hidden + 3)
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    runner.model = model
+    runner.use_aux_hidden_state_outputs = True
+    runner.supports_mm_inputs = False
+    runner.model_config = runner.vllm_config = SimpleNamespace()
+    runner.model_state = SimpleNamespace(_is_mtp_graph_runner=lambda: False)
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
+    monkeypatch.setattr(GPUModelRunner, "load_model", lambda self: None)
+    monkeypatch.setattr(runner, "_resolve_talker_kstep_frames", lambda: 0)
+    monkeypatch.setattr(runner, "_publish_shared_backbone_if_configured", lambda: None)
+    runner.load_model()
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
+
+    captured = []
+
+    def capture(parent, **kwargs):
+        captured.append(parent.model(ids, positions))
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    assert runner.capture_model() == 0
+    assert captured[0][0] is hidden and captured[0][1] is decoder.aux
+    assert runner.use_aux_hidden_state_outputs is True
 
 
 def test_talker_stage_hands_drafter_hooks_to_the_talker(mocker):

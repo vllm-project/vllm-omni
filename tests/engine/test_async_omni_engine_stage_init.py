@@ -215,7 +215,9 @@ def test_build_vllm_config_forwards_text_watermark_config(
     )
     forwarded: list[dict[str, object] | None] = []
 
-    with pytest.raises(_StopAfterEngineArgsError):
+    expected_error = _StopAfterEngineArgsError if use_v2_model_runner else ValueError
+    expected_match = None if use_v2_model_runner else "Model Runner V1 is not supported"
+    with pytest.raises(expected_error, match=expected_match):
         # start to build the vLLM config and ensure the Omni watermark config is properly parsed
         build_vllm_config(
             stage,
@@ -224,7 +226,7 @@ def test_build_vllm_config_forwards_text_watermark_config(
             watermark_config=WatermarkConfig({"text": {"key": 1234, "algorithm": "gumbel"}}),
         )
 
-    assert forwarded == [expected]
+    assert forwarded == ([expected] if use_v2_model_runner else [])
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
@@ -407,7 +409,11 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.stage_configs = [types.SimpleNamespace()]
+    engine.stage_configs = [
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="text_encoder", owns_tokenizer=True)
+        )
+    ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
@@ -446,7 +452,11 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.stage_configs = [types.SimpleNamespace()]
+    engine.stage_configs = [
+        VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="text_encoder", owns_tokenizer=True)
+        )
+    ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
@@ -1587,6 +1597,61 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
     }
 
 
+def test_startup_crash_preserves_sibling_and_replica_id(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import LocalReplicaStartupError
+
+    runtime = StageRuntime([], "dummy", None, stage_init_timeout=1, async_chunk=False)
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=_FakeVllmConfig(), num_replicas=2)
+    survivor = types.SimpleNamespace()
+
+    def initialize(replica, _timeout):
+        if replica.replica_id == 0:
+            raise LocalReplicaStartupError("exited before READY")
+        return survivor
+
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(runtime, "_build_init_groups", lambda _: {"shared": [(0, r) for r in plan.replicas]})
+    monkeypatch.setattr(runtime, "_initialize_replica", initialize)
+    monkeypatch.setattr("vllm_omni.engine.stage_runtime.build_llm_stage_output_processor", lambda *args, **kwargs: None)
+
+    runtime.initialize()
+
+    assert runtime.stage_pools[0].clients == [None, survivor]
+    assert runtime.stage_pools[0].available_replica_ids() == [1]
+
+
+@pytest.mark.parametrize("cancelled", [False, True], ids=["all_replicas_exit", "cancelled"])
+def test_startup_failure_cleans_up_initialized_clients(monkeypatch, mocker, cancelled):
+    from vllm_omni.engine.stage_engine_startup import LocalReplicaStartupError
+
+    runtime = StageRuntime([], "dummy", None, stage_init_timeout=1, async_chunk=False)
+    plans = [_make_llm_plan(i, stage_id=i, vllm_config=_FakeVllmConfig(), num_replicas=n) for i, n in enumerate([1, 2])]
+    other_stage_client = mocker.Mock()
+    sibling = mocker.Mock()
+
+    def initialize(replica, _timeout):
+        if replica.metadata.stage_id == 0:
+            return other_stage_client
+        if cancelled:
+            if replica.replica_id == 0:
+                return sibling
+            runtime._init_cancelled.set()
+        raise LocalReplicaStartupError("exited before READY")
+
+    groups = {"shared": [(plan.stage_idx, replica) for plan in plans for replica in plan.replicas]}
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: plans)
+    monkeypatch.setattr(runtime, "_build_init_groups", lambda _: groups)
+    monkeypatch.setattr(runtime, "_initialize_replica", initialize)
+
+    error = RuntimeError if cancelled else LocalReplicaStartupError
+    message = "cancelled" if cancelled else "exited before READY"
+    with pytest.raises(error, match=message):
+        runtime.initialize()
+    other_stage_client.shutdown.assert_called_once_with()
+    if cancelled:
+        sibling.shutdown.assert_called_once_with()
+
+
 def test_remote_replicas_use_distinct_init_group_keys():
     runtime = StageRuntime(
         stage_configs=[],
@@ -2661,7 +2726,7 @@ def test_engine_async_chunk_includes_downstream_stages(monkeypatch, stage_modes,
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
+def test_dist_stage_runtime_preserves_stage_total_when_local_dp_is_set(typed):
     from vllm_omni.config.omni_config import VllmOmniARStageConfig
     from vllm_omni.config.stage_config import StagePipelineConfig
     from vllm_omni.engine.stage_runtime import DistStageRuntime
@@ -2672,6 +2737,7 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
     else:
         runtime_cfg = types.SimpleNamespace(num_replicas=1)
         stage = types.SimpleNamespace(stage_id=0, runtime=runtime_cfg)
+    runtime_cfg.num_replicas = 3
     runtime = DistStageRuntime(
         stage_configs=[stage],
         model="dummy-model",
@@ -2686,7 +2752,10 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
 
     runtime._validate_single_stage_mode_replica_constraints()
 
-    assert runtime_cfg.num_replicas == 2
+    assert runtime_cfg.num_replicas == 3
+    assert runtime._get_replica_launch_mode(0, 0) == "local"
+    assert runtime._get_replica_launch_mode(0, 1) == "local"
+    assert runtime._get_replica_launch_mode(0, 2) == "remote"
 
 
 @pytest.mark.parametrize("num_replicas", [1, 2, 3])

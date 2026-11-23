@@ -11,17 +11,19 @@ pinned by the checkpoint's reference config. Model-specific controls travel in
 
 - ``cot``: ``"off"`` (default) | ``"melody"`` | ``"full"`` — how the ABC
   score span in the prompt is handled.
-- ``abc``: an ABC score as text, required for ``cot=melody|full``. Serving v1
-  does not run the model-generated ABC phase (that is two sequential engine
-  requests; use the offline example for it).
+- ``abc``: optional external score for ``cot=melody|full``; omitted scores
+  are generated within the same request.
+- ``abc_max_tokens``: automatic ABC budget, from 1 to 4096.
+- ``cfg_scale``: paired semantic guidance, from 0 to 20; default 1 disables CFG.
 
 Unsupported parameters are rejected rather than silently ignored, following
 the MiniMax Music 3 precedent.
 """
 
+import asyncio
+import math
 import secrets
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -30,28 +32,14 @@ from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     PreparedRequest,
-    resolve_stage_model_path,
 )
 from vllm_omni.model_executor.models.yue2.yue2 import (
-    CONTEXT,
     FRAMES_PER_SECOND,
     KEY_MAX_AUDIO_FRAMES,
-    KEY_MAX_HOLD_STEPS,
-    KEY_MIN_TOKENS,
-    KEY_PENALTY_WINDOW,
     KEY_PHASE,
-    KEY_PREFIX_IDS,
-    KEY_REPETITION_PENALTY,
-    KEY_SEED,
-    KEY_SKIP_SYNTHESIS,
-    KEY_TEMPERATURE,
-    KEY_TOP_K,
-    KEY_TOP_P,
     SEMANTIC_SAMPLING,
     STOP_TOKEN_IDS,
-    SYNTHESIS_HOLD_STEPS,
 )
-from vllm_omni.tokenizers.yue2_prompt import semantic_prefix_ids
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -100,12 +88,19 @@ class Yue2Adapter(ARTTSAdapter):
         if cot == "off":
             if abc is not None:
                 return "extra_params.abc requires cot=melody|full"
-        elif not isinstance(abc, str) or not abc.strip():
-            return (
-                f"cot={cot} requires extra_params.abc carrying an ABC score. "
-                "Model-generated ABC is two engine requests and is not served "
-                "in v1; use examples/offline_inference/yue2 for that."
-            )
+        elif abc is not None and (not isinstance(abc, str) or not abc.strip()):
+            return "extra_params.abc must be a nonempty ABC score"
+        budget = extra.get("abc_max_tokens", 4096)
+        if type(budget) is not int or not 1 <= budget <= 4096:
+            return "extra_params.abc_max_tokens must be an integer in [1,4096]"
+        scale = extra.get("cfg_scale", 1.0)
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(scale)
+            or not 0 <= scale <= 20
+        ):
+            return "extra_params.cfg_scale must be finite and in [0,20]"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < self.max_new_tokens_min:
@@ -145,7 +140,7 @@ class Yue2Adapter(ARTTSAdapter):
         # Resolve (and possibly download) qwen.tiktoken at startup: build()
         # runs on the request path and must not block on a hub download, and a
         # bad path should surface before the first request.
-        self._tokenizer()
+        await asyncio.to_thread(self._tokenizer)
 
     async def build(
         self,
@@ -153,30 +148,26 @@ class Yue2Adapter(ARTTSAdapter):
         sampling_params_list: list,
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
-        del sampling_params_list, has_inline_ref_audio
-        extra: dict[str, Any] = request.extra_params or {}
-        cot = extra.get("cot", "off")
-        encode = self._tokenizer().encode
-        abc_ids = encode(extra["abc"]) if cot != "off" else None
-        # validate() has already rejected blank lyrics/caption.
-        instructions = request.instructions or ""
-        lyrics = request.input or ""
-        prefix = semantic_prefix_ids(encode, instructions, lyrics, cot, abc_ids=abc_ids)
-        max_frames = int(request.max_new_tokens or _DEFAULT_MAX_FRAMES)
-        # +1: the song is delivered on the step after its last frame (the
-        # model acts on its draws one step late), which also needs a slot.
-        if len(prefix) + max_frames + 1 > CONTEXT:
-            return_err = (
-                f"YuE2 prompt is {len(prefix)} tokens and the {max_frames}-frame budget "
-                f"exceeds the {CONTEXT}-token context. Shorten the lyrics/style or "
-                "lower max_new_tokens."
-            )
-            raise ValueError(return_err)
-        return PreparedRequest(
-            prompt={"prompt_token_ids": prefix},
-            tts_params={"max_audio_frames": [max_frames]},
-            model_type=self.name,
+        from vllm_omni.model_executor.models.yue2.request import prepare_song
+
+        extra = request.extra_params or {}
+        seed = request.seed if request.seed is not None else secrets.randbelow(2**31)
+        engine = self.ctx.engine_client
+        assert engine is not None
+        prompt, params = prepare_song(
+            self._tokenizer().encode,
+            request.instructions,
+            request.input,
+            cot=extra.get("cot", "off"),
+            abc=extra.get("abc"),
+            seed=seed,
+            max_frames=int(request.max_new_tokens or _DEFAULT_MAX_FRAMES),
+            max_abc_tokens=extra.get("abc_max_tokens", 4096),
+            max_model_len=engine.vllm_config.model_config.max_model_len,
+            cfg_scale=extra.get("cfg_scale", 1.0),
         )
+        prompt["additional_information"] = {"yue2_song_sampling": params.extra_args}
+        return PreparedRequest(prompt=prompt, tts_params={}, model_type=self.name)
 
     def apply_sampling_overrides(
         self,
@@ -187,41 +178,15 @@ class Yue2Adapter(ARTTSAdapter):
     ) -> list:
         import copy
 
-        sampling_params_list = copy.deepcopy(sampling_params_list)
-        params = sampling_params_list[0]
-        max_frames = int(request.max_new_tokens or _DEFAULT_MAX_FRAMES)
-        # A service must not give every caller the same song; without an
-        # explicit seed, draw one per request.
-        seed = request.seed if request.seed is not None else secrets.randbelow(2**31)
-        assert prompt is not None  # the engine always passes the scheduled prompt
-        params.extra_args = {
-            **(params.extra_args or {}),
-            KEY_PHASE: "semantic",
-            KEY_SEED: seed,
-            KEY_TEMPERATURE: SEMANTIC_SAMPLING["temperature"],
-            KEY_TOP_P: SEMANTIC_SAMPLING["top_p"],
-            KEY_TOP_K: SEMANTIC_SAMPLING["top_k"],
-            KEY_REPETITION_PENALTY: SEMANTIC_SAMPLING["repetition_penalty"],
-            KEY_PENALTY_WINDOW: SEMANTIC_SAMPLING["penalty_window"],
-            KEY_MIN_TOKENS: SEMANTIC_SAMPLING["min_tokens"],
-            KEY_MAX_AUDIO_FRAMES: max_frames,
-            KEY_SKIP_SYNTHESIS: False,
-            # Full prompt ids: under a KV prefix-cache hit the engine schedules
-            # only the uncached tail, so the model cannot rebuild its NAR
-            # conditioning prefix from the scheduled tokens alone.
-            KEY_PREFIX_IDS: list(prompt["prompt_token_ids"]),
-        }
-        # The model needs one decode step beyond the last frame to deliver the
-        # terminal NAR/VAE pass, so do not cap the engine at exactly max_frames.
-        # Synthesize on a side stream while other songs keep decoding; the
-        # request may emit up to SYNTHESIS_HOLD_STEPS hold tokens meanwhile
-        # (see the model), so max_tokens leaves that much headroom.
-        prompt_len = len(prompt["prompt_token_ids"])
-        params.max_tokens = min(max_frames + 1 + SYNTHESIS_HOLD_STEPS, CONTEXT - prompt_len)
-        params.extra_args[KEY_MAX_HOLD_STEPS] = max(0, params.max_tokens - max_frames - 1)
-        params.stop_token_ids = list(STOP_TOKEN_IDS)
-        params.detokenize = False
-        return sampling_params_list
+        assert prompt is not None
+        params = copy.deepcopy(sampling_params_list)
+        # Phase transitions mutate nested args; keep the prepared prompt reusable.
+        args = copy.deepcopy(prompt["additional_information"]["yue2_song_sampling"])
+        params[0].extra_args = args
+        params[0].max_tokens = args[KEY_MAX_AUDIO_FRAMES] + (2 if args[KEY_PHASE] == "semantic" else 0)
+        params[0].stop_token_ids = list(STOP_TOKEN_IDS)
+        params[0].detokenize = False
+        return params
 
     @staticmethod
     def _last_meta_flag(audio_output: Mapping[str, Any], name: str) -> Any:
@@ -245,9 +210,13 @@ class Yue2Adapter(ARTTSAdapter):
 
     def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
         """Surface meta.truncated / meta.error as response headers."""
+        if self._last_meta_flag(audio_output, "abc_truncated") in (True, 1, "1"):
+            collect["audio_truncated"] = True
         truncated = self._last_meta_flag(audio_output, "truncated")
         if truncated is not None:
-            collect["audio_truncated"] = truncated is True or str(truncated) == "1"
+            collect["audio_truncated"] = (
+                collect.get("audio_truncated", False) or truncated is True or str(truncated) == "1"
+            )
         # meta.error=1 marks a failed NAR/VAE pass (empty clip); serving turns
         # it into a 500 via this generic key. Absent/0 means success.
         error = self._last_meta_flag(audio_output, "error")
@@ -259,17 +228,17 @@ class Yue2Adapter(ARTTSAdapter):
         if self._cached_tokenizer is None:
             from vllm_omni.tokenizers.yue2_tokenizer import YuE2TextTokenizer
 
-            model_path = resolve_stage_model_path(self.ctx.engine_client)
-            if model_path is None:
-                raise RuntimeError("YuE2 tokenizer needs a resolvable stage model path")
-            merge_file = Path(model_path).expanduser() / "qwen.tiktoken"
-            if not merge_file.is_file():
-                # model_path is an HF repo id: pull just the merge file into
-                # the hub cache (vae.py does the same for the VAE snapshot).
-                from vllm_omni.transformers_utils.repo_utils import hf_api
-
-                merge_file = Path(hf_api().hf_hub_download(model_path, "qwen.tiktoken"))
-            self._cached_tokenizer = YuE2TextTokenizer(merge_file)
+            engine = self.ctx.engine_client
+            assert engine is not None
+            vllm_config = engine.vllm_config
+            assert vllm_config is not None
+            config = vllm_config.model_config
+            self._cached_tokenizer = YuE2TextTokenizer.from_pretrained(
+                config.model,
+                revision=config.revision,
+                token=config.hf_token,
+                cache_dir=vllm_config.load_config.download_dir,
+            )
         return self._cached_tokenizer
 
 

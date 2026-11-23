@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage input processor for Step-Audio2: Thinker → Token2Wav transition."""
 
 from typing import Any
@@ -131,6 +132,10 @@ def thinker2token2wav_async_chunk(
                 finished=torch.tensor(False, dtype=torch.bool),
             ),
         )
+
+
+# Chunk boundaries and lookahead use the complete generated audio prefix.
+setattr(thinker2token2wav_async_chunk, "_requires_full_token_history", True)
 
 
 def thinker2token2wav(

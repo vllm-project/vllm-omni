@@ -9,6 +9,7 @@ quantization configs for W4A16/AutoRound quantization support.
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
@@ -31,7 +32,7 @@ from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELIN
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.fixture(scope="function", autouse=True)
+@pytest.fixture(scope="module")
 def _init_distributed():
     """Initialize the minimal distributed environment required by
     ReplicatedLinear (tensor-parallel group must exist)."""
@@ -41,18 +42,44 @@ def _init_distributed():
         initialize_model_parallel,
     )
 
-    from tests.helpers.runtime import assign_ephemeral_master_port
-
-    assign_ephemeral_master_port()
+    # A fresh file store per group avoids the free-port probe/bind race in env://.
     init_distributed_environment(
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method="env://",
+        distributed_init_method=get_file_store_init_method(),
     )
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    try:
+        initialize_model_parallel()
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
+
+
+def test_distributed_fixture_uses_file_rendezvous(mocker: MockerFixture):
+    get_file_store_init_method_mock = mocker.patch(
+        f"{__name__}.get_file_store_init_method",
+        return_value="file:///tmp/glm-image-rendezvous",
+    )
+    init_distributed_environment = mocker.patch("vllm.distributed.parallel_state.init_distributed_environment")
+    initialize_model_parallel = mocker.patch("vllm.distributed.parallel_state.initialize_model_parallel")
+    cleanup_dist_env_and_memory = mocker.patch("vllm.distributed.parallel_state.cleanup_dist_env_and_memory")
+
+    fixture = _init_distributed.__wrapped__()
+    next(fixture)
+    try:
+        get_file_store_init_method_mock.assert_called_once_with()
+        init_distributed_environment.assert_called_once_with(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="file:///tmp/glm-image-rendezvous",
+        )
+        initialize_model_parallel.assert_called_once_with()
+    finally:
+        fixture.close()
+
+    cleanup_dist_env_and_memory.assert_called_once_with()
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -172,6 +199,7 @@ class TestValidateGlmImageTpConstraints:
             )
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageAdaLayerNormZeroQuantization:
     """Test GlmImageAdaLayerNormZero with quantization config."""
 
@@ -220,6 +248,7 @@ class TestGlmImageAdaLayerNormZeroQuantization:
         assert len(result) == 10  # Should return 10 chunks
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageAdaLayerNormContinuousQuantization:
     """Test GlmImageAdaLayerNormContinuous with quantization config."""
 
@@ -266,6 +295,7 @@ class TestGlmImageAdaLayerNormContinuousQuantization:
         assert result.shape == (batch_size, seq_len, 2560)
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageAttentionQuantization:
     """Test GlmImageAttention with quantization config."""
 
@@ -298,6 +328,7 @@ class TestGlmImageAttentionQuantization:
         assert attn.to_qkv.quant_config is None
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestColumnParallelModulesQuantization:
     """Test ColumnParallelGELU and ColumnParallelSiLU with quantization config."""
 
@@ -336,6 +367,7 @@ class TestColumnParallelModulesQuantization:
         assert layer.proj.quant_config is mock_quant_config
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageFeedForwardQuantization:
     """Test GlmImageFeedForward with quantization config."""
 
@@ -388,6 +420,7 @@ class TestGlmImageFeedForwardQuantization:
         assert isinstance(ff.net[0], ColumnParallelSiLU)
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageTransformerBlockQuantization:
     """Test GlmImageTransformerBlock with quantization config."""
 
@@ -568,6 +601,7 @@ class TestGlmImageRotaryPosEmbed:
         assert torch.allclose(sin1, sin2)
 
 
+@pytest.mark.usefixtures("_init_distributed")
 class TestGlmImageTransformer2DModelQuantization:
     """Test GlmImageTransformer2DModel with quantization config."""
 
