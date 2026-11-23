@@ -524,6 +524,7 @@ def mux_video_audio_bytes(
             samples = samples.reshape(1, -1)
         elif samples.ndim == 2 and samples.shape[0] > samples.shape[1]:
             samples = np.ascontiguousarray(samples.T)
+        samples = np.ascontiguousarray(samples)
         num_channels = samples.shape[0]
         layout = "stereo" if num_channels >= 2 else "mono"
         a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=audio_sample_rate))
