@@ -316,7 +316,10 @@ class OmniServeCommand(CLISubcommand):
         # vLLM equivalents on the command line would silently disagree with
         # those sources of truth, so reject them at parse time.
         if getattr(args, "omni", False):
-            explicit_cli_keys: set[str] = getattr(args, "_cli_explicit_keys", set()) or set()
+            # ``explicit_keys`` is what TrackingNamespace records; there is no
+            # ``_cli_explicit_keys`` attribute, so reading that name always fell
+            # back to the empty set and this guard never fired.
+            explicit_cli_keys: set[str] = getattr(args, "explicit_keys", set()) or set()
             prohibited_with_omni: dict[str, str] = {
                 "data_parallel_size": "--data-parallel-size",
                 "data_parallel_size_local": "--data-parallel-size-local",

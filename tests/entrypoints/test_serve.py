@@ -1608,3 +1608,51 @@ def test_serve_parser_rejects_removed_shm_threshold_bytes() -> None:
 
     with pytest.raises(SystemExit):
         _parse_serve_args(["serve", "fake-model", "--omni", "--shm-threshold-bytes", "1048576"])
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--data-parallel-size", "4"],
+        ["--enable-expert-parallel"],
+        ["--data-parallel-size", "4", "--enable-expert-parallel"],
+    ],
+)
+def test_omni_rejects_vllm_parallelism_flags(flags: list[str], mocker: MockerFixture) -> None:
+    """Under ``--omni`` parallelism comes from the per-stage YAML.
+
+    The guard reads ``TrackingNamespace.explicit_keys``; it used to read
+    ``_cli_explicit_keys``, an attribute that does not exist, so the
+    ``getattr`` default made the whole check dead code and these flags were
+    accepted and then propagated to every stage.
+    """
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    args = _parse_serve_args(["serve", "fake-model", "--omni", *flags])
+    cmd = OmniServeCommand()
+    with pytest.raises(ValueError, match="not supported under --omni"):
+        cmd.validate(args)
+
+
+def test_omni_parallelism_guard_names_only_the_flags_given(mocker: MockerFixture) -> None:
+    """The error names the offending flags, not the whole blacklist."""
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--enable-expert-parallel"])
+    cmd = OmniServeCommand()
+    with pytest.raises(ValueError) as excinfo:
+        cmd.validate(args)
+    message = str(excinfo.value)
+    assert "--enable-expert-parallel" in message
+    assert "--data-parallel-size" not in message
+
+
+def test_parallelism_flags_still_allowed_without_omni(mocker: MockerFixture) -> None:
+    """The guard is scoped to ``--omni``; plain vLLM serving keeps its flags."""
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    args = _parse_serve_args(["serve", "fake-model", "--data-parallel-size", "4"])
+    OmniServeCommand().validate(args)
