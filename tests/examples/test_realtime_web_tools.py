@@ -369,6 +369,8 @@ def _proxy_state() -> dict:
         "inflight_gen": None,
         "last_frame": "",
         "turn_frame": "",
+        "pending_frame": "",
+        "frames_by_response": {},
         "pending_response_id": None,
     }
 
@@ -497,3 +499,22 @@ async def test_unsubmitted_commit_does_not_replace_the_admitted_response_frame()
         pump.cancel()
         await asyncio.gather(pump, return_exceptions=True)
     assert seen == ["frame-a"]
+
+
+@pytest.mark.asyncio
+async def test_response_done_drops_the_bound_frame() -> None:
+    backend = _QueueBackend()
+    state = _proxy_state()
+    pump = asyncio.create_task(server._pump_backend_to_client(_NullClient(), backend, _Tools(), state))
+    try:
+        server._note_client_event(state, {"type": "input_audio_buffer.append", "video_frames": ["frame-a"]})
+        server._note_client_event(state, {"type": "input_audio_buffer.commit"})
+        backend.push({"type": "response.created", "response_id": "resp_A"})
+        await _settle()
+        assert state["frames_by_response"]["resp_A"] == "frame-a"
+        backend.push({"type": "response.done", "response_id": "resp_A"})
+        await _settle()
+    finally:
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+    assert "resp_A" not in state["frames_by_response"]

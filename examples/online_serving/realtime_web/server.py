@@ -172,6 +172,17 @@ def _frame_for_response(state: dict[str, Any], response_id: str | None) -> str:
     return str(state.get("turn_frame") or "")
 
 
+def _drop_response_frame(state: dict[str, Any], response_id: str | None) -> None:
+    """Forget the frame once the response finishes.
+
+    Each tool task already copied ``frame_b64`` when it started, so the map only
+    needs to live until ``response.done``.
+    """
+    frames = state.get("frames_by_response")
+    if response_id is not None and isinstance(frames, dict):
+        frames.pop(response_id, None)
+
+
 def _hold_follow_up_for_response_done(state: dict[str, Any], response_id: str | None = None) -> None:
     """The function-call item is published before ``response.done``.
 
@@ -298,12 +309,12 @@ async def _pump_backend_to_client(
             kind = event.get("type")
             if tool_followups is not None and kind == "response.created":
                 _bind_admitted_frame(tool_followups, _event_response_id(event))
-            if (
-                tool_followups is not None
-                and kind == "response.done"
-                and _take_deferred_follow_up(tool_followups, _event_response_id(event))
-            ):
-                await backend.send(json.dumps({"type": "response.create"}))
+            if tool_followups is not None and kind == "response.done":
+                response_id = _event_response_id(event)
+                release_follow_up = _take_deferred_follow_up(tool_followups, response_id)
+                _drop_response_frame(tool_followups, response_id)
+                if release_follow_up:
+                    await backend.send(json.dumps({"type": "response.create"}))
             call = _finished_function_call(event) if event is not None else None
             if call is not None:
                 count = tool_followups["count"] if tool_followups is not None else 0

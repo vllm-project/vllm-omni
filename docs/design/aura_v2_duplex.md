@@ -65,12 +65,11 @@ plugin sets for v2.
 
 On a tie the lower id (`<|silent|>`) wins. The Model Runner V2 processor
 decides the first step from `total_len == prompt_len` on device and does not
-read the output list. The V1 processor does read the live output list, which
-is why its deploy needed `async_scheduling: false`; the V2 deploys keep that
-setting, and whether V2 still needs it is not measured. Stage1 keeps the temperature from the deploy
-profile (the shipped profile uses 0.2). The plugin forces ``min_tokens`` to 0
-and the penalty fields to their no-penalty values so a penalty cannot push the
-control token; it does not override temperature.
+read the output list. The shipped profiles keep Stage1 `async_scheduling:
+false`; whether V2 still needs that setting is not measured. Stage1 keeps the
+temperature from the deploy profile (the shipped profile uses 0.2). The plugin
+forces ``min_tokens`` to 0 and the penalty fields to their no-penalty values so
+a penalty cannot push the control token; it does not override temperature.
 
 ## Control-token families
 
