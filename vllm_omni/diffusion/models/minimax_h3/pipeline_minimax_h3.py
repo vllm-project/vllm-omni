@@ -2881,6 +2881,10 @@ class MiniMaxH3Pipeline(
         if rank < self.text_encoder_tp_size:
             ids = self._distribute_encode_inputs(ids, vision_kwargs)
             hidden = self._encode_text_hidden(ids, vision_kwargs)
+        # Only rank 0 supplies the broadcast. Drop other TP ranks' local
+        # outputs before allocating their receive buffers.
+        if rank != 0:
+            hidden = None
         return (
             _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
             _broadcast_tensor(tags, dtype=torch.long, device=self.device),

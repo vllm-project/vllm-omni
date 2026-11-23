@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -19,7 +20,7 @@ class MiniMaxH3Qwen3VLEncoder:
     """Typed name required by the extracted pipeline method."""
 
 
-def method(file, owner, name):
+def method(file, owner, name, **globals_):
     """Exercise actual lightweight methods without loading model/runtime dependencies."""
     source = ROOT / "vllm_omni/diffusion/models/minimax_h3" / file
     tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -32,6 +33,7 @@ def method(file, owner, name):
         "contextmanager": contextmanager,
         "MiniMaxH3Qwen3VLEncoder": MiniMaxH3Qwen3VLEncoder,
     }
+    scope.update(globals_)
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
     return scope[name]
 
@@ -222,3 +224,73 @@ def test_real_module_hooks_and_component_cleanup(mocker, branch, fail):
         assert torch.equal(hidden, torch.arange(4) + 1)
         assert not torch._C._is_alias_of(hidden, enc.weight)
     assert events == ["load", "offload"]
+
+
+@pytest.mark.parametrize("mode", list(EncoderWeightTransfer))
+@pytest.mark.parametrize("rank,tp_size,world_size", [(0, 1, 1), (0, 8, 8), (1, 8, 8), (7, 8, 8), (1, 1, 8)])
+def test_encode_prompt_releases_non_source_hidden_before_receive(mocker, mode, rank, tp_size, world_size):
+    expected_hidden = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
+    expected_tags = torch.tensor([0, 1, 2])
+    output_ref = None
+    events = []
+
+    def encode(input_ids, vision_kwargs):
+        nonlocal output_ref
+        assert torch.equal(input_ids, torch.tensor([1, 2, 3]))
+        hidden = expected_hidden.clone()
+        output_ref = weakref.ref(hidden)
+        events.append("encode")
+        return hidden
+
+    def broadcast(tensor, *, dtype, device):
+        assert device == torch.device("cpu")
+        if dtype == torch.bfloat16:
+            if rank == 0:
+                assert tensor is output_ref()
+            else:
+                assert tensor is None
+                # Check lifetime at receive allocation, not just the argument.
+                assert output_ref is None or output_ref() is None
+            events.append("receive")
+            expected = expected_hidden
+        else:
+            assert dtype == torch.long
+            assert tensor is None if rank != 0 else torch.equal(tensor, expected_tags)
+            expected = expected_tags
+        return tensor if rank == 0 else torch.empty_like(expected).copy_(expected)
+
+    distribute = mocker.Mock(return_value=torch.tensor([1, 2, 3]))
+    encoder = mocker.Mock(side_effect=encode)
+    pipeline = SimpleNamespace(
+        text_encoder_tp_size=tp_size,
+        device=torch.device("cpu"),
+        _encoder_weight_transfer=mode,
+        _distribute_encode_inputs=distribute,
+        _encode_text_hidden=encoder,
+        tokenizer=object(),
+        processor=SimpleNamespace(image_processor=SimpleNamespace(merge_size=2)),
+    )
+    prepared = SimpleNamespace(
+        images=[],
+        qwen_videos=[],
+        prompt="test",
+        media=SimpleNamespace(task="test"),
+        condition_labels=[],
+        video_timestamps=[],
+    )
+    check_error = mocker.Mock()
+    call = method(
+        "pipeline_minimax_h3.py",
+        "MiniMaxH3Pipeline",
+        "encode_prompt",
+        _dit_rank_world=lambda: (None, rank, world_size),
+        _broadcast_rank0_exception=check_error,
+        _broadcast_tensor=broadcast,
+        build_minimax_h3_presentation=lambda *args, **kwargs: (torch.tensor([1, 2, 3]), expected_tags),
+    )
+    hidden, tags = call(pipeline, prepared if rank == 0 else None)
+    assert torch.equal(hidden.view(torch.uint8), expected_hidden.view(torch.uint8))
+    assert torch.equal(tags, expected_tags)
+    check_error.assert_called_once_with(None)
+    assert events == (["encode", "receive"] if rank < tp_size else ["receive"])
+    assert distribute.call_count == encoder.call_count == int(rank < tp_size)
