@@ -250,6 +250,21 @@ class CompactGraph:
         return self.output
 
 
+def _compare_padded_frame(actual, reference, kv, expected_kv, slots):
+    hidden_ok = (
+        actual.eq(reference).all() if actual.shape == reference.shape else reference.new_zeros((), dtype=torch.bool)
+    )
+    if not expected_kv:
+        return bool(hidden_ok.item()), True
+
+    actual_values = torch.stack([cache.index_select(0, slots) for cache in kv])
+    expected_values = torch.stack(expected_kv)
+    kv_ok = actual_values.eq(expected_values).all()
+    # Transfer both results together so the shadow frame only waits once.
+    hidden_ok, kv_ok = torch.stack((hidden_ok, kv_ok)).tolist()
+    return hidden_ok, kv_ok
+
+
 def prepare(runner, talker, model_inputs, input_batch, width):
     rows = input_batch.num_reqs
     if MODE is None or width != 16 or input_batch.has_prefill or not 2 <= rows <= 16:
@@ -398,11 +413,14 @@ def prepare(runner, talker, model_inputs, input_batch, width):
         expected_kv = [cache.index_select(0, slots) for cache in compact.kv]
         try:
             actual = compact.replay()[:rows]
-            hidden_ok = torch.equal(actual, reference)
-            kv_ok = all(
-                torch.equal(old, cache.index_select(0, slots))
-                for old, cache in zip(expected_kv, compact.kv, strict=True)
-            )
+            if padded:
+                hidden_ok, kv_ok = _compare_padded_frame(actual, reference, compact.kv, expected_kv, slots)
+            else:
+                hidden_ok = torch.equal(actual, reference)
+                kv_ok = all(
+                    torch.equal(old, cache.index_select(0, slots))
+                    for old, cache in zip(expected_kv, compact.kv, strict=True)
+                )
         except (RuntimeError, TypeError, ValueError):
             logger.exception("[c8-talker-narrow] shadow capture failed rows=%d", rows)
             hidden_ok = kv_ok = False

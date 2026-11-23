@@ -110,9 +110,9 @@ def test_active_fused_decode_checks_shadow_before_commit(tmp_path, monkeypatch, 
     assert graph.run.call_count == (2 if matches else 1)
 
 
-@pytest.mark.parametrize("matches", [False, True])
+@pytest.mark.parametrize("mismatch", [None, "hidden", "kv"])
 @pytest.mark.parametrize("rows", [2, 12, 16])
-def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, rows):
+def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, mismatch, rows):
     mode = tmp_path / "mode"
     mode.write_text("active_fixed")
     monkeypatch.setattr(talker_batched_decode, "MODE", str(mode))
@@ -120,6 +120,7 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, ro
     monkeypatch.setattr(torch.npu, "graph_pool_handle", lambda: None)
     tokens = rows * 16
     wide = torch.arange(tokens * 2, dtype=torch.bfloat16).reshape(tokens, 2)
+    kv = [torch.zeros(rows + 1, 3, dtype=torch.bfloat16) for _ in range(2)]
     metadata = Mock(
         seq_lens_device=torch.full((rows,), 32), block_tables=torch.zeros(rows, 4), slot_mapping=torch.arange(tokens)
     )
@@ -143,7 +144,7 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, ro
         def __init__(self, *args, **kwargs):
             self.metadata = {"layer": metadata}
             self.slots = torch.arange(16 if rows > 8 else rows)
-            self.kv = []
+            self.kv = kv
             if rows > 8:
                 assert args[-3:] == (16, 512, 256)
 
@@ -158,7 +159,11 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, ro
             result = wide[self.frame : tokens : 16]
             if rows == 12:
                 result = torch.cat((result, torch.zeros(4, 2, dtype=result.dtype)))
-            return result + (0 if matches else 1)
+            if self.frame == 7 and mismatch == "kv":
+                self.kv[-1][rows - 1].fill_(1)
+            if self.frame == 7 and mismatch == "hidden":
+                result = result + 2
+            return result
 
     monkeypatch.setattr(talker_batched_decode, "CompactGraph", Graph)
     forward = talker_batched_decode.prepare(runner, None, inputs, batch, 16)
@@ -167,7 +172,8 @@ def test_active_batch_checks_the_entire_kstep(tmp_path, monkeypatch, matches, ro
     for frame in range(16):
         assert torch.equal(forward(frame, reference), wide[frame:tokens:16])
     assert reference.call_count == 16
-    if matches:
+    assert all(not cache.any() for cache in kv)
+    if mismatch is None:
         assert len(runner._c8_talker_ready) == 1
         forward = talker_batched_decode.prepare(runner, None, inputs, batch, 16)
         assert torch.equal(forward(0, reference), wide[0:tokens:16])
