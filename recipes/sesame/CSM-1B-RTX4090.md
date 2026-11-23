@@ -81,9 +81,7 @@ an L4, and it had not run when this recipe was written.
 - Python: 3.12.3
 - Driver / runtime: NVIDIA driver 615.71.09, CUDA 13.0 (PyTorch 2.14.0+cu130)
 - vLLM version: 0.34.0 (Transformers 5.22.0)
-- vLLM-Omni version or commit: `6e4427a0275c36d43c7da43513c3e207ba47d4c1`
-  plus the CUDA graph change of this recipe (`csm_depth_graph.py`,
-  `csm_talker.py`, `csm.yaml`), installed from source
+- vLLM-Omni version or commit: `05552893ce107e2e8c79241edc0f41fe9dbacec5`, run from source
 - Model runner: V2
 
 ## Command
@@ -137,8 +135,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```
 
 Expected: HTTP 200 and raw signed 16-bit little-endian mono PCM at 24 kHz.
-The first bytes arrived after about 0.07 s. Without a seed the length varies
-from run to run; three runs returned 1.28 to 1.52 s in 0.41 to 0.48 s.
+The first bytes arrived after about 0.08 s. Without a seed the length varies
+from run to run; three runs returned 1.28 to 1.52 s in 0.41 to 0.49 s.
 
 The end-to-end test, with the command of the weekly CI step:
 
@@ -152,64 +150,111 @@ CI card; the run recorded below was on the RTX 4090.
 
 ## Qualification evidence
 
-Everything below was measured on 2026-11-22 on the hardware and software
-above. These are bounded runs, not a benchmark. The per-request sampling,
-aborted-request and decoder-state items were measured at `6e4427a0`, when both
-stages still ran eagerly, and were not repeated; every other item was measured
-with the CUDA graphs on.
+Everything below was measured on 2026-11-22 and 2026-11-23 (UTC) on the
+hardware and software above, at the commit above unless an item names an
+earlier revision. The earlier revisions are this change before it was rebased
+onto main `4dfc20301`: `6e4427a0`, where both stages still ran eagerly, and the
+first revision with the CUDA graphs. Their items were not repeated. These are
+bounded runs.
 
 ### Correctness
 
-- End-to-end test: 5 passed in 492 s. It covers a text request, a streamed PCM
+- End-to-end test: 5 passed in 824 s. It covers a text request, a streamed PCM
   request, two concurrent requests, `speaker_id` 1 and a reference turn.
-  Whisper small transcripts scored 1.000 against the input for five of the six
-  responses and 0.930 for the `speaker_id` 1 request (the test requires more
-  than 0.9).
+  Whisper small transcripts scored 1.000 against the input for four of the six
+  responses, 0.915 for one of the concurrent requests and 0.930 for the
+  `speaker_id` 1 request (the test requires more than 0.9). The streamed PCM
+  scored 9.6 dB on the shared harmonic-to-noise check, whose floor is 1.0 dB;
+  33 seeded streams of three sentences scored 3.6 to 18.1 dB.
 - Sampled output across seeds: the five requests of the test with seeds 0 to 9
   each, 50 requests with default sampling. No response was truncated. With
-  Whisper small, 49 transcripts scored above 0.9 and one scored 0.729; Whisper
-  large-v3, which the test falls back to, scored that one 1.000. An earlier
-  sentence for the streaming test scored below 0.9 for 2 of 10 seeds and was
-  replaced, so intelligibility depends on the sentence and on the sample.
+  Whisper small, 49 transcripts scored above 0.9 and one scored 0.729; at the
+  first revision with the CUDA graphs, where the same request gave the same
+  transcript, Whisper large-v3, which the test falls back to, scored it 1.000.
+  An earlier sentence for the streaming test scored below 0.9 for 2 of 10
+  seeds and was replaced, so intelligibility depends on the sentence and on
+  the sample.
 - Greedy comparison with Transformers 5.22.0
   (`CsmForConditionalGeneration.generate`): four text prompts and one prompt
-  with a reference recording. All 336 frames (10,752 codes) were identical and
-  the waveforms differed by at most 1.09 steps of 16-bit PCM, with the same
-  codes as the eager run of `6e4427a0`. This used a
-  diagnostic configuration, not the packaged profile: FP32 talker,
-  `--attention-backend FLEX_ATTENTION`, sampling turned off in the request and
-  in the deploy YAML, and cuDNN TF32 turned off on both sides. In BF16 the
+  with a reference recording. All 336 compared frames (10,752 codes) were
+  identical and the waveforms differed by at most 1.09 steps of 16-bit PCM;
+  the codes also equalled those of the earlier revisions, eager and with the
+  graphs. This used a diagnostic configuration, not the packaged profile: FP32
+  talker on the `FLEX_ATTENTION` backend
+  (`--stage-overrides '{"0":{"attention_backend":"FLEX_ATTENTION"}}'`),
+  sampling turned off in the request and in the deploy YAML, and cuDNN TF32
+  turned off on both sides. In BF16 the
   codes differ from the reference implementation's BF16 output from the first
   frame, as that implementation's own BF16 and FP32 outputs do, so the
   packaged profile rests on the transcript checks above.
 - Streamed and complete responses: for 11 seeded requests the streamed PCM
   samples equalled the WAV response for that seed.
-- Per-request sampling: with `extra_params.temperature` 0 or `top_k` 1 the
-  first codebook of the first frame was the same code in 12 of 12 unseeded
-  runs, and with `top_k` 2 it took two values. Codebooks 1-31 of that frame
-  still differed from run to run, as the deploy YAML's depth-decoder sampling
-  prescribes.
+- Per-request sampling (at `6e4427a0`): with `extra_params.temperature` 0 or
+  `top_k` 1 the first codebook of the first frame was the same code in 12 of
+  12 unseeded runs, and with `top_k` 2 it took two values. Codebooks 1-31 of
+  that frame still differed from run to run, as the deploy YAML's
+  depth-decoder sampling prescribes.
 - Response formats: `wav`, `pcm`, `flac`, `mp3` and `opus` each returned
   1.44 s at 24 kHz for the seeded request above. The SSE stream returned five
   `speech.audio.delta` events and `speech.audio.done`.
-- Aborted requests: after closing a stream (one, and eight at once) and after
-  client timeouts, both stages had released the request's state, and the next
-  seeded request returned the same bytes as before.
+- Aborted requests: after closing a stream (one, eight at once, and eight
+  with a reference turn) and after client timeouts of a complete response and
+  of a reference request, the next seeded request returned the same bytes as
+  before, eight concurrent requests completed, and the two stage processes
+  held 7,084 + 1,034 MiB against 7,082 + 1,034 MiB before. At `6e4427a0`,
+  with counters added to the server, both stages had released the state of
+  every aborted request.
 
-Quality was checked by transcription only. No listening test, MOS, WER corpus
-or speaker-similarity evaluation was run.
+Quality was checked by transcription and by the word error rate below. No MOS,
+UTMOS or speaker-similarity evaluation was run.
+
+### Standard TTS benchmark
+
+Scope: `benchmarks/tts/bench_tts.py` (it runs `vllm bench serve --omni`), task
+`default_voice`, the bundled `seed_tts_smoke` sentences, 20 requests after 2
+warm-up requests per level, streamed PCM, default sampling without a seed and
+without `max_new_tokens`, so the 10 s default budget applies. The word error
+rate is Whisper large-v3 on the same GPU after each run; speaker similarity
+and UTMOS were turned off.
+
+```bash
+SEED_TTS_SIM_EVAL=0 SEED_TTS_UTMOS_EVAL=0 SEED_TTS_EVAL_DEVICE=cuda:0 \
+    python benchmarks/tts/bench_tts.py --model sesame/csm-1b --task default_voice \
+    --dataset-path benchmarks/build_dataset/seed_tts_smoke --port 8091 \
+    --concurrency 1 4 8 --num-prompts 20 --num-warmups 2 --wer-eval
+```
+
+| Concurrency | Completed | RTF, mean / P99 | First audio, median / P99 (ms) | Underrun, mean / P99 (s) | Continuity OK | Audio seconds per wall second | WER, mean / median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 20 / 20 | 0.27 / 0.28 | 81 / 87 | 0.009 / 0.014 | 100% | 3.66 | 0.050 / 0 |
+| 4 | 20 / 20 | 0.37 / 0.39 | 122 / 176 | 0.033 / 0.076 | 100% | 10.48 | 0.077 / 0 |
+| 8 | 20 / 20 | 0.40 / 0.44 | 163 / 327 | 0.061 / 0.198 | 95% | 17.79 | 0.065 / 0 |
+
+Underrun is a request's largest buffer deficit under a player that plays at
+real-time rate, and "Continuity OK" is the share of requests that stayed below
+100 ms. Of the 20 transcripts per level, 14 or 15 matched the text exactly.
+Four sentences scored above zero at every level because Whisper wrote their
+numbers as digits ("gate 23 at 1115") where the text spells them out. One
+request at concurrency 4 reached the 10 s budget and lost its last words. The
+other differences were single words. Sampling is unseeded, so the error rate
+varies from run to run: the same benchmark one commit earlier gave 0.065,
+0.064 and 0.060.
 
 ### Memory
 
 - The server's two stage processes, read with `nvidia-smi`: 7,672 MiB after
-  startup (6,830 + 842) and 7,894 MiB after the timing runs below
-  (6,858 + 1,036). The whole-device reading rose by at most 94 MiB during
-  those runs; it was taken once per round, so short peaks can be missed.
+  startup (6,830 + 842), 8,116 MiB (7,082 + 1,034) after the verification
+  requests above, which include reference recordings, and the timing runs
+  below, and 8,122 MiB (7,084 + 1,038) after the benchmark. The whole-device
+  reading rose by at most 68 MiB during the timing runs; it was taken once
+  per round, so short peaks can be missed.
 - Reported by the engine at startup: talker weights with the depth decoder's
   graphs 3.28 GiB, the backbone's graphs 0.05 GiB, and a 2.62 GiB KV cache
   (86,016 tokens); Mimi decoder weights 0.36 GiB. Before the graphs the KV
   cache had 102,400 tokens within the same memory share.
-- Each request in flight holds about 6.9 MiB of decoder state in stage 1.
+- Each request in flight held about 6.9 MiB of decoder state in stage 1 (short
+  requests, at `6e4427a0`). The decoder's attention cache, the largest part,
+  is bounded at 8.1 MiB per request and reaches that after 10 s of audio.
 
 ### Timing
 
@@ -222,24 +267,28 @@ request during the runs.
 
 | Concurrency | Requests | First audio, median / max (s) | RTF, median / max | Audio seconds per wall second |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 4 | 0.073 / 0.074 | 0.28 / 0.28 | 2.44 |
-| 2 | 6 | 0.086 / 0.104 | 0.35 / 0.36 | 4.75 |
-| 4 | 12 | 0.156 / 0.156 | 0.37 / 0.40 | 8.08 |
-| 8 | 24 | 0.285 / 0.318 | 0.41 / 0.43 | 13.43 |
-| 12 | 24 | 0.297 / 1.528 | 0.43 / 0.83 | 16.07 |
-| 16 | 32 | 0.811 / 2.416 | 0.55 / 1.08 | 17.40 |
+| 1 | 4 | 0.086 / 0.091 | 0.28 / 0.28 | 2.27 |
+| 2 | 6 | 0.103 / 0.125 | 0.35 / 0.36 | 4.75 |
+| 4 | 12 | 0.166 / 0.178 | 0.38 / 0.40 | 8.94 |
+| 8 | 24 | 0.304 / 0.322 | 0.41 / 0.43 | 16.93 |
+| 12 | 24 | 0.355 / 1.600 | 0.43 / 0.82 | 15.23 |
+| 16 | 32 | 0.776 / 2.109 | 0.55 / 0.91 | 18.61 |
 
 First audio is the time to the first byte read by the client. RTF is a
 request's wall time divided by the duration of its audio, so values above 1
-are slower than real time. All 102 requests returned 200. A second run of the
-same script differed by at most 0.01 in median RTF and, in median first audio,
-by at most 0.01 s up to 12 concurrent requests and 0.05 s at 16.
+are slower than real time. The last column divides a round's audio by the
+round's wall time, so it depends on the round's longest request. All 102
+requests returned 200. A second run of the same script differed by at most
+0.01 in median RTF up to 12 concurrent requests and 0.04 at 16 and, in median
+first audio, by at most 0.003 s up to 8 concurrent requests, 0.04 s at 12 and
+0.05 s at 16. Two runs one commit earlier measured the same median RTF and a
+median first audio of 0.072 and 0.081 s with one request.
 
 With both stages eager (`6e4427a0`, the same script and GPU, no other
 process), the RTF was 1.76 with one request and 2.03 with eight, and first
 audio took 0.151 s and 0.375 s. The depth decoder's frame step alone took
 about 127 ms per frame eagerly and 16 ms from its graph (20 ms for batches of
-2 to 8).
+2 to 8), measured at the first revision with the graphs.
 
 ## Notes
 
@@ -247,8 +296,9 @@ about 127 ms per frame eagerly and 16 ms from its graph (20 ms for batches of
 - Key flags: `--omni` is required. No other flag was used.
 - Known limitations:
     - Stage 0 runs 8 requests at a time. Further requests wait: the longest
-      wait for first audio was 1.5 s at 12 concurrent requests and 2.4 s at
-      16, where the slowest request took 1.08 s per second of audio.
+      wait for first audio was 1.6 s at 12 concurrent requests and 2.1 s at
+      16, where the slowest request took 0.91 s per second of audio (1.04 in
+      the second run).
     - The depth decoder's graphs record the deploy YAML's depth sampling.
       Setting stage 0 back to `enforce_eager: true` turns its graphs off.
       Stage 1 runs eagerly: a decode call takes about 12 ms whatever its
@@ -268,7 +318,7 @@ about 127 ms per frame eagerly and 16 ms from its graph (20 ms for batches of
 | Feature | Status on this profile | Guide |
 | --- | --- | --- |
 | Complete responses (`wav`, `pcm`, `flac`, `mp3`, `opus`) | supported | [Speech API](../../docs/serving/speech_api.md#response-format) |
-| Streamed PCM, raw bytes or SSE | supported; first audio after about 0.07 s, generation faster than real time | [Speech API](../../docs/serving/speech_api.md#response-format) |
+| Streamed PCM, raw bytes or SSE | supported; first audio after about 0.08 s, generation faster than real time | [Speech API](../../docs/serving/speech_api.md#response-format) |
 | Reference turn (`ref_audio` + `ref_text`) | supported, one recording of 1 to 30 s | [CSM-1B fields](../../docs/serving/speech_api.md#csm-1b) |
 | Uploaded voice (`POST /v1/audio/voices`, then `voice`) | supported when the voice was uploaded with its transcript; without one the request returns 400 | [Voices endpoint](../../docs/serving/speech_api.md#voices-endpoint) |
 | Preset voices, `instructions`, `language`, `sample_rate`, `speaker_embedding`, `ref_audio_2`, `x_vector_only_mode` | not supported; the fields return 400 and an unknown `voice` name is ignored | [CSM-1B fields](../../docs/serving/speech_api.md#csm-1b) |
