@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import pytest
 import torch
-from tests.model_executor.models.moss_tts.test_streaming_terminal_batch import session
 from torch import nn
 
+from tests.model_executor.models.moss_tts.test_streaming_terminal_batch import session
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

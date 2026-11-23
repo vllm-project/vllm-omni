@@ -1213,44 +1213,6 @@ class MossTTSCodecDecoder(nn.Module):
                 )
         return outputs
 
-    def _decode_stream_slot_sequence(
-        self,
-        session: _MossCodecStreamSession,
-        slot: int,
-        codes_nq_t: torch.Tensor,
-        *,
-        terminal: bool = False,
-        output_buffer: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        if codes_nq_t.numel() == 0:
-            return None
-        max_step_frames = max(1, int(self._stream_max_step_frames))
-        parts: list[torch.Tensor] = []
-        for start in range(0, int(codes_nq_t.shape[1]), max_step_frames):
-            chunk = codes_nq_t[:, start : start + max_step_frames]
-            is_terminal_chunk = terminal and start + max_step_frames >= int(codes_nq_t.shape[1])
-            chunk_samples = int(chunk.shape[1]) * self._codec.downsample_rate
-            chunk_buffer = (
-                output_buffer[
-                    ..., start * self._codec.downsample_rate : start * self._codec.downsample_rate + chunk_samples
-                ]
-                if output_buffer is not None
-                else None
-            )
-            decoded = session.step(
-                {slot: chunk},
-                terminal_slots={slot} if is_terminal_chunk else None,
-                output_buffers={slot: chunk_buffer} if chunk_buffer is not None else None,
-            )
-            wav = decoded.get(slot)
-            if wav is not None:
-                parts.append(wav)
-        if output_buffer is not None:
-            return output_buffer
-        if not parts:
-            return None
-        return torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
-
     def _finish_stream_request(
         self,
         request_id: str,
