@@ -9,9 +9,8 @@ from transformers import LlamaConfig, PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxCFGSampler, ChatterboxMRv2CFGSampler
+from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxMRv2CFGSampler
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import ChatterboxT3ForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.original_heads import (
     ORIGINAL_SPEECH_POSITIONS,
@@ -25,9 +24,6 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
     """Keep both guidance branches in step through the atomic CFG scheduler."""
-
-    prefer_model_sampler = True
-    model_sampler_wants_extra_args = True
 
     backbone_class = LlamaModel
     heads_class = OriginalHeads
@@ -67,7 +63,6 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
             raise ValueError(f"Chatterbox Original supports max_model_len up to {ORIGINAL_SPEECH_POSITIONS}")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.cfg_pairs: dict[str, tuple[str, str, float]] = {}
-        self.cfg_sampler = ChatterboxCFGSampler(Sampler(), self.cfg_pairs)
 
     def preprocess(
         self,
@@ -89,9 +84,7 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
 
         Model Runner V2 samples by row identity, so it registers here the
         guidance pair that ``prepare_original_prompt`` and
-        ``expand_original_cfg_prompts`` put in the request's
-        ``extra_args``; the default runner hands the sampler that same tuple
-        itself and passes no sampling parameters.
+        ``expand_original_cfg_prompts`` put in the request's ``extra_args``.
         """
         if sampling_params is not None:
             self.cfg_pairs[req_id] = sampling_params.extra_args["chatterbox_cfg"]
@@ -133,9 +126,6 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Return raw logits; reserved-token masking follows the CFG subtraction."""
         return self.heads.speech_head(hidden_states)
-
-    def sample(self, logits, sampling_metadata, *, per_req_extra_args):
-        return self.cfg_sampler.sample(logits, sampling_metadata, per_req_extra_args)
 
     def mrv2_custom_sampler(self, sampler):
         return ChatterboxMRv2CFGSampler(sampler, self.cfg_pairs), None

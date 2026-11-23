@@ -6,27 +6,26 @@ from collections.abc import MutableMapping, Sequence
 from dataclasses import replace
 
 import torch
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler as GpuSampler
 
 from vllm_omni.transformers_utils.configs.chatterbox import START_SPEECH_TOKEN, STOP_SPEECH_TOKEN
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 # Request ID -> (pair key, role, weight). The model owns registration/cleanup.
 CFGPairRegistry = MutableMapping[str, tuple[str, str, float]]
 
 
 class ChatterboxCFGSampler:
-    """Blend paired rows, delegate sampling, and synchronize companion tokens.
+    """Blend paired rows and mask the ids that are not speech codes.
 
     Registry roles are ``cond`` and ``uncond``. Both requests
     must be scheduled atomically and have identical speech token histories.
     A conditional request with zero weight needs no companion. Synthetic
     MRv2 warmup rows bypass pairing and still receive the speech token mask.
-    A negative-infinity restriction from V1 logit bias on either row, such as
+    A negative-infinity restriction on either row, such as
     a min_tokens or allowed_token_ids mask, bans that id from the blend. The
     companion's sampling parameters are a clone of the conditional request's
     with only ``extra_args`` replaced (``ExpandedPrompt.apply_overrides``), so
@@ -35,8 +34,7 @@ class ChatterboxCFGSampler:
     The stage that owns the registry registers and releases its pairs.
     """
 
-    def __init__(self, base_sampler: Sampler | GpuSampler, pairs: CFGPairRegistry):
-        self.base_sampler = base_sampler
+    def __init__(self, pairs: CFGPairRegistry):
         self.pairs = pairs
 
     def prepare_logits(
@@ -45,7 +43,6 @@ class ChatterboxCFGSampler:
         req_ids: Sequence[str],
         *,
         warmup: bool = False,
-        pair_metadata: Sequence[tuple[str, str, float]] | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
         """Resolve current batch rows by request identity and apply guidance."""
         if logits.ndim != 2 or logits.shape[0] != len(req_ids):
@@ -54,13 +51,13 @@ class ChatterboxCFGSampler:
             raise ValueError("Chatterbox CFG requires the Original speech vocabulary")
         groups: dict[str, dict[str, tuple[int, float]]] = {}
         for row, req_id in enumerate(req_ids):
-            # The runner also executes kernel warmup as synthetic requests
-            # under its reserved _warmup_ namespace, with nonzero prefills.
-            if warmup or req_id.startswith("_warmup_"):
+            # The runner also executes kernel and mixed-attention warmup as
+            # synthetic requests under its reserved ids, with nonzero prefills.
+            if warmup or is_warmup_request(req_id):
                 continue
-            if pair_metadata is None and req_id not in self.pairs:
+            if req_id not in self.pairs:
                 raise ValueError(f"Missing Chatterbox CFG registration: {req_id}")
-            key, role, weight = self.pairs[req_id] if pair_metadata is None else pair_metadata[row]
+            key, role, weight = self.pairs[req_id]
             if role not in ("cond", "uncond"):
                 raise ValueError(f"Unsupported Chatterbox CFG role: {role}")
             group = groups.setdefault(key, {})
@@ -105,20 +102,6 @@ class ChatterboxCFGSampler:
         guided[:, STOP_SPEECH_TOKEN + 1 :] = -torch.inf
         return guided, row_pairs
 
-    def sample(
-        self, logits: torch.Tensor, sampling_metadata: SamplingMetadata, per_req_extra_args: list[dict]
-    ) -> SamplerOutput:
-        """V1 model sampler entry point; preserve upstream sampling metadata."""
-        # Every row is a scheduled request: prepare_original_prompt tags each
-        # one, guided or not. The V1 runner's warmup (_dummy_sampler_run)
-        # calls its own sampler directly and never reaches this method.
-        pairs = [extra["chatterbox_cfg"] for extra in per_req_extra_args]
-        guided, row_pairs = self.prepare_logits(logits, [pair[0] for pair in pairs], pair_metadata=pairs)
-        output = self.base_sampler(logits=guided, sampling_metadata=sampling_metadata)
-        for cond, uncond in row_pairs:
-            output.sampled_token_ids[uncond].copy_(output.sampled_token_ids[cond])
-        return output
-
 
 class ChatterboxMRv2Sampler(OmniSampler):
     """Keep sampled tokens and owned metadata; S3Gen consumes no T3 hidden states."""
@@ -135,7 +118,7 @@ class ChatterboxMRv2CFGSampler(ChatterboxMRv2Sampler):
 
     def __init__(self, base_sampler: GpuSampler, pairs: CFGPairRegistry):
         super().__init__(base_sampler)
-        self.cfg_sampler = ChatterboxCFGSampler(base_sampler, pairs)
+        self.cfg_sampler = ChatterboxCFGSampler(pairs)
 
     def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         # InputBatch.make_dummy supplies zero prefill lengths and random IDs.

@@ -7,9 +7,9 @@
 # Runner: both stages run on Model Runner V2 with its native data plane on
 # CUDA, where it was measured: with and without streaming, at 1 and at 8
 # concurrent streams, V2 and the default runner are within run-to-run
-# variation of each other. Set ``model_runner: v1`` to use the default
-# runner; both are supported. The ``platforms:`` section at the end keeps
-# V1 where V2 is rejected (NPU, XPU) or has not been run (ROCm, MUSA).
+# variation of each other. The ``platforms:`` section at the end still selects
+# V1 on NPU, ROCm and MUSA; vLLM 0.34 removed V1, so those platforms are refused
+# at startup. XPU inherits V2.
 #
 # Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 keeps float32 weights
 # for HiFT, which is not half-precision safe, runs the flow decoder under
@@ -123,7 +123,6 @@ platforms:
         additional_config:
           conditioning_device: cpu
   xpu:
-    model_runner: v1
     stages:
       - stage_id: 0
         additional_config:

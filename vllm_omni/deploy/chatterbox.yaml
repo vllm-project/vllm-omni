@@ -91,7 +91,6 @@ platforms:
           exaggeration: 0.5
           cfg_weight: 0.5
   xpu:
-    model_runner: v1
     stages:
       - stage_id: 0
         additional_config:

@@ -27,8 +27,6 @@ from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.v1.worker.gpu_input_batch import InputBatch as V1InputBatch
 
 from tests.helpers.mark import hardware_test
 from tests.model_executor.models.chatterbox.helpers import (
@@ -51,7 +49,6 @@ from vllm_omni.model_executor.stage_input_processors.chatterbox import (
 )
 from vllm_omni.request import OmniRequest
 from vllm_omni.transformers_utils.configs.chatterbox import START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, ChatterboxConfig
-from vllm_omni.worker.sampling_utils import call_model_sampler
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 pytestmark = [pytest.mark.core_model]
@@ -139,9 +136,7 @@ def step(
         scheduled_new_reqs=list(new),
         scheduled_cached_reqs=CachedRequestData(
             req_ids=list(decode),
-            resumed_req_ids=set(),
             new_token_ids=[[] for _ in decode],
-            all_token_ids={},
             new_block_ids=[None for _ in decode],
             num_computed_tokens=list(decode.values()),
             num_output_tokens=[1 for _ in decode],
@@ -150,7 +145,6 @@ def step(
         total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[0],
         finished_req_ids=finished or set(),
         free_encoder_mm_hashes=[],
     )
@@ -414,54 +408,6 @@ def test_mrv2_warmup_rows_sample_unpaired_and_masked(runners: Callable[[str], Ru
         real = replace(InputBatch.make_dummy(1, 1, runner.input_buffers), prefill_len_np=np.array([42]))
         with pytest.raises(ValueError, match="Missing Chatterbox CFG registration"):
             sampler(logits[:1].clone(), real)
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_v1_runner_hands_each_request_its_guidance_pair(runners: Callable[[str], Runner]) -> None:
-    """The V1 runner calls the stage's sampler with each row's ``extra_args``, from its own input batch.
-
-    The rows are the pair the engine admits, in the batch order the V1 input
-    batch keeps; greedy picks the guided logits' best token for both.
-    """
-    runner, config = runners("original")
-    stage = runner.model
-    admitted = original_prompts("v1-pair", 0.5)
-    vocab = stage.model.config.vocab_size
-    batch = V1InputBatch(
-        max_num_reqs=4,
-        max_model_len=config.model_config.max_model_len,
-        max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
-        device=torch.device("cuda"),
-        vocab_size=vocab,
-        block_sizes=[config.cache_config.block_size],
-        max_num_blocks_per_req=[BLOCKS_PER_REQUEST],
-    )
-    requests = {}
-    for prompt, params, external_id in reversed(admitted):
-        requests[external_id] = CachedRequestState(
-            req_id=external_id,
-            prompt_token_ids=prompt["prompt_token_ids"],
-            mm_features=[],
-            sampling_params=params,
-            generator=None,
-            block_ids=([0],),
-            num_computed_tokens=len(prompt["prompt_token_ids"]),
-            output_token_ids=[],
-        )
-        batch.add_request(requests[external_id])
-    batch.refresh_metadata()
-    rows = {req_id: row for row, req_id in enumerate(batch.req_ids)}
-    logits = torch.zeros(2, vocab, device="cuda")
-    logits[rows["v1-pair__cfg_uncond"], :2] = torch.tensor([-2.0, 1.5])
-    logits[rows["v1-pair"], :2] = torch.tensor([1.0, 1.2])
-
-    with set_current_vllm_config(config):
-        output = call_model_sampler(
-            stage, stage.sample, logits, batch.sampling_metadata, input_batch=batch, requests=requests
-        )
-
-    assert batch.req_ids == ["v1-pair__cfg_uncond", "v1-pair"]
-    assert output.sampled_token_ids.tolist() == [[0], [0]]
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

@@ -3465,7 +3465,12 @@ class TestPlatformOverrides:
             "minicpmo_4_5_duplex_h200.yaml",
         )
         # XPU has no V1 fallback: vLLM 0.34 removed Model Runner V1.
-        xpu_full_mrv2 = platform == "xpu" and filename in ("qwen3_tts.yaml", "moss_tts_nano.yaml")
+        xpu_full_mrv2 = platform == "xpu" and filename in (
+            "qwen3_tts.yaml",
+            "moss_tts_nano.yaml",
+            "chatterbox_turbo.yaml",
+            "chatterbox.yaml",
+        )
         rocm_full_mrv2 = platform == "rocm" and filename in ("qwen3_tts.yaml", "minicpmo_4_5.yaml")
         if platform == "cuda":
             expected_runner = cuda_default_runner

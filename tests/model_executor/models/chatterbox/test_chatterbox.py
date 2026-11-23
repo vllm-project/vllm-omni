@@ -40,16 +40,12 @@ BuiltStage = Callable[[str, int], ChatterboxForConditionalGeneration]
             "original",
             0,
             ChatterboxOriginalT3,
-            # The last two have the runner sample through the stage's guidance
-            # sampler and hand it each request's guidance pair.
             {
                 "has_preprocess": True,
                 "have_multimodal_outputs": True,
                 "omni_pooler_payload_include_hidden": False,
-                "prefer_model_sampler": True,
-                "model_sampler_wants_extra_args": True,
             },
-            ["preprocess", "preprocess_decode_batch", "preprocess_decode_batch_mrv2", "sample", "on_requests_finished"],
+            ["preprocess", "preprocess_decode_batch", "preprocess_decode_batch_mrv2", "on_requests_finished"],
             ["mrv2_decode_preprocess_is_identity", "make_omni_output_mrv2"],
         ),
         (

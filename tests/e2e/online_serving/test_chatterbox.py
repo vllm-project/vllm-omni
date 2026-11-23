@@ -10,22 +10,21 @@ from websockets.sync.client import connect
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 
 TEXT = "The weather is nice today, perfect for a walk in the park."
 SERVERS = [
     pytest.param(
         OmniServerParams(
             model=model,
-            stage_config_path=modify_stage_config(get_deploy_config_path(deploy), {"model_runner": runner}),
+            stage_config_path=get_deploy_config_path(deploy),
         ),
-        id=f"{variant}-{runner}",
+        id=variant,
     )
     for variant, model, deploy in (
         ("turbo", "ResembleAI/chatterbox-turbo", "chatterbox_turbo.yaml"),
         ("original", "ResembleAI/chatterbox", "chatterbox.yaml"),
     )
-    for runner in ("v2", "v1")
 ]
 
 

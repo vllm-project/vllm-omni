@@ -29,9 +29,7 @@ def process_groups() -> Iterator[None]:
 
 
 @pytest.fixture(scope="module")
-def built_stage(
-    model_dir: str, process_groups: None
-) -> Iterator[Callable[[str, int], ChatterboxForConditionalGeneration]]:
+def built_stage(model_dir: str, process_groups: None) -> Callable[[str, int], ChatterboxForConditionalGeneration]:
     """Build a checkpoint's stage on the CPU with its initial weights, once per module.
 
     The returned function takes the checkpoint (``turbo`` or ``original``)
@@ -45,8 +43,4 @@ def built_stage(
             built[variant, stage_id] = build_stage(config, "cpu").eval()
         return built[variant, stage_id]
 
-    with pytest.MonkeyPatch.context() as patch:
-        # Original builds vLLM's V1 sampler, which otherwise asks the GPU
-        # whether FlashInfer can sample; these stages run on the CPU.
-        patch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
-        yield build
+    return build

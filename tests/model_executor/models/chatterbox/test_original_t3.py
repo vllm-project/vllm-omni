@@ -89,9 +89,8 @@ def test_decode_batches_preserve_independent_positions(model):
 def test_model_runner_v2_registers_the_pair_its_sampling_parameters_carry(model, metadata):
     """MRv2 hands preprocess each request's sampling parameters and samples by row identity.
 
-    The pair is the ``extra_args`` tuple admission tagged the request with,
-    which the default runner hands its sampler directly; the default runner
-    passes no sampling parameters, and nothing is registered for it.
+    The pair is the ``extra_args`` tuple admission tagged the request with.
+    A row without sampling parameters registers nothing.
     """
     for role, req_id in (("cond", "internal-a"), ("uncond", "internal-b")):
         params = SamplingParams(extra_args={"chatterbox_cfg": ("external-request", role, 0.5)})

@@ -43,7 +43,6 @@ def main():
     parser.add_argument("reference", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--gpu", default="0", help="Physical nvidia-smi GPU index or UUID")
-    parser.add_argument("--runner", choices=("v1", "v2"), default="v2")
     parser.add_argument("--cuda-graphs", action="store_true", help="Use the existing AR CUDA-graph path at FP32")
     parser.add_argument(
         "--profile", action="store_true", help="Trace an additional warmed request after each voice mode"
@@ -172,7 +171,7 @@ def make_backend(args):
         {} if args.variant == "turbo" else {name: settings["stages"][0]["additional_config"][name] for name in CONTROLS}
     )
     settings["async_chunk"] = False
-    settings["model_runner"] = args.runner
+    settings["model_runner"] = "v2"
     for stage in settings["stages"]:
         stage["dtype"] = "float32"
         stage["enforce_eager"] = not (args.cuda_graphs and stage["stage_id"] == 0)
@@ -272,7 +271,7 @@ def write_report(args, rows, flow_dtype):
         packages={name: importlib.metadata.version(name) for name in ("torch", "torchaudio", "transformers", "numpy")},
         precision=f"float32 weights, {flow_dtype} flow decoder; TF32 disabled",
         concurrency=1,
-        model_runner=args.runner if args.backend == "omni" else None,
+        model_runner="v2" if args.backend == "omni" else None,
         cuda_graphs=args.backend == "omni" and args.cuda_graphs,
         warmup_per_mode=2 * len(TEXTS),
         rows=rows,

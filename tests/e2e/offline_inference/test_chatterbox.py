@@ -18,14 +18,13 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 RUNNERS = [
     pytest.param(
-        (model, modify_stage_config(get_deploy_config_path(deploy), {"model_runner": runner, "async_chunk": chunked})),
-        id=f"{variant}-{runner}-{'chunked' if chunked else 'whole'}",
+        (model, modify_stage_config(get_deploy_config_path(deploy), {"async_chunk": chunked})),
+        id=f"{variant}-{'chunked' if chunked else 'whole'}",
     )
     for variant, model, deploy in (
         ("turbo", "ResembleAI/chatterbox-turbo", "chatterbox_turbo.yaml"),
         ("original", "ResembleAI/chatterbox", "chatterbox.yaml"),
     )
-    for runner in ("v1", "v2")
     for chunked in (False, True)
 ]
 
