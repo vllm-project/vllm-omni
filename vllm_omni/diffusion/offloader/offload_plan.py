@@ -66,7 +66,9 @@ class OffloadPlan:
             declared for encoder-TP shards.
         one_shot_component_paths: Component paths that run a single forward per
             prompt, so their weights only need to be read sequentially once.
-            This is the model's permission slip for a disk-streaming backing.
+            One-shot components qualify for sequential-read streaming; a
+            ``DISK`` backing declaration additionally requires a backend that
+            can serve it, and remains reserved in this release.
         component_backing: Maps component paths to the requested
             :class:`BackingKind`. Missing entries resolve to the backend
             default (DiT→``CHECKPOINT_MMAP``, everything else→``PINNED``).

@@ -468,7 +468,8 @@ def validate_disk_backing(
 
     ``DISK`` is a reserved declaration kind in this release: no backend can
     serve it yet, so it always reports a reason and callers degrade to
-    ``PINNED``.
+    ``PINNED``. ``one_shot`` is kept for that future disk-streaming backend;
+    it does not affect validation today.
     """
     if backing not in (BackingKind.CHECKPOINT_MMAP, BackingKind.DISK):
         return None
