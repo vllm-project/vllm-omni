@@ -91,6 +91,12 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.ring_degree == 1
         assert od.parallel_config.ulysses_a2a_permute is True
 
+    def test_ulysses_overlap_roundtrip(self):
+        pc = DiffusionParallelConfig(ulysses_degree=2, ulysses_overlap_chunks=2, ulysses_overlap_int8=True)
+        od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
+        assert od.parallel_config.ulysses_overlap_chunks == 2
+        assert od.parallel_config.ulysses_overlap_int8 is True
+
     def test_mask_sp_padding_roundtrip(self):
         pc = DiffusionParallelConfig(ulysses_degree=2, mask_sp_padding=True)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
