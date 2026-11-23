@@ -26,10 +26,6 @@ This section describes how to add Sequence Parallel (SP) to a diffusion transfor
 
 Diffusion transformers process long sequences of image patches or video frames. For high-resolution generation, these sequences can become very large. Enabling SP allows each GPU to process only a portion of the sequence, with attention mechanisms (Ulysses/Ring) handling cross-GPU communication transparently.
 
-Ring combines attention output and softmax log-sum-exp from each circulated K/V
-block. On SAIL PPU, the local FlashAttention path prefers the SDK's FA3 build
-when available and uses the window arguments exposed by that build.
-
 ### Architecture
 
 The major APIs for Sequence Parallel:

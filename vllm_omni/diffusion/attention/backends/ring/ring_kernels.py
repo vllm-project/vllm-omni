@@ -11,12 +11,12 @@ import torch
 from vllm_omni.diffusion.attention.backends.utils.fa import vllm_flash_attn_dense_with_lse
 
 from .ring_globals import (
-    FA3_USES_TUPLE_WINDOW,
     HAS_AITER,
     HAS_FA3,
     HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
+    SAIL_FA3_USES_TUPLE_WINDOW,
     bundled_flash_attn_version,
     fa3_fwd_func,
     fa4_attn_func,
@@ -252,7 +252,7 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
     assert fa3_fwd_func is not None, "FA3 low-level API (fa3_fwd_func) not available"
 
     window_left, window_right = window_size or (-1, -1)
-    if FA3_USES_TUPLE_WINDOW:
+    if SAIL_FA3_USES_TUPLE_WINDOW:
         out, softmax_lse, *_ = fa3_fwd_func(
             q=q,
             k=k,

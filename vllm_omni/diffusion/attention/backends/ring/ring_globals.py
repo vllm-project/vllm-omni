@@ -49,7 +49,7 @@ fa3_attn_func = None  # High-level attention function (flash_attn_func)
 # ``None`` means that the extension does not publish an architecture contract.
 FA3_SUPPORTED_CUDA_MAJORS: frozenset[int] | None = None
 HAS_PPU_FA3 = False
-FA3_USES_TUPLE_WINDOW = False
+SAIL_FA3_USES_TUPLE_WINDOW = False
 
 # FA4 detection. The CuTe API returns LSE directly, so it can participate in
 # Ring Attention's numerically stable block-wise output accumulation.
@@ -77,7 +77,7 @@ try:
     HAS_PPU_FA3 = callable(is_ppu) and is_ppu()
     if HAS_PPU_FA3:
         # SAIL wheels expose either the tuple-window API or the Hopper-style API.
-        FA3_USES_TUPLE_WINDOW = "window_size" in inspect.signature(_fa3_fwd_func).parameters
+        SAIL_FA3_USES_TUPLE_WINDOW = "window_size" in inspect.signature(_fa3_fwd_func).parameters
     else:
         # The NVIDIA source build is for Hopper, even if it imports on Blackwell.
         FA3_SUPPORTED_CUDA_MAJORS = frozenset({9})
