@@ -60,8 +60,8 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0267,
-            "mean_e2el_ms": 38325.2,
+            "request_throughput": 0.0297,
+            "mean_e2el_ms": 33652.1773,
             "mean_peak_memory_mb": 46034.6667
           }
         }
@@ -138,9 +138,9 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0248,
-            "mean_e2el_ms": 38138.5,
-            "mean_peak_memory_mb": 46339.3333
+            "request_throughput": 0.0278,
+            "mean_e2el_ms": 35976.1541,
+            "mean_peak_memory_mb": 46312.7816
           }
         }
       }
@@ -216,9 +216,9 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0155,
-            "mean_e2el_ms": 76815.3987,
-            "mean_peak_memory_mb": 46830.0
+            "request_throughput": 0.0176,
+            "mean_e2el_ms": 56599.0662,
+            "mean_peak_memory_mb": 46783.977
           }
         }
       }
@@ -289,8 +289,8 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0263,
-            "mean_e2el_ms": 38208.9,
+            "request_throughput": 0.0287,
+            "mean_e2el_ms": 34937.6484,
             "mean_peak_memory_mb": 29538.6667
           }
         }
@@ -354,6 +354,13 @@
           "seed": 42,
           "flow_shift": 12.0,
           "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "A3": {
+            "request_throughput": 0.0061,
+            "mean_e2el_ms": 163664.6399,
+            "mean_peak_memory_mb": 19795.5556
+          }
         }
       }
     ]
@@ -426,6 +433,13 @@
           "seed": 42,
           "flow_shift": 12.0,
           "extra_params": "{\"task\":\"ref2va\",\"duration\":5.0,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "A3": {
+            "request_throughput": 0.0141,
+            "mean_e2el_ms": 70768.8443,
+            "mean_peak_memory_mb": 19004.0
+          }
         }
       }
     ]

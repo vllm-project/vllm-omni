@@ -134,9 +134,9 @@
         "num-prompts": 96,
         "baseline": {
           "H200": {
-            "throughput_qps": 0.39,
-            "latency_p99": 53.1847,
-            "latency_mean": 38.3398
+            "throughput_qps": 0.4111,
+            "latency_p99": 49.6701,
+            "latency_mean": 36.2039
           }
         }
       }

@@ -62,7 +62,17 @@
           }
         },
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "require_speculative_stage": 0
+        "require_speculative_stage": 0,
+        "baseline": {
+          "A3": {
+            "request_throughput": [1.7213, 3.3122, 4.6224, 5.3049, 5.2536],
+            "mean_e2el_ms": [580.619, 1186.1419, 1704.5693, 2964.7105, 5972.8764],
+            "mean_ttft_ms": [92.9195, 153.2227, 179.1424, 175.3766, 191.5113],
+            "mean_audio_rtf": [0.1449, 0.2939, 0.4424, 0.7246, 1.4423],
+            "mean_audio_ttfp_ms": [296.0496, 656.9474, 946.2957, 1697.9254, 4597.2975],
+            "audio_throughput": [7.0833, 13.9757, 18.6681, 22.5375, 22.8526]
+          }
+        }
       }
     ]
   }

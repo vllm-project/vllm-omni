@@ -37,9 +37,9 @@
         "max-concurrency": 1,
         "baseline": {
           "H200": {
-            "throughput_qps": 0.4463,
+            "throughput_qps": 0.45,
             "latency_mean": 2.247,
-            "latency_p99": 2.5891,
+            "latency_p99": 2.3955,
             "peak_memory_mb_max": 47020.0,
             "peak_memory_mb_mean": 47020.0
           },
