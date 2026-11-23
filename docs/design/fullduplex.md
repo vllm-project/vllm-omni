@@ -1824,6 +1824,23 @@ or the turn-end token. Delegation can also mask the turn-end speech row;
 dialogue termination is derived from the original Thinker unit.
 Models without these optional IDs retain their existing handoff.
 
+The Venus session plugin additionally projects one completed delegate span per
+model turn as the shared Realtime `delegate(question)` function. Parsing is
+request/turn-local and accepts spans split across text deltas. The application
+executes the call; the shared session ledger owns result admission, deadlines,
+repeat suppression and interruption policy. MiniCPM-o continues to advertise
+`tool_mode: none`.
+
+Accepted Venus results are tokenized as `<backend>result</backend>` into a
+bounded private runtime queue. The next append reserves their exact token count
+and feeds them after that unit's media in the existing Thinker KV. They also
+belong to the unit's sliding-window history and reopen the speech gate after a
+completed turn. Ownership transfers to the stage only on successful submission;
+the commit removes only the submitted generations, retaining newer arrivals.
+Cancellation clears unsubmitted results; submitted requests retain the ordinary
+epoch fence. This is native duplex continuation, not HTTP `tool_calls` or the
+external Venus Harness/memory runtime.
+
 A fully muted unit following speech sets model-owned `meta.speech_flush`.
 The Talker appends only its audio-begin embedding to the existing condition,
 with a 26-token maximum and no minimum. The codec bridge drains pending frames

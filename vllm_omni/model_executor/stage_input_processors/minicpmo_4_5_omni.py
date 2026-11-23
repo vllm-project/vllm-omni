@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.delegation import (
+    decode_with_delegate_tags,
     delegate_speech_boundary,
     filter_delegate_condition,
 )
@@ -694,16 +695,21 @@ def _decode_native_duplex_token_ids(
     streaming_context,
     *,
     request_id: str,
+    special_token_ids: Mapping[str, int] | None = None,
 ) -> str | None:
     decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
     if not callable(decode_token_ids):
         return None
     decode_ids = [int(token_id) for token_id in token_ids]
-    try:
+
+    def decode(ids: list[int]) -> str:
         try:
-            return str(decode_token_ids(decode_ids, skip_special_tokens=True))
+            return str(decode_token_ids(ids, skip_special_tokens=True))
         except TypeError:
-            return str(decode_token_ids(decode_ids))
+            return str(decode_token_ids(ids))
+
+    try:
+        return decode_with_delegate_tags(decode_ids, decode, special_token_ids or {})
     except Exception:
         logger.exception("Failed to decode MiniCPM-o duplex token delta for request_id=%s", request_id)
         return ""
@@ -720,6 +726,7 @@ def _native_duplex_segment_output_ids(
     streaming_context,
     *,
     request_id: str,
+    special_token_ids: Mapping[str, int] | None = None,
 ) -> tuple[list[int], str, bool]:
     """Slice the cumulative thinker output down to the current segment.
 
@@ -760,6 +767,7 @@ def _native_duplex_segment_output_ids(
         segment_ids,
         streaming_context,
         request_id=request_id,
+        special_token_ids=special_token_ids,
     )
     if decoded_segment_text is not None:
         segment_text = decoded_segment_text
@@ -1056,6 +1064,7 @@ def llm2tts(
                 thinker_text,
                 _streaming_context,
                 request_id=str(llm_output.request_id),
+                special_token_ids=special_token_ids,
             )
         prompt_token_ids_len = len(prompt_token_ids)
 
@@ -1209,6 +1218,7 @@ def llm2tts(
                 handoff_ids,
                 _streaming_context,
                 request_id=str(llm_output.request_id),
+                special_token_ids=special_token_ids,
             )
             if handoff_text is not None:
                 # Match the released streaming_generate contract: transcript

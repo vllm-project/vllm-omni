@@ -170,21 +170,124 @@ the question correctly.
 
 ## Tool execution
 
-The released model can emit `<delegate>...</delegate>` requests. The external
+The default **duplex** server maps a complete `<delegate>...</delegate>` span
+to a Realtime `function_call` named `delegate`, with JSON arguments
+`{"question": "the model's natural-language task"}`. It accepts one delegation
+per model turn, including spans split across audio units. The original span
+remains in text output and is excluded from speech.
+
+The application executes the task and returns a `function_call_output` with
+the matching `call_id`. The server wraps the result in `<backend>...</backend>`
+and appends it after the next input unit's media, in the same Thinker KV cache.
+The model can then speak the answer. Input continues while the tool runs;
+no `response.create` is needed. The server also schedules a silence continuation
+when a result arrives. Applications should keep streaming input or silence so
+longer answers have enough model time.
+
+`capabilities.tool_mode` is `delegate_only` and
+`function_call_output_continuation` is `automatic`. Venus does not select among
+arbitrary named functions: dispatch the natural-language question in your
+`delegate` handler, or forward it to your own service. The server never executes
+application code. The external
 [Realtime-Venus-Harness](https://github.com/inclusionAI/Realtime-Venus/tree/main/harness)
-executes these tasks asynchronously and returns `<backend>...</backend>` feedback
-to the originating conversation. This adaptation preserves delegate text and
-excludes it from speech, but does not integrate the Harness or map delegate spans
-to OpenAI `tools` / `tool_calls`. Tool execution and asynchronous result injection
-are therefore not available in this serving profile.
+is optional application infrastructure, not a serving dependency.
+
+The shared [tool lifecycle](../../docs/serving/realtime_duplex_api.md#tool-calls-results-deadlines-and-cancellation)
+handles unknown/duplicate results, deadlines, cancellation and late replies.
+Results are limited to 4000 characters, with at most eight pending results and
+4096 pending tokens per session. Rejected results leave the call pending for a
+corrected reply. Cancellation retires results not yet submitted to the model;
+submitted work follows the existing epoch fence. The CLI below keeps pending
+calls across interruptions; custom clients choose their interruption policy.
+
+### Prepare two local tools
+
+Start the duplex server above. In a separate working directory, create a
+small inventory fixture and an async handler. These examples use local data;
+they do not contact an external service.
+
+```bash
+printf '{"widget": 73}\n' > inventory.json
+cat > tool_handlers.py <<'PY'
+import asyncio
+import json
+import re
+from pathlib import Path
+
+async def delegate(arguments):
+    question = arguments["question"]
+    if "inventory" in question.lower() or "库存" in question:
+        inventory = json.loads(await asyncio.to_thread(Path("inventory.json").read_text))
+        return json.dumps({"widget_inventory": inventory["widget"]})
+    numbers = re.findall(r"-?\d+", question)
+    if len(numbers) == 2 and any(word in question.lower() for word in ("add", "sum", "+", "加")):
+        return json.dumps({"sum": int(numbers[0]) + int(numbers[1])})
+    raise ValueError("This demo handles inventory lookup and adding two integers only")
+PY
+cat > tools.json <<'JSON'
+[{"type":"function","name":"delegate","description":"Delegate a task to the application",
+  "parameters":{"type":"object","properties":{"question":{"type":"string"}},
+  "required":["question"]}}]
+JSON
+```
+
+### Add two numbers
+
+This seeds the native session with text and streams silence. It is not a
+text-only `conversation.item.create` turn, which native MiniCPM/Venus rejects.
+Use the same model path as the running server:
+
+```bash
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+python -m vllm_omni.clients.tool_calls \
+  --url 'ws://127.0.0.1:8091/v1/realtime?duplex=1' \
+  --model ./Realtime-Venus/Realtime-Venus-Omni \
+  --tools-json tools.json --handler delegate=tool_handlers:delegate \
+  --initial-user-text 'Use <delegate>add 12 and 30</delegate> to ask the backend, then answer using its result.' \
+  --timeout 60
+```
+
+### Look up local inventory
+
+Run the same command with:
+
+```bash
+--initial-user-text 'Delegate a lookup of the current widget inventory to the backend. Do not guess the count.'
+```
+
+The handler reads `inventory.json`; the returned count is 73. Changing that
+file changes the tool's result without changing the prompt. Inspect the emitted
+`response.function_call_arguments.done`, the accepted `function_call_output`
+item, and the subsequent answer. A successful connection alone is not proof
+that the model delegated or used the result.
+
+### Ask by voice
+
+Record “Please check the widget inventory with the backend” as mono PCM16 at
+16 kHz. Replace `--initial-user-text ...` with:
+
+```bash
+--input-wav /path/to/inventory-question.wav
+```
+
+The generic CLI prints JSON events and requests text output. For speech output,
+use `DuplexToolRunner(client, {"delegate": delegate}).run()` alongside your
+existing duplex audio playback loop, request `modalities=("text", "audio")`,
+and acknowledge audio actually played. Handler failures send
+`function_call.cancel` with reason `failed`; they are not returned as invented
+business results. Stop the runner when closing the session so in-flight handlers
+are cancelled.
+
+This tool protocol is for the duplex Realtime endpoint. The explicit turn
+profile still serves ordinary multimodal HTTP requests; it does not implement
+OpenAI Chat Completions `tool_calls` for Venus.
 
 ## Scope
 
 - Both full-duplex serving (the default) and the explicit turn-based profile
   use the shared Thinker, Talker and Code2Wav stages.
-- The external Realtime-Venus delegation harness, asynchronous tool-result
-  orchestration and long-video memory adapter are not integrated. Backbone
-  compatibility does not establish those external features.
+- Application tools use the shared Realtime lifecycle. The external
+  Realtime-Venus Harness and long-video memory adapter are not bundled.
 - The Audio-only checkpoint is a separate configuration and is not covered by
   this recipe. Other devices and distributed layouts need separate validation.
 - Validation coverage and measured performance are reported in the linked PR

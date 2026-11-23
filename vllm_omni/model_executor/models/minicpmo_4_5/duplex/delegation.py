@@ -2,7 +2,35 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Keep delegation payloads out of the speech condition across duplex units."""
 
+from collections.abc import Callable, Mapping
+
 import torch
+
+
+def decode_with_delegate_tags(
+    token_ids: list[int], decode: Callable[[list[int]], str], special_token_ids: Mapping[str, int]
+) -> str:
+    """Retain delegation delimiters while the ordinary decoder skips controls.
+
+    These are tokenizer special tokens, so ``skip_special_tokens=True`` alone
+    silently destroys the tool protocol before it reaches the session plugin.
+    """
+    tags = {
+        special_token_ids.get("delegate_open_token_id", -1): "<delegate>",
+        special_token_ids.get("delegate_close_token_id", -1): "</delegate>",
+    }
+    tags.pop(-1, None)
+    pieces = []
+    start = 0
+    for index, token_id in enumerate(token_ids):
+        if token_id in tags:
+            if index > start:
+                pieces.append(decode(token_ids[start:index]))
+            pieces.append(tags[token_id])
+            start = index + 1
+    if start < len(token_ids):
+        pieces.append(decode(token_ids[start:]))
+    return "".join(pieces)
 
 
 def speech_condition_indices(

@@ -399,6 +399,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         seq: int | None = None,
         is_speech: bool = False,
         stage0_window: dict[str, object] | None = None,
+        text_token_ids: list[int] | None = None,
     ) -> _PrefillSteps:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -575,8 +576,22 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
                 state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
-        # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
-        # turn is opened once at session init; re-emitting the turn-open prefix per chunk
+        if text_token_ids and units_built:
+            # Official mixed-mode prefill puts <backend> text after the media
+            # and samples from its final token, in the same resident KV.
+            import torch
+
+            ids = torch.tensor(text_token_ids, dtype=torch.long, device=self._model_device())
+            text_embeds = self._as_2d_tensor(self._token_embedder()(ids))
+            embed_parts.append(text_embeds)
+            token_ids.extend(text_token_ids)
+            if state.pending_window_unit is not None:
+                state.pending_window_unit.embeds.append(text_embeds)
+                state.pending_window_unit.token_ids.extend(text_token_ids)
+            state.pending_speech_context = True
+            state.pending_speech_append_identity = append_identity
+        # Match official streaming_prefill: a unit carries media and optional text.
+        # The assistant turn opens once at session init; re-emitting its prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0

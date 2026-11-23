@@ -11,6 +11,9 @@ if TYPE_CHECKING:
 
     from transformers import PreTrainedTokenizerBase
 
+# Server-owned token IDs appended after the media in one native input unit.
+APPEND_TEXT_TOKEN_IDS_KEY = "duplex_append_text_token_ids"
+
 
 @dataclass(frozen=True, slots=True)
 class MiniCPMO45DuplexWindowConfig:

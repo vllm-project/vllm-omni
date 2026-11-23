@@ -12,4 +12,5 @@ REALTIME_VENUS_OMNI_PIPELINE = replace(
     # Use the shared execution classes; do not duplicate checkpoint kernels.
     default_deploy_config_name="realtime_venus_omni.yaml",
     hf_architectures=("RealtimeVenusOmni",),
+    duplex_plugin="vllm_omni.model_executor.models.realtime_venus.duplex.RealtimeVenusDuplexPlugin",
 )

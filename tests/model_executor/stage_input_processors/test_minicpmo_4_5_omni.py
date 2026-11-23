@@ -984,6 +984,34 @@ def test_venus_delegation_masks_aligned_speech_rows_and_preserves_text_tokens():
     assert source.outputs[0].token_ids == ids
 
 
+def test_venus_handoff_preserves_delegate_tags_when_tokenizer_skips_specials():
+    from vllm_omni.model_executor.models.realtime_venus.delegation import DelegateParser
+
+    def decode(ids, *, skip_special_tokens=False):
+        vocabulary = {21: "add ", 22: "12 and 30", 9400: "<delegate>", 9401: "</delegate>", 9308: "<|chunk_eos|>"}
+        return "".join(vocabulary.get(token, "") for token in ids if not (skip_special_tokens and token >= 9000))
+
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}}, source_token_decoder=decode
+    )
+    parser = DelegateParser()
+    cumulative = []
+    texts = []
+    calls = []
+    for content in ([9400, 21], [22, 9401]):
+        unit = [9304, *content, 9308]
+        cumulative.extend(unit)
+        source, _ = _native_source([101], list(cumulative), [101, *unit])
+        source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+        handoff = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+        text = handoff["meta"]["native_duplex_segment_text"]
+        texts.append(text)
+        calls.append(parser.feed(text))
+        assert handoff["ids"]["tts"] == []  # Delimiters/payload still never condition speech.
+    assert texts == ["<delegate>add ", "12 and 30</delegate>"]
+    assert calls == [None, "add 12 and 30"]
+
+
 def test_venus_delegation_state_crosses_units_and_resets_at_turn_end():
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.delegation import filter_delegate_condition
 
@@ -1029,7 +1057,7 @@ def test_venus_muted_units_flush_once_and_keep_dialogue_open(resume_speech):
     assert muted["meta"]["speech_flush"] is True
     assert muted["meta"]["turn_end"] is False
     assert muted["meta"]["next_stage_prompt_len"] == 1
-    assert muted["meta"]["native_duplex_segment_text"] == "secret"
+    assert muted["meta"]["native_duplex_segment_text"] == "<delegate>secret"
     again = handoff([31])
     assert again["ids"]["tts"] == []
     assert again["meta"]["speech_flush"] is False

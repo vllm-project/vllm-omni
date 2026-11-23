@@ -107,6 +107,7 @@ def test_pipeline_routes_by_architecture(checkpoint, monkeypatch):
     pipeline = StageConfigFactory.get_pipeline_config("renamed", trust_remote_code=True)
     assert pipeline.model_type == "realtime_venus_omni"
     assert len(pipeline.stages) == 3
+    assert pipeline.duplex_plugin == "vllm_omni.model_executor.models.realtime_venus.duplex.RealtimeVenusDuplexPlugin"
     config.version = "2.6"
     assert StageConfigFactory.get_pipeline_config("renamed", trust_remote_code=True) is None
 
