@@ -857,12 +857,80 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig, *, crop_action_
     return pre_process_func
 
 
+# Streams recorded for ``return_trajectory_latents``; the names follow the request
+# fields that carry the matching initial noise (latents, action_latents, audio_latents).
+_TRAJECTORY_STREAMS = ("latents", "action_latents", "audio_latents")
+
+
+def _begin_trajectory_run(trajectory: dict[str, list] | None) -> dict[str, list[torch.Tensor]] | None:
+    """Start recording one denoising loop; a request may run several (images, transfer chunks)."""
+    if trajectory is None:
+        return None
+    run: dict[str, list[torch.Tensor]] = {name: [] for name in (*_TRAJECTORY_STREAMS, "timesteps")}
+    trajectory["runs"].append(run)
+    return run
+
+
+def _record_trajectory_step(
+    run: dict[str, list[torch.Tensor]] | None,
+    t: torch.Tensor | None,
+    latents: torch.Tensor,
+    action_latents: torch.Tensor | None = None,
+    sound_latents: torch.Tensor | None = None,
+) -> None:
+    """Append the current latents of every stream (``t`` is ``None`` before the first step)."""
+    if run is None:
+        return
+    for name, value in (("latents", latents), ("action_latents", action_latents), ("audio_latents", sound_latents)):
+        if value is not None:
+            run[name].append(value.detach().to("cpu", torch.float32, copy=True))
+    if t is not None:
+        run["timesteps"].append(torch.as_tensor(t).detach().to("cpu", torch.float32).reshape(()))
+
+
+def _trajectory_payload(trajectory: dict[str, list] | None) -> dict[str, torch.Tensor] | None:
+    """Build the ``trajectory`` payload.
+
+    Each stream is ``[steps + 1, N, ...]``: the latents before the first step
+    and after every step. ``N`` is the stream's batch size; denoising loops
+    that run one after the other (transfer chunks, serially generated images)
+    are concatenated along it in generation order. ``timesteps`` is ``[steps]``.
+    """
+    runs = [run for run in (trajectory or {}).get("runs", []) if run["latents"]]
+    if not runs:
+        return None
+    payload = {
+        name: torch.cat([torch.stack(run[name]) for run in runs], dim=1)
+        for name in _TRAJECTORY_STREAMS
+        if runs[0][name]
+    }
+    payload["timesteps"] = torch.stack(runs[0]["timesteps"])
+    return payload
+
+
+def _with_trajectory(output: dict[str, Any], trajectory: dict[str, list] | None) -> dict[str, Any]:
+    """Attach the denoising trajectory to a pipeline output as a structured payload.
+
+    The model postprocessor passes it through next to the processed media and
+    the output formatter surfaces it as ``OmniRequestOutput.trajectory_*``
+    (video latents and timesteps) and ``multimodal_output["trajectory"]``
+    (every stream).
+    """
+    payload = _trajectory_payload(trajectory)
+    if payload is None:
+        return output
+    if isinstance(output.get("payload"), dict):
+        return {**output, "payload": {**output["payload"], "trajectory": payload}}
+    return {"payload": {**output, "trajectory": payload}}
+
+
 def _cosmos3_media_output(
     output: dict[str, Any],
     od_config: OmniDiffusionConfig,
     sampling_params: OmniDiffusionSamplingParams,
     *,
     stage_durations: dict[str, float] | None = None,
+    trajectory: dict[str, list] | None = None,
 ) -> DiffusionOutput:
     """Use shared transport only for plain video with NumPy presentation.
 
@@ -871,6 +939,8 @@ def _cosmos3_media_output(
     so shared transport does not change their presentation.
     """
     from .guardrails import is_guardrails_enabled
+
+    output = _with_trajectory(output, trajectory)
 
     video = output.get("video")
     if (
@@ -936,6 +1006,29 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         return int(fps_value) if fps_value.is_integer() else fps_value
 
     def post_process_func(
+        output: torch.Tensor | dict[str, torch.Tensor] | tuple,
+        output_type: str = "np",
+        sampling_params=None,
+    ):
+        # A denoising trajectory is not media: take it out, postprocess the
+        # rest as usual, and put it back next to the processed media.
+        trajectory = None
+        media_key = "video"
+        if isinstance(output, dict) and isinstance(output.get("payload"), dict) and "trajectory" in output["payload"]:
+            payload = dict(output["payload"])
+            trajectory = payload.pop("trajectory")
+            media_key = "image" if "image" in payload else "video"
+            output = {**output, "payload": payload}
+        result = _post_process_media(output, output_type, sampling_params)
+        if trajectory is None:
+            return result
+        if isinstance(result, dict) and isinstance(result.get("payload"), dict):
+            return {**result, "payload": {**result["payload"], "trajectory": trajectory}}
+        if isinstance(result, dict):  # video with audio: flat dict of payload entries
+            return {**result, "trajectory": trajectory}
+        return {"payload": {media_key: result, "trajectory": trajectory}, "metadata": {}}
+
+    def _post_process_media(
         output: torch.Tensor | dict[str, torch.Tensor] | tuple,
         output_type: str = "np",
         sampling_params=None,
@@ -2123,6 +2216,7 @@ class Cosmos3OmniDiffusersPipeline(
         )
 
         scheduler = build_robolab_unipc_scheduler(num_inference_steps, flow_shift_target, self.device)
+        trajectory = self._new_trajectory(sp)
         _, action_latents = self.diffuse(
             latents=latents,
             timesteps=scheduler.timesteps,
@@ -2144,6 +2238,7 @@ class Cosmos3OmniDiffusersPipeline(
             scheduler=scheduler,
             session_id=session_id,
             generator=generator,
+            trajectory=trajectory,
         )
 
         if _is_rank_zero():
@@ -2169,9 +2264,17 @@ class Cosmos3OmniDiffusersPipeline(
             },
         }
         return DiffusionOutput(
-            output=action_output,
+            output=_with_trajectory(action_output, trajectory),
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
+
+    @staticmethod
+    def _new_trajectory(sp: OmniDiffusionSamplingParams) -> dict[str, list] | None:
+        """Recorder for ``return_trajectory_latents``, or ``None`` when it is not requested.
+
+        Collected on rank 0 only: under CFG-parallel every rank runs the loop.
+        """
+        return {"runs": []} if sp.return_trajectory_latents and _is_rank_zero() else None
 
     @staticmethod
     def _truthy(value) -> bool:
@@ -3143,8 +3246,13 @@ class Cosmos3OmniDiffusersPipeline(
         scheduler: Any | None = None,
         session_id: str | None = None,
         generator: torch.Generator | None = None,
+        trajectory: dict[str, list] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Denoising loop with 3-mode CFG support (parallel, sequential, none).
+
+        When ``trajectory`` is given, the latents of every stream (video,
+        action, sound) are recorded before the first step and after every
+        step, together with each step's timestep (see ``_trajectory_payload``).
 
         Cosmos3's UND pathway is text-dependent, so CFG needs separate K/V
         caches for conditional and unconditional text.
@@ -3354,22 +3462,30 @@ class Cosmos3OmniDiffusersPipeline(
                 outputs.append(sound_latents)
             return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
-        def _assign_step_out(step_out: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
+        trajectory_run = _begin_trajectory_run(trajectory)
+
+        def _record_trajectory(t: torch.Tensor | None) -> None:
+            _record_trajectory_step(trajectory_run, t, latents, action_latents, sound_latents)
+
+        def _assign_step_out(step_out: torch.Tensor | tuple[torch.Tensor, ...], t: torch.Tensor) -> None:
             nonlocal latents, action_latents, sound_latents
             if action_latents is None and sound_latents is None:
                 # Both _step branches resolve AsyncLatents before returning.
                 assert isinstance(step_out, torch.Tensor)
                 latents = step_out
-                return
-            if not isinstance(step_out, tuple):
-                raise ValueError("Cosmos3 multimodal diffusion step returned a non-tuple result.")
-            latents = step_out[0]
-            idx = 1
-            if action_latents is not None:
-                action_latents = step_out[idx]
-                idx += 1
-            if sound_latents is not None:
-                sound_latents = step_out[idx]
+            else:
+                if not isinstance(step_out, tuple):
+                    raise ValueError("Cosmos3 multimodal diffusion step returned a non-tuple result.")
+                latents = step_out[0]
+                idx = 1
+                if action_latents is not None:
+                    action_latents = step_out[idx]
+                    idx += 1
+                if sound_latents is not None:
+                    sound_latents = step_out[idx]
+            _record_trajectory(t)
+
+        _record_trajectory(None)
 
         try:
             if cfg_parallel:
@@ -3413,7 +3529,7 @@ class Cosmos3OmniDiffusersPipeline(
                     )
                     if kv_state is not None:
                         self._kv_capture_und(kv_state, is_negative=cfg_rank_is_negative)
-                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents), t)
 
             elif do_cfg:
                 cond_cache: tuple = (None, None)
@@ -3482,7 +3598,7 @@ class Cosmos3OmniDiffusersPipeline(
                     else:
                         noise_pred = noise_cond
 
-                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents), t)
 
             else:
                 # No CFG: a single cond branch per step. Bespoke (state None) keeps
@@ -3505,7 +3621,7 @@ class Cosmos3OmniDiffusersPipeline(
                     )
                     if kv_state is not None:
                         self._kv_capture_und(kv_state, is_negative=False)
-                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                    _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents), t)
         finally:
             # Conditioning is request-local and no longer needed by VAE decode.
             # Dropping session state alone leaves these transformer aliases live.
@@ -3697,6 +3813,7 @@ class Cosmos3OmniDiffusersPipeline(
         normalize_cfg: bool = False,
         open_guidance_interval: bool = False,
         text_cfg_below_one: bool = False,
+        trajectory: dict[str, list] | None = None,
     ) -> torch.Tensor:
         if getattr(self, "_use_session_state", False):
             raise NotImplementedError(
@@ -3714,6 +3831,8 @@ class Cosmos3OmniDiffusersPipeline(
 
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
+        trajectory_run = _begin_trajectory_run(trajectory)
+        _record_trajectory_step(trajectory_run, None, latents)
         try:
             for step_index, t in enumerate(self.progress_bar(timesteps)):
                 self._set_denoise_step_metadata(step_index, timesteps, self.scheduler)
@@ -3846,6 +3965,7 @@ class Cosmos3OmniDiffusersPipeline(
                 )[0]
                 del noise_pred
                 latents = self._apply_transfer_condition(latents, velocity_mask, condition_latents, shared_kwargs)
+                _record_trajectory_step(trajectory_run, t, latents)
         finally:
             # Transfer runs to completion here. The solver's previous samples
             # must not overlap VAE decoding (also release them on failure).
@@ -4037,6 +4157,8 @@ class Cosmos3OmniDiffusersPipeline(
             aspect_ratio_override=transfer_aspect_ratio,
         )
 
+        # One recorded denoising loop per chunk, concatenated in chunk order.
+        trajectory = self._new_trajectory(sp)
         output_chunks: list[torch.Tensor] = []
         control_chunks_per_hint: dict[str, list[torch.Tensor]] = {key: [] for key in per_hint_frames}
         previous_output: torch.Tensor | None = None
@@ -4134,6 +4256,7 @@ class Cosmos3OmniDiffusersPipeline(
                 velocity_mask=velocity_mask,
                 condition_latents=condition_latents,
                 generator=generator,
+                trajectory=trajectory,
             )
             output_video = self._decode_latents(latents).clamp(-1, 1)
             if chunk_id + 1 < num_chunks:
@@ -4177,16 +4300,19 @@ class Cosmos3OmniDiffusersPipeline(
             full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
 
         return DiffusionOutput(
-            output={
-                "payload": {"video": full_output},
-                "metadata": {
-                    "transfer": {
-                        "controls": full_controls,
-                        "hints": list(per_hint_frames),
+            output=_with_trajectory(
+                {
+                    "payload": {"video": full_output},
+                    "metadata": {
+                        "transfer": {
+                            "controls": full_controls,
+                            "hints": list(per_hint_frames),
+                        },
+                        "video": {"fps": frame_rate},
                     },
-                    "video": {"fps": frame_rate},
                 },
-            },
+                trajectory,
+            ),
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -4418,6 +4544,10 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
+        # Denoising trajectory of every generated stream; one recorded loop per
+        # serially generated image, one batch row per image generated together.
+        trajectory = self._new_trajectory(sp)
+
         # --- Format prompts & tokenize (B=1; shared by every T2I output when
         # num_outputs_per_prompt > 1) ---
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
@@ -4581,6 +4711,7 @@ class Cosmos3OmniDiffusersPipeline(
                 scheduler=scheduler,
                 session_id=getattr(req, "request_id", None),
                 generator=generator,
+                trajectory=trajectory,
             )
 
         if is_t2i and batch_size > 1 and self._can_batch_t2i_outputs():
@@ -4633,7 +4764,9 @@ class Cosmos3OmniDiffusersPipeline(
                 logger.info("Sound tokenizer decoded in %.2fs", time.time() - sound_decode_start)
                 logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
             return DiffusionOutput(
-                output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate},
+                output=_with_trajectory(
+                    {"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate}, trajectory
+                ),
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
@@ -4642,19 +4775,22 @@ class Cosmos3OmniDiffusersPipeline(
                 raise ValueError("Cosmos3 action generation finished without action latents.")
             action = action_latents[:, :, :raw_action_dim].detach().cpu()
             return DiffusionOutput(
-                output={
-                    "payload": {
-                        "video": video,
-                        "actions": action,
-                    },
-                    "metadata": {
-                        "actions": {
-                            "raw_action_dim": raw_action_dim,
-                            "action_mode": action_mode,
-                            "domain_id": domain_id,
+                output=_with_trajectory(
+                    {
+                        "payload": {
+                            "video": video,
+                            "actions": action,
+                        },
+                        "metadata": {
+                            "actions": {
+                                "raw_action_dim": raw_action_dim,
+                                "action_mode": action_mode,
+                                "domain_id": domain_id,
+                            },
                         },
                     },
-                },
+                    trajectory,
+                ),
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
@@ -4663,4 +4799,5 @@ class Cosmos3OmniDiffusersPipeline(
             od_config=self.od_config,
             sampling_params=sp,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            trajectory=trajectory,
         )
