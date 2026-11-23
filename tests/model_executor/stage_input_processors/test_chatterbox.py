@@ -235,9 +235,13 @@ def scheduler_side_payloads(
             request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         adapter.save_async(None, request, new_token_ids=[token])
     payloads = receive_through_final(receiver, external_id)
-    # Nothing was added to the transport; its cleanup after the final chunk freed both entries.
+    # The sender thread frees both entries after the put that delivered the final chunk.
+    deadline = time.monotonic() + DELIVERY_SECONDS
+    while external_id in adapter.request_payload or external_id in adapter.code_prompt_token_ids:
+        assert time.monotonic() < deadline, "the sender kept the request's state after its final chunk"
+        time.sleep(0.001)
+    # Nothing was added to the transport.
     assert set(vars(adapter)) == attributes
-    assert external_id not in adapter.request_payload and external_id not in adapter.code_prompt_token_ids
     assert received(receiver, external_id, len(payloads)) == []
     return payloads
 
