@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
+from vllm_omni.diffusion.attention.backends.utils.rocm_h3_bounds import packed_cu_seqlens
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_sigma,
@@ -71,6 +72,7 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        rocm_h3_grouped_fmha: bool = False,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -117,7 +119,7 @@ class MiniMaxH3DenoiseBranch:
             "text_pos_info": {"position_ids": self.text_pos_dev},
             "img_pos_for_infer_output_info": {"position_ids": self.img_pos_dev},
             "packed_seq_params": {
-                "cu_seqlens_q": cu.to(device),
+                "cu_seqlens_q": packed_cu_seqlens(cu, device) if rocm_h3_grouped_fmha else cu.to(device),
                 "max_seqlen_q": self.used_len,
                 # One request: valid rows are a prefix, so attention may use a
                 # KV prefix length or a 1-D pad mask. See batched_packing for the

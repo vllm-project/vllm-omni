@@ -175,6 +175,15 @@ MiniMax-H3 supplies `MiniMaxH3VSAImpl` through `impl_overrides`.
 learned compression gate. Pooling, block-map construction, and tile64 provider
 calls are shared through `attention/ops/block_sparse.py`.
 
+## MiniMax-H3 grouped ROCm FlashAttention
+
+On ROCm the H3 layer also supplies `MiniMaxH3FlashAttentionImpl` for
+`FLASH_ATTN`. The layer resolves the active baseline or scheduled implementation
+before publishing the strided Ulysses receive capability. The H3 override
+validates the document boundaries again at dispatch and can return to the
+inherited packed attention path independently on each rank.
+See [MiniMax-H3 grouped attention on AMD Instinct](../../user_guide/diffusion/attention_backends/dense_backends.md#minimax-h3-grouped-attention-on-amd-instinct).
+
 ## CosyVoice3 Ascend graph region
 
 CosyVoice3 has an opt-in, model-owned NPU graph adapter around the complete
