@@ -454,6 +454,11 @@ _DIFFUSION_MODELS = {
         "pipeline_hidream_o1_image",
         "HiDreamO1ImagePipeline",
     ),
+    "HiUniPipeline": (
+        "hiuni",
+        "pipeline_hiuni",
+        "HiUniPipeline",
+    ),
     "DreamZeroPipeline": (
         "dreamzero",
         "pipeline_dreamzero",
@@ -861,6 +866,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_post_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
+    "HiUniPipeline": "get_hiuni_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "Flux3Pipeline": "get_flux3_post_process_func",

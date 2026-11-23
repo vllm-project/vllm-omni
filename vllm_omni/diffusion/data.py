@@ -842,7 +842,7 @@ def resolve_model_class_name(
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
-    from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1, _looks_like_hiuni
 
     if model_type == "praxis":
         return "Praxis1Pipeline"
@@ -861,6 +861,8 @@ def resolve_model_class_name(
         return "LancePipeline"
     if model_type == "neo_chat":
         return "SenseNovaU1Pipeline"
+    if _looks_like_hiuni(cfg):
+        return "HiUniPipeline"
     if "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
         "bailingmm_moe_v2_lite",
         "ming_flash_omni",
@@ -1934,7 +1936,7 @@ class OmniDiffusionConfig:
                     self.update_multimodal_support()
                     return
 
-                from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+                from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1, _looks_like_hiuni
 
                 assert self.model is not None
                 is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
@@ -1979,6 +1981,10 @@ class OmniDiffusionConfig:
                 elif model_type == "neo_chat":
                     self.model_class_name = "SenseNovaU1Pipeline"
                     self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
+                elif _looks_like_hiuni(cfg):
+                    self.model_class_name = "HiUniPipeline"
+                    self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
                     "bailingmm_moe_v2_lite",

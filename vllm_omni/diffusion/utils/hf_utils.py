@@ -153,6 +153,21 @@ def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bo
         return False
 
 
+def _looks_like_hiuni(config: Mapping | None) -> bool:
+    """HiUni ships a root config.json with its own model type and architecture."""
+    if not isinstance(config, Mapping):
+        return False
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "pixel_dit_qwen3_vl" or "PixelDiTForConditionalGeneration" in architectures
+
+
+def _looks_like_hiuni_model(model_name: str) -> bool:
+    try:
+        return _looks_like_hiuni(get_hf_file_to_dict("config.json", model_name))
+    except Exception:
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -213,4 +228,5 @@ def is_diffusion_model(model_name: str) -> bool:
         or _looks_like_bagel(model_name)
         or _looks_like_dreamzero(model_name)
         or _looks_like_hidream_o1(model_name)
+        or _looks_like_hiuni_model(model_name)
     )
