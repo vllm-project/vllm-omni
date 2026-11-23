@@ -141,15 +141,19 @@ def test_legacy_processor_registration_restored_on_failure(monkeypatch):
 
 
 @pytest.mark.parametrize("mode,suffix", [("duplex", ""), ("duplex", "_duplex"), ("turn", "_turn")])
-def test_venus_deploy_preserves_reference_flow_settings(mode, suffix):
-    from vllm_omni.config.stage_config import resolve_deploy_yaml
+@pytest.mark.parametrize("platform", ["cuda", "npu", "rocm", "xpu", "musa", "cpu"])
+def test_venus_deploy_inherits_minicpm_settings(mode, suffix, platform):
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
 
-    config = resolve_deploy_yaml(f"vllm_omni/deploy/realtime_venus_omni{suffix}.yaml")
-    assert config["pipeline"] == "realtime_venus_omni"
-    assert config["session_mode"] == mode
-    assert config["connectors"]["connector_of_shared_memory"]["extra"]["token2wav_n_timesteps"] == 10
-    cuda = config["platforms"]["cuda"]
-    assert cuda["connectors"]["connector_of_shared_memory"]["extra"]["token2wav_float16"] is False
-    assert cuda["connectors"]["connector_of_shared_memory"]["extra"]["token2wav_allow_tf32"] == "off"
-    codec = next(stage for stage in cuda["stages"] if stage["stage_id"] == 2)
-    assert codec["num_replicas"] == 1
+    config = _apply_platform_overrides(
+        load_deploy_config(f"vllm_omni/deploy/realtime_venus_omni{suffix}.yaml"), platform=platform
+    )
+    base_suffix = "_turn" if mode == "turn" else ""
+    expected = _apply_platform_overrides(
+        load_deploy_config(f"vllm_omni/deploy/minicpmo_4_5{base_suffix}.yaml"), platform=platform
+    )
+    assert config.session_mode == mode
+    expected.pipeline = "realtime_venus_omni"
+    # Compare the applied settings; inheritance can add empty platform stage lists.
+    config.platforms = expected.platforms = None
+    assert config == expected
