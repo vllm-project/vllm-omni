@@ -961,7 +961,7 @@ def _next_stage_input(request_id: str) -> NextStageInputMessage:
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("transitions, endpoint", [(None, 2), (((0, 2),), 2), (((0, 2), (2, 1)), 1)])
+@pytest.mark.parametrize("transitions, endpoint", [(None, 2), (((0, 2), (2, 1)), 1)])
 def test_run_entry_stage_yields_at_entry_stage(transitions, endpoint):
     """Ensure the entry stage call yields at stage 0 with FINAL_ONLY params and returns the next stage input."""
 

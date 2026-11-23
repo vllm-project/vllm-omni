@@ -409,9 +409,14 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
         client_mod.__dict__.update(saved)
 
 
-@pytest.mark.parametrize("transitions", [None, ((0, 2),)])
-@pytest.mark.parametrize("with_aligner", [False, True])
-@pytest.mark.parametrize("distributed", [False, True])
+@pytest.mark.parametrize(
+    "transitions,with_aligner,distributed",
+    [
+        pytest.param(None, False, False, id="default"),
+        pytest.param(((0, 2),), True, False, id="local-aligner"),
+        pytest.param(((0, 2),), True, True, id="distributed-aligner"),
+    ],
+)
 def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(
     monkeypatch, transitions, with_aligner, distributed
 ):

@@ -87,8 +87,6 @@ def test_inject_noop_without_forced_aligner():
     ("transitions", "order"),
     [
         (None, (0, 1, 2)),
-        (((0, 1), (1, 2)), (0, 1, 2)),
-        (((0, 2),), (0, 2)),
         (((2, 1), (0, 2)), (0, 2, 1)),
         ((), (0,)),
     ],

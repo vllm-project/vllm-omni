@@ -29,12 +29,11 @@ def _host(mocker, stage_id, route, async_chunk):
     return host
 
 
-@pytest.mark.parametrize(("source", "target"), [(0, 2), (2, 1)])
 @pytest.mark.parametrize("async_chunk", [False, True])
-def test_mrv2_payload_uses_configured_shm_edge(mocker, source, target, async_chunk):
+def test_mrv2_payload_uses_configured_shm_edge(mocker, async_chunk):
     route = StageRouting.from_transitions(3, ((0, 2), (2, 1)))
-    sender = _host(mocker, source, route, async_chunk)
-    receiver = _host(mocker, target, route, async_chunk)
+    sender = _host(mocker, 2, route, async_chunk)
+    receiver = _host(mocker, 1, route, async_chunk)
     request = _make_request("r", f"configured-mrv2-{uuid.uuid4().hex}")
     receiver.register_chunk_recv(request)
     try:

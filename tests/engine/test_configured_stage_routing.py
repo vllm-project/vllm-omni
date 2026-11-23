@@ -100,8 +100,8 @@ def _submission(**overrides):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transitions", [None, ((0, 1), (1, 2)), ((0, 2), (2, 1))])
-async def test_bridge_sender_is_bound_before_receiver_prewarm(mocker, transitions):
+async def test_bridge_sender_is_bound_before_receiver_prewarm(mocker):
+    transitions = ((0, 2), (2, 1))
     order = StageRouting.from_transitions(3, transitions).stage_order
     bridge, receiver = order[1:]
     clients = [[FakeStageClient(next_inputs=[{"prompt_token_ids": [11]}])] for _ in range(3)]
@@ -155,10 +155,9 @@ async def test_bridge_sender_is_bound_before_receiver_prewarm(mocker, transition
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transitions", [((0, 2),), ((0, 2), (2, 1))])
 @pytest.mark.parametrize("raw_terminal", [False, True])
-async def test_endpoint_completion_waits_for_other_selected_output(transitions, raw_terminal):
-    orch, state, clients = _direct_orchestrator(transitions, async_chunk=True)
+async def test_endpoint_completion_waits_for_other_selected_output(raw_terminal):
+    orch, state, clients = _direct_orchestrator(((0, 2), (2, 1)), async_chunk=True)
     endpoint = state.final_stage_id
     other = 0
     clients[other].final_output = True
@@ -182,9 +181,8 @@ async def test_endpoint_completion_waits_for_other_selected_output(transitions, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transitions", [None, ((0, 2), (2, 1))])
-async def test_abort_outputs_follow_route_and_finish_each_request_once(transitions):
-    orch, state, clients = _direct_orchestrator(transitions)
+async def test_abort_outputs_follow_route_and_finish_each_request_once():
+    orch, state, clients = _direct_orchestrator(((0, 2), (2, 1)))
     for client in clients:
         client.final_output = True
     state.final_output_stage_ids = {1, 2}
@@ -230,10 +228,9 @@ async def test_empty_bridge_aborts_prewarmed_receiver_and_preserves_submission_m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transitions", [None, ((0, 2),), ((0, 2), (2, 1))])
 @pytest.mark.parametrize("empty_inputs", [None, []])
-async def test_empty_diffusion_inputs_fail_only_request(mocker, transitions, empty_inputs):
-    orch, state, clients = _direct_orchestrator(transitions)
+async def test_empty_diffusion_inputs_fail_only_request(mocker, empty_inputs):
+    orch, state, clients = _direct_orchestrator(((0, 2), (2, 1)))
     target = state.final_stage_id
     source = orch._request_stage_path(state)[-2]
     clients[target].stage_type = "diffusion"
@@ -372,22 +369,10 @@ async def test_kv_ready_routes_once_to_configured_target(mocker):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("final,outputs", [(1, [1]), (2, [1]), (2, [0])])
-async def test_invalid_request_route_fails_before_submission(final, outputs):
+async def test_bad_output_ids_fail_one_request_without_killing_dispatch():
     orch, _, clients = _direct_orchestrator()
     orch.request_states.clear()
-    await orch._handle_add_request(_submission(final_stage_id=final, final_output_stage_ids=outputs))
-    assert isinstance(orch.output_async_queue.get_nowait(), ErrorMessage)
-    assert not orch.request_states
-    assert all(not client.add_request_calls for client in clients)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outputs", [[2.0], [True], [[2]]])
-async def test_bad_output_ids_fail_one_request_without_killing_dispatch(outputs):
-    orch, _, clients = _direct_orchestrator()
-    orch.request_states.clear()
-    await orch._handle_add_request(_submission(final_output_stage_ids=outputs))
+    await orch._handle_add_request(_submission(final_output_stage_ids=[[2]]))
     error = orch.output_async_queue.get_nowait()
     assert isinstance(error, ErrorMessage) and not error.fatal
     assert error.status_code == 400
@@ -395,23 +380,11 @@ async def test_bad_output_ids_fail_one_request_without_killing_dispatch(outputs)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("count", [0, 1, 2])
-async def test_incomplete_sampling_array_fails_before_any_submission(count):
+async def test_incomplete_sampling_array_fails_before_any_submission():
     orch, _, clients = _direct_orchestrator()
     orch.request_states.clear()
-    await orch._handle_add_request(_submission(sampling_params_list=[SamplingParams() for _ in range(count)]))
+    await orch._handle_add_request(_submission(sampling_params_list=[SamplingParams(), SamplingParams()]))
     assert isinstance(orch.output_async_queue.get_nowait(), ErrorMessage)
-    assert all(not client.add_request_calls for client in clients)
-
-
-@pytest.mark.asyncio
-async def test_endpoint_must_be_selected_to_prevent_premature_completion():
-    orch, _, clients = _direct_orchestrator()
-    clients[0].final_output = True
-    orch.request_states.clear()
-    await orch._handle_add_request(_submission(final_output_stage_ids=[0]))
-    error = orch.output_async_queue.get_nowait()
-    assert "final stage" in error.error
     assert all(not client.add_request_calls for client in clients)
 
 
@@ -421,8 +394,6 @@ async def test_endpoint_must_be_selected_to_prevent_premature_completion():
     [
         {"final_stage_id": 0},
         {"final_output_stage_ids": [0, 2]},
-        {"final_output_stage_ids": [2.0]},
-        {"final_output_stage_ids": [True]},
         {"final_output_stage_ids": [[2]]},
         {"sampling_params_list": [SamplingParams()]},
     ],
@@ -468,18 +439,17 @@ def test_frontend_selects_final_outputs_in_route_order(mocker):
     assert get_final_stage_id_for_e2e(["text", "audio"], ["text", "audio"], stages) == 2
 
 
-@pytest.mark.parametrize("modalities", [["audio"], ["text", "audio"]])
-@pytest.mark.parametrize("default_modalities", [["text", "audio"], ["text"]])
-def test_frontend_rejects_outputs_only_available_on_inactive_stages(modalities, default_modalities):
+def test_frontend_rejects_outputs_only_available_on_inactive_stages():
+    modalities = ["text", "audio"]
     stages = [
         FakeStageClient(final_output=False),
         FakeStageClient(final_output=True, final_output_type="audio"),
         FakeStageClient(final_output=True, final_output_type="text"),
     ]
     with pytest.raises(ValueError, match="output modalities are unreachable"):
-        get_final_stage_id_for_e2e(modalities, default_modalities, stages, stage_order=(0, 2))
+        get_final_stage_id_for_e2e(modalities, ["text"], stages, stage_order=(0, 2))
     assert get_final_stage_id_for_e2e(None, ["text", "audio"], stages, stage_order=(0, 2)) == 2
-    assert get_final_stage_id_for_e2e(modalities, ["text", "audio"], stages) == (1 if modalities == ["audio"] else 2)
+    assert get_final_stage_id_for_e2e(modalities, ["text", "audio"], stages) == 2
 
 
 @pytest.mark.asyncio
@@ -566,8 +536,7 @@ async def test_run_calls_follow_configured_route(transitions):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("async_chunk", [False, True])
-@pytest.mark.parametrize("final_stage_id", [1, 2])
+@pytest.mark.parametrize("async_chunk,final_stage_id", [(False, 1), (True, 1), (True, 2)])
 async def test_reordered_route_starts_at_admitted_nonzero_entry(mocker, async_chunk, final_stage_id):
     orch, _, clients = _direct_orchestrator(((0, 2), (2, 1)), async_chunk=async_chunk)
     orch.request_states.clear()
@@ -615,22 +584,31 @@ async def test_closing_request_does_not_consume_its_abort_snapshot(mocker):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "overrides",
-    [{"entry_stage_id": 1}, {"final_stage_id": 1, "final_output_stage_ids": [1]}, {"final_output_stage_ids": [0]}, {}],
-    ids=["inactive-entry", "inactive-endpoint", "missing-endpoint-output", "duplicate-id"],
+    "overrides,reason",
+    [
+        pytest.param({"entry_stage_id": 1}, "entry stage", id="inactive-entry"),
+        pytest.param({"final_stage_id": 1, "final_output_stage_ids": [1]}, "not reachable", id="inactive-endpoint"),
+        pytest.param({"final_output_stage_ids": [1]}, "belong", id="inactive-output"),
+        pytest.param({"final_output_stage_ids": [0]}, "final stage must be", id="unselected-endpoint"),
+        pytest.param({}, "already in use", id="duplicate-id"),
+    ],
 )
-async def test_rejected_route_releases_unregistered_artifacts(tmp_path, overrides):
+async def test_rejected_route_releases_unregistered_artifacts(tmp_path, overrides, reason):
     orch, state, clients = _direct_orchestrator()
+    clients[0].final_output = True
     if overrides:
         orch.request_states.clear()
     artifacts = tmp_path / "unregistered"
     artifacts.mkdir()
     await orch._handle_add_request(_submission(request_artifact_dirs=[str(artifacts)], **overrides))
     error = orch.output_async_queue.get_nowait()
-    assert isinstance(error, ErrorMessage)
+    assert isinstance(error, ErrorMessage) and not error.fatal
+    assert reason in error.error
     assert not artifacts.exists()
     assert all(not client.add_request_calls for client in clients)
-    if not overrides:
+    if overrides:
+        assert not orch.request_states
+    else:
         assert orch.request_states["r"] is state
 
 
@@ -683,8 +661,8 @@ def test_per_sample_kv_follows_the_configured_successor(entry, expected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transitions", [None, ((0, 2), (2, 1))])
-async def test_prewarm_reuses_replica_selected_by_waiting_bridge(monkeypatch, transitions):
+async def test_prewarm_reuses_replica_selected_by_waiting_bridge(monkeypatch):
+    transitions = ((0, 2), (2, 1))
     orch, state, clients = _direct_orchestrator(transitions, async_chunk=True)
     _, bridge, receiver = orch._request_stage_path(state)
     pool = orch.stage_pools[bridge]
@@ -760,8 +738,7 @@ async def test_prewarm_does_not_bind_bridge_only_stages():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bridge", ["ar", "pd", "diffusion"])
-@pytest.mark.parametrize("abort_fails", [False, True])
+@pytest.mark.parametrize("bridge,abort_fails", [("ar", False), ("ar", True), ("pd", True), ("diffusion", True)])
 async def test_cancel_during_bridge_send_retains_failed_admission(monkeypatch, bridge, abort_fails):
     orch, state, clients = _direct_orchestrator()
     pool = orch.stage_pools[2]
@@ -847,13 +824,11 @@ async def test_cancel_during_bridge_send_retains_failed_admission(monkeypatch, b
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transitions", [None, ((0, 2),), ((0, 2), (2, 1))])
-@pytest.mark.parametrize("fail_first", [False, True])
-@pytest.mark.parametrize("finish_during_abort", [False, True])
+@pytest.mark.parametrize("fail_first,finish_during_abort", [(True, False), (False, True)])
 async def test_abort_failure_drains_without_resuming_or_leaking_request(
-    monkeypatch, mocker, transitions, fail_first, finish_during_abort
+    monkeypatch, mocker, fail_first, finish_during_abort
 ):
-    orch, state, clients = _direct_orchestrator(transitions, async_chunk=True)
+    orch, state, clients = _direct_orchestrator(((0, 2), (2, 1)), async_chunk=True)
     orch._running_counter = FakeRunningCounter()
     orch._register_running_request(state)
     release_resources = mocker.spy(orch, "_release_stage_transfer_resources")

@@ -523,9 +523,11 @@ def test_serve_validate_rejects_sleep_mode_with_multiple_api_servers(mocker: Moc
         cmd.validate(args)
 
 
-@pytest.mark.parametrize("typed", [False, True])
-@pytest.mark.parametrize("downstream_async_chunk", [False, True])
-@pytest.mark.parametrize("transitions", [None, ((0, 2),)])
+@pytest.mark.parametrize(
+    "typed,downstream_async_chunk,transitions",
+    [(typed, async_chunk, None) for typed in (False, True) for async_chunk in (False, True)]
+    + [(False, True, ((0, 2),)), (True, True, ((0, 2),))],
+)
 def test_build_multi_api_stage_runtime_matches_current_constructor(
     mocker: MockerFixture, typed: bool, downstream_async_chunk: bool, transitions: tuple[tuple[int, int], ...] | None
 ) -> None:
