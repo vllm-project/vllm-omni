@@ -564,7 +564,7 @@ def _iter_steps(doc: dict):
 
 
 @pytest.mark.parametrize(
-    "pipeline_path,legacy_keys",
+    "pipeline_path,perf_keys",
     [
         (
             NIGHTLY_YAML,
@@ -577,28 +577,31 @@ def _iter_steps(doc: dict):
     ],
 )
 @pytest.mark.parametrize(
-    "changed_file,select_legacy",
+    "changed_file,select_cuda,select_npu",
     [
-        ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
-        ("vllm_omni/benchmarks/patch/patch.py", True),
-        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
-        ("vllm_omni/clients/duplex.py", False),
-        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
-        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
-        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
-        ("tests/dfx/perf/scripts/run_benchmark.py", True),
+        ("vllm_omni/benchmarks/realtime_seed_tts.py", False, False),
+        ("vllm_omni/benchmarks/patch/patch.py", True, True),
+        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", True, False),
+        ("vllm_omni/benchmarks/data_modules/daily_omni_dataset.py", True, False),
+        ("vllm_omni/benchmarks/validation.py", True, True),
+        ("vllm_omni/clients/duplex.py", False, False),
+        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False, False),
+        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True, True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True, True),
+        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True, True),
+        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True, True),
+        ("tests/dfx/perf/scripts/run_benchmark.py", True, True),
     ],
 )
 def test_qwen3_perf_pipeline_selection(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_path: Path,
-    legacy_keys: set[str],
+    perf_keys: set[str],
     changed_file: str,
-    select_legacy: bool,
+    select_cuda: bool,
+    select_npu: bool,
 ) -> None:
-    """Keep realtime-only inputs from selecting legacy CUDA/NPU perf jobs."""
+    """Select combined CUDA and retained A3 jobs according to their own workloads."""
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     _load_source_file_dependencies.cache_clear()
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
@@ -606,8 +609,9 @@ def test_qwen3_perf_pipeline_selection(
     surviving_keys = {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
     # Compare the dependency-filtered Qwen perf jobs.
-    expected_keys = set(legacy_keys) if select_legacy else set()
-    assert surviving_keys & legacy_keys == expected_keys
+    selected = select_cuda if pipeline_path.parent.name == "cuda" else select_npu
+    expected_keys = set(perf_keys) if selected else set()
+    assert surviving_keys & perf_keys == expected_keys
 
 
 @pytest.mark.parametrize(
@@ -1026,6 +1030,10 @@ def test_gepard_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch)
         matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
         assert len(matching_steps) == 1
         assert matching_steps[0]["source_file_dependencies"] == dependency
+
+    command = "\n".join(matching_steps[0]["commands"])
+    assert '"protobuf>=6.33.6,<7"' in command
+    assert "--overrides /tmp/gepard-overrides.txt" in command
 
     group = next(step for step in doc["steps"] if "Gepard Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
