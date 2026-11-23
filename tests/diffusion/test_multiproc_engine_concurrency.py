@@ -626,7 +626,9 @@ class TestRequestModeDispatch:
         )
         executor._sync_result_buffer = res_q
         executor._fail_closed_on_dp_wave_timeout = Mock()
-        monkeypatch.setattr(executor_module, "_DLO_DP_WAVE_TIMEOUT_S", 0.05)
+        # execute_model runs the denoise loop, so it is budgeted by the
+        # execute-model timeout rather than the DLO wave timeout.
+        monkeypatch.setattr(executor_module, "_EXECUTE_MODEL_TIMEOUT_S", 0.05)
 
         def reply_from_only_one_dp_rank():
             request = req_q.get(timeout=2.0)
@@ -671,7 +673,7 @@ class TestRequestModeDispatch:
         result = executor.execute_request(_make_sched_output("A"))
 
         assert result.runner_outputs[0].result.error == "timed out"
-        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._EXECUTE_MODEL_TIMEOUT_S
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
     def test_single_rank_local_request_times_out_and_fails_closed(self):
@@ -698,7 +700,7 @@ class TestRequestModeDispatch:
         result = executor.execute_request(_make_sched_output("A"))
 
         assert result.runner_outputs[0].result.error == "timed out"
-        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._EXECUTE_MODEL_TIMEOUT_S
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
     def test_rank_local_batch_wave_times_out_and_fails_closed(self):
@@ -726,7 +728,7 @@ class TestRequestModeDispatch:
             executor.execute_batch(_make_sched_output("A", "B"))
 
         assert executor.collective_rpc.call_args.args[0] == "execute_model_batch"
-        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._EXECUTE_MODEL_TIMEOUT_S
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
 

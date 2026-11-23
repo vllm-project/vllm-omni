@@ -480,7 +480,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         t = threading.Thread(target=_monitor, daemon=True, name="diffusion-worker-monitor")
         t.start()
 
-    def _fail_closed_on_dp_wave_timeout(self, exc: TimeoutError) -> None:
+    def _fail_closed_on_dp_wave_timeout(self, exc: TimeoutError, *, timeout: float | None = None) -> None:
         """Shut down every rank after a partial DP wave times out.
 
         Once one rank is stuck in a DLO AllGather, that process group cannot be
@@ -490,7 +490,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         """
         logger.error(
             "DLO DP collective wave timed out after %.1fs; shutting down the worker group: %s",
-            _DLO_DP_WAVE_TIMEOUT_S,
+            _DLO_DP_WAVE_TIMEOUT_S if timeout is None else timeout,
             exc,
         )
         self._is_failed = True
@@ -699,13 +699,13 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                 args=(scheduler_output, self.od_config),
                 unique_reply_rank=0,
                 exec_all_ranks=True,
-                timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                timeout=_EXECUTE_MODEL_TIMEOUT_S,
             )
         except TimeoutError as exc:
             # A rank that never replied leaves the process group unusable, so
             # tear the worker group down instead of letting the next wave hang
             # on it too. Mirrors the execute_request() contract.
-            self._fail_closed_on_dp_wave_timeout(exc)
+            self._fail_closed_on_dp_wave_timeout(exc, timeout=_EXECUTE_MODEL_TIMEOUT_S)
             raise
         if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
             # Propagate async_output_id to per-request RunnerOutputs so the
