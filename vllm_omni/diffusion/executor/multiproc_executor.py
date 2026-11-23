@@ -52,6 +52,10 @@ logger = init_logger(__name__)
 
 _DEQUEUE_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
+# A single execute_model call runs the whole denoise loop for one request, so its
+# wall time scales with step count, resolution and accelerator speed - not with the
+# DLO wave cadence below. Budget it separately and let slow hosts raise it.
+_EXECUTE_MODEL_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_EXECUTE_MODEL_TIMEOUT", 3600.0))
 _WORKER_SHUTDOWN_GRACE_S = 15.0
 # TorchNPU runtime finalization can outlast application-level worker cleanup.
 _NPU_WORKER_SHUTDOWN_GRACE_S = 60.0
@@ -584,7 +588,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             try:
                 results = self.collective_rpc(
                     "execute_model",
-                    timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                    timeout=_EXECUTE_MODEL_TIMEOUT_S,
                     args=(new_reqs, self.od_config, scheduler_output.kv_prefetch_job),
                     unique_reply_rank=None,
                     exec_all_ranks=True,
@@ -623,7 +627,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
-                timeout_options: dict[str, Any] = {"timeout": _DLO_DP_WAVE_TIMEOUT_S}
+                timeout_options: dict[str, Any] = {"timeout": _EXECUTE_MODEL_TIMEOUT_S}
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,
