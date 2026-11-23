@@ -53,11 +53,19 @@ automatically, so no `--model-class-name` or deploy YAML is needed.
 
 ## Command
 
+The Hugging Face repo also holds the HiUni Base and Megatron checkpoints, and
+vLLM-Omni downloads the whole repo before loading. Download only the HiUni
+checkpoint and pass the local directory as the model:
+
+```bash
+hf download ernie-research/HiUni --exclude "HiUni-Base/*" "Megatron/*" --local-dir ./HiUni
+```
+
 ### Text-to-image
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
-    --model ernie-research/HiUni \
+    --model ./HiUni \
     --prompt "一只橘猫坐在窗台上，阳光明媚" \
     --height 768 --width 1024 \
     --num-inference-steps 25 --seed 42 --cfg-scale 4.0 \
@@ -69,7 +77,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 
 ```bash
 python examples/offline_inference/image_to_image/image_edit.py \
-    --model ernie-research/HiUni \
+    --model ./HiUni \
     --image input.jpg \
     --prompt "把背景换成雪山" \
     --num-inference-steps 25 --seed 42 --cfg-scale 4.0 \
@@ -83,7 +91,7 @@ other than `1.0` add a third, text-free branch per step.
 ### Online serving
 
 ```bash
-vllm serve ernie-research/HiUni --omni --port 8091
+vllm serve ./HiUni --omni --port 8091
 ```
 
 Text chat and image understanding use `modalities: ["text"]`:
