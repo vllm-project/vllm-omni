@@ -3,9 +3,10 @@
 vLLM-Omni is usually documented on data-centre GPUs. This page collects what has actually been
 measured to fit on a single small consumer GPU, and how to run it.
 
-All numbers below come from one machine and one run: **1× RTX 3060 Laptop, 6 GiB (6144 MiB) of
-device memory, driver 617.42, vLLM 0.34.0**. Treat them as an upper bound on what 8 GiB cards can do,
-not as a guarantee on different hardware.
+All numbers below come from one machine, one configuration and one run: **1× RTX 3060 Laptop, 6 GiB
+(6144 MiB) of device memory, driver 617.42, vLLM 0.34.0**, with one sentence in, one reference clip
+cloned, and one `nvidia-smi` poller sampling. It is a starting point for other 8 GiB cards, not a
+bound on what they can run.
 
 Structured recipes record a minimum device memory per variant, and this page keeps to what one such
 machine was measured to do. Anything a recipe does not bound is *not yet measured*, not unsupported,
@@ -22,11 +23,11 @@ path. Both numbers were sampled with one `nvidia-smi` poller while both servers 
 | Text to speech | `OpenMOSS-Team/MOSS-TTS-Nano-100M` | 0.31 GiB | 6.0 s for 5.5 s of audio (RTF ≈ 1.1) |
 | Speech to text | `Qwen/Qwen3-ASR-0.6B` | 1.53 GiB + 0.58 GiB KV | 0.76 s for 7.9 s of audio (RTF ≈ 0.10) |
 
-Both services up at once use **3.16 GiB** and peak at **3.21 GiB** while both are serving, so a 6 GiB
-card keeps ~2.8 GiB of headroom for the desktop. The TTS figure is a short sentence; longer prompts
-land closer to RTF 3 on this card. Sending both requests at the same time only moves the
-peak by 50 MiB; it costs TTS latency (6.0 s → 9.2 s) and leaves speech to text untouched
-(0.76 s → 0.89 s).
+With both services up, `nvidia-smi` reports **3,212 MiB** while idle and peaks at **3,246 MiB** with
+both serving, so ~2.8 GiB of the 6,144 MiB stays free for the desktop. The TTS figure is a short
+sentence; longer prompts land closer to RTF 3 on this card. Sending both requests at the same time
+costs latency on both sides, each a single sample: TTS 6.0 s → 9.2 s, speech to text 0.76 s → 0.89 s
+(~17%).
 
 ### 1. Text to speech
 
