@@ -17,13 +17,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import itertools
 import math
 import os
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -37,7 +36,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from PIL import Image
 from torch import Tensor
-from torch.nn.init import _calculate_fan_in_and_fan_out, trunc_normal_
+from torch.nn.init import _calculate_fan_in_and_fan_out
 from transformers import AutoImageProcessor, PretrainedConfig
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.feature_extraction_utils import BatchFeature
@@ -52,26 +51,10 @@ from transformers.image_utils import (
 )
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ModelOutput
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.whisper.modeling_whisper import ACT2FN
-
-from vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph import make_encoder_graph
-
-try:
-    from transformers.models.whisper.modeling_whisper import WHISPER_ATTENTION_CLASSES
-except ImportError:
-    from transformers.models.whisper.modeling_whisper import (
-        WhisperAttention,
-    )
-
-    WHISPER_ATTENTION_CLASSES = {
-        "eager": WhisperAttention,
-        "sdpa": WhisperAttention,  # fallback to eager
-    }
-from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.models.whisper.modeling_whisper import WhisperConfig, WhisperEncoder
+from transformers.models.whisper.modeling_whisper import ACT2FN, WhisperAttention, WhisperConfig, WhisperEncoder
 from transformers.utils import (
     TensorType,
     add_start_docstrings,
@@ -130,6 +113,8 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph import make_encoder_graph
+
 
 # vllm.transformers_utils.tokenizer no longer exists in upstream vLLM;
 # _encode_tokens uses tokenizer.encode() as the only code path.
@@ -140,7 +125,6 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder as streaming_audio
-from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder_graph as streaming_audio_graph
 from vllm_omni.model_executor.models.minicpmo_4_5.vision_fused import (
     VisionGraphEncoder,
     encode_packed_fused,
@@ -159,7 +143,7 @@ hf_logger = logging.get_logger(__name__)
 # Flash attention imports (optional)
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+    from flash_attn.bert_padding import index_first_axis, pad_input
 
 
 # ============== Configuration Classes ==============
@@ -880,64 +864,15 @@ def trunc_normal_tf_(
         tensor.mul_(std).add_(mean)
 
 
-def variance_scaling_(tensor, scale=1.0, mode="fan_in", distribution="normal"):
-    fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
-    if mode == "fan_in":
-        denom = fan_in
-    elif mode == "fan_out":
-        denom = fan_out
-    elif mode == "fan_avg":
-        denom = (fan_in + fan_out) / 2
-
-    variance = scale / denom
-
-    if distribution == "truncated_normal":
-        # constant is stddev of standard normal truncated to (-2, 2)
-        trunc_normal_tf_(tensor, std=math.sqrt(variance) / 0.87962566103423978)
-    elif distribution == "normal":
-        with torch.no_grad():
-            tensor.normal_(std=math.sqrt(variance))
-    elif distribution == "uniform":
-        bound = math.sqrt(3 * variance)
-        with torch.no_grad():
-            tensor.uniform_(-bound, bound)
-    else:
-        raise ValueError(f"invalid distribution {distribution}")
-
-
 def lecun_normal_(tensor):
-    variance_scaling_(tensor, mode="fan_in", distribution="truncated_normal")
+    fan_in, _ = _calculate_fan_in_and_fan_out(tensor)
+    trunc_normal_tf_(tensor, std=math.sqrt(1.0 / fan_in) / 0.87962566103423978)
 
 
 def default_flax_embed_init(tensor):
-    variance_scaling_(tensor, mode="fan_in", distribution="normal")
-
-
-@dataclass
-# Copied from transformers.models.clip.modeling_clip.CLIPVisionModelOutput with CLIP->Siglip
-class SiglipVisionModelOutput(ModelOutput):
-    """
-    Base class for vision model's outputs that also contains image embeddings of the pooling of the last hidden states.
-    Args:
-        image_embeds (`torch.FloatTensor` of shape `(batch_size, output_dim)` *optional* returned when model is initialized with `with_projection=True`):
-            The image embeddings obtained by applying the projection layer to the pooler_output.
-        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-            Sequence of hidden-states at the output of the last layer of the model.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
-    """
-
-    image_embeds: torch.FloatTensor | None = None
-    last_hidden_state: torch.FloatTensor = None
-    hidden_states: tuple[torch.FloatTensor] | None = None
-    attentions: tuple[torch.FloatTensor] | None = None
+    fan_in, _ = _calculate_fan_in_and_fan_out(tensor)
+    with torch.no_grad():
+        tensor.normal_(std=math.sqrt(1.0 / fan_in))
 
 
 class SiglipVisionEmbeddings(nn.Module):
@@ -1201,57 +1136,25 @@ class SiglipSdpaAttention(SiglipAttention):
 
 
 class SiglipFlashAttention2(SiglipAttention):
-    """
-    Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.is_causal = False  # Hack to make sure we don't use a causal mask
+    """Non-causal vision self-attention with shared Q/K/V padding metadata."""
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.LongTensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_value: tuple[torch.Tensor] | None = None,
         output_attentions: bool = False,
-        use_cache: bool = False,
         unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
-        output_attentions = False
-
+    ) -> tuple[torch.Tensor, None]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        # if past_key_value is not None:
-        #     cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-        # to be able to avoid many of these transpose/reshape/view.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        # FlashAttention consumes (batch, sequence, heads, head_dim) directly.
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim)
 
         dropout_rate = self.dropout if self.training else 0.0
 
@@ -1294,10 +1197,7 @@ class SiglipFlashAttention2(SiglipAttention):
         attn_output = attn_output.reshape(bsz, q_len, self.embed_dim).contiguous()
         attn_output = self.out_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights
+        return attn_output, None
 
     def _flash_attention_forward(
         self,
@@ -1329,41 +1229,34 @@ class SiglipFlashAttention2(SiglipAttention):
                 The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
         """
 
-        # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
-        causal = self.is_causal and query_length != 1
-
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
             batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+            query_states, key_states, value_states, indices, cu_seqlens, max_seqlen = self._upad_input(
                 query_states,
                 key_states,
                 value_states,
                 attention_mask,
-                query_length,
                 unpadding_metadata=unpadding_metadata,
             )
-
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 
             attn_output_unpad = flash_attn_varlen_func(
                 query_states,
                 key_states,
                 value_states,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_in_batch_q,
-                max_seqlen_k=max_seqlen_in_batch_k,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
                 dropout_p=dropout,
                 softmax_scale=softmax_scale,
-                causal=causal,
+                causal=False,
             )
 
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+            attn_output = pad_input(attn_output_unpad, indices, batch_size, query_length)
         else:
             attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=False
             )
 
         return attn_output
@@ -1374,47 +1267,17 @@ class SiglipFlashAttention2(SiglipAttention):
         key_layer,
         value_layer,
         attention_mask,
-        query_length,
         unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
     ):
         if unpadding_metadata is None:
             unpadding_metadata = _get_unpad_data(attention_mask)
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = unpadding_metadata
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-
-        key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        if query_length == kv_seq_len:
-            query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
-            )
-            cu_seqlens_q = cu_seqlens_k
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k
-            indices_q = indices_k
-        elif query_length == 1:
-            max_seqlen_in_batch_q = 1
-            cu_seqlens_q = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=query_layer.device
-            )  # There is a memcpy here, that is very bad.
-            indices_q = cu_seqlens_q[:-1]
-            query_layer = query_layer.squeeze(1)
-        else:
-            # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
-
-        return (
-            query_layer,
-            key_layer,
-            value_layer,
-            indices_q,
-            (cu_seqlens_q, cu_seqlens_k),
-            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-        )
+        indices, cu_seqlens, max_seqlen = unpadding_metadata
+        batch_size, seq_len, num_heads, head_dim = key_layer.shape
+        shape = (batch_size * seq_len, num_heads, head_dim)
+        query_layer = index_first_axis(query_layer.reshape(shape), indices)
+        key_layer = index_first_axis(key_layer.reshape(shape), indices)
+        value_layer = index_first_axis(value_layer.reshape(shape), indices)
+        return query_layer, key_layer, value_layer, indices, cu_seqlens, max_seqlen
 
     def _attend_unpadded(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         # Flash attention consumes the (n, L, heads, head_dim) layout directly.
@@ -1841,12 +1704,6 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
 # limitations under the License.
 
 
-import torch
-from torch import nn
-from torch.nn.functional import *
-from torch.nn.modules.activation import *
-
-
 def get_2d_sincos_pos_embed(embed_dim, image_size):
     """
     image_size: image_size or (image_height, image_width)
@@ -1913,14 +1770,12 @@ class Resampler(nn.Module):
         num_heads,
         kv_dim=None,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        adaptive=False,
         max_size=(70, 70),
     ):
         super().__init__()
         self.num_queries = num_queries
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.adaptive = adaptive
         self.max_size = max_size
 
         self.query = nn.Parameter(torch.zeros(self.num_queries, embed_dim))
@@ -1930,7 +1785,7 @@ class Resampler(nn.Module):
         else:
             self.kv_proj = nn.Identity()
 
-        self.attn = MultiheadAttention(embed_dim, num_heads)
+        self.attn = _ResamplerAttention(embed_dim, num_heads)
         self.ln_q = norm_layer(embed_dim)
         self.ln_kv = norm_layer(embed_dim)
 
@@ -1951,15 +1806,6 @@ class Resampler(nn.Module):
         if max_h > self.max_size[0] or max_w > self.max_size[1]:
             self.max_size = [max(max_h, self.max_size[0]), max(max_w, self.max_size[1])]
             self._set_2d_pos_cache(self.max_size, device)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x, tgt_sizes=None):
         assert x.shape[0] == tgt_sizes.shape[0]
@@ -1998,7 +1844,7 @@ class Resampler(nn.Module):
             x + pos_embed,  # L * B * D +  L * B * D
             x,
             key_padding_mask=key_padding_mask,
-        )[0]
+        )
         #  out: Q * B * D
         x = out.permute(1, 0, 2)  # B * Q * D
 
@@ -2008,11 +1854,6 @@ class Resampler(nn.Module):
 
     def _repeat(self, query, N: int):
         return query.unsqueeze(1).repeat(1, N, 1)
-
-    def supports_packed(self) -> bool:
-        attn = self.attn
-        plain = not attn.batch_first and attn._qkv_same_embed_dim and attn.in_proj_weight is not None
-        return plain and attn.bias_k is None and attn.bias_v is None and not attn.add_zero_attn
 
     def forward_packed(self, x: torch.Tensor, layouts: Sequence[tuple[int, int, int]]) -> torch.Tensor:
         """``forward`` without key padding for packed ``(tokens, kv_dim)`` features; returns ``(B, Q, D)``.
@@ -2158,676 +1999,41 @@ def _encode_vision_packed(
     return out
 
 
-class MultiheadAttention(nn.MultiheadAttention):
-    def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        dropout=0.0,
-        bias=True,
-        add_bias_kv=False,
-        add_zero_attn=False,
-        kdim=None,
-        vdim=None,
-        batch_first=False,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__(
-            embed_dim, num_heads, dropout, bias, add_bias_kv, add_zero_attn, kdim, vdim, batch_first, device, dtype
-        )
+class _ResamplerAttention(nn.MultiheadAttention):
+    """Resampler's batched cross-attention with checkpoint-compatible parameters.
 
-        # rewrite out_proj layer，with nn.Linear
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, device=device, dtype=dtype)
+    Keep the reference division-based scaling and the out_proj module call.
+    The resampler always uses equal Q/K/V dimensions, a boolean padding mask,
+    and zero dropout; it does not consume attention weights.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__(embed_dim, num_heads)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
 
     def forward(
         self,
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        key_padding_mask: Tensor | None = None,
-        need_weights: bool = True,
-        attn_mask: Tensor | None = None,
-        average_attn_weights: bool = True,
-        is_causal: bool = False,
-    ) -> tuple[Tensor, Tensor | None]:
-        why_not_fast_path = ""
-        if (
-            (attn_mask is not None and torch.is_floating_point(attn_mask))
-            or (key_padding_mask is not None)
-            and torch.is_floating_point(key_padding_mask)
-        ):
-            why_not_fast_path = "floating-point masks are not supported for fast path."
+        key_padding_mask: Tensor,
+    ) -> Tensor:
+        tgt_len, batch_size, embed_dim = query.shape
+        src_len = key.shape[0]
+        head_dim = embed_dim // self.num_heads
+        w_q, w_k, w_v = self.in_proj_weight.chunk(3)
+        b_q, b_k, b_v = self.in_proj_bias.chunk(3)
+        q = F.linear(query, w_q, b_q).view(tgt_len, batch_size * self.num_heads, head_dim).transpose(0, 1)
+        k = F.linear(key, w_k, b_k).view(src_len, batch_size * self.num_heads, head_dim).transpose(0, 1)
+        v = F.linear(value, w_v, b_v).view(src_len, batch_size * self.num_heads, head_dim).transpose(0, 1)
 
-        is_batched = query.dim() == 3
-
-        key_padding_mask = _canonical_mask(
-            mask=key_padding_mask,
-            mask_name="key_padding_mask",
-            other_type=F._none_or_dtype(attn_mask),
-            other_name="attn_mask",
-            target_type=query.dtype,
-        )
-
-        attn_mask = _canonical_mask(
-            mask=attn_mask,
-            mask_name="attn_mask",
-            other_type=None,
-            other_name="",
-            target_type=query.dtype,
-            check_other=False,
-        )
-
-        if not is_batched:
-            why_not_fast_path = f"input not batched; expected query.dim() of 3 but got {query.dim()}"
-        elif query is not key or key is not value:
-            # When lifting this restriction, don't forget to either
-            # enforce that the dtypes all match or test cases where
-            # they don't!
-            why_not_fast_path = "non-self attention was used (query, key, and value are not the same Tensor)"
-        elif self.in_proj_bias is not None and query.dtype != self.in_proj_bias.dtype:
-            why_not_fast_path = (
-                f"dtypes of query ({query.dtype}) and self.in_proj_bias ({self.in_proj_bias.dtype}) don't match"
-            )
-        elif self.in_proj_weight is None:
-            why_not_fast_path = "in_proj_weight was None"
-        elif query.dtype != self.in_proj_weight.dtype:
-            # this case will fail anyway, but at least they'll get a useful error message.
-            why_not_fast_path = (
-                f"dtypes of query ({query.dtype}) and self.in_proj_weight ({self.in_proj_weight.dtype}) don't match"
-            )
-        elif self.training:
-            why_not_fast_path = "training is enabled"
-        elif (self.num_heads % 2) != 0:
-            why_not_fast_path = "self.num_heads is not even"
-        elif not self.batch_first:
-            why_not_fast_path = "batch_first was not True"
-        elif self.bias_k is not None:
-            why_not_fast_path = "self.bias_k was not None"
-        elif self.bias_v is not None:
-            why_not_fast_path = "self.bias_v was not None"
-        elif self.add_zero_attn:
-            why_not_fast_path = "add_zero_attn was enabled"
-        elif not self._qkv_same_embed_dim:
-            why_not_fast_path = "_qkv_same_embed_dim was not True"
-        elif query.is_nested and (key_padding_mask is not None or attn_mask is not None):
-            why_not_fast_path = "supplying both src_key_padding_mask and src_mask at the same time \
-                                 is not supported with NestedTensor input"
-        elif torch.is_autocast_enabled():
-            why_not_fast_path = "autocast is enabled"
-
-        if not why_not_fast_path:
-            tensor_args = (
-                query,
-                key,
-                value,
-                self.in_proj_weight,
-                self.in_proj_bias,
-                self.out_proj.weight,
-                self.out_proj.bias,
-            )
-            # We have to use list comprehensions below because TorchScript does not support
-            # generator expressions.
-            if torch.overrides.has_torch_function(tensor_args):
-                why_not_fast_path = "some Tensor argument has_torch_function"
-            elif _is_make_fx_tracing():
-                why_not_fast_path = "we are running make_fx tracing"
-            elif not all(_check_arg_device(x) for x in tensor_args):
-                why_not_fast_path = (
-                    "some Tensor argument's device is neither one of "
-                    f"cpu, cuda or {torch.utils.backend_registration._privateuse1_backend_name}"
-                )
-            elif torch.is_grad_enabled() and any(_arg_requires_grad(x) for x in tensor_args):
-                why_not_fast_path = (
-                    "grad is enabled and at least one of query or the "
-                    "input/output projection weights or biases requires_grad"
-                )
-            if not why_not_fast_path:
-                merged_mask, mask_type = self.merge_masks(attn_mask, key_padding_mask, query)
-
-                if self.in_proj_bias is not None and self.in_proj_weight is not None:
-                    return torch._native_multi_head_attention(
-                        query,
-                        key,
-                        value,
-                        self.embed_dim,
-                        self.num_heads,
-                        self.in_proj_weight,
-                        self.in_proj_bias,
-                        self.out_proj.weight,
-                        self.out_proj.bias,
-                        merged_mask,
-                        need_weights,
-                        average_attn_weights,
-                        mask_type,
-                    )
-
-        any_nested = query.is_nested or key.is_nested or value.is_nested
-        assert not any_nested, (
-            "MultiheadAttention does not support NestedTensor outside of its fast path. "
-            + f"The fast path was not hit because {why_not_fast_path}"
-        )
-
-        if self.batch_first and is_batched:
-            # make sure that the transpose op does not affect the "is" property
-            if key is value:
-                if query is key:
-                    query = key = value = query.transpose(1, 0)
-                else:
-                    query, key = (x.transpose(1, 0) for x in (query, key))
-                    value = key
-            else:
-                query, key, value = (x.transpose(1, 0) for x in (query, key, value))
-
-        if not self._qkv_same_embed_dim:
-            attn_output, attn_output_weights = self.multi_head_attention_forward(
-                query,
-                key,
-                value,
-                self.embed_dim,
-                self.num_heads,
-                self.in_proj_weight,
-                self.in_proj_bias,
-                self.bias_k,
-                self.bias_v,
-                self.add_zero_attn,
-                self.dropout,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                training=self.training,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                attn_mask=attn_mask,
-                use_separate_proj_weight=True,
-                q_proj_weight=self.q_proj_weight,
-                k_proj_weight=self.k_proj_weight,
-                v_proj_weight=self.v_proj_weight,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-        else:
-            attn_output, attn_output_weights = self.multi_head_attention_forward(
-                query,
-                key,
-                value,
-                self.embed_dim,
-                self.num_heads,
-                self.in_proj_weight,
-                self.in_proj_bias,
-                self.bias_k,
-                self.bias_v,
-                self.add_zero_attn,
-                self.dropout,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                training=self.training,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                attn_mask=attn_mask,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-        if self.batch_first and is_batched:
-            return attn_output.transpose(1, 0), attn_output_weights
-        else:
-            return attn_output, attn_output_weights
-
-    def multi_head_attention_forward(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        embed_dim_to_check: int,
-        num_heads: int,
-        in_proj_weight: Tensor | None,
-        in_proj_bias: Tensor | None,
-        bias_k: Tensor | None,
-        bias_v: Tensor | None,
-        add_zero_attn: bool,
-        dropout_p: float,
-        out_proj_weight: Tensor,
-        out_proj_bias: Tensor | None,
-        training: bool = True,
-        key_padding_mask: Tensor | None = None,
-        need_weights: bool = True,
-        attn_mask: Tensor | None = None,
-        use_separate_proj_weight: bool = False,
-        q_proj_weight: Tensor | None = None,
-        k_proj_weight: Tensor | None = None,
-        v_proj_weight: Tensor | None = None,
-        static_k: Tensor | None = None,
-        static_v: Tensor | None = None,
-        average_attn_weights: bool = True,
-        is_causal: bool = False,
-    ) -> tuple[Tensor, Tensor | None]:
-        is_batched = _mha_shape_check(query, key, value, key_padding_mask, attn_mask, num_heads)
-
-        # For unbatched input, we unsqueeze at the expected batch-dim to pretend that the input
-        # is batched, run the computation and before returning squeeze the
-        # batch dimension so that the output doesn't carry this temporary batch dimension.
-        if not is_batched:
-            # unsqueeze if the input is unbatched
-            query = query.unsqueeze(1)
-            key = key.unsqueeze(1)
-            value = value.unsqueeze(1)
-            if key_padding_mask is not None:
-                key_padding_mask = key_padding_mask.unsqueeze(0)
-
-        # set up shape vars
-        tgt_len, bsz, embed_dim = query.shape
-        src_len, _, _ = key.shape
-
-        key_padding_mask = _canonical_mask(
-            mask=key_padding_mask,
-            mask_name="key_padding_mask",
-            other_type=F._none_or_dtype(attn_mask),
-            other_name="attn_mask",
-            target_type=query.dtype,
-        )
-
-        if is_causal and attn_mask is None:
-            raise RuntimeError(
-                "Need attn_mask if specifying the is_causal hint. "
-                "You may use the Transformer module method "
-                "`generate_square_subsequent_mask` to create this mask."
-            )
-
-        if is_causal and key_padding_mask is None and not need_weights:
-            # when we have a kpm or need weights, we need attn_mask
-            # Otherwise, we use the is_causal hint go as is_causal
-            # indicator to SDPA.
-            attn_mask = None
-        else:
-            attn_mask = _canonical_mask(
-                mask=attn_mask,
-                mask_name="attn_mask",
-                other_type=None,
-                other_name="",
-                target_type=query.dtype,
-                check_other=False,
-            )
-
-            if key_padding_mask is not None:
-                # We have the attn_mask, and use that to merge kpm into it.
-                # Turn off use of is_causal hint, as the merged mask is no
-                # longer causal.
-                is_causal = False
-
-        assert embed_dim == embed_dim_to_check, (
-            f"was expecting embedding dimension of {embed_dim_to_check}, but got {embed_dim}"
-        )
-        if isinstance(embed_dim, torch.Tensor):
-            # embed_dim can be a tensor when JIT tracing
-            head_dim = embed_dim.div(num_heads, rounding_mode="trunc")
-        else:
-            head_dim = embed_dim // num_heads
-        assert head_dim * num_heads == embed_dim, f"embed_dim {embed_dim} not divisible by num_heads {num_heads}"
-        if use_separate_proj_weight:
-            # allow MHA to have different embedding dimensions when separate projection weights are used
-            assert key.shape[:2] == value.shape[:2], (
-                f"key's sequence and batch dims {key.shape[:2]} do not match value's {value.shape[:2]}"
-            )
-        else:
-            assert key.shape == value.shape, f"key shape {key.shape} does not match value shape {value.shape}"
-
-        #
-        # compute in-projection
-        #
-        if not use_separate_proj_weight:
-            assert in_proj_weight is not None, "use_separate_proj_weight is False but in_proj_weight is None"
-            q, k, v = _in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
-        else:
-            assert q_proj_weight is not None, "use_separate_proj_weight is True but q_proj_weight is None"
-            assert k_proj_weight is not None, "use_separate_proj_weight is True but k_proj_weight is None"
-            assert v_proj_weight is not None, "use_separate_proj_weight is True but v_proj_weight is None"
-            if in_proj_bias is None:
-                b_q = b_k = b_v = None
-            else:
-                b_q, b_k, b_v = in_proj_bias.chunk(3)
-            q, k, v = _in_projection(query, key, value, q_proj_weight, k_proj_weight, v_proj_weight, b_q, b_k, b_v)
-
-        # prep attention mask
-
-        if attn_mask is not None:
-            # ensure attn_mask's dim is 3
-            if attn_mask.dim() == 2:
-                correct_2d_size = (tgt_len, src_len)
-                if attn_mask.shape != correct_2d_size:
-                    raise RuntimeError(
-                        f"The shape of the 2D attn_mask is {attn_mask.shape}, but should be {correct_2d_size}."
-                    )
-                attn_mask = attn_mask.unsqueeze(0)
-            elif attn_mask.dim() == 3:
-                correct_3d_size = (bsz * num_heads, tgt_len, src_len)
-                if attn_mask.shape != correct_3d_size:
-                    raise RuntimeError(
-                        f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}."
-                    )
-            else:
-                raise RuntimeError(f"attn_mask's dimension {attn_mask.dim()} is not supported")
-
-        # add bias along batch dimension (currently second)
-        if bias_k is not None and bias_v is not None:
-            assert static_k is None, "bias cannot be added to static key."
-            assert static_v is None, "bias cannot be added to static value."
-            k = torch.cat([k, bias_k.repeat(1, bsz, 1)])
-            v = torch.cat([v, bias_v.repeat(1, bsz, 1)])
-            if attn_mask is not None:
-                attn_mask = pad(attn_mask, (0, 1))
-            if key_padding_mask is not None:
-                key_padding_mask = pad(key_padding_mask, (0, 1))
-        else:
-            assert bias_k is None
-            assert bias_v is None
-
-        #
-        # reshape q, k, v for multihead attention and make em batch first
-        #
-        q = q.view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
-        if static_k is None:
-            k = k.view(k.shape[0], bsz * num_heads, head_dim).transpose(0, 1)
-        else:
-            # TODO finish disentangling control flow so we don't do in-projections when statics are passed
-            assert static_k.size(0) == bsz * num_heads, (
-                f"expecting static_k.size(0) of {bsz * num_heads}, but got {static_k.size(0)}"
-            )
-            assert static_k.size(2) == head_dim, f"expecting static_k.size(2) of {head_dim}, but got {static_k.size(2)}"
-            k = static_k
-        if static_v is None:
-            v = v.view(v.shape[0], bsz * num_heads, head_dim).transpose(0, 1)
-        else:
-            # TODO finish disentangling control flow so we don't do in-projections when statics are passed
-            assert static_v.size(0) == bsz * num_heads, (
-                f"expecting static_v.size(0) of {bsz * num_heads}, but got {static_v.size(0)}"
-            )
-            assert static_v.size(2) == head_dim, f"expecting static_v.size(2) of {head_dim}, but got {static_v.size(2)}"
-            v = static_v
-
-        # add zero attention along batch dimension (now first)
-        if add_zero_attn:
-            zero_attn_shape = (bsz * num_heads, 1, head_dim)
-            k = torch.cat([k, torch.zeros(zero_attn_shape, dtype=k.dtype, device=k.device)], dim=1)
-            v = torch.cat([v, torch.zeros(zero_attn_shape, dtype=v.dtype, device=v.device)], dim=1)
-            if attn_mask is not None:
-                attn_mask = pad(attn_mask, (0, 1))
-            if key_padding_mask is not None:
-                key_padding_mask = pad(key_padding_mask, (0, 1))
-
-        # update source sequence length after adjustments
-        src_len = k.size(1)
-
-        # merge key padding and attention masks
-        if key_padding_mask is not None:
-            assert key_padding_mask.shape == (
-                bsz,
-                src_len,
-            ), f"expecting key_padding_mask shape of {(bsz, src_len)}, but got {key_padding_mask.shape}"
-            key_padding_mask = (
-                key_padding_mask.view(bsz, 1, 1, src_len)
-                .expand(-1, num_heads, -1, -1)
-                .reshape(bsz * num_heads, 1, src_len)
-            )
-            if attn_mask is None:
-                attn_mask = key_padding_mask
-            else:
-                attn_mask = attn_mask + key_padding_mask
-
-        # adjust dropout probability
-        if not training:
-            dropout_p = 0.0
-
-        #
-        # (deep breath) calculate attention and out projection
-        #
-
-        if need_weights:
-            B, Nt, E = q.shape
-            q_scaled = q / math.sqrt(E)
-
-            assert not (is_causal and attn_mask is None), "FIXME: is_causal not implemented for need_weights"
-
-            if attn_mask is not None:
-                attn_output_weights = torch.baddbmm(attn_mask, q_scaled, k.transpose(-2, -1))
-            else:
-                attn_output_weights = torch.bmm(q_scaled, k.transpose(-2, -1))
-            attn_output_weights = softmax(attn_output_weights, dim=-1)
-            if dropout_p > 0.0:
-                attn_output_weights = dropout(attn_output_weights, p=dropout_p)
-
-            attn_output = torch.bmm(attn_output_weights, v)
-
-            attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len * bsz, embed_dim)
-            attn_output = self.out_proj(attn_output)
-            attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
-
-            # optionally average attention weights over heads
-            attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
-            if average_attn_weights:
-                attn_output_weights = attn_output_weights.mean(dim=1)
-
-            if not is_batched:
-                # squeeze the output if input was unbatched
-                attn_output = attn_output.squeeze(1)
-                attn_output_weights = attn_output_weights.squeeze(0)
-            return attn_output, attn_output_weights
-        else:
-            # attn_mask can be either (L,S) or (N*num_heads, L, S)
-            # if attn_mask's shape is (1, L, S) we need to unsqueeze to (1, 1, L, S)
-            # in order to match the input for SDPA of (N, num_heads, L, S)
-            if attn_mask is not None:
-                if attn_mask.size(0) == 1 and attn_mask.dim() == 3:
-                    attn_mask = attn_mask.unsqueeze(0)
-                else:
-                    attn_mask = attn_mask.view(bsz, num_heads, -1, src_len)
-
-            q = q.view(bsz, num_heads, tgt_len, head_dim)
-            k = k.view(bsz, num_heads, src_len, head_dim)
-            v = v.view(bsz, num_heads, src_len, head_dim)
-
-            attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p, is_causal)
-            attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(bsz * tgt_len, embed_dim)
-
-            attn_output = self.out_proj(attn_output)
-            attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
-            if not is_batched:
-                # squeeze the output if input was unbatched
-                attn_output = attn_output.squeeze(1)
-            return attn_output, None
-
-
-def _mha_shape_check(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    key_padding_mask: Tensor | None,
-    attn_mask: Tensor | None,
-    num_heads: int,
-):
-    # Verifies the expected shape for `query, `key`, `value`, `key_padding_mask` and `attn_mask`
-    # and returns if the input is batched or not.
-    # Raises an error if `query` is not 2-D (unbatched) or 3-D (batched) tensor.
-
-    # Shape check.
-    if query.dim() == 3:
-        # Batched Inputs
-        is_batched = True
-        assert key.dim() == 3 and value.dim() == 3, (
-            "For batched (3-D) `query`, expected `key` and `value` to be 3-D"
-            f" but found {key.dim()}-D and {value.dim()}-D tensors respectively"
-        )
-        if key_padding_mask is not None:
-            assert key_padding_mask.dim() == 2, (
-                "For batched (3-D) `query`, expected `key_padding_mask` to be `None` or 2-D"
-                f" but found {key_padding_mask.dim()}-D tensor instead"
-            )
-        if attn_mask is not None:
-            assert attn_mask.dim() in (2, 3), (
-                "For batched (3-D) `query`, expected `attn_mask` to be `None`, 2-D or 3-D"
-                f" but found {attn_mask.dim()}-D tensor instead"
-            )
-    elif query.dim() == 2:
-        # Unbatched Inputs
-        is_batched = False
-        assert key.dim() == 2 and value.dim() == 2, (
-            "For unbatched (2-D) `query`, expected `key` and `value` to be 2-D"
-            f" but found {key.dim()}-D and {value.dim()}-D tensors respectively"
-        )
-
-        if key_padding_mask is not None:
-            assert key_padding_mask.dim() == 1, (
-                "For unbatched (2-D) `query`, expected `key_padding_mask` to be `None` or 1-D"
-                f" but found {key_padding_mask.dim()}-D tensor instead"
-            )
-
-        if attn_mask is not None:
-            assert attn_mask.dim() in (2, 3), (
-                "For unbatched (2-D) `query`, expected `attn_mask` to be `None`, 2-D or 3-D"
-                f" but found {attn_mask.dim()}-D tensor instead"
-            )
-            if attn_mask.dim() == 3:
-                expected_shape = (num_heads, query.shape[0], key.shape[0])
-                assert attn_mask.shape == expected_shape, (
-                    f"Expected `attn_mask` shape to be {expected_shape} but got {attn_mask.shape}"
-                )
-    else:
-        raise AssertionError(
-            f"query should be unbatched 2D or batched 3D tensor but received {query.dim()}-D query tensor"
-        )
-
-    return is_batched
-
-
-def _canonical_mask(
-    mask: Tensor | None,
-    mask_name: str,
-    other_type: DType | None,
-    other_name: str,
-    target_type: DType,
-    check_other: bool = True,
-) -> Tensor | None:
-    if mask is not None:
-        _mask_dtype = mask.dtype
-        _mask_is_float = torch.is_floating_point(mask)
-        if _mask_dtype != torch.bool and not _mask_is_float:
-            raise AssertionError(f"only bool and floating types of {mask_name} are supported")
-        if check_other and other_type is not None:
-            if _mask_dtype != other_type:
-                warnings.warn(
-                    f"Support for mismatched {mask_name} and {other_name} "
-                    "is deprecated. Use same type for both instead."
-                )
-        if not _mask_is_float:
-            mask = torch.zeros_like(mask, dtype=target_type).masked_fill_(mask, float("-inf"))
-    return mask
-
-
-def _in_projection_packed(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    w: Tensor,
-    b: Tensor | None = None,
-) -> list[Tensor]:
-    r"""
-    Performs the in-projection step of the attention operation, using packed weights.
-    Output is a triple containing projection tensors for query, key and value.
-    Args:
-        q, k, v: query, key and value tensors to be projected. For self-attention,
-            these are typically the same tensor; for encoder-decoder attention,
-            k and v are typically the same tensor. (We take advantage of these
-            identities for performance if they are present.) Regardless, q, k and v
-            must share a common embedding dimension; otherwise their shapes may vary.
-        w: projection weights for q, k and v, packed into a single tensor. Weights
-            are packed along dimension 0, in q, k, v order.
-        b: optional projection biases for q, k and v, packed into a single tensor
-            in q, k, v order.
-    Shape:
-        Inputs:
-        - q: :math:`(..., E)` where E is the embedding dimension
-        - k: :math:`(..., E)` where E is the embedding dimension
-        - v: :math:`(..., E)` where E is the embedding dimension
-        - w: :math:`(E * 3, E)` where E is the embedding dimension
-        - b: :math:`E * 3` where E is the embedding dimension
-        Output:
-        - in output list :math:`[q', k', v']`, each output tensor will have the
-            same shape as the corresponding input tensor.
-    """
-    E = q.size(-1)
-    if k is v:
-        if q is k:
-            # self-attention
-            proj = linear(q, w, b)
-            # reshape to 3, E and not E, 3 is deliberate for better memory coalescing and keeping same order as chunk()
-            proj = proj.unflatten(-1, (3, E)).unsqueeze(0).transpose(0, -2).squeeze(-2).contiguous()
-            return proj[0], proj[1], proj[2]
-        else:
-            # encoder-decoder attention
-            w_q, w_kv = w.split([E, E * 2])
-            if b is None:
-                b_q = b_kv = None
-            else:
-                b_q, b_kv = b.split([E, E * 2])
-            q_proj = linear(q, w_q, b_q)
-            kv_proj = linear(k, w_kv, b_kv)
-            # reshape to 2, E and not E, 2 is deliberate for better memory coalescing and keeping same order as chunk()
-            kv_proj = kv_proj.unflatten(-1, (2, E)).unsqueeze(0).transpose(0, -2).squeeze(-2).contiguous()
-            return (q_proj, kv_proj[0], kv_proj[1])
-    else:
-        w_q, w_k, w_v = w.chunk(3)
-        if b is None:
-            b_q = b_k = b_v = None
-        else:
-            b_q, b_k, b_v = b.chunk(3)
-        return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
-
-
-def _in_projection(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    w_q: Tensor,
-    w_k: Tensor,
-    w_v: Tensor,
-    b_q: Tensor | None = None,
-    b_k: Tensor | None = None,
-    b_v: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor]:
-    r"""
-    Performs the in-projection step of the attention operation. This is simply
-    a triple of linear projections, with shape constraints on the weights which
-    ensure embedding dimension uniformity in the projected outputs.
-    Output is a triple containing projection tensors for query, key and value.
-    Args:
-        q, k, v: query, key and value tensors to be projected.
-        w_q, w_k, w_v: weights for q, k and v, respectively.
-        b_q, b_k, b_v: optional biases for q, k and v, respectively.
-    Shape:
-        Inputs:
-        - q: :math:`(Qdims..., Eq)` where Eq is the query embedding dimension and Qdims are any
-            number of leading dimensions.
-        - k: :math:`(Kdims..., Ek)` where Ek is the key embedding dimension and Kdims are any
-            number of leading dimensions.
-        - v: :math:`(Vdims..., Ev)` where Ev is the value embedding dimension and Vdims are any
-            number of leading dimensions.
-        - w_q: :math:`(Eq, Eq)`
-        - w_k: :math:`(Eq, Ek)`
-        - w_v: :math:`(Eq, Ev)`
-        - b_q: :math:`(Eq)`
-        - b_k: :math:`(Eq)`
-        - b_v: :math:`(Eq)`
-        Output: in output triple :math:`(q', k', v')`,
-         - q': :math:`[Qdims..., Eq]`
-         - k': :math:`[Kdims..., Eq]`
-         - v': :math:`[Vdims..., Eq]`
-    """
-    Eq, Ek, Ev = q.size(-1), k.size(-1), v.size(-1)
-    assert w_q.shape == (Eq, Eq), f"expecting query weights shape of {(Eq, Eq)}, but got {w_q.shape}"
-    assert w_k.shape == (Eq, Ek), f"expecting key weights shape of {(Eq, Ek)}, but got {w_k.shape}"
-    assert w_v.shape == (Eq, Ev), f"expecting value weights shape of {(Eq, Ev)}, but got {w_v.shape}"
-    assert b_q is None or b_q.shape == (Eq,), f"expecting query bias shape of {(Eq,)}, but got {b_q.shape}"
-    assert b_k is None or b_k.shape == (Eq,), f"expecting key bias shape of {(Eq,)}, but got {b_k.shape}"
-    assert b_v is None or b_v.shape == (Eq,), f"expecting value bias shape of {(Eq,)}, but got {b_v.shape}"
-    return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
+        mask = torch.zeros_like(key_padding_mask, dtype=query.dtype).masked_fill_(key_padding_mask, float("-inf"))
+        mask = mask.view(batch_size, 1, 1, src_len).expand(-1, self.num_heads, -1, -1)
+        mask = mask.reshape(batch_size * self.num_heads, 1, src_len)
+        scores = torch.baddbmm(mask, q / math.sqrt(head_dim), k.transpose(-2, -1))
+        out = torch.bmm(F.softmax(scores, dim=-1), v)
+        out = out.transpose(0, 1).contiguous().view(tgt_len * batch_size, embed_dim)
+        return self.out_proj(out).view(tgt_len, batch_size, embed_dim)
 
 
 def _get_audio_cache_length(past_key_values: Any) -> int:
@@ -2846,16 +2052,12 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+        self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             dropout=config.attention_dropout,
             config=config,
             layer_idx=layer_idx,
-        )
-        attention_parameters = inspect.signature(self.self_attn.forward).parameters
-        self._past_key_values_kwarg = (
-            "past_key_values" if "past_key_values" in attention_parameters else "past_key_value"
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -2894,18 +2096,13 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        attention_kwargs = {
-            "hidden_states": hidden_states,
-            "attention_mask": attention_mask,
-            "layer_head_mask": layer_head_mask,
-            "output_attentions": output_attentions,
-            self._past_key_values_kwarg: past_key_values,
-        }
-        attn_out = self.self_attn(**attention_kwargs)
-        hidden_states = attn_out[0]
-        attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        if len(attn_out) > 2:
-            past_key_values = attn_out[2]
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+            past_key_values=past_key_values,
+        )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -3274,72 +2471,6 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         )
 
 
-class MiniCPMOOmniImageFeatureInputs(TensorSchema):
-    """
-    Dimensions:
-        - ni: Number of images
-        - nq: Number of queries (from resampler)
-        - embed_dim: Embedding dimension
-    """
-
-    type: Literal["image_features"]
-    image_embeds: Annotated[
-        torch.Tensor | list[torch.Tensor],
-        TensorShape("ni", "nq", "embed_dim"),
-    ]
-
-
-def _minicpmo_omni_llm_field_config(hf_inputs: Mapping[str, torch.Tensor]):
-    """Create field config for MiniCPM-o thinker multimodal inputs."""
-    # For MiniCPM-o, pixel_values come preprocessed from image processor
-    # tgt_sizes indicates the size of each image after patch embedding
-    pixel_values = hf_inputs.get("pixel_values")
-    tgt_sizes = hf_inputs.get("tgt_sizes")
-
-    # Handle empty case - return empty tensor configs like qwen2.5
-    if pixel_values is None or tgt_sizes is None or (isinstance(pixel_values, list) and len(pixel_values) == 0):
-        # Return empty configs with empty tensors
-        return dict(
-            pixel_values=MultiModalFieldConfig.flat_from_sizes("image", torch.empty((0,), dtype=torch.long)),
-            tgt_sizes=MultiModalFieldConfig.batched("image"),
-            image_embeds=MultiModalFieldConfig.flat_from_sizes("image", torch.empty((0,), dtype=torch.long)),
-        )
-
-    # Calculate number of images and slices per image
-    if isinstance(pixel_values, list):
-        num_images = len(pixel_values)
-        # Calculate number of slices per image (each image can have multiple slices)
-        pixel_value_sizes = torch.tensor(
-            [len(pv) if isinstance(pv, list) else 1 for pv in pixel_values], dtype=torch.long
-        )
-    else:
-        num_images = 1
-        pixel_value_sizes = torch.tensor([1], dtype=torch.long)
-
-    # query_num is the output size from resampler
-    query_num = hf_inputs.get("query_num", 64)
-    image_grid_sizes = torch.full((num_images,), query_num, dtype=torch.long)
-
-    return dict(
-        pixel_values=MultiModalFieldConfig.flat_from_sizes("image", pixel_value_sizes),
-        tgt_sizes=MultiModalFieldConfig.batched("image"),
-        image_embeds=MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes),
-    )
-
-
-def get_version_by_config(config: PretrainedConfig) -> tuple[int, ...]:
-    version_float = getattr(config, "version", None)
-
-    # The old configs do not include version number
-    # TODO: Remove this after the HF repos are updated
-    if version_float is None:
-        if config.hidden_size == 2304 and config.query_num == 64:
-            return (2, 0)
-        return (2, 5)
-    version_str = str(version_float)
-    return tuple(int(x) for x in version_str.split("."))
-
-
 _MAX_FRAMES_PER_VIDEO = 64
 
 
@@ -3361,11 +2492,7 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         return self._lazy_tokenizer
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        mm_limits = {"image": None, "audio": None}
-        if self.get_model_version() in {(2, 6), (4, 0), (4, 5)}:
-            mm_limits["video"] = None
-
-        return mm_limits
+        return {"image": None, "audio": None, "video": None}
 
     def get_audio_placeholder(
         self,
@@ -3394,9 +2521,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         # vLLM >=0.16 expects ``BaseProcessingInfo.get_data_parser`` to construct
         # the per-model multi-modal data parser.
         return MiniCPMOMultiModalDataParser(target_sr=self.get_default_audio_sampling_rate())
-
-    def get_chunk_length(self) -> int:
-        return self.get_hf_config().audio_chunk_length
 
     def get_max_audio_tokens_per_chunk(self) -> int:
         pool_step = self.get_default_audio_pool_step()
@@ -3460,19 +2584,9 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
 
         return hf_processor
 
-    def get_hf_image_processor(self) -> MiniCPMVImageProcessor:
-        """Get the MiniCPM-o image processor."""
-        config = self.get_hf_config()
-        return MiniCPMVImageProcessor(
-            max_slice_nums=config.slice_config.max_slice_nums,
-            scale_resolution=config.image_size,
-            patch_size=config.vision_config.patch_size,
-            use_image_id=config.use_image_id,
-            image_feature_size=config.query_num,
-        )
-
-    def get_model_version(self):
-        return get_version_by_config(self.get_hf_config())
+    def get_model_version(self) -> tuple[int, int]:
+        # Required by the upstream MiniCPMV processor's prompt batching helper.
+        return (4, 5)
 
     def get_image_processor(self, **kwargs: object):
         return self.get_hf_processor(**kwargs).image_processor
@@ -3480,17 +2594,11 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_slice_image_placeholder(
         self,
         image_size: ImageSize,
-        # For MiniCPM V/O 2.6
         image_idx: int = 0,
         max_slice_nums: int | None = None,
         use_image_id: bool = True,
     ) -> str:
         image_processor = self.get_image_processor()
-        version = self.get_model_version()
-
-        if version == (2, 0) or version == (2, 5):
-            return image_processor.get_slice_image_placeholder(image_size)
-
         return image_processor.get_slice_image_placeholder(
             image_size,
             image_idx=image_idx,
@@ -3501,15 +2609,9 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_sliced_grid(
         self,
         image_size: ImageSize,
-        # For MiniCPM V/O 2.6
         max_slice_nums: int | None = None,
     ) -> tuple[int, int] | None:
         image_processor = self.get_image_processor()
-        version = self.get_model_version()
-
-        if version == (2, 0) or version == (2, 5):
-            return image_processor.get_sliced_grid(image_size)
-
         if max_slice_nums is None:
             max_slice_nums = image_processor.max_slice_nums
 
@@ -3555,15 +2657,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
             frame_size,
             max_slice_nums=self.get_video_max_slice_num(),
         )
-
-    def get_max_video_tokens(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-    ) -> int:
-        num_frames = self.get_num_frames_with_most_features(seq_len, mm_counts)
-        num_video_tokens_total = self.get_max_video_frame_tokens() * num_frames
-        return num_video_tokens_total
 
     def get_video_max_slice_num(self) -> int:
         return 1
@@ -4319,7 +3412,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             text_config = Qwen2Config.from_dict(config_dict)
             llm_arch = "Qwen2ForCausalLM"
-        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.config import (
             patch_minicpmo_remote_config,
         )
 
@@ -4346,7 +3439,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 embed_dim=embed_dim,  # LLM embedding dimension
                 num_heads=embed_dim // 128,  # Default from MiniCPM-o
                 kv_dim=vision_dim,  # Vision encoder dimension
-                adaptive=True,  # Enable adaptive resampling
             )
             self.resampler.attn_implementation = config.vision_config._attn_implementation
         else:
@@ -4362,13 +3454,11 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_output_dim = int(self.apm.config.encoder_ffn_dim // 4)
             self.audio_avg_pooler = nn.AvgPool1d(config.audio_pool_step, stride=config.audio_pool_step)
             self.audio_projection_layer = MultiModalProjector(in_dim=audio_output_dim, out_dim=embed_dim)
-            self.audio_encoder_layer = -1
             self.audio_past_key_values = None
         else:
             self.apm = None
             self.audio_avg_pooler = None
             self.audio_projection_layer = None
-            self.audio_encoder_layer = None
             self.audio_past_key_values = None
 
         # Ascend Conv1d must stay outside NPUGraph; CUDA retains the full
@@ -4377,151 +3467,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self._encode_audio_transformer if current_omni_platform.is_npu() else self._encode_audio_features
         )
         self._audio_encoder_graph = make_encoder_graph(audio_forward, vllm_config)
-        self.mm_token_ids = set[int]()
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
     def get_language_model(self) -> torch.nn.Module:
         return self.llm
-
-    def _process_image_input(self, image_input: dict[str, torch.Tensor]) -> list[torch.Tensor]:
-        """Process image input through vision encoder and resampler.
-
-        Args:
-            image_input: Dict containing:
-                - pixel_values: List of preprocessed image tensors or tensor
-                - tgt_sizes: Target sizes for each image after patch embedding
-
-        Returns:
-            List of image embeddings (one per image)
-        """
-        if self.vpm is None or self.resampler is None:
-            return []
-
-        pixel_values_list = image_input.get("pixel_values")
-        tgt_sizes = image_input.get("tgt_sizes")
-
-        if pixel_values_list is None or tgt_sizes is None:
-            return []
-
-        # Normalize input format
-        if not isinstance(pixel_values_list, list):
-            pixel_values_list = [pixel_values_list]
-        if not isinstance(tgt_sizes, list | torch.Tensor):
-            tgt_sizes = [tgt_sizes] if tgt_sizes is not None else []
-
-        # Convert to tensors if needed
-        if isinstance(tgt_sizes, list):
-            tgt_sizes = torch.vstack(
-                [torch.tensor(ts) if not isinstance(ts, torch.Tensor) else ts for ts in tgt_sizes]
-            ).type(torch.int32)
-
-        dtype = self.llm.model.embed_tokens.weight.dtype
-        device = self.llm.model.embed_tokens.weight.device
-
-        # Process all images
-        all_pixel_values = []
-        img_cnt = []
-        for pixel_values in pixel_values_list:
-            if isinstance(pixel_values, list):
-                img_cnt.append(len(pixel_values))
-                all_pixel_values.extend(
-                    [pv.flatten(end_dim=1).permute(1, 0) if pv.ndim > 2 else pv for pv in pixel_values]
-                )
-            else:
-                img_cnt.append(1)
-                if pixel_values.ndim > 2:
-                    all_pixel_values.append(pixel_values.flatten(end_dim=1).permute(1, 0))
-                else:
-                    all_pixel_values.append(pixel_values)
-
-        if not all_pixel_values:
-            return []
-
-        # Stack and reshape pixel values
-        tgt_sizes = (
-            [ts for ts in tgt_sizes if isinstance(ts, torch.Tensor)] if isinstance(tgt_sizes, list) else tgt_sizes
-        )
-        if isinstance(tgt_sizes, list):
-            tgt_sizes = torch.vstack(tgt_sizes).type(torch.int32)
-
-        max_patches = torch.max(tgt_sizes[:, 0] * tgt_sizes[:, 1])
-
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(all_pixel_values, batch_first=True, padding_value=0.0)
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-
-        # Create patch attention mask
-        patch_attn_mask = torch.zeros((B, 1, max_patches), dtype=torch.bool, device=device)
-        for i in range(B):
-            patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
-
-        # Process through vision encoder with batching
-        all_pixel_values = all_pixel_values.type(dtype)
-        vision_batch_size = self.config.vision_batch_size
-
-        if B > vision_batch_size:
-            vision_embeddings = []
-            for i in range(0, B, vision_batch_size):
-                start_idx = i
-                end_idx = min(i + vision_batch_size, B)
-                tmp_emb = self.vpm(
-                    all_pixel_values[start_idx:end_idx],
-                    patch_attention_mask=patch_attn_mask[start_idx:end_idx],
-                    tgt_sizes=tgt_sizes[start_idx:end_idx],
-                ).last_hidden_state
-                vision_embeddings.append(tmp_emb)
-            vision_embedding = torch.cat(vision_embeddings, dim=0)
-        else:
-            vision_embedding = self.vpm(
-                all_pixel_values,
-                patch_attention_mask=patch_attn_mask,
-                tgt_sizes=tgt_sizes,
-            ).last_hidden_state
-
-        # Apply resampler
-        image_embeds = self.resampler(vision_embedding, tgt_sizes)  # (B, query_num, embed_dim)
-
-        # Split back into per-image embeddings
-        image_embeddings = []
-        start = 0
-        for cnt in img_cnt:
-            if cnt > 0:
-                image_embeddings.append(image_embeds[start : start + cnt])
-                start += cnt
-            else:
-                image_embeddings.append([])
-
-        return image_embeddings
-
-    # def _parse_and_validate_vision_input(
-    #     self,
-    #     modality: str,
-    #     **kwargs: object,
-    # ) -> MiniCPMVImageInputs | None:
-    #     pixel_values = kwargs.pop("pixel_values", None)
-    #     image_embeds = kwargs.pop("image_embeds", None)
-    #
-    #     if pixel_values is None and image_embeds is None:
-    #         return None
-    #
-    #     if image_embeds is not None:
-    #         return MiniCPMVImageEmbeddingInputs(
-    #             type="image_embeds",
-    #             image_embeds=image_embeds,
-    #         )
-    #
-    #     tgt_sizes = kwargs.pop("tgt_sizes")
-    #
-    #     num_slices_flat = torch.tensor([len(ps) for ps in pixel_values])
-    #     pixel_values_flat = flatten_bn(pixel_values)
-    #     tgt_sizes_flat = flatten_bn(tgt_sizes, concat=True)
-    #
-    #     return MiniCPMVImagePixelInputs(
-    #         type="pixel_values",
-    #         pixel_values=pixel_values_flat,
-    #         tgt_sizes=tgt_sizes_flat,
-    #         num_slices=num_slices_flat,
-    #     )
 
     def _parse_and_validate_vision_input(
         self,
@@ -4635,8 +3584,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         tgt_sizes = data["tgt_sizes"]
 
         vpm = self.vpm
-        packed = getattr(self, "vision_packed_encode", False) and hasattr(vpm, "forward_packed")
-        if packed and hasattr(self.resampler, "forward_packed") and self.resampler.supports_packed():
+        if self.vision_packed_encode:
             layouts = _packed_vision_layouts(pixel_values, tgt_sizes, vpm.embeddings.patch_size)
             if layouts is not None:
                 graph_encoder = None
@@ -4817,7 +3765,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if (
             graph is not None
             and not self.training
-            and self.audio_encoder_layer == -1
             # Whisper's FP16 overflow guard reads tensor booleans on the host.
             and self.apm.conv1.weight.dtype != torch.float16
         ):
@@ -4859,26 +3806,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def _encode_audio_features(self, wavforms: torch.Tensor, audio_attention_mask: torch.Tensor) -> torch.Tensor:
         """Stateless audio encoder, projection and pooling (no streaming KV)."""
-        selects_final_layer = self.audio_encoder_layer == -1
         audio_outputs = self.apm(
             wavforms,
             attention_mask=audio_attention_mask,
-            output_hidden_states=not selects_final_layer,
+            output_hidden_states=False,
         )
-        if selects_final_layer:
-            audio_states = audio_outputs.last_hidden_state
-        else:
-            # Whisper follows the Hugging Face hidden-state ordering: the
-            # embedding output, followed by each encoder layer output.
-            assert audio_outputs.hidden_states is not None
-            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
-        audio_embeds = self.audio_projection_layer(audio_states)
-
-        audio_embeds = audio_embeds.transpose(1, 2)
-        audio_embeds = self.audio_avg_pooler(audio_embeds)
-        audio_embeds = audio_embeds.transpose(1, 2)
-
-        return audio_embeds
+        return self._project_pooled_audio(audio_outputs.last_hidden_state)
 
     def get_audio_embedding_streaming(
         self,
@@ -4944,29 +3877,19 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             device=wavforms.device,
         )
 
-        # As in get_audio_embedding: every layer's output only to pick the last one keeps 25 activations alive.
-        selects_final_layer = self.audio_encoder_layer == -1
         audio_outputs = self.apm(
             wavforms,
             past_key_values=self.audio_past_key_values,
             use_cache=True,
-            output_hidden_states=not selects_final_layer,
+            output_hidden_states=False,
             attention_mask=audio_attention_mask,
             use_extra_context=use_extra_context,
             prefix_extra_frames=prefix_extra_frames,
             suffix_extra_frames=suffix_extra_frames,
             cnn_min_length=cnn_min_length,
         )
-        if selects_final_layer:
-            audio_states = audio_outputs.last_hidden_state
-        else:
-            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
         self.audio_past_key_values = audio_outputs.past_key_values
-
-        audio_embeds = self.audio_projection_layer(audio_states)
-        audio_embeds = audio_embeds.transpose(1, 2)
-        audio_embeds = self.audio_avg_pooler(audio_embeds)
-        audio_embeds = audio_embeds.transpose(1, 2)
+        audio_embeds = self._project_pooled_audio(audio_outputs.last_hidden_state)
 
         _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
         # One host read of the lengths instead of a device sync per slice bound.
@@ -4988,9 +3911,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         requested = getattr(self.config, "duplex_audio_encoder_batching", None)
         if requested is not None and not bool(requested):
             return False
-        reason = streaming_audio.streaming_batch_unsupported_reason(
-            self.apm, audio_encoder_layer=self.audio_encoder_layer
-        )
+        reason = streaming_audio.streaming_batch_unsupported_reason(self.apm)
         if reason is not None:
             logger.info("MiniCPM-o streaming audio encoder stays per-session: %s", reason)
             return False
@@ -5009,10 +3930,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         batch_sizes = getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes", None)
         if getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions", False) is True:
             # Overrides the explicit list: the grid follows duplex max_sessions.
-            batch_sizes = streaming_audio_graph.batch_sizes_for_sessions(getattr(self, "_duplex_max_sessions", 1))
+            batch_sizes = streaming_audio.batch_sizes_for_sessions(getattr(self, "_duplex_max_sessions", 1))
         allocated = torch.accelerator.memory_allocated(self.apm.conv1.weight.device)
         try:
-            wrapper = streaming_audio_graph.StreamingAudioGraphEncoder(
+            wrapper = streaming_audio.StreamingAudioGraphEncoder(
                 self.apm,
                 self.audio_projection_layer,
                 self.audio_avg_pooler,
@@ -5094,7 +4015,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         return multimodal_embeddings
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
+        """vLLM encoder profiling calls this; the inherited Protocol stub returns None."""
         return self.get_multimodal_embeddings(**kwargs)
 
     def get_input_embeddings(
@@ -5127,7 +4048,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        # NOTE: In v1, inputs_embeds is always generated at model runner
+        # NOTE: inputs_embeds is generated by the model runner
         elif inputs_embeds is None:
             multimodal_embeddings = self.get_multimodal_embeddings(**kwargs)
             inputs_embeds = self.get_input_embeddings(input_ids, multimodal_embeddings)

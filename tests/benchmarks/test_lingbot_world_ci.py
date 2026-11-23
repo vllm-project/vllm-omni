@@ -27,34 +27,28 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize(
-    "platform,vllm_version,torch_version,error",
+    "platform,packages",
     [
-        pytest.param("cuda", "0.34.0", "2.14.0+cu130", None, id="cuda-final034"),
-        pytest.param("cuda", "0.34.0+cu130", "2.14.0", None, id="cuda-local034"),
-        pytest.param("cuda", "0.33.0", "2.14.0", "vLLM", id="cuda-legacy033-rejected"),
-        pytest.param("cuda", "0.34.0rc1", "2.14.0", "vLLM", id="cuda-rc-rejected"),
-        pytest.param("cuda", "0.34.0.dev1", "2.14.0", "vLLM", id="cuda-dev-rejected"),
-        pytest.param("cuda", "0.35.0", "2.14.0", "vLLM", id="cuda-future-rejected"),
-        pytest.param("cuda", "0.34.0", "2.13.0", "Torch", id="cuda-wrong-torch"),
-        pytest.param("npu", "0.33.0", "2.14.0", None, id="npu-legacy033"),
-        pytest.param("npu", "0.34.0", "2.14.0", "vLLM", id="npu-final034-rejected"),
-        pytest.param("npu", "0.33.0rc1", "2.14.0", "vLLM", id="npu-rc033-rejected"),
-        pytest.param("npu", "0.33.0.dev1", "2.14.0", "vLLM", id="npu-dev033-rejected"),
-        pytest.param("rocm", "0.33.0", "2.14.0", "Unsupported platform", id="unsupported-platform"),
+        pytest.param("cuda", {"vllm": "0.35.0.dev1", "torch": "2.15.0+cu130"}, id="cuda"),
+        pytest.param(
+            "npu",
+            {"vllm": "0.35.0+empty", "torch": "2.11.0", "torch-npu": "2.11.0.post1", "vllm-ascend": "0.35.0rc1"},
+            id="npu",
+        ),
     ],
 )
-def test_capture_runtime_matches_platform_release(monkeypatch, platform, vllm_version, torch_version, error):
+def test_capture_records_installed_package_versions(monkeypatch, platform, packages):
     from tests.e2e.accuracy.lingbot_world import prepare
 
-    versions = {"vllm": vllm_version, "torch": torch_version}
-    if platform == "npu":
-        versions.update({"torch-npu": torch_version, "vllm-ascend": vllm_version})
-    monkeypatch.setattr(prepare.importlib.metadata, "version", versions.__getitem__)
-    if error is not None:
-        with pytest.raises(RegressionError, match=error):
-            prepare.verify_inference_runtime(platform)
-    else:
-        assert prepare.verify_inference_runtime(platform) == {"packages": versions}
+    monkeypatch.setattr(prepare.importlib.metadata, "version", packages.__getitem__)
+    assert prepare.inference_runtime_metadata(platform) == {"packages": packages}
+
+
+def test_capture_rejects_unsupported_platform():
+    from tests.e2e.accuracy.lingbot_world.prepare import inference_runtime_metadata
+
+    with pytest.raises(RegressionError, match="Unsupported platform: rocm"):
+        inference_runtime_metadata("rocm")
 
 
 class _DeviceProperties(NamedTuple):

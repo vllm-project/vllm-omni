@@ -349,12 +349,18 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core._send_engine_dead()
             raise
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            if signal_callback is not None:
-                signal_callback.stop()
-            if coord_client is not None:
-                with contextlib.suppress(RuntimeError):
-                    coord_client.close()
-            if engine_core is not None:
-                engine_core.shutdown()
+            # Repeated termination signals must not interrupt owner cleanup.
+            # The process manager can still enforce its SIGKILL deadline.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                if signal_callback is not None:
+                    signal_callback.stop()
+                if coord_client is not None:
+                    with contextlib.suppress(RuntimeError):
+                        coord_client.close()
+                if engine_core is not None:
+                    engine_core.shutdown()
+            finally:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)

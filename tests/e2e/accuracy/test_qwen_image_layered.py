@@ -138,7 +138,7 @@ def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, o
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 def test_qwen_image_layered_matches_diffusers(accuracy_artifact_root: Path, qwen_bear_image: Image.Image) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
