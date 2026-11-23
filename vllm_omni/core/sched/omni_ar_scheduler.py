@@ -473,6 +473,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # A stage without a configured connector edge sets the same keys in additional_config.
         additional = getattr(self.vllm_config, "additional_config", None)
         extra = {**(additional if isinstance(additional, dict) else {}), **extra}
+        self._talker_refill_coalesce = extra.get("minicpmo_talker_refill_coalesce", False) is True
+        self._last_talker_refill_deferred = False
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -500,6 +502,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return False
         oldest = min(request.arrival_time for request in self.waiting)
         return time.time() - oldest < self._prefill_admission_max_wait_s
+
+    def _should_coalesce_talker_refill(self) -> bool:
+        """Give a near-full K-step batch one decode step to free more slots."""
+        if (
+            not getattr(self, "_talker_refill_coalesce", False)
+            or self._last_talker_refill_deferred
+            or not self._talker_kstep_armed()
+            or not self.waiting
+            or self.kv_holding_waiting
+            or self.num_waiting_for_streaming_input
+            or len(self.running) < 8
+            or not 1 <= self.max_num_running_reqs - len(self.running) <= 2
+        ):
+            return False
+        if any(request.resumable or request.num_computed_tokens for request in self.waiting):
+            return False
+        oldest = min(request.arrival_time for request in self.waiting)
+        return time.time() - oldest < 0.650 and all(
+            not request.resumable
+            and request.num_in_flight_tokens == 0
+            and request.num_computed_tokens >= len(request.prompt_token_ids)
+            and len(request.spec_token_ids) == self.num_spec_tokens
+            for request in self.running
+        )
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -966,7 +992,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         unit = self._isolation_unit(request)
         return None if unit is None else len(unit)
 
-    def _begin_seeded_isolation(self) -> _SeededIsolationStep:
+    def _begin_seeded_isolation(self, *, coalesce_talker_refill: bool = False) -> _SeededIsolationStep:
         """Apply this step's seeded-isolation queue surgery.
 
         Kept out of ``schedule()`` so the policy keeps a small, self-contained
@@ -1038,7 +1064,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # alongside. A drain step keeps ``kv_holding_waiting`` and hides only
         # the fresh ``waiting`` queue.
         original_wait_queues = None
-        deferred = seeded_defer or self._should_defer_waiting_admission()
+        deferred = seeded_defer or coalesce_talker_refill or self._should_defer_waiting_admission()
         if deferred or solo_queue is not None or drain_kv:
             original_wait_queues = self.waiting, self.kv_holding_waiting
             if deferred:
@@ -1147,13 +1173,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # steady-state K-step request) must not carry the K-step drafts --
         # the multi-frame loop requires uniform decode spans and the runner
         # refuses the rest.
-        self._drop_talker_drafts_if_prefill_pending()
+        coalesce_talker_refill = self._should_coalesce_talker_refill()
+        if coalesce_talker_refill:
+            logger.info_once("MiniCPM-o Talker coalesced a refill for one K-step")
+        self._last_talker_refill_deferred = coalesce_talker_refill
+        if not coalesce_talker_refill:
+            self._drop_talker_drafts_if_prefill_pending()
 
-        step = self._begin_seeded_isolation()
+        step = self._begin_seeded_isolation(coalesce_talker_refill=coalesce_talker_refill)
         original_max_num_active_reqs = self.max_num_active_reqs
         self.max_num_active_reqs = step.limit
         scheduled_any = False
         try:
+            if coalesce_talker_refill:
+                self._drop_talker_drafts_if_prefill_pending()
             scheduler_output = super().schedule(throttle_prefills)
             scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
             if scheduled_tokens is None and isinstance(scheduler_output, dict):
