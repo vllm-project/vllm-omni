@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MiniCPM-o 4.5 audio chunk attention masks."""
 
 from __future__ import annotations
@@ -38,10 +38,25 @@ def _reference_chunk_mask(
     return mask
 
 
-@pytest.mark.parametrize("size", [0, 1, 49, 50, 51, 1500])
-@pytest.mark.parametrize("chunk_size", [1, 17, 50])
-@pytest.mark.parametrize("num_left_chunks", [-1, 0, 1, 3])
-@pytest.mark.parametrize("num_lookhead", [0, 1, 7])
+@pytest.mark.parametrize(
+    ("size", "chunk_size", "num_left_chunks", "num_lookhead"),
+    [
+        pytest.param(0, 50, -1, 0, id="empty"),
+        pytest.param(1, 50, 0, 0, id="single-token"),
+        pytest.param(49, 50, 1, 7, id="before-chunk-boundary"),
+        pytest.param(50, 50, 1, 7, id="at-chunk-boundary"),
+        pytest.param(51, 50, 1, 7, id="after-chunk-boundary"),
+        pytest.param(1500, 50, 3, 7, id="long-audio"),
+        # Cross context settings only on inputs long enough to exercise every
+        # left window and lookahead, instead of repeating empty/full masks.
+        *[
+            (4 * chunk_size + 1, chunk_size, left_chunks, lookahead)
+            for chunk_size in (1, 17, 50)
+            for left_chunks in (-1, 0, 1, 3)
+            for lookahead in (0, 1, 7)
+        ],
+    ],
+)
 def test_subsequent_chunk_mask_matches_row_by_row_reference(
     size: int,
     chunk_size: int,

@@ -22,6 +22,7 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS
 from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexStageRequestContext, DuplexStageSubmission
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
 from vllm_omni.engine.messages import StageSubmissionMessage
 from vllm_omni.engine.orchestrator import (
@@ -355,6 +356,10 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
 async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
     orchestrator = _orchestrator(cls=DuplexOrchestrator)
     orchestrator.replica_placement = None
+    # The default plugin answer: a Stage0 request prewarms its downstream stages.
+    plugin = mocker.create_autospec(DuplexModelPlugin, instance=True)
+    plugin.prewarms_downstream_stages.return_value = True
+    orchestrator.plugin = plugin
     prewarm = mocker.AsyncMock(return_value=True)
     orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
     sampling_params = tuple(_sampling_params())

@@ -31,7 +31,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 
 # Fish Speech S2 Pro
 vllm serve fishaudio/s2-pro --omni --port 8091
@@ -156,6 +156,10 @@ Content-Type: application/json
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 | `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
 
+For Step-Audio2, `max_new_tokens` overrides the first (Thinker) stage's token
+budget. Omitting it preserves deployment defaults; later stages keep their
+configured budgets. This is a token limit, not an audio-duration limit.
+
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
 #### Voice Clone Parameters (Base task)
@@ -201,11 +205,19 @@ responses and `truncated` on the SSE `speech.audio.done` event:
 - absent: the model does not report truncation, or the server did not record
   why generation stopped. This does not mean the audio is complete.
 
-Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3 and
-YuE2 (YuE2 on non-streaming responses only, from its own metadata). Qwen3-TTS
-rejects some truncated generations with an error instead (Base task requests,
-and requests whose budget the server sizes from the text), so those never
-return audio.
+Models that report it today: Qwen3-TTS, Breeze-TTS-2, Fish Audio Drama 3,
+CosyVoice3, Voxtral TTS and YuE2 (YuE2 on non-streaming responses only, from
+its own metadata). Qwen3-TTS returns the generated audio when any task
+(Base, CustomVoice or VoiceDesign) reaches its length limit, including a
+server-derived budget. It does not retry or raise an error solely because
+codec EOS was not emitted before the limit. The context window, configured
+output limit and text-scaled codec budgets still bound generation; a successful
+response does not guarantee that the entire input was spoken.
+
+The context window includes both the conditioned prompt and generated codec
+tokens. For example, an 892-token prompt in a 4096-token context leaves only
+3204 tokens for speech. Raising `max_new_tokens` alone cannot extend the
+context; adjust the Talker stage's `max_model_len` or split the text when needed.
 
 Raw audio streams (`stream_format="audio"`) send their headers before
 generation ends, and the batch endpoint and WebSocket streaming do not carry the
@@ -323,7 +335,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 
 | Parameter | Type | Required | Description |
 | ----------- | ------ | ---------- | ------------- |
-| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm). MP4/M4A is **not** supported — extract the audio track as WAV first, e.g. `ffmpeg -i clip.mp4 -vn -ar 48000 -ac 1 -sample_fmt s16 clip.wav`. |
+| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4/m4a). AAC, WebM and MP4/M4A are decoded with the same loader as inline `ref_audio`. Without a content type (or with `application/octet-stream`) the format is taken from the filename extension. |
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
 | `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
@@ -375,17 +387,25 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ## Streaming Text Input (WebSocket)
 
 The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
-Its default `buffered` mode synthesizes all text received before `input.done` as
-one request. For the supported Qwen3-TTS Chinese/English scope, M1
-`commitment` mode can instead start an independent request whenever the
-semantic-readiness policy marks a boundary after accumulated raw text.
-The separate `model_input_mode` selects complete or incremental model input;
-incremental input uses the commitment frontend and keeps one request alive for
-the utterance.
+With `model_input_mode="complete"` (default), choose the input policy according
+to when synthesis should start:
 
-In incremental mode, the adapter buffers any tokenizer-unstable suffix after
-frontend commitment. It submits the initial engine request only when stable text
-tokens are available, or flushes the remaining text at `input.done`. Subsequent
+| `text_input_mode` | `split_granularity` | When a TTS request starts | Handling more text during synthesis |
+| --- | --- | --- | --- |
+| `buffered` (default) | `none` (default) | After `input.done`, using all accumulated text. | The handler waits for generation before processing another input message. |
+| `buffered` | `sentence` or `clause` | At each linguistic boundary, before `input.done`; remaining text is flushed at `input.done`. | The handler waits for each segment's generation before processing another input message. |
+| `commitment` | `none` (required) | Queued at each semantic-readiness boundary and synthesized in order; `input.done` closes and flushes the policy. | The reader can accept and queue later segments while the synthesis worker runs. M1 supports the documented Qwen3-TTS Chinese/English scope. |
+
+All three configurations submit independent TTS requests. None appends later
+text to the prompt of a model request that is already generating, or preserves
+acoustic/model state between segments. Reusing the WebSocket connection after
+`session.done` also does not imply reuse of a model generation session.
+
+With `model_input_mode="incremental"`, the commitment frontend feeds one model
+request for the entire utterance. The adapter buffers any tokenizer-unstable
+suffix after frontend commitment. It submits the initial engine request only
+when stable text tokens are available, or flushes the remaining text at
+`input.done`. Subsequent
 releases may also be buffered without sending an engine update. The delivered
 token IDs match encoding the complete model text, regardless of text packet
 boundaries or delivery batching. Empty or whitespace-only utterances do not
@@ -406,19 +426,35 @@ including the time spent waiting for engine admission.
     Commitment mode is not a general sentence detector. Its strong-terminator
     boundaries say only that the configured finite policy no longer needs to
     withhold a recognized lexical or special-text suffix. A released segment
-    may be shorter or longer than a linguistic sentence. Every segment is
-    synthesized as a new one-shot request; model and acoustic state are not
-    continued from the preceding segment.
+    may be shorter or longer than a linguistic sentence. In `complete` model
+    input mode, every segment is synthesized as a new one-shot request; model
+    and acoustic state are not continued from the preceding segment.
 
 Text transport and audio transport are separate choices. `input.text` always
 arrives incrementally. `stream_audio=false` sends one binary audio frame per
-synthesis request; `stream_audio=true` sends one or more PCM chunks per
-request.
+synthesis request; `stream_audio=true` sends one or more audio chunks per
+request. Streaming requires `response_format="pcm"` or `"wav"`.
 
-In buffered mode, `split_granularity="sentence"` or `"clause"` enables the
-linguistic splitter and emits requests before EOF. Commitment mode requires
-`split_granularity="none"` because only the readiness policy may decide its
-irreversible boundaries.
+For `response_format="wav"`, each synthesis request is one WAV byte stream that
+begins with a WAV header using placeholder RIFF and data sizes (`0xFFFFFFFF`),
+followed by PCM samples. WebSocket message boundaries are arbitrary; clients
+must feed that request's binary frames into one stream parser rather than
+parsing each frame as a standalone audio unit. One WAV stream is produced per
+`audio.start`/`audio.done` pair: with `split_granularity="sentence"` or
+`"clause"`, or with multiple utterances on one connection, each pair starts a
+new stream with its own header. Do not feed all binary frames from a connection
+into a single WAV parser. Strict WAV readers that require finalized sizes
+should use a non-streaming response.
+
+Enabling `stream_audio` changes audio delivery, not the input policy: with the
+default buffered configuration, the first synthesis request still waits for
+`input.done`. Commitment mode requires `split_granularity="none"` because only
+the readiness policy may decide its irreversible boundaries.
+
+For the separate turn-based audio input/output protocol, see the
+[`/v1/realtime` Realtime Audio API](realtime_openai_duplex_api.md). Its model-specific
+support does not make an arbitrary TTS backend support incremental prompt
+extension through `/v1/audio/speech/stream`.
 
 ### WebSocket Protocol
 
@@ -435,9 +471,9 @@ Server -> Client:
 
 | Message | Description |
 | --------- | ------------- |
-| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000, "channels": 1}` | Audio generation is starting for one request. In commitment mode, `sentence_text` is the raw committed segment and `sentence_index` is its zero-based ordinal; the legacy field names do not assert that it is a sentence. For streamed PCM, it is sent with the first audio chunk and carries that audio's `sample_rate` and `channels` (omitted when no audio was produced). |
-| Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
-| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | The corresponding request is complete. `error=true` means it failed. |
+| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000, "channels": 1}` | Audio generation is starting for one request. In commitment mode, `sentence_text` is the raw committed segment and `sentence_index` is its zero-based ordinal; the legacy field names do not assert that it is a sentence. For streamed `pcm` or `wav`, it is sent with the first audio chunk and carries that audio's `sample_rate` and `channels` (omitted when no audio was produced). |
+| Binary frame | A chunk of the current request's continuous byte stream; feed frames to that request's parser (`audio.start` … `audio.done`). With `stream_audio=true`, the stream contains PCM samples; for `wav`, each request starts with its own 44-byte placeholder WAV header. |
+| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | The corresponding request is complete. `total_bytes` counts all binary bytes sent for that request, including the WAV header when applicable. `error=true` means it failed. |
 | `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Terminal marker after `input.done`/EOF and all started requests have settled. It is not a success indicator. `total_sentences` is the number of requests that emitted `audio.start`, despite the compatibility name. |
 | `{"type": "error", "message": "..."}` | A protocol, limit, validation, or generation error. Some protocol errors are recoverable; a segment failure terminates the current utterance. |
 
@@ -546,6 +582,8 @@ queued work, and do not emit `session.done`.
 In incremental mode, generation ending before text EOF is submitted is also
 reported as a failure. The error message includes the model's finish reason
 when available; `audio.done.error=true` and the same EOF/reuse rules apply.
+After text EOF is submitted, reaching a Qwen3-TTS length limit returns the
+generated audio normally, as in complete mode.
 
 ### Flushing vs. Closing
 
@@ -574,11 +612,18 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 ### Session Config Parameters
 
-All REST API parameters are supported, plus:
+All REST API parameters are supported, except `input` (sent as `input.text`)
+and `stream` / `stream_format` (replaced by `stream_audio`). The REST request
+rules are checked when `session.config` arrives; checks that depend on how the
+server was started, such as `word_timestamps` without `--forced-aligner`, run
+when the first text arrives. `ref_audio` takes a single string and
+`speaker_embedding` a flat list. `duration_seconds` and `token_count` set the
+length of a whole request, so they require `split_granularity="none"` and
+`text_input_mode="buffered"`. Session parameters:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
-| `stream_audio` | bool | false | Stream one or more PCM chunks for each synthesis request over WebSocket |
+| `stream_audio` | bool | false | Stream one or more audio chunks for each synthesis request over WebSocket. Requires `response_format="pcm"` or `"wav"`. |
 | `text_input_mode` | `"buffered"` or `"commitment"` | `"buffered"` | Select whole-utterance buffering or M1 semantic-readiness commitment. Commitment requires Qwen3-TTS and explicit `language="Chinese"` or `"English"`. |
 | `model_input_mode` | `"complete"` or `"incremental"` | `"complete"` | Select one complete request per text segment or one incrementally fed request per utterance. Incremental input requires commitment, PCM streaming, and an opted-in model adapter (currently Qwen3-TTS CustomVoice with MRv2). |
 | `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
@@ -649,7 +694,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 ```bash
@@ -671,7 +716,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}'
 ```
 
 ```bash
@@ -788,6 +833,10 @@ python examples/online_serving/text_to_speech/voxcpm2/precompute_custom_voice.py
 Only profiles whose safetensors payload can be loaded and validated are exposed
 by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 `POST /v1/audio/speech` by passing `voice="alice"` without `ref_audio`.
+
+For VoxCPM2, an explicit `ref_audio` overrides an uploaded or precomputed
+`voice`. Such requests do not reuse the named voice's conditioning cache;
+requests without an explicit reference retain the normal named-voice cache.
 
 **Configuration (environment variables):**
 
@@ -971,9 +1020,9 @@ For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overri
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --omni --port 8091 --trust-remote-code --enforce-eager \
-    --stage-overrides '{"0":{"max_num_seqs":10,"gpu_memory_utilization":0.2},
-                        "1":{"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
+    --omni --port 8091 --trust-remote-code \
+    --stage-overrides '{"0":{"enforce_eager":true,"max_num_seqs":10,"gpu_memory_utilization":0.2},
+                        "1":{"enforce_eager":true,"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
 ```
 
 The bundled `qwen3_tts.yaml` uses a multi-request default and lets stage 1 batch chunks across in-flight requests. For latency-sensitive deployments, avoid forcing stage 1 back to `max_num_seqs: 1`; benchmark before reducing it below `10`.
@@ -1066,6 +1115,10 @@ OmniVoice processes voice-cloning audio after decoding. It removes middle gaps o
 OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
 key, and value tensors are evaluated in BF16 even when the stage is configured with `dtype: float32`; the attention output is converted back to the model's
 hidden-state dtype before the output projection. Consequently, a float32 stage configuration does not imply FP32 attention arithmetic.
+When the selected diffusion attention backend cannot run packed variable-length attention, as with the cuDNN default on sm_12x Blackwell
+GPUs, OmniVoice runs vLLM's FlashAttention 2 varlen kernel when the device supports it and otherwise uses SDPA with a block mask.
+On those GPUs the FlashAttention 2 kernels are compiled from PTX at first use, which adds about 16 seconds to the first server start on an
+RTX 5070; the CUDA compute cache keeps them for later starts.
 
 OmniVoice splits long input into smaller text chunks and joins the decoded audio. You can change the split behavior for one request through `extra_params`:
 
@@ -1224,7 +1277,7 @@ curl http://localhost:8091/v1/audio/voices
 If you encounter OOM errors:
 
 1. Use smaller model variant: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
-2. Reduce `--gpu-memory-utilization`
+2. Reduce `gpu_memory_utilization` for the affected stage in the deploy YAML or with `--stage-overrides`.
 
 ### Unsupported Speaker
 
@@ -1285,7 +1338,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091 \
     --trust-remote-code \
-    --enforce-eager \
+    --stage-overrides '{"0":{"enforce_eager":true},"1":{"enforce_eager":true}}' \
     --uvicorn-log-level debug
 ```
 
@@ -1318,6 +1371,20 @@ MOSS-TTS Local uses a reference transcript for continuation conditioning; omitti
 it uses reference-audio conditioning instead. Keep this choice consistent when
 comparing benchmarks. Supplying inline `ref_audio` overrides the uploaded voice
 and does not use the named-voice cache shortcut.
+
+Ming-TTS (dense) can reuse a worker-cached speaker embedding for a single inline
+`ref_audio` when the resolver provides the same decoded-audio content key, even
+if the request text or audio locator changes. This avoids repeated speaker
+embedding extraction; the waveform is still resolved and sent to the worker.
+If the resolver provides no content key or the worker entry is evicted, the
+embedding is extracted again. Multi-reference requests retain their existing
+extraction behavior.
+
+Remote URLs are keyed by their raw URL string in the separate waveform resolve
+cache. A hit returns the cached waveform without fetching or decoding it again;
+the server does not check whether content at the same URL has changed. Ming's
+speaker cache uses the content key of the waveform returned by that resolver.
+It does not change remote URL refresh behavior.
 
 The separate decoded-waveform resolve cache defaults to **4 GiB and 2048 entries
 per speech server instance**. These are LRU limits, not preallocated memory or a

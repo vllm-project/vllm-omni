@@ -78,6 +78,73 @@ steps:
             fi
             (exit "$$status")
 
+      # Exercise the same four-GPU replica fault contract on MI325. The
+      # released deploy overlay already has blocking four-GPU ROCm functional
+      # coverage; this job adds process-kill, convergence, and cleanup coverage.
+      - label: "Reliability Test · qwen3-omni replicas"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 240
+        source_file_dependencies: omni_qwen3_omni_replica_reliability
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-replica-reliability/**/*
+        commands:
+          - export ROCM_QWEN3_REPLICA_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-replica-reliability"
+          - mkdir -p "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_qwen3_omni_replica.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_4" \
+              > "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 5 ]]; then
+              echo "Expected exactly 5 Qwen3-Omni replica reliability nodes, found $$count." >&2
+              cat "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 220m \
+                pytest -s -v -ra tests/dfx/reliability/test_qwen3_omni_replica.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_4" \
+                --junitxml="$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 5 or skipped != 1:
+                print(
+                    f"Expected exactly 5 executed Qwen3-Omni replica reliability tests with 1 known skip; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_REPLICA_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
       - label: "Reliability Test · wan22"
         agent_pool: mi300_2
         depends_on: amd-build
@@ -126,9 +193,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 13 or skipped != 1:
+            if tests != 13 or skipped != 0:
                 print(
-                    f"Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip; "
+                    f"Expected exactly 13 executed Wan2.2 reliability tests with no skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -193,9 +260,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 13 or skipped != 1:
+            if tests != 13 or skipped != 0:
                 print(
-                    f"Expected exactly 13 executed HunyuanImage reliability tests with 1 known skip; "
+                    f"Expected exactly 13 executed HunyuanImage reliability tests with no skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -257,14 +324,80 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 14 or skipped != 3:
+            if tests != 14 or skipped != 0:
                 print(
-                    f"Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips; "
+                    f"Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with no skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
                 raise SystemExit(5)
             ' "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      # The replica deploy uses devices 0,1,2. Run it on the available
+      # four-GPU MI300 pool with the fourth device intentionally idle.
+      - label: "Reliability Test · minicpmo-4.5 replicas"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 240
+        source_file_dependencies: omni_minicpmo_4_5_replica_reliability
+        artifact_paths:
+          - artifacts/rocm-minicpmo-replica-reliability/**/*
+        commands:
+          - export ROCM_MINICPMO_REPLICA_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-replica-reliability"
+          - mkdir -p "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_minicpmo_4_5_replica.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_3" \
+              > "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 5 ]]; then
+              echo "Expected exactly 5 MiniCPM-o 4.5 replica reliability nodes, found $$count." >&2
+              cat "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 220m \
+                pytest -s -v -ra tests/dfx/reliability/test_minicpmo_4_5_replica.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_3" \
+                --junitxml="$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 5 or skipped != 1:
+                print(
+                    f"Expected exactly 5 executed MiniCPM-o 4.5 replica reliability tests with 1 known skip; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MINICPMO_REPLICA_ARTIFACT_DIR/pytest.xml"
               then
                 status=0
               else
@@ -295,8 +428,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 76 ]]; then
-              echo "Expected exactly 76 single-GPU invalid-parameter nodes, found $$count." >&2
+            if [[ "$$count" != 37 ]]; then
+              echo "Expected exactly 37 single-GPU invalid-parameter nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -324,9 +457,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 76 or skipped != 5:
+            if tests != 37 or skipped != 5:
                 print(
-                    f"Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips; "
+                    f"Expected exactly 37 single-GPU invalid-parameter tests with 5 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -360,8 +493,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 24 ]]; then
-              echo "Expected exactly 24 invalid-parameter reliability nodes, found $$count." >&2
+            if [[ "$$count" != 18 ]]; then
+              echo "Expected exactly 18 invalid-parameter reliability nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -390,9 +523,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 24 or skipped != 0:
+            if tests != 18 or skipped != 0:
                 print(
-                    f"Expected exactly 24 executed invalid-parameter reliability tests; "
+                    f"Expected exactly 18 executed invalid-parameter reliability tests; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -428,8 +561,8 @@ steps:
               > "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 127 ]]; then
-              echo "Expected exactly 127 audio invalid-parameter nodes, found $$count." >&2
+            if [[ "$$count" != 85 ]]; then
+              echo "Expected exactly 85 audio invalid-parameter nodes, found $$count." >&2
               cat "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -457,9 +590,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 127 or skipped != 26:
+            if tests != 85 or skipped != 26:
                 print(
-                    f"Expected exactly 127 audio invalid-parameter tests with 26 known skips; "
+                    f"Expected exactly 85 audio invalid-parameter tests with 26 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -1054,6 +1187,438 @@ steps:
             tests/e2e/online_serving/test_cosmos3.py
             2 diffusion rocm-cosmos3-weekly
 
+      # Mirror the CUDA weekly Qwen-Image Edit/Layered single-card contract.
+      # Keep online and accuracy owners separate so numerical comparisons do
+      # not inherit server processes or memory from the functional sweep.
+      - label: "Qwen-Image Edit and Layered online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_qwen_image_edit_weekly
+          - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-edit-layered-online-weekly/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 11 285m rocm-qwen-image-edit-layered-online-weekly
+            'tests/e2e/online_serving/test_qwen_image_edit.py::test_single_image_to_image_001[default]'
+            'tests/e2e/online_serving/test_qwen_image_edit.py::test_multi_images_to_image_001[default]'
+            'tests/e2e/online_serving/test_qwen_image_edit.py::test_different_sizes_001[default]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[cpu_offload]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[single_card_001]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[cpu_offload]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[single_card_001]'
+            'tests/e2e/online_serving/test_qwen_image_layered.py::test_single_image_to_image_001[default]'
+            'tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[cpu_offload]'
+            'tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_layered_output_image_count[layers_guard_001_layers2]'
+            'tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_empty_prompt[prompt_001]'
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Qwen-Image Edit and Layered accuracy · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_qwen_image_edit_weekly
+          - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-edit-layered-accuracy-weekly/**/*
+        commands:
+          - export ROCM_QWEN_IMAGE_EDIT_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-edit-layered-accuracy-weekly"
+          - mkdir -p "$$ROCM_QWEN_IMAGE_EDIT_ACCURACY_ARTIFACT_DIR"
+          - |
+            status=0
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh \
+              1 3 285m rocm-qwen-image-edit-layered-accuracy-weekly \
+              tests/e2e/accuracy/test_qwen_image_edit.py::test_qwen_image_edit_single_matches_diffusers \
+              tests/e2e/accuracy/test_qwen_image_edit.py::test_qwen_image_edit_2511_matches_diffusers_pixelwise \
+              tests/e2e/accuracy/test_qwen_image_layered.py::test_qwen_image_layered_matches_diffusers \
+              -m 'slow and diffusion and rocm and MI325 and cards_1' \
+              || status=$$?
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_QWEN_IMAGE_EDIT_ACCURACY_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. \
+                "$$ROCM_QWEN_IMAGE_EDIT_ACCURACY_ARTIFACT_DIR/accuracy/"
+            fi
+            exit "$$status"
+
+      # Preserve the CUDA weekly two-card feature matrix exactly: five Edit
+      # configurations for each input shape and three Layered configurations.
+      - label: "Qwen-Image Edit and Layered online · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_qwen_image_edit_weekly
+          - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-edit-layered-2gpu-weekly/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 13 285m rocm-qwen-image-edit-layered-2gpu-weekly
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[parallel_001]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[parallel_002]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[parallel_003]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[parallel_004]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_single_image[parallel_005]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[parallel_001]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[parallel_002]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[parallel_003]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[parallel_004]'
+            'tests/e2e/online_serving/test_qwen_image_edit_expansion.py::test_qwen_image_edit_2511_two_images[parallel_005]'
+            'tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[sp_001]'
+            'tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[cfg_parallel_001]'
+            'tests/e2e/online_serving/test_qwen_image_layered_expansion.py::test_feature[parallel_hsdp]'
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      # The base Qwen-Image core/advanced cases already have blocking ROCm
+      # owners. This is the only CUDA core-model node without an AMD owner.
+      - label: "Qwen-Image merged LoRA · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies:
+          - diffusion_qwen_image_function
+          - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          ROCM_DIFFUSION_RUN_LEVEL: core_model
+        artifact_paths:
+          - artifacts/rocm-qwen-image-merged-lora-weekly/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 1 105m rocm-qwen-image-merged-lora-weekly
+            tests/e2e/features/rlhf_test/test_qwen_image_merged_lora.py::test_qwen_image_merged_lora_changes_and_restores_generation
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      # The checkpoint uses GPTQ-packed W4A16 weights. Keep this separate from
+      # the BF16 owners so quantized loading and generation fail independently.
+      - label: "Qwen-Image AutoRound W4A16 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_qwen_image_autoround_weekly
+          - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-autoround-weekly/**/*
+        commands:
+          - export QWEN_IMAGE_AUTOROUND_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-autoround-weekly"
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 285m rocm-qwen-image-autoround-weekly
+            tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py::test_qwen_image_autoround_w4a16_load
+            tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py::test_qwen_image_autoround_w4a16_generate
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      # Exact MI325 owners for the CUDA weekly LongCat contracts, promoted
+      # after these selectors passed on AMD hardware without skips or retries.
+      - label: "LongCat online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_longcat_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-longcat-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 4 285m rocm-longcat-weekly-1gpu
+            'tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[default]'
+            'tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[single_card_001]'
+            'tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[default]'
+            'tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[single_card_001]'
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "LongCat online · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_longcat_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-longcat-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 2 285m rocm-longcat-weekly-2gpu
+            'tests/e2e/online_serving/test_longcat_image_expansion.py::test_longcat_image[parallel_001]'
+            'tests/e2e/online_serving/test_longcat_image_edit_expansion.py::test_longcat_image_edit[parallel_001]'
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      # Boogu has distinct one-card, two-card CFG, and full three-rank CFG
+      # contracts. The three-rank case uses a four-card allocation because the
+      # AMD weekly fleet has no dedicated three-card queue; the fourth GPU idles.
+      - label: "Boogu online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_boogu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-boogu-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 17 285m rocm-boogu-weekly-1gpu
+            'tests/e2e/online_serving/test_boogu_image.py::test_text_to_image_001[default]'
+            'tests/e2e/online_serving/test_boogu_image.py::test_batch_001[default]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_single_image_to_image_001[edit]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_single_image_to_image_001[edit-turbo-hotfix-1k]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_double_guidance_001[default]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_001[edit]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_001[edit-turbo-hotfix-1k]'
+            'tests/e2e/online_serving/test_boogu_image_edit.py::test_images_edits_endpoint_double_guidance_001[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[vae_slicing_tiling]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[vae_slicing_tiling]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[default]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[vae_slicing_tiling]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_image_only_guidance[default]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_align_res_output_size[edit]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_align_res_output_size[edit-turbo-hotfix-1k]'
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Boogu online · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_boogu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-boogu-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 6 285m rocm-boogu-weekly-2gpu
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_non_square_resolution[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_cfg_off[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_expansion.py::test_high_resolution[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_image_only_guidance[cfg_parallel_2]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_double_guidance_cfg_parallel[cfg_parallel_2_round_robin]'
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_cfg_off_on_cfg_parallel_server[cfg_parallel_2_cfg_off]'
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      - label: "Boogu Edit CFG · 3-rank on 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_boogu_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-boogu-edit-cfg-weekly-3rank/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 1 285m rocm-boogu-edit-cfg-weekly-3rank
+            'tests/e2e/online_serving/test_boogu_image_edit_expansion.py::test_double_guidance_cfg_parallel[cfg_parallel_3_full]'
+            -m 'slow and diffusion and rocm and MI325 and cards_3'
+
+      # Preserve the CUDA Flux weekly split: FLUX.2-dev plus FLUX.1 Schnell on
+      # one card, and FLUX.2-dev plus FLUX.1 Kontext on two cards.
+      - label: "Flux online and offline · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_flux_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-flux-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 5 285m rocm-flux-weekly-1gpu
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[cpu_offload]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[layerwise_offload]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[cpu_offload]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[layerwise_offload]'
+            tests/e2e/offline_inference/test_flux1_schnell_expansion.py::test_flux_schnell_text_to_image
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Flux online and offline · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_flux_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-flux-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 10 285m rocm-flux-weekly-2gpu
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[parallel_cfg_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[ulysses_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[ring_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev[vae_patch_parallel_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[parallel_cfg_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[ulysses_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[ring_2]'
+            'tests/e2e/online_serving/test_flux_2_dev_expansion.py::test_flux_2_dev_batched_chat_completions[vae_patch_parallel_2]'
+            tests/e2e/offline_inference/test_flux1_kontext_expansion.py::test_flux_kontext_text_to_image
+            tests/e2e/offline_inference/test_flux1_kontext_expansion.py::test_flux_kontext_image_edit
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      # Krea2 keeps online and offline single-card coverage together, while the
+      # HSDP and VAE-patch contracts stay isolated on the two-card owner.
+      - label: "Krea2 online and offline · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_krea2_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-krea2-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 7 285m rocm-krea2-weekly-1gpu
+            'tests/e2e/online_serving/test_krea2_expansion.py::test_krea2[single_card_basic]'
+            'tests/e2e/online_serving/test_krea2_expansion.py::test_krea2[single_card_layerwise_offload]'
+            'tests/e2e/online_serving/test_krea2_expansion.py::test_krea2_lora[single_card_lora]'
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_text_to_image_001
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_layerwise_offload
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_cache_dit
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_lora
+            -m 'slow and diffusion and rocm and MI325 and cards_1'
+
+      - label: "Krea2 offline · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 300
+        source_file_dependencies:
+          - diffusion_krea2_weekly
+          - rocm_diffusion_nightly_runner
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-krea2-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 2 285m rocm-krea2-weekly-2gpu
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_hsdp
+            tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_vae_patch_parallel
+            -m 'slow and diffusion and rocm and MI325 and cards_2'
+
+      # Probe the exact CUDA-owned Wan2.1 VACE nodes on ROCm before adding
+      # MI325 source marks. Exact node invocation avoids claiming support until
+      # both resource shapes have clean hardware evidence.
+      - label: "Wan2.1 VACE probe · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: diffusion_wan2_1_vace_weekly
+        artifact_paths:
+          - artifacts/rocm-wan-vace-weekly-1gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            1 2 105m rocm-wan-vace-weekly-1gpu
+            'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[single_card_cpu_offload]'
+            'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[single_card_001]'
+
+      - label: "Wan2.1 VACE probe · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_wan2_1_vace_weekly
+        artifact_paths:
+          - artifacts/rocm-wan-vace-weekly-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 5 165m rocm-wan-vace-weekly-2gpu
+            'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[parallel_001]'
+            'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[parallel_002]'
+            'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[parallel_003]'
+            'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[parallel_004]'
+            'tests/e2e/online_serving/test_wan_2_1_vace_expansion.py::test_wan_2_1_vace[parallel_005]'
+
   - group: "TTS E2E Weekly"
     steps:
       - label: "Moss TTS expansion · 1-GPU"
@@ -1465,6 +2030,7 @@ steps:
           OMP_NUM_THREADS: "1"
           MKL_NUM_THREADS: "1"
           NUMEXPR_NUM_THREADS: "1"
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: artifacts/rocm-glm-tts-weekly
         artifact_paths:
           - artifacts/rocm-glm-tts-weekly/**/*
         commands:

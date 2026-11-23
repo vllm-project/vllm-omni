@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -59,6 +59,7 @@ from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
+    extract_diffusion_scheduler_wait_ms,
     iter_mm_outputs,
     iter_request_output_items,
 )
@@ -270,24 +271,18 @@ class StagePool:
     def __init__(
         self,
         stage_id: int,
-        clients: StagePoolClient | list[StagePoolClient],
+        clients: StagePoolClient | Sequence[StagePoolClient | None],
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
         watermarkers: Mapping[str, Watermarker] | None = None,
         strict_watermarking: bool = False,
     ) -> None:
-        if isinstance(clients, list):
-            normalized_clients: list[StagePoolClient] = list(clients)
-        else:
-            normalized_clients = [clients]
-
-        # Allow empty pools when running in distributed head mode for a
-        # non-self stage; clients will arrive via add_client(...).
         self.stage_id = stage_id
-        # Slots can become None after a dynamic remove_client (distributed mode);
-        # iterate via live_replica_ids() to skip holes.
-        self.clients: list[StagePoolClient | None] = list(normalized_clients)
+        # A slot is empty after a startup failure or dynamic removal. Keep its
+        # index reserved so routing and metrics use the original replica IDs.
+        # Distributed heads can also start with no slots and add clients later.
+        self.clients: list[StagePoolClient | None] = list(clients) if isinstance(clients, Sequence) else [clients]
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self.collect_stage_metrics = True
@@ -1130,13 +1125,26 @@ class StagePool:
         request_outputs: list[Any],
         *,
         submit_ts: float,
+        submit_perf: float | None = None,
         request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
-        now = _time.time()
-        stage_gen_time_ms = (now - submit_ts) * 1000.0
+        if submit_perf is not None:
+            stage_gen_time_ms = (_time.perf_counter() - submit_perf) * 1000.0
+        else:
+            stage_gen_time_ms = (_time.time() - submit_ts) * 1000.0
+        scheduler_wait_ms = extract_diffusion_scheduler_wait_ms(request_outputs[0]) if request_outputs else None
+        if scheduler_wait_ms is not None:
+            if scheduler_wait_ms > stage_gen_time_ms:
+                logger.warning(
+                    "Stage-%s diffusion scheduler wait %.3f ms exceeds stage generation %.3f ms",
+                    self.stage_id,
+                    scheduler_wait_ms,
+                    stage_gen_time_ms,
+                )
+            stage_gen_time_ms -= scheduler_wait_ms
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
         native_text_metrics = {}
         if request_id:
@@ -1182,6 +1190,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             stage_gen_time_ms=stage_gen_time_ms,
+            scheduler_queue_wait_ms=scheduler_wait_ms,
             rx_transfer_bytes=0,
             rx_decode_time_ms=0.0,
             rx_in_flight_time_ms=0.0,
@@ -1218,6 +1227,7 @@ class StagePool:
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
         has_output_timestamps = bool(output_timestamps)
+        now = _time.time()
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)

@@ -32,10 +32,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     SpeechServingContext,
     TextCommitmentCapabilities,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
-    QWEN3_TTS_AUTO_BUDGET_KEY,
-    Qwen3TTSAdapter,
-)
+from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 from vllm_omni.model_executor.models.qwen3_tts.input_stream import Qwen3TTSTextInput
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import build_assistant_text
 from vllm_omni.model_executor.models.qwen3_tts.streaming_tokenizer import Qwen3TTSStreamingTokenizerSpec
@@ -248,8 +245,18 @@ def _finish_utterance(ws):
                 return events, audio
 
 
-def test_native_ws_streams_before_eof_and_reuses_connection(native_app, text_tokenizer):
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_native_ws_streams_before_eof_and_reuses_connection(native_app, text_tokenizer, finish_reason):
     engine = native_app.engine
+    generate = engine.generate
+
+    async def generate_with_finish_reason(**kwargs):
+        async with aclosing(generate(**kwargs)) as outputs:
+            async for output in outputs:
+                yield output
+        yield SimpleNamespace(metrics={"stage_metrics": {"0": {"finish_reason": finish_reason}}})
+
+    engine.generate = generate_with_finish_reason
     with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
         ws.send_json({"type": "input.text", "text": "Hello "})
@@ -279,7 +286,6 @@ def test_native_ws_streams_before_eof_and_reuses_connection(native_app, text_tok
         assert {request_id for request_id, _, _ in engine.appends} == {submitted["request_id"]}
         assert engine.appends[-1][2]
         assert submitted["sampling_params_list"][0].max_tokens == 1024
-        assert QWEN3_TTS_AUTO_BUDGET_KEY not in submitted["prompt"]["additional_information"]
 
         ws.send_json({"type": "input.text", "text": "A second utterance!"})
         ws.send_json({"type": "input.done"})
@@ -405,14 +411,11 @@ def test_native_generation_ending_before_eof_reports_error_and_rejects_more_text
         assert ws.receive_json()["type"] == "audio.start"
         assert ws.receive_bytes()
         error = ws.receive_json()
-        if finish_reason == "length":
-            assert "token budget" in error["message"]
+        assert "ended before closing its text input" in error["message"]
+        if finish_reason is not None:
+            assert f"finish_reason={finish_reason}" in error["message"]
         else:
-            assert "ended before closing its text input" in error["message"]
-            if finish_reason is not None:
-                assert f"finish_reason={finish_reason}" in error["message"]
-            else:
-                assert "finish_reason=" not in error["message"]
+            assert "finish_reason=" not in error["message"]
         assert set(error) == {"type", "message", "partial_audio", "action"}
         assert error["partial_audio"] and error["action"] == "discard"
         done = ws.receive_json()

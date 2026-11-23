@@ -16,6 +16,8 @@ import math
 import random
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
+from functools import cache
 
 import torch
 import torch.nn as nn
@@ -263,6 +265,19 @@ class OmniVoiceRMSNorm(nn.Module):
         return self.weight * x.to(self.weight.dtype)
 
 
+@cache
+def _vllm_fa2_varlen() -> Callable[..., torch.Tensor] | None:
+    """vLLM's FA2 varlen kernel when this CUDA device supports it, else None."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+    except ImportError:
+        return None
+    return flash_attn_varlen_func if is_fa_version_supported(2) else None
+
+
 class OmniVoiceAttention(nn.Module):
     """Qwen3-style GQA using packed, full-bidirectional varlen attention."""
 
@@ -296,6 +311,10 @@ class OmniVoiceAttention(nn.Module):
             skip_sequence_parallel=True,
         )
         self.use_packed_varlen = self.attention_op.attn_backend.supports_multi_doc_packed_varlen()
+        # When the selected backend cannot run packed varlen (for example cuDNN
+        # on sm_12x Blackwell), vLLM's FA2 varlen still keeps the packed
+        # boundaries without building a dense SDPA mask.
+        self.fa2_varlen = None if self.use_packed_varlen else _vllm_fa2_varlen()
 
     def forward(
         self,
@@ -325,6 +344,20 @@ class OmniVoiceAttention(nn.Module):
         q, k, v = (tensor.permute(0, 2, 1, 3).contiguous().to(torch.bfloat16) for tensor in (q, k, v))
         if self.use_packed_varlen:
             out = self.attention_op(q, k, v, attn_metadata)
+        elif self.fa2_varlen is not None:
+            extra = attn_metadata.extra
+            out = self.fa2_varlen(
+                q[0],
+                k[0],
+                v[0],
+                cu_seqlens_q=extra["cu_seqlens_q"],
+                cu_seqlens_k=extra["cu_seqlens_k"],
+                max_seqlen_q=extra["max_seqlen_q"],
+                max_seqlen_k=extra["max_seqlen_k"],
+                softmax_scale=self.scale,
+                causal=False,
+                fa_version=2,
+            ).unsqueeze(0)
         else:
             out = self.attention_op.sdpa_fallback.forward(q, k, v, attn_metadata)
 
@@ -771,7 +804,9 @@ class OmniVoiceGenerator(nn.Module):
         self.layers = nn.ModuleList(
             [OmniVoiceTransformerBlock(config, layer_idx) for layer_idx in range(config.llm_num_hidden_layers)]
         )
-        self._needs_sdpa_mask = any(not layer.self_attn.use_packed_varlen for layer in self.layers)
+        self._needs_sdpa_mask = any(
+            not layer.self_attn.use_packed_varlen and layer.self_attn.fa2_varlen is None for layer in self.layers
+        )
         self.norm = OmniVoiceRMSNorm(config.llm_hidden_size, eps=config.llm_rms_norm_eps)
 
         # Prediction head: hidden → 8 * 1025

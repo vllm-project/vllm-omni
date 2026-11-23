@@ -35,8 +35,6 @@ def test_bagel_img2img_kv_transfer_preserves_compressed_rope(monkeypatch):
 
     model = object.__new__(OmniBagelForConditionalGeneration)
     torch.nn.Module.__init__(model)
-    model._pending_img2img_info = [(6, 4, 32, 32)] * 2
-    model._last_img2img_info = (6, 4, 32, 32)
     model._ropes_pending, model._ropes_metadata = [], {}
     model._img2img_token_id = 99
     # Substitute only the attention kernels; keep Bagel's real position rewrite.
@@ -72,7 +70,13 @@ def test_bagel_img2img_kv_transfer_preserves_compressed_rope(monkeypatch):
     )
 
     def forward(_runner, *_args, **_kwargs):
-        model(input_ids, positions, inputs_embeds=torch.zeros(29, 2))
+        model(
+            input_ids,
+            positions,
+            inputs_embeds=torch.zeros(29, 2),
+            seq_token_counts=lengths,
+            img2img_layouts=[(6, 4, 32, 32), None, (6, 4, 32, 32)],
+        )
         runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=req_ids))
         return None
 
@@ -150,9 +154,6 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
 
     model = object.__new__(OmniBagelForConditionalGeneration)
     torch.nn.Module.__init__(model)
-    # Encoder profiling and earlier image requests leave this image geometry.
-    model._pending_img2img_info = []
-    model._last_img2img_info = (6, 4, 32, 32)
     model._ropes_pending = []
     live_metadata = {"ropes": [7], "image_shape": [32, 32]}
     model._ropes_metadata = {"live": live_metadata}
@@ -172,7 +173,13 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
     def parent_forward(_runner, scheduler_output, *_args, **_kwargs):
         n = scheduler_output.tokens
         # Keep the real Bagel forward, position rewrite and pending producer.
-        model(torch.full((n,), 99), torch.arange(n), inputs_embeds=torch.zeros(n, 2))
+        model(
+            torch.full((n,), 99),
+            torch.arange(n),
+            inputs_embeds=torch.zeros(n, 2),
+            seq_token_counts=[n],
+            img2img_layouts=[(6, 4, 32, 32)],
+        )
         runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=scheduler_output.req_ids))
         return None
 
@@ -180,7 +187,13 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
     excluded = SimpleNamespace(tokens=12, req_ids=["excluded"])
     if step == "capture":
         # Native graph capture invokes the model directly, bypassing the runner.
-        model(torch.full((12,), 99), torch.arange(12), inputs_embeds=torch.zeros(12, 2))
+        model(
+            torch.full((12,), 99),
+            torch.arange(12),
+            inputs_embeds=torch.zeros(12, 2),
+            seq_token_counts=[12],
+            img2img_layouts=[(6, 4, 32, 32)],
+        )
     elif step == "failed":
         with pytest.raises(RuntimeError, match="attention failed after position metadata"):
             runner.execute_model(excluded)
@@ -198,7 +211,28 @@ def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, 
     }
     assert model._ropes_pending == []
     assert model._ropes_metadata["live"] is live_metadata
-    assert model._last_img2img_info == (6, 4, 32, 32)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("num_tokens", "max_num_reqs", "max_model_len", "expected_tokens"),
+    [
+        (32768, 1, 22800, 22800),
+        (32768, 2, 22800, 32768),
+        (32768, 2, 8192, 16384),
+        (16384, 2, 8192, 16384),
+        (1, 1, 22800, 1),
+    ],
+)
+def test_dummy_run_respects_context_capacity(mocker, num_tokens, max_num_reqs, max_model_len, expected_tokens):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.max_num_reqs = max_num_reqs
+    runner.max_model_len = max_model_len
+    parent_run = mocker.patch.object(
+        omni_ar_model_runner.OmniGPUModelRunner, "_dummy_run", return_value=mocker.sentinel.outputs
+    )
+    assert runner._dummy_run(num_tokens, skip_attn=False, context_len=0) is mocker.sentinel.outputs
+    parent_run.assert_called_once_with(expected_tokens, skip_attn=False, context_len=0)
 
 
 class _FakeStream:
@@ -380,8 +414,13 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     # Exercise the deferred structured-output branch in one existing matrix
     # case without doubling the full orchestration parametrization.
     requires_multimodal_postprocess = not needs_history and include_hidden is None and engine_output_type == "text"
+
+    def compute_prompt_logits(hidden):
+        return hidden
+
     runner.model = SimpleNamespace(
         compute_logits=lambda hidden: hidden,
+        compute_prompt_logits=compute_prompt_logits,
         logitsprocs_need_output_token_ids=needs_history,
         postprocess_requires_multimodal_outputs=requires_multimodal_postprocess,
     )
@@ -411,6 +450,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
 
     assert runner.sample_tokens(None) is mock_out
+    assert logprobs_mock.call_args.args[0] is compute_prompt_logits
     if requires_multimodal_postprocess:
         runner.model_state.run_postprocess.assert_called_once_with(text_hidden, input_batch, multimodal_outputs)
     else:
