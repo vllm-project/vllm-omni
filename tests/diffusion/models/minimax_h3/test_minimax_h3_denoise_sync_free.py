@@ -89,9 +89,19 @@ def test_index_row_updates_match_boolean_masks(device: str) -> None:
         values = torch.randn(int(mask.sum()), 48, device=device)
         expected, actual = rows.clone(), rows.clone()
         expected[mask] = values
-        _assign_rows(actual, index, mask, values)
+        _assign_rows(actual, index, values)
         assert torch.equal(actual, expected)
         assert torch.equal(rows.index_select(0, index), rows[mask])
+
+
+@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("values_shape", [(1, 48), (48,), (59, 48), (60, 47)])
+def test_assign_rows_rejects_values_not_sized_to_target_rows(device: str, values_shape: tuple) -> None:
+    rows = torch.zeros(100, 48, device=device)
+    index = torch.arange(60, device=device)
+    with pytest.raises(ValueError, match="target row values have shape"):
+        _assign_rows(rows, index, torch.ones(values_shape, device=device))
+    assert not rows.any()
 
 
 @hardware_test(res={"cuda": "L4"})
@@ -114,7 +124,7 @@ def test_step_kwargs_do_not_synchronize() -> None:
             audio_ref_cond_timestep=0.95,
         )
         target = video_rows.index_select(0, branch.update_idx_dev)
-        _assign_rows(video_rows, branch.update_idx_dev, branch.update_mask_dev, target * 0.5)
+        _assign_rows(video_rows, branch.update_idx_dev, target * 0.5)
     finally:
         torch.cuda.set_sync_debug_mode("default")
 

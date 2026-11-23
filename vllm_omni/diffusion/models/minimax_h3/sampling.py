@@ -23,12 +23,17 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _assign_rows(rows: torch.Tensor, index: torch.Tensor, mask: torch.Tensor, values: torch.Tensor) -> None:
-    """``rows[mask] = values`` through the mask's precomputed row ``index``, which needs no host sync."""
-    if tuple(values.shape) == (index.shape[0], *rows.shape[1:]):
-        rows.index_copy_(0, index, values)
-    else:
-        rows[mask] = values
+def _assign_rows(rows: torch.Tensor, index: torch.Tensor, values: torch.Tensor) -> None:
+    """``rows[mask] = values`` through the mask's precomputed row ``index``, which needs no host sync.
+
+    Every caller passes one value row per target row (sampler latents and
+    locked audio rows are both sized to the target rows), so any other shape
+    is a bug and raises instead of broadcasting.
+    """
+    expected = (index.shape[0], *rows.shape[1:])
+    if tuple(values.shape) != expected:
+        raise ValueError(f"target row values have shape {tuple(values.shape)}, expected {expected}")
+    rows.index_copy_(0, index, values)
 
 
 class MiniMaxH3Model:
@@ -58,10 +63,10 @@ class MiniMaxH3Model:
     def rows_for(self, latents):
         """Fill reusable model inputs; valid until this request's next prediction."""
         rows = self.model_rows
-        for row, mask, index, latent in zip(rows, self.masks, self.indices, latents, strict=True):
-            _assign_rows(row, index, mask, latent)
+        for row, index, latent in zip(rows, self.indices, latents, strict=True):
+            _assign_rows(row, index, latent)
         if self.branch.locked_audio_rows is not None:
-            _assign_rows(rows[1], self.indices[1], self.masks[1], self.branch.locked_audio_rows)
+            _assign_rows(rows[1], self.indices[1], self.branch.locked_audio_rows)
         return tuple(rows)
 
     @property
@@ -124,8 +129,8 @@ class MiniMaxH3Model:
 
     def write_back(self, state: SamplingState):
         """Write checked latents into the existing full video/audio rows."""
-        for row, mask, index, latent in zip(self.rows, self.masks, self.indices, state.latents, strict=True):
-            _assign_rows(row, index, mask, latent)
+        for row, index, latent in zip(self.rows, self.indices, state.latents, strict=True):
+            _assign_rows(row, index, latent)
         return self.rows
 
 
