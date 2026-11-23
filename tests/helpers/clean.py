@@ -15,6 +15,8 @@ import os
 import subprocess
 import time
 
+import psutil
+
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -223,8 +225,12 @@ def _print_device_processes() -> None:
         print("=" * 80)
 
 
-def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
-    """Tear down distributed state and reset device memory for tests."""
+def cleanup_test_environment(*, shutdown_ray: bool = False, wait_for_device_memory: bool = True) -> None:
+    """Tear down distributed state and reset device memory for tests.
+
+    Disable only the free-memory wait when fault-injection sidecars intentionally
+    hold device memory; distributed teardown and cache cleanup still run.
+    """
     from vllm import envs
     from vllm.distributed.parallel_state import (
         destroy_distributed_environment,
@@ -258,7 +264,7 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
             logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
 
     num_devices = current_omni_platform.device_count()
-    if num_devices > 0:
+    if num_devices > 0 and wait_for_device_memory:
         try:
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_devices)),
@@ -273,9 +279,39 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
         _print_device_processes()
 
 
+# Lower-cased process-title prefixes of the engine workers spawned under the test
+# process. vLLM titles its processes ``VLLM::EngineCore[_DP*]`` and
+# ``VLLM::Worker[_*]``; vLLM-Omni adds ``VLLM::StageEngineCoreProc_*`` and
+# ``vLLM-Omni::DiffusionWorker[_*]``. ``StageDiffusionProc`` sets no title, so it
+# cannot be recognised this way.
+ENGINE_WORKER_PROCESS_MARKERS: tuple[str, ...] = (
+    "vllm::enginecore",
+    "vllm::stageenginecoreproc",
+    "vllm::worker",
+    "vllm-omni::diffusionworker",
+)
+
+
+def is_engine_worker_process(proc: psutil.Process) -> bool:
+    """True when the title of *proc* starts with one of ``ENGINE_WORKER_PROCESS_MARKERS``.
+
+    ``setproctitle`` rewrites ``argv[0]``; the kernel name is cut to 15
+    characters, so it is only read when the cmdline is empty. A marker in a
+    later argument (``python -c ... vllm::worker``) does not match.
+    """
+    try:
+        cmdline = proc.cmdline()
+        title = (cmdline[0] if cmdline and cmdline[0] else proc.name()).lower()
+    except psutil.Error:
+        return False
+    return title.startswith(ENGINE_WORKER_PROCESS_MARKERS)
+
+
 __all__ = [
+    "ENGINE_WORKER_PROCESS_MARKERS",
     "cleanup_test_environment",
     "get_physical_device_indices",
+    "is_engine_worker_process",
     "pick_least_used_device_indices",
     "wait_for_gpu_memory_to_clear",
 ]

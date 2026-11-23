@@ -23,9 +23,10 @@ import torch
 from vllm import ir
 from vllm.config import VllmConfig, set_current_vllm_config
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 # ---------------------------------------------------------------------------
 # Constants

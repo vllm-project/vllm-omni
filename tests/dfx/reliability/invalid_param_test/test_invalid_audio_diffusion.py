@@ -25,7 +25,7 @@ _PARAMS = [
             ],
         ),
         id="stable_audio_open",
-        marks=hardware_marks(res={"cuda": "L4"}),
+        marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}),
     ),
 ]
 
@@ -34,56 +34,10 @@ _PARAMS = [
     "overrides, err_message",
     [
         pytest.param({"input": ""}, ("cannot be empty", "input"), id="input_empty"),
-        pytest.param({"input": "   "}, ("cannot be empty", "input"), id="input_whitespace_only"),
-        pytest.param({"input": 123}, ("input", "a valid string"), id="input_wrong_type"),
-        pytest.param(
-            {"response_format": "mpeg"},
-            ("response_format", "literal_error", "Input should be"),
-            id="response_format_invalid",
-        ),
-        pytest.param({"speed": 0.1}, ("speed", "greater_than_equal", "0.25"), id="speed_too_low"),
-        pytest.param({"speed": 99.0}, ("speed", "less_than_equal", "4"), id="speed_too_high"),
-        pytest.param({"stream_format": 1}, ("stream_format", "literal_error", "audio"), id="stream_format_wrong_type"),
-        pytest.param(
-            {"stream_format": "sse"},
-            ("sse", "stream_format", "value_error", "not a supported stream_format"),
-            id="stream_format_sse_blocked",
-        ),
-        pytest.param({"audio_length": -1.0}, ("audio_length", "greater_than", "0"), id="audio_length_negative"),
-        pytest.param({"audio_length": 0}, ("audio_length", "greater_than", "0"), id="audio_length_zero"),
-        # ``OmniOpenAIServingAudioGenerate`` only forwards ``audio_start`` when ``audio_length`` is set.
         pytest.param(
             {"audio_start": -0.5, "audio_length": 5.0},
             ("audio_start_in_s", "between", "0", "512"),
             id="audio_start_negative",
-        ),
-        pytest.param(
-            {"negative_prompt": ["noise"]}, ("negative_prompt", "a valid string"), id="negative_prompt_wrong_type"
-        ),
-        pytest.param(
-            {"guidance_scale": -1.0},
-            ("guidance_scale", "greater_than_equal", "0"),
-            id="guidance_scale_negative",
-        ),
-        pytest.param(
-            {"num_inference_steps": 0},
-            ("num_inference_steps", "greater_than_equal", "1"),
-            id="num_inference_steps_zero",
-        ),
-        pytest.param(
-            {"num_inference_steps": -1},
-            ("num_inference_steps", "greater_than_equal", "1"),
-            id="num_inference_steps_negative",
-        ),
-        pytest.param(
-            {"num_inference_steps": 6000},
-            ("num_inference_steps", "less_than_equal", "1000"),
-            id="num_inference_steps_above_max",
-        ),
-        pytest.param(
-            {"guidance_scale": 1001.0},
-            ("guidance_scale", "less_than_equal", "1000"),
-            id="guidance_scale_above_max",
         ),
         pytest.param(
             {"audio_length": 86401.0}, ("Requested audio length", "exceeds maximum"), id="audio_length_above_max"

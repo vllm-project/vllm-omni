@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import torch
+from cache_dit import ForwardPattern
 
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 
@@ -15,6 +17,12 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
 
     This adapter reuses the shared Z-Image DiT and injects Ming-specific request conditions.
     """
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={"layers": ForwardPattern.Pattern_3},
+        has_separate_cfg=False,
+        check_forward_pattern=False,
+    )
 
     def forward(
         self,

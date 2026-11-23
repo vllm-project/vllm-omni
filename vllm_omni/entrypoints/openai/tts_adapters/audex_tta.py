@@ -37,22 +37,25 @@ class AudexTTAAdapter(ARTTSAdapter):
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._tokenizer = None
-        self._tta_rvq = None
+        self._tta_rvq: dict[str, object] | None = None
 
     def _get_tokenizer(self):
         """Load and cache the tokenizer used only by the Audex TTA adapter."""
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
+            from vllm_omni.model_executor.models.audex.checkpoint import (
+                ensure_audex_snapshot,
+                load_audex_tokenizer,
+            )
 
-            from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
-
-            model_path = os.path.normpath(self.ctx.engine_client.model_config.model)
+            engine_client = self.ctx.engine_client
+            assert engine_client is not None
+            model_path = os.path.normpath(engine_client.model_config.model)
             root = (
                 os.path.dirname(model_path)
                 if os.path.basename(model_path).startswith("checkpoint_folder")
                 else ensure_audex_snapshot(model_path, profile="tta")
             )
-            self._tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"))
+            self._tokenizer = load_audex_tokenizer(os.path.join(root, "checkpoint_folder_audiogen"))
         return self._tokenizer
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:

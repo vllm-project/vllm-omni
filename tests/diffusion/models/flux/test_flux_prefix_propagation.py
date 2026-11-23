@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that FLUX transformer blocks correctly propagate `quant_config` and
 `prefix` through all sub-layers.
 
@@ -9,9 +9,8 @@ prefix rooted at the block prefix.  This is critical for quantized weight loadin
 to match checkpoint keys to the correct model parameters.
 """
 
-import os
-
 import pytest
+from vllm.utils.network_utils import get_file_store_init_method
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -31,17 +30,18 @@ def _init_distributed():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    # A fresh file store avoids the free-port probe/bind race of env://.
     init_distributed_environment(
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method="env://",
+        distributed_init_method=get_file_store_init_method(),
     )
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    try:
+        initialize_model_parallel()
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
 
 
 def _param_names(module) -> set[str]:
@@ -104,7 +104,7 @@ def test_flux_single_transformer_block_passes_prefix():
         f"norm.linear.* not found in params: {sorted(params)}"
     )
 
-    # proj_mlp (ReplicatedLinear) should have weight
+    # proj_mlp (ColumnParallelLinear) should have weight
     assert any(name.startswith("proj_mlp.") for name in params), f"proj_mlp.* not found in params: {sorted(params)}"
 
     # attn should have QKV projection

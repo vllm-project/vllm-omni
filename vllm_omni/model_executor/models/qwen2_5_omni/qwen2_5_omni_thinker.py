@@ -5,6 +5,7 @@
 
 import hashlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -23,6 +24,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.inputs import MultiModalHashes
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -34,7 +36,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    check_interleaved_audio_video,
     create_qwen2_5_omni_thinker_field_factory,
     merge_interleaved_embeddings,
 )
@@ -78,7 +79,7 @@ from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems, Vide
 from vllm.multimodal.processing.context import TimingContext
 from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.multimodal.processing.processor import (
-    MultiModalProcessingInfo,
+    MultiModalProcessingResult,
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
     PromptReplacement,
@@ -88,7 +89,9 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.quantization.component_config import (
+    ComponentQuantizationConfig,
     resolve_encoder_quant_config,
 )
 
@@ -367,7 +370,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """Apply omni-specific HF kwargs before the upstream Qwen2.5-Omni
         processor runs.
@@ -378,23 +381,30 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         per-video ``use_audio_in_video`` mask handling have to run here.
         """
         valid_mm_items = mm_items.select({k for k, c in mm_items.get_all_counts().items() if c > 0})
-        processor_data, _ = self._get_hf_mm_data(valid_mm_items)
+        # Upstream removed `_get_hf_mm_data`; extract the raw processor data
+        # (still keyed as `videos`/`video_metadata`/`audios`) for the omni
+        # kwargs helpers below, instead of `_get_hf_mm_inputs` which renames
+        # and injects a dummy text key.
+        processor_data: dict[str, object] = {}
+        for items in valid_mm_items.values():
+            if items:
+                processor_data.update(items.get_processor_data())
 
-        hf_processor_mm_kwargs = _presampled_videos_hf_kwargs(
+        hf_kwargs = _presampled_videos_hf_kwargs(
             processor_data,
-            hf_processor_mm_kwargs,
+            hf_kwargs,
         )
-        hf_processor_mm_kwargs = _coerce_use_audio_in_video_for_hf_processor(
+        hf_kwargs = _coerce_use_audio_in_video_for_hf_processor(
             processor_data,
-            hf_processor_mm_kwargs,
+            hf_kwargs,
         )
 
         processed_data = super()._apply_hf_processor_main(
             mm_items,
-            hf_processor_mm_kwargs,
+            hf_kwargs,
         )
 
-        per_video_mask = hf_processor_mm_kwargs.get(_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY)
+        per_video_mask = hf_kwargs.get(_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY)
         if per_video_mask is not None:
             processed_data["use_audio_in_video"] = torch.tensor(per_video_mask)
         return processed_data
@@ -564,32 +574,6 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
             ),
         ]
 
-    def _apply_hf_processor_mm_only(
-        self,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ):
-        mm_counts = mm_items.get_all_counts()
-
-        if "video" in mm_counts:
-            video_use_audio_in_video = _get_request_video_use_audio_in_video(
-                hf_processor_mm_kwargs,
-                mm_counts["video"],
-            )
-            if any(video_use_audio_in_video):
-                assert "audio" in mm_counts
-                mm_counts["audio"] -= sum(video_use_audio_in_video)
-
-        _, mm_processed_data, _ = self._apply_hf_processor_text_mm(
-            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-        )
-
-        return mm_processed_data
-
     def _get_audio_in_video_pairs(
         self,
         mm_data_items: MultiModalDataItems,
@@ -639,14 +623,14 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
-    ) -> MultiModalProcessingInfo:
+    ) -> MultiModalProcessingResult:
         """Cache-aware: processes video/audio pairs as units,
         using pair-specific cache keys. Falls back to standard cache if no pairs."""
 
-        cache = self.cache
+        cache = inputs.cache
 
-        _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
-        if cache is None or passthrough_data:
+        has_passthrough_data = any(len(items.get_passthrough_data()) > 0 for items in inputs.mm_data_items.values())
+        if cache is None or has_passthrough_data:
             return self._apply_hf_processor(inputs, timing_ctx)
 
         aiv_pairs = self._get_audio_in_video_pairs(
@@ -694,7 +678,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         with timing_ctx.record("apply_hf_processor"):
             mm_missing_processed_data = self._apply_hf_processor_main(
                 mm_items=mm_missing_data_items,
-                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                hf_kwargs=hf_processor_mm_kwargs,
             )
 
         mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
@@ -720,7 +704,8 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
                 mm_missing_prompt_updates=mm_missing_prompt_updates,
             )
 
-        mm_info = MultiModalProcessingInfo(
+        mm_info = MultiModalProcessingResult(
+            prompt_ids=self._postprocess_prompt(inputs.prompt),
             kwargs=mm_kwargs,
             hashes=mm_hashes,
             prompt_updates=mm_prompt_updates,
@@ -819,11 +804,12 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
     def _maybe_apply_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
-        prompt_ids: list[int],
-        mm_kwargs: MultiModalKwargsItems,
-        mm_prompt_updates: MultiModalPromptUpdates,
+        mm_res: MultiModalProcessingResult,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         mm_item_counts = mm_items.get_all_counts()
+        prompt_ids = mm_res.prompt_ids
+        mm_kwargs = mm_res.kwargs
+        mm_prompt_updates = mm_res.prompt_updates
         self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
         self._validate_mm_updates(mm_prompt_updates, mm_item_counts)
 
@@ -1078,13 +1064,26 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 "in the audio tower part."
             )
 
-        self.quant_config = quant_config
+        # Online quantization (e.g. --quantization fp8 on a BF16 checkpoint)
+        # only targets the Thinker LM. Serialized checkpoint configs are kept
+        # as they are: pre-quantized ones (modelopt NVFP4/FP8/MXFP8) leave the
+        # vision encoder in BF16 without scale tensors, so it gets None there.
+        visual_prefix = maybe_prefix(prefix, "visual")
+        language_prefix = maybe_prefix(prefix, "language_model")
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            visual_quant_config = quant_config.resolve(visual_prefix)
+        elif isinstance(quant_config, OnlineQuantizationConfig):
+            quant_config = ComponentQuantizationConfig(
+                component_configs={language_prefix: quant_config},
+                default_config=None,
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+            visual_quant_config = None
+        else:
+            visual_quant_config = resolve_encoder_quant_config(quant_config)
 
-        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
-        # the Thinker LM. Vision encoder weights remain in BF16 with no FP8
-        # scale tensors; passing quant_config causes FP8 kernels to run on
-        # BF16 weights, producing garbage embeddings. Keep None for encoders.
-        visual_quant_config = resolve_encoder_quant_config(quant_config)
+        self.vllm_config = vllm_config
+        self.quant_config = quant_config
 
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
@@ -1098,7 +1097,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                     vision_config=thinker_config.vision_config,
                     norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
                     quant_config=visual_quant_config,
-                    prefix=maybe_prefix(prefix, "visual"),
+                    prefix=visual_prefix,
                 )
             else:
                 self.visual = None
@@ -1106,7 +1105,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "language_model"),
+                prefix=language_prefix,
                 hf_config=thinker_config.text_config,
                 architectures=["Qwen2ForCausalLM"],
             )
@@ -1365,8 +1364,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         video_token_id = self.config.video_token_index
         audio_token_id = self.config.audio_token_index
 
-        # The interleaving check reads scalar positions in a Python loop.
-        # Keep its masks on CPU to avoid repeated CUDA synchronization.
+        # Keep the masks on CPU: the counts below and the per-modality counts
+        # in merge_interleaved_embeddings then read back without CUDA syncs.
         input_ids_cpu = input_ids.cpu()
         is_video = is_multimodal & (input_ids_cpu == video_token_id)
         is_audio = is_multimodal & (input_ids_cpu == audio_token_id)

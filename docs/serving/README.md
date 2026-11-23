@@ -12,6 +12,11 @@ This guide focuses on vLLM-Omni's primary task endpoints. Compatible models
 may also expose standard routes inherited from vLLM, such as
 `POST /v1/completions`; those routes remain model- and task-dependent.
 
+`POST /tokenize`, `POST /detokenize`, and the opt-in `GET /tokenizer_info`
+require a model with a configured tokenization handler. Pure diffusion servers
+do not expose these routes and return HTTP 404; token counting is unavailable
+for those servers.
+
 ## Start and Verify the Server
 
 Start a model with the shared serving command:
@@ -36,6 +41,47 @@ Use `http://localhost:8091/v1` as the `base_url` for an OpenAI SDK client. If
 the server was started with `--api-key`, include an `Authorization` header with
 `Bearer <api-key>` in requests.
 
+## Browser Access (CORS)
+
+A web page calling the server directly from another origin needs CORS
+permission. vLLM-Omni inherits vLLM's CORS middleware and CLI options. By
+default, `--allowed-origins` is an empty list: no cross-origin browser access
+is allowed. Server-to-server clients, including Python SDKs, do not require
+CORS configuration.
+
+For a local web page served on port 8000 and an API server on port 8091:
+
+```bash
+vllm serve <model> --omni --host 127.0.0.1 --port 8091 \
+  --allowed-origins '["http://localhost:8000", "http://127.0.0.1:8000"]' \
+  --allowed-methods '["GET", "POST"]' \
+  --allowed-headers '["Content-Type", "Authorization"]'
+```
+
+An origin is a scheme, hostname, and port, with no path or trailing slash.
+`localhost` and `127.0.0.1` are different origins, as are different ports or
+schemes. The options above accept JSON lists. `--allowed-methods` and
+`--allowed-headers` default to `["*"]`; this example restricts both.
+`--allow-credentials` is disabled by default. Enable it only when the browser
+needs credentialed requests, such as cookies, and use explicit allowed origins.
+
+Check a browser-style preflight request before sending a generation request:
+
+```bash
+curl -i -X OPTIONS http://127.0.0.1:8091/v1/models \
+  -H 'Origin: http://localhost:8000' \
+  -H 'Access-Control-Request-Method: GET' \
+  -H 'Access-Control-Request-Headers: authorization'
+```
+
+With the configuration above, this returns HTTP 200 and
+`Access-Control-Allow-Origin: http://localhost:8000`. An unlisted origin,
+method, or header fails preflight with HTTP 400. An ordinary request from an
+unlisted origin can still execute and return HTTP 200 without an allow-origin
+header; the browser prevents the page from reading that response. CORS is not
+authentication or network access control. Keep a local-only server bound to
+loopback, and configure authentication separately when exposing it.
+
 ## Choose a Core HTTP Endpoint
 
 Prefer a task-specific endpoint when one matches your workload. Use Chat
@@ -49,6 +95,9 @@ the default wrapper for every generation task.
 | Sound, music, or ambient audio generation | `POST /v1/audio/generate` | JSON | Audio bytes | [Audio Generation](audio_generate_api.md) |
 | Text-to-image | `POST /v1/images/generations` | JSON | Base64 JSON or an image file | [Image Generation](image_generation_api.md) |
 | Image editing | `POST /v1/images/edits` | Multipart form | Base64 JSON or SSE | [Image Edit](image_edit_api.md) |
+| Promptable image segmentation | `POST /v1/images/segmentations` | Multipart form | Instance masks, boxes, scores (JSON) | [Image Segmentation](image_segmentation_api.md) |
+| Video concept segmentation and tracking | `POST /v1/videos/segmentations` | Multipart form | Per-frame tracked instance masks, boxes, scores (JSON); optional mask videos | [Video Segmentation](video_segmentation_api.md) |
+| Video depth estimation | `POST /v1/videos/depth` | Multipart form | Per-frame depth as a rendered MP4; optional raw float16 depth (NPZ) | [Video Depth](video_depth_api.md) |
 | Video generation (recommended) | `POST /v1/videos` | Multipart form | Asynchronous job JSON | [Videos](videos_api.md) |
 | Video generation (blocking) | `POST /v1/videos/sync` | Multipart form | Video bytes | [Videos](videos_api.md#synchronous-response) |
 
@@ -144,7 +193,7 @@ interchangeably.
 | ---------- | ---------- | ------------------- | --------- |
 | Incremental text input for speech synthesis | `WS /v1/audio/speech/stream` | Send text events and receive audio | [Streaming Text to Speech](speech_api.md#streaming-text-input-websocket) |
 | Live video understanding | `WS /v1/video/chat/stream` | Send video frames and receive text/audio | [Streaming Video Input](video_stream_api.md) |
-| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_api.md) |
+| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_openai_duplex_api.md) |
 | Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`) | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
 | Generated video chunks | `WS /v1/realtime/video` | Start a diffusion request and receive fragmented MP4 | [Streaming Video Output](streaming_video_output_api.md) |
 | Robot policy inference | `WS /v1/realtime/robot/openpi` | Send MessagePack observations and receive action arrays | [OpenPI Robot Policy](openpi_api.md) |
@@ -154,18 +203,16 @@ All six routes are model- or configuration-dependent. In particular,
 pipeline declares a `duplex_plugin` and its deploy configuration sets
 `session_mode: duplex` (with `session_mode: turn` the same model boots the
 ordinary turn-based serving stack instead). On a duplex server a stock
-Realtime client needs no vendor query parameter; `duplex=0` selects the
-turn-based Realtime handler, which a duplex server does not mount, so that
-connection is refused with `Realtime API is not available`. Such a server
-serves the websocket route plus `POST /v1/chat/completions`, `/v1/models`
-and `/health`, and no other turn-based HTTP route. The chat route is the
-ordinary chat service running on the duplex engine: a request is a
-turn-based generation on the same stages, served alongside the live
-websocket sessions; it opens no duplex session and holds no
-`duplex_session.max_sessions` slot -- see [Full Duplex](full_duplex_api.md).
-On a server that is not duplex, an explicit `?duplex=1` is refused rather
-than answered by the turn-based handler, so a client that requested duplex
-never silently gets the other protocol.
+Realtime client needs no vendor query parameter; `duplex=0` opts out of native
+duplex and selects the turn-based Realtime handler. It runs generation on the
+same stages, alongside live websocket sessions, and opens no duplex session
+or consumes a `duplex_session.max_sessions` slot -- see
+[Full Duplex](full_duplex_api.md).
+Such a server serves the websocket route plus `POST /v1/chat/completions`,
+`/v1/models` and `/health`, and no other turn-based HTTP route. On a server
+that is not duplex, an explicit `?duplex=1` is refused rather than answered by
+the turn-based handler, so a client that requested duplex never silently gets
+the other protocol.
 
 ## Related Endpoints
 
@@ -177,6 +224,7 @@ never silently gets the other protocol.
 | TTS voice management | `GET/POST /v1/audio/voices`, `DELETE /v1/audio/voices/{name}` | [Voices](speech_api.md#voices-endpoint) |
 | Video job lifecycle | `GET /v1/videos`, `GET/DELETE /v1/videos/{video_id}`, `GET /v1/videos/{video_id}/content` | [Video endpoints](videos_api.md#endpoints) |
 | Release and restore stage memory | `POST /v1/omni/sleep`, `POST /v1/omni/wakeup` | [Sleep Mode](../features/sleep_mode.md) |
+| Run one stage per call (experimental) | `POST /v1/run` | [Independent Stage Execution](../features/independent_stage_execution.md) |
 
 ## Standalone Experimental Servers
 

@@ -103,7 +103,7 @@ def test_block_hashing_uses_upstream_extra_keys_directly(monkeypatch):
     # Independent expected native extras: a crossing item has a negative
     # relative offset; a block can include the end of one item and the next.
     first, second = (feature.identifier for feature in row.mm_features)
-    extras = [((first, 2),), ((first, -2), (second, 3)), ((second, -1),)]
+    extras = [(("mm", first, 2),), (("mm", first, -2), ("mm", second, 3)), (("mm", second, -1),)]
     parent = BlockHash(hash_fn(("diffusion-prefix-root-v1", row.cache_namespace)))
     expected = []
     for start, keys in zip(range(0, 12, 4), extras, strict=True):

@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 # Small mock dimensions (head_dim = HIDDEN_SIZE / NUM_HEADS = 16 must equal
 # sum(AXES_DIM_ROPE)).
@@ -133,12 +136,14 @@ def _tiny_od_config(**overrides):
     )
 
 
+@pytest.mark.cpu
 def test_boogu_image_transformer_import():
     from vllm_omni.diffusion.models.boogu_image import BooguImageTransformer2DModel
 
     assert BooguImageTransformer2DModel is not None
 
 
+@pytest.mark.cpu
 def test_real_rotary_emb_matches_complex_reference():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import apply_rotary_emb
 
@@ -158,6 +163,7 @@ def test_real_rotary_emb_matches_complex_reference():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.cpu
 def test_real_rotary_frequency_tables_are_real_and_repeated():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageDoubleStreamRotaryPosEmbed,
@@ -175,6 +181,7 @@ def test_real_rotary_frequency_tables_are_real_and_repeated():
         torch.testing.assert_close(freqs_sin[..., ::2], freqs_sin[..., 1::2])
 
 
+@pytest.mark.cpu
 def test_real_rotary_frequency_tables_use_float32_on_npu(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
 
@@ -188,6 +195,7 @@ def test_real_rotary_frequency_tables_use_float32_on_npu(monkeypatch):
     assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
 
 
+@pytest.mark.cpu
 def test_real_rotary_frequency_tables_use_float32_on_mps(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
 
@@ -205,6 +213,7 @@ def test_real_rotary_frequency_tables_use_float32_on_mps(monkeypatch):
     assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
 
 
+@pytest.mark.cpu
 def test_single_stream_block_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformerBlock,
@@ -235,6 +244,7 @@ def test_single_stream_block_shape():
         block(hidden_states, attention_mask, rotary_emb, None)
 
 
+@pytest.mark.cpu
 def test_single_stream_block_no_modulation():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformerBlock,
@@ -258,6 +268,7 @@ def test_single_stream_block_no_modulation():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu
 def test_double_stream_block_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageDoubleStreamTransformerBlock,
@@ -304,6 +315,7 @@ def test_double_stream_block_shape():
     assert torch.isfinite(instruct_out).all()
 
 
+@pytest.mark.cpu
 def test_transformer_instantiates():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -369,6 +381,7 @@ def recording_quant_config():
     return RecordingQuantConfig()
 
 
+@pytest.mark.cpu
 def test_transformer_propagates_quant_config_and_prefix(recording_quant_config):
     from vllm.model_executor.layers.linear import LinearBase
 
@@ -400,6 +413,7 @@ def test_transformer_propagates_quant_config_and_prefix(recording_quant_config):
     }
 
 
+@pytest.mark.cpu
 def test_transformer_preprocesses_multiple_instruction_feature_layers():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -422,6 +436,7 @@ def test_transformer_preprocesses_multiple_instruction_feature_layers():
     assert torch.equal(processed, torch.cat(hidden_states, dim=-1))
 
 
+@pytest.mark.cpu
 def test_transformer_validates_rope_dims():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -431,6 +446,7 @@ def test_transformer_validates_rope_dims():
         BooguImageTransformer2DModel(od_config=_tiny_od_config(axes_dim_rope=[8, 8, 8]))
 
 
+@pytest.mark.cpu
 def test_transformer_rejects_prompt_tuning():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -494,6 +510,7 @@ def _native_to_checkpoint_weights(name: str, param: torch.Tensor) -> list[tuple[
     return [(name, param)]
 
 
+@pytest.mark.cpu
 def test_transformer_exposes_stacked_params_mapping():
     """The packed -> sub-layer mapping must be discoverable from the module tree.
 
@@ -522,6 +539,7 @@ def test_transformer_exposes_stacked_params_mapping():
     assert mapped_leaves == {"to_qkv", "img_to_qkv", "instruct_to_qkv", "gate_up_proj"}
 
 
+@pytest.mark.cpu
 def test_transformer_load_weights_round_trip():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -555,6 +573,7 @@ def test_transformer_load_weights_round_trip():
         assert torch.allclose(reloaded[native_name], expected[native_name])
 
 
+@pytest.mark.cpu
 def test_transformer_load_weights_rejects_partial_fused_params():
     """A fused parameter must not count as loaded until all its shards arrive.
 
@@ -585,6 +604,7 @@ def test_transformer_load_weights_rejects_partial_fused_params():
     assert partial_name not in loaded
 
 
+@pytest.mark.cpu
 def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -627,6 +647,7 @@ def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
     assert next(name for name in native_params if name != loaded_name) in text
 
 
+@pytest.mark.cpu
 def test_transformer_forward_t2i_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageDoubleStreamRotaryPosEmbed,
@@ -656,6 +677,7 @@ def test_transformer_forward_t2i_shape():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu
 def test_transformer_forward_ti2i_shape():
     """Editing path: a non-empty ``ref_image_hidden_states`` exercises the
     reference-image patch embedder + refiner and must not change the output
@@ -699,6 +721,117 @@ def test_transformer_forward_ti2i_shape():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu
+def test_transformer_forward_batch_invariant_to_partner_padding():
+    """Row A must not change when only row B's padded length changes.
+
+    Both rows carry a non-empty reference image (the TI2I/editing path), so
+    this exercises the reference-image refiner and the joint
+    instruction/reference/noise sequence concatenation and position
+    offsets -- not just the T2I path, which skips the reference refiner
+    entirely and would leave that concatenation logic uncovered. Real
+    attention masking, RoPE, and sequence concatenation are exercised
+    end-to-end through the actual (tiny) weights -- the mechanism the CPU
+    pipeline-level fakes in ``test_pipeline_boogu_image.py`` cannot reach,
+    since those stop at a fake encoder/transformer boundary. A's instruction
+    content, reference latent, and attention mask are held byte-identical
+    across runs; only B's padded region grows.
+    """
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+        BooguImageTransformer2DModel,
+    )
+
+    torch.manual_seed(0)
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    _randomize_parameters(model)
+    # _randomize_parameters' uniform(-0.02, 0.02) scale (tuned for the other
+    # shape/finite-value tests in this file) makes the instruction stream's
+    # contribution to the final output smaller than float32 rounding noise
+    # after 4 layers of untrained mixing with the image latents -- both the
+    # invariance check and the negative control below were passing/failing
+    # vacuously at that scale (diffs ~1e-6) until confirmed via a scaled-up
+    # diagnostic that masking is in fact respected; amplify locally so a real
+    # masking regression is distinguishable from noise.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.mul_(20.0)
+    model.eval()
+
+    batch_size = 2
+    in_channels = 4
+    latent_h = latent_w = 8
+    instruction_feat_dim = 32
+    a_len = 5
+
+    torch.manual_seed(0)
+    latents = torch.randn(batch_size, in_channels, latent_h, latent_w)
+    timestep = torch.full((batch_size,), 0.5)
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(model.axes_dim_rope, model.axes_lens, theta=10000)
+    a_content = torch.randn(a_len, instruction_feat_dim)
+    # Non-empty, fixed per-row reference latents route both rows through the
+    # TI2I reference-image refiner and the joint instruction/reference/noise
+    # concatenation, rather than the T2I path (which skips both entirely).
+    a_ref = torch.randn(in_channels, 6, 10)
+    b_ref = torch.randn(in_channels, 6, 10)
+    ref_image_hidden_states = [[a_ref], [b_ref]]
+
+    def run(b_len, a_mask_len=a_len, a_tail_value=0.0):
+        """``a_mask_len`` marks how many of row A's leading positions are valid.
+
+        Real usage always leaves it at ``a_len``; the negative control below
+        widens it to include A's own padding tail so that tail's content
+        starts to matter, proving the invariance check exercises real
+        masking rather than an architecture that ignores trailing positions
+        regardless of the mask.
+        """
+        width = max(a_len, b_len)
+        instruction_hidden_states = torch.zeros(batch_size, width, instruction_feat_dim)
+        instruction_hidden_states[0, :a_len] = a_content
+        if width > a_len:
+            instruction_hidden_states[0, a_len:] = a_tail_value
+        torch.manual_seed(100 + b_len)
+        instruction_hidden_states[1, :b_len] = torch.randn(b_len, instruction_feat_dim)
+
+        instruction_attention_mask = torch.zeros(batch_size, width, dtype=torch.bool)
+        instruction_attention_mask[0, :a_mask_len] = True
+        instruction_attention_mask[1, :b_len] = True
+
+        with torch.no_grad():
+            return model(
+                latents,
+                timestep,
+                instruction_hidden_states,
+                freqs_real,
+                instruction_attention_mask,
+                ref_image_hidden_states=ref_image_hidden_states,
+            )
+
+    out_short_b = run(b_len=3)
+    out_long_b = run(b_len=8)  # B now sits in a much wider padded batch than A.
+
+    torch.testing.assert_close(
+        out_short_b[0],
+        out_long_b[0],
+        rtol=1e-4,
+        atol=1e-4,
+        msg="row A changed when only B's padded length grew",
+    )
+
+    # Negative control: mark A's own padding tail "valid" (mask length ==
+    # full width) and show that what sits there now measurably changes A's
+    # output -- a magnitude-based outlier there did not (SDPA masking makes
+    # softmax weight on a correctly-excluded position exactly zero regardless
+    # of its magnitude), so this instead varies the tail's *content* under a
+    # broken mask and checks the two runs diverge.
+    width = max(a_len, 8)
+    tail_x = torch.randn(width - a_len, instruction_feat_dim)
+    tail_y = torch.randn(width - a_len, instruction_feat_dim)
+    out_broken_x = run(b_len=8, a_mask_len=width, a_tail_value=tail_x)
+    out_broken_y = run(b_len=8, a_mask_len=width, a_tail_value=tail_y)
+    assert not torch.allclose(out_broken_x[0], out_broken_y[0], rtol=1e-4, atol=1e-4)
+
+
 # ---------------------------------------------------------------------------
 # The three tests below are for the fused qk-norm+RoPE kernel's wiring into
 # this transformer: the packed-table layout conversion, the fused path against
@@ -715,7 +848,7 @@ _FUSED_EPS = 1e-5
 
 
 def _fused_rotary_pair(tokens: int):
-    theta = torch.randn(1, tokens, _FUSED_HEAD_DIM // 2, device="cuda", dtype=torch.float32)
+    theta = torch.randn(1, tokens, _FUSED_HEAD_DIM // 2, device=DEVICE_TYPE, dtype=torch.float32)
     return (
         torch.cos(theta).repeat_interleave(2, dim=-1),
         torch.sin(theta).repeat_interleave(2, dim=-1),
@@ -727,8 +860,8 @@ def _fused_norms():
     from vllm.model_executor.layers.layernorm import RMSNorm
 
     with set_current_vllm_config(VllmConfig()):
-        norm_q = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
-        norm_k = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
+        norm_q = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).to(DEVICE_TYPE).to(torch.bfloat16)
+        norm_k = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).to(DEVICE_TYPE).to(torch.bfloat16)
     with torch.no_grad():
         norm_q.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
         norm_k.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
@@ -747,8 +880,8 @@ def _operand_ulp_bound(x, weight, cos, sin):
     return 2.0**-6 * torch.stack((even_mag, odd_mag), dim=-1).flatten(-2) + 1e-6
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 def test_packed_rope_table_layout(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         _with_packed_rope_table,
@@ -773,7 +906,7 @@ def test_packed_rope_table_layout(monkeypatch):
     assert len(short) == 2
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_qk_norm_rope_matches_eager_chain():
     """The fused path vs the previous eager chain at real Boogu shapes.
@@ -793,8 +926,8 @@ def test_fused_qk_norm_rope_matches_eager_chain():
 
     torch.manual_seed(0)
     norm_q, norm_k = _fused_norms()
-    q = torch.randn(1, 4139, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 4139, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 4139, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    k = torch.randn(1, 4139, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
     cos, sin = _fused_rotary_pair(4139)
     with_table = _with_packed_rope_table((cos, sin))
 
@@ -806,7 +939,7 @@ def test_fused_qk_norm_rope_matches_eager_chain():
         assert (diff <= bound).all(), "fused path beyond one operand ulp of the eager chain"
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fallback_with_no_packed_table():
     """Without a packed table the helper is bit-exact to the old chain."""
@@ -817,8 +950,8 @@ def test_fallback_with_no_packed_table():
 
     torch.manual_seed(0)
     norm_q, norm_k = _fused_norms()
-    q = torch.randn(1, 64, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 64, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 64, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    k = torch.randn(1, 64, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
     cos, sin = _fused_rotary_pair(64)
 
     out_q, out_k = _qk_norm_rope(q, k, norm_q, norm_k, (cos, sin), torch.bfloat16)
@@ -828,6 +961,7 @@ def test_fallback_with_no_packed_table():
     assert torch.equal(out_k, ref_k)
 
 
+@pytest.mark.cpu
 def test_packed_rope_table_env_override(monkeypatch):
     """VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS steers the packing gate: 0 packs
     even a 43-token table, a huge value leaves a 4139-token table untouched,

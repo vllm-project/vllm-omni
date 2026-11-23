@@ -6,12 +6,20 @@
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from .omni_duplex_eval_clock import normalize_response_items, validate_clock
+from .omni_duplex_eval_clock import (
+    has_response_chunks,
+    normalize_response_chunks,
+    normalize_response_items,
+    validate_clock,
+)
 from .omni_duplex_eval_dataset import DuplexSample
-from .omni_duplex_eval_judge import DuplexJudge
+from .omni_duplex_eval_judge import DuplexJudge, JudgeResponseError
 from .omni_duplex_eval_media import extract_jpeg, materialize_media, video_duration
 from .omni_duplex_eval_metrics import (
     PROTOCOL_PIN,
@@ -25,6 +33,16 @@ from .omni_duplex_eval_metrics import (
     temporal_window,
 )
 
+logger = logging.getLogger(__name__)
+
+# Echo the offending reply back once and ask for the score JSON again. This
+# corrects the response format only; the scoring prompt itself (and the pinned
+# rubric it carries) is never reworded. Trace lines record every retry.
+_JUDGE_FORMAT_FOLLOWUP = (
+    "Your reply does not contain the required score fields ({fields}). "
+    "Respond again with only the JSON object that includes these fields."
+)
+
 
 def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -32,11 +50,40 @@ def _read(path: Path) -> Any:
 
 def _write(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_name(f"{path.name}.{uuid4().hex}.part")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+# Judge frames are sent at source resolution unless bounded. Image tokens grow
+# with pixel count, so 4K frames overflow a 64K-token judge after ~10 frames
+# (#7375). 1920 keeps 1080p and smaller frames unchanged.
+DEFAULT_JUDGE_FRAME_MAX_SIDE = 1920
 
 
 def _text(items: list[dict[str, Any]]) -> str:
     return " ".join(str(item.get("sentence", item.get("text", ""))).strip() for item in items).strip()
+
+
+def _gt_references(answers: list[object]) -> list[str]:
+    """Mirror the official evaluator's reference handling.
+
+    Drop empty strings (order-preserving, strip-based) then deduplicate while
+    keeping the first occurrence, as ``non_empty_strings`` followed by
+    ``load_reference_texts`` does in OpenBMB/Omni-DuplexEval. Numbering an
+    empty or repeated answer would deviate from the pinned content prompt.
+    """
+    references = []
+    for answer in answers:
+        if answer is None:
+            continue
+        text = str(answer).strip()
+        if text:
+            references.append(text)
+    return list(dict.fromkeys(references))
 
 
 def evaluate_sample(
@@ -47,9 +94,66 @@ def evaluate_sample(
     *,
     judge_fps: int = 2,
     judge_video_mode: str = "video_url",
+    judge_frame_max_side: int | None = DEFAULT_JUDGE_FRAME_MAX_SIDE,
     window_size: float = 10.0,
     allow_invalid_clock: bool = False,
 ) -> dict[str, Any]:
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    if score_path.exists():
+        # A failed retry must not leave an older score eligible for aggregation.
+        # Keep the .previous suffix: summaries and accuracy CI scan *.json.
+        score_path.replace(score_path.with_name(f"{score_path.name}.{uuid4().hex}.previous"))
+    trace_path = score_path.with_suffix(".judge.jsonl")
+    trace_path.write_text("", encoding="utf-8")
+
+    def judge_result(call: Callable[..., str], required: tuple[str, ...]) -> dict[str, Any]:
+        def _trace(payload: dict[str, Any]) -> None:
+            with trace_path.open("a", encoding="utf-8") as trace:
+                trace.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        try:
+            raw_response = call()
+        except JudgeResponseError as exc:
+            _trace({"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)})
+            raise
+        parse_error: str | None = None
+        parsed: dict[str, Any] | None = None
+        try:
+            parsed = parse_judge_json(raw_response, required=required)
+        except ValueError as exc:
+            parse_error = str(exc)
+        _trace({"raw_response": raw_response, "error": parse_error})
+        if parse_error is None:
+            assert parsed is not None
+            return parsed
+        # The judge can answer in prose instead of the required score JSON, or
+        # with a malformed value in a field that is present; echo the offending
+        # reply back once so only the format is corrected, naming what failed
+        # to parse so the retry can address it.
+        followup = (
+            raw_response,
+            _JUDGE_FORMAT_FOLLOWUP.format(fields=", ".join(required)) + f"\n{parse_error}",
+        )
+        try:
+            retry_response = call(followup=followup)
+        except JudgeResponseError as exc:
+            _trace(
+                {
+                    "raw_response": exc.raw_response,
+                    "finish_reason": exc.finish_reason,
+                    "judge_retry": True,
+                    "error": str(exc),
+                }
+            )
+            raise
+        try:
+            parsed = parse_judge_json(retry_response, required=required)
+        except ValueError as exc:
+            _trace({"raw_response": retry_response, "judge_retry": True, "error": str(exc)})
+            raise
+        _trace({"raw_response": retry_response, "judge_retry": True})
+        return parsed
+
     raw = _read(response_path)
     meta = (
         _read(response_path.with_name(response_path.stem + ".meta.json"))
@@ -57,7 +161,6 @@ def evaluate_sample(
         else {}
     )
     validate_clock(meta, allow_invalid=allow_invalid_clock)
-    items = normalize_response_items(raw)
     result: dict[str, Any] = {
         "id": sample.id,
         "family": sample.family,
@@ -66,8 +169,10 @@ def evaluate_sample(
         "response_meta": meta,
         "judge_model": getattr(judge, "model", None),
         "judge_video_mode": judge_video_mode,
+        "judge_frame_max_side": judge_frame_max_side,
     }
     if sample.family == "rtd":
+        items = normalize_response_items(raw)
         video_path = materialize_media(sample.video, score_path.parent / ".media", sample.id, ".mp4")
         duration = sample.video_duration or video_duration(video_path)
         temporal_rows = []
@@ -86,9 +191,12 @@ def evaluate_sample(
                     }
                 )
                 continue
-            frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
-            parsed = parse_judge_json(
-                judge.temporal(build_temporal_prompt(*window, item["sentence"], sample.question_text), frames)
+            frames = _extract_frames(video_path, _times(*window, fps=judge_fps), max_side=judge_frame_max_side)
+            parsed = judge_result(
+                lambda **kw: judge.temporal(
+                    build_temporal_prompt(*window, item["sentence"], sample.question_text), frames, **kw
+                ),
+                ("temporal_score", "is_relevant"),
             )
             temporal_rows.append(
                 {
@@ -104,15 +212,41 @@ def evaluate_sample(
             )
         content_frames = None
         if judge_video_mode == "frame-sample":
-            content_frames = _extract_frames(video_path, _content_frame_times(duration))
-        content = parse_judge_json(
-            judge.content(
-                build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2]),
-                video_path,
-                frames=content_frames,
-                mode=judge_video_mode,
-            )
+            content_frames = _extract_frames(video_path, _content_frame_times(duration), max_side=judge_frame_max_side)
+        content_prompt = build_content_prompt(
+            _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
         )
+        try:
+            content = judge_result(
+                lambda **kw: judge.content(
+                    content_prompt, video_path, frames=content_frames, mode=judge_video_mode, **kw
+                ),
+                ("content_score",),
+            )
+        except Exception as exc:
+            # A long clip can overflow the judge model's context window when the
+            # whole video is passed through (video_url mode): the judge answers
+            # HTTP 400 "Input length (83158) exceeds model's maximum context
+            # length (65536)" (#9089).  Degrade that single content call to the
+            # frame-sample path instead of failing the whole run.
+            if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
+                raise
+            logger.warning(
+                "Judge rejected the full video for %s (context length exceeded); "
+                "retrying the content prompt in frame-sample mode",
+                sample.id,
+            )
+            content_frames = _extract_frames(video_path, _content_frame_times(duration), max_side=judge_frame_max_side)
+            if not content_frames:
+                # Nothing to fall back to: keep the original judge error.
+                raise
+            content = judge_result(
+                lambda **kw: judge.content(
+                    content_prompt, video_path, frames=content_frames, mode="frame-sample", **kw
+                ),
+                ("content_score",),
+            )
+            content["judge_input_fallback"] = "frame-sample"
         if content_frames is not None:
             content["frame_count"] = len(content_frames)
         result.update(
@@ -126,22 +260,33 @@ def evaluate_sample(
             raise ValueError(f"missing proactive-reminder task type for split {sample.split!r}")
         task = sample.task_type
         times = _reminder_times(sample)
+        chunks = normalize_response_chunks(raw)
+        # Chunks keep their own boundary whitespace; legacy sentence items are stripped.
+        separator = "" if has_response_chunks(raw) else " "
         event_rows = []
         if task == "correction" or not times:
-            response = _text(items)
-            parsed = parse_judge_json(
-                judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1))
+            response = separator.join(chunk["text"] for chunk in chunks).strip()
+            parsed = judge_result(
+                lambda **kw: judge.chat(
+                    build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
+                ),
+                ("success_score",),
             )
             event_rows.append({"response_segment": response, **parsed})
         else:
             for start in times:
                 lo, hi = reminder_window(start, window_size)
-                response = " ".join(item["sentence"] for item in items if lo <= item["start"] <= hi)
+                response = separator.join(
+                    chunk["text"] for chunk in chunks if lo <= chunk["current_time"] <= hi
+                ).strip()
                 if not response:
                     event_rows.append({"start_time": start, "response_segment": "", "success_score": 0})
                 else:
-                    parsed = parse_judge_json(
-                        judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1))
+                    parsed = judge_result(
+                        lambda **kw: judge.chat(
+                            build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
+                        ),
+                        ("success_score",),
                     )
                     event_rows.append({"start_time": start, "response_segment": response, **parsed})
         scores = [int(row.get("success_score", 0)) for row in event_rows]
@@ -161,12 +306,29 @@ def _times(start: float, end: float, *, fps: int) -> list[float]:
     )
 
 
-def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
+def _is_judge_context_length_error(exc: BaseException) -> bool:
+    """True when the judge rejected the request because its input was too long.
+
+    The judge client raises ``requests.HTTPError`` with the HTTP response
+    attached, e.g. HTTP 400
+    ``Input length (83158) exceeds model's maximum context length (65536)``.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    text = str(getattr(response, "text", "") or "").lower()
+    if "context length" in text:
+        return True
+    # Other OpenAI-compatible judges phrase the same rejection differently.
+    return "input length" in text and "exceed" in text
+
+
+def _extract_frames(path: str | Path, timestamps: list[float], *, max_side: int | None = None) -> list[bytes]:
     """Extract only decodable JPEG frames; clips can end on non-keyframes."""
     frames = []
     for timestamp in timestamps:
         try:
-            frame = extract_jpeg(path, timestamp=timestamp)
+            frame = extract_jpeg(path, timestamp=timestamp, max_side=max_side)
         except (OSError, ValueError):
             continue
         if frame.startswith(b"\xff\xd8"):
@@ -175,7 +337,12 @@ def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
 
 
 def _content_frame_times(duration: float) -> list[float]:
-    """Sample the full video at approximately one frame every three seconds."""
+    """Sample the full video at approximately one frame every three seconds.
+
+    The count is not capped. The ``video_url`` overflow fallback sends this
+    whole list, so a long clip can exceed the judge context again. That second
+    error is not caught and fails the sample.
+    """
     if duration <= 0:
         return []
     times = []
@@ -183,11 +350,6 @@ def _content_frame_times(duration: float) -> list[float]:
     while timestamp < duration:
         times.append(min(timestamp, max(0.0, duration - 0.01)))
         timestamp += 3.0
-    # Qwen2.5-VL has a finite per-request image-token budget. Preserve
-    # coverage while bounding long clips to a safely portable frame count.
-    if len(times) > 16:
-        stride = (len(times) - 1) / 15
-        times = [times[round(i * stride)] for i in range(16)]
     return times
 
 
@@ -211,23 +373,31 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
             row = _read(path)
             row.setdefault("split", path.parent.name)
             rows.append(row)
+    rtd_rows = [row for row in rows if "temporal" in row]
+    # Only RTD uses judge frames. Legacy RTD scores without the field used
+    # source resolution, the same as None.
+    frame_max_sides = {row.get("judge_frame_max_side") for row in rtd_rows}
+    if len(frame_max_sides) > 1:
+        raise ValueError(
+            f"{score_root} mixes judge_frame_max_side values {sorted(frame_max_sides, key=str)}; "
+            "rerun evaluate for all scored RTD samples with --overwrite and one value"
+        )
     rtd_temporal = [
         row["temporal"]["summary"] | {"content_score": row.get("content", {}).get("content_score", 0.0)}
-        for row in rows
-        if "temporal" in row
+        for row in rtd_rows
     ]
     pr = [{"task_type": row.get("task_type"), **row.get("pr", {})} for row in rows if "pr" in row]
     result = {"protocol_pin": PROTOCOL_PIN, "samples": len(rows)}
     if rtd_temporal:
+        result["judge_frame_max_side"] = frame_max_sides.pop()
         by_task: dict[str, list[dict[str, float]]] = {}
-        for row in rows:
-            if "temporal" in row:
-                by_task.setdefault(str(row.get("split", row.get("task_type", "unknown"))), []).append(
-                    {
-                        "content": float(row.get("content", {}).get("content_score", 0.0)),
-                        "temporal": float(row["temporal"]["summary"].get("avg_temporal_score", 0.0)),
-                    }
-                )
+        for row in rtd_rows:
+            by_task.setdefault(str(row.get("split", row.get("task_type", "unknown"))), []).append(
+                {
+                    "content": float(row.get("content", {}).get("content_score", 0.0)),
+                    "temporal": float(row["temporal"]["summary"].get("avg_temporal_score", 0.0)),
+                }
+            )
         result["rtd"] = {
             "mean_content_score": sum(item["content_score"] for item in rtd_temporal) / len(rtd_temporal),
             "mean_avg_temporal_score": sum(item["avg_temporal_score"] for item in rtd_temporal) / len(rtd_temporal),

@@ -189,6 +189,7 @@ def _cfg_prediction(
 def test_sana_video_quick_pipeline_stages_match_diffusers(
     variant: str,
     _hardware,
+    sana_model_parallel,
 ) -> None:
     """Compare the first denoising step without replacing native attention.
 

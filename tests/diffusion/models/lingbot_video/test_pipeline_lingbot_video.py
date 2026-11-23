@@ -148,7 +148,8 @@ def test_postprocess_keeps_torch_by_default_and_converts_np_when_requested():
     assert array.shape == (2, 4, 4, 3)
     video = post({"video": frames}, SimpleNamespace(output_type="pt"))
     assert set(video) == {"video"}
-    assert video["video"] is frames
+    assert isinstance(video["video"], np.ndarray)
+    np.testing.assert_array_equal(video["video"], frames.numpy())
     image = post(
         {"image": torch.ones(4, 4, 3)},
         SimpleNamespace(output_type="pt"),
@@ -160,6 +161,40 @@ def test_postprocess_keeps_torch_by_default_and_converts_np_when_requested():
     latent_output = post({"image": latent}, SimpleNamespace(output_type="latent"))
     assert set(latent_output) == {"image"}
     assert latent_output["image"] is latent
+
+
+@pytest.mark.parametrize("output_type", [None, "pt", "np"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_postprocess_preserves_video_range_for_serving(output_type: str | None, dtype: torch.dtype) -> None:
+    from vllm_omni.diffusion.models.lingbot_video import get_lingbot_video_post_process_func
+    from vllm_omni.entrypoints.openai.video_api_utils import _coerce_video_to_frames
+
+    # Include black and midtones: all-white frames cannot expose double normalization.
+    frames = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], dtype=dtype)
+    frames = frames.reshape(5, 1, 1, 1).expand(5, 2, 4, 3).clone()
+    expected = frames.float().numpy().copy()
+    sampling = None if output_type is None else OmniDiffusionSamplingParams(output_type=output_type)
+    post = get_lingbot_video_post_process_func(None)
+
+    processed = post({"video": frames}, sampling)
+    encoded_frames = np.stack(_coerce_video_to_frames(processed["video"]))
+
+    assert set(processed) == {"video"}
+    assert encoded_frames.dtype == np.float32
+    np.testing.assert_array_equal(encoded_frames, expected)
+    np.testing.assert_array_equal(frames.float().numpy(), expected)
+
+
+@pytest.mark.parametrize("output_key", ["image", "video"])
+def test_postprocess_preserves_latent_payload(output_key: str) -> None:
+    from vllm_omni.diffusion.models.lingbot_video import get_lingbot_video_post_process_func
+
+    latents = torch.tensor([-2.0, 0.0, 2.0]).reshape(1, 3, 1, 1, 1)
+    sampling = OmniDiffusionSamplingParams(output_type="latent")
+    processed = get_lingbot_video_post_process_func(None)({output_key: latents}, sampling)
+
+    assert set(processed) == {output_key}
+    assert processed[output_key] is latents
 
 
 def test_postprocess_preserves_image_contract_for_serving():
@@ -181,7 +216,9 @@ def test_postprocess_preserves_image_contract_for_serving():
         sampling_params=sampling,
         request_id="lingbot-image-contract-test",
     )
-    raw_output = {"image": torch.ones(8, 12, 3)}
+    image = torch.zeros(8, 12, 3)
+    image[4:] = 1.0
+    raw_output = {"image": image}
     processed = get_lingbot_video_post_process_func(SimpleNamespace())(raw_output, sampling)
     normalized = normalize_diffusion_postprocess_output(processed)
 
@@ -199,6 +236,8 @@ def test_postprocess_preserves_image_contract_for_serving():
     endpoint_images = _extract_images_from_result(result)
     assert len(endpoint_images) == 1
     assert endpoint_images[0].size == (12, 8)
+    assert endpoint_images[0].getpixel((0, 0)) == (0, 0, 0)
+    assert endpoint_images[0].getpixel((0, 7)) == (255, 255, 255)
 
 
 def test_forward_resolves_t2v_sampling_and_flow_shift_alias():
@@ -573,6 +612,153 @@ def test_load_weights_rejects_external_weight_stream():
     assert pipeline.load_weights([]) == set()
     with pytest.raises(RuntimeError, match="components are loaded directly"):
         pipeline.load_weights([("transformer.weight", torch.zeros(1))])
+
+
+@pytest.mark.parametrize(
+    ("config", "host"),
+    [
+        ({}, False),
+        ({"enable_layerwise_offload": True}, True),
+        ({"enable_cpu_offload": True}, True),
+        ({"enable_layerwise_offload": True, "enable_cpu_offload": True}, True),
+        ({"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}}, True),
+        ({"diffusion_offload_config": {"mode": "module", "components": ["dit", "text_encoder"]}}, True),
+    ],
+    ids=["none", "layerwise", "cpu", "both", "public-layer", "public-module"],
+)
+def test_construction_device_follows_offload_policy(monkeypatch, config, host):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    for component_class in (
+        module.LingBotVideoTransformer3DModel,
+        module.Qwen3VLForConditionalGeneration,
+        module.AutoencoderKLWan,
+    ):
+        monkeypatch.setattr(component_class, "from_pretrained", lambda *args, **kwargs: nn.Linear(2, 2))
+    monkeypatch.setattr(module.Qwen3VLProcessor, "from_pretrained", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(module.FlowUniPCMultistepScheduler, "from_pretrained", lambda *args, **kwargs: None)
+    # The meta device stands in for the accelerator, so the test runs on CPU-only hosts.
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("meta"))
+
+    pipeline = module.LingBotVideoPipeline(
+        od_config=SimpleNamespace(
+            model="unused",
+            dtype=torch.float32,
+            enable_diffusion_pipeline_profiler=False,
+            quantization_config=None,
+            **config,
+        )
+    )
+
+    expected = "cpu" if host else "meta"
+    assert pipeline.device == torch.device("meta")
+    for component in (pipeline.transformer, pipeline.text_encoder, pipeline.vae):
+        assert component.weight.device.type == expected
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"enable_distributed_layerwise_offload": True},
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            }
+        },
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local", "resident_layers": 1}},
+            }
+        },
+    ],
+    ids=["legacy", "allgather", "resident-layers"],
+)
+def test_distributed_layerwise_offload_is_rejected(config):
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
+
+    with pytest.raises(ValueError, match="does not support distributed layerwise offload"):
+        LingBotVideoPipeline(od_config=SimpleNamespace(**config))
+
+
+def test_offload_plan_streams_text_encoder_blocks():
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
+    from vllm_omni.diffusion.offloader.component_utils import get_encoder_block_groups
+
+    text_encoder = nn.Module()
+    text_encoder.model = nn.Module()
+    text_encoder.model.visual = nn.Module()
+    text_encoder.model.visual.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(2)])
+    text_encoder.model.language_model = nn.Module()
+    text_encoder.model.language_model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(3)])
+
+    plan = LingBotVideoPipeline._offload_plan
+    groups = get_encoder_block_groups(text_encoder, "text_encoder", plan, strict=True)
+    assert [len(group) for group in groups] == [2, 3]
+
+
+def test_quantization_is_rejected():
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
+
+    with pytest.raises(NotImplementedError, match="does not support quantization"):
+        LingBotVideoPipeline(od_config=SimpleNamespace(quantization_config=object()))
+
+
+@pytest.mark.parametrize(
+    ("config", "offloaded"),
+    [
+        ({}, False),
+        ({"enable_cpu_offload": True}, True),
+        ({"enable_layerwise_offload": True}, True),
+        ({"diffusion_offload_config": {"mode": "module", "components": ["dit", "text_encoder"]}}, True),
+    ],
+    ids=["none", "cpu", "layerwise", "public-module"],
+)
+def test_to_host_keeps_execution_device_under_offload(config, offloaded):
+    pipeline = _make_pipeline()
+    pipeline.od_config = SimpleNamespace(**config)
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.device = torch.device("meta")
+
+    assert pipeline.to("cpu") is pipeline
+    assert pipeline.transformer.weight.device.type == "cpu"
+    assert pipeline.device == (torch.device("meta") if offloaded else torch.device("cpu"))
+
+
+def test_model_level_offload_pairs_transformer_with_text_encoder():
+    from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+    from vllm_omni.diffusion.offloader.sequential_backend import ModelLevelOffloadBackend, SequentialOffloadHook
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.text_encoder = nn.Linear(2, 2)
+    pipeline.vae = nn.Linear(2, 2)
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False), torch.device("cpu")
+    )
+
+    backend.enable(pipeline)
+    try:
+        assert backend.enabled
+        dit_hook = pipeline.transformer._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+        encoder_hook = pipeline.text_encoder._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+        assert dit_hook.offload_targets == [pipeline.text_encoder]
+        assert encoder_hook.offload_targets == [pipeline.transformer]
+    finally:
+        backend.disable()
+
+
+def test_to_dtype_does_not_cast_vae():
+    pipeline = _make_pipeline()
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.vae = nn.Linear(2, 2)
+
+    pipeline.to(torch.bfloat16)
+    assert pipeline.transformer.weight.dtype == torch.bfloat16
+    assert pipeline.vae.weight.dtype == torch.float32
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])

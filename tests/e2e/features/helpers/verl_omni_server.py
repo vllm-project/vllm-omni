@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Ray-serializable verl-omni HTTP server test double for RLHF E2E tests.
 
@@ -16,6 +16,7 @@ import os
 from enum import Enum
 from typing import Any
 
+import psutil
 import torchvision.transforms as T
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
@@ -32,6 +33,25 @@ logger = logging.getLogger(__name__)
 
 CUSTOM_PIPELINE_CLASS = "tests.e2e.features.helpers.custom_pipeline.QwenImagePipelineWithLogProbForTest"
 WORKER_EXTENSION_CLASS = "tests.e2e.features.helpers.custom_pipeline.vLLMOmniColocateWorkerExtensionForTest"
+
+
+def _snapshot_diffusion_workers() -> list[tuple[psutil.Process, float]]:
+    """Capture worker identities before shutdown can reparent descendants."""
+    try:
+        descendants = psutil.Process().children(recursive=True)
+    except psutil.Error:
+        return []
+
+    workers: list[tuple[psutil.Process, float]] = []
+    for proc in descendants:
+        try:
+            cmdline = proc.cmdline()
+            title = (cmdline[0] if cmdline and cmdline[0] else proc.name()).lower()
+            if title.startswith("vllm-omni::diffusionworker"):
+                workers.append((proc, proc.create_time()))
+        except psutil.Error:
+            continue
+    return workers
 
 
 class RolloutMode(Enum):
@@ -212,6 +232,28 @@ class vLLMOmniHttpServerLocal:
 
         self.engine = engine_client
 
+    async def shutdown(self) -> None:
+        """Stop the diffusion engine before Ray destroys this actor."""
+        workers = _snapshot_diffusion_workers()
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
+        identities = {proc.pid: created for proc, created in workers}
+        _, alive = psutil.wait_procs([proc for proc, _ in workers], timeout=5)
+        remaining: list[int] = []
+        for proc in alive:
+            try:
+                if (
+                    proc.create_time() == identities[proc.pid]
+                    and proc.is_running()
+                    and proc.status() != psutil.STATUS_ZOMBIE
+                ):
+                    remaining.append(proc.pid)
+            except psutil.Error:
+                continue
+        if remaining:
+            raise RuntimeError(f"engine shutdown left diffusion worker PIDs: {remaining}")
+
     async def generate(
         self,
         prompt_ids: list[int],
@@ -246,7 +288,10 @@ class vLLMOmniHttpServerLocal:
         sampling_kwargs["extra_args"] = extra_args
         diffusion_sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
 
-        generator = self.engine.generate(
+        engine = self.engine
+        if engine is None:
+            raise RuntimeError("Server must be launched before generating")
+        generator = engine.generate(
             prompt=custom_prompt,
             request_id=request_id,
             sampling_params_list=[diffusion_sampling_params],

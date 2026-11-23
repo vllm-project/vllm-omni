@@ -1,3 +1,28 @@
 # MiniCPM-o 4.5 using the turn-based engine and ordinary HTTP serving.
 base_config: minicpmo_4_5.yaml
 session_mode: turn
+
+stages:
+  - stage_id: 0
+    # Inherit CUDA ngram speculation; it requires prefix caching disabled.
+    enable_prefix_caching: false
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        # Keep the turn engine's upstream kernel and compilation defaults.
+        kernel_config: {}
+        compilation_config: {}
+  rocm:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  xpu:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  musa:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false

@@ -8,49 +8,19 @@
 
 from __future__ import annotations
 
-import copy
 import time
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.config.vllm import set_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from .audio_tokenizer_v2 import MossAudioTokenizerModel as MossAudioTokenizerV2Model
+
 logger = init_logger(__name__)
-
-
-@support_torch_compile(
-    dynamic_arg_dims={
-        "codes": {1: "batch", 2: "frames"},
-        "codes_lengths": {0: "batch"},
-        "state_slot_ids": {0: "batch"},
-        "valid_rows": {0: "batch"},
-    }
-)
-class _MossStreamingDecodeCompileAdapter(nn.Module):
-    """Expose the codec streaming hot path to vLLM compile.
-
-    The wrapper preserves the codec dtype: v1 decodes in FP32 to match its
-    quantizer output, while v2 uses BF16.
-    """
-
-    def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:
-        super().__init__()
-        self.codec = codec
-
-    def forward(
-        self,
-        codes: torch.Tensor,
-        codes_lengths: torch.Tensor,
-        state_slot_ids: torch.Tensor,
-        valid_rows: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.codec.decode_streaming_tensors(codes, codes_lengths, state_slot_ids, valid_rows)
 
 
 @dataclass
@@ -87,21 +57,13 @@ class CUDAGraphStreamingDecoderWrapper:
         self.batch_sizes = sorted({int(size) for size in batch_sizes if 0 < int(size) <= state_capacity})
         self.frame_sizes = sorted({int(size) for size in frame_sizes if int(size) > 0})
         self.num_quantizers = int(num_quantizers)
+        self._shared_kv = isinstance(codec, MossAudioTokenizerV2Model)
         self.graphs: dict[tuple[int, int], _CapturedStreamingDecodeGraph] = {}
         self._pool = None
         self._warmed_up = False
-        # vLLM owns Inductor compilation; this wrapper remains the sole owner
-        # of CUDA Graph capture/replay because it understands persistent codec
-        # state slots. Disable vLLM's CUDA Graph layer to avoid nested graphs.
-        compile_config = copy.copy(vllm_config)
-        compile_config.compilation_config = copy.copy(vllm_config.compilation_config)
-        compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        compile_config.compilation_config.static_forward_context = {}
-        with set_current_vllm_config(compile_config):
-            self._compiled_decode: nn.Module | None = _MossStreamingDecodeCompileAdapter(
-                codec,
-                vllm_config=compile_config,
-            )
+        # This wrapper owns CUDA Graph capture/replay because it understands
+        # persistent codec state slots; the decode runs uncompiled.
+        self._decode = codec.decode_streaming_tensors
 
     @property
     def is_ready(self) -> bool:
@@ -113,14 +75,21 @@ class CUDAGraphStreamingDecoderWrapper:
 
     @property
     def scratch_capacity(self) -> int:
+        if self._shared_kv:
+            return 1
         return max(self.batch_sizes, default=0)
+
+    def _padding_slots(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        if self._shared_kv:
+            return torch.full((batch_size,), self.state_capacity, dtype=torch.long, device=device)
+        return self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=device)
+
+    def _reset_capture_slots(self, slots: torch.Tensor) -> None:
+        self.codec.reset_decoder_state_slots(slots[:1] if self._shared_kv else slots)
 
     @torch.no_grad()
     def warmup(self, device: torch.device) -> None:
         if self._warmed_up:
-            return
-        self._warmed_up = True
-        if device.type != "cuda" or not self.batch_sizes or not self.frame_sizes:
             return
 
         capture_keys = sorted(
@@ -136,59 +105,15 @@ class CUDAGraphStreamingDecoderWrapper:
         with torch.cuda.device(device):
             for batch_size, frame_size in capture_keys:
                 key = (batch_size, frame_size)
-                try:
-                    compiled = self._capture(batch_size, frame_size, device)
-                    logger.info(
-                        "  Captured %s MOSS-TTS streaming decoder CUDA graph for (B,T)=%s",
-                        "compiled" if compiled else "plain",
-                        key,
-                    )
-                except Exception:
-                    self.graphs.pop(key, None)
-                    logger.warning(
-                        "  Failed to capture MOSS-TTS streaming decoder CUDA graph for (B,T)=%s; using eager",
-                        key,
-                        exc_info=True,
-                    )
+                self._capture_with_decode(batch_size, frame_size, device, self._decode)
+                logger.info("  Captured MOSS-TTS streaming decoder CUDA graph for (B,T)=%s", key)
+        self._warmed_up = True
         logger.info(
             "MOSS-TTS streaming decoder CUDA graph warmup complete: %d/%d captured in %.1f ms",
             len(self.graphs),
             len(capture_keys),
             (time.perf_counter() - start_s) * 1000.0,
         )
-
-    @torch.no_grad()
-    def _capture(self, batch_size: int, frame_size: int, device: torch.device) -> bool:
-        if self._compiled_decode is not None:
-            try:
-                self._capture_with_decode(
-                    batch_size,
-                    frame_size,
-                    device,
-                    self._compiled_decode,
-                )
-                return True
-            except Exception:
-                logger.warning(
-                    "vLLM compile/capture failed for MOSS-TTS (B,T)=(%d,%d); falling back to a plain CUDA Graph",
-                    batch_size,
-                    frame_size,
-                    exc_info=True,
-                )
-                scratch_slots = self.state_capacity + torch.arange(
-                    batch_size,
-                    dtype=torch.long,
-                    device=device,
-                )
-                self.codec.reset_decoder_state_slots(scratch_slots)
-                self._compiled_decode = None
-        self._capture_with_decode(
-            batch_size,
-            frame_size,
-            device,
-            self.codec.decode_streaming_tensors,
-        )
-        return False
 
     @torch.no_grad()
     def _capture_with_decode(
@@ -206,7 +131,7 @@ class CUDAGraphStreamingDecoderWrapper:
             device=device,
         )
         lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
-        scratch_slots = self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=device)
+        scratch_slots = self._padding_slots(batch_size, device)
         valid_rows = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         stream = torch.cuda.Stream()
@@ -216,7 +141,7 @@ class CUDAGraphStreamingDecoderWrapper:
                 _ = decode(codes, lengths, scratch_slots, valid_rows)
         torch.cuda.current_stream().wait_stream(stream)
         torch.accelerator.synchronize(device)
-        self.codec.reset_decoder_state_slots(scratch_slots)
+        self._reset_capture_slots(scratch_slots)
 
         if self._pool is None:
             self._pool = current_platform.get_global_graph_pool()
@@ -263,17 +188,13 @@ class CUDAGraphStreamingDecoderWrapper:
         graph_frame_size = self._select_frame_size(int(frame_size), allow_frame_padding)
         if graph_frame_size is None:
             return None
-        entry = self.graphs.get((batch_size, graph_frame_size))
-        if entry is None:
-            return None
+        entry = self.graphs[(batch_size, graph_frame_size)]
 
         entry.static_codes.zero_()
         entry.static_codes[:, :actual_batch_size, :frame_size].copy_(codes, non_blocking=True)
         entry.static_lengths.zero_()
         entry.static_lengths[:actual_batch_size].fill_(int(frame_size))
-        entry.static_state_slot_ids.copy_(
-            self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=entry.static_state_slot_ids.device)
-        )
+        entry.static_state_slot_ids.copy_(self._padding_slots(batch_size, entry.static_state_slot_ids.device))
         entry.static_state_slot_ids[:actual_batch_size].copy_(state_slot_ids, non_blocking=True)
         entry.static_valid_rows.zero_()
         entry.static_valid_rows[:actual_batch_size].fill_(True)

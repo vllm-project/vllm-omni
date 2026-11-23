@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_thinker import (
     MingFlashOmniThinkerForConditionalGeneration,
@@ -156,23 +157,43 @@ def _source_output(prefix_len: int = 4):
     )
 
 
-def test_bridge_extracts_query_and_direct_conditions():
+@pytest.mark.parametrize(("extra_args", "num_layers"), (({}, 1), ({"num_layers": 1}, 1), ({"num_layers": 3}, 3)))
+def test_bridge_extracts_query_and_direct_conditions(extra_args, num_layers):
     result = thinker2image(
         [_source_output()],
         prompt={"multi_modal_data": {"img2img": "reference"}},
-        sampling_params=SimpleNamespace(extra_args={"num_layers": 3}),
+        sampling_params=SimpleNamespace(extra_args=extra_args),
     )
 
     extra = result[0]["extra"]
     assert extra["query_hidden_states"].shape == (256, 2048)
     assert extra["direct_hidden_states"].shape == (4, 6144)
     assert extra["reference_image"] == "reference"
-    assert extra["num_layers"] == 3
+    assert extra["num_layers"] == num_layers
     assert set(extra["direct_hidden_states"][:, :2048].unique().tolist()) == {5}
 
 
+@pytest.mark.parametrize("num_layers", ("abc", "2", None, 2.7, 2.0, True, False, 0, -1, [], {}))
+def test_bridge_rejects_invalid_num_layers_before_extracting_conditions(num_layers, monkeypatch):
+    def unexpected_extract(_source_output):
+        pytest.fail("Invalid num_layers must be rejected before extracting conditions")
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.stage_input_processors.ming_image._extract_conditions",
+        unexpected_extract,
+    )
+
+    with pytest.raises(OmniClientError, match="num_layers must be a positive integer") as exc_info:
+        thinker2image(
+            [SimpleNamespace()],
+            sampling_params=SimpleNamespace(extra_args={"num_layers": num_layers}),
+        )
+
+    assert exc_info.value.status_code == 400
+
+
 def test_bridge_rejects_text_negative_condition():
-    with pytest.raises(ValueError, match="does not accept negative_prompt"):
+    with pytest.raises(OmniClientError, match="does not accept negative_prompt"):
         thinker2image(
             [_source_output()],
             prompt={"negative_prompt": "bad"},

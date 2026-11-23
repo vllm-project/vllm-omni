@@ -56,9 +56,9 @@ vLLM-Omni is flexible and easy to use with:
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
 - Omni-modality models (e.g. Qwen3-Omni, MiniCPM-o 4.5, Cosmos3, HunyuanImage, BAGEL)
-- TTS models (e.g. Qwen3-TTS, IndexTTS 2.5, CosyVoice3)
-- Diffusion models — image, video, and audio generation (e.g. MiniMax H3, LTX-2.5, SANA-Video, Wan2.2)
-- Robot-policy and action models (e.g. π0, GR00T-N1.7, DreamZero-DROID, InternVLA-A1)
+- TTS models (e.g. Qwen3-TTS, Tencent AuK, Breeze-TTS-2, CosyVoice3)
+- Diffusion models — image, video, and audio generation (e.g. MiniMax H3, LingBot World, MAGI-2, LTX-2.5, Wan2.2)
+- Robot-policy and action models (e.g. π0.5, GR00T-N1.7, DreamZero-DROID, InternVLA-A1)
 
 For more information, checkout the following:
 

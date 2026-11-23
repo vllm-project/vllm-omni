@@ -412,7 +412,8 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         "--timeout-s",
         str(args.timeout_s),
     ]
-    command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
+    if args.ref_audio is not None:
+        command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
     temperature = getattr(args, "temperature", None)
     if temperature is None and args.validation_mode == "response-required":
         temperature = 0.0
@@ -473,7 +474,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", default="ws://127.0.0.1:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--input-wav", required=True)
-    parser.add_argument("--ref-audio", required=True)
+    parser.add_argument(
+        "--ref-audio",
+        help="Optional reference WAV; the MiniCPM-o server uses the bundled prompt when omitted.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--summary-output")
     parser.add_argument("--chunk-ms", type=int, default=200)

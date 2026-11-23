@@ -1,20 +1,23 @@
-# Experimental Full-Duplex (JoyVL)
+# Experimental Full-Duplex (JoyVL, Mage-VL)
 
-This package now contains the JoyVL framework and its example integration,
-plus two client-side helpers kept for the benchmark and e2e drivers:
+This package now contains the JoyVL framework, the JoyVL and Mage-VL example
+integrations, and two client-side helpers kept for the benchmark and e2e
+drivers:
 
 ```text
 core/              generic duplex scaffold used by the JoyVL adapter
 joyvl/             JoyVL model-specific integration
+mage_vl/           Mage-VL model-specific integration
 client.py          legacy Realtime probe client (RealtimeDuplexClient) used by
-                   the omniinteract / omni-duplex-eval benchmarks and the
-                   server-VAD and Nemotron e2e drivers; applications should use
+                   the omni-duplex-eval benchmark and the MiniCPM-o server-VAD
+                   e2e driver; applications should use
                    vllm_omni.clients.duplex.DuplexClient instead
 video_stacking.py  camera-frame tiling for omni duplex video input
 ```
 
 To run JoyVL, see
 [`recipes/JD/JoyAI-VL-Interaction.md`](../../../recipes/JD/JoyAI-VL-Interaction.md).
+To run Mage-VL, see [`recipes/Microsoft/Mage-VL.md`](../../../recipes/Microsoft/Mage-VL.md).
 
 The native full-duplex runtimes graduated out of this package. They now live
 in the stable tree, where sessions are engine-resident (RFC
@@ -28,8 +31,10 @@ vllm_omni/entrypoints/duplex_omni.py           DuplexOmni + DuplexSessionHandle 
 vllm_omni/entrypoints/duplex/                  WebSocket transport (attachments, resume, replay)
 vllm_omni/clients/duplex.py                    DuplexClient / DuplexClientBase
 vllm_omni/model_executor/models/minicpmo_4_5/duplex/  MiniCPM-o 4.5 DuplexModelPlugin
-vllm_omni/model_executor/models/personaplex/duplex/   PersonaPlex (pre-framework, not ported yet)
-vllm_omni/model_executor/models/nemotron_voicechat/duplex/  Nemotron VoiceChat (pre-framework, not ported yet)
+vllm_omni/model_executor/models/personaplex/duplex/   PersonaPlex DuplexModelPlugin
+vllm_omni/model_executor/models/nemotron_voicechat/duplex/  Nemotron VoiceChat DuplexModelPlugin
+vllm_omni/model_executor/models/qwen3_omni/duplex/    Qwen3-Omni DuplexModelPlugin
+vllm_omni/model_executor/models/aura_omni/duplex/     AURA DuplexModelPlugin
 vllm_omni/model_executor/duplex_sampling.py    AR-runner sampling hook helper
 vllm_omni/outputs/duplex.py                    typed output decision envelope
 ```
@@ -57,7 +62,6 @@ only model policy.
 
 For production serving, prefer the stable plugin seam instead: implement one
 `vllm_omni.engine.duplex.plugin.DuplexModelPlugin` and name it in the model's
-`pipeline.py` as `duplex_plugin`, as MiniCPM-o 4.5 does. PersonaPlex and
-Nemotron VoiceChat still carry their pre-framework duplex code and are ported
-to the plugin contract in follow-up PRs. The contract is documented in
+`pipeline.py` as `duplex_plugin`, as MiniCPM-o 4.5, PersonaPlex, Nemotron
+VoiceChat, Qwen3-Omni and AURA do. The contract is documented in
 [`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md).

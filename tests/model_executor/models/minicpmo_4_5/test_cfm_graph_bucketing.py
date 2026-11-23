@@ -10,110 +10,51 @@ back. These tests pin the decision math on CPU, no CUDA required.
 """
 
 from types import SimpleNamespace
+from typing import NamedTuple
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
-    _cfm_pad_frames,
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
+    CFMGraphWrapper,
+    WholeEulerCFMGraphWrapper,
+    _att_keep_ranges,
+    _build_capture_mask,
+    _capture_query_width,
+    _format_memory_delta,
+    _memory_snapshot,
+    _whole_euler_att_segments,
     _zero_padded_cnn_cache,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+    _cfm_pad_frames,
     _zero_padded_frames,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_pads_partial_chunk_up_to_bucket():
-    # 50 frames on a 16-frame grid -> 14 padding frames.
-    assert _cfm_pad_frames(mel_frames=50, offset=0, noise_capacity=1000, bucket_frames=16, disabled=False) == 14
-
-
-def test_aligned_chunk_needs_no_padding():
-    assert _cfm_pad_frames(mel_frames=64, offset=0, noise_capacity=1000, bucket_frames=16, disabled=False) == 0
-
-
-def test_ragged_valid_lengths_path_disables_bucketing():
-    """The ragged per-request cache path must never be padded."""
-    for ragged in (True,):
-        for mel in (50, 64, 96):
-            assert (
-                _cfm_pad_frames(
-                    mel_frames=mel,
-                    offset=0,
-                    noise_capacity=1000,
-                    bucket_frames=16,
-                    disabled=ragged,
-                )
-                == 0
-            )
-
-
-def test_disabled_bucketing_returns_zero():
-    """bucket_frames <= 1 (or wrapper absent) means plain eager behavior."""
-    for bucket in (0, 1):
-        assert (
-            _cfm_pad_frames(
-                mel_frames=50,
-                offset=0,
-                noise_capacity=1000,
-                bucket_frames=bucket,
-                disabled=False,
-            )
-            == 0
+@pytest.mark.parametrize(
+    ("mel_frames", "offset", "capacity", "bucket", "disabled", "padding"),
+    [
+        pytest.param(50, 0, 1000, 16, False, 14, id="partial"),
+        pytest.param(64, 0, 1000, 16, False, 0, id="aligned"),
+        pytest.param(50, 0, 1000, 16, True, 0, id="ragged"),
+        pytest.param(50, 0, 1000, 0, False, 0, id="disabled-grid"),
+        pytest.param(50, 0, 1000, 1, False, 0, id="unit-grid"),
+        pytest.param(50, 50, 110, 16, False, 0, id="padding-exceeds-noise"),
+        pytest.param(50, 50, 114, 16, False, 14, id="padding-fits-noise-exactly"),
+        pytest.param(50, 50, 120, 16, False, 14, id="padding-fits-noise"),
+    ],
+)
+def test_cfm_padding_respects_grid_and_noise_capacity(mel_frames, offset, capacity, bucket, disabled, padding):
+    assert (
+        _cfm_pad_frames(
+            mel_frames=mel_frames, offset=offset, noise_capacity=capacity, bucket_frames=bucket, disabled=disabled
         )
-
-
-def test_padding_never_overflows_noise_buffer():
-    """Padding past the decoder's noise buffer must fall back to zero.
-
-    The padded call slices x from decoder.rand_noise[offset:end]; exceeding
-    its width would crash. Bucketing is best-effort, never required.
-    """
-    # 96 frames + 16 pad = 112 > 100 capacity -> give up, pad 0.
-    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=16, disabled=False) == 0
-    # Same mel length fits when un-padded: 96 <= 100.
-    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=1, disabled=False) == 0
-    # Cache offset eats into the capacity: 64 + 0 pad would fit, 64 + 48 pad
-    # would not, so the pad must be dropped.
-    assert _cfm_pad_frames(mel_frames=64, offset=50, noise_capacity=110, bucket_frames=16, disabled=False) == 0
-    # The original chunk fits while the padded one does not: 50 + 50 = 100
-    # <= 110, but 100 + 14 = 114 > 110, so the pad must be dropped.
-    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=110, bucket_frames=16, disabled=False) == 0
-    # Same numbers with room for the padding: 114 <= 120, so it stands.
-    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=120, bucket_frames=16, disabled=False) == 14
-
-
-def test_padding_applies_with_cache_offset_when_it_fits():
-    # offset 50 + mel 50 + pad 14 = 114 <= 200 -> pad stands.
-    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=200, bucket_frames=16, disabled=False) == 14
-
-
-def test_steady_state_cache_width_saturates_on_bucket_grid():
-    """Pin the real recurrence: grow, then trim to ``prompt_len + 100``.
-
-    ``_decode_batch_once`` trims the estimator attention cache after every
-    decode, so the width saturates instead of growing without bound. What
-    matters for the graph cache is that the steady-state
-    ``(chunk_width, cache_width)`` pair settles on a single grid point.
-    """
-    bucket, prompt_len = 16, 304
-    cache_cap = prompt_len + 100
-    width = prompt_len
-    shapes = set()
-    for _ in range(20):
-        pad = _cfm_pad_frames(
-            mel_frames=50,
-            offset=width,
-            noise_capacity=30000,
-            bucket_frames=bucket,
-            disabled=False,
-        )
-        assert pad == 14
-        shapes.add((50 + pad, width))  # (chunk width, cache width) as used
-        width = min(width + 50 + pad, cache_cap)
-    assert width == cache_cap
-    # (64, 304) -> (64, 368) -> (64, 404), then stable.
-    assert shapes == {(64, 304), (64, 368), (64, 404)}
+        == padding
+    )
 
 
 def test_varied_chunk_lengths_collapse_onto_few_widths():
@@ -137,6 +78,75 @@ def test_varied_chunk_lengths_collapse_onto_few_widths():
     }
     assert len(padded) == 4, sorted(padded)  # 16 / 32 / 48 / 64
     assert len(padded) < len(varied)
+
+
+def test_capture_query_width_collapses_decode_grid_onto_one_bucket():
+    """Whole-Euler capture bucket is the #7416 pad helper with a 64-wide decode grid."""
+    assert _capture_query_width(16, 0) == 16
+    assert _capture_query_width(16, 1) == 16
+    assert {_capture_query_width(w, 64) for w in (16, 32, 48, 50, 64)} == {64}
+    assert _capture_query_width(304, 64) == 320
+    assert _capture_query_width(320, 64) == 320
+
+
+def test_att_keep_ranges_match_the_streaming_trim():
+    """Past ``prompt_len + 100`` frames the cache keeps its first ``prompt_len`` and last 100."""
+    assert _att_keep_ranges(368, (300, 100)) == [(0, 368)]
+    assert _att_keep_ranges(400, (300, 100)) == [(0, 400)]
+    assert _att_keep_ranges(464, (300, 100)) == [(0, 300), (364, 100)]
+    assert _att_keep_ranges(464, None) == [(0, 464)]
+
+
+def test_whole_euler_att_segments_skip_capture_padding():
+    # Steady chunk: capture width == chunk width, so only the trim applies.
+    assert _whole_euler_att_segments(mel_width=64, query_cap=64, offset=400, keep=(300, 100)) == [
+        (0, 300),
+        (364, 100),
+    ]
+    # A 32-wide chunk on the 64 capture: the graph wrote [current 64 | cache 400];
+    # frames 32:64 are capture padding and the cache starts at 64.
+    assert _whole_euler_att_segments(mel_width=32, query_cap=64, offset=400, keep=None) == [(0, 32), (64, 400)]
+    assert _whole_euler_att_segments(mel_width=32, query_cap=64, offset=400, keep=(300, 100)) == [
+        (0, 32),
+        (64, 268),
+        (364, 100),
+    ]
+    # First chunk: no cache, only the tail of the capture width is dropped.
+    assert _whole_euler_att_segments(mel_width=304, query_cap=320, offset=0, keep=None) == [(0, 304)]
+
+
+def test_capture_mask_moves_the_cache_block_past_capture_padding():
+    width, cap, offset, valid = 32, 64, 8, 30
+    caller = torch.ones(2, width, width + offset, dtype=torch.bool)
+    caller[:, :, valid:width] = False
+    mask = _build_capture_mask(
+        attn_mask=caller,
+        batch_size=1,
+        query_cap=cap,
+        offset=offset,
+        mel_width=width,
+        mel_frames=valid,
+        device=torch.device("cpu"),
+    )
+    assert mask.shape == (2, cap, cap + offset)
+    assert mask[:, :, :valid].all()
+    assert not mask[:, :, valid:cap].any()
+    assert mask[:, :, cap:].all()
+    # Capture-padding query rows are never empty, so SDPA cannot produce NaN there.
+    assert mask.any(dim=-1).all()
+
+    implicit = _build_capture_mask(
+        attn_mask=None,
+        batch_size=1,
+        query_cap=cap,
+        offset=offset,
+        mel_width=width,
+        mel_frames=width,
+        device=torch.device("cpu"),
+    )
+    assert implicit[:, :, :width].all()
+    assert not implicit[:, :, width:cap].any()
+    assert implicit[:, :, cap:].all()
 
 
 def test_zero_padded_frames_survives_an_integration_step():
@@ -227,3 +237,220 @@ def test_zero_padded_cnn_cache_uniform_blocks_use_one_write():
     assert cache._version - version == 1
     assert torch.equal(cache[..., :3], torch.ones(16, 2, 3, 3))
     assert torch.count_nonzero(cache[..., 3:]) == 0
+
+
+@pytest.mark.parametrize("max_graphs", [15, 32])
+def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypatch, max_graphs):
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import graphs as graph_module
+
+    captured = []
+    stats = {"captures": 0}
+
+    def entry(*, graph_batch, query_cap, offset, **kwargs):
+        captured.append((graph_batch, query_cap, offset))
+        stats["captures"] += 1
+        return ()
+
+    wrapper = SimpleNamespace(
+        enabled=True,
+        att_slots=0,
+        _att_capacity=0,
+        offset_bucket_frames=50,
+        query_widths=(50,),
+        _graph_batches=lambda: [1, 2, 4, 8, 16],
+        max_graphs=max_graphs,
+        _cache={},
+        _slot_graphs={},
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        _entry=entry,
+        _precapture_fill=lambda statics: None,
+        _stats=stats,
+        arena=SimpleNamespace(att_bytes=lambda: 0),
+    )
+    monkeypatch.setattr(graph_module, "_memory_snapshot", lambda device: None)
+    count = WholeEulerCFMGraphWrapper.precapture(
+        wrapper, offsets=range(300, 401), steady=400, channels=4, spk_dim=4, tail_frames=6
+    )
+    assert captured[:15] == [(b, 50, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+    assert count == min(max_graphs, 30)
+    assert wrapper.query_widths == (50,)
+    if max_graphs == 32:
+        assert (1, 100, 350) in captured
+        assert captured[15:] == [(b, 100, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+
+
+@pytest.mark.parametrize("width,valid", [(0, 0), (3, 2), (8, 8)])
+def test_uniform_capture_mask_cache_reuses_only_key_storage(width, valid):
+    cache: dict[tuple[int, int, int, int, int, torch.device], torch.Tensor] = {}
+    args = dict(
+        attn_mask=None,
+        query_cap=8,
+        offset=2,
+        mel_width=width,
+        mel_frames=valid,
+        device=torch.device("cpu"),
+        offset_cap=4,
+        key_masks=cache,
+    )
+    first = _build_capture_mask(batch_size=1, **args)
+    larger = _build_capture_mask(batch_size=4, **args)
+    expected = torch.zeros(8, 8, 12, dtype=torch.bool)
+    expected[:, :width, :valid] = True
+    expected[:, :width, 8:10] = True
+    if width < 8:
+        expected[:, width:] = expected[:, :1]
+    torch.testing.assert_close(larger, expected)
+    assert first.data_ptr() == larger.data_ptr()
+    assert larger.untyped_storage().nbytes() == 12
+    # The CFG split used when filling graph inputs must preserve broadcasting.
+    target = torch.empty_like(larger)
+    target.unflatten(0, (2, 4)).copy_(larger.unflatten(0, (2, 4)))
+    torch.testing.assert_close(target, expected)
+
+
+def test_capture_key_mask_cache_is_bounded_and_excludes_dynamic_masks():
+    cache: dict[tuple[int, int, int, int, int, torch.device], torch.Tensor] = {}
+    args = dict(batch_size=1, query_cap=4, mel_width=3, mel_frames=2, device=torch.device("cpu"), key_masks=cache)
+    first = _build_capture_mask(attn_mask=None, offset=0, **args)
+    retained = first.clone()
+    for offset in range(70):
+        _build_capture_mask(attn_mask=None, offset=offset, **args)
+    assert len(cache) == 64
+    torch.testing.assert_close(first, retained)
+    caller = torch.ones(2, 3, 3, dtype=torch.bool)
+    a = _build_capture_mask(attn_mask=caller, offset=0, **args)
+    caller[0, :, 1] = False
+    b = _build_capture_mask(attn_mask=caller, offset=0, **args)
+    assert a[0, :, 1].all() and not b[0, :, 1].any()
+    assert len(cache) == 64
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu", "cpu"])
+def test_graph_memory_telemetry_uses_device_allocator(monkeypatch, mocker, device_type):
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import graphs as graph_module
+
+    device = SimpleNamespace(type=device_type)
+    api = mocker.Mock()
+    api.memory_allocated.return_value = 10
+    api.memory_reserved.return_value = 20
+    api.max_memory_allocated.return_value = 30
+    api.max_memory_reserved.return_value = 40
+    monkeypatch.setattr(torch, "npu", api if device_type == "npu" else mocker.Mock(), raising=False)
+    monkeypatch.setattr(torch, "accelerator", api if device_type == "cuda" else mocker.Mock())
+    if device_type == "cpu":
+        assert graph_module._memory_snapshot(device) is None
+        assert graph_module._memory_peak(device) is None
+        assert not api.mock_calls
+    else:
+        assert graph_module._memory_snapshot(device) == (10, 20)
+        assert graph_module._memory_peak(device) == (30, 40)
+        for name in ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved"):
+            getattr(api, name).assert_called_once_with(device)
+
+
+def test_npu_precapture_stops_after_graph_exceeds_memory_budget(monkeypatch, mocker):
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import graphs as graph_module
+
+    api = mocker.Mock()
+    api.memory_allocated.return_value = 0
+    api.memory_reserved.side_effect = [0, 2048]
+    monkeypatch.setattr(torch, "npu", api, raising=False)
+    # Keep tensor allocation on CPU; exercise the real NPU telemetry and
+    # precapture stop policy without requiring a device or graph capture.
+    empty = torch.empty
+    monkeypatch.setattr(graph_module.torch, "empty", lambda shape, **kwargs: empty(shape))
+    wrapper = WholeEulerCFMGraphWrapper.__new__(WholeEulerCFMGraphWrapper)
+    wrapper.enabled = True
+    wrapper.att_slots = 0
+    wrapper._att_capacity = 0
+    wrapper.offset_bucket_frames = 50
+    wrapper.query_widths = (50,)
+    wrapper._graph_batches = lambda: [1]
+    wrapper.max_graphs = 10
+    wrapper._cache = {}
+    wrapper._slot_graphs = {}
+    wrapper.device = SimpleNamespace(type="npu")
+    wrapper.dtype = torch.float32
+    wrapper._stats = {"captures": 0}
+    wrapper.arena = mocker.Mock()
+    wrapper.arena.att_bytes.return_value = 0
+
+    def entry(**kwargs):
+        wrapper._stats["captures"] += 1
+        return ()
+
+    wrapper._entry = entry
+    assert wrapper.precapture(offsets=[50, 100, 150], steady=150, channels=4, spk_dim=4, max_graph_bytes=1024) == 1
+    assert api.memory_reserved.call_count == 2
+
+
+class _InputSignature(NamedTuple):
+    """The three properties ``replay`` reads from an input before capturing.
+
+    Everything ``replay`` does ahead of the capture decision -- the device
+    check and the cache key -- comes from these, and ``_capture`` is mocked
+    out, so the tests need no CUDA tensors and no GPU.
+    """
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+
+def _cfm_input_signatures(chunk_size: int) -> tuple[_InputSignature, ...]:
+    device = torch.device("cuda:0")
+    shapes = ((2, 16, chunk_size), (2, 1, 8), (2, 2, 8, 2), (2, 2, 1, 4, 8), (2, 2, 8, 2), (2, 2, 1, 12, 8))
+    return tuple(_InputSignature(shape, torch.float32, device) for shape in shapes)
+
+
+def _wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 4) -> CFMGraphWrapper:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    wrapper = object.__new__(CFMGraphWrapper)
+    wrapper.max_graphs = max_graphs
+    wrapper.enabled = True
+    wrapper.graph_fn = Mock(return_value=torch.tensor([42.0]))
+    wrapper.device = torch.device("cuda:0")
+    wrapper._cache = {}
+    wrapper._unsupported = set()
+    wrapper._stats = {"calls": 0, "hits": 0, "captures": 0, "flushes": 0, "eager": 0}
+    wrapper._capture = Mock(return_value=None)
+    return wrapper
+
+
+def test_capture_is_not_gated_on_free_device_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whether to capture must not be decided from free device memory.
+
+    A capture is served by the caching allocator out of its private graph
+    pool, and the allocator falls back on memory it has already reserved. Free
+    device memory is therefore neither an upper nor a lower bound on what a
+    capture can draw, and a threshold on it decides the wrong question -- one
+    whose answer also silently varies with card size and with whatever else
+    shares the device. Anything consulting it here would fail this test.
+    """
+    import vllm_omni.platforms as platforms_module
+
+    def _saturated(device: torch.device | None = None) -> int:
+        raise AssertionError("capture must not depend on device-level free memory")
+
+    # Setting the attribute on the module shadows the lazy ``__getattr__``, so
+    # this neither builds nor requires a real platform singleton.
+    monkeypatch.setattr(
+        platforms_module,
+        "current_omni_platform",
+        Mock(get_free_memory=_saturated),
+        raising=False,
+    )
+
+    wrapper = _wrapper(monkeypatch)
+    wrapper.replay(*_cfm_input_signatures(10))
+
+    wrapper._capture.assert_called_once()
+
+
+def test_memory_reporting_is_inert_off_cuda() -> None:
+    """Capture logging must not break the platforms that have no such counters."""
+    assert _memory_snapshot(torch.device("cpu")) is None
+    assert _format_memory_delta(None, (1, 2)) == ""
+    assert _format_memory_delta((1, 2), None) == ""
+    assert "allocated" in _format_memory_delta((0, 0), (1 << 20, 2 << 20))

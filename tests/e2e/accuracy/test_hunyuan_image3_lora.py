@@ -17,6 +17,7 @@ import yaml
 from huggingface_hub import hf_hub_download
 from safetensors.torch import save_file
 
+from tests.e2e.accuracy.helpers import reset_artifact_dir
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -24,10 +25,30 @@ from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
+ROCM_MAX_REPEAT_MISMATCH_RATIO = 0.01
+ROCM_MAX_REPEAT_ABS_DIFF = 1
 
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
-def test_hunyuan_image3_dit_lora_generation(tmp_path: Path):
+
+def _assert_repeatable(actual: np.ndarray, expected: np.ndarray, *, label: str) -> None:
+    if torch.version.hip is None:
+        np.testing.assert_array_equal(actual, expected)
+        return
+
+    abs_diff = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+    mismatched_ratio = float(np.count_nonzero(abs_diff)) / abs_diff.size
+    max_abs_diff = int(abs_diff.max())
+    print(f"{label}: mismatched_ratio={mismatched_ratio:.6f}, max_abs_diff={max_abs_diff}")
+    assert mismatched_ratio <= ROCM_MAX_REPEAT_MISMATCH_RATIO
+    assert max_abs_diff <= ROCM_MAX_REPEAT_ABS_DIFF
+
+
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)
+def test_hunyuan_image3_dit_lora_generation(
+    tmp_path: Path,
+    accuracy_artifact_root: Path,
+):
     model = "tencent/HunyuanImage-3.0-Instruct"
+    output_dir = reset_artifact_dir(accuracy_artifact_root / "hunyuan_image3_lora")
     config = json.loads(Path(hf_hub_download(model, "config.json")).read_text())
     hidden = config["hidden_size"]
     heads = config["num_attention_heads"]
@@ -96,7 +117,7 @@ def test_hunyuan_image3_dit_lora_generation(tmp_path: Path):
             )
             image = outputs[0].images[0]
             assert image.size == (512, 512)
-            image.save(tmp_path / f"{label}.png")
+            image.save(output_dir / f"{label}.png")
             return np.asarray(image).copy()
 
         baseline = generate("baseline")
@@ -104,7 +125,9 @@ def test_hunyuan_image3_dit_lora_generation(tmp_path: Path):
         restored = generate("restored")
         repeated = generate("repeated", request)
         zero_scale = generate("zero_scale", request, scale=0.0)
-        assert np.abs(adapted.astype(float) - baseline).mean() > 0.1
-        np.testing.assert_array_equal(restored, baseline)
-        np.testing.assert_array_equal(repeated, adapted)
-        np.testing.assert_array_equal(zero_scale, baseline)
+        adapted_mean_abs_diff = float(np.abs(adapted.astype(float) - baseline).mean())
+        print(f"adapted_mean_abs_diff={adapted_mean_abs_diff:.6f}")
+        assert adapted_mean_abs_diff > 0.1
+        _assert_repeatable(restored, baseline, label="restored_vs_baseline")
+        _assert_repeatable(repeated, adapted, label="repeated_vs_adapted")
+        _assert_repeatable(zero_scale, baseline, label="zero_scale_vs_baseline")

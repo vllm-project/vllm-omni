@@ -26,29 +26,59 @@ Example::
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+import weakref
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, suppress
 from typing import Any
 from uuid import uuid4
 
 from vllm.logger import init_logger
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands as duplex_commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, ResponseCreateOptions
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import DuplexEvent, SessionClosed
 from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionError,
     DuplexSessionEventMessage,
 )
+from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 _DEFAULT_CONTROL_TIMEOUT_S = 10.0
+# A cold engine can spend tens of seconds initializing per-session state before
+# the first open lands; control ops on a live session keep the short budget.
+_DEFAULT_OPEN_TIMEOUT_S = 60.0
+
+
+class _ProcessWorkerRuntime:
+    """Entrypoint-owned factory adapter; no frontend object is sent over IPC."""
+
+    def __init__(self, model: str, options: dict[str, Any]) -> None:
+        from vllm.plugins import load_general_plugins
+
+        from vllm_omni.entrypoints.duplex.warmup import warmup_silence_unit
+
+        load_general_plugins()
+        self.runtime = DuplexOmni(model=model, **options)
+        self.model = self.runtime.model
+        self.engine = self.runtime.engine
+        assert isinstance(self.engine, DuplexOmniEngine)
+        self.process_warmup_audio = warmup_silence_unit(self.engine.plugin)
+
+    async def check_health(self) -> None:
+        await self.runtime.check_health()
+
+    def shutdown(self) -> None:
+        self.runtime.shutdown()
 
 
 class DuplexSessionHandle:
@@ -66,7 +96,11 @@ class DuplexSessionHandle:
         self.capabilities: DuplexCapabilities = DuplexCapabilities()
         self.public_session: dict[str, object] = {}
         self.lease_generation: int = 0
-        self._outbox: asyncio.Queue[DuplexEvent | None] = asyncio.Queue()
+        limits = omni.duplex_session_config
+        self._outbox = DuplexOutputBuffer(
+            max_bytes=limits.max_pending_output_bytes_per_session,
+            max_events=limits.max_pending_output_events_per_session,
+        )
         self._closed = False
         self._close_reason: str | None = None
         self._closed_event = asyncio.Event()
@@ -219,12 +253,10 @@ class DuplexSessionHandle:
         self._consumer_active = True
         try:
             while True:
-                if self._closed and self._outbox.empty():
-                    return
                 event = await self._outbox.get()
                 if event is None:
-                    if self._closed and self._outbox.empty():
-                        return
+                    return
+                if not self._outbox.is_valid(event):
                     continue
                 yield event
                 if event.is_terminal:
@@ -235,6 +267,37 @@ class DuplexSessionHandle:
     async def wait_closed(self) -> str:
         await self._closed_event.wait()
         return self._close_reason or "closed"
+
+    def output_guard(self, event: DuplexEvent) -> AbstractContextManager[bool]:
+        """Recheck held audio while committing its delivery; never await inside this guard."""
+        return self._outbox.guard(event)
+
+    def _latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        """Newest accepted ``session.updated`` payload for wire-default apply.
+
+        Serving-only. Not part of the public handle (``submit`` / ``events``).
+        """
+        return self._outbox.latest_accepted_session()
+
+    def _observation_seq(self) -> int:
+        """How many ``session.updated`` / ``error`` events this session has enqueued."""
+        return self._outbox.observation_seq()
+
+    async def _wait_for_observation(self, seen: int) -> bool:
+        """Wait for a control event newer than ``seen``. False if the outbox is closed."""
+        return await self._outbox.wait_for_observation(seen)
+
+    def _arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+        """Keep one update's outcome until the serving reader consumes it."""
+        self._outbox.arm_observation_retention(after_seq, event_id)
+
+    def _disarm_observation_retention(self) -> None:
+        """Drop the retained update outcome."""
+        self._outbox.disarm_observation_retention()
+
+    def _retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        """Control events kept for the outstanding update."""
+        return self._outbox.retained_observations_after(seq)
 
     async def __aenter__(self) -> DuplexSessionHandle:
         return self
@@ -256,7 +319,7 @@ class DuplexSessionHandle:
             self.lease_generation = int(result.lease_generation)
 
     def _deliver(self, event: DuplexEvent) -> None:
-        self._outbox.put_nowait(event)
+        self._outbox.put(event)
         if isinstance(event, SessionClosed):  # SessionExpired is a SessionClosed
             self._mark_closed(event.reason or event.type)
 
@@ -266,7 +329,7 @@ class DuplexSessionHandle:
         self._closed = True
         self._close_reason = reason
         self._closed_event.set()
-        self._outbox.put_nowait(None)
+        self._outbox.close()
 
 
 class DuplexOmni(AsyncOmni):
@@ -274,25 +337,65 @@ class DuplexOmni(AsyncOmni):
 
     Construct it like ``AsyncOmni``. The pipeline must declare
     ``duplex_plugin`` and the deploy config ``session_mode: duplex``; the
-    engine raises at startup otherwise. There is no ``generate()``: duplex
-    serving is session-only.
+    engine raises at startup otherwise. ``duplex_engine_backend_as_process=True``
+    isolates the runtime from the frontend GIL and restricts this deployment
+    to sessions. The default ``False`` also permits model-supported chat.
     """
 
-    engine: DuplexOmniEngine
+    session_only: bool = False
+    final_output_task: asyncio.Task[None] | None
+    engine: DuplexOmniEngine | ProcessDuplexEngineClient  # type: ignore[assignment]
 
     def _create_engine(self, **engine_kwargs: Any) -> DuplexOmniEngine:
         from vllm_omni.entrypoints.duplex.audio_encoding import encode_audio
 
         return DuplexOmniEngine(duplex_audio_encoder=encode_audio, **engine_kwargs)
 
-    def __init__(self, model: str = "", *args: Any, **kwargs: Any) -> None:
-        super().__init__(model, *args, **kwargs)
+    def __init__(
+        self,
+        model: str = "",
+        *args: Any,
+        duplex_engine_backend_as_process: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        self.session_only = duplex_engine_backend_as_process
+        if self.session_only:
+            if args:
+                raise TypeError("The process duplex backend accepts keyword engine options only")
+            self.engine = ProcessDuplexEngineClient(model, kwargs, factory=_ProcessWorkerRuntime)
+            self.model = self.engine.metadata.model
+            self._initialize_output_state()
+            self._initialize_async_frontend()
+            self.endpoint_restrictions += tuple(
+                EndpointRestriction(capability, "The process duplex backend serves sessions only")
+                for capability in OmniServingCapability
+            )
+            self._weak_finalizer = weakref.finalize(self, self.engine.shutdown)
+        else:
+            super().__init__(model, *args, **kwargs)
         self._handles: dict[str, DuplexSessionHandle] = {}
         #: Rollbacks of resumes whose caller was cancelled mid-RPC (see ``resume_session``).
         self._resume_compensations: set[asyncio.Task[None]] = set()
         #: Initial and maximum delay between replays of an abandoned resume
         #: whose answers keep timing out.
         self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
+
+    async def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
+        if self.session_only:
+            raise NotImplementedError("The process duplex backend serves sessions only; use open_session()")
+        async for output in super().generate(*args, **kwargs):
+            yield output
+
+    async def aclose(self) -> None:
+        """Release sessions and flush the process shutdown before joining it."""
+        try:
+            await self.close_all_sessions()
+        finally:
+            try:
+                if isinstance(self.engine, ProcessDuplexEngineClient):
+                    await self.engine.aclose()
+            finally:
+                self.shutdown()
 
     # ---- deployment facts ----
 
@@ -341,7 +444,7 @@ class DuplexOmni(AsyncOmni):
         self,
         config: DuplexSessionConfig | Mapping[str, object] | None = None,
         *,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexSessionHandle:
         """Open an engine-resident session and return its handle.
 
@@ -353,11 +456,14 @@ class DuplexOmni(AsyncOmni):
         session_id = f"duplex-{uuid4().hex}"
         session_config = self._resolve_session_config(config, model=self.model)
         handle = DuplexSessionHandle(self, session_id)
-        self._handles[session_id] = handle
         self._final_output_handler()
+        self._handles[session_id] = handle
         try:
-            result = await self.engine.open_session_async(session_id, session_config, timeout=timeout)
+            result = await self.engine.open_session_async(
+                session_id, session_config, output_buffer=handle._outbox, timeout=timeout
+            )
         except BaseException:
+            handle._mark_closed("open_failed")
             if self._handles.get(session_id) is handle:
                 self._handles.pop(session_id, None)
             # Dropping the handle only forgets the id here. The engine may still
@@ -605,13 +711,22 @@ class DuplexOmni(AsyncOmni):
             handle._mark_closed(f"engine_dead: {error}")
         self._handles.clear()
 
-    def shutdown(self, timeout: float | None = None) -> None:
+    def _on_frontend_shutdown(self) -> None:
+        if not self.session_only:
+            super()._on_frontend_shutdown()
         for handle in list(self._handles.values()):
             handle._mark_closed("shutdown")
         self._handles.clear()
         for compensation in list(self._resume_compensations):
             compensation.cancel()
-        super().shutdown(timeout)
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        if isinstance(self.engine, ProcessDuplexEngineClient):
+            self._close_async_frontend()
+            self.engine.shutdown(timeout)
+            self._weak_finalizer.detach()
+        else:
+            super().shutdown(timeout)
 
 
 __all__ = ["DuplexOmni", "DuplexSessionHandle"]

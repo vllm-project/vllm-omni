@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_image>.
 
-
 This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_edit.py` CLI.
 
 ## Local CLI Usage

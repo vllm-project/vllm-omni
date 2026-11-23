@@ -5,12 +5,13 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.common.test_alias_free_activation import ENV, native_resample
 from vllm_omni.model_executor.models.common import alias_free_activation as fir
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.npu,
+    *hardware_marks(res={"npu": "A3"}, num_cards=1),
     pytest.mark.skipif(not fir.current_omni_platform.is_npu(), reason="requires Ascend NPU"),
 ]
 

@@ -44,9 +44,12 @@ class InteractionMixin:
             fps = media.fps
             num_latent_frames = media.num_latent_frames
 
+        context = state.interaction_boundary
+        if getattr(state.sampling, "streaming_buffer_seconds", None) is not None and context is None:
+            raise ValueError("paced interactions require an engine-owned boundary")
         merged = self._interaction_coordinator.apply_at_chunk_boundary(
             state,
-            boundary_at=synchronized_monotonic_time(),
+            boundary_at=context.boundary_at if context is not None else synchronized_monotonic_time(),
             num_media_frames=num_media_frames,
             fps=fps,
             num_latent_frames=num_latent_frames,

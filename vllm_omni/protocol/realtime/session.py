@@ -68,11 +68,24 @@ def apply_realtime_session_defaults(
     """Derive the wire defaults a Realtime ``session`` object declares."""
     input_format: object = session_payload.get("input_audio_format")
     audio_config = session_payload.get("audio")
-    if input_format is None and isinstance(audio_config, dict):
+    nested_input_format: object = None
+    if isinstance(audio_config, dict):
         audio_input = audio_config.get("input")
         if isinstance(audio_input, dict):
-            input_format = audio_input.get("format")
+            nested_input_format = audio_input.get("format")
+    if input_format is None:
+        input_format = nested_input_format
     input_format, input_rate = parse_realtime_audio_format(input_format)
+    # A projected session.updated keeps the client's nested format object and
+    # also fills the flat ``input_audio_format`` string (``audio/pcm`` →
+    # ``pcm16``, which carries no rate). Borrow that rate only when the nested
+    # object is the same encoding. A mismatched nested rate is ignored. When
+    # this payload does not declare a rate, keep ``defaults.input_sample_rate_hz``
+    # (the last accepted rate on a live connection, or 16000 on a fresh object).
+    if input_rate is None and isinstance(nested_input_format, dict):
+        nested_format, nested_rate = parse_realtime_audio_format(nested_input_format)
+        if nested_format == input_format and nested_rate is not None:
+            input_rate = nested_rate
     # Any: heterogeneous field values splatted into ``dataclasses.replace`` below.
     updates: dict[str, Any] = {}
     if isinstance(input_format, str) and input_format.lower() in REALTIME_INPUT_AUDIO_FORMATS:

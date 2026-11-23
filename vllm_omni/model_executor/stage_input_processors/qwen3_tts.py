@@ -3,6 +3,7 @@
 
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import math
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -11,11 +12,16 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
+    JOYAI_FINISH_ON_NEXT_STOP_KEY,
     CodesStruct,
     MetaStruct,
     OmniPayload,
     OmniPayloadStruct,
+    request_flag_is_set,
     to_dict,
+)
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     AdaptiveChunkController,
@@ -35,6 +41,54 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _precomputed_assistant_text_tokens(request: Any) -> int | None:
+    """Return the request's assistant text-token count carried by this payload.
+
+    Scope: this instrumentation reports a count only for requests that already
+    carry precomputed assistant text ids (``PRECOMPUTED_TEXT_IDS_KEY``) in
+    ``additional_information``.  A request carrying only the raw text string
+    returns ``None`` and Code2Wav then logs rho without n_k; deriving the count
+    from raw text needs the model tokenizer and is a follow-up.
+
+    Definition: the value counts the request's assistant text ids — the
+    tokenizer output of the assistant chat-template framing plus the text, i.e.
+    the same ids the prompt builder consumes — so template/control tokens are
+    included, not excluded.  It is a *running request* count, not a segment
+    count: one request ID covers every segment a resumable request is fed, and
+    the ids handed down for the segment being released cover the text released
+    so far.  Code2Wav turns it into the segment's own n_k by taking the increase
+    between consecutive segment boundaries (``_SegmentRhoTracker``).
+    """
+    additional_information = getattr(request, "additional_information", None)
+    if additional_information is None:
+        return None
+    entries = getattr(additional_information, "entries", None)
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get(PRECOMPUTED_TEXT_IDS_KEY)
+    if entry is None:
+        return None
+    return _serialized_entry_token_count(entry)
+
+
+def _serialized_entry_token_count(entry: Any) -> int | None:
+    """Count the ids in a serialized ``AdditionalInformationEntry``.
+
+    ``additional_information`` crosses process boundaries, so the precomputed
+    ids arrive either as a nested list or as a tensor encoded as raw bytes plus
+    its shape.
+    """
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, (list, tuple)) and list_data:
+        # ``list_data`` is ``[assistant_token_ids_for_len]`` (one list of ids).
+        text_ids = list_data[0] if len(list_data) == 1 and isinstance(list_data[0], (list, tuple)) else list_data
+        return len(text_ids) or None
+    tensor_shape = getattr(entry, "tensor_shape", None)
+    if getattr(entry, "tensor_data", None) is not None and isinstance(tensor_shape, list) and tensor_shape:
+        return math.prod(tensor_shape) or None
+    return None
 
 
 def _qwen3_tts_degenerate_finished_payload():
@@ -101,6 +155,29 @@ def _should_append_async_frame(
 
 def _append_tensor_frame(transfer_manager: Any, request_id: str, frame: torch.Tensor) -> None:
     transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(torch.long).reshape(-1).contiguous())
+
+
+def _stamp_finish_on_next_stop(meta: MetaStruct, request: object, *, finished: bool) -> None:
+    """Copy the last-sentence terminal stamp onto this chunk's meta.
+
+    Independent Qwen3-TTS never sets the request flag, so empty finished
+    payloads stay unstamped and Code2Wav keeps the pending_finish path.
+    """
+    if finished and request_flag_is_set(request, JOYAI_FINISH_ON_NEXT_STOP_KEY):
+        meta.joyai_finish_on_next_stop = True
+
+
+def _empty_finished_async_chunk(request_id: str, request: object) -> OmniPayloadStruct:
+    meta = MetaStruct(
+        request_id=request_id,
+        left_context_size=0,
+        finished=torch.tensor(True, dtype=torch.bool),
+    )
+    _stamp_finish_on_next_stop(meta, request, finished=True)
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+        meta=meta,
+    )
 
 
 def talker2code2wav_async_chunk(
@@ -213,10 +290,7 @@ def talker2code2wav_async_chunk(
         transfer_manager._qwen3_tts_emitted_frames = emitted_frames
     if request_id in emitted_frames and length <= emitted_frames[request_id]:
         if finished:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(request_id=request_id, left_context_size=0, finished=torch.tensor(True)),
-            )
+            return _empty_finished_async_chunk(request_id, request)
         return None
 
     # Full-utterance Code2Wav is gated by ``full_utterance_decode`` (explicit
@@ -230,18 +304,11 @@ def talker2code2wav_async_chunk(
 
     if length <= 0:
         if finished:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(
-                    request_id=request_id,
-                    left_context_size=0,
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-            )
+            return _empty_finished_async_chunk(request_id, request)
         return None
 
     if full_utterance_decode is True:
-        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        first_chunk = request_id not in emitted_frames
         context_length = length
     elif adaptive_enabled:
         _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
@@ -298,14 +365,7 @@ def talker2code2wav_async_chunk(
                 return None
             if context_length == 0:
                 ctrl.log_summary(request_id)
-                return OmniPayloadStruct(
-                    codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                    meta=MetaStruct(
-                        request_id=request_id,
-                        left_context_size=0,
-                        finished=torch.tensor(True, dtype=torch.bool),
-                    ),
-                )
+                return _empty_finished_async_chunk(request_id, request)
 
     elif ramp is not None:
         chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
@@ -314,16 +374,9 @@ def talker2code2wav_async_chunk(
         if not emit:
             return None
         if context_length == 0:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(
-                    request_id=request_id,
-                    left_context_size=0,
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-            )
+            return _empty_finished_async_chunk(request_id, request)
     else:
-        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        first_chunk = request_id not in emitted_frames
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
         if use_first_chunk and length <= initial_chunk_size:
@@ -358,7 +411,6 @@ def talker2code2wav_async_chunk(
     # ICL reference codes are part of the first decoder initialization only.
     # Follow-up chunks rely entirely on the request-local decoder cache.
     ref_code = request_payload.get(request_id)
-    emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
     ref_context_size = 0
     ref_context_request_id: str | None = None
     ref_context_included = False
@@ -388,18 +440,22 @@ def talker2code2wav_async_chunk(
             ref_context = ref_context[-ref_code_context_frames:]
         ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
         if ref_context_size > 0:
-            if emitted_chunks <= 0:
+            # Transport chunk IDs span segments. The adapter clears this watermark
+            # in OmniChunkTransferAdapter._send_single_request_for_generation
+            # when is_segment_finished is set, so the next segment re-sends reference.
+            if request_id not in emitted_frames:
                 ref_context_request_id = request_id
-                ref_frames = ref_context.tolist()
+                ref_frames = list(ref_context.to(device="cpu").unbind(0))
                 window_frames = ref_frames + window_frames
                 ref_context_included = True
                 left_context_size = ref_context_size
 
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
-    code_predictor_codes = torch.tensor(
-        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
-        dtype=torch.long,
+    # Keep the codebook-major CPU wire format without extracting every
+    # tensor element as a Python scalar. Legacy buffered frames can be lists.
+    code_predictor_codes = (
+        torch.stack([torch.as_tensor(frame, dtype=torch.long, device="cpu") for frame in window_frames])
+        .transpose(0, 1)
+        .reshape(-1)
     )
 
     meta = MetaStruct(
@@ -407,10 +463,20 @@ def talker2code2wav_async_chunk(
         left_context_size=left_context_size,
         finished=torch.tensor(finished, dtype=torch.bool),
     )
+    source_meta = multimodal_output.get("meta", {}) if isinstance(multimodal_output, Mapping) else {}
+    first_audio = source_meta.get("first_audio", False)
+    if isinstance(first_audio, torch.Tensor):
+        first_audio = bool(first_audio.numel() and first_audio.reshape(-1)[-1].item())
+    if first_audio:
+        meta.first_audio = torch.tensor(True, dtype=torch.bool)
     if ref_context_size > 0 and ref_context_request_id is not None:
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
+    request_text_tokens = _precomputed_assistant_text_tokens(request)
+    if request_text_tokens is not None:
+        meta.request_text_tokens = request_text_tokens
+    _stamp_finish_on_next_stop(meta, request, finished=finished)
 
     emitted_frames[request_id] = length
     return OmniPayloadStruct(
@@ -494,11 +560,13 @@ def talker2code2wav_async_chunk_batch(
             request_payload[request_id] = value.contiguous()
 
     payloads: list[OmniPayloadStruct | None] = []
-    for request, finished in zip(requests, is_finished):
+    for request, finished, pooling_output in zip(requests, is_finished, pooling_outputs):
         payloads.append(
             talker2code2wav_async_chunk(
                 transfer_manager=transfer_manager,
-                multimodal_output={},
+                multimodal_output={"meta": pooling_output.get("meta", {})}
+                if isinstance(pooling_output, Mapping)
+                else {},
                 request=request,
                 is_finished=finished,
             )
@@ -723,6 +791,9 @@ def talker2code2wav_full_payload(
     # async-chunk path, which already ships left_context_size in-band.
     if ref_code is not None and ref_frames > 0:
         meta["left_context_size"] = ref_frames
+    request_text_tokens = _precomputed_assistant_text_tokens(request)
+    if request_text_tokens is not None:
+        meta["request_text_tokens"] = request_text_tokens
     return {
         "codes": {"audio": codec_codes},
         "meta": meta,

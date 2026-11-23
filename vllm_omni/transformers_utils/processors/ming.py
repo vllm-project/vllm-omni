@@ -177,6 +177,7 @@ class MingFlashOmniProcessor(ProcessorMixin):
         video_processor_class = "AutoVideoProcessor"
     audio_processor_class = "AutoFeatureExtractor"
     tokenizer_class = "AutoTokenizer"
+    chat_template: str | dict[str, str] | None
 
     def __init__(
         self,

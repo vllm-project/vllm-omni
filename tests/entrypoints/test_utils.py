@@ -34,6 +34,8 @@ from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.utils import (
     coerce_param_message_types,
     filter_dataclass_kwargs,
+    get_final_stage_id_for_e2e,
+    parse_stage_overrides,
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 
@@ -345,6 +347,10 @@ class TestResolveOmniConfig:
         checkpoint = tmp_path / "model.safetensors"
         if checkpoint_exists:
             checkpoint.write_text("dummy")
+        if deploy_config_path is not None:
+            deploy_path = tmp_path / deploy_config_path
+            deploy_path.write_text("stages: []\n", encoding="utf-8")
+            deploy_config_path = str(deploy_path)
         create_from_model = mocker.patch(
             "vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None
         )
@@ -459,7 +465,8 @@ class TestResolveOmniConfig:
         assert stage.diffusion_config.revision == "pinned-revision"
         assert stage.final_output_type == "video"
 
-    def test_generic_diffusion_stage_overrides_reach_typed_backend(self, mocker: MockerFixture):
+    @pytest.mark.parametrize("stage_id", ["0", "00"])
+    def test_generic_diffusion_stage_overrides_reach_typed_backend(self, mocker: MockerFixture, stage_id: str):
         from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
         mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
@@ -476,14 +483,16 @@ class TestResolveOmniConfig:
                 "tensor_parallel_size": 1,
                 "diffusion_streaming_output": True,
             },
-            stage_overrides={
-                "0": {
-                    "extras": {"ltx2_use_conv_vae": True},
-                    "tensor_parallel_size": 2,
-                    "devices": "2,3",
-                    "engine_backend": "custom.backend",
+            stage_overrides=parse_stage_overrides(
+                {
+                    stage_id: {
+                        "extras": {"ltx2_use_conv_vae": True},
+                        "tensor_parallel_size": 2,
+                        "devices": "2,3",
+                        "engine_backend": "custom.backend",
+                    },
                 },
-            },
+            ),
             strategy_config_path=None,
         )
         stage = resolved.stage_by_id(0)
@@ -667,6 +676,37 @@ class TestCumulativeStreamingCoercion:
         assert all([isinstance(r, SamplingParams) for r in result])
         assert result[0].output_kind == RequestOutputKind.DELTA
         assert result[1].output_kind == RequestOutputKind.DELTA
+
+
+def _stage(final_output: bool, final_output_type: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(final_output=final_output, final_output_type=final_output_type)
+
+
+class TestGetFinalStageIdForE2E:
+    TEXT_AUDIO_STAGES = [_stage(True, "text"), _stage(False), _stage(True, "audio")]
+
+    def test_none_uses_default_modalities_and_picks_last_final_stage(self):
+        assert get_final_stage_id_for_e2e(None, ["text", "audio"], self.TEXT_AUDIO_STAGES) == 2
+
+    def test_requested_modality_selects_matching_final_stage(self):
+        assert get_final_stage_id_for_e2e(["text"], ["text", "audio"], self.TEXT_AUDIO_STAGES) == 0
+
+    def test_unsupported_modality_is_ignored_with_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
+            result = get_final_stage_id_for_e2e(["video", "text"], ["text", "audio"], self.TEXT_AUDIO_STAGES)
+
+        assert result == 0
+        assert any(rec.levelno == logging.WARNING and "video" in rec.message for rec in caplog.records)
+
+    def test_no_final_output_stage_falls_back_to_last_stage(self):
+        stages = [_stage(False), _stage(False), _stage(False)]
+
+        assert get_final_stage_id_for_e2e(["text"], ["text"], stages) == 2
+
+    def test_stage_without_final_output_attribute_is_skipped(self):
+        stages = [_stage(True, "text"), SimpleNamespace()]
+
+        assert get_final_stage_id_for_e2e(None, ["text"], stages) == 0
 
 
 @pytest.mark.parametrize("api_server_count", [1, 2])

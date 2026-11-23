@@ -29,6 +29,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Online INT8 linears** | ✅ Ordinary loader finalizes the int8 weight (contiguous or transposed view) and fp32 scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Online MXFP8 linears** | ✅ Ordinary loader finalizes the fp8 weight (contiguous) and e8m0 block scale (contiguous or transposed view) before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Online MXFP4 linears (vLLM XPU kernel)** | ✅ Ordinary loader finalizes the packed fp4 weight and e8m0 block scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
@@ -129,6 +130,18 @@ For a component configured with `weight_transfer="allgather"`, each rank stores 
 block's shard is copied to a device buffer and reconstructed with
 `all_gather_into_tensor` on a communication stream while the current block is
 executing.
+
+Weights are packed into chunk-major rank shards. `dlo_chunk_size_mb` (default
+64 MiB) bounds each collective, allowing the next chunk's host-to-device copy
+to overlap the current chunk's AllGather on separate streams. Two chunk-input
+buffers are reused only after their prior collective completes. The shared
+full-block buffers retain the existing compute-readiness and prefetch ordering.
+Chunk packing applies only when the effective weight-sharding group has more
+than one rank; rank-local mmap retains its bounded staging path.
+
+Packing preserves each parameter and buffer's physical layout, including
+strides. Loader-provided transforms may change strides but must preserve dtype
+and shape; invalid transforms raise before the source weights are released.
 
 ```text
 Compute:    [Block N]             [Block N+1]          [Block N+2]

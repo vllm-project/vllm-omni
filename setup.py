@@ -23,10 +23,10 @@ def uninstall_onnxruntime() -> None:
     with ROCm-specific dependencies.
     """
     try:
-        import pkg_resources
+        from importlib.metadata import PackageNotFoundError, metadata
 
         try:
-            pkg_resources.get_distribution("onnxruntime")
+            metadata("onnxruntime")
             print("Found onnxruntime installed, uninstalling for ROCm compatibility...")
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime"],
@@ -34,7 +34,7 @@ def uninstall_onnxruntime() -> None:
                 stderr=subprocess.DEVNULL,
             )
             print("Successfully uninstalled onnxruntime")
-        except pkg_resources.DistributionNotFound:
+        except PackageNotFoundError:
             print("onnxruntime not installed, skipping uninstall")
     except Exception as e:
         print(f"Warning: Failed to uninstall onnxruntime: {e}")
@@ -157,22 +157,13 @@ def get_vllm_omni_version() -> str:
         # Append device-specific suffix
         device = detect_target_device()
 
-        if device == "cuda":
-            # if it is cuda, following vLLM
-            # we don't need to add any suffix
-            pass
-        elif device == "rocm":
-            version += f"{sep}rocm"
-        elif device == "npu":
-            version += f"{sep}npu"
-        elif device == "xpu":
-            version += f"{sep}xpu"
-        elif device == "musa":
-            version += f"{sep}musa"
-        elif device == "cpu":
-            version += f"{sep}cpu"
-        else:
+        if device not in ("cuda", "rocm", "npu", "xpu", "musa", "cpu"):
             raise RuntimeError(f"Unknown target device: {device}")
+        # CUDA has no suffix, following vLLM. When building a wheel from an
+        # sdist (`python -m build`), the version comes from PKG-INFO and
+        # already carries the suffix; don't append it a second time.
+        if device != "cuda" and version.partition("+")[2].split(".")[-1] != device:
+            version += f"{sep}{device}"
 
     # Tell setuptools_scm to use this version
     # This will be picked up by write_to and written to _version.py

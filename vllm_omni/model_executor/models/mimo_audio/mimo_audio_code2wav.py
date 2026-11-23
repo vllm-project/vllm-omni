@@ -1,10 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 Xiaomi Corporation.
+from __future__ import annotations
+
 import logging
 import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torchaudio
@@ -13,17 +18,17 @@ from torchaudio.transforms import MelSpectrogram
 from transformers import AutoTokenizer, Qwen2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.models import SupportsPP
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID, MiMoAudioConfig
 from vllm_omni.model_executor.models.mimo_audio.cuda_graph_decoder_wrapper import CUDAGraphMiMoDecoderWrapper
 from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +336,7 @@ class MiMoAudioCodes:
     empty: int
 
     @classmethod
-    def from_tokenizer(cls, tokenizer: AutoTokenizer) -> "MiMoAudioCodes":
+    def from_tokenizer(cls, tokenizer: AutoTokenizer) -> MiMoAudioCodes:
         def idx(token: str) -> int:
             token_id = tokenizer.convert_tokens_to_ids(token)
             if not isinstance(token_id, int):
@@ -432,7 +437,7 @@ def get_tokenizer_worker(
     return _TOKENIZER_WORKER_CACHE[key]
 
 
-class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
+class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
     """Decode MiMo audio codes to waveform for the code2wav stage."""
 
     have_multimodal_outputs = True
@@ -694,37 +699,6 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
                 multimodal_outputs={"model_outputs": [model_output.to(dtype=torch.float32).reshape(-1)]},
             )
         raise TypeError(f"Unexpected model output type: {type(model_output)}")
-
-    def _get_full_code_sequence(
-        self,
-        code_tensor: torch.Tensor | None,
-        kwargs: dict,
-    ) -> torch.Tensor | None:
-        """Gather the full prompt token ids (code sequence) if available."""
-        if code_tensor is not None and code_tensor.numel() > 1:
-            return code_tensor
-
-        sampling_metadata = kwargs.get("sampling_metadata")
-        prompt_token_ids = getattr(sampling_metadata, "prompt_token_ids", None) if sampling_metadata else None
-
-        if prompt_token_ids is None:
-            return code_tensor
-
-        if isinstance(prompt_token_ids, torch.Tensor):
-            return prompt_token_ids.detach().to(torch.long).view(-1)
-
-        if isinstance(prompt_token_ids, list):
-            if len(prompt_token_ids) == 0:
-                return code_tensor
-            if isinstance(prompt_token_ids[0], list):
-                flat = prompt_token_ids[0]
-            else:
-                flat = prompt_token_ids
-            if len(flat) == 0:
-                return code_tensor
-            return torch.tensor(flat, dtype=torch.long)
-
-        return code_tensor
 
     @torch.inference_mode()
     def _batch_decode_waveforms(
@@ -1051,6 +1025,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     ) -> SamplerOutput | None:
         # code2wav stage does not need sampling, but needs to return a valid SamplerOutput to avoid CUDA errors
         # Use Sampler to handle sampling, even though the result will not be used
+        from vllm.v1.sample.sampler import Sampler
+
         if logits is None or logits.numel() == 0:
             return None
 
