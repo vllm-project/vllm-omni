@@ -197,6 +197,27 @@ def _resolve_kernel_bias(layer: torch.nn.Module, bias: torch.Tensor | None) -> t
     return bias
 
 
+def _prepare_kernel_weights(kernel, layer: torch.nn.Module) -> None:
+    """Run kernel weight prep without consuming a caller-owned bias.
+
+    Marlin permutes and pads ``layer.bias`` for its GEMM layout. When
+    ``skip_bias_add`` is set the caller adds the bias after the GEMM, so the
+    checkpoint bias must remain in its original order.
+    """
+    caller_bias = None
+    caller_bias_snapshot = None
+    if getattr(layer, "skip_bias_add", False):
+        caller_bias = getattr(layer, "bias", None)
+        if caller_bias is not None:
+            caller_bias_snapshot = caller_bias.detach().clone()
+
+    kernel.process_weights_after_loading(layer)
+
+    if caller_bias is not None and caller_bias_snapshot is not None:
+        caller_bias.data = caller_bias_snapshot
+        layer.bias = caller_bias
+
+
 class DiffusionConvRotConfig(QuantizationConfig):
     """Online ConvRot quantization of every non-ignored diffusion linear layer."""
 
@@ -477,7 +498,7 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         layer.params_dtype = layer.orig_dtype
         replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
-        kernel.process_weights_after_loading(layer)
+        _prepare_kernel_weights(kernel, layer)
         self._finish_weight_processing(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -516,7 +537,7 @@ class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         layer.params_dtype = layer.orig_dtype
         replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
-        kernel.process_weights_after_loading(layer)
+        _prepare_kernel_weights(kernel, layer)
         self._finish_weight_processing(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:

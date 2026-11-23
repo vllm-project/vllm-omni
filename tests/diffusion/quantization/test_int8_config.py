@@ -388,7 +388,10 @@ class TestOffloadAfterQuant:
         assert marked == 1
         assert lazy_int8._offload_after_quant
 
-    def test_bias_first_checkpoint_offloads_each_layer_before_next_load(self, mocker: MockerFixture):
+    @pytest.mark.parametrize("offload_after_quant", [False, True])
+    def test_bias_first_checkpoint_finalizes_each_layer_before_next_load(
+        self, mocker: MockerFixture, offload_after_quant
+    ):
         from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
         from vllm_omni.quantization.int8_config import LazyWeightMixin
 
@@ -427,7 +430,9 @@ class TestOffloadAfterQuant:
         second, second_moved_to = make_layer()
         model = torch.nn.Sequential(first, second)
 
-        assert DiffusersPipelineLoader._request_offload_after_quant(model) == 2
+        assert DiffusersPipelineLoader._prepare_lazy_weight_loading(model) == 2
+        if offload_after_quant:
+            assert DiffusersPipelineLoader._request_offload_after_quant(model) == 2
 
         bias = torch.randn(4)
         first.bias.weight_loader(first.bias, bias)
@@ -438,14 +443,14 @@ class TestOffloadAfterQuant:
         # starts materializing the second layer's weight.
         assert first.processed
         assert first._already_called_process_weights_after_loading
-        assert first_moved_to == ["cpu"]
+        assert first_moved_to == (["cpu"] if offload_after_quant else [])
         assert not getattr(second, "_already_called_process_weights_after_loading", False)
 
         second.bias.weight_loader(second.bias, bias)
         second.weight.weight_loader(second.weight, torch.randn(4, 8))
         assert second.processed
         assert second._already_called_process_weights_after_loading
-        assert second_moved_to == ["cpu"]
+        assert second_moved_to == (["cpu"] if offload_after_quant else [])
 
 
 class TestInt8LinearMethod:

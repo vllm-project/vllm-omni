@@ -918,6 +918,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             plan_result.fallback_reason,
                         )
                     logger.debug("Loading weights on %s ...", load_device)
+                    self._prepare_lazy_weight_loading(model)
                     if offload_after_quant:
                         marked = self._request_offload_after_quant(model)
                         if marked:
@@ -988,6 +989,19 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             if callable(candidate):
                 reporter = cast(Callable[[str], None], candidate)
                 reporter(component_name)
+
+    @staticmethod
+    def _prepare_lazy_weight_loading(model: nn.Module) -> int:
+        """Install per-layer load tracking before any checkpoint tensor is read."""
+        prepared = 0
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            prepare = getattr(quant_method, "prepare_lazy_loading", None)
+            if prepare is None:
+                continue
+            prepare(module)
+            prepared += 1
+        return prepared
 
     @staticmethod
     def _request_offload_after_quant(model: nn.Module) -> int:

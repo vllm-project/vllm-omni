@@ -335,7 +335,11 @@ class LazyWeightMixin:
         """
         self._offload_after_quant = True
         if layer is not None:
-            self._install_bias_load_tracking(layer)
+            self.prepare_lazy_loading(layer)
+
+    def prepare_lazy_loading(self, layer: torch.nn.Module) -> None:
+        """Install parameter tracking before checkpoint iteration starts."""
+        self._install_bias_load_tracking(layer)
 
     def _lazy_load_device(self) -> torch.device:
         """Device the meta weight materializes on at first load.

@@ -185,6 +185,49 @@ def test_kernel_bias_prefers_prepared_layer_bias_only_when_layer_has_bias():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("method_cls", "config_name", "factory_name", "quantize_name"),
+    [
+        (ConvRotMxfp4OnlineLinearMethod, "convrot_mxfp4", "init_mxfp4_linear_kernel", "mxfp4_quantize"),
+        (ConvRotMxfp8OnlineLinearMethod, "convrot_mxfp8", "init_mxfp8_linear_kernel", "mxfp8_e4m3_quantize"),
+    ],
+)
+@pytest.mark.parametrize("skip_bias_add", [False, True])
+def test_mxfp_kernel_prep_preserves_caller_owned_bias(
+    mocker: MockerFixture, method_cls, config_name, factory_name, quantize_name, skip_bias_add
+):
+    class PermutingKernel:
+        def process_weights_after_loading(self, layer):
+            layer.bias = torch.nn.Parameter(layer.bias.detach().flip(0), requires_grad=False)
+
+    mocker.patch.object(convrot_config, factory_name, return_value=PermutingKernel())
+    mocker.patch.object(
+        convrot_config, quantize_name, return_value=(torch.zeros(4, 16, dtype=torch.uint8), torch.ones(4, 1))
+    )
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.randn(4, 32, dtype=torch.bfloat16), requires_grad=False)
+    original_bias = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0, 4.0]), requires_grad=False)
+    layer.bias = original_bias
+    layer.has_bias = True
+    layer.skip_bias_add = skip_bias_add
+    layer.orig_dtype = torch.bfloat16
+    layer.input_size_per_partition = 32
+    layer.output_size_per_partition = 4
+    layer.logical_widths = [4]
+
+    method_cls(build_quant_config(config_name)).process_weights_after_loading(layer)
+
+    if skip_bias_add:
+        assert layer.bias is original_bias
+        torch.testing.assert_close(layer.bias, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    else:
+        assert layer.bias is not original_bias
+        torch.testing.assert_close(layer.bias, torch.tensor([4.0, 3.0, 2.0, 1.0]))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_missing_mxfp_support_only_disables_mxfp_methods(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     mocker.patch.object(convrot_config, "_MXFP_AVAILABLE", False)
