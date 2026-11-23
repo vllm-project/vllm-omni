@@ -305,6 +305,42 @@ class TestResidentLayers:
         with pytest.raises(ValueError, match="no matching resident_dit_paths"):
             resolve_offload_plan(_WanStylePipeline(), self._dlo_config(2, {"dit"}))
 
+    @staticmethod
+    def _mot_pipeline(resident_children: dict[str, frozenset[str]]) -> nn.Module:
+        class Pipeline(nn.Module):
+            _dit_modules = ["language_model.model"]
+            _offload_plan = OffloadPlan(
+                block_attrs={"language_model.model": ("layers",)},
+                resident_dit_paths=frozenset({"language_model.model"}),
+                resident_dit_children=resident_children,
+            )
+
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.model = nn.Module()
+                model = self.language_model.model
+                model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(4)])
+                # 16384 x 65536 fp32 is ~4 GiB, above the nested-component
+                # threshold, so it is split out unless the plan keeps it.
+                with torch.device("meta"):
+                    model.embed_tokens = nn.Linear(16_384, 65_536)
+
+        return Pipeline()
+
+    def test_declared_resident_children_stay_with_the_block_stream(self):
+        pipeline = self._mot_pipeline({"language_model.model": frozenset({"embed_tokens"})})
+        resolved = resolve_offload_plan(pipeline, self._dlo_config(2, {"dit"}))
+
+        dit = resolved.dits[0]
+        assert dit.children == ()
+        assert _stack_of(dit).resident_head == 2
+
+    def test_undeclared_large_child_needs_the_on_demand_contract(self):
+        pipeline = self._mot_pipeline({})
+        with pytest.raises(ValueError, match="must implement load_to_device"):
+            resolve_offload_plan(pipeline, self._dlo_config(2, {"dit"}))
+
 
 class TestValidation:
     def test_selected_dit_requires_a_discovered_module(self):
