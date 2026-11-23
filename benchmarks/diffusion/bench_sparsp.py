@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Compare sparse Ring K/V demand and manifest planning on one NCCL backend."""
+"""Compare sparse Ring K/V demand planners on one NCCL backend."""
 
 import argparse
 import hashlib
@@ -51,11 +51,8 @@ def benchmark(args, device):
     full = SparSPSpec(cdf=args.cdf)
     demand = replace(full, routing="selective_direct")
     manifest = replace(demand, demand_planner="manifest")
-    policy_order = [full, demand, manifest]
-    if args.include_pair_relay:
-        policy_order.append(replace(manifest, routing="selective_pair_relay"))
-        policy_order.append(manifest)
-    policy_order.extend((demand, full))
+    per_hop = replace(demand, demand_planner="per_hop")
+    policy_order = [full, per_hop, demand, manifest, manifest, demand, per_hop, full]
     reference = None
     results = []
     for spec in policy_order:
@@ -81,14 +78,7 @@ def benchmark(args, device):
                     samples.append(elapsed.item())
         executor = get_sp_group().sparsp_executors.pop((heads, dim, spec))
         counters = torch.tensor(
-            [
-                executor.payload_bytes,
-                executor.dense_payload_bytes,
-                executor.cross_pair_payload_bytes,
-                executor.forwarded_payload_bytes,
-            ],
-            dtype=torch.int64,
-            device=device,
+            [executor.payload_bytes, executor.dense_payload_bytes], dtype=torch.int64, device=device
         )
         dist.all_reduce(counters)
         executor.close()
@@ -106,14 +96,12 @@ def benchmark(args, device):
                 "mean_ms": statistics.mean(samples),
                 "kv_payload_bytes_global": counters[0].item(),
                 "relay_kv_payload_bytes_global": counters[1].item(),
-                "cross_pair_kv_payload_bytes_global": counters[2].item() if world == 4 else None,
-                "forwarded_kv_payload_bytes_global": counters[3].item() if world == 4 else None,
                 "bitwise_equal": True,
             }
         )
     direct_bytes = {case["kv_payload_bytes_global"] for case in results if case["routing"] == "selective_direct"}
     if len(direct_bytes) != 1:
-        raise RuntimeError("SparSP manifest changed the number of transferred K/V bytes")
+        raise RuntimeError("SparSP demand planners transferred different numbers of K/V bytes")
     return {
         "input_shape": list(q.shape),
         "placement_grid": args.placement_grid,
@@ -137,7 +125,6 @@ def main():
     parser.add_argument("--cdf", type=float, default=0.9)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=200)
-    parser.add_argument("--include-pair-relay", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.warmup, args.iterations) < 1:
@@ -149,8 +136,6 @@ def main():
     try:
         if world not in (2, 3, 4):
             raise ValueError("run on two to four GPUs")
-        if args.include_pair_relay and world != 4:
-            raise ValueError("pair relay requires four GPUs in contiguous rank pairs")
         initialize_model_parallel(sequence_parallel_size=world, ring_degree=world)
         report = benchmark(args, device)
         if dist.get_rank() == 0:

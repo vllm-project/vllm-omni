@@ -7,33 +7,24 @@ K/V payloads preserve the input BF16 or FP16 bits.
 
 | Setting | Options | Effect |
 | --- | --- | --- |
-| `routing` | `full_ring`, `selective_direct`, `selective_pair_relay` | Relay full K/V, send the requested head/block pairs, or coalesce cross-pair requests. |
-| `demand_planner` | `torch`, `manifest` | Derive packed indices with PyTorch or compact masks into reusable GPU scratch. |
+| `routing` | `full_ring`, `selective_direct` | Relay full K/V or send only the requested head/block pairs. |
+| `demand_planner` | `torch`, `manifest`, `per_hop` | When direct demand is exchanged and how many hops are posted ahead of local attention. |
 | `placement` | `none`, `auto`, `interval_periodic` | Use contiguous ownership or assign whole query tiles by recurring spatial bands. |
 
-Direct demand exchanges a per-head K/V block mask once per attention call.
+Direct demand exchanges a per-head K/V block mask for each attention call.
 Both endpoints derive the same head/block order and payload length. Each
 sender packs those blocks into contiguous K/V packets and the receiver
-places them in the layout used by sparse attention. The `manifest` planner
-compacts indices in one GPU pass and reads back only the packet lengths.
-With direct routing, the local attention pass can run while demand
-exchange and compact layout preparation are in flight.
-NCCL packet lengths are copied into pinned host memory on the planning
-stream. Initial packets can pack directly from the GPU plan while the host
-reads lengths for NCCL. The first two hops can use separate slots, and a later hop
-reuses its slot once placement has consumed the previous packet.
-The union over local queries determines traffic savings.
+places them in the layout used by sparse attention. The union over local
+queries determines traffic savings.
 
-With four Ring ranks, `selective_pair_relay` groups ranks 0–1 and 2–3.
-Place each pair on the same CPU socket and use the manifest planner.
-One packet crosses sockets per producer and includes the union of both
-remote consumers' demands. Each socket chooses between the two cross-socket
-rank matchings using the manifest to minimize the number of blocks that
-need forwarding. The ingress rank forwards the second consumer's
-contiguous prefix to its same-socket peer. The independent
-within-pair and cross-pair exchanges share a single NCCL batch. The executor
-queues the first exchange and forwarding before launching local attention.
-Forwarding can also run while attention consumes the first two received packets.
+- `torch` exchanges every hop's demand in one collective, then keeps one
+  hop in flight ahead of compute.
+- `manifest` exchanges every hop's demand in one collective, derives all
+  packed indices, and posts every hop before local attention.
+- `per_hop` is the on-demand control. It posts every hop before local
+  attention, but each hop first exchanges its own demand and reads its
+  packed indices back to the host. That round trip queues behind the
+  previous hop's payload on the same NCCL communicator.
 
 The default `placement: none` leaves video ownership contiguous.
 `placement: auto` uses periodic ownership when each rank can own an
@@ -92,22 +83,8 @@ CUDA_VISIBLE_DEVICES=1,4,5,6 NCCL_P2P_LEVEL=SYS NCCL_P2P_DISABLE=0 NCCL_SHM_DISA
 ```
 
 The archive must contain `q`, `k`, and `v` in canonical BSHD token order.
-The comparison brackets on-demand routing with full-ring NCCL controls
-and compares both planners at identical K/V payload size. It verifies
+The comparison brackets the demand planners with full-ring NCCL controls
+and compares the planners at identical K/V payload size. It verifies
 bitwise output equality and reports the NCCL version, attention-call
-latency, and bytes sent across all ranks. For four ranks, the report also
-counts bytes crossing the rank-pair boundary. Add `--include-pair-relay`
-on a two-pair topology or `--placement-grid 40 24 48` for the 46,080-token
-periodic refinement capture.
-
-In a 45-call-per-policy LTX-2 replay on four PCIe L40 GPUs with NCCL
-2.32.6 and CDF 0.90, the full Ring and paired manifest paths produced
-bitwise-identical BF16 outputs.
-
-| Capture | Full Ring | Paired manifest |
-| --- | ---: | ---: |
-| Generation, 11,520 tokens | 11.935 ms | 11.961 ms |
-| Refinement, 46,080 tokens | 46.152 ms | 45.349 ms |
-
-The refinement capture sent 3.92% fewer total K/V bytes and 35.13% fewer
-cross-socket K/V bytes. The timings measure attention calls on captured inputs.
+latency, and bytes sent across all ranks. Add `--placement-grid 40 24 48`
+for the 46,080-token periodic refinement capture.

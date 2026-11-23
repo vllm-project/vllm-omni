@@ -38,19 +38,16 @@ def test_sparsp_serializes_manifest_demand():
     assert spec.backend_kwargs()["sparsp"]["demand_planner"] == "manifest"
 
 
-def test_sparsp_manifest_requires_demand():
-    with pytest.raises(ValueError, match="manifest demand planner requires selective routing"):
-        SparSPSpec(demand_planner="manifest")
+@pytest.mark.parametrize("planner", ["manifest", "per_hop"])
+def test_sparsp_demand_planners_require_selective_direct(planner):
+    with pytest.raises(ValueError, match=f"{planner} demand planner requires selective_direct routing"):
+        SparSPSpec(demand_planner=planner)
+    assert SparSPSpec(routing="selective_direct", demand_planner=planner).demand_planner == planner
 
 
-def test_sparsp_pair_relay_requires_manifest():
-    with pytest.raises(ValueError, match="pair relay requires the manifest"):
-        SparSPSpec(routing="selective_pair_relay")
-    spec = AttentionSpec(
-        backend="SPARSP_ATTN",
-        sparsp={"routing": "selective_pair_relay", "demand_planner": "manifest"},
-    )
-    assert spec.backend_kwargs()["sparsp"]["routing"] == "selective_pair_relay"
+def test_sparsp_rejects_removed_pair_relay():
+    with pytest.raises(ValueError, match="invalid SparSP routing"):
+        SparSPSpec(routing="selective_pair_relay", demand_planner="manifest")
 
 
 def test_demand_plans_keep_each_peers_native_head_and_block_order(monkeypatch):
@@ -60,7 +57,6 @@ def test_demand_plans_keep_each_peers_native_head_and_block_order(monkeypatch):
 
     executor = SparseRingExecutor.__new__(SparseRingExecutor)
     executor.tokens, executor.heads, executor.world, executor.rank = 128, 2, 3, 1
-    executor.manifest = None
     monkeypatch.setattr(executor, "group", None, raising=False)
     selected = torch.zeros(1, 2, 2, 6, dtype=torch.bool)
     selected[0, 0, 0, 1] = True

@@ -109,8 +109,6 @@ class SparSPAttentionImpl(AttentionImpl):
             or parallel.tensor_parallel_size != 1
         ):
             raise ValueError("SPARSP_ATTN requires pure Ring SP: ring>=2, ulysses=allgather=TP=1")
-        if self.config.routing == "selective_pair_relay" and parallel.ring_degree != 4:
-            raise ValueError("SparSP pair relay requires four Ring ranks")
         if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
             raise ValueError("SPARSP_ATTN requires equal [B,S,H,D] Q/K/V")
         if (
