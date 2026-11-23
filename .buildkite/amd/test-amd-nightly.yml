@@ -27,6 +27,22 @@ steps:
           # Preserve the existing audio validators and the deploy's ROCm V1 override.
           - bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh tests/e2e/online_serving/test_qwen3_tts_base_expansion.py 8 tts rocm-qwen3-tts-base-expansion
 
+  - group: ":full_moon: Qwen3-TTS CustomVoice Expansion MI300 Nightly"
+    steps:
+      - label: "Qwen3-TTS CustomVoice Full-Model Expansion"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 120
+        source_file_dependencies: tts_qwen3_tts_function
+        env:
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-customvoice-expansion/failed-audio"
+        artifact_paths:
+          - artifacts/rocm-qwen3-tts-customvoice-expansion/**/*
+        commands:
+          - bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh tests/e2e/online_serving/test_qwen3_tts_customvoice_expansion.py 10 tts rocm-qwen3-tts-customvoice-expansion
+
   - group: ":full_moon: Wan2.2 Backend Similarity MI300 Nightly"
     steps:
       - label: "Wan2.2 Diffusers Backend Similarity"
@@ -1611,6 +1627,22 @@ steps:
             tests/diffusion/distributed/test_cfg_parallel.py
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
 
+      - label: "Diffusion Pipeline Parallel Parity · 2 GPUs"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 45
+        source_file_dependencies: [diffusion_pipeline_parallel_parity, rocm_diffusion_nightly_runner]
+        artifact_paths:
+          - artifacts/rocm-diffusion-pipeline-parallel-2gpu/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            2 5 30m rocm-diffusion-pipeline-parallel-2gpu
+            tests/diffusion/distributed/test_pipeline_parallel.py
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
+
       - label: "Diffusion Exchange and Ring Parity · 4 GPUs"
         agent_pool: mi300_4
         depends_on: amd-build
@@ -1645,6 +1677,28 @@ steps:
             4 2 45m rocm-diffusion-cfg-3rank
             tests/diffusion/distributed/test_cfg_parallel.py::test_predict_noise_with_multi_branch_cfg_parity
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_3"
+
+      - label: "Wan and Qwen-Image VAE Patch-Decode Equivalence"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 75
+        source_file_dependencies:
+          - diffusion_vae_patch_decode
+          - rocm_diffusion_nightly_runner
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-vae-patch-decode/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 60m rocm-vae-patch-decode
+            "tests/diffusion/distributed/test_vae_decode_parallelism.py::test_vae_patch_parallel_tp2[wan22_t2v_a14b]"
+            "tests/diffusion/distributed/test_vae_decode_parallelism.py::test_vae_patch_parallel_tp2[qwen_image]"
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
+            --basetemp="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-vae-patch-decode/previews"
 
   - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
     # Flux2Klein distributed cold starts measure about 590-604s on MI325 and
