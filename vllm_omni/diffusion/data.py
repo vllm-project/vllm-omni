@@ -1057,6 +1057,10 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Optional static AdaLN weight residency within ordinary layerwise offload.
+    cache_adaln: bool = False
+    adaln_cache_max_gib: float = 25.0
+    adaln_cache_reserve_gib: float = 8.0
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires

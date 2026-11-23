@@ -45,6 +45,29 @@ Non-block state of a selected DiT or text encoder remains device resident.
 Unselected components, VAEs, and declared resident modules are not streamed by
 this backend.
 
+## Optional static AdaLN residency
+
+`cache_adaln` is a default-off option for ordinary DiT layerwise offload.
+Configuration, stage transport and CLI preserve the requested cache limit
+and free-memory reserve. The backend selects materialized parameters and
+buffers within AdaLN-named DiT modules after loading/quantization; selection
+does not depend on attention precision or a device generation.
+
+Cache preparation copies every selected tensor with its recorded dtype and
+stride before rebinding any model storage. Budget, memory-query, or copy
+failure rolls back cache-owned state and leaves ordinary LO available.
+MiniMax-H3's non-block final AdaLN projection weight and scale are excluded
+from the cache; the current checkpoint retains the original 101-tensor scope.
+Selected tensors are excluded from both sides of the hook ring and from
+materialization probes, so a cached tensor cannot hide missing streamed
+weights. Other block weights continue to use the original hook protocol.
+
+On disable, streamed weights return to their recorded original devices and
+cache-owned tensors return to their original storage. Shutdown also restores
+cache-owned storage without materializing all streamed blocks. A startup free-memory
+reserve cannot guarantee that arbitrary future requests or VAE execution
+will fit; this policy does not provide an automatic generation retry.
+
 ## Invariants and limitations
 
 - Each offloaded tensor has one pinned host backing store.

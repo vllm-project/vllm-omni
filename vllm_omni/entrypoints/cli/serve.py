@@ -1093,6 +1093,26 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
+            "--cache-adaln",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Keep DiT AdaLN weights and quantization buffers resident within ordinary layerwise offload. "
+            "Disabled by default; budget or allocation failures fall back to ordinary LO.",
+        )
+        omni_config_group.add_argument(
+            "--adaln-cache-max-gib",
+            type=_nonneg_finite_float,
+            default=25.0,
+            help="Maximum AdaLN cache per device in GiB (default: 25); zero forces ordinary LO fallback.",
+        )
+        omni_config_group.add_argument(
+            "--adaln-cache-reserve-gib",
+            type=_nonneg_finite_float,
+            default=8.0,
+            help="Minimum free device memory in GiB after cache allocation (default: 8). "
+            "Reserve for activations and auxiliary stages; this is not a worst-case generation memory bound.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-offload-config",
             type=json.loads,
             default=None,

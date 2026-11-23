@@ -42,6 +42,26 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --diffusion-offload-config '{"mode":"layer","components":["dit"]}'
 ```
 
+## Optional AdaLN cache
+
+Ordinary DiT layerwise offload supports `--cache-adaln` (default off),
+`--adaln-cache-max-gib` (25 GiB per device) and `--adaln-cache-reserve-gib`
+(8 GiB free after allocation). Python/stage fields use the corresponding
+underscore names. Model offload, distributed LO and encoder-only selections
+reject the cache option. A5 rejects cache admission before allocation.
+
+```bash
+vllm serve /path/to/model --omni --enable-layerwise-offload \
+  --cache-adaln --adaln-cache-max-gib 25 --adaln-cache-reserve-gib 8
+```
+
+Cached AdaLN weights and scales retain their loaded dtype/stride. Budget,
+telemetry or copy failures leave ordinary LO available. The reserve is a
+startup check; it does not bound future activation/VAE memory. MiniMax-H3's
+non-block final projection weight and scale retain their existing residency.
+Selection, rollback and hook exclusion are specified in the
+[layerwise offload design](../../../design/feature/offloader/layerwise_offload.md).
+
 ## Component selection
 
 Add `dit`, `text_encoder`, or both to the `components` list. Omitting
