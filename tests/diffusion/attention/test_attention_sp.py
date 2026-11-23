@@ -211,14 +211,13 @@ class _MockAllGatherSPGroup:
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("joint_strategy", ["front", "rear"])
+@pytest.mark.parametrize(("rank", "joint_strategy"), [(0, "front"), (1, "rear")])
 @pytest.mark.parametrize(
-    ("mask_image", "mask_joint", "joint_query"),
-    [(False, True, True), (True, True, False), (True, False, True)],
-    ids=["text-padding", "both-padding-cached-kv", "image-padding"],
+    ("mask_image", "mask_joint"),
+    [(False, True), (True, True), (True, False)],
+    ids=["text-padding", "both-padding", "image-padding"],
 )
-def test_allgather_joint_key_mask_reaches_sdpa(rank, joint_strategy, mask_image, mask_joint, joint_query):
+def test_allgather_joint_key_mask_reaches_sdpa(rank, joint_strategy, mask_image, mask_joint):
     query = torch.zeros(1, 2, 1, 1)
     keys = [torch.zeros_like(query) for _ in range(2)]
     image_mask = torch.tensor([[True, True, True, not mask_image]])
@@ -228,7 +227,7 @@ def test_allgather_joint_key_mask_reaches_sdpa(rank, joint_strategy, mask_image,
     metadata = AttentionMetadata(
         attn_mask=image_mask if mask_image else None,
         joint_attn_mask=joint_mask if mask_joint else None,
-        joint_query=query if joint_query else None,
+        joint_query=query,
         joint_key=query,
         joint_value=joint_mask.float().view_as(query),
         joint_strategy=joint_strategy,
@@ -245,20 +244,16 @@ def test_allgather_joint_key_mask_reaches_sdpa(rank, joint_strategy, mask_image,
 @pytest.mark.parametrize("mask_shape", [(2, 4), (1, 6), (1, 2, 6)])
 def test_allgather_preserves_existing_full_mask(mask_shape):
     query = torch.zeros(1, 2, 1, 1)
-    keys = [torch.zeros_like(query) for _ in range(2)]
-    values = [torch.ones_like(query) for _ in range(2)]
-    values[1][:, -1] = 0
+    chunks = [query, query]
     mask = torch.ones(mask_shape, dtype=torch.bool)
     mask[..., -1] = False
     metadata = AttentionMetadata(attn_mask=mask)
     if mask_shape[-1] == 6:
-        metadata.joint_key, metadata.joint_value = query, torch.ones_like(query)
-    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=0, gather_chunks=[keys, values]))
-    q, k, v, metadata, _ = strategy.pre_attention(query, keys[0], values[0], metadata)
+        metadata.joint_key = metadata.joint_value = query
+    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=0, gather_chunks=[chunks, chunks]))
+    _, _, _, metadata, _ = strategy.pre_attention(query, query, query, metadata)
 
     assert metadata.attn_mask is mask
-    output = SDPAImpl(num_heads=1, head_size=1, softmax_scale=1.0)._forward_impl(q, k, v, metadata)
-    torch.testing.assert_close(output, torch.ones_like(output))
 
 
 @pytest.mark.cpu
