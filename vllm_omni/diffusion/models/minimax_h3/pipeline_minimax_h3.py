@@ -1445,8 +1445,6 @@ class MiniMaxH3Pipeline(
                 return None
         return name
 
-    remap_checkpoint_key = _remap_ckpt_key
-
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
