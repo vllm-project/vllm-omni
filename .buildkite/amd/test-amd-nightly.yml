@@ -1678,6 +1678,28 @@ steps:
             tests/diffusion/distributed/test_cfg_parallel.py::test_predict_noise_with_multi_branch_cfg_parity
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_3"
 
+      - label: "Wan and Qwen-Image VAE Patch-Decode Equivalence"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: Blocking
+        timeout_in_minutes: 75
+        source_file_dependencies:
+          - diffusion_vae_patch_decode
+          - rocm_diffusion_nightly_runner
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-vae-patch-decode/**/*
+        commands:
+          - >-
+            bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
+            4 2 60m rocm-vae-patch-decode
+            "tests/diffusion/distributed/test_vae_decode_parallelism.py::test_vae_patch_parallel_tp2[wan22_t2v_a14b]"
+            "tests/diffusion/distributed/test_vae_decode_parallelism.py::test_vae_patch_parallel_tp2[qwen_image]"
+            -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
+            --basetemp="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-vae-patch-decode/previews"
+
   - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
     # Flux2Klein distributed cold starts measure about 590-604s on MI325 and
     # use a model-scoped 900s engine deadline. Keep ten minutes around the
