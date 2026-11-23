@@ -91,9 +91,9 @@ NEGATIVE_PROMPT = (
     "stylized filters, or AI artifacts."
 )
 
-# Release parity exercises the accelerated BF16 cuDNN path in both runtimes.
-# Degenerate one-token attention falls back to PyTorch SDPA MATH.
-ATTENTION_BACKEND = "torch_sdpa_cudnn_bf16"
+# CUDA release parity uses cuDNN in both runtimes. ROCm uses each runtime's
+# PyTorch SDPA priority order so both sides select the same available kernel.
+ATTENTION_BACKEND = "torch_sdpa_default_bf16" if torch.version.hip is not None else "torch_sdpa_cudnn_bf16"
 LTX25_STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
 
@@ -649,7 +649,7 @@ def _assert_strict_similarity(
 @pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path, task: str) -> None:
     """Compare Omni with official canonical DiffVAE and matching connector weights."""
@@ -779,7 +779,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
 @pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 @pytest.mark.parametrize("pipeline_mode", ["full_one_stage", "full_two_stage"])
 def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
@@ -941,7 +941,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
 @pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 def test_ltx25_t2a_matches_official(accuracy_artifact_root: Path) -> None:
     """Compare Omni's audio-only runtime with the official T2A pipeline."""
     artifact_parent = accuracy_artifact_root / "ltx_official"

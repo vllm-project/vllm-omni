@@ -23,11 +23,12 @@ MODEL_REVISION = os.environ.get(
 SAMPLE_RATE = 48_000
 REQUESTED_DURATION_S = 2.0
 EXPECTED_SAMPLE_COUNT = 96_480
+ATTENTION_BACKEND = "TORCH_SDPA" if torch.version.hip is not None else "CUDNN_ATTN"
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 def test_ltx25_text_to_audio_offline_generate() -> None:
     """A real LTX-2.5 checkpoint generates finite stereo 48 kHz audio offline."""
     from vllm_omni import Omni
@@ -39,7 +40,7 @@ def test_ltx25_text_to_audio_offline_generate() -> None:
         "model": MODEL,
         "model_class_name": "LTX2TextToAudioPipeline",
         "enforce_eager": True,
-        "diffusion_attention_backend": "CUDNN_ATTN",
+        "diffusion_attention_backend": ATTENTION_BACKEND,
     }
     if MODEL_REVISION and not os.path.isdir(MODEL):
         omni_kwargs["revision"] = MODEL_REVISION

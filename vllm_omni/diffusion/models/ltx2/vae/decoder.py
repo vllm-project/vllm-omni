@@ -196,10 +196,41 @@ class LTX2VideoVaeNeighborhoodNattenProcessor(diffusers_decoder.LTX2VideoVaeNeig
         return attn.to_out[0](hidden_states)
 
 
+class LTX2VideoVaeNeighborhoodTritonProcessor:
+    """Portable Triton ``na3d`` processor for ROCm DiffVAE decode."""
+
+    def __init__(self) -> None:
+        # Keep the optional compiler backend out of CPU-only imports.
+        from vllm.triton_utils import HAS_TRITON
+
+        if not HAS_TRITON:
+            raise RuntimeError("Triton is unavailable")
+        from ..ops.na3d import na3d
+
+        self._na3d = na3d
+
+    def __call__(
+        self, attn: "LTX2VideoVaeNeighborhoodAttention", hidden_states: torch.Tensor, block_mask=None
+    ) -> torch.Tensor:
+        batch_size, num_frames, height, width, channels = hidden_states.shape
+        query, key, value = attn.project_qkv(hidden_states)
+        query, key, value = query.contiguous(), key.contiguous(), value.contiguous()
+        hidden_states = self._na3d(
+            query,
+            key,
+            value,
+            kernel_size=tuple(attn.kernel_size),
+            scale=1.0,
+        )
+        hidden_states = hidden_states.reshape(batch_size, num_frames, height, width, channels)
+        return attn.to_out[0](hidden_states)
+
+
 class LTX2VideoVaeNeighborhoodAttention(diffusers_decoder.LTX2VideoVaeNeighborhoodAttention):
     _available_processors = [
         *diffusers_decoder.LTX2VideoVaeNeighborhoodAttention._available_processors,
         LTX2VideoVaeNeighborhoodNattenProcessor,
+        LTX2VideoVaeNeighborhoodTritonProcessor,
     ]
 
     def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

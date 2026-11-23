@@ -413,11 +413,46 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
     assert calls["init_distributed"] is True
 
 
+def test_ltx25_neighborhood_processor_uses_triton_on_rocm(monkeypatch):
+    expected = object()
+
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodTritonProcessor",
+        lambda: expected,
+    )
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodNattenProcessor",
+        lambda: (_ for _ in ()).throw(AssertionError("ROCm must not initialize NATTEN")),
+    )
+
+    assert ltx2_components._create_ltx25_neighborhood_processor() is expected
+
+
+def test_ltx25_triton_failure_has_actionable_rocm_remedy(monkeypatch):
+    class MissingTritonProcessor:
+        def __init__(self):
+            raise RuntimeError("Triton is unavailable")
+
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodTritonProcessor",
+        MissingTritonProcessor,
+    )
+
+    with pytest.raises(RuntimeError, match=r"ROCm requires the bundled Triton.*working ROCm PyTorch and Triton"):
+        ltx2_components._create_ltx25_neighborhood_processor()
+
+
 def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
     class MissingNattenProcessor:
         def __init__(self):
             raise ImportError("kernels is unavailable")
 
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(
         ltx2_components,
         "LTX2VideoVaeNeighborhoodNattenProcessor",
@@ -425,7 +460,7 @@ def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match=r"kernels==0\.16\.1.*supported GPU.*allow Hub access"):
-        ltx2_components._create_ltx25_natten_processor()
+        ltx2_components._create_ltx25_neighborhood_processor()
 
 
 def test_ltx_checkpoint_explicit_version_precedes_structural_heuristics(tmp_path):

@@ -2606,6 +2606,14 @@ _KREA2_WEEKLY_2GPU_NODES = (
     "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_hsdp",
     "tests/e2e/offline_inference/test_krea2_expansion.py::test_krea2_vae_patch_parallel",
 )
+_LTX_WEEKLY_1GPU_PATHS = (
+    "tests/e2e/online_serving/test_ltx.py",
+    "tests/e2e/online_serving/test_ltx25.py",
+    "tests/e2e/online_serving/test_ltx25_audio.py",
+    "tests/e2e/offline_inference/test_ltx25_audio.py",
+    "tests/e2e/accuracy/ltx/test_ltx_official_similarity.py",
+    "tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py",
+)
 _AMD_DIFFUSION_PARITY_WEEKLY_JOBS = (
     (
         "LongCat online · 1-GPU",
@@ -2812,6 +2820,109 @@ def test_longcat_boogu_flux_krea2_weekly_jobs_are_exact_blocking_rocm_owners() -
     krea2_offline_source = Path("tests/e2e/offline_inference/test_krea2_expansion.py").read_text(encoding="utf-8")
     assert krea2_offline_source.count('@hardware_test(res={"cuda": "H100", "rocm": "MI325"})') == 4
     assert krea2_offline_source.count('@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)') == 2
+
+
+def test_ltx_weekly_jobs_are_exact_blocking_rocm_owners_and_ready_qualifies_na3d() -> None:
+    runner = ".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh"
+    jobs = (
+        (
+            "LTX functional and accuracy · 1-GPU",
+            "mi300_1",
+            300,
+            "1",
+            "19",
+            "285m",
+            "rocm-ltx-weekly-1gpu",
+            _LTX_WEEKLY_1GPU_PATHS,
+            "slow and diffusion and rocm and MI325 and cards_1",
+        ),
+        (
+            "LTX HSDP · 2-GPU",
+            "mi300_2",
+            180,
+            "2",
+            "1",
+            "165m",
+            "rocm-ltx-weekly-2gpu",
+            ("tests/e2e/online_serving/test_ltx.py",),
+            "slow and diffusion and rocm and MI325 and cards_2",
+        ),
+    )
+
+    for label, pool, timeout, gpus, tests, run_timeout, artifact, paths, marker in jobs:
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        assert step["grade"] == "Blocking"
+        assert step["agent_pool"] == pool
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == timeout
+        assert step["source_file_dependencies"] == ["diffusion_ltx_weekly", "rocm_diffusion_nightly_runner"]
+        assert step["env"] == {
+            "VLLM_ROCM_USE_AITER": "0",
+            "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
+        }
+        assert step["artifact_paths"] == [f"artifacts/{artifact}/**/*"]
+        assert "retry" not in step
+        assert len(step["commands"]) == 1
+
+        tokens = [token for token in split(step["commands"][0]) if token.strip()]
+        runner_index = tokens.index(runner)
+        args = tokens[runner_index + 1 :]
+        assert args[:4] == [gpus, tests, run_timeout, artifact]
+        marker_index = args.index("-m")
+        assert tuple(args[4:marker_index]) == paths
+        assert args[marker_index + 1] == marker
+
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+    ltx_dependencies = {
+        dependency
+        for item in dependencies["diffusion_ltx_weekly"]
+        for dependency in (item if isinstance(item, list) else (item,))
+    }
+    for path in _LTX_WEEKLY_1GPU_PATHS:
+        assert any(
+            path == dependency or (dependency.endswith("/") and path.startswith(dependency))
+            for dependency in ltx_dependencies
+        )
+    assert "vllm_omni/diffusion/models/ltx2/" in ltx_dependencies
+    assert "tests/diffusion/models/ltx2/" in ltx_dependencies
+
+    single_mark = 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})'
+    two_card_mark = 'hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)'
+    ltx_source = Path("tests/e2e/online_serving/test_ltx.py").read_text(encoding="utf-8")
+    assert single_mark in ltx_source
+    assert two_card_mark in ltx_source
+    assert single_mark in Path("tests/e2e/online_serving/test_ltx25.py").read_text(encoding="utf-8")
+    hardware_decorator = '@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)'
+    for path in (
+        "tests/e2e/online_serving/test_ltx25_audio.py",
+        "tests/e2e/offline_inference/test_ltx25_audio.py",
+    ):
+        assert hardware_decorator in Path(path).read_text(encoding="utf-8")
+    accuracy_decorator = '@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)'
+    assert accuracy_decorator in Path("tests/e2e/accuracy/ltx/test_ltx_official_similarity.py").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        Path("tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py")
+        .read_text(encoding="utf-8")
+        .count(accuracy_decorator)
+        == 3
+    )
+
+    ready = _find_step("Diffusion · LTX DiffVAE Triton NA", AMD_READY_PIPELINE)
+    assert ready["grade"] == "Blocking"
+    assert ready["agent_pool"] == "mi300_1"
+    assert ready["depends_on"] == "amd-build"
+    assert ready["mirror_hardwares"] == ["amdproduction"]
+    assert ready["source_file_dependencies"] == "diffusion_ltx_weekly"
+    ready_command = "\n".join(ready["commands"])
+    assert "tests/diffusion/models/ltx2/test_ltx2_diffvae_na3d.py" in ready_command
+    assert "test_triton_na3d_matches_explicit_inward_shift_mask_on_rocm" in ready_command
+    assert "core_model and rocm and MI325 and cards_1" in ready_command
 
 
 _COSMOS3_WEEKLY_NODES = (
@@ -6520,6 +6631,6 @@ def test_weekly_keeps_only_wan21_vace_burn_in_nonblocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 52
-    assert sum(step["grade"] == "Blocking" for step in steps) == 50
+    assert len(steps) == 54
+    assert sum(step["grade"] == "Blocking" for step in steps) == 52
     assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == _WAN21_VACE_WEEKLY_LABELS
