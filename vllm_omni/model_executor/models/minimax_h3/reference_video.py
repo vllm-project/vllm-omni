@@ -32,7 +32,6 @@ def resolve_reference_video_decode_reuse(extra_args: Mapping[str, object]) -> bo
 def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
     required_fields = (
         "original_path",
-        "prepared_path",
         "input_has_audio",
         "width",
         "height",
@@ -40,7 +39,7 @@ def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_di
         "duration_seconds",
         "audio_duration_seconds",
     )
-    optional_fields = ("rgb_path", "frame_count")
+    optional_fields = ("prepared_path", "rgb_path", "frame_count")
     return json.dumps(
         {
             "artifact_dir": artifact_dir,
@@ -64,7 +63,6 @@ def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[st
         raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor")
     required = {
         "original_path",
-        "prepared_path",
         "input_has_audio",
         "width",
         "height",
@@ -72,11 +70,13 @@ def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[st
         "duration_seconds",
         "audio_duration_seconds",
     }
-    optional = {"rgb_path", "frame_count"}
+    optional = {"prepared_path", "rgb_path", "frame_count"}
     if any(
         not isinstance(item, dict)
         or not required.issubset(item)
         or not set(item).issubset(required | optional)
+        or not (isinstance(item.get("prepared_path"), str) or "rgb_path" in item)
+        or ("prepared_path" in item and not isinstance(item["prepared_path"], str))
         or (("rgb_path" in item) != ("frame_count" in item))
         or ("rgb_path" in item and not isinstance(item["rgb_path"], str))
         or ("frame_count" in item and (not isinstance(item["frame_count"], int) or item["frame_count"] <= 0))
@@ -364,7 +364,7 @@ def _transcode_reference_video(
     pad_last_frame: bool = False,
     cover: bool = False,
     rgb_output_path: str | None = None,
-) -> str:
+) -> str | None:
     output = str(Path(workdir) / "prepared.mp4")
     duration_args = ["-t", f"{float(duration_seconds):.6f}"] if duration_seconds is not None else []
     frame_count_args = ["-frames:v", str(int(target_frame_count))] if target_frame_count > 0 else []
@@ -426,15 +426,11 @@ def _transcode_reference_video(
     else:
         command = [
             *input_args,
-            "-filter_complex",
-            f"[0:v:0]{','.join(filters)},split=2[prepared][rgb]",
             "-map",
-            "[prepared]",
+            "0:v:0",
             "-an",
-            *video_output_args,
-            "-map",
-            "[rgb]",
-            "-an",
+            "-vf",
+            ",".join(filters),
             *duration_args,
             *frame_count_args,
             "-f",
@@ -444,7 +440,7 @@ def _transcode_reference_video(
             rgb_output_path,
         ]
     subprocess.run(command, check=True, stdin=subprocess.DEVNULL)
-    return output
+    return output if rgb_output_path is None else None
 
 
 def prepare_edit_video(
@@ -476,6 +472,7 @@ def prepare_edit_video(
         pad_last_frame=True,
         cover=cover,
     )
+    assert prepared_path is not None
 
     return {
         "original_path": source,
@@ -553,7 +550,6 @@ def prepare_reference_videos(
         )
         item: dict[str, Any] = {
             "original_path": source,
-            "prepared_path": prepared_path,
             "input_has_audio": bool(meta.get("audio_codecs")),
             "width": width,
             "height": height,
@@ -568,6 +564,8 @@ def prepare_reference_videos(
                 float(target_frame_count) / MINIMAX_H3_FPS if target_frame_count > 0 else duration,
             ),
         }
+        if prepared_path is not None:
+            item["prepared_path"] = prepared_path
         if rgb_path is not None:
             frame_size = int(width) * int(height) * 3
             rgb_size = os.path.getsize(rgb_path)
@@ -692,11 +690,13 @@ def _decode_video_frames_ffmpeg(
 
 
 def sample_reference_video_frames(
-    prepared_path: str,
+    prepared_path: str | None,
     *,
     decoded_frames: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if decoded_frames is None:
+        if prepared_path is None:
+            raise OmniClientError("prepared reference video has neither reusable RGB nor a prepared MP4")
         meta = _probe_video(prepared_path)
         frame_count = int(meta["frame_count"])
     else:
@@ -717,7 +717,7 @@ def sample_reference_video_frames(
             indices.append(frame_index)
         cursor += ratio
     if not indices:
-        raise OmniClientError(f"no frames sampled from {prepared_path}")
+        raise OmniClientError("no frames sampled from prepared reference video")
 
     if decoded_frames is None:
         decoded_frames = _decode_video_frames_ffmpeg(

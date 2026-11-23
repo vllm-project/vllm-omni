@@ -46,6 +46,10 @@ def test_prepared_reference_descriptor_round_trips_rgb_sidecar(tmp_path):
     with pytest.raises(ValueError, match="invalid MiniMax H3"):
         reference_video.deserialize_prepared_reference_videos(json.dumps(payload))
 
+    del item["prepared_path"]
+    encoded = reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
+    assert reference_video.deserialize_prepared_reference_videos(encoded) == (str(tmp_path), [item])
+
 
 def test_prepared_rgb_sidecar_validates_exact_size(tmp_path):
     item = _descriptor_item(tmp_path)
@@ -72,6 +76,7 @@ def test_reused_descriptor_selects_frames_independently_of_request_option(
     decoded = np.full_like(rgb, 123)
     if has_sidecar:
         rgb.tofile(item["rgb_path"])
+        del item["prepared_path"]
     else:
         del item["rgb_path"], item["frame_count"]
     monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: decoded)
@@ -180,8 +185,12 @@ def test_request_option_reaches_real_rgb_producer(monkeypatch, reference_clip, r
     captures = []
 
     def record_transcode(*args, **kwargs):
-        captures.append(kwargs["rgb_output_path"] is not None)
-        return original_transcode(*args, **kwargs)
+        result = original_transcode(*args, **kwargs)
+        reuse = kwargs["rgb_output_path"] is not None
+        captures.append(reuse)
+        assert (result is None) == reuse
+        assert Path(kwargs["workdir"], "prepared.mp4").exists() != reuse
+        return result
 
     monkeypatch.setattr(reference_video, "_transcode_reference_video", record_transcode)
     extra_args: dict[str, object] = {"task": "ref2va"}
@@ -204,8 +213,12 @@ def test_removed_environment_switch_does_not_override_consecutive_requests(monke
     captures = []
 
     def record_transcode(*args, **kwargs):
-        captures.append(kwargs["rgb_output_path"] is not None)
-        return original_transcode(*args, **kwargs)
+        result = original_transcode(*args, **kwargs)
+        reuse = kwargs["rgb_output_path"] is not None
+        captures.append(reuse)
+        assert (result is None) == reuse
+        assert Path(kwargs["workdir"], "prepared.mp4").exists() != reuse
+        return result
 
     monkeypatch.setattr(reference_video, "_transcode_reference_video", record_transcode)
     outputs = []
@@ -253,18 +266,35 @@ def test_transcode_sidecar_matches_prepared_video_pixels(
         check=True,
         stdin=subprocess.DEVNULL,
     )
-    rgb_path = str(tmp_path / "prepared.rgb")
+    prepared_dir = tmp_path / "prepared"
+    sidecar_dir = tmp_path / "sidecar"
+    prepared_dir.mkdir()
+    sidecar_dir.mkdir()
+    rgb_path = str(sidecar_dir / "prepared.rgb")
     prepared = reference_video._transcode_reference_video(
         source,
         target_width=32,
         target_height=32,
         target_frame_count=target_frames,
-        workdir=str(tmp_path),
+        workdir=str(prepared_dir),
+        start_time_seconds=start,
+        duration_seconds=duration,
+        pad_last_frame=pad,
+    )
+    assert prepared is not None
+    sidecar = reference_video._transcode_reference_video(
+        source,
+        target_width=32,
+        target_height=32,
+        target_frame_count=target_frames,
+        workdir=str(sidecar_dir),
         start_time_seconds=start,
         duration_seconds=duration,
         pad_last_frame=pad,
         rgb_output_path=rgb_path,
     )
+    assert sidecar is None
+    assert not (sidecar_dir / "prepared.mp4").exists()
     rgb = reference_video.load_prepared_rgb_frames(
         {"rgb_path": rgb_path, "frame_count": expected_count, "width": 32, "height": 32}
     )

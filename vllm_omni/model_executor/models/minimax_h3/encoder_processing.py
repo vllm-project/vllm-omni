@@ -542,7 +542,7 @@ def _reuse_prepared_reference_videos(
     if len(prepared) != expected_count:
         raise OmniClientError("MiniMax H3 prepared-reference-video count does not match the request")
     for item in prepared:
-        if not os.path.isfile(item["prepared_path"]):
+        if "rgb_path" not in item and not os.path.isfile(item["prepared_path"]):
             raise OmniClientError(f"MiniMax H3 prepared reference video is unavailable: {item['prepared_path']}")
     return prepared
 
@@ -798,7 +798,7 @@ def prepare_encoder_inputs(
                         )
                         encoded_video_inputs.append(_frames_to_tensor(full_frames))
                         sampled = sample_reference_video_frames(
-                            item["prepared_path"],
+                            item.get("prepared_path"),
                             decoded_frames=full_frames,
                         )
                         video_timestamps.append(sampled["block_timestamps"])
