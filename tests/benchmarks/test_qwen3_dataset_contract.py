@@ -235,8 +235,8 @@ def test_cuda_pipeline_selects_each_matrix_case_once():
         ("test_qwen3_omni_datasets_cuda_default", "default-seed-tts-c64"),
         ("test_qwen3_omni_datasets_cuda_async_daily", "async-prefix-daily-omni-c8"),
         *{("test_qwen3_omni_datasets_cuda_async_seed", f"async-prefix-seed-tts-c{c}") for c in (1, 16, 32, 64)},
-        ("test_qwen3_omni_duplex_omni_duplex_eval", "c8_accuracy_response_stats_v5"),
-        ("test_qwen3_omni_duplex_omniinteract", "c8_accuracy_response_stats_v5"),
+        ("test_qwen3_omni_duplex_omni_duplex_eval", "c8_accuracy_response_stats"),
+        ("test_qwen3_omni_duplex_omniinteract", "c8_accuracy_response_stats"),
     }
     assert selected == Counter({case: 1 for case in expected})
 

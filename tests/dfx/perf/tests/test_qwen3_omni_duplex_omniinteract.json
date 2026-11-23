@@ -58,7 +58,7 @@
         "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1q1a_math",
         "omniinteract_max_video_duration_s": 600,
         "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
-        "name": "c8_accuracy_response_stats_v5",
+        "name": "c8_accuracy_response_stats",
         "duplex_metric_aggregation": "response",
         "metric-percentiles": "50,95",
         "ready_check_timeout_sec": 0,

@@ -40,7 +40,7 @@
     },
     "benchmark_params": [
       {
-        "name": "c8_accuracy_response_stats_v5",
+        "name": "c8_accuracy_response_stats",
         "dataset_name": "omni-duplex-eval",
         "dataset_path": "Hothan/Omni-DuplexEval@de63329f76daa5e0c604363ef6a2c383dfba45f6",
         "backend": "openai-realtime-duplex",
@@ -257,7 +257,7 @@
     },
     "benchmark_params": [
       {
-        "name": "c8_accuracy_response_stats_v5",
+        "name": "c8_accuracy_response_stats",
         "runtime_resource_aliases": {
           "910": "A3"
         },
