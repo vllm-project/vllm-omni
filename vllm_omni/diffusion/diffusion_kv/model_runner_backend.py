@@ -11,7 +11,12 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dcp_group
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec, get_block_table_width
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
+
+try:
+    from vllm.v1.kv_cache_interface import get_block_table_width
+except ImportError:
+    from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 

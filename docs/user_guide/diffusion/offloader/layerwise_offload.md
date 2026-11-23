@@ -109,3 +109,30 @@ offload consume the same `OffloadPlan` metadata.
 - Setup consolidates and pins block parameters, increasing cold-start time.
 - Performance depends on block compute time and host-to-device bandwidth;
   lightweight blocks may not hide transfers.
+
+## NPU CPU binding
+
+Set `additional_config={"enable_cpu_binding": true}` to bind each NPU worker
+and its existing threads to permitted CPUs on its device's PCIe NUMA node.
+`false` preserves incoming affinity; explicit `true` reports binding failure.
+The DCMI adapter supports both legacy and Ascend 950 APIs and reordered device
+visibility. Binding is independent of sparse precision and does not enable LO.
+
+```bash
+vllm serve /path/to/model --omni \
+  --additional-config '{"enable_cpu_binding":true}'
+```
+
+Local spawned workers inherit locality before Torch imports; the launching
+thread restores its affinity after startup, including failed starts. Worker
+initialization and loading bind existing thread pools within their individual
+CPU limits. IRQ affinity and process-wide page migration are unchanged.
+When omitted, the automatic policy applies only if an optional AdaLN cache is
+enabled for MindIE-SD CP2×U8 on 16 devices; failure then preserves affinity.
+A5 uses explicit binding with LO and AdaLN residency disabled.
+
+Set `VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE=2` (AICPU) or `3` (AIV) before
+startup to choose the engine for both Ulysses and AllGather-KV groups.
+Omitting it preserves the HCCL default. Check participating group logs to
+confirm the selected engine. CPU binding support does not establish a latency
+gain; qualify each model/topology with frozen-source hot samples.

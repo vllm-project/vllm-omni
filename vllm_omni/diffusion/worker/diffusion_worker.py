@@ -589,6 +589,9 @@ class DiffusionWorker:
 
         # Setup device
         self.device = current_omni_platform.get_torch_device(self.local_rank)
+        from vllm_omni.diffusion.offloader.npu_cpu_affinity import maybe_bind_npu_offload_cpu
+
+        self.cpu_affinity_bound = maybe_bind_npu_offload_cpu(self.od_config, self.device)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config

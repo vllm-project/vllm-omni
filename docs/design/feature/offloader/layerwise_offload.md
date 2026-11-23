@@ -47,6 +47,18 @@ this backend.
 
 ## Invariants and limitations
 
+- Before loading NPU weights for cached MindIE-SD U8 x CP2 execution on 16
+  devices, the diffusion loader selects allowed CPUs from the device's actual
+  PCIe NUMA topology. Native Omni and SD8 do not trigger this automatic policy.
+  `additional_config.enable_cpu_binding` overrides the automatic
+  policy. An explicit false preserves incoming affinity; explicit true
+  requires successful binding. The local multiprocessing executor narrows its
+  launching thread while starting each worker, so the fresh interpreter inherits
+  local CPUs before importing Torch. The parent thread is restored after every
+  start, including failed starts. Binding also runs before device initialization and
+  again before loading, covering existing worker thread pools without
+  widening their individual CPU limits. This changes worker CPU placement only;
+  cache ownership, tensor layout, restoration and the hook ring are unchanged.
 - Each offloaded tensor has one pinned host backing store.
 - Parameter identity is preserved when storage is rebound.
 - Blocks with heterogeneous shapes and dtypes use their recorded metadata;

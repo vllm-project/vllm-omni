@@ -3,12 +3,12 @@
 
 import copy
 from dataclasses import MISSING, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
 from transformers import PretrainedConfig
 from vllm.config import ModelConfig
-from vllm.config.utils import CompileFactors, config
+from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     get_hf_text_config,
@@ -19,6 +19,9 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 import vllm_omni.model_executor.models as me_models
+
+if TYPE_CHECKING:
+    from vllm.config.utils import CompileFactors
 
 logger = init_logger(__name__)
 
@@ -170,14 +173,8 @@ class OmniModelConfig(ModelConfig):
     requires_full_payload_input: bool = False
     scheduling_metadata_adapter: str | None = None
 
-    def compile_factors(self) -> CompileFactors:
-        """Compile factors for the Omni Model config, used for the compile cache.
-
-        v0.34 replaced ``ModelConfig.compute_hash``/``VllmConfig.compute_hash``
-        with ``compile_factors()`` + ``vllm.config.utils.hash_config``; this
-        ports the connector normalization that used to live in the removed
-        ``compute_hash`` override.
-        """
+    def _normalized_compile_config(self):
+        """Normalize volatile connector identities on a copy for both cache APIs."""
         from vllm_omni.distributed.omni_connectors.utils.config import connector_hash_factors
 
         # Remove hash factors on a copy of the object, then use the mutated copy to get the factors.
@@ -192,7 +189,15 @@ class OmniModelConfig(ModelConfig):
             hashed.omni_kv_config = dict(self.omni_kv_config)
             hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
 
-        return super(OmniModelConfig, hashed).compile_factors()
+        return hashed
+
+    def compile_factors(self) -> "CompileFactors":
+        """Use the vLLM 0.34 compile-factor API."""
+        return super(OmniModelConfig, self._normalized_compile_config()).compile_factors()
+
+    def compute_hash(self) -> str:
+        """Retain connector hash normalization with the A5 vLLM 0.33 runtime."""
+        return super(OmniModelConfig, self._normalized_compile_config()).compute_hash()
 
     @property
     def registry(self):

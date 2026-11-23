@@ -33,6 +33,7 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.offloader.npu_cpu_affinity import npu_worker_start_affinity
 from vllm_omni.diffusion.sched.request_scheduler import (
     build_rank_local_dp_extra_args_signature,
     build_request_batch_sampling_params_key,
@@ -388,7 +389,10 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                 daemon=True,
             )
             scheduler_pipe_readers.append(reader)
-            process.start()
+            # Spawn inherits the launching thread's CPU allowance before the
+            # child interpreter imports its main module, Torch or the worker.
+            with npu_worker_start_affinity(od_config, i, is_npu=current_omni_platform.is_npu()):
+                process.start()
             processes.append(process)
 
         # Wait for all workers to be ready

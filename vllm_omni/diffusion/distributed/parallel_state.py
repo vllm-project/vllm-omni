@@ -610,6 +610,30 @@ def build_ulysses_allgather_rank_groups(
     return ulysses_groups, allgather_groups
 
 
+def _new_sequence_parallel_group(ranks: list[int], kind: str):
+    """Apply the selected HCCL engine to both Ulysses and AllGather-KV."""
+    mode = envs.VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE
+    if mode is None:
+        return torch.distributed.new_group(ranks)
+    if mode not in (2, 3) or not current_omni_platform.is_npu():
+        raise ValueError("VLLM_OMNI_ULYSSES_HCCL_EXPANSION_MODE requires NPU and mode 2 (AICPU) or 3 (AIV)")
+    import torch_npu
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_op_expansion_mode": mode}
+    group = torch.distributed.new_group(ranks, backend="hccl", pg_options=options)
+    logger.info("%s HCCL group ranks=%s expansion_mode=%d", kind, ranks, mode)
+    return group
+
+
+def _new_ulysses_group(ranks: list[int]):
+    return _new_sequence_parallel_group(ranks, "Ulysses")
+
+
+def _new_allgather_group(ranks: list[int]):
+    return _new_sequence_parallel_group(ranks, "AllGather-KV")
+
+
 def _set_ulysses_allgather_pg(
     sp_ulysses_degree: int,
     sp_allgather_degree: int,
@@ -635,11 +659,11 @@ def _set_ulysses_allgather_pg(
         sp_allgather_degree,
     )
     for ranks in ulysses_groups:
-        group = torch.distributed.new_group(ranks)
+        group = _new_ulysses_group(ranks)
         if rank in ranks:
             ulysses_pg = group
     for ranks in allgather_groups:
-        group = torch.distributed.new_group(ranks)
+        group = _new_allgather_group(ranks)
         if rank in ranks:
             allgather_pg = group
     for singleton_rank in range(world_size):
@@ -728,7 +752,7 @@ def set_seq_parallel_pg(
 
         ulysses_pg = ring_pg = allgather_pg = None
         for group_ranks in sp_group_ranks:
-            group = torch.distributed.new_group(group_ranks)
+            group = _new_allgather_group(group_ranks)
             if rank in group_ranks:
                 allgather_pg = group
         for singleton_rank in range(world_size):
@@ -773,7 +797,7 @@ def set_seq_parallel_pg(
                 # Ulysses groups are contiguous chunks; Ring groups are strided.
                 for i in range(num_ulysses_pgs):
                     ulysses_ranks = group_ranks[i * sp_ulysses_degree : (i + 1) * sp_ulysses_degree]
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_ulysses_group(ulysses_ranks)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
@@ -793,7 +817,7 @@ def set_seq_parallel_pg(
                         local_ring = list(ring_ranks)
                 for i in range(num_ulysses_pgs):
                     ulysses_ranks = group_ranks[i::num_ulysses_pgs]
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_ulysses_group(ulysses_ranks)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
@@ -816,7 +840,7 @@ def set_seq_parallel_pg(
                             (i + 1) * sp_ulysses_degree + offset,
                         )
                     )
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_ulysses_group(ulysses_ranks)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
 
@@ -837,7 +861,7 @@ def set_seq_parallel_pg(
 
                 for i in range(num_ulysses_pgs):
                     ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
-                    group = torch.distributed.new_group(ulysses_ranks)
+                    group = _new_ulysses_group(ulysses_ranks)
                     if rank in ulysses_ranks:
                         ulysses_pg = group
 
