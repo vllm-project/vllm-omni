@@ -1809,8 +1809,8 @@ cancels its tasks and releases its recordings.
 ## Realtime-Venus delegation speech condition
 
 Realtime-Venus selects the native duplex engine by default through
-`realtime_venus_omni.yaml`. The explicit `_duplex.yaml` profile remains an alias;
-`realtime_venus_omni_turn.yaml` selects the ordinary turn engine. All three
+`realtime_venus_omni.yaml`;
+`realtime_venus_omni_turn.yaml` selects the ordinary turn engine. Both
 profiles inherit the corresponding MiniCPM-o duplex or turn deployment,
 including its Flow precision, step count and stage settings.
 

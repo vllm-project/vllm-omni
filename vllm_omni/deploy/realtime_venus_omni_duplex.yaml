@@ -1,3 +1,0 @@
-# Compatibility alias: realtime_venus_omni.yaml now defaults to full duplex.
-base_config: realtime_venus_omni.yaml
-session_mode: duplex

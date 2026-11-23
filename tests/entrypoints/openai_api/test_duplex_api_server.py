@@ -374,7 +374,6 @@ def test_minicpmo_serving_profiles(monkeypatch, deploy_name, expected):
     [
         (None, True),
         ("realtime_venus_omni.yaml", True),
-        ("realtime_venus_omni_duplex.yaml", True),
         ("realtime_venus_omni_turn.yaml", False),
     ],
 )

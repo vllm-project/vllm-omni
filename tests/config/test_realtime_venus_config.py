@@ -141,7 +141,7 @@ def test_legacy_processor_registration_restored_on_failure(monkeypatch):
     assert registered == [RealtimeVenusOmniConfig]
 
 
-@pytest.mark.parametrize("mode,suffix", [("duplex", ""), ("duplex", "_duplex"), ("turn", "_turn")])
+@pytest.mark.parametrize("mode,suffix", [("duplex", ""), ("turn", "_turn")])
 @pytest.mark.parametrize("platform", ["cuda", "npu", "rocm", "xpu", "musa", "cpu"])
 def test_venus_deploy_inherits_minicpm_settings(mode, suffix, platform):
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config

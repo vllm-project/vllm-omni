@@ -35,7 +35,6 @@ vllm serve ./Realtime-Venus/Realtime-Venus-Omni \
 
 The default profile serves continuous audio/video sessions over WebSocket.
 Omitting `--deploy-config` selects this same full-duplex profile automatically.
-`realtime_venus_omni_duplex.yaml` remains an equivalent explicit alias.
 
 The profile inherits the [MiniCPM-o deployment](../../vllm_omni/deploy/minicpmo_4_5.yaml)
 settings, changing only the pipeline identity. This includes five Flow steps
