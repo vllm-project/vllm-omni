@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import partial
@@ -18,13 +19,18 @@ import torch
 from PIL import Image
 from torch import Tensor, nn
 from torch.nn import functional as F
-from vllm.utils.torch_utils import set_torch_threads_for_runtime
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_default_torch_dtype, set_torch_threads_for_runtime
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.seedvr2 import config as envs
-from vllm_omni.diffusion.models.seedvr2.config import COLOR_CORRECTION_METHODS, DEFAULT_COLOR_CORRECTION_METHOD
+from vllm_omni.diffusion.models.seedvr2.config import (
+    COLOR_CORRECTION_METHODS,
+    DEFAULT_COLOR_CORRECTION_METHOD,
+    get_dit_compute_dtype,
+)
 from vllm_omni.diffusion.models.seedvr2.nadit import SEEDVR2_3B_CONFIG, SeedVR2NaDiT, validate_seedvr2_parallel_config
 from vllm_omni.diffusion.models.seedvr2.vae import SeedVR2VAE
 from vllm_omni.diffusion.offloader.config import offload_enabled
@@ -583,6 +589,19 @@ def sample_noise(condition: torch.Tensor, generator: torch.Generator) -> torch.T
     return torch.empty_like(condition).normal_(generator=generator)
 
 
+def velocity_to_fp16(velocity: torch.Tensor) -> torch.Tensor:
+    """Check the BF16 DiT output at the FP16 Euler boundary."""
+    if velocity.dtype != torch.bfloat16:
+        raise RuntimeError(f"SeedVR2 expected BF16 DiT velocity, got {velocity.dtype}")
+    velocity = velocity.to(torch.float16)
+    # Casting first also catches finite BF16 values that overflow FP16.
+    # aminmax propagates NaNs and avoids a clip-sized finiteness mask.
+    low, high = torch.aminmax(velocity)
+    if not (torch.isfinite(low) & torch.isfinite(high)).item():
+        raise RuntimeError("SeedVR2 DiT velocity is non-finite after conversion to FP16")
+    return velocity
+
+
 class SeedVR2Pipeline(nn.Module):
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -596,7 +615,14 @@ class SeedVR2Pipeline(nn.Module):
         self.device = get_local_device()
         self.od_config = od_config
         self.frame_pixels, self.clip_pixels = _admission_budget(od_config)
-        self.transformer = SeedVR2NaDiT(**SEEDVR2_3B_CONFIG, use_varlen_kernel=False)
+        dit_dtype = get_dit_compute_dtype(od_config.additional_config)
+        self.dit_dtype = torch.bfloat16 if dit_dtype == "bfloat16" else torch.float16
+        if self.dit_dtype == torch.bfloat16:
+            current_platform.check_if_supports_dtype(self.dit_dtype)
+        # Load checkpoint tensors directly into their final parameter dtype.
+        # NaDiT constructs RoPE frequency buffers explicitly in FP32.
+        with set_default_torch_dtype(self.dit_dtype):
+            self.transformer = SeedVR2NaDiT(**SEEDVR2_3B_CONFIG, use_varlen_kernel=False)
         self.vae = SeedVR2VAE()
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -620,7 +646,8 @@ class SeedVR2Pipeline(nn.Module):
         text = torch.load(model_path / "pos_emb.pt", map_location="cpu", weights_only=True)
         if not isinstance(text, torch.Tensor) or text.ndim != 2 or text.shape[1] != 5120 or text.shape[0] == 0:
             raise ValueError("SeedVR2 pos_emb.pt must contain a tensor of shape [L,5120]")
-        self.register_buffer("text", text.to(device=self.device, dtype=od_config.dtype), persistent=False)
+        text = text.to(device=self.device, dtype=od_config.dtype)
+        self.register_buffer("text", text.to(dtype=self.dit_dtype), persistent=False)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         targets = self.state_dict()
@@ -665,7 +692,13 @@ class SeedVR2Pipeline(nn.Module):
                 text_len=self.text.shape[0],
                 parallel_config=self.od_config.parallel_config,
             )
-            velocity = self.transformer(video, self.text, shape, text_shape, timestep, runtime).vid_sample
+            use_bf16 = self.dit_dtype == torch.bfloat16
+            with torch.autocast(self.device.type, enabled=False) if use_bf16 else nullcontext():
+                velocity = self.transformer(video, self.text, shape, text_shape, timestep, runtime).vid_sample
+            if use_bf16:
+                # Window SP assembles the full velocity on every rank before
+                # returning, so all participants validate the same values.
+                velocity = velocity_to_fp16(velocity)
             # Reference Euler returns fp32, then VAE casts to fp16 before scaling.
             restored = noise - velocity.reshape_as(noise)
             decoded = self.vae.decode((restored / 0.9152).permute(3, 0, 1, 2).unsqueeze(0))

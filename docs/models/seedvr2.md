@@ -93,6 +93,25 @@ frame is repeated internally to reach 4n+1, and the decoded output is cropped ba
 to the original frame count. Five frames remain five; six frames are internally
 padded to nine and return six.
 
+## DiT compute precision
+
+Some input windows can produce non-finite FP16 DiT outputs and leave black
+frames in an otherwise decodable video. On hardware with BF16 support, add
+the following startup option to either serving command above:
+
+```bash
+--additional-config '{"seedvr2_dit_compute_dtype":"bfloat16"}'
+```
+
+Keep `--dtype float16` for the pipeline. SeedVR2 loads the same checkpoint
+into BF16 DiT parameters and uses BF16 text conditioning. RoPE frequency
+buffers retain FP32 precision. The VAE, sampled noise and Euler update use
+FP16. SeedVR2 checks that the DiT velocity is finite after conversion to FP16
+before passing it to the solver. Use the same option on all workers.
+
+The default is `float16`. Restart the service to change this setting. Both
+the video endpoint and the long-video endpoint use the loaded model's precision.
+
 ## Colour correction
 
 Restoration reproduces detail faithfully but shifts global colour, so the
@@ -245,7 +264,7 @@ parallel outputs are numerically close rather than bitwise identical.
 
 | Property | Contract |
 | --- | --- |
-| Weights / dtype | Released 3B DiT and VAE, FP16 |
+| Weights / dtype | Released 3B FP16 checkpoint. DiT compute defaults to FP16 and optionally uses BF16. VAE uses FP16. |
 | Reference semantics | C0 whole clip, colour correction on by default |
 | Video input | One uploaded file, or offline TCHW RGB floats / PIL frames |
 | Timing | Constant frame rate, increasing PTS; normalize the video origin to zero |
