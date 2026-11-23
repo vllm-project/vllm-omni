@@ -187,8 +187,13 @@ def na3d(
         raise ValueError(f"Invalid LTX-2.5 neighborhood kernel: {kernel_size}.")
 
     batch, frames, height, width, heads, head_dim = query.shape
-    if any(size > dimension for size, dimension in zip(kernel_size, (frames, height, width), strict=True)):
-        raise ValueError(f"LTX-2.5 neighborhood kernel {kernel_size} exceeds token grid {(frames, height, width)}.")
+    if any(dimension <= 0 for dimension in (frames, height, width)):
+        raise ValueError(
+            f"LTX-2.5 neighborhood attention requires a non-empty token grid, got {(frames, height, width)}."
+        )
+    kernel_frames, kernel_height, kernel_width = (
+        min(size, dimension) for size, dimension in zip(kernel_size, (frames, height, width), strict=True)
+    )
 
     query = query.contiguous()
     key = key.contiguous()
@@ -196,7 +201,7 @@ def na3d(
     output = torch.empty_like(query)
     padded_head_dim = max(16, triton.next_power_of_2(head_dim))
     query_block = 16
-    key_block = max(16, min(32, triton.next_power_of_2(min(width, query_block + kernel_size[2]))))
+    key_block = max(16, min(32, triton.next_power_of_2(min(width, query_block + kernel_width))))
     grid = (
         triton.cdiv(width, query_block),
         frames * height,
@@ -221,9 +226,9 @@ def na3d(
             query.stride(3),
             query.stride(4),
             scale,
-            kernel_frames=kernel_size[0],
-            kernel_height=kernel_size[1],
-            kernel_width=kernel_size[2],
+            kernel_frames=kernel_frames,
+            kernel_height=kernel_height,
+            kernel_width=kernel_width,
             head_dim=head_dim,
             padded_head_dim=padded_head_dim,
             query_block=query_block,

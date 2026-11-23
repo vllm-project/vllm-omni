@@ -13,13 +13,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @hardware_test(res={"rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("shape", [(7, 8, 9), (13, 12, 17)])
 @torch.inference_mode()
-def test_triton_na3d_matches_explicit_inward_shift_mask_on_rocm():
+def test_triton_na3d_matches_explicit_inward_shift_mask_on_rocm(shape: tuple[int, int, int]):
     from vllm_omni.diffusion.models.ltx2.ops.na3d import na3d
 
-    # Exercise inward shifting on every axis instead of the degenerate case
-    # where the 11x11x11 window covers the complete token grid.
-    shape = (13, 12, 17)
     generator = torch.Generator(device="cuda").manual_seed(43)
     query, key, value = [
         torch.randn(1, *shape, 4, 64, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
@@ -28,8 +26,9 @@ def test_triton_na3d_matches_explicit_inward_shift_mask_on_rocm():
     coordinates = torch.stack(
         torch.meshgrid(*(torch.arange(n, device="cuda") for n in shape), indexing="ij"), dim=-1
     ).reshape(-1, 3)
-    start = (coordinates - 5).clamp_min(0).minimum(torch.tensor(shape, device="cuda") - 11)
-    mask = ((coordinates[None] >= start[:, None]) & (coordinates[None] < start[:, None] + 11)).all(-1)
+    window = torch.tensor(tuple(min(11, dimension) for dimension in shape), device="cuda")
+    start = (coordinates - window // 2).clamp_min(0).minimum(torch.tensor(shape, device="cuda") - window)
+    mask = ((coordinates[None] >= start[:, None]) & (coordinates[None] < start[:, None] + window)).all(-1)
     with sdpa_kernel(SDPBackend.MATH):
         expected = (
             torch.nn.functional.scaled_dot_product_attention(
