@@ -116,6 +116,8 @@ class BnBOnlineLinearMethod(LazyWeightMixin, LinearMethodBase):
     Loads BF16/FP16 checkpoint weights and quantizes them during loading.
     """
 
+    finalize_requires_bias = False
+
     def __init__(self, quant_config: DiffusionBitsAndBytesConfig):
         self.quant_config = quant_config
 

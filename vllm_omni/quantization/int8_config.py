@@ -323,6 +323,10 @@ class LazyWeightMixin:
     # model after loading opt in per layer via ``enable_offload_after_quant``.
     supports_offload_after_quant: bool = True
     _offload_after_quant: bool = False
+    # Methods whose processing leaves layer.bias untouched can finalize a
+    # weight-first checkpoint immediately when offload is disabled; the later
+    # bias load updates the same parameter.
+    finalize_requires_bias: bool = True
 
     def enable_offload_after_quant(self, layer: torch.nn.Module | None = None) -> None:
         """Return each layer to host memory as soon as it has been quantized.
@@ -363,9 +367,10 @@ class LazyWeightMixin:
             return
         # Quantizers may replace the bias while processing the weights. Loading a
         # cached reference afterwards would then update the obsolete parameter.
-        # Unless the bias loader tracked completion, leave finalization to the
-        # regular post-load sweep, which is guaranteed to run after all tensors.
-        if getattr(layer, "has_bias", False) and not getattr(layer, "_lazy_bias_loaded", False):
+        # Weight-only methods can finalize before bias when they stay on device;
+        # bias-transforming/offload paths still wait for the post-load sweep.
+        wait_for_bias = self.finalize_requires_bias or self._offload_after_quant
+        if wait_for_bias and getattr(layer, "has_bias", False) and not getattr(layer, "_lazy_bias_loaded", False):
             return
 
         self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
@@ -498,6 +503,7 @@ class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
     # the mixin provides the hook: the weight never visits the accelerator,
     # so there is nothing to return to host.
     supports_offload_after_quant: bool = False
+    finalize_requires_bias = False
 
     def _lazy_load_device(self) -> torch.device:
         return torch.device("cpu")
@@ -596,6 +602,8 @@ class Int8OnlineLinearMethod(LazyWeightMixin, Int8LinearMethod):
     and quantized the weights during loading.
     """
 
+    finalize_requires_bias = False
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -630,6 +638,8 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
     NPU Online version of Int8LinearMethod, loads the fp16/bf16 checkpoint
     and quantized the weights during loading.
     """
+
+    finalize_requires_bias = False
 
     def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
         # NPUInt8LinearMethod's override is unreachable from here: LazyWeightMixin

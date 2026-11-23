@@ -446,6 +446,8 @@ class ConvRotInt8OnlineLinearMethod(Int8OnlineLinearMethod):
 class ConvRotInt4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
     """Rotated W4A4: packed per-output-channel INT4 weights and dynamic per-token INT4 activations."""
 
+    finalize_requires_bias = False
+
     def __init__(self, quant_config: DiffusionConvRotConfig):
         super().__init__(quant_config._int8)
         self.rotation_group_size = quant_config.rotation_group_size
