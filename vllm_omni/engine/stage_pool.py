@@ -271,7 +271,6 @@ class StagePool:
     )
     _DIT_LOAD_PUSH_TIMEOUT_S: float = 0.5
 
-
     def __init__(
         self,
         stage_id: int,

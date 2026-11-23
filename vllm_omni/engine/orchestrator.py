@@ -1551,7 +1551,7 @@ class OrchestratorBase:
                                     )
                                 except Exception:
                                     logger.debug(
-                                        "[Orchestrator] leagcy _poll_dit_load_throttled failed for stage-%s rep-%s",
+                                        "[Orchestrator] legacy _poll_dit_load_throttled failed for stage-%s rep-%s",
                                         stage_id,
                                         replica_id,
                                         exc_info=True,
