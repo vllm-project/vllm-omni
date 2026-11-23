@@ -570,6 +570,66 @@ def test_consume_preprocess_once_buffer_keys_removes_only_declared_nested_values
     assert runner.requests["r1"].additional_information_cpu is info
 
 
+def test_preprocess_retains_conditioning_until_last_prefill_slice(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as runner_module
+
+    monkeypatch.setattr(runner_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+    runner.supports_mm_inputs = False
+    runner.enable_prompt_embeds = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner.has_talker_mtp = False
+    runner.vllm_config.model_config.async_chunk = True
+    runner.input_ids = DummyBuffer(torch.zeros(4, dtype=torch.long))
+    runner.inputs_embeds = DummyBuffer(torch.zeros(4, 4))
+    runner.positions = torch.arange(4)
+    runner.input_batch.num_computed_tokens_cpu = [0]
+    runner.requests["r1"].prompt_token_ids = [11, 12, 13, 14]
+    runner._init_model_kwargs = lambda: {}
+    runner._update_intermediate_buffer(
+        "r1",
+        {
+            "conditioning": torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            "persistent": [7],
+        },
+    )
+    conditioning = runner.model_intermediate_buffer["r1"]["conditioning"].clone()
+
+    def preprocess(input_ids, input_embeds, **payload):
+        if payload["_omni_is_prefill"]:
+            offset = payload["_omni_num_computed_tokens"]
+            embeddings = payload["conditioning"][offset : offset + input_ids.numel()]
+        else:
+            assert "conditioning" not in payload
+            embeddings = torch.full_like(input_embeds, 99.0)
+        return input_ids, embeddings, {}
+
+    runner.model = SimpleNamespace(
+        has_preprocess=True,
+        preprocess=preprocess,
+        preprocess_once_buffer_keys={"conditioning"},
+    )
+    for offset, scheduled in [(0, 1), (1, 2), (3, 1), (4, 1)]:
+        runner.input_batch.num_computed_tokens_cpu[0] = offset
+        output = runner._preprocess(
+            SimpleNamespace(
+                total_num_scheduled_tokens=scheduled,
+                num_scheduled_tokens={"r1": scheduled},
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(),
+            ),
+            scheduled,
+        )
+        info = runner.model_intermediate_buffer["r1"]
+        assert ("conditioning" in info) == (offset + scheduled < 4)
+        assert info["persistent"] == [7]
+        assert runner.requests["r1"].additional_information_cpu is info
+        expected = conditioning[offset : offset + scheduled] if offset < 4 else torch.full((1, 4), 99.0)
+        torch.testing.assert_close(output[1], expected)
+
+
 def test_update_additional_information_deserializes_new_request_payload():
     from vllm_omni.engine.serialization import serialize_additional_information
 

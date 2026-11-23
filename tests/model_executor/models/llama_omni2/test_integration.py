@@ -255,6 +255,51 @@ def test_talker_cached_decode_does_not_reuse_prefill_handoff():
     assert update == {}
 
 
+@pytest.mark.parametrize("with_separator", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 2])
+def test_talker_chunked_prefill_matches_full_conditioning(with_separator, chunk_size):
+    talker = _bare_talker()
+    token_ids = [11, 12, 13] + ([151665] if with_separator else [])
+    payload = {
+        "ids": {"output": token_ids},
+        "hidden_states": {"output": torch.arange(12, dtype=torch.float32).reshape(3, 4)},
+        "_omni_is_prefill": True,
+        "_omni_prompt_len": len(token_ids),
+    }
+    full_ids, full_embeds, _ = talker.preprocess(torch.zeros(len(token_ids), dtype=torch.int32), None, **payload)
+    chunk_ids = []
+    chunk_embeds = []
+    for offset in range(0, len(token_ids), chunk_size):
+        scheduled = min(chunk_size, len(token_ids) - offset)
+        result_ids, result_embeds, _ = talker.preprocess(
+            torch.zeros(scheduled, dtype=torch.int32),
+            None,
+            _omni_num_computed_tokens=offset,
+            **payload,
+        )
+        assert result_ids.dtype == torch.int32
+        assert result_embeds.shape == (scheduled, 4)
+        chunk_ids.append(result_ids)
+        chunk_embeds.append(result_embeds)
+
+    assert torch.equal(torch.cat(chunk_ids), full_ids)
+    torch.testing.assert_close(torch.cat(chunk_embeds), full_embeds)
+
+
+@pytest.mark.parametrize("offset,scheduled", [(-1, 1), (2, 2), (3, 1)])
+def test_talker_rejects_prefill_slice_outside_conditioning(offset, scheduled):
+    with pytest.raises(ValueError, match="scheduled"):
+        _bare_talker().preprocess(
+            torch.zeros(scheduled, dtype=torch.long),
+            None,
+            ids={"output": [11, 12, 13]},
+            hidden_states={"output": torch.ones(3, 4)},
+            _omni_is_prefill=True,
+            _omni_prompt_len=3,
+            _omni_num_computed_tokens=offset,
+        )
+
+
 def test_speech_placeholder_path_publishes_decode_rows_after_splice():
     thinker = _bare_thinker()
     input_ids = torch.tensor([7, 151665, 8])

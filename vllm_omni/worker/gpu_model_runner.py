@@ -1801,7 +1801,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_embeds=embed_slice,
                     **req_infos,
                 )
-                if is_prefill:
+                if is_prefill and num_computed_tokens + sched_tokens >= prompt_len:
                     self._consume_preprocess_once_buffer_keys(req_id)
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(

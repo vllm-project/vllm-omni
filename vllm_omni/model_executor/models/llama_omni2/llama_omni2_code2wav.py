@@ -402,7 +402,7 @@ class LlamaOmni2Code2WavCore:
                     self._window,
                 )
 
-        if not finished and speech.shape[-1] >= self.source_cache_len:
+        if not finished:
             emitted = speech[..., : -self.source_cache_len]
         else:
             emitted = speech

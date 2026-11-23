@@ -51,6 +51,12 @@ class _LookaheadFlow(_FakeFlow):
         return super().inference(token=token, finalize=finalize, **kwargs)
 
 
+class _OverlapFlow(_FakeFlow):
+    def inference(self, *, token, finalize, **kwargs):
+        mel, cache = super().inference(token=token, finalize=finalize, **kwargs)
+        return (mel if finalize else mel[..., : -self.pre_lookahead_len]), cache
+
+
 class _FailingFlow(_FakeFlow):
     def __init__(self):
         super().__init__()
@@ -325,6 +331,53 @@ def test_streaming_core_buffers_short_nonfinal_lookahead_window_until_decodable(
     assert emitted is not None
     assert emitted.sequence_index == 0
     assert emitted.consumed_units == 4
+
+
+@pytest.mark.parametrize("overlap", [2, 3, 3840])
+@pytest.mark.parametrize("with_followup", [False, True])
+def test_streaming_core_withholds_entire_short_overlap_until_terminal(overlap, with_followup):
+    core = LlamaOmni2Code2WavCore(
+        flow=_OverlapFlow(),
+        hift=_FakeHift(),
+        device="cpu",
+        mel_cache_len=overlap,
+        source_cache_len=overlap,
+    )
+    first = core.process("short-overlap", [1, 2, 3], finished=False)
+
+    assert first is not None
+    assert first.audio.numel() == 0
+    assert core._states["short-overlap"].speech_cache.reshape(-1).tolist() == [1.0, 2.0]
+    window = torch.hamming_window(2 * overlap, periodic=False)
+    emitted = [first.audio]
+    if with_followup:
+        followup = core.process("short-overlap", [4, 5, 6], finished=False)
+        expected_middle = torch.arange(1, 6, dtype=torch.float32)
+        expected_middle[:2] *= window[:2] + window[-2:]
+        emitted_count = max(0, 5 - overlap)
+        assert followup is not None
+        torch.testing.assert_close(followup.audio, expected_middle[:emitted_count])
+        emitted.append(followup.audio)
+        expected_final = torch.arange(emitted_count + 1, 7, dtype=torch.float32)
+        retained = expected_middle[emitted_count:]
+        expected_final[:-1] = expected_final[:-1] * window[: retained.numel()] + retained * window[-retained.numel() :]
+        expected = torch.cat([expected_middle[:emitted_count], expected_final])
+    else:
+        expected_final = torch.arange(1, 4, dtype=torch.float32)
+        expected_final[:2] *= window[:2] + window[-2:]
+        expected = expected_final
+
+    final = core.process("short-overlap", [], finished=True)
+    assert final is not None
+    assert final.finished is True
+    torch.testing.assert_close(final.audio, expected_final)
+    emitted.append(final.audio)
+    combined = torch.cat(emitted)
+    assert combined.numel() == (6 if with_followup else 3)
+    torch.testing.assert_close(combined, expected)
+    assert "short-overlap" not in core
+    with pytest.raises(ValueError, match="already finished"):
+        core.process("short-overlap", [], finished=True)
 
 
 def test_streaming_core_finalizes_a_short_buffered_lookahead_window():

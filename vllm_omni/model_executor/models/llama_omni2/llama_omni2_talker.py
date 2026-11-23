@@ -207,27 +207,36 @@ class LlamaOmni2TalkerForConditionalGeneration(nn.Module, SupportsPP):
         )
         if hidden_states is None:
             raise ValueError("LLaMA-Omni 2 Talker requires hidden_states.output")
-        hidden_states = hidden_states.to(input_ids.device)
-
         hidden_count = hidden_states.shape[0]
         if token_ids.shape[0] not in (hidden_count, hidden_count + 1):
             raise ValueError(
                 "LLaMA-Omni 2 Talker ids.output must have one token per "
                 "Thinker hidden row, plus at most one terminal separator"
             )
-        fused = self.prepare_talker_embeddings(
-            hidden_states,
-            token_ids[:hidden_count],
-        )
-        if token_ids.shape[0] == hidden_count + 1:
-            self._validate_embedding_token_ids(token_ids[-1:])
-            separator_embedding = self.language_model.embed_input_ids(token_ids[-1:])
-            fused = torch.cat([fused, separator_embedding], dim=0)
-        if fused.shape[0] != input_ids.shape[0]:
+        prompt_len = int(payload.get("_omni_prompt_len", token_ids.shape[0]))
+        start = int(payload.get("_omni_num_computed_tokens", 0))
+        end = start + input_ids.shape[0]
+        if prompt_len != token_ids.shape[0] or start < 0 or end > token_ids.shape[0]:
             raise ValueError(
-                "LLaMA-Omni 2 Talker scheduled prompt length does not match "
-                f"the inter-stage payload: {input_ids.shape[0]} vs {fused.shape[0]}"
+                "LLaMA-Omni 2 Talker scheduled prompt slice does not match "
+                f"the inter-stage payload: [{start}:{end}], "
+                f"prompt length {prompt_len}, payload length {token_ids.shape[0]}"
             )
+        token_ids = token_ids[start:end]
+        hidden_states = hidden_states[start : min(end, hidden_count)].to(input_ids.device)
+        scheduled_hidden_count = hidden_states.shape[0]
+        if scheduled_hidden_count:
+            fused = self.prepare_talker_embeddings(
+                hidden_states,
+                token_ids[:scheduled_hidden_count],
+            )
+            if token_ids.shape[0] > scheduled_hidden_count:
+                self._validate_embedding_token_ids(token_ids[-1:])
+                separator_embedding = self.language_model.embed_input_ids(token_ids[-1:])
+                fused = torch.cat([fused, separator_embedding], dim=0)
+        else:
+            self._validate_embedding_token_ids(token_ids)
+            fused = self.language_model.embed_input_ids(token_ids)
         return token_ids.to(dtype=input_ids.dtype), fused, {}
 
     def get_language_model(self) -> nn.Module:
