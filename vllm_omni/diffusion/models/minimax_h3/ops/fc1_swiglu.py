@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
+
 import torch
 from torch.library import Library
 from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -17,14 +20,21 @@ _GROUP_M = 16
 _NUM_STAGES = 4
 _NUM_WARPS = 4
 
-_allocator_ready = False
 
+@contextlib.contextmanager
+def _tma_allocator(device: torch.device) -> Iterator[None]:
+    """Give the kernel's on-device TMA descriptors scratch on ``device`` for this launch only.
 
-def _ensure_tma_allocator() -> None:
-    global _allocator_ready
-    if not _allocator_ready:
-        triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
-        _allocator_ready = True
+    ``triton.set_allocator`` sets a process-wide context variable; resetting it afterwards keeps whatever allocator
+    other Triton kernels installed.
+    """
+    from triton.runtime import _allocation
+
+    token = _allocation._allocator.set(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device=device))
+    try:
+        yield
+    finally:
+        _allocation._allocator.reset(token)
 
 
 if HAS_TRITON:
@@ -87,33 +97,33 @@ def fc1_swiglu_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 
 def _fc1_swiglu_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    _ensure_tma_allocator()
     x2d = x.reshape(-1, x.shape[-1]).contiguous()
     m, k = x2d.shape
     n = weight.shape[0] // 2
     out = torch.empty(m, n, device=x.device, dtype=x.dtype)
     if m:
         sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        _fc1_swiglu_kernel[(sms,)](
-            x2d,
-            weight,
-            out,
-            m,
-            n,
-            k,
-            NUM_SMS=sms,
-            BM=_BLOCK_M,
-            BN=_BLOCK_N,
-            BK=_BLOCK_K,
-            GROUP_M=_GROUP_M,
-            num_warps=_NUM_WARPS,
-            num_stages=_NUM_STAGES,
-        )
+        with _tma_allocator(x.device):
+            _fc1_swiglu_kernel[(sms,)](
+                x2d,
+                weight,
+                out,
+                m,
+                n,
+                k,
+                NUM_SMS=sms,
+                BM=_BLOCK_M,
+                BN=_BLOCK_N,
+                BK=_BLOCK_K,
+                GROUP_M=_GROUP_M,
+                num_warps=_NUM_WARPS,
+                num_stages=_NUM_STAGES,
+            )
     return out.view(*x.shape[:-1], n)
 
 
 def _fc1_swiglu_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return x.new_empty(*x.shape[:-1], weight.shape[0] // 2)
+    return x.new_empty((*x.shape[:-1], weight.shape[0] // 2))
 
 
 _OP_LIB = Library("vllm_omni", "FRAGMENT")
