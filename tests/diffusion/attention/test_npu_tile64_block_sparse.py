@@ -212,6 +212,43 @@ def test_require_reports_a_torch_npu_without_the_operator(monkeypatch):
         require_npu_tile64_sparse()
 
 
+def _stub_ascend_device_type(monkeypatch, reported):
+    """Install a ``vllm_ascend.utils`` reporting ``reported`` as the SoC version.
+
+    ``reported`` of ``None`` leaves the classifier out of the module, which is
+    how an older vllm_ascend looks to the ``from ... import``.
+    """
+    device_type = type("AscendDeviceType", (), {"A2": "A2", "A3": "A3", "A5": "A5"})
+    utils = types.ModuleType("vllm_ascend.utils")
+    utils.AscendDeviceType = device_type
+    if reported is not None:
+        utils.get_ascend_device_type = lambda: reported
+    parent = types.ModuleType("vllm_ascend")
+    parent.utils = utils
+    monkeypatch.setitem(sys.modules, "vllm_ascend", parent)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
+    return device_type
+
+
+def test_require_refuses_a_soc_version_other_than_a3(operator_calls, monkeypatch):
+    device_type = _stub_ascend_device_type(monkeypatch, "A5")
+    with pytest.raises(ValueError, match="Atlas A3 only"):
+        require_npu_tile64_sparse()
+    assert device_type.A5 != device_type.A3
+
+
+def test_require_admits_a3(operator_calls, monkeypatch):
+    _stub_ascend_device_type(monkeypatch, "A3")
+    require_npu_tile64_sparse()
+
+
+def test_require_admits_a_device_whose_soc_version_cannot_be_read(operator_calls, monkeypatch):
+    # Refusing here would make an older vllm_ascend, rather than the device,
+    # the reason an A3 cannot start.
+    _stub_ascend_device_type(monkeypatch, None)
+    require_npu_tile64_sparse()
+
+
 def _resolve(provider="auto", precision="bf16", dtype=torch.bfloat16, head_size=128, block_size=64):
     device = types.SimpleNamespace(type="npu", index=0)
     return block_sparse.resolve_block_sparse_provider.__wrapped__(

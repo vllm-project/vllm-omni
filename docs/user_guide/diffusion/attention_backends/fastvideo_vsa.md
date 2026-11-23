@@ -196,8 +196,19 @@ one. Padded key rows are filled with a valid key from their own 128-token
 block and padded value rows are zero; the padded rows' contribution to the
 softmax denominator is then removed using the log-sum-exp the operator returns.
 
-Layers without a VSA gate (the token refiner) and 128-token layouts keep the
-dense path on this platform.
+**Scope: Atlas A3.** The operator is called with `inner_precise=0`, and which
+precision modes a device accepts depends on its SoC version -- the 950 series
+documents 4 as its only one -- so the operator being installed does not mean
+the call will run. This route is measured on A3 and admits A3: another SoC
+version is refused at startup, before any kernel launch, rather than left to
+fail inside the operator. A device whose SoC version cannot be read is allowed
+through with a warning.
+
+Layers without a VSA gate (the token refiner) keep the dense path on this
+platform, as they do on CUDA. A 128-token layout is a different matter: it is
+not a fallback here but a startup error, so FastH3 Omni's tile128
+configuration, which the CUDA providers serve, is refused on Ascend rather
+than run densely.
 
 ## Automatic provider selection
 

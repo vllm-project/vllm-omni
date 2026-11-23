@@ -33,19 +33,51 @@ cancellation at ``2**-24`` even when ``P`` runs to thousands. Padded rows of
 from __future__ import annotations
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 TILE = 64
 KEY_BLOCK = 128
 
 
 def require_npu_tile64_sparse() -> None:
-    """Fail before launch when the installed torch_npu lacks the block-sparse operator."""
+    """Fail before launch when this device cannot run the route below.
+
+    Having the operator installed is not enough. The call uses
+    ``inner_precise=0``, and the supported modes differ by SoC version -- the
+    950 series documents 4 as its only one -- so a device that resolves the
+    symbol can still reject the call. This route is measured on Atlas A3 and
+    nothing else, so A3 is what it admits.
+
+    A device that cannot be classified at all is let through rather than
+    refused: that is the behaviour without this guard, and an older
+    ``vllm_ascend`` missing the classifier should not stop an A3 from starting.
+    The guard refuses only a SoC version it positively identifies as another.
+    """
     try:
         import torch_npu
     except ImportError as exc:
         raise ImportError("NPU VSA requires torch_npu") from exc
     if not callable(getattr(torch_npu, "npu_block_sparse_attention", None)):
         raise ImportError("NPU VSA requires torch_npu.npu_block_sparse_attention")
+    try:
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        device_type = get_ascend_device_type()
+    except (ImportError, AttributeError):
+        logger.warning(
+            "NPU VSA could not read the Ascend SoC version; this route is validated on "
+            "Atlas A3 only and calls npu_block_sparse_attention with inner_precise=0, "
+            "which other SoC versions need not support."
+        )
+        return
+    if device_type != AscendDeviceType.A3:
+        raise ValueError(
+            f"NPU VSA runs on Atlas A3 only, and this device reports {device_type}. The route "
+            "calls npu_block_sparse_attention with inner_precise=0, whose support varies by SoC "
+            "version. Select a dense diffusion attention backend to run MiniMax-H3 here."
+        )
 
 
 def pair_key_tiles(block_map: torch.Tensor, block_sizes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
