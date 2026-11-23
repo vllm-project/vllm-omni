@@ -79,8 +79,9 @@ def test_model_default_follows_the_configured_model_and_device(
     batching: dict[str, object],
     expected: str | None,
 ) -> None:
-    monkeypatch.setattr(platforms_mod, "current_omni_platform", _Platform(cuda=cuda, major=major))
+    # Build the config before faking the platform: its __post_init__ imports modules that probe the real one.
     config = OmniDiffusionConfig(model_class_name=model, **batching) if model is not None else None
+    monkeypatch.setattr(platforms_mod, "current_omni_platform", _Platform(cuda=cuda, major=major))
     monkeypatch.setattr(config_mod, "get_current_diffusion_config_or_none", lambda: config)
     assert selector_mod._model_default_backend() == expected
 
@@ -142,3 +143,20 @@ def test_without_a_model_default_the_platform_default_is_unchanged(monkeypatch: 
     backend, spec = selector_mod.get_attn_backend_for_role("self", 128)
     assert backend is _PlatformDefault and spec is None
     assert calls == [None]
+
+
+def test_capability_query_follows_the_model_default(monkeypatch: pytest.MonkeyPatch, h3_on_sm10x: None) -> None:
+    # SP auto-pad asks for mask support before layers exist; it must see the backend the layers will run.
+    resolve, calls = _fake_resolver(model_default_available=True)
+    monkeypatch.setattr(selector_mod, "_cached_get_backend_cls", resolve)
+    assert selector_mod.get_attn_backend_for_capability("self") is _ModelDefault
+    assert calls == ["FLASHINFER_ATTN"]
+
+
+def test_capability_query_falls_back_with_an_unavailable_model_default(
+    monkeypatch: pytest.MonkeyPatch, h3_on_sm10x: None
+) -> None:
+    resolve, calls = _fake_resolver(model_default_available=False)
+    monkeypatch.setattr(selector_mod, "_cached_get_backend_cls", resolve)
+    assert selector_mod.get_attn_backend_for_capability("self") is _PlatformDefault
+    assert calls == ["FLASHINFER_ATTN", None]

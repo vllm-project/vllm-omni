@@ -208,7 +208,7 @@ def test_cute_dsl_matches_sdpa_for_strided_value_and_kv_prefix():
     torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(("tokens", "heads", "head_dim"), [(2, 3, 64), (257, 56, 128), (64, 7, 96)])
 def test_dense_tokens_copies_token_strided_view_exactly(tokens, heads, head_dim):
     qkv = torch.randn(tokens, 3, heads * head_dim, device="cuda", dtype=torch.bfloat16)

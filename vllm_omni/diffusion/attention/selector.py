@@ -114,6 +114,18 @@ def _model_default_backend() -> str | None:
     return metadata.default_attention_backend(capability.major if capability is not None else None)
 
 
+def _resolve_model_default(head_size: int) -> type[AttentionBackend] | None:
+    """The model default's backend class, or None when there is none or it is unavailable."""
+    model_default_backend = _model_default_backend()
+    if model_default_backend is None:
+        return None
+    try:
+        return _cached_get_backend_cls(model_default_backend, head_size)
+    except ValueError as exc:
+        _log_model_default_unavailable(model_default_backend, str(exc))
+        return None
+
+
 @cache
 def _log_model_default_unavailable(backend_name: str, reason: str) -> None:
     logger.warning(
@@ -172,20 +184,15 @@ def get_attn_backend_for_role(
         )
         return backend_cls, spec
 
-    model_default_backend = _model_default_backend()
-    if model_default_backend is not None:
-        try:
-            backend_cls = _cached_get_backend_cls(model_default_backend, head_size)
-        except ValueError as exc:
-            _log_model_default_unavailable(model_default_backend, str(exc))
-        else:
-            _log_backend_resolution(
-                role=role,
-                role_category=role_category,
-                backend_name=backend_cls.get_name(),
-                source="model default",
-            )
-            return backend_cls, None
+    backend_cls = _resolve_model_default(head_size)
+    if backend_cls is not None:
+        _log_backend_resolution(
+            role=role,
+            role_category=role_category,
+            backend_name=backend_cls.get_name(),
+            source="model default",
+        )
+        return backend_cls, None
 
     # 2. Platform default
     backend_cls = _cached_get_backend_cls(None, head_size, allow_trtllm_default)
@@ -208,8 +215,9 @@ def get_attn_backend_for_capability(
     SequenceParallel auto-pad does not know ``head_size``. Explicit
     ``AttentionConfig`` selections are loaded from the registry without
     geometry validation, so CUDNN_ATTN is not rejected for the unknown
-    sentinel. Platform defaults still consult the platform with
-    ``HEAD_SIZE_UNKNOWN``.
+    sentinel. The model default and the platform default go through the same
+    lookup as ``get_attn_backend_for_role`` with ``HEAD_SIZE_UNKNOWN``, so the
+    mask-support answer matches the backend the layers will run.
     """
     spec = None
     if attention_config is not None:
@@ -221,4 +229,7 @@ def get_attn_backend_for_capability(
         from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 
         return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
+    backend_cls = _resolve_model_default(HEAD_SIZE_UNKNOWN)
+    if backend_cls is not None:
+        return backend_cls
     return _cached_get_backend_cls(None, HEAD_SIZE_UNKNOWN)
