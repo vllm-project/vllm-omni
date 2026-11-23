@@ -167,7 +167,10 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
     if raw_flow_shift is None:
         raw_flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
 
-    return normalize_shift(raw_flow_shift, name="flow_shift", error_cls=OmniClientError)
+    try:
+        return normalize_shift(raw_flow_shift, name="flow_shift")
+    except ValueError as exc:
+        raise OmniClientError(str(exc)) from exc
 
 
 def resolve_wan_boundary_ratio(

@@ -308,13 +308,28 @@ def test_resolve_wan_flow_shift_keeps_finite_values(extra_args: dict, config_shi
 
 
 @pytest.mark.parametrize(
-    "flow_shift", ["nan", "inf", "-inf", float("nan"), float("-inf"), 0.0, -2.0, "abc", True, False]
+    "flow_shift",
+    [
+        "nan",
+        "inf",
+        "-inf",
+        float("nan"),
+        float("-inf"),
+        0.0,
+        -2.0,
+        "abc",
+        True,
+        False,
+        pytest.param(10**400, id="huge-int"),
+    ],
 )
 def test_resolve_wan_flow_shift_rejects_invalid_request_value(flow_shift: object) -> None:
     request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"flow_shift": flow_shift}))
 
-    with pytest.raises(OmniClientError, match=f"flow_shift must be a positive finite number, got {flow_shift!r}"):
+    with pytest.raises(OmniClientError, match=r"^flow_shift (must be|is too large)") as exc_info:
         resolve_wan_flow_shift(request, SimpleNamespace(flow_shift=5.0))
+    assert type(exc_info.value.__cause__) is ValueError
+    assert str(exc_info.value) == str(exc_info.value.__cause__)
 
 
 @pytest.mark.parametrize("bad_shift", ["nan", float("nan"), "inf", 0.0, -2.0])

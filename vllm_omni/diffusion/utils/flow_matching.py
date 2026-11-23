@@ -8,16 +8,20 @@ import torch
 from torch import nn
 
 
-def normalize_shift(value: float | str, *, name: str, error_cls: type[Exception]) -> float:
-    """Convert a shift while preserving the caller's error classification."""
+def normalize_shift(value: float | str, *, name: str) -> float:
+    """Convert a shift to a positive finite float, raising ``ValueError`` otherwise."""
     if isinstance(value, bool):
-        raise error_cls(f"{name} must be a positive finite number, got {value!r}.")
+        raise ValueError(f"{name} must be a number, not a boolean, got {value!r}.")
     try:
         shift = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise error_cls(f"{name} must be a positive finite number, got {value!r}.") from exc
-    if not math.isfinite(shift) or shift <= 0:
-        raise error_cls(f"{name} must be a positive finite number, got {value!r}.")
+    except OverflowError as exc:
+        raise ValueError(f"{name} is too large to represent as a float.") from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}.") from exc
+    if not math.isfinite(shift):
+        raise ValueError(f"{name} must be a finite float, got {value!r}.")
+    if shift <= 0:
+        raise ValueError(f"{name} must be greater than 0, got {value!r}.")
     return shift
 
 

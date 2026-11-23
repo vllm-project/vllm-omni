@@ -209,11 +209,10 @@ retains the client error through the runner and multiprocess executor. Under
 sigma windows, Wan2.2 and HunyuanImage-3.0 check the scheduler's sigmas once,
 right after building the timesteps. Sigmas outside `[0, 1]` raise the same
 `invalid_attention_schedule` client error as the other checks here, before any
-denoise forward. In step mode the
-request fails during its own preparation, not in a step shared with other
-requests. MiniMax-H3 solvers reject such sigmas when the request's schedule is
-prepared. Asynchronous `/v1/videos` reports all of these errors on the job
-record rather than the creation response.
+denoise forward. In step mode the request fails during its own preparation, not
+in a step shared with other requests. MiniMax-H3 solvers reject such sigmas when
+the request's schedule is prepared. Asynchronous `/v1/videos` reports all of
+these errors on the job record rather than the creation response.
 
 ## Compatibility limits
 

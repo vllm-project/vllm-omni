@@ -184,7 +184,10 @@ class BaseScheduler(ABC):
         for name in ("flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"):
             value = extra_args.get(name)
             if value is not None:
-                normalize_shift(value, name=name, error_cls=OmniClientError)
+                try:
+                    normalize_shift(value, name=name)
+                except ValueError as exc:
+                    raise OmniClientError(str(exc)) from exc
         try:
             # A schedule written into extra_args after construction reaches here unabsorbed on the
             # inline stage client, whose clone() does not re-run __post_init__; the subprocess client

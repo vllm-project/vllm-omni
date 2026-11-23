@@ -620,14 +620,30 @@ class TestRequestScheduler:
 
     @pytest.mark.parametrize("shift_key", ["flow_shift", "audio_flow_shift", "timestep_shift", "timesteps_shift"])
     @pytest.mark.parametrize(
-        "flow_shift", ["nan", "inf", "-inf", float("nan"), float("inf"), float("-inf"), 0.0, -2.0, "abc", True, False]
+        "flow_shift",
+        [
+            "nan",
+            "inf",
+            "-inf",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            0.0,
+            -2.0,
+            "abc",
+            True,
+            False,
+            pytest.param(10**400, id="huge-int"),
+        ],
     )
     def test_rejects_invalid_flow_shift(self, shift_key: str, flow_shift: object) -> None:
         request = _make_request("invalid-shift")
         request.sampling_params.extra_args = {shift_key: flow_shift}
 
-        with pytest.raises(OmniClientError, match=f"{shift_key} must be a positive finite number, got {flow_shift!r}"):
+        with pytest.raises(OmniClientError, match=rf"^{shift_key} (must be|is too large)") as exc_info:
             self.scheduler.add_request(request)
+        assert type(exc_info.value.__cause__) is ValueError
+        assert str(exc_info.value) == str(exc_info.value.__cause__)
 
         assert self.scheduler.num_waiting_requests() == 0
 

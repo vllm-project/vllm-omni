@@ -1484,7 +1484,7 @@ class OmniDiffusionConfig:
                     f"got {self.request_batch_max_wait_ms}."
                 )
         if self.flow_shift is not None:
-            self.flow_shift = normalize_shift(self.flow_shift, name="flow_shift", error_cls=ValueError)
+            self.flow_shift = normalize_shift(self.flow_shift, name="flow_shift")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
