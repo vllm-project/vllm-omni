@@ -1542,6 +1542,17 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen_image_expansion.py
     - tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py
 
+  diffusion_vae_patch_decode:
+    - *wan22
+    - *qwen_image
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/distributed/
+    - vllm_omni/platforms/
+    - tests/diffusion/distributed/test_vae_decode_parallelism.py
+    - tests/helpers/
+    - tests/conftest.py
+
   diffusion_qwen_image_accuracy:
     - *qwen_image
     - tests/e2e/accuracy/test_qwen_image.py
