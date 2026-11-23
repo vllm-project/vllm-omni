@@ -34,9 +34,8 @@ def _line_index(lines: list[str], prefix: str) -> int:
     return matches[0]
 
 
-def test_rocm_base_tracks_cuda_bootstrap_release() -> None:
-    # Bootstrap images must exist; the candidate runtime is installed later
-    # from the pinned CUDA wheel or the matching ROCm source commit.
+def test_rocm_base_tracks_cuda_release() -> None:
+    # Every platform defaults to the matching published release image.
     assert _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_IMAGE") == "vllm/vllm-openai"
     assert "@sha256:" in _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_TAG")
     assert len(_docker_arg(CUDA_CI_DOCKERFILE, "VLLM_PRECOMPILED_WHEEL_COMMIT")) == 40
@@ -55,8 +54,8 @@ def test_rocm_base_tracks_cuda_bootstrap_release() -> None:
     assert image_tag == cuda_release_tag == cuda_ci_tag.split("@")[0]
 
 
-def test_rocm_defaults_to_building_the_candidate_runtime() -> None:
-    assert _docker_arg(ROCM_DOCKERFILE, "USE_NIGHTLY_BUILD") == "1"
+def test_rocm_defaults_to_the_published_runtime() -> None:
+    assert _docker_arg(ROCM_DOCKERFILE, "USE_NIGHTLY_BUILD") == "0"
 
 
 def test_amd_build_uses_registry_cache() -> None:
@@ -313,8 +312,8 @@ def test_rocm_build_context_excludes_git_history() -> None:
 
 
 def test_rocm_source_ref_tracks_cuda_vllm_release() -> None:
-    # Both runtime installations must track the candidate, independently of
-    # the older published images used to bootstrap their dependencies.
+    # The optional ROCm source rebuild must track the same release commit
+    # as the published CUDA runtime.
     cuda_version = _docker_arg(CUDA_RELEASE_DOCKERFILE, "VLLM_VERSION")
     rocm_source_ref = _docker_arg(ROCM_DOCKERFILE, "VLLM_VERSION_OR_COMMIT_HASH")
 

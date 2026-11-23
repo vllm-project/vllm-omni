@@ -38,7 +38,13 @@ from tests.dfx.reliability.scenarios import (
     ProcessKillWorkerWithLoad,
     ServeRootCrashAtLaunch,
 )
-from tests.dfx.reliability.scenarios.oom import GPU_OOM_MARKERS, _looks_like_server_unreachable
+from tests.dfx.reliability.scenarios.oom import (
+    GPU_OOM_MARKERS,
+    _assert_oom_failure_evidence,
+    _looks_like_server_unreachable,
+    _require_oom_pressure,
+    _snapshot_oom_workers,
+)
 from tests.helpers.assertions import assert_http_error
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
@@ -240,45 +246,54 @@ def _run_oom_at_load(server: Any, client: Any) -> None:
         client,
         _video_request_config(width=256, height=256, num_frames=5, num_inference_steps=2, reference_size=(256, 256)),
     )
-    stderr_before = set(getattr(server, "_server_error_lines", ()))
     config = MODEL.hard_oom_config
-    handle = inject_gpu_oom(
-        device=resolve_oom_device_spec(config, _deploy_config_path(server)),
-        target_mem_ratio=config["target_mem_ratio"],
-        hold_seconds=config["hold_seconds"],
-        startup_timeout_sec=config["startup_timeout_sec"],
-        strict=config["strict"],
-        max_free_bytes=config.get("max_free_bytes"),
-    )
-    detail: Any = None
-    try:
-        started = time.monotonic()
-        print("[wan-oom] preflight passed; pressure ready; submitting one fault job", flush=True)
-        try:
-            result = _create_and_wait_video_job(client, fault_request, timeout_sec=180, err_code=(200, 500, 503))
-        except Exception as exc:
-            assert _looks_like_server_unreachable(exc), f"unexpected OOM job failure: {exc!r}"
-            detail = repr(exc)
-        else:
-            detail = result.json_body
-            print(f"[wan-oom] fault status={result.status_code}, body={str(detail)[:4096]}", flush=True)
-            assert isinstance(detail, dict) and detail.get("status") != "completed", (
-                f"OOM fault job must fail, got {detail!r}"
-            )
-            assert_http_error(result, err_code=(500, 503))
-            assert extract_openai_error_contract_from_payload(detail) is not None, (
-                f"OOM response lacks an error object: {detail!r}"
-            )
-        assert time.monotonic() - started < 180, "OOM job did not fail within 180 seconds"
-        stderr_delta = "".join(line for line in getattr(server, "_server_error_lines", ()) if line not in stderr_before)
-        evidence = str(detail) + stderr_delta
-        assert any(marker in evidence.lower() for marker in GPU_OOM_MARKERS), (
-            f"video job failed without explicit GPU OOM evidence; detail={str(detail)[:4096]}, "
-            f"stderr_tail={stderr_delta[-4096:]!r}"
+    with server.capture_stderr_evidence(GPU_OOM_MARKERS) as stderr_capture:
+        handle = inject_gpu_oom(
+            device=resolve_oom_device_spec(config, _deploy_config_path(server)),
+            target_mem_ratio=config["target_mem_ratio"],
+            hold_seconds=config["hold_seconds"],
+            startup_timeout_sec=config["startup_timeout_sec"],
+            strict=config["strict"],
+            max_free_bytes=config.get("max_free_bytes"),
         )
-    finally:
-        stop_gpu_oom_hogs(handle)
-        print("[wan-oom] memory pressure removed", flush=True)
+        detail: Any = None
+        try:
+            pressure_diagnostics = _require_oom_pressure(handle, phase="before the fault request")
+            workers_before = _snapshot_oom_workers(
+                server,
+                worker_markers_extra=(MODEL.worker_pattern,),
+            )
+            print(f"[wan-oom] verified pressure: {pressure_diagnostics}", flush=True)
+            started = time.monotonic()
+            print("[wan-oom] preflight passed; pressure ready; submitting one fault job", flush=True)
+            try:
+                result = _create_and_wait_video_job(client, fault_request, timeout_sec=180, err_code=(200, 500, 503))
+            except Exception as exc:
+                assert _looks_like_server_unreachable(exc), f"unexpected OOM job failure: {exc!r}"
+                detail = repr(exc)
+            else:
+                detail = result.json_body
+                print(f"[wan-oom] fault status={result.status_code}, body={str(detail)[:4096]}", flush=True)
+                assert isinstance(detail, dict) and detail.get("status") != "completed", (
+                    f"OOM fault job must fail, got {detail!r}"
+                )
+                assert_http_error(result, err_code=(500, 503))
+                assert extract_openai_error_contract_from_payload(detail) is not None, (
+                    f"OOM response lacks an error object: {detail!r}"
+                )
+            assert time.monotonic() - started < 180, "OOM job did not fail within 180 seconds"
+            response_evidence = str(detail)
+            _assert_oom_failure_evidence(
+                server=server,
+                handle=handle,
+                workers_before=workers_before,
+                response_evidence=response_evidence,
+                stderr_capture=stderr_capture,
+                context="video job",
+            )
+        finally:
+            stop_gpu_oom_hogs(handle)
+            print("[wan-oom] memory pressure removed", flush=True)
 
     try:
         health = client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
@@ -415,7 +430,6 @@ def test_graceful_shutdown(omni_server_function, online_client_function) -> None
 @launch_scenario_params(
     MODEL,
     ServeRootCrashAtLaunch,
-    skip_reason="Worker survives root crash during startup: https://github.com/vllm-project/vllm-omni/issues/10398",
 )
 def test_serve_root_crash_at_launch(launch_params) -> None:
     """SIGKILL only root before readiness, after a diffusion worker exists.

@@ -162,6 +162,21 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 
 Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` on `vllm serve` to switch to the legacy synchronous path.
 
+### Packed Flow precision
+
+The opt-in packed profiles (`cosyvoice3_full_response.yaml` and
+`cosyvoice3_packed_streaming.yaml`) disable BF16 reduced-precision GEMM
+reductions during each packed Flow solve, including eager solves, graph warmup,
+capture and replay. The previous setting is restored after every solve, so other
+models in the worker keep their own. Batch composition and graph padding can
+otherwise select a different GEMM with larger intermediate rounding errors.
+
+FlashInfer graph plans can choose different attention tiles from eager plans,
+so bitwise graph/eager equivalence is not guaranteed. Validate audio quality
+and performance using the same hardware, software and final deployment settings.
+This precision setting does not change streaming position noise or chunk-causal
+attention semantics.
+
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
@@ -358,7 +373,7 @@ Override the default text per case with `--text`, write to a custom path with `-
 
 ### Notes
 
-- Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../../ming_flash_omni/).
+- Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../ming_flash_omni/).
 - Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single GPU, `enforce_eager`, `max_num_seqs: 1`).
 - Decode defaults from the Ming cookbook: `max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
 

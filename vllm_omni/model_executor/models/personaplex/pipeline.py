@@ -39,6 +39,7 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             stage_id=0,
             model_stage="personaplex",
             execution_type=StageExecutionType.LLM_AR,
+            supports_native_mrv2_data_plane=True,
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
@@ -72,6 +73,7 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             sampling_constraints={"detokenize": True},
             supports_native_mrv2_data_plane=True,
             supports_duplex_mrv2=True,
+            requires_full_payload_input=True,
         ),
     ),
 )

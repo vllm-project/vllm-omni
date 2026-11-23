@@ -37,6 +37,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.exact_bf16_rope_musa import musa_qk_rotary, musa_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -100,13 +101,14 @@ def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torc
     """Rotate interleaved pairs with complex FP32 multiplication.
 
     Same contract as the reference `apply_rotary_emb_qwen(..., use_real=False)`:
-    `x` is [B, S, H, D], `freqs` is the complex frequency tensor [S, D // 2].
+    `x` is [B, S, H, D]; `freqs` is [S, D // 2] or [B, S, D // 2].
     """
     fused = rotary(x, freqs)
     if fused is not None:
         return fused
     paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+    freqs = freqs.unsqueeze(1) if freqs.ndim == 2 else freqs.unsqueeze(2)
+    return torch.view_as_real(paired * freqs).flatten(3).to(x.dtype)
 
 
 # Hold the freqs object so its id cannot be recycled into a different table.
@@ -116,8 +118,10 @@ _NPU_ROPE: dict[str, object] = {"freqs": None, "tables": None}
 def _npu_rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if _NPU_ROPE["freqs"] is freqs:
         return _NPU_ROPE["tables"]  # type: ignore[return-value]
-    cos = torch.real(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.imag(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    # Interleaved npu_rotary_mul requires [1, tokens, 1, D] tables.
+    table_freqs = freqs.reshape(1, -1, 1, freqs.shape[-1])
+    cos = torch.real(table_freqs).float().repeat_interleave(2, dim=-1)
+    sin = torch.imag(table_freqs).float().repeat_interleave(2, dim=-1)
     tables = (cos, sin)
     _NPU_ROPE["freqs"] = freqs
     _NPU_ROPE["tables"] = tables
@@ -133,8 +137,23 @@ def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> 
     import torch_npu
 
     rot_cos, rot_sin = _npu_rope_tables(freqs)
-    rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
-    return rotated.to(dtype=x.dtype)
+    values = x.float()
+    if freqs.ndim == 3:
+        # Fold batch and sequence together so each token uses its own row's frequencies.
+        values = values.reshape(1, -1, *x.shape[2:])
+    rotated = torch_npu.npu_rotary_mul(values, rot_cos, rot_sin, rotary_mode="interleave")
+    return rotated.reshape_as(x).to(dtype=x.dtype)
+
+
+def _apply_qwen_image21_rotary_emb_musa(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Interleaved RoPE through a Triton kernel with the native rotation's rounding.
+
+    Inputs the kernel does not take use ``_apply_qwen_image21_rotary_emb_native``.
+    """
+    rotated = musa_rotary(x, freqs)
+    if rotated is not None:
+        return rotated
+    return _apply_qwen_image21_rotary_emb_native(x, freqs)
 
 
 def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -143,8 +162,9 @@ def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) 
     Algebraically identical to the complex multiplication, computed in fp32:
     (x1 + i x2)(cos + i sin) interleaved back as [x1 cos - x2 sin, x1 sin + x2 cos, ...].
     """
-    cos = torch.real(freqs).float().unsqueeze(1)
-    sin = torch.imag(freqs).float().unsqueeze(1)
+    head_dim = 1 if freqs.ndim == 2 else 2
+    cos = torch.real(freqs).float().unsqueeze(head_dim)
+    sin = torch.imag(freqs).float().unsqueeze(head_dim)
     x_pairs = x.float().unflatten(-1, (-1, 2))
     x1, x2 = x_pairs.unbind(-1)
     out = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
@@ -416,7 +436,11 @@ class QwenImage21Rope(nn.Module):
         return torch.polar(torch.ones_like(freqs), freqs)
 
     def forward(
-        self, img_shapes: list[tuple[int, int, int]], image_pad_mask: torch.Tensor, device: torch.device
+        self,
+        img_shapes: list[tuple[int, int, int]],
+        image_pad_mask: torch.Tensor,
+        device: torch.device,
+        text_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.freqs = [freq.to(device) for freq in self.freqs]
 
@@ -450,11 +474,22 @@ class QwenImage21Rope(nn.Module):
 
         height_index = torch.where(height_index < 0, height_index + self.freqs[1].shape[0], height_index)
         width_index = torch.where(width_index < 0, width_index + self.freqs[2].shape[0], width_index)
+        height_freqs = self.freqs[1].index_select(0, height_index)
+        width_freqs = self.freqs[2].index_select(0, width_index)
+        if text_valid_mask is None:
+            return torch.cat([self.freqs[0].index_select(0, frame_index), height_freqs, width_freqs], dim=-1)
+
+        # Text padding can precede valid tokens. Each request's frame position
+        # must exclude its own padded text positions; padded slots are masked.
+        padded_text = ~text_valid_mask.bool() & ~image_pad_mask.unsqueeze(0)
+        frame_by_request = (frame_index.unsqueeze(0) - padded_text.long().cumsum(dim=1)).clamp_min_(0)
+        batch_size = text_valid_mask.shape[0]
+        frame_freqs = self.freqs[0].index_select(0, frame_by_request.flatten()).view(batch_size, total_len, -1)
         return torch.cat(
             [
-                self.freqs[0].index_select(0, frame_index),
-                self.freqs[1].index_select(0, height_index),
-                self.freqs[2].index_select(0, width_index),
+                frame_freqs,
+                height_freqs.unsqueeze(0).expand(batch_size, -1, -1),
+                width_freqs.unsqueeze(0).expand(batch_size, -1, -1),
             ],
             dim=-1,
         )
@@ -563,6 +598,8 @@ class QwenImage21Attention(nn.Module):
             return _apply_qwen_image21_rotary_emb(x, freqs)
         if x.device.type == "npu":
             return _apply_qwen_image21_rotary_emb_npu(x, freqs)
+        if x.device.type == "musa":
+            return _apply_qwen_image21_rotary_emb_musa(x, freqs)
         # Platform fallback without complex-tensor kernels (the CustomOp rope layer
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
@@ -657,7 +694,10 @@ class QwenImage21Attention(nn.Module):
 
         fused_qk = None
         if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
-            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+            if query.device.type == "musa":
+                fused_qk = musa_qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+            else:
+                fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
         if fused_qk is not None:
             query, key = fused_qk
         else:
@@ -887,6 +927,7 @@ class QwenImage21SequencePrepare(nn.Module):
         img_shapes: list[tuple[int, int, int]],
         img_mask: torch.Tensor,
         is_decode: bool,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""
         Returns:
@@ -901,7 +942,17 @@ class QwenImage21SequencePrepare(nn.Module):
             rotary_emb = geometry["rotary_emb"]
         else:
             image_pad_mask = self.expand_image_pad_mask(img_mask[0])
-            rotary_emb = self.pos_embed(img_shapes, image_pad_mask, device=hidden_states.device)
+            text_valid_mask = None
+            if encoder_hidden_states_mask is not None and not bool(encoder_hidden_states_mask.all()):
+                text_valid_mask = torch.ones(
+                    batch_size, image_pad_mask.shape[0], dtype=torch.bool, device=hidden_states.device
+                )
+                text_positions = (~image_pad_mask).nonzero(as_tuple=True)[0]
+                vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
+                text_valid_mask[:, text_positions] = encoder_hidden_states_mask.bool()[:, vlm_text_positions]
+            rotary_emb = self.pos_embed(
+                img_shapes, image_pad_mask, device=hidden_states.device, text_valid_mask=text_valid_mask
+            )
             if geometry is not None:
                 geometry.update(image_pad_mask=image_pad_mask, rotary_emb=rotary_emb)
 
@@ -913,7 +964,7 @@ class QwenImage21SequencePrepare(nn.Module):
             target_hidden_states = self.img_in(hidden_states[:, -target_tokens:])
             dim = target_hidden_states.shape[-1]
             prefix_hidden_states = target_hidden_states.new_zeros(batch_size, 0, dim)
-            return prefix_hidden_states, target_hidden_states, rotary_emb[:0], rotary_emb[prefix_len:]
+            return prefix_hidden_states, target_hidden_states, rotary_emb[..., :0, :], rotary_emb[..., prefix_len:, :]
 
         hidden_states = self.img_in(hidden_states)
 
@@ -931,9 +982,24 @@ class QwenImage21SequencePrepare(nn.Module):
         return (
             joint_hidden_states[:, :prefix_len],
             joint_hidden_states[:, prefix_len:],
-            rotary_emb[:prefix_len],
-            rotary_emb[prefix_len:],
+            rotary_emb[..., :prefix_len, :],
+            rotary_emb[..., prefix_len:, :],
         )
+
+
+def _qwen_image21_rope_text_mask(
+    text_mask: torch.Tensor | None, device: torch.device, sp_active: bool
+) -> torch.Tensor | None:
+    if text_mask is None:
+        return None
+    if sp_active or device.type not in ("cuda", "npu"):
+        if not bool(text_mask.all()):
+            raise ValueError(
+                "Qwen-Image-2.1 mixed-length text padding requires CUDA or NPU without sequence parallelism "
+                "for per-request image RoPE."
+            )
+        return None
+    return text_mask
 
 
 class QwenImage21Transformer2DModel(CachedTransformer):
@@ -1325,8 +1391,14 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             )
             geometry = self._geometry_for_request(kv_cache, img_mask, signature)
         self.sequence_prepare._request_geometry = geometry
+        per_request_mask = _qwen_image21_rope_text_mask(encoder_hidden_states_mask, hidden_states.device, sp_active)
         prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
-            hidden_states, txt_hidden_states, layout, img_mask, is_decode
+            hidden_states,
+            txt_hidden_states,
+            layout,
+            img_mask,
+            is_decode,
+            per_request_mask,
         )
         # Read SP pad size after sequence_prepare: the auto-pad hook only writes
         # ctx.sp_padding_size during the split inside that call (and once per
@@ -1343,7 +1415,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             sp_padding = int(ctx.sp_padding_size)
         # Local layout is always [prefix, target (shard)]: full sequence when SP is off.
         joint_hidden_states = torch.cat([prefix_hidden_states, target_hidden_states], dim=1)
-        freqs = torch.cat([prefix_freqs, target_freqs], dim=0)
+        freqs = torch.cat([prefix_freqs, target_freqs], dim=-2)
         prefix_len = prefix_hidden_states.shape[1]
         sp_prefix_len = prefix_len if sp_active and not is_decode else 0
 
@@ -1459,7 +1531,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prepared_modulation = None
         pointwise_validated = False
         if (
-            joint_hidden_states.device.type in {"cuda", "npu"}
+            joint_hidden_states.device.type in {"cuda", "npu", "musa"}
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
@@ -1469,7 +1541,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             # its token selection/scale/tanh once per step, using the same ops.
             scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
             decode_broadcast = (
-                joint_hidden_states.device.type == "npu"
+                joint_hidden_states.device.type in ("npu", "musa")
                 and joint_hidden_states.dtype == torch.bfloat16
                 and batch_size == 1
                 and is_decode

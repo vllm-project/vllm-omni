@@ -16,9 +16,9 @@ echo "Dockerfile: ${dockerfile}"
 if ! command -v buildctl &> /dev/null; then
   mkdir -p /tmp/buildkit
   buildkit_version=v0.29.0
-  wget -q \
+  curl -fsSL \
     "https://github.com/moby/buildkit/releases/download/${buildkit_version}/buildkit-${buildkit_version}.linux-arm64.tar.gz" \
-    -O /tmp/buildkit.tar.gz
+    -o /tmp/buildkit.tar.gz
   tar -xzf /tmp/buildkit.tar.gz -C /tmp/buildkit
   cp /tmp/buildkit/bin/buildctl /usr/local/bin/
 fi

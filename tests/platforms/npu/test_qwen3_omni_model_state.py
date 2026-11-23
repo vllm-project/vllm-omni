@@ -2,22 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3 V2 must preserve Omni lifecycle and build Ascend metadata."""
 
+from __future__ import annotations
+
 from functools import partial
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
 pytest.importorskip("vllm_ascend")
 
-from vllm.config import CUDAGraphMode
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
+from vllm.v1.worker.gpu.states import RequestState
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.platforms.npu.models.qwen3_omni_model_state import NPUQwen3OmniModelState
 from vllm_omni.worker_v2.model_states import init_omni_model_state
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -53,10 +59,61 @@ def test_attention_delegates_to_ascend_without_losing_omni_hooks(monkeypatch):
     assert mro.index(OmniModelState) < mro.index(AscendModelState)
 
 
+@pytest.mark.parametrize(
+    ("final_stages", "force_kv", "prefix_caching", "expect_payload"),
+    [
+        pytest.param((0, 0), False, False, False, id="text-only"),
+        pytest.param((0, 2), False, False, True, id="mixed-audio"),
+        pytest.param((0, None), False, False, True, id="unknown-route"),
+        pytest.param((0, 0), True, False, True, id="forced-kv"),
+        pytest.param((0, 0), False, True, True, id="prefix-cache"),
+    ],
+)
+def test_thinker_only_materializes_payloads_with_consumers(
+    monkeypatch, final_stages, force_kv, prefix_caching, expect_payload
+):
+    state = NPUQwen3OmniModelState.__new__(NPUQwen3OmniModelState)
+    state.model = Qwen3OmniMoeForConditionalGeneration.__new__(Qwen3OmniMoeForConditionalGeneration)
+    state.model.model_stage = "thinker"
+    state.vllm_config = VllmConfig.__new__(VllmConfig)
+    state.vllm_config.model_config = OmniModelConfig.__new__(OmniModelConfig)
+    state.vllm_config.model_config.async_chunk = True
+    state.vllm_config.cache_config = CacheConfig(enable_prefix_caching=prefix_caching)
+    state.vllm_config.kv_transfer_config = None
+    state.vllm_config.speculative_config = None
+    state.intermediate_buffer = OmniIntermediateBuffer(len(final_stages))
+    for idx, stage in enumerate(final_stages):
+        if stage is not None:
+            state.intermediate_buffer.buffers[idx]["omni_final_stage_id"] = stage
+    state.intermediate_buffer.buffers[0]["omni_force_kv_transfer"] = force_kv
+    batch = AscendInputBatch.__new__(AscendInputBatch)
+    batch.num_reqs = len(final_stages)
+    batch.idx_mapping_np = np.arange(batch.num_reqs, dtype=np.int32)
+    hidden = torch.arange(12).reshape(2, 2, 3)
+    payload = {"embed": {"prefill": torch.zeros(4, 3)}}
+    req_states = RequestState.__new__(RequestState)
+
+    def build_payload(self, model_output, input_batch, request_states):
+        assert self is state
+        assert input_batch is batch
+        assert request_states is req_states
+        assert model_output[1] is payload
+        return hidden.reshape(4, 3), payload
+
+    monkeypatch.setattr(OmniModelState, "postprocess_model_output", build_payload)
+    text, multimodal = state.postprocess_model_output((hidden, payload), batch, req_states)
+
+    assert torch.equal(text, hidden.reshape(4, 3))
+    if expect_payload:
+        assert multimodal is payload
+    else:
+        assert multimodal == {}
+
+
 class _KvInitRecorder:
     """Record the native → stage-cache ordering without module-level state."""
 
-    def __init__(self, config: object, profiling: bool, spec: object = None) -> None:
+    def __init__(self, config: object, profiling: bool, spec: _SpecConfig | None = None) -> None:
         self.config = config
         self.profiling = profiling
         self.spec = spec
@@ -104,7 +161,7 @@ class _SpecConfig:
 
     def __init__(self, dynamic: bool) -> None:
         self._dynamic = dynamic
-        self.num_speculative_tokens_per_batch_size = None
+        self.num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self._dynamic

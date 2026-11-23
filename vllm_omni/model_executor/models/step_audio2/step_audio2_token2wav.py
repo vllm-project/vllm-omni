@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from __future__ import annotations
+
 import io
 import os
 import threading
@@ -22,6 +24,8 @@ try:
 except ImportError:
     from torch.nn.utils import weight_norm
 
+from typing import TYPE_CHECKING
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
@@ -30,8 +34,6 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.multimodal.media.audio import load_audio
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
@@ -42,6 +44,9 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     STEP_AUDIO2_DEFAULT_PROMPT_WAV,
     STREAM_SOURCE_CACHE_LEN,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -855,6 +860,8 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
 
     @property
     def sampler(self):
+        from vllm.v1.sample.sampler import Sampler
+
         return Sampler()
 
     def embed_input_ids(
