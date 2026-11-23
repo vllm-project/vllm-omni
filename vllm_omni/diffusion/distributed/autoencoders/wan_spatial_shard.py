@@ -618,6 +618,8 @@ class WanDistCausalConv3d(nn.Conv3d):
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self._trim_cache: dict[int, tuple[int, int, int]] = {}
         self._backend = dist.get_backend(group) if dist.is_initialized() else None
+        self.reuse_input_buffer = False
+        self._input_buf: torch.Tensor | None = None
         self.input_memory_format = torch.contiguous_format
 
     def forward(
@@ -630,8 +632,8 @@ class WanDistCausalConv3d(nn.Conv3d):
         """Assemble history, padding, and halo slots in the convolution layout.
 
         Reuse the shared causal-input kernel when supported, otherwise copy
-        into the same slots with PyTorch. Conv3d uses transient storage
-        to avoid retaining one large activation per layer.
+        into the same slots with PyTorch. Only the LingBot streaming fast path
+        requests a persistent input buffer.
         """
         from .wan_vae_fastpath.forwards import CFG_ATTR
 
@@ -653,7 +655,11 @@ class WanDistCausalConv3d(nn.Conv3d):
         total_height = top + height + pad_h1 + halo_h
         total_width = left + width + pad_w1 + halo_w
         shape = (batch, channels, total_frames, total_height, total_width)
-        buf = torch.empty(shape, dtype=x.dtype, device=x.device, memory_format=self.input_memory_format)
+        reuse = self.reuse_input_buffer and not torch.is_grad_enabled()
+        if reuse:
+            buf = _persistent_input_buffer(self, shape, x)
+        else:
+            buf = torch.empty(shape, dtype=x.dtype, device=x.device, memory_format=self.input_memory_format)
         fused = False
         if (
             getattr(self, CFG_ATTR, None) is not None
@@ -673,14 +679,16 @@ class WanDistCausalConv3d(nn.Conv3d):
                 buf[:, :, :pad_t0].zero_()
             if pad_t1:
                 buf[:, :, total_frames - pad_t1 :].zero_()
-            if pad_h0:
-                buf[:, :, :, halo_h:top].zero_()
-            if pad_h1:
-                buf[:, :, :, total_height - halo_h - pad_h1 : total_height - halo_h].zero_()
-            if pad_w0:
-                buf[:, :, :, :, halo_w:left].zero_()
-            if pad_w1:
-                buf[:, :, :, :, total_width - halo_w - pad_w1 : total_width - halo_w].zero_()
+            # A persistent buffer's spatial padding stays zero across streaming blocks.
+            if not reuse:
+                if pad_h0:
+                    buf[:, :, :, halo_h:top].zero_()
+                if pad_h1:
+                    buf[:, :, :, total_height - halo_h - pad_h1 : total_height - halo_h].zero_()
+                if pad_w0:
+                    buf[:, :, :, :, halo_w:left].zero_()
+                if pad_w1:
+                    buf[:, :, :, :, total_width - halo_w - pad_w1 : total_width - halo_w].zero_()
             interior = buf[:, :, pad_t0 : pad_t0 + cache_frames + frames, top : top + height, left : left + width]
             if cache_frames:
                 interior[:, :, :cache_frames].copy_(cache_x)
