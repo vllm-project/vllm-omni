@@ -108,6 +108,7 @@ def _register_omni_hf_configs() -> None:
             BailingMoeV3AudioConfig,
         )
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.realtime_venus import RealtimeVenusOmniConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -141,6 +142,7 @@ def _register_omni_hf_configs() -> None:
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
         ("chatterbox", ChatterboxConfig),
+        ("realtime_venus_omni", RealtimeVenusOmniConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

@@ -611,6 +611,9 @@ def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
         ),
     )
 
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.processor.AutoImageProcessor", _AutoImageProcessor
+    )
     loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
 
     assert loaded is processor

@@ -1,0 +1,22 @@
+# Realtime-Venus Omni: reuse the three-stage execution core.
+base_config: minicpmo_4_5_turn.yaml
+pipeline: realtime_venus_omni
+# The external Venus delegation harness and memory runtime are not provided.
+session_mode: turn
+connectors:
+  connector_of_shared_memory:
+    extra:
+      # Preserve the released checkpoint's flow step count.
+      token2wav_n_timesteps: 10
+platforms:
+  cuda:
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          # Do not inherit the MiniCPM Seed-TTS reduced-precision recipe.
+          token2wav_float16: false
+          token2wav_allow_tf32: "off"
+    stages:
+      - stage_id: 2
+        num_replicas: 1
+        devices: "0"

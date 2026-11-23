@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.delegation import filter_delegate_condition
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
@@ -767,6 +768,7 @@ def _native_duplex_segment_output_ids(
         # The text handed to the Talker in this turn starts over (see
         # _native_duplex_append_turn_text).
         state["turn_text_tail"] = ""
+        state["delegate_muted"] = False
     return segment_ids, segment_text, turn_start
 
 
@@ -1182,6 +1184,7 @@ def llm2tts(
                     tts_hidden_slice = thinker_hidden_states[:0]
                     thinker_text = ""
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
+        spoken_text = None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
                 handoff_ids,
@@ -1193,10 +1196,21 @@ def llm2tts(
                 # text comes from total_ids_in_unit, the same slice that
                 # conditions the Talker.
                 thinker_text = handoff_text
-                # The sentence-end check reads the same complete unit slice.
-                _native_duplex_append_turn_text(
-                    _streaming_context, request_id=str(llm_output.request_id), text=handoff_text
+                spoken_text = handoff_text
+        if is_native_duplex_handoff and handoff_ids is not None and tts_hidden_slice is not None:
+            bridge_states = getattr(_streaming_context, "bridge_states", None)
+            handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
+            if isinstance(handoff_state, dict):
+                speech_ids, tts_hidden_slice = filter_delegate_condition(
+                    handoff_ids, tts_hidden_slice, special_token_ids, handoff_state
                 )
+                if speech_ids is not handoff_ids:
+                    spoken_text = _decode_native_duplex_token_ids(
+                        speech_ids, _streaming_context, request_id=str(llm_output.request_id)
+                    )
+                handoff_ids = speech_ids
+        if spoken_text:
+            _native_duplex_append_turn_text(_streaming_context, request_id=str(llm_output.request_id), text=spoken_text)
         model_intermediate_buffer = build_duplex_intermediate_buffer(
             request_id=str(llm_output.request_id),
             prompt_token_ids=prompt_token_ids,

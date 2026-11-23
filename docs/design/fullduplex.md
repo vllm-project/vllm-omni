@@ -1805,3 +1805,18 @@ cancels its tasks and releases its recordings.
   during playback; `--inline` drives the same scenario through
   `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
   (admission, resume, takeover, expiry).
+
+## Realtime-Venus delegation speech condition
+
+Realtime-Venus reuses the MiniCPM-o stage implementation. Its optional
+`delegate_open_token_id` and `delegate_close_token_id` belong to the model
+plugin's special-token metadata. At the native Thinker-to-Talker handoff,
+the bridge removes delegation delimiters and their enclosed token/hidden-state
+rows from speech conditioning while preserving the complete text output.
+The mask is request-local, continues across units, and resets at a new turn
+or the turn-end token. The turn-end row is retained to drain pending speech.
+Models without these optional IDs retain their existing handoff.
+
+This filtering does not execute delegated work or supply the external Venus
+memory runtime. The [Realtime-Venus recipe](../../recipes/inclusionAI/Realtime-Venus.md)
+defines the currently exposed serving scope and validation limitations.

@@ -971,3 +971,34 @@ def test_llm2tts_does_not_alias_live_thinker_token_list() -> None:
     live_tokens.append(13)
 
     assert converted["model_intermediate_buffer"]["ids"]["output"] == [11, 12]
+
+
+def test_venus_delegation_masks_aligned_speech_rows_and_preserves_text_tokens():
+    ids = [9304, 21, 9400, 31, 32, 9401, 22, 9310, 9308]
+    source, latent = _native_source([101], ids, [101, *ids[:-1]])
+    source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+    info = _native_handoff(source)
+    assert info["ids"]["tts"] == [21, 22, 9310]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[[2, 7, 8]])
+    assert info["meta"]["turn_end"] is True
+    assert source.outputs[0].token_ids == ids
+
+
+def test_venus_delegation_state_crosses_units_and_resets_at_turn_end():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.delegation import filter_delegate_condition
+
+    special = {"delegate_open_token_id": 9400, "delegate_close_token_id": 9401, "turn_eos_token_id": 9310}
+    state: dict[str, bool] = {}
+    hidden = torch.arange(16).reshape(4, 4)
+    ids, rows = filter_delegate_condition([21, 9400, 31, 32], hidden, special, state)
+    assert ids == [21]
+    assert torch.equal(rows, hidden[:1])
+    ids, rows = filter_delegate_condition([33, 9401, 22, 23], hidden, special, state)
+    assert ids == [22, 23]
+    assert torch.equal(rows, hidden[2:])
+    ids, rows = filter_delegate_condition([9400, 34, 35, 9310], hidden, special, state)
+    assert ids == [9310]
+    assert not state["delegate_muted"]
+    ids, rows = filter_delegate_condition([21, 22, 23, 24], hidden, special, state)
+    assert ids == [21, 22, 23, 24]
+    assert rows is hidden

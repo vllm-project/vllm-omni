@@ -31,7 +31,6 @@ logger = init_logger(__name__)
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
-_MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_FRAME_POOL_LOCK = Lock()
 _MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
 
@@ -1187,6 +1186,8 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "chunk_eos_token_id": self.chunk_eos_token_id,
                 "chunk_tts_eos_token_id": self.chunk_tts_eos_token_id,
                 "turn_eos_token_id": self.turn_eos_token_id,
+                "delegate_open_token_id": getattr(self, "delegate_open_token_id", -1),
+                "delegate_close_token_id": getattr(self, "delegate_close_token_id", -1),
             }.items()
             if isinstance(value, int) and value >= 0
         }
@@ -1196,27 +1197,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         if not model_path:
             return None
         try:
-            from transformers import AutoImageProcessor, AutoProcessor
+            from transformers import AutoProcessor
 
-            original_register = AutoImageProcessor.register
+            from vllm_omni.model_executor.models.minicpmo_4_5.processor import legacy_image_processor_registration
 
-            def register_image_processor(config_class, *args, **kwargs):
-                # The checkpoint's auto_map already loads this class. Its
-                # legacy string registration is incompatible with some
-                # Transformers versions and is otherwise redundant.
-                if config_class == "MiniCPMVImageProcessor":
-                    return None
-                return original_register(config_class, *args, **kwargs)
-
-            with _MINICPMO45_PROCESSOR_LOAD_LOCK:
-                setattr(AutoImageProcessor, "register", staticmethod(register_image_processor))
-                try:
-                    processor = AutoProcessor.from_pretrained(
-                        model_path,
-                        trust_remote_code=True,
-                    )
-                finally:
-                    setattr(AutoImageProcessor, "register", staticmethod(original_register))
+            with legacy_image_processor_registration():
+                processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         except Exception as exc:
             raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
         if getattr(processor, "tokenizer", None) is None:

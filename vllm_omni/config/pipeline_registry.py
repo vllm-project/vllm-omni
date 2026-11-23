@@ -140,6 +140,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
     resolve_qwen3_omni_pipeline,
 )
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.realtime_venus.pipeline import REALTIME_VENUS_OMNI_PIPELINE
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -229,6 +230,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_tts": MING_TTS_PIPELINE,
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
+    "realtime_venus_omni": REALTIME_VENUS_OMNI_PIPELINE,
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "minimax_h3_disaggregated_decode": MINIMAX_H3_DECODE_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
