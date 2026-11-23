@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Golden shape test for the NemotronVoiceChat frame-locked timeline contract.
 
 Pins the exact prefill/off-by-one arithmetic against values verified with the
@@ -190,6 +190,29 @@ def test_postprocess_skips_intermediate_prefill_chunks(monkeypatch: pytest.Monke
     assert update["nvc_function_tokens"].numel() == 1
 
 
+def test_thinker_uses_native_buffer_identity_for_preprocess_and_feedback() -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+
+    buffer = OmniIntermediateBuffer(1)
+    buffer.add_request(0, SimpleNamespace(req_id="req", mm_features=[], additional_information=None))
+    info = buffer.buffers[0]
+    assert "request_id" not in info
+    thinker = _bare_thinker()
+    prefill = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    session = {"prefill_embeds": prefill, "func_token": -1}
+    thinker._sessions = {"req": session}
+    ids = torch.zeros(3, dtype=torch.long)
+
+    _, embeds, _ = thinker.preprocess(ids, None, **info)
+    torch.testing.assert_close(embeds, prefill)
+    update = thinker.postprocess(prefill, **info)
+    assert session["func_token"] == int(update["nvc_prev_function_token"])
+
+
 def test_prefill_contract_arithmetic() -> None:
     # vllm_prefill_len = logical_prompt_token_len + 1 (the +1 is acoustic
     # frame 0); decode steps == acoustic_frame_count; NeMo timeline
@@ -239,7 +262,7 @@ def test_code2wav_reuses_and_clears_per_request_streaming_cache() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.anchor = nn.Parameter(torch.zeros(()))
-            self.caches = []
+            self.caches: list[object] = []
 
         def decode(self, codes, lengths, *, cache):
             self.caches.append(cache)

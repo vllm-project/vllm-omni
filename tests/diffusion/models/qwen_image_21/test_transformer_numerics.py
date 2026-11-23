@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
 
@@ -51,54 +52,7 @@ def test_rope_frequencies_do_not_depend_on_loader_device(device):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cpu
-@pytest.mark.parametrize("valid_lengths", [(13, 90), (10, 30)], ids=["positive", "negative"])
-@pytest.mark.parametrize(
-    "row_index",
-    [
-        pytest.param(
-            0,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=AssertionError,
-                reason="Padded rows change image RoPE; tracked in diffusion_runtime.md per-request Qwen RoPE follow-up",
-            ),
-            id="padded-row",
-        ),
-        pytest.param(1, id="unpadded-control"),
-    ],
-)
-def test_batched_rope_preserves_positions_from_each_requests_text_mask(valid_lengths, row_index):
-    """Helper-level tracking check for positions derived from each text mask.
-
-    This intentionally exercises ``QwenImage21Rope`` directly, rather than the
-    full batched Transformer path. A row-aware RoPE fix will change this
-    helper's signature; rewrite this strict xfail before removing it.
-    """
-    rope = transformer.QwenImage21Rope(theta=10000, axes_dim=[16, 56, 56])
-    device = torch.device("cpu")
-    padded_length = max(valid_lengths)
-    prompt_embeds_mask = torch.arange(padded_length).unsqueeze(0) < torch.tensor(valid_lengths).unsqueeze(1)
-    target_tokens = 4
-    image_shapes = [(1, 2, 2)]
-    batched_image_mask = torch.cat(
-        [torch.zeros(padded_length, dtype=torch.bool), torch.ones(target_tokens, dtype=torch.bool)]
-    )
-    batched_freqs = rope(image_shapes, batched_image_mask, device)
-
-    # Standalone image positions advance only over this request's valid text.
-    valid_length = int(prompt_embeds_mask[row_index].sum())
-    standalone_image_mask = torch.cat(
-        [torch.zeros(valid_length, dtype=torch.bool), torch.ones(target_tokens, dtype=torch.bool)]
-    )
-    standalone_freqs = rope(image_shapes, standalone_image_mask, device)
-    torch.testing.assert_close(
-        batched_freqs[:padded_length][prompt_embeds_mask[row_index]], standalone_freqs[:valid_length], rtol=0, atol=0
-    )
-    torch.testing.assert_close(batched_freqs[-target_tokens:], standalone_freqs[-target_tokens:], rtol=0, atol=0)
-
-
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_scheduler_matches_diffusers_on_latent_device():
     import numpy as np
     from diffusers import FlowMatchEulerDiscreteScheduler
@@ -107,7 +61,7 @@ def test_scheduler_matches_diffusers_on_latent_device():
 
     pipeline = object.__new__(QwenImage21Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.device = torch.device("cuda", 0)
+    pipeline.device = torch.device(DEVICE_TYPE, 0)
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True)
     timesteps, _ = pipeline.prepare_timesteps(50, None, 4096)
     reference = FlowMatchEulerDiscreteScheduler.from_config(pipeline.scheduler.config)
@@ -126,9 +80,9 @@ def test_scheduler_matches_diffusers_on_latent_device():
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_timestep_frequencies_match_cpu_initialization():
     reference = transformer.QwenImage21TemporalTimesteps(timestep_dim=256)
-    with torch.device("cuda"):
+    with torch.device(DEVICE_TYPE):
         loaded = transformer.QwenImage21TemporalTimesteps(timestep_dim=256)
     assert loaded.freqs.device.type == "cuda"
     torch.testing.assert_close(loaded.freqs.cpu(), reference.freqs, rtol=0, atol=0)
-    timesteps = torch.tensor([0.0, 0.984375, 1.0], device="cuda")
-    torch.testing.assert_close(loaded(timesteps), reference.to("cuda")(timesteps), rtol=0, atol=0)
+    timesteps = torch.tensor([0.0, 0.984375, 1.0], device=DEVICE_TYPE)
+    torch.testing.assert_close(loaded(timesteps), reference.to(DEVICE_TYPE)(timesteps), rtol=0, atol=0)

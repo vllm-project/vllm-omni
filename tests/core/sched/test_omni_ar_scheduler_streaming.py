@@ -1458,6 +1458,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     session = _make_request()
     session.resumable = True
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session._omni_segment_generation = 0
 
     def queue(*requests):
         result = MagicMock()
@@ -1487,6 +1488,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
 
     assert session.status == RequestStatus.WAITING
     assert session in sched.waiting.requests
+    assert session._omni_segment_generation == 1
     assert session not in sched.kv_holding_waiting.requests
     assert sched.num_waiting_for_streaming_input == 0
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
@@ -1506,6 +1508,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     """Only duplex connector-driven receivers resume without an update."""
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session._omni_segment_generation = 0
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
@@ -1521,6 +1524,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched._resume_downstream_chunk_receiver(session)
 
     assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert session._omni_segment_generation == 0
     assert sched.num_waiting_for_streaming_input == 1
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.kv_holding_waiting.remove_requests.assert_not_called()

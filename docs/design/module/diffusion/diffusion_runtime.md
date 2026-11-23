@@ -352,36 +352,19 @@ negative prompt; internal batched encoding accepts one string per request.
 This preserves CFG-off ignore semantics across role handoffs without clearing
 another request's shared raw negative prompt or overwriting its image conditions.
 
-Native Qwen generator batches share a padded joint sequence layout. The current
-Transformer counts padded prefix slots when positioning image tokens with RoPE,
-so attention masks alone do not preserve the positions used by separate
-requests with shorter text. This also applies to native FULL batching; output
-differences across batch compositions can include position changes as well as
-floating-point rounding.
+### Per-request Qwen RoPE positions
 
-### Follow-up: per-request Qwen RoPE positions
+Native Qwen generator batches share a padded joint sequence layout. On CUDA
+and NPU without sequence parallelism, the Transformer uses the text validity
+mask for the active CFG branch to exclude padding from each request's RoPE
+frame positions. Mixed-length text padding is rejected with sequence
+parallelism or on other devices.
 
-The desired contract is that padding introduced for batching does not change
-the positional inputs of an individual request. This remains unresolved.
-Derive per-request text offsets from `prompt_embeds_mask` (and
-`negative_prompt_embeds_mask` for CFG), excluding invalid padding positions.
-Map those offsets through the interleaved text/condition-image layout before
-positioning the target image. The current shared one-dimensional RoPE table
-must support row-specific positions, including prefix-cache reuse and step
-execution; changing the attention mask alone is insufficient.
-
-`test_batched_rope_preserves_positions_from_each_requests_text_mask` in
-`tests/diffusion/models/qwen_image_21/test_transformer_numerics.py` is a
-helper-level tracking test, rather than a batched Transformer or pipeline
-acceptance test. It derives standalone reference offsets from each request's
-mask. Its strict expected failures for padded rows track this gap; the
-unpadded controls guard the existing helper path. A row-aware helper signature
-will require rewriting the test, not simply removing its xfail markers. A
-repair must add integration coverage for those positional checks and cover
-condition-image layouts, positive/negative branches, request/step execution,
-and cache reuse before
-claiming that padding preserves standalone semantics. BF16 numerical
-equivalence requires separate validation even once positions agree.
+The upstream regression tests in
+`tests/diffusion/models/qwen_image_21/test_per_request_rope.py` cover mixed
+text lengths, layouts with a reference image, and singleton decode after
+mixed prefill. BF16 output equivalence across batch compositions requires
+separate validation.
 
 ## Request state and identity
 

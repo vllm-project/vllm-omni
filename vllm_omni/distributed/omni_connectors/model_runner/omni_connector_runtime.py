@@ -45,7 +45,7 @@ def needs_omni_connector(model_config: Any) -> bool:
     return (
         bool(getattr(model_config, "requires_full_payload_input", False))
         or bool(getattr(model_config, "custom_process_next_stage_input_func", None))
-        or get_stage_connector_role(model_config) is not None
+        or get_stage_connector_role(model_config) not in (None, "none")
     )
 
 
@@ -55,7 +55,10 @@ def _should_create_payload_connector(model_config: Any) -> bool:
     Sender edges may instead be owned solely by KV transfer. Receivers still
     need a connector even though they do not declare a downstream payload hook.
     """
-    if get_stage_connector_role(model_config) != "sender":
+    role = get_stage_connector_role(model_config)
+    if role == "none":
+        return False
+    if role != "sender":
         return True
 
     next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -1139,8 +1142,7 @@ class _OmniConnectorRuntimeMixin:
             return None
 
         params = signature.parameters
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
-            return "pooling_output"
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
 
         supported = {
             name
@@ -1151,13 +1153,15 @@ class _OmniConnectorRuntimeMixin:
                 inspect.Parameter.KEYWORD_ONLY,
             )
         }
-        if not {"transfer_manager", "request"}.issubset(supported):
+        if not accepts_kwargs and not {"transfer_manager", "request"}.issubset(supported):
             return None
+        # Explicit payload parameters take precedence: a builder may accept
+        # unrelated **kwargs without reading its model output from them.
         if "pooling_output" in supported:
             return "pooling_output"
         if "multimodal_output" in supported:
             return "multimodal_output"
-        return None
+        return "pooling_output" if accepts_kwargs else None
 
     @staticmethod
     def _load_custom_batch_func(custom_process_func: Any | None) -> Any | None:

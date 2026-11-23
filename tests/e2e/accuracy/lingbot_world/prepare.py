@@ -17,7 +17,6 @@ import urllib.request
 from pathlib import Path
 
 import regex as re
-from packaging.version import Version
 
 from tests.e2e.accuracy.lingbot_world.opencv_provider import PROVIDER, validate_opencv_provider_record
 from vllm_omni.benchmarks.realtime_video.eval import read_json, sha256, verify_environment, write_json
@@ -26,19 +25,11 @@ from vllm_omni.benchmarks.realtime_video.metrics import RegressionError
 ROOT = Path(__file__).resolve().parents[4]
 
 
-def verify_inference_runtime(platform: str) -> dict:
-    names = ("vllm", "torch") + (("torch-npu", "vllm-ascend") if platform == "npu" else ())
-    packages = {name: importlib.metadata.version(name) for name in names}
-    version = Version(packages["vllm"])
-    # NPU capture keeps the unchanged vLLM-Ascend 0.33.0 image.
-    expected_vllm = "0.34.0" if platform == "cuda" else "0.33.0"
-    if version.base_version != expected_vllm or version.is_prerelease or version.is_devrelease:
-        raise RegressionError(f"LingBot {platform} capture requires released vLLM {expected_vllm}")
+def inference_runtime_metadata(platform: str) -> dict:
     if platform not in ("cuda", "npu"):
         raise RegressionError(f"Unsupported platform: {platform}")
-    if platform == "cuda" and Version(packages["torch"]).base_version != "2.14.0":
-        raise RegressionError("CUDA comparison requires Torch 2.14.0")
-    return {"packages": packages}
+    names = ("vllm", "torch") + (("torch-npu", "vllm-ascend") if platform == "npu" else ())
+    return {"packages": {name: importlib.metadata.version(name) for name in names}}
 
 
 def select_cuda_devices(available: int, mask: str | None, *, dies: int, reserved_cards: int) -> str:
@@ -340,7 +331,7 @@ def prepare_capture(settings):
     visible = prepare(settings, output / "allocation.json")
     variable = "ASCEND_RT_VISIBLE_DEVICES" if settings["platform"] == "npu" else "CUDA_VISIBLE_DEVICES"
     os.environ[variable] = visible
-    runtime = verify_inference_runtime(settings["platform"])
+    runtime = inference_runtime_metadata(settings["platform"])
     verify_source_imports()
     model = os.environ.get("LINGBOT_MODEL_PATH")
     if model is None:

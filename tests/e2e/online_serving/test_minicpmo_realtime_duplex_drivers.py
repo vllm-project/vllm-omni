@@ -2526,7 +2526,7 @@ def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
             assert wf.readframes(wf.getnframes()) == expected
 
 
-def test_realtime_duplex_demo_replay_tail_window_bounds():
+def test_realtime_duplex_demo_replay_tail_window_bounds(monkeypatch):
     """A tiny positive duration must skip the replay instead of slicing [-0:]."""
     demo = _load_example_demo_module()
     window = demo._replay_tail_window
@@ -2544,6 +2544,17 @@ def test_realtime_duplex_demo_replay_tail_window_bounds():
     assert window(2_880_000, 0, 0.3, 16_000, 1) == (4_800, 0)
     # Durations shorter than one audio sample are skipped as well.
     assert window(2_880_000, 0, 1e-5, 16_000, 1) is None
+    # Start both tracks at frame 14 (14 s), rather than pairing 14.8 s audio with frame 16.
+    assert window(291_200, 19, 3.4, 16_000, 1) == (67_200, 5)
+    assert window(291_200, 37, 3.4, 16_000, 2) == (59_200, 8)
+    assert window(291_200, 0, 3.4, 16_000, 1) == (54_400, 0)
+    assert window(291_200, 19, 1e308, 16_000, 1) == (291_200, 19)
+    for value in (float("inf"), float("-inf"), float("nan")):
+        assert window(291_200, 19, value, 16_000, 1) is None
+        monkeypatch.setattr(sys, "argv", ["demo", "--input-wav", "input.wav", f"--post-commit-replay-seconds={value}"])
+        with pytest.raises(SystemExit) as exc:
+            demo.parse_args()
+        assert exc.value.code == 2
 
 
 @pytest.mark.parametrize(
