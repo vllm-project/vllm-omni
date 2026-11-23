@@ -205,7 +205,7 @@ def run(
         rows = plan.image_query_blocks
         if image_sparsity > 0 and rows.numel():
             for columns in plan.image_groups:
-                values = scores[..., rows[:, None], columns[None, :]]
+                values = scores.index_select(-2, rows).index_select(-1, columns)
                 keep = max(1, math.ceil(columns.numel() * (1 - image_sparsity)))
                 selected = values.topk(keep, dim=-1).indices
                 mask[..., rows[:, None], columns[None, :]] = torch.zeros_like(values, dtype=torch.bool).scatter_(
