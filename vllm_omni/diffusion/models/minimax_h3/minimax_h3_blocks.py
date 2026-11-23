@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +49,7 @@ from .vdnh3 import VDNConfig, VDNH3HybridAttention
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+    from .adaln_plan import MiniMaxH3AdalnPlan
     from .reference_isolation import MiniMaxH3ReferenceIsolation
     from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
@@ -737,24 +738,42 @@ class MiniMaxH3AdalnProj(nn.Module):
             self._weight_stager = PinnedModuleStager(self.linear, device, cache_retention=BoundedAllocatorCache(device))
             self._host_signature = self._offload_signature()
 
+    @contextmanager
+    def _staged_weight(self):
+        """Device weights for the calls inside: staged from the host when AdaLN weights are offloaded."""
+        if self._weight_stager is None:
+            yield
+            return
+        self._weight_stager.load()
+        try:
+            yield
+        finally:
+            self._weight_stager.offload()
+
     def _project(self, t_emb: torch.Tensor) -> torch.Tensor:
         self._prepare_weight_stager(t_emb.device)
 
         def project() -> torch.Tensor:
             x = nn.functional.silu(t_emb)
-            if self._weight_stager is None:
+            with self._staged_weight():
                 return self.linear(x.to(_BF16_DTYPE))[0]
-            self._weight_stager.load()
-            try:
-                return self.linear(x.to(_BF16_DTYPE))[0]
-            finally:
-                self._weight_stager.offload()
 
         return (
             project()
             if self._adaln_cache is None
             else self._adaln_cache.project(self._cache_name, self.linear, t_emb, project)
         )
+
+    def _project_and_plan(self, t_emb: torch.Tensor, plan: MiniMaxH3AdalnPlan) -> torch.Tensor:
+        """This forward's per-step projection, plus the request's table from the same weight in one staging."""
+        self._prepare_weight_stager(t_emb.device)
+        x = nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        rows = plan.rows()
+        with self._staged_weight():
+            per_step = self.linear(x)[0]
+            table = self.linear(rows.reshape(-1, rows.shape[-1]))[0].view(rows.shape[0], rows.shape[1], -1)
+        plan.record(self, table, per_step)
+        return per_step
 
     @torch.compiler.disable
     def _project_cached(self, t_emb: torch.Tensor) -> torch.Tensor:
@@ -766,6 +785,9 @@ class MiniMaxH3AdalnProj(nn.Module):
             planned = plan.lookup(self)
             if planned is not None:
                 return planned
+            if plan.wants(self):
+                # Built here, inside the block's forward, so an offloaded weight is staged or materialized.
+                return self._project_and_plan(t_emb, plan)
         return self._project(t_emb)
 
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:

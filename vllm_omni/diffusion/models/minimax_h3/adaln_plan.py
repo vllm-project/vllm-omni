@@ -3,21 +3,29 @@
 """Request-level AdaLN projections for MiniMax-H3.
 
 Each block's ``adaln_proj`` applies a ~520 MB weight to a handful of timestep
-rows, so computing it every denoising step streams the whole weight from HBM
-once per step. A request's per-step timestep sets follow from its sigma
-schedule, so one call per block over all steps' rows reads each weight once.
+rows, so computing it every denoising step reads the whole weight once per
+step: from HBM when it is resident, over PCIe when it lives on the host
+(``minimax_h3_adaln_offload``) or is streamed by layerwise offload. A request's
+per-step timestep sets follow from its sigma schedule, so one call per block
+over all steps' rows reads each weight once per request.
+
+A projection's table is built inside the first planned forward that reaches
+it, where its weight is available exactly as the per-step call sees it
+(resident, staged from the host, or materialized by an offload hook). That
+forward returns its own per-step result; the table row for its step is compared
+with that result, and at the next forward one readback keeps the tables that
+match bit for bit and drops the rest.
 
 Results are keyed by host-side scalars the sampler already has (branch and the
-step's video/audio/condition timesteps), so a forward reads nothing back from
+step's video/audio/condition timesteps), so a lookup reads nothing back from
 the device. A forward that was not planned (another solver's intermediate
 point, a latent edit, a packed multi-request batch), or whose embedding was
-transformed before AdaLN, falls back to the per-step call. Each projection's batched result is compared with a
-per-step call when the plan is built and only bit-identical groups are kept.
+transformed before AdaLN, falls back to the per-step call.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 
 import torch
 from torch import nn
@@ -35,7 +43,6 @@ def projection_plan_safe(proj: nn.Module) -> bool:
     return (
         not isinstance(linear, BaseLayerWithLoRA)
         and type(getattr(linear, "quant_method", None)) is UnquantizedLinearMethod
-        and not getattr(proj, "_offload_weights", False)
         and not linear._forward_hooks
         and not linear._forward_pre_hooks
         and get_tensor_model_parallel_world_size() == 1
@@ -53,18 +60,21 @@ class MiniMaxH3AdalnPlan:
     def __init__(
         self,
         time_embedder: Callable[[torch.Tensor], torch.Tensor],
-        projs: Iterable[nn.Module],
         steps: Sequence[tuple[Hashable, torch.Tensor]],
         *,
         safe: Callable[[nn.Module], bool] = projection_plan_safe,
     ) -> None:
         """``steps``: (step key, that forward's unique timesteps) for every planned forward."""
         self.hits = self.misses = 0
+        self._safe = safe
         self._key: Hashable | None = None
         self._entry: tuple[int, int] | None = None
         # step key -> (row count M, index in that M's table)
         self._index: dict[Hashable, tuple[int, int]] = {}
         self._tables: dict[int, dict[int, torch.Tensor]] = {}  # id(proj) -> M -> [steps, M, out]
+        # (id(proj), M) -> (table, whether its row matched that forward's per-step result), until checked
+        self._pending: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._built: set[tuple[int, int]] = set()
         groups: dict[int, list[torch.Tensor]] = {}
         embed_dtypes = set()
         for key, unique in steps:
@@ -79,20 +89,8 @@ class MiniMaxH3AdalnPlan:
             embed_dtypes.add(t_emb.dtype)
             rows.append(nn.functional.silu(t_emb).to(_BF16_DTYPE))
         self.embed_dtype = embed_dtypes.pop() if len(embed_dtypes) == 1 else None
-        inputs = {m: torch.stack(rows) for m, rows in groups.items()}
-        candidates = []
-        for proj in projs:
-            if not safe(proj):
-                continue
-            for m, x in inputs.items():
-                table = proj.linear(x.reshape(-1, x.shape[-1]))[0].view(x.shape[0], m, -1)
-                per_step = proj.linear(x[0])[0]
-                candidates.append((proj, m, table, (table[0] == per_step).all()))
-        # One readback per request decides which (projection, M) tables are kept.
-        same = torch.stack([c[3] for c in candidates]).tolist() if candidates else []
-        for (proj, m, table, _), keep in zip(candidates, same, strict=True):
-            if keep:
-                self._tables.setdefault(id(proj), {})[m] = table
+        # M -> [steps, M, t_dim] BF16 projection inputs, as the per-step call computes them
+        self._inputs = {m: torch.stack(rows) for m, rows in groups.items()}
 
     @property
     def planned_steps(self) -> int:
@@ -104,7 +102,10 @@ class MiniMaxH3AdalnPlan:
 
     def bind(self, t_emb: torch.Tensor) -> None:
         """Bind lookups to this forward. Only host metadata is checked: the embedding's dtype (changed by the
-        control branch) and row count must match the planned step. The selected key is consumed."""
+        control branch) and row count must match the planned step. The selected key is consumed. Tables built
+        by earlier forwards are checked here, with one readback."""
+        if self._pending:
+            self._check_pending()
         entry = self._index.get(self._key) if self._key is not None else None
         self._key = None
         valid = entry is not None and t_emb.dtype == self.embed_dtype and t_emb.shape[0] == entry[0]
@@ -118,6 +119,30 @@ class MiniMaxH3AdalnPlan:
             return None
         self.hits += 1
         return table[entry[1]]
+
+    def wants(self, proj: nn.Module) -> bool:
+        """Whether this forward should build ``proj``'s table for its row count (once per request)."""
+        entry = self._entry
+        return entry is not None and (id(proj), entry[0]) not in self._built and self._safe(proj)
+
+    def rows(self) -> torch.Tensor:
+        """Every planned step's projection inputs for this forward's row count: [steps, M, t_dim]."""
+        assert self._entry is not None
+        return self._inputs[self._entry[0]]
+
+    def record(self, proj: nn.Module, table: torch.Tensor, per_step: torch.Tensor) -> None:
+        """Keep ``table`` ([steps, M, out]) pending a check of this forward's row against ``per_step``."""
+        assert self._entry is not None
+        m, index = self._entry
+        self._built.add((id(proj), m))
+        self._pending[(id(proj), m)] = (table, (table[index] == per_step).all())
+
+    def _check_pending(self) -> None:
+        pending, self._pending = self._pending, {}
+        same = torch.stack([flag for _, flag in pending.values()]).tolist()
+        for ((proj_id, m), (table, _)), keep in zip(pending.items(), same, strict=True):
+            if keep:
+                self._tables.setdefault(proj_id, {})[m] = table
 
 
 def build_adaln_plan(
@@ -146,11 +171,7 @@ def build_adaln_plan(
                 audio_ref_cond_timestep=cond[1],
             )
             steps.append((adaln_step_key(branch, times, cond), torch.unique(timesteps, sorted=True)))
-        projs = [block.adaln_proj for block in model.blocks]
-        final_layer = getattr(model, "final_layer", None)
-        if final_layer is not None:
-            projs.append(final_layer.adaln_proj)
-        return MiniMaxH3AdalnPlan(model.time_embedder, projs, steps)
+        return MiniMaxH3AdalnPlan(model.time_embedder, steps)
 
 
 __all__ = ["MiniMaxH3AdalnPlan", "adaln_step_key", "build_adaln_plan", "projection_plan_safe"]
