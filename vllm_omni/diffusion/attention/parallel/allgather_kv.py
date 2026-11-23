@@ -106,7 +106,100 @@ class AllGatherKVParallelAttention:
             query_global_offset=query_global_offset,
         )
 
+        attn_metadata = self._prepare_attn_mask(attn_metadata, k_full)
+
         return q_local, k_full, v_full, attn_metadata, _AllGatherKVCtx(name=self.name)
+
+    def _prepare_attn_mask(
+        self, attn_metadata: AttentionMetadata | None, key: torch.Tensor
+    ) -> AttentionMetadata | None:
+        if attn_metadata is None:
+            return None
+        if attn_metadata.joint_attn_mask is None:
+            joint_key, mask = attn_metadata.joint_key, attn_metadata.attn_mask
+            if joint_key is None or mask is None:
+                return attn_metadata
+            # Only an image-only key mask needs extension. Full key masks and
+            # pair masks already describe the final layout; leave them alone.
+            image_shape = (key.shape[0], key.shape[1] - joint_key.shape[1])
+            if tuple(mask.shape) != image_shape:
+                return attn_metadata
+        return self._merge_joint_attn_mask(attn_metadata, key)
+
+    @staticmethod
+    def _merge_joint_attn_mask(attn_metadata: AttentionMetadata | None, key: torch.Tensor) -> AttentionMetadata | None:
+        """Own all 2D key-mask handling against the final, post-gather keys.
+
+        For 2D key masks, True-fill the missing side and concatenate in
+        ``joint_strategy`` order. Size the joint side from ``joint_key``
+        because ``joint_query`` can be empty during cached-KV reuse. A provided
+        image mask must cover the gathered global image keys.
+
+        4D masks are handled by AllGather query-range slicing; combining one
+        with a 2D joint mask fails closed instead of merging the two.
+        """
+        if attn_metadata is None:
+            return attn_metadata
+        joint_mask = attn_metadata.joint_attn_mask
+        img_mask = attn_metadata.attn_mask
+        if joint_mask is None and img_mask is None:
+            return attn_metadata
+
+        # Rank check first: the merge only combines 2D masks (an absent side
+        # counts as 2D -- it gets True-filled below).
+        joint_rank = joint_mask.ndim if joint_mask is not None else 2
+        img_rank = img_mask.ndim if img_mask is not None else 2
+        if joint_rank != 2:
+            raise NotImplementedError(f"AllGather-KV only supports a 2D joint_attn_mask (got ndim={joint_rank}).")
+        if img_rank == 4:
+            if joint_mask is not None:
+                raise NotImplementedError(
+                    "AllGather-KV cannot merge a 2D joint_attn_mask with a 4D "
+                    "attn_mask: move the padding into a single mask, or set allgather_degree=1."
+                )
+            return attn_metadata
+        if img_rank != 2:
+            raise NotImplementedError(f"AllGather-KV only supports 2D or 4D attn_mask (got ndim={img_rank}).")
+
+        joint_k = attn_metadata.joint_key
+        if joint_mask is not None and joint_k is None:
+            raise ValueError(
+                "AllGather-KV got a joint_attn_mask without joint K/V: "
+                "the mask describes joint keys that would never be gathered."
+            )
+
+        batch = key.shape[0]
+        joint_len = joint_k.shape[1] if joint_k is not None else 0
+        img_len = key.shape[1] - joint_len
+        if img_mask is not None and tuple(img_mask.shape) != (batch, img_len):
+            raise ValueError(
+                "AllGather-KV expects a 2D attn_mask covering the gathered "
+                f"global image keys [batch={batch}, keys={img_len}], got {tuple(img_mask.shape)}."
+            )
+        if joint_mask is not None and tuple(joint_mask.shape) != (batch, joint_len):
+            raise ValueError(
+                "AllGather-KV got a joint_attn_mask inconsistent with the joint "
+                f"keys: expected [batch={batch}, keys={joint_len}], got {tuple(joint_mask.shape)}."
+            )
+
+        if joint_len == 0:
+            # No joint keys: the image mask already covers every key.
+            assert img_mask is not None
+            attn_metadata.attn_mask = img_mask.bool().contiguous()
+            return attn_metadata
+
+        if joint_mask is None:
+            joint_mask = torch.ones(batch, joint_len, dtype=torch.bool, device=key.device)
+        if img_mask is None:
+            img_mask = torch.ones(batch, img_len, dtype=torch.bool, device=key.device)
+        joint_strategy = attn_metadata.joint_strategy or "front"
+        merged = (
+            torch.cat([joint_mask, img_mask], dim=1)
+            if joint_strategy == "front"
+            else torch.cat([img_mask, joint_mask], dim=1)
+        )
+        attn_metadata.attn_mask = merged.bool().contiguous()
+        return attn_metadata
 
     def _remap_packed_query_metadata(
         self,
