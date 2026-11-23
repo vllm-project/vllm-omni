@@ -211,27 +211,16 @@ class _MockAllGatherSPGroup:
 
 def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
     from vllm_omni.diffusion.attention.backends import flash_attn_hub
-    from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 
-    device = current_omni_platform.get_torch_device(rank)
-    current_omni_platform.set_device(device)
-    torch.distributed.init_process_group("nccl", rank=rank, world_size=2, init_method=init_method)
+    init_distributed_environment(world_size=2, rank=rank, distributed_init_method=init_method)
     try:
-        singletons = [torch.distributed.new_group([i]) for i in range(2)]
-        group = SequenceParallelGroupCoordinator(
-            [[0, 1]],
-            rank,
-            "nccl",
-            ulysses_group=singletons[rank],
-            ring_group=singletons[rank],
-            allgather_group=torch.distributed.group.WORLD,
-        )
-        strategy = AllGatherKVParallelAttention(group)
+        initialize_model_parallel(sequence_parallel_size=2, allgather_degree=2)
+        strategy = AllGatherKVParallelAttention(parallel_state.get_sp_group())
         impl = getattr(flash_attn_hub, backend)(num_heads=1, head_size=64, softmax_scale=0.125)
-        query = torch.zeros(2, 2, 1, 64, device=device, dtype=torch.bfloat16)
+        query = torch.zeros(2, 2, 1, 64, device=current_omni_platform.get_torch_device(rank), dtype=torch.bfloat16)
+        device = query.device
         joint = torch.zeros(2, 4, 1, 64, device=device, dtype=query.dtype)
         joint_mask = torch.tensor([[True, True, True, False], [True, False, False, False]], device=device)
-        local_image_mask = torch.ones(query.shape[:2], dtype=torch.bool, device=device)
         for joint_strategy in ("front", "rear"):
             metadata = AttentionMetadata(
                 joint_attn_mask=joint_mask,
@@ -242,12 +231,8 @@ def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
             )
             q, k, v, metadata, _ = strategy.pre_attention(query, query, torch.ones_like(query), metadata)
             output = impl.forward_cuda(q, k, v, metadata)
-            valid_queries = torch.cat(
-                [joint_mask, local_image_mask] if joint_strategy == "front" else [local_image_mask, joint_mask],
-                dim=1,
-            )
             # Every valid value is one and every padding value zero.
-            torch.testing.assert_close(output[valid_queries], torch.ones_like(output[valid_queries]))
+            torch.testing.assert_close(output, torch.ones_like(output))
             # Equal Q/K lengths retain the existing query-padding behavior.
             square_output = impl.forward_cuda(k, k, v, metadata)
             torch.testing.assert_close(
@@ -255,7 +240,7 @@ def _joint_mask_hub_worker(rank: int, backend: str, init_method: str):
             )
             assert torch.count_nonzero(square_output[~metadata.attn_mask]) == 0
     finally:
-        torch.distributed.destroy_process_group()
+        destroy_distributed_env()
 
 
 @pytest.mark.parametrize(
