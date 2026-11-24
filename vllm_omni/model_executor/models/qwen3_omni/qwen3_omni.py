@@ -300,7 +300,28 @@ class Qwen3OmniMoeForConditionalGeneration(
             if spec_config is not None:
                 if spec_config.method in ("eagle3", "extract_hidden_states"):
                     raise ValueError("Qwen3-Omni auxiliary hidden-state speculation only supports DFlash")
+                if self.is_staged_run and getattr(vllm_config.model_config, "async_chunk", False):
+                    # Other methods would reach the Talker as multi-row decode
+                    # chunks, which the async-chunk processor drops.
+                    if not (spec_config.use_dflash() or spec_config.method == "ngram_gpu"):
+                        raise ValueError(
+                            "Qwen3-Omni async_chunk speech supports only DFlash and ngram_gpu speculation, "
+                            f"got method={spec_config.method!r}; disable async_chunk or use a supported method"
+                        )
+                    if (
+                        spec_config.method == "ngram_gpu"
+                        and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex"
+                    ):
+                        raise ValueError(
+                            "Qwen3-Omni ngram_gpu with async_chunk does not support session_mode=duplex; "
+                            "use session_mode=turn or disable speculation"
+                        )
                 if spec_config.use_dflash():
+                    if getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
+                        raise ValueError(
+                            "Qwen3-Omni DFlash does not support session_mode=duplex; "
+                            "use session_mode=turn or disable DFlash"
+                        )
                     if vllm_config.parallel_config.pipeline_parallel_size > 1:
                         raise ValueError(
                             "Qwen3-Omni DFlash requires pipeline_parallel_size=1; "
@@ -390,11 +411,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             # Codebook 0 uses V1's per-request CUDA generator (see
             # Qwen3OmniTalkerSampler). Residual codebooks receive their own
-            # request-local generator through get_mtp_seed. Keep the external
-            # uniform buffer disabled: explicit generators bypass the outer MTP
-            # graph while the predictor's inner graphs remain available, and
-            # switching to whole-span uniforms would change the sampling stream.
-            self.mtp_sample_uniforms = False
+            # request-local generator through get_mtp_seed. Feed their noise
+            # through a static tensor so seeded requests can still replay the
+            # whole-MTP graph. Preserve the eager predictor's per-step draw
+            # shapes so enabling that graph does not change any RNG stream.
+            self.mtp_sample_uniforms = True
+            self.mtp_sample_uniforms_preserve_eager_stream = True
             self.mrv2_custom_sampler = mrv2_talker_sampler
             self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
             self.mtp_sample_vocab_size = self._codec_codebook_size
@@ -517,6 +539,10 @@ class Qwen3OmniMoeForConditionalGeneration(
     @property
     def mtp_output_key(self) -> tuple[str, str]:
         return getattr(self, "talker_mtp_output_key", ("codes", "audio"))
+
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return bool(getattr(self, "talker_mtp_accepts_per_row_generators", False))
 
     @property
     def mtp_graph_safe(self) -> bool:
@@ -1399,6 +1425,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         except Exception:
             pass
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
+        if meta.get("resumable") and meta.get("decode_span") and start_index == 0:
+            # The first prefill step starts a fresh text queue for this segment.
+            embed = {**embed, "cached_decode": None}
+            update_dict.setdefault("embed", {})["cached_decode"] = None
+            update_dict.setdefault("meta", {})["eos_emitted"] = False
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
@@ -1550,8 +1581,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         use_v2_model_runner = getattr(self.vllm_config.model_config, "use_v2_model_runner", False)
         queue_started = meta.get("decode_span_queue_started", False)
         queued_decode = use_v2_model_runner or meta.get("decode_span", False) or queue_started
-        if queued_decode and not meta.get("resumable", False):
-            if not use_v2_model_runner and not queue_started:
+        resumable = meta.get("resumable", False)
+        if queued_decode and (not resumable or meta.get("decode_span", False)):
+            if not resumable and not use_v2_model_runner and not queue_started:
                 # MRv1's indexed cache retains consumed rows. Convert it to a
                 # pending-only queue once, when the first speculative span
                 # arrives; later chunks must not trim the pending rows again.

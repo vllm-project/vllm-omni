@@ -749,7 +749,10 @@ Its inputs are token IDs, embeddings, previous hidden states and per-row
 conditioning; it returns updated embeddings and prediction codes. Models may
 supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local explicit seeds, and declare
 `mtp_accepts_per_row_generators`, `mtp_accepts_req_infos`, or `mtp_sample_uniforms`
-(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
+(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. A model whose
+buffered noise must preserve eager per-step RNG call shapes can also declare
+`mtp_sample_uniforms_preserve_eager_stream`; graph-padding rows then use a
+constant and do not advance any generator. Qwen3-TTS retains
 its existing `talker_mtp` entry point for V1.
 
 ### Selecting one or two Qwen3-TTS stages
