@@ -93,18 +93,42 @@ def test_installer_is_scoped_and_preserves_overrides(monkeypatch):
         assert torch.equal(model.encoder[0](x), original(x))
 
 
-@pytest.mark.parametrize("spatial", [(1, 1), (3, 5), (8, 9)])
-def test_reduction_preserves_causal_padding_math(spatial, monkeypatch):
-    conv = nn.Conv3d(4, 8, 3, padding=1).eval()
-    conv.pad_mode = "constant"
+def _checkpoint_causal_conv(conv: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
+    # Mirrors BaseConv3d.forward for T=1 in the public checkpoint source
+    # (MiniMaxAI/MiniMax-H3@42ed227, Ref2VA/video_vae/conv.py): spatial
+    # padding first, then K_t - 1 zero frames before the single frame.
+    ph, pw = conv.padding[1:]
+    x = F.pad(x, (pw, pw, ph, ph, 0, 0), mode=conv.pad_mode)
+    x = torch.cat([x.new_zeros(*x.shape[:2], conv.kernel_size[0] - 1, *x.shape[3:]), x], dim=2)
+    return F.conv3d(x, conv.weight, conv.bias, conv.stride)
+
+
+# padding/stride pairs used by the checkpoint encoder (vae_cnn.py): ResNet and
+# conv_in/conv_out use padding=1; the downsample conv uses padding=(1, 0, 0)
+# with a spatial stride.
+@pytest.mark.parametrize(("padding", "stride"), [(1, 1), ((1, 0, 0), (1, 2, 2))])
+@pytest.mark.parametrize("pad_mode", ["constant", "reflect", "replicate"])
+@pytest.mark.parametrize("spatial", [(3, 5), (8, 9)])
+def test_reduction_matches_checkpoint_causal_conv(padding, stride, pad_mode, spatial, monkeypatch):
+    conv = nn.Conv3d(4, 8, 3, padding=padding, stride=stride).eval()
+    conv.pad_mode = pad_mode
     with torch.no_grad():
-        conv.weight.fill_(0.125)
-        conv.bias.fill_(0.25)
-    x = torch.arange(4 * spatial[0] * spatial[1], dtype=torch.float32).view(1, 4, 1, *spatial)
-    expected = F.conv3d(F.pad(x, (1, 1, 1, 1, 2, 0)), conv.weight, conv.bias)
+        # Small integers keep every sum exact in FP32. Each temporal slice
+        # gets a different scale, so selecting the wrong slice changes the
+        # result instead of matching by construction.
+        base = (torch.arange(conv.weight[:, :, 0].numel()) % 7 - 3).view_as(conv.weight[:, :, 0]).float()
+        for t, scale in enumerate((1.0, 16.0, 256.0)):
+            conv.weight[:, :, t] = base * scale
+        conv.bias.copy_(torch.arange(8, dtype=torch.float32))
+    x = (torch.arange(4 * spatial[0] * spatial[1]) % 5 - 2).float().view(1, 4, 1, *spatial)
+    expected = _checkpoint_causal_conv(conv, x)
     monkeypatch.setattr(ops, "_eligible", lambda *_: True)
     actual = ops._forward(conv, x)
+    assert actual.shape == expected.shape
     assert torch.equal(actual, expected)
+    with torch.no_grad():
+        conv.weight[:, :, -1] = conv.weight[:, :, 0]
+    assert not torch.equal(ops._forward(conv, x), expected)
 
 
 def _cached_model(monkeypatch):
@@ -176,15 +200,43 @@ def test_unversioned_weights_never_reuse_cache(monkeypatch):
         assert model.encoder._omni_image_conv_weight is None
 
 
-def test_stream_change_and_unknown_stream_invalidate(monkeypatch):
+class _Stream:
+    def __init__(self, handle):
+        if handle is not None:
+            self.npu_stream = handle
+
+
+class _Backend:
+    def __init__(self):
+        self.stream = _Stream("A")
+        self.devices = []
+
+    def current_stream(self, device):
+        self.devices.append(device)
+        return self.stream
+
+
+def test_stream_switch_rebuilds_and_unknown_stream_skips_cache(monkeypatch):
+    # Meta weights take the device-stream branch of _weight_key on CPU hosts.
     model = _cached_model(monkeypatch)
-    conv = model.encoder
-    original = ops._weight_key
-    first = ops._weight(conv)
-    monkeypatch.setattr(ops, "_weight_key", lambda w: (*original(w), "other-stream"))
-    assert ops._weight(conv) is not first
-    monkeypatch.setattr(ops, "_weight_key", lambda w: None)
-    ops._weight(conv)
+    conv = model.encoder.to("meta")
+    backend = _Backend()
+    monkeypatch.setattr(torch, "get_device_module", lambda device: backend)
+
+    def weight_on(handle):
+        backend.stream = _Stream(handle)
+        return ops._weight(conv)
+
+    a1 = weight_on("A")
+    assert weight_on("A") is a1
+    b = weight_on("B")
+    assert b is not a1
+    a2 = weight_on("A")
+    assert a2 is not a1 and a2 is not b
+    assert conv._omni_image_conv_weight[1][-1] == "A"
+    assert backend.devices and all(device == conv.weight.device for device in backend.devices)
+    # A stream without a native handle cannot order reuse, so never cache.
+    weight_on(None)
     assert conv._omni_image_conv_weight is None
 
 
