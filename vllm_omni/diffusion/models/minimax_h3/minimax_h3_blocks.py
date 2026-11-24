@@ -631,7 +631,7 @@ class MiniMaxH3MLP(nn.Module):
         fc1 = self.fc1
         return (
             not isinstance(fc1, BaseLayerWithLoRA)
-            and type(fc1.quant_method) is UnquantizedLinearMethod
+            and type(getattr(fc1, "quant_method", None)) is UnquantizedLinearMethod
             and fc1.bias is None
             and fc1_swiglu_supported(x, fc1.weight)
         )
