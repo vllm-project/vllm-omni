@@ -593,11 +593,13 @@ def _prepare_diffusion_quant_config(
 
 
 def validate_text_encoder_vision_sp_support(od_config: OmniDiffusionConfig, model_class: type[nn.Module]) -> None:
-    """Require each concrete pipeline to opt in to vision SP explicitly."""
-    if od_config.parallel_config.text_encoder_vision_sp_size != 1 and not model_class.__dict__.get(
-        "supports_text_encoder_vision_sp", False
-    ):
+    """Restrict vision SP to opted-in pipelines on Ascend NPU."""
+    if od_config.parallel_config.text_encoder_vision_sp_size == 1:
+        return
+    if not model_class.__dict__.get("supports_text_encoder_vision_sp", False):
         raise ValueError(f"{model_class.__name__} does not support text_encoder_vision_sp_size > 1")
+    if not current_omni_platform.is_npu():
+        raise ValueError("text_encoder_vision_sp_size > 1 requires Ascend NPU")
 
 
 def initialize_model(

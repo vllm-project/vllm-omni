@@ -223,7 +223,8 @@ remaining flags stay unchanged.
 
 #### Qwen3-VL vision sequence parallelism
 
-MiniMax-H3 vision SP on Ascend NPU reuses the local text encoder's TP group.
+Vision SP is available only for the MiniMax-H3 video pipeline on Ascend NPU.
+It reuses the local text encoder's TP group.
 It is independent of DiT `--usp` / `--ring` and adds no devices.
 
 Append `--text-encoder-vision-sp-size 8` to the TP8 serving command above.

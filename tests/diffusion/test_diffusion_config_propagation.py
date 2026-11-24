@@ -46,6 +46,13 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
 
+def test_vision_sp_preserves_positional_vae_parallel_mode():
+    config = DiffusionParallelConfig(1, None, 1, False, None, 1, 1, 1, "strict", False, 1, 1, 1, "batch")
+
+    assert config.vae_parallel_mode == "batch"
+    assert config.text_encoder_vision_sp_size == 1
+
+
 def test_direct_config_extras_are_independent_dicts():
     first = OmniDiffusionConfig(model="test-model")
     second = OmniDiffusionConfig(model="test-model")

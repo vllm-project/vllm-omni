@@ -327,7 +327,7 @@ class DiffusionParallelConfig:
       (world size / data_parallel_size).
     """
 
-    text_encoder_vision_sp_size: int = 1
+    text_encoder_vision_sp_size: int = field(default=1, kw_only=True)
     """MiniMax-H3-only vision SP: 1 (replicated), or 2/4/8 matching text encoder TP.
 
     Reuses the encoder TP group without increasing the DiT world size.

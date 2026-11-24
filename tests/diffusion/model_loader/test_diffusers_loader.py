@@ -996,6 +996,8 @@ def test_initialize_model_sets_current_diffusion_config_during_model_constructio
     )
     monkeypatch.setattr(registry_mod, "_apply_sequence_parallel_if_enabled", lambda *_args, **_kwargs: None)
 
+    monkeypatch.setattr(registry_mod.current_omni_platform, "is_npu", lambda: vision_sp_size != 1)
+
     model = initialize_model(od_config)
 
     assert model.captured_config is od_config
@@ -1022,6 +1024,41 @@ def test_initialize_model_rejects_unsupported_vision_sp_before_construction(monk
     )
     with pytest.raises(ValueError, match="does not support text_encoder_vision_sp_size"):
         initialize_model(od_config)
+
+
+def test_initialize_model_rejects_vision_sp_on_non_ascend_before_construction(monkeypatch):
+    import vllm_omni.diffusion.registry as registry_mod
+
+    class OptedInModel(nn.Module):
+        supports_text_encoder_vision_sp = True
+
+        def __init__(self, **kwargs):
+            raise AssertionError("vision SP on non-Ascend must be rejected before construction")
+
+    od_config = _loader_config(
+        model_class_name="OptedInModel",
+        parallel_config=DiffusionParallelConfig(text_encoder_tp_size=4, text_encoder_vision_sp_size=4),
+    )
+    monkeypatch.setattr(registry_mod.current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(
+        registry_mod.DiffusionModelRegistry,
+        "_try_load_model_cls",
+        staticmethod(lambda _name: OptedInModel),
+    )
+    with pytest.raises(ValueError, match="requires Ascend NPU"):
+        initialize_model(od_config)
+
+
+def test_minimax_h3_image_does_not_opt_in_to_vision_sp(monkeypatch):
+    import vllm_omni.diffusion.registry as registry_mod
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_image import MiniMaxH3ImagePipeline
+
+    od_config = _loader_config(
+        parallel_config=DiffusionParallelConfig(text_encoder_tp_size=4, text_encoder_vision_sp_size=4),
+    )
+    monkeypatch.setattr(registry_mod.current_omni_platform, "is_npu", lambda: True)
+    with pytest.raises(ValueError, match="MiniMaxH3ImagePipeline does not support"):
+        registry_mod.validate_text_encoder_vision_sp_support(od_config, MiniMaxH3ImagePipeline)
 
 
 def test_initialize_model_requires_concrete_vision_sp_opt_in(monkeypatch):
