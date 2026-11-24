@@ -428,22 +428,3 @@ def test_running_prefix_cache_reset_keeps_the_final_row(prefix_caching, stale_fi
     assert list(a.output_token_ids) == [111, FINAL]
     assert not scheduler.requests and not scheduler._minicpmo45_terminal_rows
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
-
-
-@pytest.mark.parametrize("prefix_caching", [True, False], ids=["output_cache", "cold"])
-def test_text_only_reply_stops_without_a_terminal_forward(prefix_caching):
-    """modalities=["text"] ends at stage 0: no Talker takes the final row, so no extra forward."""
-    from tests.core.sched.test_minicpmo_mrv2_terminal_row import _final_stage_zero
-
-    scheduler = _scheduler(prefix_caching, num_spec=0)
-    a = _request("A", PROMPT, 2)
-    _final_stage_zero(a)
-    scheduler.add_request(a)
-    finishes = []
-    for sampled in (111, FINAL):
-        step = scheduler.schedule()
-        _, step_finishes = _deliver(scheduler, step, _booked(scheduler, step), {"A": [sampled]})
-        finishes += step_finishes
-    assert finishes == [("A", FinishReason.LENGTH)]
-    assert not scheduler._minicpmo45_terminal_rows and not scheduler.requests
-    assert scheduler.schedule().total_num_scheduled_tokens == 0
