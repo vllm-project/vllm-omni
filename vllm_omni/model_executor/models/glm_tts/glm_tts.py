@@ -269,9 +269,10 @@ def _glm_tts_mrv2_sample(
     ranks = torch.arange(vocab, device=weighted_scores.device).unsqueeze(0)
     top_k_keep = (top_k.unsqueeze(1) <= 0) | (ranks < top_k.unsqueeze(1))
     top_k_scores = sorted_scores.masked_fill(~top_k_keep, float("-inf"))
-    # Match the existing V1 GLM-TTS helper: normalize over the top-k subset,
-    # then apply top-p to that truncated distribution.
-    sorted_probs = top_k_scores.softmax(dim=1)
+    # Official GLM-TTS normalizes over the full eligible vocabulary, then
+    # applies top-p and caps the retained prefix at top-k. Normalizing the
+    # top-k subset would make it sum to one too early and narrow the sampler.
+    sorted_probs = (top_k_scores - torch.logsumexp(sorted_scores, dim=1, keepdim=True)).exp()
     keep = (sorted_probs.cumsum(dim=1) - sorted_probs) < top_p.unsqueeze(1)
     keep &= top_k_keep
     nucleus = top_k_scores.masked_fill(~keep, float("-inf"))

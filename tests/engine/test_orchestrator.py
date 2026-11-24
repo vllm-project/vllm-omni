@@ -5028,17 +5028,30 @@ def test_diffusion_params_carry_the_sample_count(n: int, per_sample_kv: bool, co
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("resumable", "model_type", "method", "accepted"),
+    ("resumable", "model_type", "method", "final_stage_id", "async_chunk", "runner", "accepted"),
     [
-        (True, "qwen3_omni_moe", "dflash", False),
-        (False, "qwen3_omni_moe", "dflash", True),
-        (True, "qwen3_omni_moe", None, True),
-        (True, "qwen3_omni_moe", "mtp", True),
-        (True, "other_model", "dflash", True),
+        (True, "qwen3_omni_moe", "dflash", 1, False, "v1", False),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v1", True),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v2-scheduler", True),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v2-native", True),
+        (True, "qwen3_omni_moe", "dflash", 1, True, "v2-mixed", False),
+        (True, "qwen3_omni_moe", "dflash", 0, False, "v1", True),
+        (False, "qwen3_omni_moe", "dflash", 1, False, "v1", True),
+        (True, "qwen3_omni_moe", None, 1, False, "v1", True),
+        (True, "qwen3_omni_moe", "mtp", 1, False, "v1", True),
+        (True, "other_model", "dflash", 1, False, "v1", True),
     ],
 )
-async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
-    mocker, tmp_path, resumable: bool, model_type: str, method: str | None, accepted: bool
+async def test_qwen3_omni_dflash_resumable_admission(
+    mocker,
+    tmp_path,
+    resumable: bool,
+    model_type: str,
+    method: str | None,
+    final_stage_id: int,
+    async_chunk: bool,
+    runner: str,
+    accepted: bool,
 ) -> None:
     artifact_dir = tmp_path / "request-artifacts"
     artifact_dir.mkdir()
@@ -5046,17 +5059,27 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
         0,
         FakeStageClient(),
         stage_vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type=model_type),
+                use_v2_model_runner=runner.startswith("v2"),
+                supports_native_mrv2_data_plane=runner in {"v2-native", "v2-mixed"},
+                async_chunk=async_chunk,
+            ),
             speculative_config=SimpleNamespace(use_dflash=lambda: method == "dflash") if method else None,
         ),
+    )
+    downstream_config = (
+        SimpleNamespace(model_config=pool.stage_vllm_config.model_config) if runner == "v2-native" else None
     )
     output_queue: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
         output_async_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
-        stage_pools=[pool],
+        stage_pools=[pool, StagePool(1, FakeStageClient(), stage_vllm_config=downstream_config)],
+        async_chunk=async_chunk,
     )
+    mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", new_callable=mocker.AsyncMock)
     dispatch = mocker.patch.object(pool, "submit_initial", new_callable=mocker.AsyncMock, return_value=0)
     await orchestrator._handle_add_request(
         StageSubmissionMessage(
@@ -5065,8 +5088,8 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
             prompt=SimpleNamespace(sampling_params=SamplingParams(), resumable=resumable),
             original_prompt={},
             output_prompt_text=None,
-            sampling_params_list=[SamplingParams()],
-            final_stage_id=0,
+            sampling_params_list=[SamplingParams(), SamplingParams()],
+            final_stage_id=final_stage_id,
             preprocess_ms=0,
             request_timestamp=0,
             enqueue_ts=0,
@@ -5074,6 +5097,7 @@ async def test_add_request_rejects_qwen3_omni_dflash_resumable_input(
         )
     )
     if accepted:
+        assert output_queue.empty(), output_queue.get_nowait()
         dispatch.assert_awaited_once()
         assert output_queue.empty()
         assert artifact_dir.exists()
@@ -5325,3 +5349,49 @@ async def test_shared_kv_ready_waits_for_ar_terminal_output(mocker, shared):
     raw.finish_reason = FinishReason.STOP
     await orch._handle_kv_ready_raw_outputs(0, OmniEngineCoreOutputs(outputs=[raw]))
     assert forward.await_count == (1 if shared else 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prewarmed", [True, False])
+async def test_empty_next_input_aborts_only_prewarmed_downstream(prewarmed: bool) -> None:
+    """A non-judged pipeline whose bridge yields no input ends the request with an empty output.
+
+    Stages that async-chunk prewarm already submitted can never receive input
+    now, so they are aborted; without a prewarm nothing is aborted (unchanged).
+    """
+    clients = [FakeStageClient(final_output=index == 4) for index in range(5)]
+    pools = _build_stage_pools(
+        [[client] for client in clients],
+        output_processors=[FakeOutputProcessor() for _ in clients],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in clients],
+    )
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-empty-bridge",
+        sampling_params_list=[_sampling_params() for _ in clients],
+        final_stage_id=4,
+    )
+    submitted = [0, 1, 4] if prewarmed else [0, 1]
+    for stage_id in submitted:
+        # Bind the request where it actually ran (and where async-chunk prewarmed it).
+        await pools[stage_id].submit_initial(
+            "req-empty-bridge", req_state, SimpleNamespace(request_id="req-empty-bridge", prompt_token_ids=[1])
+        )
+        req_state.stage_submit_ts[stage_id] = float(stage_id)
+    orchestrator.request_states["req-empty-bridge"] = req_state
+    stage_output = SimpleNamespace(request_id="req-empty-bridge", finished=True, outputs=[])
+
+    await orchestrator._forward_to_next_stage("req-empty-bridge", 1, stage_output, req_state)
+
+    message = output_queue.get_nowait()
+    assert message.finished and message.stage_id == 4
+    assert "req-empty-bridge" not in orchestrator.request_states
+    aborted = [index for index, client in enumerate(clients) if client.abort_calls]
+    assert aborted == ([0, 1, 4] if prewarmed else [])
+    assert clients[2].add_request_calls == []
