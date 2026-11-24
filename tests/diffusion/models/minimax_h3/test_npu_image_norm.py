@@ -4,7 +4,7 @@ import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -22,6 +22,20 @@ _SPEC.loader.exec_module(ops)
 @dataclass(frozen=True)
 class Device:
     type: str = "npu"
+
+
+def _backend(monkeypatch, fused=None, soc="Ascend910B4", queries=None):
+    def get_device_name(device):
+        if queries is not None:
+            queries.append(device)
+        return soc
+
+    backend = ModuleType("torch_npu")
+    if fused is not None:
+        backend.npu_group_norm_silu = fused
+    backend.npu = SimpleNamespace(get_device_name=get_device_name)
+    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    return backend
 
 
 def test_non_npu_is_not_installed():
@@ -90,9 +104,7 @@ def test_private_dispatch_keeps_decoder_and_other_instances_unchanged(monkeypatc
         calls.append(x)
         return (F.silu(F.group_norm(x, groups, weight, bias, eps)),)
 
-    backend = ModuleType("torch_npu")
-    monkeypatch.setattr(backend, "npu_group_norm_silu", fused, raising=False)
-    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    _backend(monkeypatch, fused)
     model = nn.Module()
     model.encoder = EncoderFCN3D().eval()
     model.decoder = ResnetBlock3D().eval()
@@ -126,9 +138,7 @@ def test_unknown_encoder_and_norm_subclasses_keep_original_forward(monkeypatch):
     assert ops.install_npu_group_norm_silu(model, device=Device()) == 0
     assert "forward" not in model.encoder.__dict__
 
-    backend = ModuleType("torch_npu")
-    monkeypatch.setattr(backend, "npu_group_norm_silu", lambda *_: (), raising=False)
-    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    _backend(monkeypatch, lambda *_: ())
     model.encoder = EncoderFCN3D().eval()
     other_norm = type("SpatialParallelGroupNorm", (nn.GroupNorm,), {})
     model.encoder.norm = other_norm(4, 8).eval()
@@ -143,9 +153,7 @@ def test_video_temporal_isolation_and_independent_scope(monkeypatch):
         calls.append(tuple(x.shape))
         return (F.silu(F.group_norm(x, groups, weight, bias, eps)),)
 
-    backend = ModuleType("torch_npu")
-    monkeypatch.setattr(backend, "npu_group_norm_silu", fused, raising=False)
-    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    _backend(monkeypatch, fused)
     model = nn.Module()
     model.encoder = EncoderFCN3D().eval()
     model.encoder.norm = TemporalIsolatedSpatialParallelGroupNorm(4, 8).eval()
@@ -164,8 +172,7 @@ def test_video_temporal_isolation_and_independent_scope(monkeypatch):
 
 
 def test_missing_backend_does_not_install(monkeypatch):
-    backend = ModuleType("torch_npu")
-    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    _backend(monkeypatch)
     model = nn.Module()
     model.encoder = EncoderFCN3D().eval()
     assert ops.install_npu_group_norm_silu(model, device=Device()) == 0
@@ -179,9 +186,7 @@ def test_video_ordinary_group_norm_keeps_ncthw(monkeypatch):
         calls.append(tuple(x.shape))
         return (F.silu(F.group_norm(x, groups, weight, bias, eps)),)
 
-    backend = ModuleType("torch_npu")
-    monkeypatch.setattr(backend, "npu_group_norm_silu", fused, raising=False)
-    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    _backend(monkeypatch, fused)
     model = nn.Module()
     model.encoder = EncoderFCN3D().eval()
     assert ops.install_npu_group_norm_silu(model, device=Device()) == 1
@@ -201,9 +206,7 @@ def test_temporal_helper_missing_falls_back_to_original_ncthw(monkeypatch):
         calls.append(args[0])
         return (args[0],)
 
-    backend = ModuleType("torch_npu")
-    monkeypatch.setattr(backend, "npu_group_norm_silu", fused, raising=False)
-    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    _backend(monkeypatch, fused)
     namespace = get_group_norm_3d.__globals__
     merge_time = namespace["_merge_time_to_batch"]
     monkeypatch.setitem(namespace, "_merge_time_to_batch", None)
@@ -218,4 +221,63 @@ def test_temporal_helper_missing_falls_back_to_original_ncthw(monkeypatch):
     expected = norm_silu(x, model.encoder.norm) + x
     with torch.inference_mode(), ops.video_encode_context():
         assert torch.equal(model.encoder(x), expected)
+    assert calls == []
+
+
+def _fused_calls():
+    calls = []
+
+    def fused(x, weight, bias, groups, eps):
+        calls.append(tuple(x.shape))
+        return (F.silu(F.group_norm(x, groups, weight, bias, eps)),)
+
+    return calls, fused
+
+
+def test_910b_target_device_installs_fusion(monkeypatch):
+    calls, fused = _fused_calls()
+    queries = []
+    _backend(monkeypatch, fused, soc="Ascend910B4", queries=queries)
+    model = nn.Module()
+    model.encoder = EncoderFCN3D().eval()
+    device = Device()
+    assert ops.install_npu_group_norm_silu(model, device=device) == 1
+    # The SoC is read from the device the VAE is being built for.
+    assert queries == [device]
+    assert "forward" in model.encoder.__dict__
+    monkeypatch.setattr(ops, "_eligible", lambda *_: True)
+    x = torch.randn(1, 8, 1, 3, 5)
+    assert torch.equal(model.encoder(x), norm_silu(x, model.encoder.norm) + x)
+    assert calls == [(1, 8, 1, 3, 5)]
+
+
+@pytest.mark.parametrize("soc", ["Ascend910_9392", "Ascend910C", "Ascend310P3", "", None])
+def test_non_910b_or_unknown_soc_keeps_original_forward(monkeypatch, soc):
+    calls, fused = _fused_calls()
+    _backend(monkeypatch, fused, soc=soc)
+    model = nn.Module()
+    model.encoder = EncoderFCN3D().eval()
+    assert ops.install_npu_group_norm_silu(model, device=Device()) == 0
+    assert "forward" not in model.encoder.__dict__
+    assert not hasattr(model.encoder.norm, "_omni_group_norm_silu_supported")
+    x = torch.randn(1, 8, 1, 3, 5)
+    with torch.inference_mode(), ops.image_encode_context():
+        assert torch.equal(model.encoder(x), norm_silu(x, model.encoder.norm) + x)
+    assert calls == []
+
+
+def test_device_query_missing_or_failing_keeps_original_forward(monkeypatch):
+    calls, fused = _fused_calls()
+    backend = _backend(monkeypatch, fused)
+    del backend.npu
+    model = nn.Module()
+    model.encoder = EncoderFCN3D().eval()
+    assert ops.install_npu_group_norm_silu(model, device=Device()) == 0
+
+    def failing(device):
+        raise RuntimeError("device not initialized")
+
+    backend.npu = SimpleNamespace(get_device_name=failing)
+    assert ops.install_npu_group_norm_silu(model, device=Device()) == 0
+    assert "forward" not in model.encoder.__dict__
     assert calls == []

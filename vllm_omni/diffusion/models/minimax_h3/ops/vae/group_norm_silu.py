@@ -15,6 +15,10 @@ import torch.nn as nn
 
 _IMAGE_ENCODE = ContextVar("h3_npu_image_norm", default=False)
 _VIDEO_ENCODE = ContextVar("h3_npu_video_norm", default=False)
+# Only the 910B family has validated output parity. The torch_npu support table
+# for npu_group_norm_silu does not list Atlas A3 (910_93 / 910C), so every other
+# or unreadable device name keeps the checkpoint forward.
+_FUSED_SOC_PREFIXES = ("ascend910b",)
 
 
 @contextmanager
@@ -67,6 +71,14 @@ def _eligible(x: torch.Tensor, norm: nn.Module, cond: torch.Tensor | None) -> bo
     )
 
 
+def _fused_soc_supported(torch_npu, device: torch.device) -> bool:
+    try:
+        name = str(torch_npu.npu.get_device_name(device))
+    except Exception:
+        return False
+    return name.strip().lower().startswith(_FUSED_SOC_PREFIXES)
+
+
 def install_npu_group_norm_silu(model: nn.Module, *, device: torch.device) -> int:
     """Bind private encoder forwards without changing remote-code globals."""
 
@@ -85,7 +97,7 @@ def install_npu_group_norm_silu(model: nn.Module, *, device: torch.device) -> in
     except ImportError:
         return 0
     fused = getattr(torch_npu, "npu_group_norm_silu", None)
-    if not callable(fused):
+    if not callable(fused) or not _fused_soc_supported(torch_npu, device):
         return 0
     norm_types = (nn.GroupNorm,) + tuple(
         cls
