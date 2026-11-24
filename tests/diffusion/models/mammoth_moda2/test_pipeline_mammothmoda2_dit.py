@@ -520,6 +520,8 @@ def test_forward_transitions_request_scoped_cache_dit_across_requests(mock_tp1, 
     torch.manual_seed(0)  # Deterministic random init → deterministic cache hits.
     with _force_torch_sdpa():
         pipeline = MammothModa2DiTPipeline(od_config=_cache_dit_od_config())
+    # The modules stay on CPU; on a GPU host get_local_device() would place inputs on the GPU.
+    pipeline.device = torch.device("cpu")
     initialize_block_weights(pipeline.gen_transformer)
     pipeline.eval()
     assert pipeline._cache_dit_config is not None
