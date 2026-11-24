@@ -1242,16 +1242,6 @@ def fused_qk_norm_rope(
     q_weight = q_weight.contiguous()
     k_weight = k_weight.contiguous()
     rope_table = rope_table.contiguous()
-    if _fused_npu_supported(q, k, head_dim, rotary_dim, interleaved):
-        return _npu_qk_norm_rope(
-            q,
-            k,
-            q_weight,
-            k_weight,
-            rope_table,
-            eps,
-            rotary_dim,
-        )
     if not _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved):
         return _fused_qk_norm_rope_impl(
             q,
