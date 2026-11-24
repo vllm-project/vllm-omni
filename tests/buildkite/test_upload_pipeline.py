@@ -996,7 +996,7 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     assert step["source_file_dependencies"] == [
         "tts_qwen3_tts_function",
     ]
-    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2", "VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR": "."}
     command = "\n".join(step["commands"])
     assert "VLLM_OMNI_CI_MODEL_RUNNER" not in command
     assert "failed=0" in command
