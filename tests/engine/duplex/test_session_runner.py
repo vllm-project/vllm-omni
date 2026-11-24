@@ -1340,6 +1340,100 @@ async def test_empty_silent_commit_acks_without_opening_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trailing_commit_after_consumed_speech_units_is_a_user_turn() -> None:
+    """A commit sent after the whole feed still closes the user turn.
+
+    Each paced append is consumed as its own unit, so nothing is pending when
+    the commit arrives. The commit is a turn marker then: it adds the user
+    item and acks without ``empty``/``no_response``, and it must not re-submit
+    audio the model already consumed.
+    """
+    h = await open_harness()
+    try:
+        for _ in range(3):
+            await h.run(append_audio())
+            request_id = h.port.submissions[-1].context.request_id
+            await h.deliver_and_settle(
+                listen_output(request_id),
+                stage_id=0,
+                segment_finished=True,
+                segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+                segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+            )
+        submitted_before = len(h.port.submissions)
+        events = await h.run(commands.Commit(event_id="evt-commit"))
+        assert "response.listen" not in types(events), "a speech commit must not be answered as silence"
+        committed = find(events, "input_audio_buffer.committed")
+        assert committed.details.get("empty") is not True
+        assert committed.details.get("no_response") is not True
+        assert h.session.history[-1]["role"] == "user"
+        assert len(h.port.submissions) == submitted_before
+        assert h.runner.model_state.speech_since_commit is False
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_overlap_terminal_that_discards_nothing_keeps_speech_since_commit() -> None:
+    """A response terminal that discards no input must not erase the commit marker.
+
+    Overlap speech consumed unit-by-unit stays committable: at the terminal the
+    non-promoted-overlap branch runs with an empty buffer, and clearing the
+    marker there made the next trailing commit land as client-marked silence.
+    """
+    h = await open_harness()
+    try:
+        await _open_active_response(h)
+        # The response is still running; overlap speech has accumulated and a
+        # commit waits behind the active response.
+        h.session.accumulate_overlap_speech(1000)
+        h.runner.model_state.deferred_response_create = True
+        context = await _append_turn(h)
+        turn_id = context.fence.turn_id
+        events = await _send_model_result_and_settle(h, _terminal_listen_result(context.request_id, turn_id))
+        assert "response.listen" in types(events)
+        assert h.runner.model_state.audio_buffer.has_pending() is False
+        assert h.runner.model_state.speech_since_commit is True
+
+        commit_events = await h.run(commands.Commit(event_id="evt-commit"))
+        committed = find(commit_events, "input_audio_buffer.committed")
+        assert committed.details.get("empty") is not True
+        assert committed.details.get("no_response") is not True
+        assert h.session.history[-1]["role"] == "user"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_commit_after_only_silence_units_stays_silent() -> None:
+    """Silence-only input keeps the silent commit semantics.
+
+    Non-speech appends never set the commit marker, so the commit drops the
+    turn: no user item enters the history and no response is scheduled.
+    """
+    h = await open_harness()
+    try:
+        for _ in range(2):
+            await h.run(append_audio(is_speech=False, value=0.0))
+            request_id = h.port.submissions[-1].context.request_id
+            await h.deliver_and_settle(
+                listen_output(request_id),
+                stage_id=0,
+                segment_finished=True,
+                segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+                segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+            )
+        events = await h.run(commands.Commit(event_id="evt-commit"))
+        assert "response.listen" not in types(events), types(events)
+        assert "response.created" not in types(events), types(events)
+        find(events, "input_audio_buffer.committed")
+        assert len(h.session.history) == 0
+        assert h.runner.model_state.audio_buffer.has_pending() is False
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commit_projects_the_user_item_and_does_not_resubmit_consumed_audio() -> None:
     h = await open_harness()
     try:

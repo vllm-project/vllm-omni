@@ -290,7 +290,12 @@ class SessionEmitter:
                 had_pending_overlap_audio = model_state.audio_buffer.has_pending()
                 model_state.audio_buffer.clear()
                 model_state.input_since_commit = False
-                model_state.speech_since_commit = False
+                if had_pending_overlap_audio:
+                    # The pending turn is discarded wholesale, so its speech
+                    # cannot be committed later.
+                    model_state.speech_since_commit = False
+                # Nothing pending: the overlap speech was already consumed unit by
+                # unit — keep its marker so a trailing commit still closes the turn.
                 if had_pending_overlap_audio and self._projector is not None:
                     self.emit_events(discard_pending_input_audio(self._projector, session.overlap_speech_ms))
 

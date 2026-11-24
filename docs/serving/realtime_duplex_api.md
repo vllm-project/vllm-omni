@@ -708,6 +708,29 @@ model-native lane the audio is already streaming into the model before the
 commit, so the model may start answering — or emit a listen decision —
 without any commit at all.
 
+The commit covers everything appended since the last commit, wherever that
+audio sits when the commit arrives:
+
+- Audio still buffered at the commit is sealed into the user item and
+  submitted as the turn's final unit; `create_response=True` also opens the
+  forced answer at that unit, while plain `auto_response` leaves the decision
+  to the model on the turn-final unit.
+- Audio the model already consumed unit-by-unit keeps its commit: the commit
+  still adds the user item and acks the turn (no `empty`/`no_response`), and
+  the consumed audio is not submitted again. A model-native session whose
+  input is fully consumed opens no response at the commit — the model answers
+  through its own per-unit decisions — so a client that wants an answer now
+  should send the commit while the last chunk is still pending (or follow
+  with `response.create`).
+- A commit is dropped as client-marked silence only when no speech-carrying
+  append happened since the last commit (an `is_speech: False` commit with
+  nothing buffered): it acks with `empty`/`no_response` and keeps the session
+  listening.
+
+A commit never feeds the same speech into two responses: already-consumed
+audio is a turn marker, and audio retained from an earlier commit is consumed
+by the response it opened, not re-committed.
+
 ### Consume responses
 
 `responses()` demultiplexes the event stream into one `ResponseHandle` per
