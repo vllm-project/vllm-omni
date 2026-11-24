@@ -49,7 +49,7 @@ def test_explicit_exchange_setting_is_forwarded(monkeypatch, parallel_context, e
 
 @pytest.mark.parametrize("chunks", [0, 4])
 def test_ce_overlap_chunks_are_forwarded_to_pure_ulysses(monkeypatch, parallel_context, chunks):
-    parallel_context.ulysses_ce_overlap_chunks = chunks
+    parallel_context.ulysses_overlap_chunks = chunks
     strategy = Mock()
     monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
 

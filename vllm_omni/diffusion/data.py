@@ -328,7 +328,7 @@ class DiffusionParallelConfig:
     allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
-    ulysses_ce_overlap_chunks: int = 0
+    ulysses_overlap_chunks: int = 0
     """Overlap the CUDA copy-engine Ulysses exchange with attention in this many head chunks (0 disables).
 
     Requires ``ulysses_a2a_permute`` and strict pure Ulysses. Each chunk's Q/K/V move to their head owners while
@@ -435,16 +435,16 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
-        if self.ulysses_ce_overlap_chunks < 0:
-            raise ValueError(f"ulysses_ce_overlap_chunks must be >= 0, but got {self.ulysses_ce_overlap_chunks}")
-        if self.ulysses_ce_overlap_chunks > 0 and (
+        if self.ulysses_overlap_chunks < 0:
+            raise ValueError(f"ulysses_overlap_chunks must be >= 0, but got {self.ulysses_overlap_chunks}")
+        if self.ulysses_overlap_chunks > 0 and (
             not self.ulysses_a2a_permute
             or self.ulysses_mode != "strict"
             or self.ring_degree != 1
             or self.allgather_degree != 1
         ):
             raise ValueError(
-                "ulysses_ce_overlap_chunks requires ulysses_a2a_permute and strict pure Ulysses "
+                "ulysses_overlap_chunks requires ulysses_a2a_permute and strict pure Ulysses "
                 "(ulysses_mode='strict', ring_degree=1, allgather_degree=1). "
                 f"Got ulysses_a2a_permute={self.ulysses_a2a_permute}, ulysses_mode={self.ulysses_mode!r}, "
                 f"ring_degree={self.ring_degree}, allgather_degree={self.allgather_degree}."

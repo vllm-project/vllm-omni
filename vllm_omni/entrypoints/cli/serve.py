@@ -827,7 +827,7 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--ulysses-ce-overlap-chunks",
+            "--ulysses-overlap-chunks",
             type=int,
             default=None,
             help=(
