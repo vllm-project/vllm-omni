@@ -1040,7 +1040,98 @@ def test_venus_closing_delegate_decision_restores_aligned_speech():
     assert torch.equal(torch.as_tensor(unpack_handoff_tensor(resumed["hidden_states"]["tts"])), latent[[2, 3]])
     assert resumed["meta"]["turn_start"] is True
     assert resumed["meta"]["turn_end"] is True
-    assert resumed["meta"]["speech_muted"] is False
+    assert resumed["meta"]["text_without_audio"] is True
+
+
+@pytest.mark.parametrize("split_delegate", [False, True])
+@pytest.mark.parametrize("turn_end", [False, True])
+def test_venus_mixed_delegate_zero_frames_reaches_tool_parser(split_delegate, turn_end):
+    from vllm.sampling_params import SamplingParams
+
+    from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import _forward, _model
+    from tests.model_executor.models.minicpmo_4_5.test_talker_mrv2 import _EOS, _batch, _req_states, _talker
+    from tests.model_executor.stage_input_processors.test_minicpmo_4_5_async_chunk import (
+        _duplex_delta,
+        _manager,
+    )
+    from vllm_omni.data_entry_keys import to_dict
+    from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
+    from vllm_omni.model_executor.models.realtime_venus.duplex import VenusDataPlane
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import tts2code2wav_async_chunk
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}},
+        source_token_decoder=lambda ids, **_: "".join({21: "lookup", 22: "Done"}.get(i, "") for i in ids),
+    )
+    units = [[9304, 9400, 21, 9308], [9401, 22]] if split_delegate else [[9304, 9400, 21, 9401, 22]]
+    units[-1].extend([9310, 9308] if turn_end else [9308])
+    talker = _talker()
+    vocoder, _ = _model()
+    manager = _manager()
+    request_state = _NativeRequestState(
+        request_id="delegate",
+        external_req_id="delegate",
+        prompt_token_ids=[0],
+        resumable=True,
+        sampling_params=SamplingParams(stop_token_ids=[_EOS]),
+    )
+    plane = VenusDataPlane(lambda *args: "")
+    data_context = DuplexDataPlaneContext(auto_responds=True, active_response_id="response", turn_id=0)
+    cumulative, events, emitted_texts = [], [], []
+    for unit in units:
+        cumulative.extend(unit)
+        source, _ = _native_source([101], list(cumulative), [101, *unit[:-1]])
+        source.outputs[0].multimodal_output["meta"].update(delegate_open_token_id=9400, delegate_close_token_id=9401)
+        info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+        # Without sentence-final punctuation, turn-end draining permits EOS
+        # immediately. Verify the real sampler mask before injecting that sample.
+        prefill, _ = _batch([dict(slot=0, prompt_len=1, computed=0, span=[0], prefill=True)])
+        talker.make_omni_output_mrv2(
+            torch.zeros((1, 4)),
+            input_batch=prefill,
+            req_states=_req_states({0: 1}),
+            model_intermediate_buffer=[info],
+        )
+        assert not talker._mrv2_masked_eos[0].item()
+        batch, _ = _batch([dict(slot=0, prompt_len=1, computed=1, span=[_EOS], prefill=False)])
+        output = talker.make_omni_output_mrv2(
+            torch.zeros((1, 4)),
+            input_batch=batch,
+            req_states=_req_states({0: 1}),
+            model_intermediate_buffer=[info],
+        ).multimodal_outputs
+        output["meta"] = {key: value[0] if isinstance(value, list) else value for key, value in output["meta"].items()}
+        request_state.accept_tokens([_EOS])
+        request = request_state.snapshot(include_token_history=True, sampled_token_ids=[_EOS])
+        payload = tts2code2wav_async_chunk(manager, output, request)
+        assert payload.meta.code_flat_numel == 0
+        emitted_texts.append(bytes(payload.meta.llm_output_text_utf8.tolist()).decode())
+        waveform = _forward(vocoder, [to_dict(payload)]).multimodal_outputs
+        projected = OmniRequestOutput(
+            request_id="delegate",
+            finished=False,
+            outputs=[],
+            _multimodal_output={key: value[0] for key, value in waveform.items()},
+        )
+        events.extend(plane.project_output(projected, context=data_context))
+        repeated = list(plane.project_output(projected, context=data_context))
+        assert not any(event.get("text") or event.get("function_call") or event.get("error") for event in repeated)
+
+    assert not [event for event in events if event.get("error")]
+    calls = [event for event in events if event.get("function_call")]
+    assert len(calls) == 1
+    assert json.loads(calls[0]["arguments"]) == {"question": "lookup"}
+    assert "".join(event.get("text", "") for event in events) == "<delegate>lookup</delegate>Done"
+    assert "".join(emitted_texts) == "<delegate>lookup</delegate>Done"
+    assert sum(event.get("end_of_turn") is True for event in events) == int(turn_end)
+    # A later audible unit must not replay text already delivered at zero frames.
+    request = request_state.snapshot(include_token_history=True, sampled_token_ids=[])
+    following = tts2code2wav_async_chunk(
+        manager, _duplex_delta(*range(25), epoch=0, turn_id=int(turn_end), text="Next."), request
+    )
+    assert bytes(following.meta.llm_output_text_utf8.tolist()) == b"Next."
 
 
 def test_venus_delimiter_only_decisions_flush_once_and_resume_speech():
@@ -1096,7 +1187,7 @@ def test_venus_delimiter_only_decisions_flush_once_and_resume_speech():
     assert json.loads(arguments) == {"question": "lookup"}
     assert [info["ids"]["tts"] for info in handoffs] == [[23], [], [], [], [22, 9310]]
     assert [info["meta"]["speech_flush"] for info in handoffs] == [False, True, False, False, False]
-    assert [info["meta"]["speech_muted"] for info in handoffs] == [False, True, True, True, False]
+    assert [info["meta"]["text_without_audio"] for info in handoffs] == [True] * 5
     assert [info["meta"]["native_duplex_segment_text"] for info in handoffs] == [
         "Checking.",
         "<delegate>",
@@ -1211,7 +1302,7 @@ def test_venus_first_speech_after_initial_delegation_starts_fresh(muted_units: i
     for index in range(muted_units):
         muted = handoff([9400, 31] if index == 0 else [31])
         assert muted["ids"]["tts"] == []
-        assert muted["meta"]["speech_muted"] is True
+        assert muted["meta"]["text_without_audio"] is True
         assert muted["meta"]["speech_flush"] is False
 
     first = handoff([9401, 21])
@@ -1219,7 +1310,7 @@ def test_venus_first_speech_after_initial_delegation_starts_fresh(muted_units: i
     assert first["meta"]["turn_start"] is True
     assert first["meta"]["replace_streaming_prompt"] is True
     assert first["meta"]["speech_flush"] is False
-    assert first["meta"]["speech_muted"] is False
+    assert first["meta"]["text_without_audio"] is True
     assert _native_duplex_chunk_budget(first["meta"]) == (26, 0)
 
     following = handoff([22])

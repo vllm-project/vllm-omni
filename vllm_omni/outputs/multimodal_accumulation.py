@@ -19,7 +19,7 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "llm_output_text_utf8",
         "segment_end",
         "speech_flush",
-        "speech_muted",
+        "text_without_audio",
         "streaming_condition_seq",
         "tts_is_last_chunk",
         "turn_end",

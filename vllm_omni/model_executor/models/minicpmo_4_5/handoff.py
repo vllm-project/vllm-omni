@@ -8,7 +8,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerial
 
 # Speech boundaries are independent of dialogue turn boundaries.
 SPEECH_FLUSH_KEY = "speech_flush"
-SPEECH_MUTED_KEY = "speech_muted"
+TEXT_WITHOUT_AUDIO_KEY = "text_without_audio"
 
 
 def pack_handoff_tensor(value: torch.Tensor) -> bytes:

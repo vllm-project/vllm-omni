@@ -48,7 +48,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.config import (
 from vllm_omni.model_executor.models.minicpmo_4_5.config import stage_connector_extra
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import (
     SPEECH_FLUSH_KEY,
-    SPEECH_MUTED_KEY,
+    TEXT_WITHOUT_AUDIO_KEY,
     unpack_handoff_tensor,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
@@ -2159,7 +2159,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             segment_texts_utf8: list[torch.Tensor] = []
             turn_end_flags: list[torch.Tensor] = []
             speech_flush_flags: list[torch.Tensor] = []
-            speech_muted_flags: list[torch.Tensor] = []
+            text_without_audio_flags: list[torch.Tensor] = []
             for info in model_intermediate_buffer:
                 info_dict = info if isinstance(info, dict) else {}
                 native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
@@ -2174,7 +2174,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
                 turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
                 speech_flush_flags.append(torch.tensor(bool(meta_info.get(SPEECH_FLUSH_KEY)), dtype=torch.bool))
-                speech_muted_flags.append(torch.tensor(bool(meta_info.get(SPEECH_MUTED_KEY)), dtype=torch.bool))
+                text_without_audio_flags.append(
+                    torch.tensor(bool(meta_info.get(TEXT_WITHOUT_AUDIO_KEY)), dtype=torch.bool)
+                )
             meta_outputs["native_duplex"] = native_duplex_flags
             meta_outputs["duplex_epoch"] = duplex_epochs
             meta_outputs["duplex_turn_id"] = duplex_turn_ids
@@ -2184,7 +2186,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             meta_outputs["native_duplex_segment_text"] = segment_texts_utf8
             meta_outputs["turn_end"] = turn_end_flags
             meta_outputs[SPEECH_FLUSH_KEY] = speech_flush_flags
-            meta_outputs[SPEECH_MUTED_KEY] = speech_muted_flags
+            meta_outputs[TEXT_WITHOUT_AUDIO_KEY] = text_without_audio_flags
 
         return OmniOutput(
             text_hidden_states=hidden,
@@ -2854,7 +2856,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         speech_flush_flags: list[torch.Tensor] = []
-        speech_muted_flags: list[torch.Tensor] = []
+        text_without_audio_flags: list[torch.Tensor] = []
         row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
         # Keep one batched projection, but omit rows that exit without sampling.
         projection_rows: list[int] = []
@@ -2909,7 +2911,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
                 turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
                 speech_flush_flags.append(torch.tensor(bool(meta_info.get(SPEECH_FLUSH_KEY)), dtype=torch.bool))
-                speech_muted_flags.append(torch.tensor(bool(meta_info.get(SPEECH_MUTED_KEY)), dtype=torch.bool))
+                text_without_audio_flags.append(
+                    torch.tensor(bool(meta_info.get(TEXT_WITHOUT_AUDIO_KEY)), dtype=torch.bool)
+                )
 
             if not isinstance(info, dict):
                 stop_rows.append(row_continue)
@@ -3161,7 +3165,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "llm_output_text_utf8": segment_texts_utf8,
                     "turn_end": turn_end_flags,
                     SPEECH_FLUSH_KEY: speech_flush_flags,
-                    SPEECH_MUTED_KEY: speech_muted_flags,
+                    TEXT_WITHOUT_AUDIO_KEY: text_without_audio_flags,
                 }
             )
         multimodal_outputs: dict[str, Any] = {

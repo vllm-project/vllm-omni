@@ -65,15 +65,17 @@ def test_new_input_does_not_rearm_an_already_delivered_boundary():
 
 
 @pytest.mark.parametrize("turn_end", [False, True])
-def test_venus_muted_unit_emits_text_once_without_audio(turn_end):
+@pytest.mark.parametrize("text_without_audio", [None, False, True])
+def test_zero_frame_text_delivery_is_opt_in_and_deduplicated(turn_end, text_without_audio):
     plane = MiniCPMO45DataPlaneSession(lambda *args: "")
     output = _boundary(0)
-    output.outputs[0].text = "<delegate>look up the weather</delegate>"
-    output.multimodal_output["meta.speech_muted"] = True
+    output.outputs[0].text = "<delegate>look up the weather</delegate>Done."
+    if text_without_audio is not None:
+        output.multimodal_output["meta.text_without_audio"] = text_without_audio
     output.multimodal_output["meta.turn_end"] = turn_end
     events = _project(plane, output)
     assert len(events) == 1
-    assert events[0]["text"] == output.outputs[0].text
+    assert events[0]["text"] == (output.outputs[0].text if text_without_audio else "")
     assert events[0]["audio_data"] == ""
     assert events[0]["end_of_turn"] is turn_end
     assert events[0]["abort_data_plane_request"] is True

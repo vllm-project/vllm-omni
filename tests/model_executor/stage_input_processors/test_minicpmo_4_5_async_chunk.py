@@ -118,7 +118,7 @@ def test_venus_zero_frame_speech_flush_reaches_generation_receiver():
     first = tts2code2wav_async_chunk(manager, _duplex_delta(text="Let me check."), request)
     assert first.meta.code_flat_numel == 0
     muted = _duplex_delta(text="<delegate>lookup</delegate>")
-    muted["meta"].update(speech_flush=torch.tensor(True), speech_muted=torch.tensor(True))
+    muted["meta"].update(speech_flush=torch.tensor(True), text_without_audio=torch.tensor(True))
     payload = tts2code2wav_async_chunk(manager, muted, request)
     assert payload.meta.last_chunk is True
     assert payload.meta.finished.item() is False
@@ -147,14 +147,14 @@ def test_venus_muted_text_is_delivered_without_waiting_for_or_replaying_in_speec
     manager = _manager()
     request = _request("delegate")
     muted = _duplex_delta(text="secret")
-    muted["meta"]["speech_muted"] = torch.tensor(True)
+    muted["meta"]["text_without_audio"] = torch.tensor(True)
     first = tts2code2wav_async_chunk(manager, muted, request, True)
     assert first.meta.code_flat_numel == 0
-    assert first.meta.speech_muted is True
+    assert first.meta.text_without_audio is True
     assert bytes(first.meta.llm_output_text_utf8.tolist()) == b"secret"
     spoken = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="spoken"), request)
     assert bytes(spoken.meta.llm_output_text_utf8.tolist()) == b"spoken"
-    assert spoken.meta.speech_muted is False
+    assert spoken.meta.text_without_audio is False
 
 
 def test_empty_full_payload_releases_consumer_wait_gate() -> None:

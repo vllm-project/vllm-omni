@@ -28,7 +28,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.delegation import (
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import (
     SPEECH_FLUSH_KEY,
-    SPEECH_MUTED_KEY,
+    TEXT_WITHOUT_AUDIO_KEY,
     pack_handoff_tensor,
     unpack_handoff_tensor,
 )
@@ -51,7 +51,7 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     duplex_epoch: int | None = None
     segment_end: bool | None = None
     turn_end: bool | None = None
-    speech_muted: bool | None = None
+    text_without_audio: bool | None = None
     tts_is_last_chunk: bool | None = None
 
 
@@ -319,7 +319,7 @@ def tts2code2wav_async_chunk(
         segment_text_utf8 = None
     turn_end = bool(_coerce_int(output_meta.get("turn_end")))
     speech_flush = bool(_coerce_int(output_meta.get(SPEECH_FLUSH_KEY)))
-    speech_muted = bool(_coerce_int(output_meta.get(SPEECH_MUTED_KEY)))
+    text_without_audio = bool(_coerce_int(output_meta.get(TEXT_WITHOUT_AUDIO_KEY)))
     duplex_turn_key = (duplex_epoch, duplex_turn_id)
 
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -402,7 +402,7 @@ def tts2code2wav_async_chunk(
     )
     if native_duplex and current_text_utf8 and not state.get("segment_text_recorded", False):
         # Talker repeats the unit text on every codec step. Queue it once for
-        # the first Code2Wav payload that can carry audio for this unit.
+        # the first audio payload or an opted-in text-only unit boundary.
         pending_text_utf8.extend(current_text_utf8)
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
@@ -454,7 +454,7 @@ def tts2code2wav_async_chunk(
         output_codes = []
     state["codec_end"] = codec_end
     code_flat_numel = len(output_codes)
-    if native_duplex and (code_flat_numel > 0 or (speech_muted and finished)):
+    if native_duplex and (code_flat_numel > 0 or (text_without_audio and finished)):
         segment_text_utf8 = torch.tensor(pending_text_utf8, dtype=torch.uint8)
         pending_text_utf8.clear()
     if native_duplex and finished:
@@ -506,7 +506,7 @@ def tts2code2wav_async_chunk(
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
-            speech_muted=speech_muted,
+            text_without_audio=text_without_audio,
             replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,
         ),
@@ -1299,7 +1299,9 @@ def llm2tts(
                 meta["turn_eos_token_id"] = int(turn_eos_id)
             meta["turn_start"] = native_turn_start or speech_restart
             meta[SPEECH_FLUSH_KEY] = speech_flush
-            meta[SPEECH_MUTED_KEY] = skip_speech
+            # Delegation text must reach the parser even when a mixed speech
+            # unit samples codec EOS before producing its first audio frame.
+            meta[TEXT_WITHOUT_AUDIO_KEY] = has_delegation
             if native_segment_end:
                 meta["segment_end"] = True
         ref_audio = reference_audio_by_request_id.get(llm_output.request_id)

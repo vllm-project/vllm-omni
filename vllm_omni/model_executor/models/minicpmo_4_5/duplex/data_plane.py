@@ -16,7 +16,7 @@ from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneConte
 from vllm_omni.model_executor.common.request_outputs import coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.model_executor.models.minicpmo_4_5.handoff import SPEECH_MUTED_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -347,9 +347,9 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     return
                 request_state.pending_audio_without_text = pending_audio
 
-        if tts_segment_end and _bool_metadata(mm_output, (SPEECH_MUTED_KEY,), default=False) and text:
-            # A delegation-only unit intentionally has no waveform. Publish
-            # its text at this unit boundary instead of waiting for speech.
+        if tts_segment_end and _bool_metadata(mm_output, (TEXT_WITHOUT_AUDIO_KEY,), default=False) and text:
+            # Venus text also carries delegation control. Deliver it even
+            # when a mixed speech unit reaches codec EOS without a waveform.
             delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
             result = runtime_result(
                 stage_role="tts",

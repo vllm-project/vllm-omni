@@ -1872,11 +1872,13 @@ codec-token budget, even though there was no earlier speech to flush. Subsequent
 speech units continue normally. A new turn or request resets all delegation
 state. This keeps speech lifecycle independent of dialogue lifecycle.
 
-`meta.speech_muted` carries intentionally silent text units through Talker and
-Code2Wav. The codec bridge consumes their pending text even when no audio frames
-exist; the data plane emits that text once at the unit boundary, using the same
-cache-epoch/chunk-sequence deduplication as audio. It does not wait for later
-speech or replay the delegation text with the next audible unit.
+`meta.text_without_audio` opts Venus units into text delivery independent of
+speech generation. It travels through Talker and Code2Wav for every unit,
+including mixed delegation/speech units that sample codec EOS before producing
+any audio frames. The codec bridge consumes their pending text at the unit
+boundary; the data plane emits it once using the same cache-epoch/chunk-sequence
+deduplication as audio. It does not wait for later speech or replay the text with
+the next audible unit. Stock MiniCPM keeps its existing audio-gated delivery.
 Zero-frame flushes on a live native request carry a scheduling placeholder so
 the generation receiver retains their text and boundary metadata, including
 speech-only flushes with `last_chunk=True`. `code_flat_numel=0` keeps the

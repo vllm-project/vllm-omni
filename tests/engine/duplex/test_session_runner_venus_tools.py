@@ -18,7 +18,7 @@ from tests.engine.duplex.test_session_runner import (
 from tests.engine.duplex.test_session_runner_nemotron_voicechat import answer, error_codes
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallState
-from vllm_omni.model_executor.models.minicpmo_4_5.handoff import SPEECH_MUTED_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import TEXT_WITHOUT_AUDIO_KEY
 from vllm_omni.model_executor.models.realtime_venus.duplex import RealtimeVenusDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -45,7 +45,7 @@ async def delegate(h, question="12 + 30"):
         epoch=h.session.epoch,
         turn_id=h.session.turn_id,
     )
-    output.multimodal_output[SPEECH_MUTED_KEY] = True
+    output.multimodal_output[TEXT_WITHOUT_AUDIO_KEY] = True
     events = await h.deliver_and_settle(output)
     calls = [event for event in events if event.type == "response.function_call_arguments.done"]
     assert len(calls) == 1, types(events)
@@ -87,7 +87,7 @@ async def test_result_reaches_one_append_and_duplicate_cannot_replay_it(boundary
                 h.stage0_request_id(), text="<delegate>12 + 30</delegate>", samples=0, tts_is_last_chunk=True
             )
             repeated.multimodal_output.update(
-                {SPEECH_MUTED_KEY: True, "meta.duplex_audio_cache_epoch": 0, "meta.duplex_audio_chunk_seq": 1}
+                {TEXT_WITHOUT_AUDIO_KEY: True, "meta.duplex_audio_cache_epoch": 0, "meta.duplex_audio_chunk_seq": 1}
             )
             events = await h.deliver_and_settle(repeated)
             assert error_codes(events) == []

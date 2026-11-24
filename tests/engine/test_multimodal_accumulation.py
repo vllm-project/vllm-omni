@@ -108,7 +108,7 @@ def test_replace_nemotron_snapshot_keys_detects_nested_meta_marker():
         "duplex_audio_cache_epoch",
         "duplex_audio_chunk_seq",
         "speech_flush",
-        "speech_muted",
+        "text_without_audio",
         "streaming_condition_seq",
     ],
 )
