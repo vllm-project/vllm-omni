@@ -3,6 +3,7 @@
 # Adapted from Tencent-Hunyuan/Hy-Nomas (Copyright 2026 Tencent).
 
 from collections import OrderedDict
+from collections.abc import Sequence
 from functools import cache
 
 import numpy as np
@@ -101,7 +102,46 @@ class RangeAttention(nn.Module):
     def clear(self) -> None:
         self.masks.clear()
 
-    def forward(self, q, k, v, *, ranges=None, query_mask=None, key_mask=None, block_mask=None):
+    def resolve_masks(
+        self,
+        q_length: int,
+        k_length: int,
+        device: torch.device | str,
+        *,
+        batch_size: int = 1,
+        ranges: Sequence[Sequence[tuple[int, int, int, int]]] | None = None,
+        query_mask: torch.Tensor | None = None,
+        key_mask: torch.Tensor | None = None,
+    ) -> tuple[BlockMask | None, ...]:
+        target_device = torch.device(device)
+        if q_length < 0 or k_length < 0 or batch_size < 0:
+            raise ValueError("Hy-Nomas attention requires non-negative lengths and batch size.")
+        for visibility, length in ((query_mask, q_length), (key_mask, k_length)):
+            if visibility is not None and (
+                visibility.shape != (batch_size, length)
+                or visibility.dtype != torch.bool
+                or visibility.device != target_device
+            ):
+                raise ValueError("Hy-Nomas attention requires Boolean visibility masks matching Q/K.")
+        if not q_length or not k_length:
+            return (None,) * batch_size
+        resolved: list[BlockMask | None] = []
+        device_str = str(target_device)
+        for batch in range(batch_size):
+            qr = np.ones(q_length, dtype=bool) if query_mask is None else query_mask[batch].detach().cpu().numpy()
+            kr = np.ones(k_length, dtype=bool) if key_mask is None else key_mask[batch].detach().cpu().numpy()
+            rectangles = [(0, q_length, 0, k_length)] if ranges is None else ranges[batch]
+            cache_key = (q_length, k_length, device_str, tuple(rectangles), qr.tobytes(), kr.tobytes())
+            if cache_key not in self.masks:
+                self.masks[cache_key] = build_range_mask(q_length, k_length, rectangles, target_device, qr, kr)
+                while len(self.masks) > 32:
+                    self.masks.popitem(last=False)
+            self.masks.move_to_end(cache_key)
+            resolved.append(self.masks[cache_key])
+        return tuple(resolved)
+
+    @torch._dynamo.disable
+    def forward(self, q, k, v, *, ranges=None, query_mask=None, key_mask=None, block_mask=None, block_masks=None):
         if q.ndim != 4 or k.ndim != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]:
             raise ValueError("Hy-Nomas attention requires matching BSND query/key/value tensors.")
         if (
@@ -128,6 +168,7 @@ class RangeAttention(nn.Module):
         if block_mask is not None:
             if (
                 not isinstance(block_mask, BlockMask)
+                or block_masks is not None
                 or ranges is not None
                 or query_mask is not None
                 or key_mask is not None
@@ -143,26 +184,46 @@ class RangeAttention(nn.Module):
                 scale=self.softmax_scale,
                 enable_gqa=q.shape[2] != k.shape[2],
             ).transpose(1, 2)
+        if block_masks is not None:
+            has_tokens = bool(q.shape[1] and k.shape[1])
+            if (
+                not isinstance(block_masks, Sequence)
+                or isinstance(block_masks, str | bytes)
+                or ranges is not None
+                or query_mask is not None
+                or key_mask is not None
+                or len(block_masks) != q.shape[0]
+                or (not has_tokens and any(mask is not None for mask in block_masks))
+                or (
+                    has_tokens
+                    and any(
+                        not isinstance(mask, BlockMask) or mask.shape[-2:] != (q.shape[1], k.shape[1])
+                        for mask in block_masks
+                    )
+                )
+            ):
+                raise ValueError("Prebuilt Flex BlockMask cannot be combined with rectangle/token masks")
+        else:
+            block_masks = self.resolve_masks(
+                q.shape[1],
+                k.shape[1],
+                q.device,
+                batch_size=q.shape[0],
+                ranges=ranges,
+                query_mask=query_mask,
+                key_mask=key_mask,
+            )
         output = torch.empty_like(q)
-        for batch in range(q.shape[0]):
-            qr = np.ones(q.shape[1], dtype=bool) if query_mask is None else query_mask[batch].detach().cpu().numpy()
-            kr = np.ones(k.shape[1], dtype=bool) if key_mask is None else key_mask[batch].detach().cpu().numpy()
-            rectangles = [(0, q.shape[1], 0, k.shape[1])] if ranges is None else ranges[batch]
-            if not q.shape[1] or not k.shape[1]:
+        for batch, batch_mask in enumerate(block_masks):
+            if not q.shape[1] or not k.shape[1] or batch_mask is None:
                 output[batch].zero_()
                 continue
-            cache_key = (q.shape[1], k.shape[1], str(q.device), tuple(rectangles), qr.tobytes(), kr.tobytes())
-            if cache_key not in self.masks:
-                self.masks[cache_key] = build_range_mask(q.shape[1], k.shape[1], rectangles, q.device, qr, kr)
-                while len(self.masks) > 32:
-                    self.masks.popitem(last=False)
-            self.masks.move_to_end(cache_key)
             kernel = compiled_flex() if q.device.type == "cuda" else flex_attention
             result = kernel(
                 q[batch].transpose(0, 1)[None],
                 k[batch].transpose(0, 1)[None],
                 v[batch].transpose(0, 1)[None],
-                block_mask=self.masks[cache_key],
+                block_mask=batch_mask,
                 scale=self.softmax_scale,
                 enable_gqa=q.shape[2] != k.shape[2],
                 kernel_options={"ROWS_GUARANTEED_SAFE": False, "BLOCKS_ARE_CONTIGUOUS": False},

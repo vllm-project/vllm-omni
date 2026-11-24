@@ -5,30 +5,26 @@
 
 from __future__ import annotations
 
-import errno
-import json
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.dfx.conftest import assert_fault_exception, resolve_oom_device_spec
 from tests.dfx.reliability.helpers import (
     PARTIAL_ISOLATION_HTTP_TIMEOUT_SEC,
     FaultModel,
     SignalSpec,
-    extract_openai_error_contract_from_bytes,
-    inject_gpu_oom,
-    post_json_raw,
+    launch_scenario_params,
     scenario_params,
-    stop_gpu_oom_hogs,
+    sigterm_serve_root_and_assert_cleanup,
 )
 from tests.dfx.reliability.scenarios import (
-    GpuOomConcurrent,
-    GpuOomErrorContract,
-    GpuOomLarge,
-    GpuOomRecovery,
+    FullCrashAtLaunch,
+    GpuOomAtLaunch,
+    GpuOomUnderLoad,
+    GracefulShutdown,
+    PartialCrashAtExit,
+    PartialCrashAtLaunch,
     PartialStageIsolation,
     ProcessKillServeRootNoLoad,
     ProcessKillServeRootWithLoad,
@@ -36,24 +32,19 @@ from tests.dfx.reliability.scenarios import (
     ProcessKillTreeWithLoad,
     ProcessKillWorkerNoLoad,
     ProcessKillWorkerWithLoad,
+    ServeRootCrashAtLaunch,
 )
 from tests.helpers.mark import hardware_marks
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image
 from tests.helpers.runtime import dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
-QWEN_SERVE_ROOT_SIGNALS: tuple[SignalSpec, ...] = (
-    ("SIGTERM", None),
-    ("SIGINT", None),
-    ("SIGKILL", "vllm issue#43060"),
-)
-QWEN_TREE_WITH_LOAD_SIGNALS: tuple[SignalSpec, ...] = (
-    ("SIGTERM", "issue#8912"),
-    ("SIGKILL", None),
-)
+QWEN_SERVE_ROOT_SIGNALS: tuple[SignalSpec, ...] = (("SIGKILL", "https://github.com/vllm-project/vllm/issues/43060"),)
 
 RUNTIME_WORKER_PATTERN = "StageEngineCoreProc_stage0"
 _PROCESS_KILL_WORKER_CHAT_FF_HTTP_TIMEOUT_SEC = 30
+# Includes a fresh interpreter's torch import, CUDA initialization and allocation.
+_OOM_SIDECAR_STARTUP_TIMEOUT_SEC = 120
 
 
 def _default_oom_device_spec() -> str:
@@ -73,38 +64,11 @@ def _hard_oom_config() -> dict[str, Any]:
         "target_mem_ratio": 0.95,
         "max_free_bytes": 32 * 1024 * 1024 if getattr(torch.version, "hip", None) else 256 * 1024 * 1024,
         "hold_seconds": 0,
-        "startup_timeout_sec": 20,
+        "startup_timeout_sec": _OOM_SIDECAR_STARTUP_TIMEOUT_SEC,
         "strict": False,
     }
 
 
-def _recover_oom_max_free_bytes() -> int | None:
-    import torch
-
-    # A proportional target leaves several GiB free on high-memory MI300 cards.
-    # Match the proven HIP hard-OOM ceiling while preserving ratio-only CUDA.
-    return 32 * 1024 * 1024 if getattr(torch.version, "hip", None) else None
-
-
-OOM_RECOVER_INJECTION_CONFIG: dict[str, Any] = {
-    "device": _default_oom_device_spec(),
-    "target_mem_ratio": 0.95,
-    "max_free_bytes": _recover_oom_max_free_bytes(),
-    "hold_seconds": 0,
-    "startup_timeout_sec": 20,
-    "strict": False,
-}
-FAULT_ERROR_KEYWORDS = (
-    "the request failed",
-    "oom",
-    "out of memory",
-    "cuda",
-    "orchestrator",
-    "timeout",
-    "connection",
-    "500",
-    "503",
-)
 PROCESS_KILL_ERROR_KEYWORDS = (
     "timeout",
     "did not complete within",
@@ -171,16 +135,33 @@ def _multimodal_request(model: str) -> dict[str, Any]:
     }
 
 
+def _oom_preflight_request(model: str) -> dict[str, Any]:
+    """Match MiniCPM's small text input with text and audio output for OOM preflight."""
+    request = _text_request(model)
+    request["modalities"] = ["text", "audio"]
+    return request
+
+
 def _heavy_messages() -> list[dict[str, Any]]:
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+    # Prepare distinct images before pressure; avoid video sampling and the
+    # dimension-based synthetic-image cache. GPU runs must establish actual OOM.
+    image_count = 16
+    width, height = 1280, 720
+    image_data_url = [
+        f"data:image/jpeg;base64,{generate_synthetic_image(width, height, seed=i, force_regenerate=True)['base64']}"
+        for i in range(image_count)
+    ]
     audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}"
+    print(
+        f"[oom-under-load] Qwen fault payload: images={image_count}, image_size={width}x{height}, "
+        "audio_seconds=20, max_tokens=128; media prepared before pressure",
+        flush=True,
+    )
     return dummy_messages_from_mix_data(
         system_prompt=_system_prompt(),
-        video_data_url=video_data_url,
         image_data_url=image_data_url,
         audio_data_url=audio_data_url,
-        content_text="What is recited in the audio? What is in this image? What is in this video? " * 200,
+        content_text=("Compare all the images, and summarize the audio. " * 128) + "Answer in one short sentence.",
     )
 
 
@@ -188,110 +169,14 @@ def _mix_probe_payload(server: Any) -> dict[str, Any]:
     return {
         "model": server.model,
         "messages": _heavy_messages(),
-        "stream": True,
+        "stream": False,
         "modalities": ["text", "audio"],
+        "max_tokens": 128,
     }
 
 
 def _assert_text_200(client: Any, model: str) -> None:
     client.send_chat_completions_http_request({"json": _text_request(model), "timeout": 120})
-
-
-def _deploy_config_path(server: Any) -> str | None:
-    args: list[str] = server.serve_args
-    for index, arg in enumerate(args):
-        if arg == "--deploy-config" and index + 1 < len(args):
-            return args[index + 1]
-        if arg.startswith("--deploy-config="):
-            return arg.split("=", 1)[1]
-    return None
-
-
-def _server_error_code(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int) and value == 500:
-        return value
-    if isinstance(value, str) and value.isdigit() and int(value) == 500:
-        return int(value)
-    return None
-
-
-def _stream_server_error_code(body: bytes) -> int | None:
-    text = body.decode("utf-8", errors="replace")
-    payloads: list[object] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("data:"):
-            continue
-        data = stripped[len("data:") :].strip()
-        if not data or data == "[DONE]":
-            continue
-        try:
-            payloads.append(json.loads(data))
-        except json.JSONDecodeError:
-            continue
-    if not payloads:
-        try:
-            payloads.append(json.loads(text))
-        except json.JSONDecodeError:
-            return None
-    for payload in payloads:
-        if not isinstance(payload, dict):
-            continue
-        error = payload.get("error")
-        if isinstance(error, dict):
-            code = _server_error_code(error.get("code"))
-            if code is not None:
-                return code
-        if "choices" not in payload:
-            code = _server_error_code(payload.get("code"))
-            if code is not None:
-                return code
-    return None
-
-
-def _fault_keywords_match_response(*, status: int, body: bytes) -> bool:
-    if status >= 400:
-        return True
-    text = body.decode("utf-8", errors="replace").lower()
-    hints = (
-        "the request failed",
-        "oom",
-        "out of memory",
-        "cuda",
-        "orchestrator",
-        "timeout",
-        "connection refused",
-        "connection reset",
-    )
-    return any(key in text for key in hints)
-
-
-def _looks_like_server_unreachable(exc: BaseException) -> bool:
-    if isinstance(exc, (ConnectionRefusedError, BrokenPipeError, ConnectionResetError)):
-        return True
-    errno_val = getattr(exc, "errno", None)
-    if isinstance(exc, OSError) and errno_val is not None:
-        return errno_val in (errno.ECONNREFUSED, errno.ECONNRESET, errno.EPIPE)
-    message = str(exc).lower()
-    return "connection refused" in message or "actively refused" in message
-
-
-def _assert_server_alive(client: Any, *, scenario: str) -> None:
-    deadline = time.monotonic() + 15.0
-    responded = False
-    while time.monotonic() < deadline:
-        try:
-            status = client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
-            responded = True
-            assert status in (200, 503), f"[{scenario} alive] unexpected /health status={status}"
-        except Exception as exc:  # noqa: BLE001
-            if _looks_like_server_unreachable(exc):
-                pytest.fail(f"[{scenario} alive] server exited after single-stage OOM (#4285): {exc!r}")
-            raise
-        time.sleep(0.5)
-    assert responded, f"[{scenario} alive] /health never responded after fault"
 
 
 class Qwen3Omni(FaultModel):
@@ -307,31 +192,25 @@ class Qwen3Omni(FaultModel):
                 "server_args": ["--async-chunk"],
             },
         },
-        {
-            "test_name": "qwen3_omni_reliability_default",
-            "server_params": {
-                "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-                "stage_config_name": "qwen3_omni_moe.yaml",
-                "server_args": ["--no-async-chunk"],
-            },
-        },
     ]
     deploy_dir = Path(get_deploy_config_path("qwen3_omni_moe.yaml")).parent
-    lifecycle_scenario = "qwen3_omni_reliability_default"
+    lifecycle_scenario = "qwen3_omni_reliability_async_chunk"
     eager_oom_stage_ids = (0, 1)
     worker_pattern = RUNTIME_WORKER_PATTERN
     isolation_pattern = "StageEngineCoreProc_stage1"
     hard_oom_config = _hard_oom_config()
-    recover_oom_config = OOM_RECOVER_INJECTION_CONFIG
-    fault_error_keywords = FAULT_ERROR_KEYWORDS
     process_kill_error_keywords = PROCESS_KILL_ERROR_KEYWORDS
     with_load_timeout_sec = 300.0
     concurrent_workers = 4
     concurrent_timeout_sec = 30.0
     serve_root_signals = QWEN_SERVE_ROOT_SIGNALS
     serve_root_with_load_signals = QWEN_SERVE_ROOT_SIGNALS
-    tree_with_load_signals = QWEN_TREE_WITH_LOAD_SIGNALS
-    oom_large_fail_message = "expected large chat payload request failure during GPU OOM injection"
+
+    def oom_under_load_request(self, server: Any) -> dict[str, Any]:
+        return _mix_probe_payload(server)
+
+    def oom_preflight_request(self, server: Any) -> dict[str, Any]:
+        return _oom_preflight_request(server.model)
 
     def warmup(self, client: Any, server: Any) -> None:
         client.send_omni_request(_multimodal_request(server.model), request_num=1)
@@ -340,7 +219,7 @@ class Qwen3Omni(FaultModel):
         client.send_omni_request(_multimodal_request(server.model), request_num=1)
 
     def submit_serve_load(self, client: Any, server: Any) -> None:
-        client.send_omni_request(_text_request(server.model), request_num=1)
+        client.send_omni_request(_multimodal_request(server.model), request_num=1)
 
     def submit_concurrent(self, client: Any, server: Any) -> Any:
         return client.send_chat_completions_http_request(
@@ -358,261 +237,13 @@ class Qwen3Omni(FaultModel):
         )
 
     def isolation_warmup(self, client: Any, server: Any) -> None:
-        _assert_text_200(client, server.model)
+        self.warmup(client, server)
 
     def isolation_after(self, client: Any, server: Any) -> None:
         _assert_text_200(client, server.model)
         client.send_chat_completions_http_request(
             {"json": _multimodal_request(server.model), "timeout": PARTIAL_ISOLATION_HTTP_TIMEOUT_SEC},
             err_code=500,
-        )
-
-    def oom_large_probe(self, client: Any, server: Any) -> None:
-        video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
-        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
-        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}"
-        messages = dummy_messages_from_mix_data(
-            system_prompt=_system_prompt(),
-            video_data_url=video_data_url,
-            image_data_url=image_data_url,
-            audio_data_url=audio_data_url,
-            content_text=f"{_mix_prompt()} " * 200,
-        )
-        client.send_omni_request(
-            {
-                "model": server.model,
-                "messages": messages,
-                "stream": True,
-                "key_words": {"audio": ["test"]},
-            },
-            request_num=1,
-        )
-
-    def oom_concurrent_probe(self, client: Any, server: Any) -> None:
-        video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
-        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
-        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}"
-        messages = dummy_messages_from_mix_data(
-            system_prompt=_system_prompt(),
-            video_data_url=video_data_url,
-            image_data_url=image_data_url,
-            audio_data_url=audio_data_url,
-            content_text=f"{_mix_prompt()} " * 200,
-        )
-        client.send_omni_request(
-            {
-                "model": server.model,
-                "messages": messages,
-                "stream": True,
-                "modalities": ["text", "audio"],
-                "key_words": {"audio": ["test"]},
-            },
-            request_num=4,
-        )
-
-    def run_error_contract(self, server: Any, client: Any) -> None:
-        device_spec = resolve_oom_device_spec(self.hard_oom_config, _deploy_config_path(server))
-        handle = inject_gpu_oom(
-            device=device_spec,
-            target_mem_ratio=self.hard_oom_config["target_mem_ratio"],
-            hold_seconds=self.hard_oom_config["hold_seconds"],
-            startup_timeout_sec=self.hard_oom_config["startup_timeout_sec"],
-            strict=self.hard_oom_config["strict"],
-            max_free_bytes=self.hard_oom_config["max_free_bytes"],
-        )
-        mix_base = _mix_probe_payload(server)
-        try:
-            text_request = {
-                "model": mix_base["model"],
-                "messages": mix_base["messages"],
-                "stream": False,
-                "modalities": ["text"],
-                "max_tokens": 256,
-            }
-            audio_request = {
-                "model": mix_base["model"],
-                "messages": mix_base["messages"],
-                "stream": False,
-                "modalities": ["text", "audio"],
-            }
-            client.send_chat_completions_http_request({"json": text_request, "timeout": 120}, err_code=500)
-            client.send_chat_completions_http_request({"json": audio_request, "timeout": 120}, err_code=500)
-        finally:
-            stop_gpu_oom_hogs(handle)
-        _assert_server_alive(client, scenario="oom_contract")
-
-    def run_oom_recovery(self, server: Any, client: Any) -> None:
-        _run_oom_recovery(server, client)
-
-
-def _mix_prompt() -> str:
-    return "What is recited in the audio? What is in this image? Describe the video briefly."
-
-
-def _run_oom_recovery(omni_server_function: Any, online_client_function: Any) -> None:
-    """Black-box: under bounded GPU pressure, a heavy mix chat fails; after hog stops, the same request succeeds.
-
-    Uses ``OOM_RECOVER_INJECTION_CONFIG``: HIP applies the proven hard-OOM free-memory
-    ceiling because a proportional target alone leaves several GiB free on MI300.
-    CUDA keeps the existing ratio-only behavior.
-
-    Fault and recovery phases use raw ``/v1/chat/completions`` HTTP so tests can assert
-    on status codes and JSON error payloads (or fault keywords in streamed bodies).
-    """
-    device_spec = resolve_oom_device_spec(
-        OOM_RECOVER_INJECTION_CONFIG,
-        _deploy_config_path(omni_server_function),
-    )
-    handle = inject_gpu_oom(
-        device=device_spec,
-        target_mem_ratio=OOM_RECOVER_INJECTION_CONFIG["target_mem_ratio"],
-        hold_seconds=OOM_RECOVER_INJECTION_CONFIG["hold_seconds"],
-        startup_timeout_sec=OOM_RECOVER_INJECTION_CONFIG["startup_timeout_sec"],
-        strict=OOM_RECOVER_INJECTION_CONFIG["strict"],
-        max_free_bytes=OOM_RECOVER_INJECTION_CONFIG["max_free_bytes"],
-    )
-    host = omni_server_function.host
-    port = omni_server_function.port
-    mix_payload = _mix_probe_payload(omni_server_function)
-    mix_chat_timeout_sec = 180
-    print(
-        "[oom-recover] injection ready "
-        f"device={device_spec} target_mem_ratio={OOM_RECOVER_INJECTION_CONFIG['target_mem_ratio']} "
-        f"strict={OOM_RECOVER_INJECTION_CONFIG['strict']} hold_seconds={OOM_RECOVER_INJECTION_CONFIG['hold_seconds']}"
-    )
-    print(f"[oom-recover] target endpoint http://{host}:{port}/v1/chat/completions")
-
-    failure_observed = False
-    fault_status: int | None = None
-    fault_body = b""
-    try:
-        try:
-            print(f"[oom-recover] fault-phase request start timeout={mix_chat_timeout_sec}s")
-            fault_status, fault_body = post_json_raw(
-                host,
-                port,
-                "/v1/chat/completions",
-                mix_payload,
-                timeout_sec=mix_chat_timeout_sec,
-            )
-            print(f"[oom-recover] fault-phase request done status={fault_status} body_prefix={fault_body[:200]!r}")
-        except Exception as exc:
-            failure_observed = True
-            print(f"[oom-recover] fault-phase request raised {type(exc).__name__}: {exc!r}")
-            assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
-        else:
-            assert fault_status is not None
-            stream_error_code = _stream_server_error_code(fault_body)
-            failure_observed = (
-                fault_status != 200
-                or stream_error_code is not None
-                or _fault_keywords_match_response(status=fault_status, body=fault_body)
-            )
-            assert failure_observed, (
-                "expected mix multimodal request failure while OOM pressure is active; "
-                f"status={fault_status}, stream_error_code={stream_error_code}, "
-                f"body_prefix={fault_body[:500]!r}"
-            )
-            if fault_status >= 400 and extract_openai_error_contract_from_bytes(fault_body) is None:
-                assert _fault_keywords_match_response(status=fault_status, body=fault_body), (
-                    "non-2xx without OpenAI-style error object should still mention fault hints in body; "
-                    f"status={fault_status}, body_prefix={fault_body[:500]!r}"
-                )
-            else:
-                assert stream_error_code is not None or _fault_keywords_match_response(
-                    status=fault_status, body=fault_body
-                ), (
-                    "HTTP 200 under pressure should still surface a streaming error code or fault hints; "
-                    f"stream_error_code={stream_error_code}, body_prefix={fault_body[:500]!r}"
-                )
-    finally:
-        print("[oom-recover] stopping OOM sidecar(s)")
-        stop_gpu_oom_hogs(handle)
-        print("[oom-recover] OOM sidecar(s) stopped")
-
-    recovery_deadline = time.monotonic() + 90.0
-    terminal_health: int | None = None
-    unreachable_streak = 0
-    last_health_exc: BaseException | None = None
-    while time.monotonic() < recovery_deadline:
-        try:
-            status = online_client_function.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
-            unreachable_streak = 0
-            if status in (200, 503):
-                terminal_health = status
-                print(f"[oom-recover] terminal health reached status={terminal_health}")
-                break
-        except Exception as exc:
-            last_health_exc = exc
-            if _looks_like_server_unreachable(exc):
-                unreachable_streak += 1
-                if unreachable_streak >= 5:
-                    pytest.fail(
-                        "after OOM sidecar stopped, /health is unreachable (connection refused / reset). "
-                        "The APIServer process likely exited (e.g. orchestrator thread crash under OOM); "
-                        "this test expects the server to stay up for post-fault health polling. "
-                        f"last_exc={last_health_exc!r}"
-                    )
-            else:
-                unreachable_streak = 0
-        time.sleep(1.0)
-    else:
-        pytest.fail(
-            "server did not converge to a terminal health state after OOM pressure was removed; "
-            f"last_health_exc={last_health_exc!r}"
-        )
-
-    probe_payload = {
-        "model": omni_server_function.model,
-        "messages": [{"role": "user", "content": "What is the capital of China? Answer in one word."}],
-        "stream": False,
-        "modalities": ["text"],
-    }
-    start = time.monotonic()
-    post_mix_status: int | None = None
-    post_mix_body = b""
-    request_status: int | None = None
-    try:
-        assert terminal_health is not None
-        if terminal_health == 200:
-            print(f"[oom-recover] recovery-phase mix request start timeout={mix_chat_timeout_sec}s")
-            post_mix_status, post_mix_body = post_json_raw(
-                host,
-                port,
-                "/v1/chat/completions",
-                mix_payload,
-                timeout_sec=mix_chat_timeout_sec,
-            )
-            print(
-                "[oom-recover] recovery-phase mix request done "
-                f"status={post_mix_status} body_prefix={post_mix_body[:200]!r}"
-            )
-        else:
-            print("[oom-recover] terminal health=503, send lightweight probe request")
-            request_status, _ = post_json_raw(host, port, "/v1/chat/completions", probe_payload, timeout_sec=20)
-            print(f"[oom-recover] lightweight probe done status={request_status}")
-    except Exception:
-        post_mix_status = None
-        request_status = None
-    elapsed = time.monotonic() - start
-    assert elapsed < 200, f"post-fault request should not hang after OOM removal: {elapsed:.2f}s"
-
-    if terminal_health == 200:
-        assert post_mix_status == 200, (
-            "health recovered but repeated mix multimodal request did not return HTTP 200; "
-            f"status={post_mix_status}, body_prefix={post_mix_body[:600]!r}"
-        )
-        recover_err = extract_openai_error_contract_from_bytes(post_mix_body)
-        assert recover_err is None, f"unexpected error object after recovery: {recover_err!r}"
-        recover_stream_code = _stream_server_error_code(post_mix_body)
-        assert recover_stream_code is None, (
-            "health recovered but the mix stream still carried a server error; "
-            f"stream_error_code={recover_stream_code}, body_prefix={post_mix_body[:600]!r}"
-        )
-    else:
-        assert request_status is None or request_status == 500, (
-            "unhealthy terminal state should fail fast on requests, "
-            f"got health={terminal_health}, request_status={request_status}"
         )
 
 
@@ -625,42 +256,30 @@ pytestmark = [
 ]
 
 
-@scenario_params(MODEL, GpuOomErrorContract)
-def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
-    omni_server_function,
-    online_client_function,
-) -> None:
-    """Text chat and audio output both return HTTP 500 under OOM, and the API stays up."""
-    GpuOomErrorContract().run(MODEL, omni_server_function, online_client_function)
+@scenario_params(MODEL, GpuOomUnderLoad)
+def test_gpu_oom_at_load(omni_server_function, online_client_function) -> None:
+    """One async-chunk OOM injection, followed by recovery or a restart-required state.
 
-
-@scenario_params(MODEL, GpuOomLarge)
-def test_reliability_fault_gpu_oom_large_request_failure(omni_server_function, online_client_function) -> None:
-    GpuOomLarge().run(MODEL, omni_server_function, online_client_function)
-
-
-@scenario_params(MODEL, GpuOomConcurrent)
-def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, online_client_function) -> None:
-    GpuOomConcurrent().run(MODEL, omni_server_function, online_client_function)
-
-
-@scenario_params(MODEL, GpuOomRecovery)
-def test_reliability_fault_gpu_oom_recovers_after_fault_removed(omni_server_function, online_client_function) -> None:
-    GpuOomRecovery().run(MODEL, omni_server_function, online_client_function)
+    A healthy instance must serve the same multimodal request again. A 503 or
+    unreachable API requires a full restart. Serial suite cases provide fresh
+    startup coverage; this case alone does not assert restart recovery.
+    """
+    GpuOomUnderLoad().run(MODEL, omni_server_function, online_client_function)
 
 
 @scenario_params(MODEL, ProcessKillWorkerNoLoad)
-def test_reliability_fault_process_kill_worker_no_load(
+def test_stage_crash_at_idle_001(
     omni_server_function,
     online_client_function,
     signal_name: str,
 ) -> None:
-    """After a quiet worker kill, the next request returns HTTP 500, then concurrent requests fail."""
+    """After a quiet worker kill, the next request returns HTTP 500, then concurrent requests fail and health becomes 503."""
     ProcessKillWorkerNoLoad().run(MODEL, omni_server_function, online_client_function, signal_name)
+    sigterm_serve_root_and_assert_cleanup(omni_server_function, scenario="stage_crash_at_idle")
 
 
 @scenario_params(MODEL, ProcessKillWorkerWithLoad, skip_reason="issue#8912")
-def test_reliability_fault_process_kill_worker_with_load_request_failure(
+def test_stage_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -669,7 +288,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 
 @scenario_params(MODEL, ProcessKillServeRootNoLoad)
-def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup(
+def test_serve_root_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -678,7 +297,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 
 @scenario_params(MODEL, ProcessKillServeRootWithLoad)
-def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
+def test_serve_root_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -687,7 +306,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
 
 
 @scenario_params(MODEL, ProcessKillTreeNoLoad)
-def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
+def test_process_tree_crash_at_idle(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -696,7 +315,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 
 @scenario_params(MODEL, ProcessKillTreeWithLoad)
-def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
+def test_process_tree_crash_at_load(
     omni_server_function,
     online_client_function,
     signal_name: str,
@@ -704,7 +323,50 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     ProcessKillTreeWithLoad().run(MODEL, omni_server_function, online_client_function, signal_name)
 
 
+@launch_scenario_params(MODEL, GpuOomAtLaunch)
+def test_gpu_oom_at_launch(launch_params) -> None:
+    """Exhaust GPU memory before startup. The failure is observable, and a later start serves."""
+    GpuOomAtLaunch().run(MODEL, launch_params)
+
+
+@launch_scenario_params(MODEL, PartialCrashAtLaunch)
+def test_stage_crash_at_launch(launch_params) -> None:
+    """Kill a stage before readiness; require failure and cleanup, with recovery covered by later serial cases."""
+    PartialCrashAtLaunch().run(MODEL, launch_params)
+
+
+@launch_scenario_params(MODEL, FullCrashAtLaunch)
+def test_process_tree_crash_at_launch(launch_params) -> None:
+    """Kill the startup process tree; later serial cases cover fresh startup and service.
+
+    This case alone does not verify restart recovery.
+    """
+    FullCrashAtLaunch().run(MODEL, launch_params)
+
+
+@scenario_params(MODEL, PartialCrashAtExit)
+def test_stage_crash_at_exit(omni_server_function, online_client_function) -> None:
+    """Begin shutdown, kill one stage, and require timely cleanup.
+
+    Later serial cases cover fresh startup and service; this case does not
+    independently verify restart recovery.
+    """
+    PartialCrashAtExit().run(MODEL, omni_server_function, online_client_function)
+
+
 @scenario_params(MODEL, PartialStageIsolation)
-def test_reliability_fault_partial_stage_isolation(omni_server_function, online_client_function) -> None:
+def test_stage_crash_at_idle_002(omni_server_function, online_client_function) -> None:
     """Kill one stage or one worker. Requests bound to it fail, and one SIGTERM still exits the API."""
     PartialStageIsolation().run(MODEL, omni_server_function, online_client_function)
+
+
+@scenario_params(MODEL, GracefulShutdown)
+def test_graceful_shutdown(omni_server_function, online_client_function) -> None:
+    """SIGTERM the healthy root; all children and resources must clear within 60s."""
+    GracefulShutdown().run(MODEL, omni_server_function, online_client_function)
+
+
+@launch_scenario_params(MODEL, ServeRootCrashAtLaunch, skip_reason="https://github.com/vllm-project/vllm/issues/43060")
+def test_serve_root_crash_at_launch(launch_params) -> None:
+    """SIGKILL only the root before readiness, after a worker exists; require orphan cleanup."""
+    ServeRootCrashAtLaunch().run(MODEL, launch_params)

@@ -230,7 +230,7 @@ def test_ltx_vocoder_loader_uses_profile_fallback(monkeypatch):
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
     calls: dict[str, Any] = {"components": []}
-    natten_processor = object()
+    neighborhood_processor = object()
 
     class FakeDiffusionDecoder:
         def set_attn_processor(self, processor):
@@ -303,8 +303,8 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     monkeypatch.setattr(ltx2_components, "load_transformer_config", fake_transformer_config)
     monkeypatch.setattr(
         ltx2_components,
-        "LTX2VideoVaeNeighborhoodNattenProcessor",
-        lambda: natten_processor,
+        "_create_ltx25_neighborhood_processor",
+        lambda: neighborhood_processor,
     )
     monkeypatch.setattr(
         ltx2_components,
@@ -337,7 +337,7 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         od_config.model,
         {"local_files_only": False, "dtype": torch.bfloat16, "revision": revision},
     )
-    assert calls["diffusion_decoder_processor"] is natten_processor
+    assert calls["diffusion_decoder_processor"] is neighborhood_processor
     assert calls["diffusion_decoder_tiling"] is True
     assert calls["diffusion_decoder_parallel"] == (2, "tile")
     assert calls["transformer_config"] == (
@@ -413,11 +413,46 @@ def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_arti
     assert calls["init_distributed"] is True
 
 
+def test_ltx25_neighborhood_processor_uses_triton_on_rocm(monkeypatch):
+    expected = object()
+
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodTritonProcessor",
+        lambda: expected,
+    )
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodNattenProcessor",
+        lambda: (_ for _ in ()).throw(AssertionError("ROCm must not initialize NATTEN")),
+    )
+
+    assert ltx2_components._create_ltx25_neighborhood_processor() is expected
+
+
+def test_ltx25_triton_failure_has_actionable_rocm_remedy(monkeypatch):
+    class MissingTritonProcessor:
+        def __init__(self):
+            raise RuntimeError("Triton is unavailable")
+
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodTritonProcessor",
+        MissingTritonProcessor,
+    )
+
+    with pytest.raises(RuntimeError, match=r"ROCm requires the bundled Triton.*working ROCm PyTorch and Triton"):
+        ltx2_components._create_ltx25_neighborhood_processor()
+
+
 def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
     class MissingNattenProcessor:
         def __init__(self):
             raise ImportError("kernels is unavailable")
 
+    monkeypatch.setattr(ltx2_components.current_omni_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(
         ltx2_components,
         "LTX2VideoVaeNeighborhoodNattenProcessor",
@@ -425,7 +460,7 @@ def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match=r"kernels==0\.16\.1.*supported GPU.*allow Hub access"):
-        ltx2_components._create_ltx25_natten_processor()
+        ltx2_components._create_ltx25_neighborhood_processor()
 
 
 def test_ltx_checkpoint_explicit_version_precedes_structural_heuristics(tmp_path):

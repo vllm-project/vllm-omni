@@ -7,13 +7,13 @@ import math
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.worker import block_table as native_block_table
 
 from vllm_omni.diffusion.diffusion_kv import model_runner_backend as model_runner_backend_module
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -186,12 +186,12 @@ class _FakeBlockTables:
 
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
-        self.block_sizes = list(kwargs["block_sizes"])
-        self.max_num_reqs = int(kwargs["max_num_reqs"])
-        self.max_num_batched_tokens = int(kwargs["max_num_batched_tokens"])
-        self.cp_size = int(kwargs["cp_size"])
-        self.cp_rank = int(kwargs["cp_rank"])
-        self.cp_interleave = int(kwargs["cp_interleave"])
+        self.block_sizes = list(cast(list[int], kwargs["block_sizes"]))
+        self.max_num_reqs = int(cast(int, kwargs["max_num_reqs"]))
+        self.max_num_batched_tokens = int(cast(int, kwargs["max_num_batched_tokens"]))
+        self.cp_size = int(cast(int, kwargs["cp_size"]))
+        self.cp_rank = int(cast(int, kwargs["cp_rank"]))
+        self.cp_interleave = int(cast(int, kwargs["cp_interleave"]))
         self.blocks_per_kv_block = [1] * len(self.block_sizes)
         self.block_tables = [_FakeStagedTable() for _ in self.block_sizes]
         self.num_blocks = _FakeNumBlocks(len(self.block_sizes), self.max_num_reqs)
@@ -300,7 +300,7 @@ def _install_native_modules(monkeypatch: pytest.MonkeyPatch, events: list[tuple]
         "get_diffusion_kv_block_tables_cls",
         lambda: _FakeBlockTables,
     )
-    monkeypatch.setattr(native_block_table, "get_block_table_width", get_block_table_width, raising=False)
+    monkeypatch.setattr(model_runner_backend_module, "get_block_table_width", get_block_table_width)
 
 
 def _runner(

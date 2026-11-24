@@ -108,6 +108,7 @@ class MingAudioVAEModel(nn.Module):
             info_list = runtime_infos if isinstance(runtime_infos, list) else None
         info_list = info_list or [{}]
         num_reqs = max(len(info_list), 1)
+        runner_ids = kwargs.get("request_ids") or []
         sr_tensor = torch.tensor(int(self.ming_config.sample_rate), dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32, device=self.vllm_config.device_config.device)
 
@@ -124,6 +125,14 @@ class MingAudioVAEModel(nn.Module):
                     f"Ming Stage-2 received a payload without {KEY_REQUEST_ID}. keys={sorted(info.keys())}"
                 )
             request_id = _resolve_request_id(info, idx)
+            if idx < len(runner_ids) and runner_ids[idx]:
+                # Match the ids on_requests_finished receives, so aborted requests free their state.
+                request_id = runner_ids[idx]
+            elif has_ming_context:
+                # Keyed by the payload id, this state would never be freed by on_requests_finished.
+                raise RuntimeError(
+                    f"Ming Stage-2 got no runner request id for batch slot {idx} ({len(runner_ids)} ids passed)."
+                )
             self._touch_request_state(request_id)
             chunk_id = _coerce_optional_int(_first_present(info.get(KEY_CHUNK_ID), kv_meta.get(KEY_CHUNK_ID)))
             finished = _coerce_finished(
@@ -242,6 +251,10 @@ class MingAudioVAEModel(nn.Module):
                 stacklevel=2,
             )
         return loaded
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            self._clear_request_state(request_id)
 
     def _clear_request_state(self, request_id: str) -> None:
         self._past_key_values.pop(request_id, None)

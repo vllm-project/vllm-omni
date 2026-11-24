@@ -49,8 +49,8 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=(f"{_PROC}.thinker2talker_async_chunk"),
             # Takes effect only when the deploy selects model_runner v2 for this stage.
             # Duplex commits each utterance as a fresh request, so the turn-mode
-            # native data plane also serves duplex. Resumable streaming input
-            # stays on the V1 prompt-replacement path.
+            # native data plane also serves duplex. Resumable DFlash speech
+            # acknowledges each segment before publishing to that plane.
             supports_native_mrv2_data_plane=True,
             supports_duplex_mrv2=True,
             sampling_constraints={"detokenize": True},
@@ -105,6 +105,15 @@ QWEN3_OMNI_CHAT_FALLBACK_PIPELINE = replace(
     duplex_plugin=(
         "vllm_omni.model_executor.models.qwen3_omni.duplex.chat_fallback_plugin.Qwen3OmniChatFallbackPlugin"
     ),
+)
+
+
+QWEN3_OMNI_RESUMABLE_PIPELINE = replace(
+    QWEN3_OMNI_PIPELINE,
+    model_type="qwen3_omni_moe_resumable",
+    # Scheduler-owned chunk publication confirms the segment boundary before
+    # forwarding Thinker's committed tokens and Talker's codec frames.
+    stages=tuple(replace(stage, supports_native_mrv2_data_plane=False) for stage in QWEN3_OMNI_PIPELINE.stages),
 )
 
 QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(

@@ -14,7 +14,7 @@ from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
-from vllm_omni.engine.messages import ErrorMessage
+from vllm_omni.engine.messages import AddCompanionRequestMessage, ErrorMessage
 from vllm_omni.entrypoints.async_omni import CACHE_RESET_TIMEOUT_S, AsyncOmni
 
 pytestmark = [pytest.mark.core_model]
@@ -32,6 +32,8 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
     omni._final_output_handler = lambda: None
+    omni._check_frontend_admission = lambda: None
+    omni._frontend_shutting_down = False
     omni._clear_frontend_mm_cache = AsyncMock()
 
     stage_configs = [SimpleNamespace(stage_type=stage_type) for stage_type in stage_types]
@@ -1780,7 +1782,12 @@ def test_cancelled_submit_with_landed_parent_keeps_mm_cache(mocker):
                 sampling_params_list=[object()],
             )
             mocker.patch.object(engine, "_build_add_request_message", return_value=parent)
-            mocker.patch.object(engine, "_build_cfg_companions", return_value=[object()])
+            companion = mocker.Mock(
+                spec=AddCompanionRequestMessage,
+                role="cfg_text",
+                companion_id="parent-1__cfg_text",
+            )
+            mocker.patch.object(engine, "_build_cfg_companions", return_value=[companion])
 
             await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(queue.async_q.join(), orch_loop))
             queue.sync_q.put_nowait(object())  # leave room for exactly the parent

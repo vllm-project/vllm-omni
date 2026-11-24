@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """stage input processor for a forced-aligner stage.
 
 Bridges a Code2Wav (audio) stage to a pooling forced-aligner stage:
@@ -51,7 +51,10 @@ def decode_pooling_output(logits: Any, request: Any, hf_config: Any) -> Any:
 
     ts_id = int(getattr(hf_config, "timestamp_token_id"))
     thinker_cfg = getattr(hf_config, "thinker_config", hf_config)
-    classify_num = int(getattr(thinker_cfg, "classify_num"))
+    classify_num = getattr(hf_config, "num_labels", None)
+    if classify_num is None:
+        classify_num = getattr(thinker_cfg, "classify_num")
+    classify_num = int(classify_num)
     seg_ms = float(getattr(hf_config, "timestamp_segment_time"))
 
     prompt_token_ids = list(getattr(request, "prompt_token_ids", []) or [])

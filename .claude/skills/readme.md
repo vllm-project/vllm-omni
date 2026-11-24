@@ -37,6 +37,10 @@ self-check.
 
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
+- [`add-fullduplex-model`](add-fullduplex-model/SKILL.md): guides integration of
+  new full-duplex speech and multimodal models on the unified engine-resident
+  duplex framework (`DuplexOmni`, `DuplexModelPlugin`, Model Runner V2 hooks,
+  `WS /v1/realtime?duplex=1`, and `omni_duplex_eval`)
 - [`add-omni-model`](add-omni-model/SKILL.md): integrates a new multi-stage
   thinker/talker/code2wav omni model, from the HF reference through pipeline,
   stage hand-off processors, deploy YAML, parity ladder, tests, and recipe
@@ -67,6 +71,10 @@ self-check.
   optimization, including stage attribution, TTFT / AUDIO_TTFP / AUDIO_RTF
   tuning, async_chunk codec chunking, CUDA graphs, MRv2, replicas, and
   quality-gated A/B evidence
+- [`omni-perf-ceiling`](omni-perf-ceiling/SKILL.md): estimates the best
+  reachable omni serving performance (for example AUDIO_RTF at a target
+  concurrency) from measured cells and per-stage calibrated roofline estimates, and reports the remaining unattributed gap, on CUDA GPUs
+  or Ascend NPUs
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
   PR by validating title format, dead code, simplification opportunities,
   accuracy and performance claims, and merge readiness

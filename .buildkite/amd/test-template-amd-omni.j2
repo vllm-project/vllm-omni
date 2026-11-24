@@ -71,13 +71,38 @@ steps:
   - group: "AMD Tests"
     depends_on: ~
     steps:
-      - label: "AMD: :docker: build image"
+      - label: "AMD: :docker: seed dependency cache"
         depends_on: ~
         soft_fail: false
         commands:
-          - "bash .buildkite/amd/scripts/build-ci-image.sh"
-        key: "amd-build"
+          - "bash .buildkite/amd/scripts/build-ci-image.sh cache"
+        key: "amd-cache"
         concurrency: 1
+        concurrency_group: "vllm-omni-amd-cache-publish"
+        env:
+          DOCKER_BUILDKIT: "1"
+          PYTORCH_ROCM_ARCH: "gfx942"
+          ROCM_CI_IMAGE_REGISTRY: "{{ docker_registry_amd }}"
+        retry:
+          automatic:
+            - exit_status: -1  # Agent was lost
+              limit: 2
+            - exit_status: -10  # Agent was lost
+              limit: 2
+            - exit_status: 128  # Git connectivity issues
+              limit: 2
+            - exit_status: 1  # Machine occasionally fail
+              limit: 1
+        agents:
+          queue: amd-cpu
+
+      - label: "AMD: :docker: build image"
+        depends_on: amd-cache
+        soft_fail: false
+        commands:
+          - "bash .buildkite/amd/scripts/build-ci-image.sh image"
+        key: "amd-build"
+        concurrency: 2
         concurrency_group: "vllm-omni-amd-image-publish"
         env:
           DOCKER_BUILDKIT: "1"

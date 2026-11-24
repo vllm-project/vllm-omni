@@ -412,6 +412,45 @@ mirror_hardwares:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
+  # Explicit eight-GPU A/B allocation: ordinary AR/DiT each need TP4.
+  # Keep this outside the numeric presets so unrelated "not cards_1" jobs
+  # retain their existing four-GPU maximum when hardware is inferred.
+  h100_weight_sharing_tp4:
+    agents:
+      queue: mithril-h100-pool
+    retry: *hardware_retry
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 8
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: VLLM_CI_HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
   # vLLM device: b200-k8s → agents.queue b200-k8s + Buildkite K8s agent-stack podSpec
   b200_1:
     agents:

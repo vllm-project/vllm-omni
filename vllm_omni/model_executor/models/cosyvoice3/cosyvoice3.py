@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from __future__ import annotations
+
 import hashlib
 import os
 from collections import OrderedDict
@@ -10,7 +12,7 @@ from functools import partial
 from math import gcd
 from threading import Lock
 from types import MethodType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import onnxruntime
@@ -24,7 +26,7 @@ from vllm.config.multimodal import BaseDummyOptions
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
@@ -38,8 +40,7 @@ from vllm.multimodal.processing import (
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
@@ -73,6 +74,9 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache, get_speaker_cache
 
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
+
 logger = init_logger(__name__)
 
 # vLLM stacks these Qwen2 projections; the checkpoint carries one tensor per shard.
@@ -80,6 +84,15 @@ _QWEN2_STACKED_SHARDS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
+
+
+class _CosyVoice3RejectionSampler(RejectionSampler):
+    def __call__(self, logits, input_batch, draft_logits=None):
+        output = super().__call__(logits, input_batch, draft_logits)
+        if input_batch.num_draft_tokens > 0:
+            # Startup warmup also verifies drafts; keep request-time evidence visible.
+            logger.debug("CosyVoice3 Talker is verifying draft codes")
+        return output
 
 
 def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) -> None:
@@ -118,6 +131,12 @@ def _normalize_request_conditioning(payload: dict) -> dict:
     batch dimension. A multi-item list here is an unsplit batch and must
     fail instead of silently choosing another request's voice.
     """
+    # MRv2 stores runner-owned request state beside the model conditioning.
+    # Keep it in the source buffer (including the sampler's SamplingParams),
+    # but validate only conditioning against the strict model payload schema.
+    payload = payload.copy()
+    for key in ("sampling_params", "req_id", "global_request_id", "mm_features", "prompt_embeds_cpu"):
+        payload.pop(key, None)
     embed = payload.get("embed")
     if not isinstance(embed, Mapping):
         return payload
@@ -287,6 +306,7 @@ def _ras_mrv2_sample(
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray | None = None,
     return_logprobs: bool = False,
     *,
     default_top_p: float,
@@ -308,7 +328,26 @@ def _ras_mrv2_sample(
     from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
     logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
-    sampler.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+    logit_bias_state = getattr(sampler, "logit_bias_state", None)
+    if logit_bias_state is not None:
+        logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+    else:
+        from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
+        from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+
+        ctx = LogitsContext(
+            expanded_idx_mapping=expanded_idx_mapping,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_local_pos=expanded_local_pos,
+            input_ids=input_ids,
+            pos=pos,
+            seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+        )
+        # RAS owns repetition handling; keep the other request constraints.
+        for processor in sampler.logits_processors:
+            if not isinstance(processor, PenaltiesState):
+                logits = processor.apply(logits, ctx)
     states = sampler.sampling_states
     temperature = states.temperature.gpu
     req_states = sampler.req_states
@@ -339,7 +378,11 @@ def _ras_mrv2_sample(
     row_temperature = temperature[rows]
     scores = torch.log_softmax(logits / row_temperature.clamp_min(eps).unsqueeze(1), dim=1)
     num_rows, vocab = scores.shape
-    top_k, top_p = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+    top_k, top_p, _ = states.get_top_k_top_p(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        scores.shape[-1],
+    )
     if top_p is None:
         top_p = scores.new_full((num_rows,), default_top_p)
     if top_k is None:
@@ -417,7 +460,7 @@ class _SpeechTokenBatcher:
                         future.set_exception(exc)
 
 
-_REFERENCE_CONDITIONERS: dict[str, "CosyVoice3MultiModalProcessor"] = {}
+_REFERENCE_CONDITIONERS: dict[str, CosyVoice3MultiModalProcessor] = {}
 _REFERENCE_CACHE_DEBUG = {True: 0, False: 0}
 _REFERENCE_CONDITIONERS_LOCK = Lock()
 
@@ -613,10 +656,10 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         model = model.to(device).eval()
         return (model, _s3, device)
 
-    _s3_batcher: "_SpeechTokenBatcher | None" = None
+    _s3_batcher: _SpeechTokenBatcher | None = None
 
     @classmethod
-    def _ensure_s3_batcher(cls) -> "_SpeechTokenBatcher":
+    def _ensure_s3_batcher(cls) -> _SpeechTokenBatcher:
         if cls._s3_batcher is None:
             model, s3, device = cls._ensure_s3_model()
             with _REFERENCE_CONDITIONERS_LOCK:
@@ -721,7 +764,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
 
     def _get_mm_fields_config(
         self,
-        hf_inputs: "BatchFeature",
+        hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         return {
@@ -795,6 +838,7 @@ class CosyVoice3DummyInputsBuilder(OmniDummyInputsBuilder[CosyVoice3MultiModalPr
 class CosyVoice3Model(
     nn.Module,
     SupportsMultiModal,
+    SupportsEagle3,
 ):
     supports_multimodal_raw_input_only = True
     supports_multimodal = True
@@ -806,6 +850,17 @@ class CosyVoice3Model(
     model_sampler_can_defer_rng = True
     supports_sampled_token_ids_cpu_override = True
     _sampling_eps = 1e-5
+
+    @property
+    def mrv2_forward_returns_tensor(self) -> bool:
+        """Declare the Talker's base MRv2 output contract.
+
+        The Talker returns hidden states directly. When DSpark requests target
+        layers, upstream MRv2 owns the resulting ``(hidden, aux)`` tuple via
+        ``use_aux_hidden_state_outputs``. Code2Wav returns ``OmniOutput`` and
+        still needs the structured-output capture path.
+        """
+        return self.model_stage == "cosyvoice3_talker"
 
     @property
     def owns_generation_output_storage(self) -> bool:
@@ -832,6 +887,19 @@ class CosyVoice3Model(
         self._pending_rejection_rng: DeferredRejection | None = None
         self._sampled_token_feedback: tuple[torch.Tensor, list[list[int]]] | None = None
         self.config = vllm_config.model_config.hf_config
+        self._dspark_config = vllm_config.speculative_config
+        if self._dspark_config is not None and not self._dspark_config.use_dspark():
+            self._dspark_config = None
+        if self._dspark_config is not None:
+            if vllm_config.model_config.model_stage != "cosyvoice3_talker":
+                raise ValueError("CosyVoice3 DSpark must be configured on the Talker stage only")
+            if not getattr(vllm_config.model_config, "use_v2_model_runner", True):
+                raise ValueError("CosyVoice3 DSpark requires model_runner: v2")
+            if vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise ValueError("CosyVoice3 DSpark currently supports one GPU (TP=1)")
+            draft_config = self._dspark_config.draft_model_config.hf_config
+            if draft_config.vocab_size != int(self.config.llm["speech_token_size"]) + 200:
+                raise ValueError("Convert the CosyVoice3 DSpark checkpoint to the speech vocabulary before serving")
         standard_sampling = cosyvoice3_standard_sampling(self.config)
         logger.info("CosyVoice3 sampling policy: %s", "standard" if standard_sampling else "ras")
         self.have_multimodal_outputs = True
@@ -887,11 +955,25 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
-    def get_language_model(self) -> "nn.Module":
-        """Return the language model for upstream MoE detection."""
+    def get_language_model(self) -> nn.Module:
+        """Expose the decoder for upstream MoE detection and draft-layer setup."""
+        if getattr(self, "_dspark_config", None) is not None:
+            # This Qwen decoder's text embedding is not a speech embedding.
+            # Converted drafts must retain their own embed_tokens and lm_head
+            # weights; upstream DSpark honors their loaded own-weight flags.
+            return self.talker.llm
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
         return self.model
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if self.model_stage != "cosyvoice3_talker":
+            raise ValueError("CosyVoice3 auxiliary hidden states belong to the Talker stage")
+        # MRv2 separates drafter target layers from Omni-owned auxiliary outputs.
+        self.talker.llm.model._set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return (2, 12, 21)
 
     def _create_llm_vllm_config(self, parent_config: VllmConfig) -> VllmConfig:
         """Create VllmConfig for the inner Qwen2 LLM.
@@ -1078,6 +1160,8 @@ class CosyVoice3Model(
         per_req_sampling_params: list[SamplingParams | None] | None = None,
         defer_rng: bool = False,
     ) -> SamplerOutput | None:
+        from vllm.v1.sample.sampler import Sampler
+
         if logits is None or logits.numel() == 0:
             return None
         if self.model_stage != "cosyvoice3_talker":
@@ -1218,7 +1302,7 @@ class CosyVoice3Model(
             raise RuntimeError("CosyVoice3 sampled-token feedback belongs to another step")
         return tokens
 
-    def mrv2_custom_sampler(self, sampler: Any) -> None:
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         """Model Runner V2: the V1 sampling policies on the MRv2 sampler.
 
         RAS replaces the sampling step (``_ras_mrv2_sample``). Standard
@@ -1245,12 +1329,33 @@ class CosyVoice3Model(
         state = getattr(sampler, "penalties_state", None)
         if state is not None:
             state.apply_staged_writes = MethodType(_generated_only_penalty_writes, state)
-        # MRv2 captures tensor outputs and constructs OmniOutput afterwards.
-        # This contract also applies when only the codec stage enables packed Flow.
-        self._mrv2_tensor_output = True
         # MRv2 hands make_omni_output no multimodal kwargs; carry each prompt's
         # conditioning from the encoder call to its batch row instead.
         self._mrv2_encoded_conditioning = OrderedDict()
+        if getattr(self, "_dspark_config", None) is not None:
+            if not cosyvoice3_standard_sampling(self.config):
+                from vllm_omni.model_executor.models.cosyvoice3.dspark import (
+                    ras_probabilities,
+                    ras_verification_logits,
+                )
+
+                sampler._cosyvoice3_ras_probabilities = torch.compile(ras_probabilities, dynamic=True)
+                sampler.apply_sampling_params = MethodType(
+                    partial(
+                        ras_verification_logits,
+                        default_top_p=float(sampling_cfg.get("top_p", 0.8)),
+                        default_top_k=int(sampling_cfg.get("top_k", 25)),
+                        win_size=int(sampling_cfg.get("win_size", 10)),
+                        tau_r=float(sampling_cfg.get("tau_r", 0.1)),
+                    ),
+                    sampler,
+                )
+            logger.info(
+                "CosyVoice3 DSpark enabled: %d draft tokens, sampling policy %s",
+                self._dspark_config.num_speculative_tokens,
+                "standard" if cosyvoice3_standard_sampling(self.config) else "ras-exact-verification",
+            )
+            return sampler, _CosyVoice3RejectionSampler(sampler, self._dspark_config, sampler.req_states.device)
         return None
 
     def _full_vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -1540,6 +1645,10 @@ class CosyVoice3Model(
         # Packed Flow owns the torch estimator; speaker TRT remains independent.
         if cosyvoice3_packed_inference_enabled():
             return
+        # Explicit padded compilation owns this estimator; speaker TRT is independent.
+        # Compilation is selected at load time; runtime flag changes are unsupported.
+        if getattr(self.config, "cosyvoice3_compile_dit", False):
+            return
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
         onnx_path = self._resolve_flow_estimator_onnx()
@@ -1637,7 +1746,7 @@ class CosyVoice3Model(
         inputs_embeds: torch.Tensor | None = None,
         additional_information: dict[str, object] | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | OmniOutput:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | OmniOutput:
         if self.model_stage == "cosyvoice3_talker":
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)

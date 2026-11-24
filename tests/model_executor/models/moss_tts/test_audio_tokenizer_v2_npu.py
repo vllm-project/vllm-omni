@@ -205,14 +205,7 @@ def test_npu_addcmul_layer_matches_mul_add():
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_npu_multi_layer_streaming_matches_whole_sequence(dtype):
-    """Chunked streaming with headroom matches whole-sequence decode on NPU.
-
-    fp32: matches to ~1e-5 (measured 7.6e-6).  bf16 on NPU is *not* exact:
-    the fused bf16 attention path accumulates roughly 15 dB-SNR rounding noise
-    through the untrained random-weight codec.  That divergence is inherited
-    from ``main`` (pure ``main`` measures 16.7 dB, identical to this branch), so
-    the bf16 case gates on the empirical SNR baseline instead of 1e-3.
-    """
+    """Chunked decode must preserve whole-sequence causal visibility on NPU."""
     model = _tiny_codec(num_layers=3, dtype=dtype)
     model = model.to("npu")
     torch.manual_seed(1)
@@ -220,21 +213,56 @@ def test_npu_multi_layer_streaming_matches_whole_sequence(dtype):
     reference = model._decode_frame(codes).audio
     with_headroom = _stream_decode(model, codes, 6, headroom=True)
     assert with_headroom.shape == reference.shape
-    if dtype == torch.float32:
-        torch.testing.assert_close(with_headroom.float(), reference.float(), rtol=1e-3, atol=1e-3)
-    else:
-        snr = _waveform_snr(reference, with_headroom)
-        assert snr > 15.0, f"streaming-vs-whole SNR={snr:.2f} dB"
+    torch.testing.assert_close(with_headroom.float(), reference.float(), rtol=1e-3, atol=1e-3)
+
+
+@hardware_test(res={"npu": "A3"}, num_cards=1)
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("frames", [1, 2])
+def test_npu_shared_metadata_masks_invalid_and_future_keys(dtype: torch.dtype, frames: int) -> None:
+    """Shared metadata and its layer-to-layer reuse must preserve causal visibility."""
+    from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
+        MossAudioTokenizerMultiheadAttention,
+        StreamingExecutionContext,
+        prepare_streaming_attention_metadata,
+    )
+
+    slots = torch.zeros(1, dtype=torch.long, device="npu")
+    valid = torch.ones(1, dtype=torch.bool, device="npu")
+    metadata = prepare_streaming_attention_metadata(slots, valid, frames, 4, 4, True)
+    execution_context = StreamingExecutionContext(slots, valid, metadata)
+    x = torch.ones(1, frames, 64, device="npu", dtype=dtype)
+    if frames == 2:
+        x[:, 1] = 3
+    expected = torch.tensor([1.0] if frames == 1 else [1.0, 2.0], device="npu", dtype=dtype)
+    shared_bias = None
+    for _ in range(2):
+        attention = MossAudioTokenizerMultiheadAttention(
+            64, 1, causal=True, context=4, device="npu", dtype=dtype
+        ).eval()
+        # Q=K=0 gives uniform attention; V and the output projection are identities.
+        attention.in_projs[0].weight.zero_()
+        attention.in_projs[0].weight[128:].copy_(torch.eye(64, device="npu", dtype=dtype))
+        attention.out_projs[0].weight.copy_(torch.eye(64, device="npu", dtype=dtype))
+        state = attention._init_streaming_state(1)
+        attention._streaming_state = state
+        assert state.kv_cache is not None
+        state.kv_cache.cache[0].zero_()
+        state.kv_cache.cache[1].fill_(100)
+        actual = attention(x, x, x, execution_context=execution_context, attn_bias=shared_bias)
+        torch.testing.assert_close(actual, expected.view(1, frames, 1).expand_as(actual), rtol=0, atol=0)
+        shared_bias = attention._cached_attn_bias
 
 
 @hardware_test(res={"npu": "A3"}, num_cards=1)
 @torch.no_grad()
 def test_npu_slot_reset_reuse():
-    """Slot reset and reuse produces the same audio on NPU."""
+    """A reset slot must not expose KV left by a different, longer input."""
     model = _tiny_codec(num_layers=3, dtype=torch.bfloat16)
     model = model.to("npu")
     torch.manual_seed(5)
-    codes = torch.randint(0, 16, (2, 1, 12), device="npu")
+    codes = torch.randint(0, 16, (2, 1, 24), device="npu")
 
     model.initialize_decoder_state_pool(2, 0, chunk_frames=6)
     try:
@@ -242,12 +270,49 @@ def test_npu_slot_reset_reuse():
         valid = torch.ones(1, dtype=torch.bool, device="npu")
         out1 = model.decode_streaming_batch(codes[:, :, :6], torch.tensor([6], device="npu"), slot, valid).audio
 
-        model.reset_decoder_state_slots(torch.tensor([0], device="npu"))
+        model.reset_decoder_state_slots(slot)
+        for start in range(6, 24, 6):
+            model.decode_streaming_batch(codes[:, :, start : start + 6], torch.tensor([6], device="npu"), slot, valid)
+        model.reset_decoder_state_slots(slot)
         out2 = model.decode_streaming_batch(codes[:, :, :6], torch.tensor([6], device="npu"), slot, valid).audio
     finally:
         model.close_decoder_state_pool()
 
-    torch.testing.assert_close(out2, out1, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(out2, out1, rtol=0, atol=0)
+
+
+@hardware_test(res={"npu": "A3"}, num_cards=1)
+@torch.no_grad()
+def test_npu_slot_reset_reuse_with_codec_graph() -> None:
+    """Real codec graph replay must isolate reset request slots, including padding."""
+    from vllm.config import VllmConfig
+
+    from vllm_omni.platforms.npu.models.moss_tts_streaming_decode_wrapper import NPUGraphStreamingDecoderWrapper
+
+    model = _tiny_codec(num_layers=3, dtype=torch.bfloat16).to("npu").eval()
+    torch.manual_seed(5)
+    codes = torch.randint(0, 16, (2, 1, 24), device="npu")
+    slots = torch.zeros(1, dtype=torch.long, device="npu")
+    model.initialize_decoder_state_pool(2, 1, chunk_frames=6)
+    try:
+        wrapper = NPUGraphStreamingDecoderWrapper(
+            model, state_capacity=2, batch_sizes=[2], frame_sizes=[6], num_quantizers=2, vllm_config=VllmConfig()
+        )
+        wrapper.warmup(torch.device("npu:0"))
+        first = wrapper.decode(codes[:, :, :6], slots)
+        assert first is not None
+        model.reset_decoder_state_slots(slots)
+        for start in range(6, 24, 6):
+            assert wrapper.decode(codes[:, :, start : start + 6], slots) is not None
+        model.reset_decoder_state_slots(slots)
+        second = wrapper.decode(codes[:, :, :6], slots)
+        assert second is not None
+        torch.testing.assert_close(second[0], first[0], rtol=0, atol=0)
+        assert wrapper._graph_runner is not None
+        assert wrapper._graph_runner.stats["failed"] == 0
+        assert wrapper._graph_runner.stats["hits"] > 0
+    finally:
+        model.close_decoder_state_pool()
 
 
 @hardware_test(res={"npu": "A3"}, num_cards=1)

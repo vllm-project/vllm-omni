@@ -67,3 +67,30 @@ def test_safe_linalg_solve_reraises_unrelated_runtime_error(monkeypatch: pytest.
 
     with pytest.raises(RuntimeError, match="solver exploded for another reason"):
         flow_matching.safe_linalg_solve(matrix, rhs)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (True, "shift must be a number, not a boolean, got True."),
+        ("abc", "shift must be a number, got 'abc'."),
+        (None, "shift must be a number, got None."),
+        pytest.param(10**400, "shift is too large to represent as a float.", id="huge-int"),
+        ("nan", "shift must be a finite float, got 'nan'."),
+        (float("-inf"), "shift must be a finite float, got -inf."),
+        ("1e400", "shift must be a finite float, got '1e400'."),
+        (0.0, "shift must be greater than 0, got 0.0."),
+        (-2, "shift must be greater than 0, got -2."),
+    ],
+)
+def test_normalize_shift_raises_value_error_with_specific_message(value: object, message: str):
+    with pytest.raises(ValueError) as exc_info:
+        flow_matching.normalize_shift(value, name="shift")
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == message
+
+
+@pytest.mark.parametrize(("value", "expected"), [(0.25, 0.25), ("3.0", 3.0), (12, 12.0)])
+def test_normalize_shift_returns_positive_finite_float(value: object, expected: float):
+    assert flow_matching.normalize_shift(value, name="shift") == expected

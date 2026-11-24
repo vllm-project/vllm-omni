@@ -109,9 +109,7 @@ def preprocess_chat(mocker: MockerFixture, serving_chat):
     renderer = mocker.MagicMock()
     renderer.tokenizer = object()
     renderer.render_chat_async = mocker.AsyncMock(return_value=(([],), ({"prompt_token_ids": [1]},)))
-    chat_params = mocker.MagicMock()
     mocker.patch.object(ChatCompletionRequest, "build_tok_params", return_value=object())
-    mocker.patch.object(ChatCompletionRequest, "build_chat_params", return_value=chat_params)
 
     async def preprocess(request, *, supported=None):
         if supported is not None:
