@@ -13,6 +13,8 @@ msgpack without ``pickle`` or ``VLLM_ALLOW_INSECURE_SERIALIZATION``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Sequence
 from typing import Any
 
@@ -44,12 +46,24 @@ def is_encoded_ipc_handle(value: Any) -> bool:
     return isinstance(value, dict) and len(value) == 1 and IPC_WIRE_TAG in value
 
 
-def _check_optional_bytes(value: Any, field_name: str) -> bytes | None:
+def _check_optional_bytes(value: Any, field_name: str, *, allow_b64_str: bool = False) -> bytes | None:
     if value is None:
         return None
     if isinstance(value, (bytes, bytearray)):
         return bytes(value)
+    if allow_b64_str and isinstance(value, str):
+        try:
+            return base64.b64decode(value.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+            raise ValueError(f"CUDA IPC handle {field_name} has invalid base64 payload") from exc
     raise ValueError(f"CUDA IPC handle {field_name} must be bytes or None, got {type(value).__name__}")
+
+
+def _encode_optional_bytes(value: Any, field_name: str, *, json_safe: bool) -> bytes | str | None:
+    raw = _check_optional_bytes(value, field_name)
+    if raw is None or not json_safe:
+        return raw
+    return base64.b64encode(raw).decode("ascii")
 
 
 def _check_int(value: Any, field_name: str) -> int:
@@ -64,8 +78,8 @@ def _check_bool(value: Any, field_name: str) -> bool:
     return value
 
 
-def encode_ipc_handle_args(args: Sequence[Any]) -> dict[str, list[Any]]:
-    """Encode a 15-tuple of ``rebuild_cuda_tensor`` args into msgspec-safe primitives."""
+def encode_ipc_handle_args(args: Sequence[Any], *, json_safe: bool = False) -> dict[str, list[Any]]:
+    """Encode a 15-tuple of ``rebuild_cuda_tensor`` args into wire-safe primitives."""
     if is_encoded_ipc_handle(args):
         # Validate by round-tripping once rather than blindly trusting input.
         args = decode_ipc_handle_args(args)
@@ -114,13 +128,13 @@ def encode_ipc_handle_args(args: Sequence[Any]) -> dict[str, list[Any]]:
         storage_cls_name,
         dtype_name,
         _check_int(storage_device, "storage_device"),
-        _check_optional_bytes(storage_handle, "storage_handle"),
+        _encode_optional_bytes(storage_handle, "storage_handle", json_safe=json_safe),
         _check_int(storage_size_bytes, "storage_size_bytes"),
         _check_int(storage_offset_bytes, "storage_offset_bytes"),
         _check_bool(requires_grad, "requires_grad"),
-        _check_optional_bytes(ref_counter_handle, "ref_counter_handle"),
+        _encode_optional_bytes(ref_counter_handle, "ref_counter_handle", json_safe=json_safe),
         _check_int(ref_counter_offset, "ref_counter_offset"),
-        _check_optional_bytes(event_handle, "event_handle"),
+        _encode_optional_bytes(event_handle, "event_handle", json_safe=json_safe),
         _check_bool(event_sync_required, "event_sync_required"),
     ]
     return {IPC_WIRE_TAG: encoded}
@@ -172,21 +186,21 @@ def decode_ipc_handle_args(encoded: Any) -> tuple[Any, ...]:
         _NAME_TO_STORAGE_CLS[storage_cls_name],
         _NAME_TO_DTYPE[dtype_name],
         _check_int(storage_device, "storage_device"),
-        _check_optional_bytes(storage_handle, "storage_handle"),
+        _check_optional_bytes(storage_handle, "storage_handle", allow_b64_str=True),
         _check_int(storage_size_bytes, "storage_size_bytes"),
         _check_int(storage_offset_bytes, "storage_offset_bytes"),
         _check_bool(requires_grad, "requires_grad"),
-        _check_optional_bytes(ref_counter_handle, "ref_counter_handle"),
+        _check_optional_bytes(ref_counter_handle, "ref_counter_handle", allow_b64_str=True),
         _check_int(ref_counter_offset, "ref_counter_offset"),
-        _check_optional_bytes(event_handle, "event_handle"),
+        _check_optional_bytes(event_handle, "event_handle", allow_b64_str=True),
         _check_bool(event_sync_required, "event_sync_required"),
     )
 
 
-def _encode_handle_dict(handle_dict: dict[str, Any]) -> dict[str, dict[str, list[Any]]]:
+def _encode_handle_dict(handle_dict: dict[str, Any], *, json_safe: bool = False) -> dict[str, dict[str, list[Any]]]:
     if not isinstance(handle_dict, dict):
         raise ValueError(f"Expected dict mapping GPU UUID to IPC args, got {type(handle_dict).__name__}")
-    return {uuid: encode_ipc_handle_args(args) for uuid, args in handle_dict.items()}
+    return {uuid: encode_ipc_handle_args(args, json_safe=json_safe) for uuid, args in handle_dict.items()}
 
 
 def _decode_handle_dict(handle_dict: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
@@ -208,12 +222,14 @@ def _decode_handle_dict(handle_dict: dict[str, Any]) -> dict[str, tuple[Any, ...
 
 def encode_ipc_handles(
     handles: list[dict[str, Any]] | dict[str, Any],
+    *,
+    json_safe: bool = False,
 ) -> list[dict[str, dict[str, list[Any]]]] | dict[str, dict[str, list[Any]]]:
-    """Encode per-parameter or single-buffer IPC handle mappings for msgspec transport."""
+    """Encode per-parameter or single-buffer IPC handle mappings for msgspec or JSON transport."""
     if isinstance(handles, list):
-        return [_encode_handle_dict(item) for item in handles]
+        return [_encode_handle_dict(item, json_safe=json_safe) for item in handles]
     if isinstance(handles, dict):
-        return _encode_handle_dict(handles)
+        return _encode_handle_dict(handles, json_safe=json_safe)
     raise ValueError(f"Expected list or dict of IPC handles, got {type(handles).__name__}")
 
 

@@ -311,12 +311,18 @@ def _two_rank_all_gather_worker(rank: int, port: int, fail_sender_rpc: bool) -> 
             def finish_weight_update(self, weight_version: str | None = None) -> None:
                 assert rank == 0
 
+        released_counters = 0
+
         def fake_reduce(t: torch.Tensor):
             return (None, _fake_cuda_ipc_args(t, storage_handle=f"rank-{rank}".encode()))
 
         def on_ipc_collect():
             nonlocal ipc_collect_calls
             ipc_collect_calls += 1
+
+        def on_release_counter(_ipc_args: tuple[Any, ...]) -> None:
+            nonlocal released_counters
+            released_counters += 1
 
         # Insert keys in opposite orders on rank 0 vs rank 1 to prove sorted-name alignment.
         tensors = (
@@ -339,6 +345,7 @@ def _two_rank_all_gather_worker(rank: int, port: int, fail_sender_rpc: bool) -> 
                 stage_tensor_fn=lambda t: t.detach().clone().contiguous(),
                 ipc_collect_fn=on_ipc_collect,
                 synchronize_fn=lambda: None,
+                release_ipc_counter_fn=on_release_counter,
             ),
             client=RecordingClient(),
             source=source,
@@ -353,7 +360,9 @@ def _two_rank_all_gather_worker(rank: int, port: int, fail_sender_rpc: bool) -> 
             trainer.send_weights()
 
         # Both ranks must reach outcome exchange and ipc_collect without deadlocking.
+        # Because update_weights() was attempted, neither rank may manually decrement IPC counters.
         assert ipc_collect_calls == 1
+        assert released_counters == 0
         if rank == 0:
             if fail_sender_rpc:
                 assert len(received_payloads) == 2
@@ -392,10 +401,18 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
     try:
         ipc_collect_calls = 0
         reduce_calls = 0
+        released_counters = 0
+        events: list[str] = []
 
         def on_ipc_collect():
             nonlocal ipc_collect_calls
             ipc_collect_calls += 1
+            events.append("ipc_collect")
+
+        def on_release_counter(_ipc_args: tuple[Any, ...]) -> None:
+            nonlocal released_counters
+            released_counters += 1
+            events.append("release_counter")
 
         class NoopClient:
             def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
@@ -422,13 +439,20 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
         def reduce_fn(t: torch.Tensor):
             nonlocal reduce_calls
             reduce_calls += 1
+            if mode == "export_fail_rank1" and rank == 1 and reduce_calls == 2:
+                raise RuntimeError("injected rank1 partial reduce_tensor failure")
             if mode == "sender_encode_fail" and rank == 0:
                 # Picklable built-in class rejected by encode_ipc_handles on sender AFTER all-gather.
                 return (None, _fake_cuda_ipc_args(t, tensor_cls=object))
             return (None, _fake_cuda_ipc_args(t))
 
+        tensors = (
+            {"a.lora_A.weight": torch.ones(2, 4), "b.lora_B.weight": torch.ones(4, 2)}
+            if mode == "export_fail_rank1"
+            else {"a.lora_A.weight": torch.ones(2, 4)}
+        )
         source = LoRAAdapterWeightSource(
-            {"a.lora_A.weight": torch.ones(2, 4)},
+            tensors,
             peft_config={"r": 2, "lora_alpha": 2, "target_modules": ["gate"]},
         )
         trainer = WeightTransferTrainerFactory.trainer_init(
@@ -440,6 +464,7 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
                 stage_tensor_fn=stage_fn,
                 ipc_collect_fn=on_ipc_collect,
                 synchronize_fn=sync_fn,
+                release_ipc_counter_fn=on_release_counter,
             ),
             client=NoopClient(),
             source=source,
@@ -451,6 +476,7 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
                 trainer.send_weights()
             # No rank may export CUDA IPC handles when preparation fails.
             assert reduce_calls == 0
+            assert released_counters == 0
             assert ipc_collect_calls == 0
         elif mode == "sync_fail_rank1":
             match = "injected rank1 async CUDA sync error" if rank == 1 else "trainer preparation failed on rank 1"
@@ -458,7 +484,17 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
                 trainer.send_weights()
             # Local synchronize failure is coordinated before any IPC export.
             assert reduce_calls == 0
+            assert released_counters == 0
             assert ipc_collect_calls == 0
+        elif mode == "export_fail_rank1":
+            match = "injected rank1 partial reduce_tensor failure" if rank == 1 else "handle export failed on rank 1"
+            with pytest.raises(RuntimeError, match=match):
+                trainer.send_weights()
+            # Every confirmed-unpublished export releases its IPC counter before ipc_collect.
+            expected_exports = 2 if rank == 0 else 1
+            assert released_counters == expected_exports
+            assert ipc_collect_calls == 1
+            assert events == ["release_counter"] * expected_exports + ["ipc_collect"]
         else:
             if rank == 0:
                 with pytest.raises(ValueError, match="Unsupported tensor class"):
@@ -466,13 +502,16 @@ def _rank_failure_phase_worker(rank: int, port: int, mode: str) -> None:
             else:
                 with pytest.raises(RuntimeError, match="weight sync failed on rank 0"):
                     trainer.send_weights()
+            # Encoding failed before update_weights(), so both ranks release unpublished counters.
             assert reduce_calls == 1
+            assert released_counters == 1
             assert ipc_collect_calls == 1
+            assert events == ["release_counter", "ipc_collect"]
     finally:
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["prep_oom_rank1", "sync_fail_rank1", "sender_encode_fail"])
+@pytest.mark.parametrize("mode", ["prep_oom_rank1", "sync_fail_rank1", "export_fail_rank1", "sender_encode_fail"])
 def test_trainer_multi_rank_failures_before_and_after_gather_do_not_deadlock(mode):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -483,7 +522,6 @@ def test_trainer_multi_rank_failures_before_and_after_gather_do_not_deadlock(mod
 @pytest.mark.parametrize(
     "failure_mode",
     [
-        "start_reply_lost",
         "update_before_worker",
         "update_reply_lost_after_staging",
         "finish_before_worker",
@@ -496,10 +534,9 @@ def test_trainer_aborts_remote_worker_without_committing_on_interrupted_rpc(
     failure_mode,
     client_has_abort_method,
 ):
-    """Interrupted start, update, or finish must keep worker state consistent and usable.
+    """Interrupted update or finish must keep worker state consistent and usable.
 
     Covers:
-    - start_weight_update reaching the worker with only the reply lost
     - update_weights failing before reaching the worker
     - update_weights reaching the worker (staging the full adapter) with only the reply lost
     - finish_weight_update failing before reaching the worker
@@ -564,10 +601,6 @@ def test_trainer_aborts_remote_worker_without_committing_on_interrupted_rpc(
                 worker.init_weight_transfer_engine(init_info)
 
             def start_weight_update(self) -> None:
-                if fault_armed["armed"] and failure_mode == "start_reply_lost":
-                    fault_armed["armed"] = False
-                    worker.start_weight_update()
-                    raise ConnectionError("simulated start reply loss after worker started session")
                 worker.start_weight_update()
 
             def update_weights(self, update_info: dict[str, Any]) -> None:
@@ -753,6 +786,236 @@ def test_trainer_does_not_abort_unrelated_already_active_session(monkeypatch):
         assert "existing" in worker_engine._staged.tensors
 
 
+@pytest.mark.parametrize(
+    ("start_outcome", "other_session_has_staged"),
+    [
+        ((409, '{"detail": "start_weight_update called while a weight update is already active"}'), True),
+        ((409, '{"detail": "conflict"}'), True),
+        ((500, "Internal Server Error"), True),
+        ((504, "Gateway Timeout"), False),
+        ("read_timeout", False),
+    ],
+)
+def test_trainer_http_client_start_failure_never_aborts_other_session(
+    monkeypatch,
+    start_outcome,
+    other_session_has_staged,
+):
+    """Unconfirmed start_weight_update failures over HTTPVLLMWeightSyncClient must never abort another session."""
+    import requests
+    from vllm.distributed.weight_transfer.clients import HTTPVLLMWeightSyncClient
+
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    for mod in (linear, parameter):
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: 0)
+
+    with set_current_vllm_config(VllmConfig()):
+        model = torch.nn.Module()
+        model.transformer = torch.nn.Module()
+        model.transformer.stacked_params_mapping = [("gate_up", "gate", 0), ("gate_up", "up", 1)]
+        model.transformer.gate_up = linear.MergedColumnParallelLinear(
+            4, [6, 6], bias=False, params_dtype=torch.bfloat16
+        )
+        manager = DiffusionLoRAManager(model, torch.device("cpu"), torch.bfloat16, lora_application="merged")
+        worker_engine = MergedLoRAIPCWeightTransferEngine(
+            WeightTransferConfig(backend="omni_lora_ipc"), VllmConfig(), torch.device("cpu"), model
+        )
+        worker_engine.lora_manager = manager
+        worker = object.__new__(DiffusionWorker)
+        worker.weight_transfer_engine = worker_engine
+        worker._weight_update_active = False
+
+        # Pre-existing active session owned by another caller (empty or already staged).
+        worker.start_weight_update()
+        if other_session_has_staged:
+            worker_engine._kind = "adapter"
+            worker_engine._staged.tensors["other_caller"] = torch.ones(2, 4)
+
+        posted: list[tuple[str, Any]] = []
+
+        def fake_post(url: str, json: dict[str, Any] | None = None, timeout: float = 300):
+            path = url.rsplit("/", 1)[-1]
+            posted.append((path, json))
+            resp = requests.Response()
+            resp.url = url
+            if path == "init_weight_transfer_engine":
+                worker.init_weight_transfer_engine(json["init_info"])
+                resp.status_code = 200
+                resp._content = b'{"message":"ok"}'
+                return resp
+            if path == "start_weight_update":
+                if start_outcome == "read_timeout":
+                    raise requests.exceptions.ReadTimeout("simulated start read timeout")
+                status_code, body = start_outcome
+                resp.status_code = status_code
+                resp.reason = "Error"
+                resp._content = body.encode("utf-8")
+                return resp
+            raise AssertionError(f"Unexpected HTTP route after failed start: {path}")
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        released_counters = 0
+
+        def on_release_counter(_ipc_args: tuple[Any, ...]) -> None:
+            nonlocal released_counters
+            released_counters += 1
+
+        client = HTTPVLLMWeightSyncClient("http://127.0.0.1:8000")
+        source = LoRAAdapterWeightSource(
+            {"base_model.model.transformer.gate.lora_A.weight": torch.ones(2, 4)},
+            peft_config={"r": 2, "lora_alpha": 2, "target_modules": ["gate"]},
+            lora_int_id=12,
+        )
+        trainer = WeightTransferTrainerFactory.trainer_init(
+            MergedLoRAIPCTrainerInitInfo(
+                rank=0,
+                gpu_uuid="gpu-0",
+                reduce_tensor_fn=lambda t: (None, _fake_cuda_ipc_args(t)),
+                stage_tensor_fn=lambda t: t.detach().clone().contiguous(),
+                ipc_collect_fn=lambda: None,
+                synchronize_fn=lambda: None,
+                release_ipc_counter_fn=on_release_counter,
+            ),
+            client=client,
+            source=source,
+        )
+
+        expected_exc = requests.exceptions.ReadTimeout if start_outcome == "read_timeout" else requests.HTTPError
+        with pytest.raises(expected_exc) as exc_info:
+            trainer.send_weights()
+        if expected_exc is requests.HTTPError:
+            assert "already active" not in str(exc_info.value)
+
+        # No abort request may be sent on an unconfirmed start, and unpublished IPC exports are released.
+        assert [path for path, _ in posted if path == "update_weights"] == []
+        assert released_counters == 1
+        assert worker._weight_update_active is True
+        if other_session_has_staged:
+            assert "other_caller" in worker_engine._staged.tensors
+
+
+def test_trainer_http_client_successful_update_without_insecure_serialization(monkeypatch):
+    """Real HTTPVLLMWeightSyncClient publishes JSON-safe handles with VLLM_ALLOW_INSECURE_SERIALIZATION=0."""
+    import json
+
+    import requests
+    from vllm import envs as vllm_envs
+    from vllm.distributed.weight_transfer.clients import HTTPVLLMWeightSyncClient
+
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    monkeypatch.setattr(vllm_envs, "VLLM_ALLOW_INSECURE_SERIALIZATION", False)
+    for mod in (linear, parameter):
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: 0)
+
+    with set_current_vllm_config(VllmConfig()):
+        model = torch.nn.Module()
+        model.transformer = torch.nn.Module()
+        model.transformer.stacked_params_mapping = [("gate_up", "gate", 0), ("gate_up", "up", 1)]
+        model.transformer.gate_up = linear.MergedColumnParallelLinear(
+            4, [6, 6], bias=False, params_dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            model.transformer.gate_up.weight.fill_(0.25)
+        base = model.transformer.gate_up.weight.detach().clone()
+
+        manager = DiffusionLoRAManager(model, torch.device("cpu"), torch.bfloat16, lora_application="merged")
+        worker_engine = MergedLoRAIPCWeightTransferEngine(
+            WeightTransferConfig(backend="omni_lora_ipc"), VllmConfig(), torch.device("cpu"), model
+        )
+        worker_engine.lora_manager = manager
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+        worker = object.__new__(DiffusionWorker)
+        worker.weight_transfer_engine = worker_engine
+        worker._weight_update_active = False
+
+        exported: dict[bytes, torch.Tensor] = {}
+
+        def fake_reduce(t: torch.Tensor):
+            handle = f"http-h-{len(exported)}".encode()
+            exported[handle] = t
+            return (None, _fake_cuda_ipc_args(t, storage_handle=handle))
+
+        def fake_receive(receiver, info: MergedLoRAIPCUpdateInfo):
+            assert isinstance(info.ipc_handles, list)
+            receiver.model.load_weights(
+                [(name, exported[handle_map["gpu-0"][7]]) for name, handle_map in zip(info.names, info.ipc_handles)]
+            )
+
+        monkeypatch.setattr(IPCWeightTransferEngine, "receive_weights", fake_receive)
+
+        posted_update_bodies: list[dict[str, Any]] = []
+
+        def fake_post(url: str, json_body: dict[str, Any] | None = None, **kwargs):
+            payload_json = kwargs.get("json", json_body)
+            # Round-trip through JSON to guarantee pure JSON wire compatibility (no pickle).
+            wire_body = json.loads(json.dumps(payload_json)) if payload_json is not None else None
+            path = url.rsplit("/", 1)[-1]
+            resp = requests.Response()
+            resp.url = url
+            resp.status_code = 200
+            resp._content = b'{"message":"ok"}'
+            if path == "init_weight_transfer_engine":
+                worker.init_weight_transfer_engine(wire_body["init_info"])
+            elif path == "start_weight_update":
+                worker.start_weight_update()
+            elif path == "update_weights":
+                posted_update_bodies.append(wire_body)
+                worker.update_weights(wire_body["update_info"])
+            elif path == "finish_weight_update":
+                worker.finish_weight_update()
+            else:
+                raise AssertionError(f"Unexpected HTTP route: {path}")
+            return resp
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        gen = torch.Generator().manual_seed(77)
+        lora_a = torch.randn(2, 4, generator=gen)
+        lora_b = torch.randn(6, 2, generator=gen)
+        expected = base.detach().clone()
+        expected[:6].copy_((base[:6].float() + torch.mm(lora_b.float(), lora_a.float())).to(base.dtype))
+
+        source = LoRAAdapterWeightSource(
+            {
+                "base_model.model.transformer.gate.lora_A.weight": lora_a,
+                "base_model.model.transformer.gate.lora_B.weight": lora_b,
+            },
+            peft_config={"r": 2, "lora_alpha": 2, "target_modules": ["gate"]},
+            lora_int_id=19,
+        )
+        trainer = WeightTransferTrainerFactory.trainer_init(
+            MergedLoRAIPCTrainerInitInfo(
+                rank=0,
+                gpu_uuid="gpu-0",
+                encode_handles=True,
+                reduce_tensor_fn=fake_reduce,
+                stage_tensor_fn=lambda t: t.detach().clone().contiguous(),
+                ipc_collect_fn=lambda: None,
+                synchronize_fn=lambda: None,
+            ),
+            client=HTTPVLLMWeightSyncClient("http://127.0.0.1:8000"),
+            source=source,
+        )
+
+        trainer.send_weights()
+
+        assert len(posted_update_bodies) == 1
+        update_info = posted_update_bodies[0]["update_info"]
+        assert "ipc_handles_wire" in update_info
+        assert "ipc_handles" not in update_info
+        assert "ipc_handles_pickled" not in update_info
+        assert worker._weight_update_active is False
+        assert manager.list_adapters() == [19]
+        torch.testing.assert_close(model.transformer.gate_up.weight, expected, rtol=0, atol=0)
+        torch.testing.assert_close(model.transformer.gate_up.weight[6:], base[6:], rtol=0, atol=0)
+
+
 def test_abort_update_info_rejects_non_empty_tensor_payload():
     with pytest.raises(ValueError, match="Abort update info must not carry tensor payloads"):
         MergedLoRAIPCUpdateInfo(
@@ -762,9 +1025,32 @@ def test_abort_update_info_rejects_non_empty_tensor_payload():
             ipc_handles=[{}],
             abort=True,
         )
+    with pytest.raises(ValueError, match="Abort update info must not carry tensor payloads"):
+        MergedLoRAIPCUpdateInfo(
+            names=[],
+            dtype_names=[],
+            shapes=[],
+            ipc_handles_wire=[{}],
+            abort=True,
+        )
+    with pytest.raises(ValueError, match="Cannot specify `ipc_handles_wire` together with"):
+        MergedLoRAIPCUpdateInfo(
+            names=["a"],
+            dtype_names=["float32"],
+            shapes=[[1]],
+            ipc_handles=[{}],
+            ipc_handles_wire=[{}],
+        )
+    bad_b64 = encode_ipc_handles([{"gpu-0": _fake_cuda_ipc_args(torch.ones(2, 2))}], json_safe=True)
+    bad_b64[0]["gpu-0"][IPC_WIRE_TAG][7] = "not-valid-base64!!!"
+    with pytest.raises(ValueError, match="invalid base64"):
+        decode_ipc_handles(bad_b64)
 
 
 def test_ar_worker_abort_weight_update_drops_staged_without_committing(monkeypatch):
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+
     from vllm_omni.lora.weight_transfer import _ABORT_UPDATE_PAYLOAD, MergedLoRASessionAbortedError
     from vllm_omni.worker.base import OmniGPUWorkerBase
 
@@ -789,42 +1075,83 @@ def test_ar_worker_abort_weight_update_drops_staged_without_committing(monkeypat
             WeightTransferConfig(backend="omni_lora_ipc"), vllm_config, torch.device("cpu"), model
         )
         engine.lora_manager = manager
-        engine.start_weight_update()
-        engine._staged.tensors["dummy"] = torch.ones(2, 4)
 
         close_count = {"count": 0}
 
-        class _Loan:
+        class _CountingExitStack(ExitStack):
             def close(self) -> None:
                 close_count["count"] += 1
+                super().close()
 
         worker = object.__new__(OmniGPUWorkerBase)
         worker.vllm_config = vllm_config
         worker.weight_transfer_engine = engine
-        worker._weight_update_active = True
+        worker._weight_update_active = False
         worker._weight_update_is_draft = False
-        worker._weight_update_kv_cache_loan = _Loan()
+        worker._incomplete_weight_updates = set()
+        worker._weight_update_kv_cache_loan = _CountingExitStack()
+        worker._kv_cache_reclaimable = False
+        worker.model_runner = SimpleNamespace(get_model=lambda: model, extensible_kv_cache=None)
 
-        # Repeated abort_weight_update calls must be idempotent and close the KV loan once.
+        # 1) Explicit abort_weight_update through real inherited worker.start_weight_update():
+        #    must restore has_incomplete_weight_update() to False and close KV loan once.
+        assert worker.has_incomplete_weight_update() is False
+        worker.start_weight_update()
+        assert worker._weight_update_active is True
+        assert worker.has_incomplete_weight_update() is True
+        engine._kind = "adapter"
+        engine._staged.tensors["dummy"] = torch.ones(2, 4)
+
         worker.abort_weight_update()
         worker.abort_weight_update()
         assert worker._weight_update_active is False
+        assert worker.has_incomplete_weight_update() is False
         assert close_count["count"] == 1
         assert not engine._staged.tensors
         assert manager.list_adapters() == []
         torch.testing.assert_close(model.transformer.gate_up.weight, base, rtol=0, atol=0)
 
-        # Subsequent session aborted via the 4-method GPUWorker.update_weights sentinel path.
-        engine.start_weight_update()
+        # 2) Sentinel abort through real inherited worker.start_weight_update() + worker.update_weights():
+        #    must also restore has_incomplete_weight_update() to False.
+        worker.start_weight_update()
+        assert worker.has_incomplete_weight_update() is True
+        engine._kind = "adapter"
         engine._staged.tensors["dummy2"] = torch.ones(2, 4)
-        worker._weight_update_active = True
         with pytest.raises(MergedLoRASessionAbortedError, match="aborted by trainer"):
             worker.update_weights(dict(_ABORT_UPDATE_PAYLOAD))
         assert worker._weight_update_active is False
+        assert worker.has_incomplete_weight_update() is False
         assert close_count["count"] == 2
         assert not engine._staged.tensors
         assert manager.list_adapters() == []
         torch.testing.assert_close(model.transformer.gate_up.weight, base, rtol=0, atol=0)
+
+        # 3) Dense update abort (both explicit and sentinel) must keep has_incomplete_weight_update() True.
+        worker.start_weight_update()
+        engine._kind = "dense"
+        worker.abort_weight_update()
+        assert worker._weight_update_active is False
+        assert worker.has_incomplete_weight_update() is True
+
+        # 4) When a prior incomplete update already exists, aborting a later adapter session
+        #    must preserve has_incomplete_weight_update() == True (never falsely clear prior state).
+        worker.start_weight_update()
+        engine._kind = "adapter"
+        engine._staged.tensors["dummy3"] = torch.ones(2, 4)
+        with pytest.raises(MergedLoRASessionAbortedError, match="aborted by trainer"):
+            worker.update_weights(dict(_ABORT_UPDATE_PAYLOAD))
+        assert worker._weight_update_active is False
+        assert worker.has_incomplete_weight_update() is True
+        assert not engine._staged.tensors
+
+        # Also verify dense sentinel abort from a clean completeness state keeps it True.
+        worker._incomplete_weight_updates.clear()
+        worker.start_weight_update()
+        engine._kind = "dense"
+        with pytest.raises(MergedLoRASessionAbortedError, match="aborted by trainer"):
+            worker.update_weights(dict(_ABORT_UPDATE_PAYLOAD))
+        assert worker._weight_update_active is False
+        assert worker.has_incomplete_weight_update() is True
 
 
 def _mismatched_names_worker(rank: int, port: int) -> None:

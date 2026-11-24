@@ -102,6 +102,52 @@ _ABORT_UPDATE_PAYLOAD: dict[str, Any] = {
 }
 
 
+def _extract_error_text(exc: BaseException) -> str:
+    """Return exception text plus any attached HTTP response body or reason."""
+    parts = [str(exc)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        reason = getattr(response, "reason", None) or getattr(response, "reason_phrase", None)
+        if isinstance(reason, str) and reason:
+            parts.append(reason)
+        try:
+            body = getattr(response, "text", None)
+        except Exception:
+            body = None
+        if isinstance(body, str) and body:
+            parts.append(body)
+        else:
+            raw_content = getattr(response, "content", None)
+            if isinstance(raw_content, (bytes, bytearray)) and raw_content:
+                parts.append(raw_content.decode("utf-8", errors="replace"))
+    return " ".join(part for part in parts if part)
+
+
+def _uses_http_pickle_client(client: Any) -> bool:
+    """Return True for built-in HTTP sync clients that pickle ``ipc_handles``."""
+    for cls in type(client).__mro__:
+        if cls.__module__ == "vllm.distributed.weight_transfer.clients" and cls.__name__ == "HTTPVLLMWeightSyncClient":
+            return True
+    return False
+
+
+def _default_release_ipc_counter(ipc_args: tuple[Any, ...]) -> None:
+    """Release one sender-side PyTorch CUDA IPC ref counter for an unpublished export."""
+    if len(ipc_args) < 13:
+        return
+    storage_cls = ipc_args[4]
+    storage_device = ipc_args[6]
+    storage_handle = ipc_args[7]
+    storage_size_bytes = ipc_args[8]
+    ref_counter_handle = ipc_args[11]
+    ref_counter_offset = ipc_args[12]
+    if storage_handle is None or storage_size_bytes == 0 or ref_counter_handle is None:
+        return
+    release_fn = getattr(storage_cls, "_release_ipc_counter", None)
+    if callable(release_fn):
+        release_fn(ref_counter_handle, ref_counter_offset, device=storage_device)
+
+
 @dataclass
 class MergedLoRAIPCUpdateInfo(IPCWeightTransferUpdateInfo):
     """IPC tensor metadata plus PEFT config; omit config for a full base update."""
@@ -109,12 +155,27 @@ class MergedLoRAIPCUpdateInfo(IPCWeightTransferUpdateInfo):
     peft_config: dict | None = None
     lora_int_id: int = 1
     abort: bool = False
+    ipc_handles_wire: list[dict[str, Any]] | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.abort:
-            if self.names or self.dtype_names or self.shapes or self.ipc_handles or self.ipc_handles_pickled:
+            if (
+                self.names
+                or self.dtype_names
+                or self.shapes
+                or self.ipc_handles
+                or self.ipc_handles_pickled
+                or self.ipc_handles_wire
+            ):
                 raise ValueError("Abort update info must not carry tensor payloads")
             self.ipc_handles = []
+        elif self.ipc_handles_wire is not None:
+            if self.ipc_handles is not None or self.ipc_handles_pickled is not None:
+                raise ValueError(
+                    "Cannot specify `ipc_handles_wire` together with `ipc_handles` or `ipc_handles_pickled`"
+                )
+            self.ipc_handles = decode_ipc_handles(self.ipc_handles_wire)
+            self.ipc_handles_wire = None
         super().__post_init__()
         if self.ipc_handles is not None:
             self.ipc_handles = decode_ipc_handles(self.ipc_handles)
@@ -149,6 +210,7 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
     model: torch.nn.Module
     lora_manager: LoRAManager
     cpu_group: torch.distributed.ProcessGroup | None = None
+    _last_abort_was_non_mutating: bool = False
 
     def __init__(
         self,
@@ -206,6 +268,7 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
         self._peft_config: dict | None = None
         self._adapter_id = 1
         self._error: Exception | None = None
+        self._last_abort_was_non_mutating = False
 
     def receive_weights(self, update_info: MergedLoRAIPCUpdateInfo) -> None:
         """Receive unchanged IPC tensors with optional adapter metadata.
@@ -239,12 +302,21 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
             finally:
                 self.reset_weight_update_target()
 
-    def abort_weight_update(self) -> None:
-        """Discard staged adapter tensors without preparing or committing."""
+    def abort_weight_update(self) -> bool:
+        """Discard staged adapter tensors without preparing or committing.
+
+        Returns:
+            ``True`` when live model weights were not mutated during the
+            aborted session (empty or staged-adapter session), ``False`` when
+            a dense base update may already have modified live weights.
+        """
+        non_mutating = self._kind != "dense"
+        self._last_abort_was_non_mutating = non_mutating
         self._kind = None
         self._peft_config = None
         self._error = None
         self._cleanup_session(suppress_errors=True)
+        return non_mutating
 
     def update_weights(self, update_info: dict) -> None:
         """Receive a chunk, discarding staged tensors if receiving fails.
@@ -391,6 +463,7 @@ class MergedLoRAIPCTrainerInitInfo(IPCTrainerInitInfo):
     stage_tensor_fn: Callable[[torch.Tensor], torch.Tensor] | None = field(default=None, repr=False)
     ipc_collect_fn: Callable[[], None] | None = field(default=None, repr=False)
     synchronize_fn: Callable[[], None] | None = field(default=None, repr=False)
+    release_ipc_counter_fn: Callable[[tuple[Any, ...]], None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.packed:
@@ -425,6 +498,7 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         stage_tensor_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
         ipc_collect_fn: Callable[[], None] | None = None,
         synchronize_fn: Callable[[], None] | None = None,
+        release_ipc_counter_fn: Callable[[tuple[Any, ...]], None] | None = None,
     ) -> None:
         # Bypass IPCTrainerWeightTransferEngine.__init__ only when resolving
         # device/UUID so CPU unit tests can supply stubbed seams without CUDA.
@@ -441,6 +515,12 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         self._reduce_tensor_fn = reduce_tensor_fn or reduce_tensor
         self._ipc_collect_fn = ipc_collect_fn or torch.cuda.ipc_collect
         self._synchronize_fn = synchronize_fn or torch.accelerator.synchronize
+        if release_ipc_counter_fn is not None:
+            self._release_ipc_counter_fn: Callable[[tuple[Any, ...]], None] | None = release_ipc_counter_fn
+        elif reduce_tensor_fn is None:
+            self._release_ipc_counter_fn = _default_release_ipc_counter
+        else:
+            self._release_ipc_counter_fn = None
 
         if device is None:
             if gpu_uuid is None:
@@ -504,6 +584,7 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
             stage_tensor_fn=init_info.stage_tensor_fn,
             ipc_collect_fn=init_info.ipc_collect_fn,
             synchronize_fn=init_info.synchronize_fn,
+            release_ipc_counter_fn=init_info.release_ipc_counter_fn,
         )
         if engine.is_sender:
             engine.client.init_weight_transfer_engine({"packed": False})
@@ -622,26 +703,55 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
             return merged
         return [{} for _ in handles]
 
-    def _exchange_session_outcome(self, local_error: BaseException | None) -> tuple[int, str] | None:
-        """Barrier and broadcast the session outcome across all trainer ranks."""
+    def _exchange_session_outcome(
+        self,
+        local_error: BaseException | None,
+        *,
+        handles_published: bool = False,
+    ) -> tuple[tuple[int, str] | None, bool]:
+        """Barrier and broadcast the session outcome and publish flag across ranks."""
         world_size = self._group_world_size()
         if world_size == 1:
-            return None
-        outcomes: list[str | None] = [None] * world_size
+            return None, handles_published
+        outcomes: list[Any] = [None] * world_size
         local_msg = repr(local_error) if local_error is not None else None
-        torch.distributed.all_gather_object(outcomes, local_msg, group=self.process_group)
-        for rank_idx, msg in enumerate(outcomes):
-            if msg is not None:
-                return rank_idx, msg
-        return None
+        torch.distributed.all_gather_object(outcomes, (local_msg, handles_published), group=self.process_group)
+        any_published = False
+        first_failure: tuple[int, str] | None = None
+        for rank_idx, item in enumerate(outcomes):
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError(f"Invalid session outcome payload from rank {rank_idx}")
+            msg, published = item
+            any_published = any_published or bool(published)
+            if msg is not None and first_failure is None:
+                first_failure = (rank_idx, msg)
+        return first_failure, any_published
+
+    def _release_unpublished_exports(self, local_handles: list[dict[str, tuple]]) -> None:
+        """Decrement sender IPC counters for exports confirmed never sent to any worker."""
+        if self._release_ipc_counter_fn is None:
+            return
+        for handle_map in local_handles:
+            for ipc_args in handle_map.values():
+                try:
+                    self._release_ipc_counter_fn(ipc_args)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to release unpublished CUDA IPC counter during omni_lora_ipc cleanup: %s",
+                        exc,
+                        exc_info=True,
+                    )
 
     def _release_staged_refs(
         self,
         weight_refs: list[torch.Tensor],
         *,
+        unpublished_handles: list[dict[str, tuple]] | None = None,
         run_ipc_collect: bool = True,
         suppress_errors: bool,
     ) -> None:
+        if unpublished_handles:
+            self._release_unpublished_exports(unpublished_handles)
         weight_refs.clear()
         if not run_ipc_collect:
             return
@@ -687,7 +797,7 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         try:
             self.client.update_weights(dict(_ABORT_UPDATE_PAYLOAD))
         except Exception as abort_exc:
-            msg = str(abort_exc)
+            msg = _extract_error_text(abort_exc)
             if isinstance(abort_exc, MergedLoRASessionAbortedError) or "aborted by trainer" in msg:
                 logger.debug("Remote omni_lora_ipc session aborted cleanly without committing: %s", abort_exc)
             elif "start_weight_update must be called before update_weights" in msg:
@@ -792,6 +902,7 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         except BaseException:
             self._release_staged_refs(
                 weight_refs,
+                unpublished_handles=ipc_handles,
                 run_ipc_collect=bool(ipc_handles),
                 suppress_errors=True,
             )
@@ -800,43 +911,51 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         # Phase 2: sender encoding + RPC session + collective outcome broadcast.
         rpc_error: BaseException | None = None
         peer_failure: tuple[int, str] | None = None
-        start_attempted = False
         session_started = False
+        update_attempted = False
         session_finished = False
         finish_attempted = False
         try:
             if self.is_sender:
                 assert normalized_cfg is not None
+                use_http_wire = self.encode_handles and _uses_http_pickle_client(self.client)
                 wire_handles: list[dict[str, Any]] = (
-                    encode_ipc_handles(merged_handles)  # type: ignore[assignment]
+                    encode_ipc_handles(merged_handles, json_safe=use_http_wire)  # type: ignore[assignment]
                     if self.encode_handles
                     else merged_handles
                 )
+                handle_key = "ipc_handles_wire" if use_http_wire else "ipc_handles"
                 payload: dict[str, Any] = {
                     "names": names,
                     "dtype_names": dtype_names,
                     "shapes": shapes,
-                    "ipc_handles": wire_handles,
+                    handle_key: wire_handles,
                     "peft_config": normalized_cfg,
                     "lora_int_id": resolved_id,
                 }
-                start_attempted = True
                 self.client.start_weight_update()
                 session_started = True
+                update_attempted = True
                 self.client.update_weights(payload)
                 finish_attempted = True
                 self.client.finish_weight_update()
                 session_finished = True
         except BaseException as exc:
             rpc_error = exc
-            should_abort = session_started or (start_attempted and "already active" not in str(exc))
-            if self.is_sender and should_abort and not session_finished:
+            # Only abort after start_weight_update() confirmed session ownership;
+            # without a session token, aborting on an unconfirmed start could
+            # disrupt another caller's empty active session.
+            if self.is_sender and session_started and not session_finished:
                 self._abort_remote_session(finish_attempted=finish_attempted)
         finally:
             # Keep staging references strongly alive until after the worker ack
             # and collective outcome exchange across all trainer ranks.
+            any_published = True
             try:
-                peer_failure = self._exchange_session_outcome(rpc_error)
+                peer_failure, any_published = self._exchange_session_outcome(
+                    rpc_error,
+                    handles_published=update_attempted,
+                )
             except Exception as exc:
                 logger.warning(
                     "Post-send outcome exchange failed during omni_lora_ipc trainer cleanup: %s",
@@ -846,8 +965,12 @@ class MergedLoRAIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
                 if rpc_error is None:
                     self._release_staged_refs(weight_refs, suppress_errors=True)
                     raise
+            unpublished = (
+                ipc_handles if (rpc_error is not None or peer_failure is not None) and not any_published else None
+            )
             self._release_staged_refs(
                 weight_refs,
+                unpublished_handles=unpublished,
                 suppress_errors=(rpc_error is not None or peer_failure is not None),
             )
 

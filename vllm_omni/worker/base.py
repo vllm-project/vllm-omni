@@ -165,6 +165,44 @@ class OmniGPUWorkerBase(GPUWorker):
             gc.collect()
             return res
 
+    def _start_weight_update(self, is_draft: bool = False) -> None:
+        was_active = getattr(self, "_weight_update_active", False)
+        incomplete = getattr(self, "_incomplete_weight_updates", None)
+        prior_incomplete = isinstance(incomplete, set) and is_draft in incomplete
+        try:
+            super()._start_weight_update(is_draft=is_draft)
+        except BaseException:
+            if (
+                not was_active
+                and not getattr(self, "_weight_update_active", False)
+                and not prior_incomplete
+                and isinstance(incomplete, set)
+                and isinstance(getattr(self, "weight_transfer_engine", None), MergedLoRAIPCWeightTransferEngine)
+            ):
+                incomplete.discard(is_draft)
+            raise
+        self._merged_lora_prior_incomplete: bool | None = prior_incomplete
+
+    def _maybe_restore_incomplete_after_non_mutating_abort(self) -> None:
+        engine = getattr(self, "weight_transfer_engine", None)
+        prior_incomplete = getattr(self, "_merged_lora_prior_incomplete", None)
+        self._merged_lora_prior_incomplete = None
+        if isinstance(engine, MergedLoRAIPCWeightTransferEngine) and getattr(
+            engine, "_last_abort_was_non_mutating", False
+        ):
+            engine._last_abort_was_non_mutating = False
+            if prior_incomplete is False:
+                incomplete = getattr(self, "_incomplete_weight_updates", None)
+                if isinstance(incomplete, set):
+                    incomplete.discard(getattr(self, "_weight_update_is_draft", False))
+
+    def _end_weight_update(self, refresh: bool) -> None:
+        super()._end_weight_update(refresh=refresh)
+        if not refresh:
+            self._maybe_restore_incomplete_after_non_mutating_abort()
+        else:
+            self._merged_lora_prior_incomplete = None
+
     def finish_weight_update(self) -> None:
         """End failed merged sessions so the trainer can publish a new adapter.
 
@@ -174,6 +212,7 @@ class OmniGPUWorkerBase(GPUWorker):
         try:
             super().finish_weight_update()
         except Exception:
+            self._merged_lora_prior_incomplete = None
             if isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine):
                 self._weight_update_active = False
                 try:
@@ -210,6 +249,7 @@ class OmniGPUWorkerBase(GPUWorker):
                     "Failed to close KV cache loan during abort_weight_update.",
                     exc_info=True,
                 )
+        self._maybe_restore_incomplete_after_non_mutating_abort()
 
     def remove_lora(self, lora_id: int) -> bool:
         """Restore the dense base for a merged policy, or remove a runtime adapter.
