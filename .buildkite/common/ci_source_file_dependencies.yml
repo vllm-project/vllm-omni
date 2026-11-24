@@ -621,6 +621,7 @@ source_file_dependencies:
 
   omni_qwen3_omni_function:
     - *qwen3_omni
+    - tests/helpers/assertions.py
     - vllm_omni/lora/
     - tests/e2e/features/rlhf_test/test_qwen3_omni_merged_lora.py
     - tests/e2e/features/rlhf_test/qwen3_omni_merge_probe.py
