@@ -1733,6 +1733,7 @@ def test_rank_growth_invalidates_moe_punica_before_republish(monkeypatch):
     # The rank bump clears the punica cache before the first republish, and
     # the reactivation publishes again once the adapter state is committed.
     assert published_cache_values[0] is None
+    assert isinstance(manager._moe_punica_wrapper, SimpleNamespace)
     assert manager._moe_punica_wrapper.max_lora_rank == 128
 
 
@@ -2343,10 +2344,13 @@ def _composed_harness(monkeypatch, max_cached_adapters: int = 4):
 def test_set_active_adapters_composes_and_caches(monkeypatch):
     manager, models, load_calls, activations = _composed_harness(monkeypatch)
     req1, req2 = _dummy_lora_request(1), _dummy_lora_request(2)
+    validate = Mock()
+    manager.pipeline._validate_diffusion_lora_composition = validate
 
     manager.set_active_adapters([req1, req2], [0.5, 2.0])
 
     assert sorted(load_calls) == [1, 2]
+    assert [call.kwargs["lora_model"].id for call in validate.call_args_list] == [1, 2]
     assert len(manager._composed_adapters) == 1
     composed_id = next(iter(manager._composed_adapters.values()))
     assert composed_id in manager._registered_adapters
@@ -2369,6 +2373,7 @@ def test_set_active_adapters_composes_and_caches(monkeypatch):
     # Same combo again: composed cache hit, no reload, no re-registration.
     manager.set_active_adapters([req2, req1], [2.0, 0.5])
     assert sorted(load_calls) == [1, 2]
+    assert validate.call_count == 2
     assert len(manager._composed_adapters) == 1
     assert activations == [(composed_id, 1.0), (composed_id, 1.0)]
 
@@ -2376,6 +2381,42 @@ def test_set_active_adapters_composes_and_caches(monkeypatch):
     manager.set_active_adapters([req1, req2], [0.5, 1.0])
     assert len(manager._composed_adapters) == 2
     assert activations[-1][0] != composed_id
+
+
+def test_composition_validates_each_source_before_loading_the_next(monkeypatch):
+    manager, _, load_calls, _ = _composed_harness(monkeypatch)
+
+    def validate(*, lora_model):
+        # A later model-specific load may prune a transient source's metadata.
+        assert load_calls == [lora_model.id]
+        raise ValueError("source cannot be composed")
+
+    manager.pipeline._validate_diffusion_lora_composition = validate
+    compose = Mock()
+    monkeypatch.setattr(manager, "_compose_lora_models", compose)
+    with pytest.raises(ValueError, match="source cannot be composed"):
+        manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(2)])
+    compose.assert_not_called()
+    assert manager._registered_adapters == {}
+    assert manager._composed_adapters == {}
+
+
+@pytest.mark.parametrize("disabled_index", [0, 1])
+def test_zero_scale_source_bypasses_composition_validation(monkeypatch, disabled_index):
+    manager, _, load_calls, _ = _composed_harness(monkeypatch)
+    validate = Mock(side_effect=AssertionError("one active source does not need composition"))
+    manager.pipeline._validate_diffusion_lora_composition = validate
+    activate_single = Mock()
+    monkeypatch.setattr(manager, "set_active_adapter", activate_single)
+    requests = [_dummy_lora_request(1), _dummy_lora_request(2)]
+    scales = [1.0, 1.0]
+    scales[disabled_index] = 0.0
+
+    manager.set_active_adapters(requests, scales)
+
+    validate.assert_not_called()
+    activate_single.assert_called_once_with(requests[1 - disabled_index], 1.0)
+    assert not load_calls
 
 
 def test_set_active_adapters_single_and_empty_fall_back(monkeypatch):

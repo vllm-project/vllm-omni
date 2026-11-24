@@ -47,14 +47,14 @@ def _sampling() -> OmniDiffusionSamplingParams:
     )
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
 def test_krea2_text_to_image_001(offline_client: OfflineOmniClient) -> None:
     """Basic functional smoke: a single prompt produces a decoded image."""
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize(
     "omni_runner",
     [(MODEL, None, {"enable_layerwise_offload": True})],
@@ -65,7 +65,7 @@ def test_krea2_layerwise_offload(offline_client: OfflineOmniClient) -> None:
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.cache
 @pytest.mark.parametrize("omni_runner", [(MODEL, None, {"cache_backend": "cache_dit"})], indirect=True)
 def test_krea2_cache_dit(offline_client: OfflineOmniClient) -> None:
@@ -78,7 +78,7 @@ def test_krea2_cache_dit(offline_client: OfflineOmniClient) -> None:
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "omni_runner",
     # Standalone HSDP: use_hsdp=True with an explicit hsdp_shard_size shards the DiT weights
@@ -97,7 +97,7 @@ def test_krea2_hsdp(offline_client: OfflineOmniClient) -> None:
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "omni_runner",
     # VAE patch-parallel decode: partition the VAE decode across the TP world. Mirrors the online
@@ -127,7 +127,7 @@ def _generate(handler: OfflineOmniClient, lora_request: LoRARequest | None, lora
     return np.asarray(images[0].convert("RGB"), dtype=np.int16)
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
 def test_krea2_lora(offline_client: OfflineOmniClient) -> None:
     """Validate diffusion LoRA on Krea 2: visible effect, scale sensitivity, clean deactivation.
