@@ -186,7 +186,7 @@ def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
         assert all("MI325" not in keys for keys in baseline_keys)
 
 
-def test_qwen3_omni_async_perf_uses_default_v2_profile_and_cold_start_timeout() -> None:
+def test_qwen3_omni_perf_uses_default_v2_profile_and_cold_start_timeout() -> None:
     async_config = json.loads(PERF_CONFIGS["Qwen3-Omni Async-Chunk Perf"].read_text(encoding="utf-8"))[0]
     async_server = async_config["server_params"]
     assert "stage_config_name" not in async_server
@@ -200,4 +200,4 @@ def test_qwen3_omni_async_perf_uses_default_v2_profile_and_cold_start_timeout() 
     no_async_config = json.loads(PERF_CONFIGS["Qwen3-Omni No-Async-Chunk Perf"].read_text(encoding="utf-8"))[0]
     no_async_server = no_async_config["server_params"]
     assert "stage_config_name" not in no_async_server
-    assert "--stage-init-timeout" not in no_async_server["extra_cli_args"]
+    assert no_async_server["extra_cli_args"] == ["--no-async-chunk", "--stage-init-timeout", "900"]

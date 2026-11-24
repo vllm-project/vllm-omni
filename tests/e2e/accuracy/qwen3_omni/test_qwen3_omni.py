@@ -57,7 +57,11 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 stage_configs = [get_deploy_config_path("qwen3_omni_moe.yaml")]
 
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    # Cold NFS loading of the 65.7 GiB checkpoint can take over 500 s, before
+    # compilation and graph capture. Match the async performance startup budget.
+    OmniServerParams(model=model, stage_config_path=stage_config, stage_init_timeout=900)
+    for model in models
+    for stage_config in stage_configs
 ]
 
 
