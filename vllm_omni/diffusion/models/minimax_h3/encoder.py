@@ -11,9 +11,9 @@ memory (the retained 50-layer encoder is ~51.5 GB in BF16).
 
 The computation contract is unchanged from the HF reference path:
 
-- plain BF16 weights, only the first ``MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER``
-  decoder layers are kept (the checkpoint consumes the unnormalized hidden
-  state after decoder layer 49);
+- BF16 and serialized ModelOpt FP8/BF16 mixed checkpoints are supported; only
+  the first ``MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER`` decoder layers are kept
+  (the checkpoint consumes the unnormalized hidden state after layer 49);
 - cuDNN SDP is enabled during encode;
 - the multimodal backbone runs with an all-ones attention mask and
   ``mm_token_type_ids`` derived from the image/video token ids;
@@ -42,15 +42,22 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+from vllm_omni.quantization import build_quant_config
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
+
+MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER = WeightsMapper(
+    orig_to_new_prefix={"model.language_model": "text_encoder.text_model"},
+)
+_MODELOPT_ENCODER_QUANT_METHODS = frozenset({"modelopt", "modelopt_mixed"})
 
 logger = init_logger(__name__)
 
@@ -68,6 +75,24 @@ def _is_quantized_linear(module: LinearBase) -> bool:
     return not isinstance(module.quant_method, UnquantizedLinearMethod)
 
 
+def _cast_unquantized_tensors(module: nn.Module, dtype: torch.dtype) -> None:
+    """``Module.to(dtype)`` that leaves quantized linear state untouched.
+
+    ``Tensor.is_floating_point()`` is true for FP8, so ``Module.to`` would
+    upcast serialized FP8 weights (and their FP32 scales) to ``dtype``.
+    """
+    for submodule in module.modules():
+        if isinstance(submodule, LinearBase) and _is_quantized_linear(submodule):
+            continue
+        tensors = itertools.chain(
+            submodule.named_parameters(recurse=False),
+            submodule.named_buffers(recurse=False),
+        )
+        for _, tensor in tensors:
+            if tensor.is_floating_point() and tensor.dtype != dtype:
+                tensor.data = tensor.data.to(dtype)
+
+
 def _default_weight_loader(
     param: nn.Parameter,
     loaded_weight: torch.Tensor,
@@ -82,10 +107,10 @@ def _tp_range(group: Any) -> tuple[int, int]:
 
 
 _QKV_PROJECTION_RE = re.compile(
-    r"^(layers\.\d+\.self_attn\.)(?P<part>[qkv])_proj\.(?P<kind>weight(?:_packed|_scale)?)$"
+    r"^(layers\.\d+\.self_attn\.)(?P<part>[qkv])_proj\.(?P<kind>weight(?:_packed|_scale)?|input_scale)$"
 )
 _GATE_UP_PROJECTION_RE = re.compile(
-    r"^(layers\.\d+\.mlp\.)(?P<part>gate|up)_proj\.(?P<kind>weight(?:_packed|_scale)?)$"
+    r"^(layers\.\d+\.mlp\.)(?P<part>gate|up)_proj\.(?P<kind>weight(?:_packed|_scale)?|input_scale)$"
 )
 _MINIMAX_H3_TEXT_LAYER_PREFIX = "text_encoder.text_model.layers"
 
@@ -198,14 +223,21 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
         return self.quant_method.apply(self, input_)
 
     def weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int | None = None
     ) -> None:
+        if loaded_shard_id not in (0, 1):
+            raise ValueError(f"gate/up packed tensor requires shard id 0 or 1, got {loaded_shard_id!r}")
         shard_size = self.intermediate_size_per_partition
-        start_idx = self._tp_rank * shard_size
-        if loaded_shard_id == 1:  # up_proj
-            param.data[shard_size : 2 * shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
-        else:  # gate_proj
-            param.data[0:shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
+        source = loaded_weight.flatten() if param.ndim == 1 else loaded_weight
+        # ModelOpt per-tensor FP8 keeps one scale per logical shard.
+        static_scale = param.ndim == 1 and param.numel() == 2
+        copy_size = 1 if static_scale else shard_size
+        source_offset = 0 if static_scale else self._tp_rank * shard_size
+        expected_size = 1 if static_scale else shard_size * self._tp_size
+        if source.shape[0] != expected_size:
+            raise ValueError(f"gate/up shard must have dim-0 size {expected_size}, got {tuple(loaded_weight.shape)}")
+        target_offset = loaded_shard_id * copy_size
+        param.data.narrow(0, target_offset, copy_size).copy_(source.narrow(0, source_offset, copy_size))
 
 
 class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
@@ -270,17 +302,24 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
         head_dim = self.head_dim
         q_local = self.local_num_heads * head_dim
         kv_local = self.local_num_kv_heads * head_dim
-        if loaded_shard_id == "q":
-            start_idx = self._tp_rank * q_local
-            param.data[0:q_local].copy_(loaded_weight.narrow(0, start_idx, q_local))
-        elif loaded_shard_id == "k":
-            start_idx = self._tp_rank * kv_local
-            param.data[q_local : q_local + kv_local].copy_(loaded_weight.narrow(0, start_idx, kv_local))
-        elif loaded_shard_id == "v":
-            start_idx = self._tp_rank * kv_local
-            param.data[q_local + kv_local : q_local + 2 * kv_local].copy_(loaded_weight.narrow(0, start_idx, kv_local))
-        else:
+        shards = {
+            "q": (0, 0, q_local),
+            "k": (1, q_local, kv_local),
+            "v": (2, q_local + kv_local, kv_local),
+        }
+        if loaded_shard_id not in shards:
             raise ValueError(f"unexpected QKV shard id {loaded_shard_id!r}")
+        shard_index, target_offset, shard_size = shards[loaded_shard_id]
+        source = loaded_weight.flatten() if param.ndim == 1 else loaded_weight
+        # ModelOpt per-tensor FP8 keeps one scale per logical shard.
+        static_scale = param.ndim == 1 and param.numel() == len(shards)
+        copy_size = 1 if static_scale else shard_size
+        source_offset = 0 if static_scale else self._tp_rank * shard_size
+        target_offset = shard_index if static_scale else target_offset
+        expected_size = 1 if static_scale else shard_size * self._tp_size
+        if source.shape[0] != expected_size:
+            raise ValueError(f"QKV shard must have dim-0 size {expected_size}, got {tuple(loaded_weight.shape)}")
+        param.data.narrow(0, target_offset, copy_size).copy_(source.narrow(0, source_offset, copy_size))
 
 
 # A fused weight is filled from several checkpoint tensors, so a partial load leaves
@@ -374,6 +413,16 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
     ) -> None:
         del loaded_shard_id
+        if param.ndim == 1:
+            # FP8 weight/input scales index output channels (or the whole
+            # tensor), so row parallelism leaves them replicated.
+            if loaded_weight.numel() != param.numel():
+                raise ValueError(
+                    "MiniMax H3 row-parallel scale size mismatch: "
+                    f"checkpoint={loaded_weight.numel()}, parameter={param.numel()}"
+                )
+            param.data.copy_(loaded_weight.reshape_as(param))
+            return
         # The stored width is input_size_per_partition for BF16 weights and
         # input_size_per_partition/{2,32} for MXFP4 packed weights/scales.
         shard_size = param.data.shape[1]
@@ -1185,6 +1234,21 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             if not quant_config.block_name_to_quantize:
                 quant_config.block_name_to_quantize = [_MINIMAX_H3_TEXT_LAYER_PREFIX]
             self.quant_config = quant_config
+        elif str(hf_quant_config.get("quant_method", "")).lower() in _MODELOPT_ENCODER_QUANT_METHODS:
+            quant_config = build_quant_config(hf_quant_config)
+            if quant_config.get_name() not in _MODELOPT_ENCODER_QUANT_METHODS:
+                raise ValueError(
+                    "MiniMax H3 text encoder currently supports only ModelOpt FP8 or mixed-precision "
+                    f"pre-quantized checkpoints, got {quant_config.get_name()!r}"
+                )
+            # The checkpoint's ignore list names HF q/k/v and gate/up modules;
+            # resolve it against the packed encoder projections.
+            quant_config.packed_modules_mapping = {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                "gate_up_proj": ["gate_proj", "up_proj"],
+            }
+            quant_config.apply_vllm_mapper(MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER)
+            self.quant_config = quant_config
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
@@ -1196,12 +1260,16 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
             quant_config=quant_config,
         )
-        if not isinstance(quant_config, FastH3NVFP4Config):
+        if quant_config is not None and quant_config.get_name() in _MODELOPT_ENCODER_QUANT_METHODS:
+            _cast_unquantized_tensors(self.text_model, dtype)
+        elif not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, "
+            "text_encoder_tp_size=%d, quantization=%s, vision replicated",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            quant_config.get_name() if quant_config is not None else "bf16",
         )
 
     @property
@@ -1213,7 +1281,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return self._tp_size
 
     def _map_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
-        if name == "lm_head.weight" or name == "model.language_model.norm.weight":
+        if name.startswith("lm_head.") or name == "model.language_model.norm.weight":
             return None
         if name.startswith("model.visual."):
             return ("vision." + name[len("model.visual.") :], None)
@@ -1252,7 +1320,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             sources = _fused_source_shards(module)
             if sources is None:
                 continue
-            for suffix in ("weight", "weight_packed", "weight_scale"):
+            for suffix in ("weight", "weight_packed", "weight_scale", "input_scale"):
                 param_name = f"{module_name}.{suffix}"
                 if param_name in params:
                     expected_fused_shards[param_name] = sources

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
+import regex as re
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -24,6 +25,7 @@ from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.attention.schedule import (
@@ -318,6 +320,62 @@ def _resolve_minimax_h3_model_root(
             require_all=True,
         )
     )
+
+
+_MINIMAX_H3_TRANSFORMER_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".attn.norm_q": ".attn.q_norm",
+        ".attn.norm_k": ".attn.k_norm",
+        ".attn.to_out.0": ".attn.out_proj",
+        ".ff.net.0.proj": ".mlp.fc1",
+        ".ff.net.2": ".mlp.fc2",
+    },
+    orig_to_new_prefix={
+        "audio_proj_in": "audio_patch_proj",
+        "audio_proj_out": "final_layer.audio_out",
+        "context_embedder": "condition_proj",
+        "norm_out.linear": "final_layer.adaln_proj.linear",
+        "norm_out.norm": "final_layer.norm",
+        "proj_in": "video_patch_proj",
+        "proj_out": "final_layer.video_out",
+        "time_embedder.linear_1": "time_embedder.proj_in",
+        "time_embedder.linear_2": "time_embedder.proj_out",
+        "token_refiner.refiner_blocks": "token_refiner.blocks",
+        "transformer_blocks": "blocks",
+    },
+)
+
+_MINIMAX_H3_QUANT_IGNORE_MAPPER = _MINIMAX_H3_TRANSFORMER_MAPPER | WeightsMapper(
+    orig_to_new_substr={
+        ".attn.to_out": ".attn.out_proj",
+        ".ff.net.0": ".mlp.fc1",
+        ".ff": ".mlp",
+    }
+)
+
+_MINIMAX_H3_MODELOPT_QUANT_METHODS = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"})
+
+
+def _remap_minimax_h3_checkpoint_key(key: str) -> str | tuple[str, str] | None:
+    """Map a Diffusers H3 key while preserving packed-loader routing."""
+    component, separator, source = key.partition(".")
+    if not separator or component not in {"transformer", "transformers_ref"}:
+        return None
+
+    target = _MINIMAX_H3_TRANSFORMER_MAPPER.apply_list([source])[0]
+    output = target
+
+    qkv_match = re.search(r"\.attn\.to_([qkv])\.(weight|weight_scale|input_scale)$", target)
+    if qkv_match:
+        shard_id, suffix = qkv_match.groups()
+        stem = f"{target[: qkv_match.start()]}.attn.qkv_proj"
+        target, output = f"{stem}.{suffix}", f"{stem}.to_{shard_id}.{suffix}"
+    elif ".ff.net.0.proj." in source and target.endswith((".weight", ".weight_scale")):
+        stem, _, suffix = target.rpartition(".")
+        output = f"{stem}.diffusers_{suffix}"
+
+    target, output = f"{component}.{target}", f"{component}.{output}"
+    return target if target == output else (target, output)
 
 
 _MINIMAX_H3_DENOISE_INPUT_KEYS = (
@@ -743,6 +801,12 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    hf_to_vllm_mapper = _MINIMAX_H3_QUANT_IGNORE_MAPPER
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
+        "qkv_proj": ["to_q", "to_k", "to_v"],
+        "fc1": ["gate_proj", "up_proj"],
+    }
+    remap_checkpoint_key = staticmethod(_remap_minimax_h3_checkpoint_key)
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
     # Set from --lora-path when it names a VDN-H3 checkpoint directory.
@@ -1221,6 +1285,18 @@ class MiniMaxH3Pipeline(
                     allow_patterns_overrides=["nvfp4_weights.safetensors"],
                 ),
             )
+        ref_transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformers_ref",
+        )
+        # Serialized ModelOpt configs name Diffusers modules; resolve their
+        # ignore lists against the native DiT and its packed projections.
+        for component_quant_config in {
+            id(config): config for config in (transformer_quant_config, ref_transformer_quant_config) if config
+        }.values():
+            if component_quant_config.get_name() in _MINIMAX_H3_MODELOPT_QUANT_METHODS:
+                component_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
+                component_quant_config.packed_modules_mapping = self.packed_modules_mapping
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
         self.transformer = transformer_cls(
             od_config,
@@ -1247,7 +1323,7 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
-                quant_config=transformer_quant_config,
+                quant_config=ref_transformer_quant_config,
                 diffusers_weights=modular,
             )
 
