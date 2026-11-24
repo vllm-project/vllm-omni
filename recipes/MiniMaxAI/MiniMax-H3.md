@@ -694,6 +694,31 @@ As on CUDA, H3 is CFG-distilled, so keep `--cfg-parallel-size` at 1, and the H3 
 supports only its native `tile` mode. `--text-encoder-tp-size` is validated on
 gfx942; on gfx950 it was not exercised.
 
+#### Experimental BF16 dense attention on gfx950
+
+For the four-GPU FL2VA configuration, you can build the specialized attention
+kernel from source with ROCm Clang. Run the following from the vLLM-Omni
+checkout, using an output path visible to every worker.
+
+```bash
+mkdir -p /tmp/h3-kernels
+/opt/rocm/llvm/bin/clang -target amdgcn-amd-amdhsa -mcpu=gfx950 \
+  -x assembler -nostdlib \
+  vllm_omni/diffusion/models/minimax_h3/rocm_kernels/wide_first_gfx950.s \
+  -o /tmp/h3-kernels/wide_first.hsaco
+```
+
+Add `--additional-config '{"rocm_h3_wide_fmha_path":"/tmp/h3-kernels/wide_first.hsaco"}'`
+to the four-GPU command above. The experimental path runs during eager BF16
+inference with 14 local heads, head dimension 128 and 37,760 sequence rows.
+It computes the two segments independently. Other sequence layouts and graph
+capture use the configured attention backend. Each active kernel workspace
+uses approximately 130 MiB per device stream to stage V.
+
+The ROCm regression test builds the kernel and compares every output row for
+the nine supported segment boundaries with AITER. Run it on an MI350X with
+`pytest -q tests/diffusion/models/minimax_h3/test_rocm_wide_fmha_gpu.py`.
+
 ### Validated ROCm evidence
 
 vLLM-Omni with MiniMax H3 support, BF16. gfx942 rows measured with the
