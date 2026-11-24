@@ -3,6 +3,7 @@
 
 import sys
 import types
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -163,6 +164,32 @@ def test_npu_qk_norm_rope_ignores_installed_mindiesd(monkeypatch: pytest.MonkeyP
     assert calls == {"rms_norm": 2, "rotary_mul": 2, "mindiesd_rope": 0}
     torch.testing.assert_close(actual_q, expected_q, atol=0, rtol=0)
     torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(("tokens", "use_eagle"), [(99_864, True), (99_865, False)])
+def test_npu_qk_norm_rope_eagle_packed_int32_limit(
+    monkeypatch: pytest.MonkeyPatch, tokens: int, use_eagle: bool
+) -> None:
+    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
+
+    q = torch.empty((tokens, 56, _HEAD_DIM), device="meta", dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    weight = q.new_empty((_HEAD_DIM,))
+    rope_table = q.new_empty((tokens, _ROTARY_DIM))
+
+    eagle = Mock(return_value=(q, k, k))
+    monkeypatch.setitem(sys.modules, "mindiesd.fused_ops", types.SimpleNamespace(eagle_split_norm_rope_concat=eagle))
+    rms_norm = Mock(side_effect=lambda x, *_args, **_kwargs: (x,))
+    monkeypatch.setitem(sys.modules, "torch_npu", types.SimpleNamespace(npu_rms_norm=rms_norm))
+    monkeypatch.setattr(fused, "_npu_apply_rope_table", lambda x, *_: x)
+    pack_qkv = Mock(wraps=torch.cat)
+    monkeypatch.setattr(torch, "cat", pack_qkv)
+
+    fused._npu_qk_norm_rope(q, k, weight, weight, rope_table, _EPS, _ROTARY_DIM)
+
+    assert pack_qkv.call_count == eagle.call_count == int(use_eagle)
+    assert rms_norm.call_count == (0 if use_eagle else 2)
 
 
 @hardware_test(res={"npu": "A3"}, num_cards=1)

@@ -605,14 +605,7 @@ def _npu_qk_norm_rope(
     import torch_npu
 
     q_heads, kv_heads = q.shape[1], k.shape[1]
-    if (
-        q_weight.dtype == k_weight.dtype == rope_table.dtype == q.dtype
-        and 0 < kv_heads <= q_heads <= 128
-        and q_heads % kv_heads == 0
-        and 0 < q.numel() + 2 * k.numel() <= torch.iinfo(torch.int32).max
-        and torch.finfo(torch.float32).tiny <= eps <= torch.finfo(torch.float32).max
-        and (not torch.is_grad_enabled() or not any(t.requires_grad for t in (q, k, q_weight, k_weight, rope_table)))
-    ):
+    if 0 < q.numel() + 2 * k.numel() <= torch.iinfo(torch.int32).max:
         try:
             from mindiesd.fused_ops import eagle_split_norm_rope_concat
 
