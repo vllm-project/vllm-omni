@@ -1680,27 +1680,36 @@ def _frontend_cli_fields() -> frozenset[str]:
     return frozenset(config_field.name for config_field in fields(FrontendArgs))
 
 
-def diffusion_ingress_allowed_fields() -> frozenset[str]:
-    """Field names the diffusion ingress validator accepts from raw engine kwargs.
+def diffusion_ingress_stage_consumed_fields() -> frozenset[str]:
+    """Raw-ingress field names the diffusion stage config consumes itself.
 
-    Single source of truth for the raw-ingress contract shared by
-    ``normalize_and_validate_diffusion_engine_ingress_kwargs`` and external
-    embedders (RL frameworks strip their LLM-only engine args against this
-    set before submitting diffusion requests, instead of mirroring the
-    private per-owner sets).
+    Shared by the ingress validator (its return filter) and
+    :func:`diffusion_ingress_allowed_fields`, so the two cannot drift.
     """
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.engine.arg_utils import orchestrator_field_names
 
-    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    stage_consumed_fields = (
-        diffusion_fields
+    return (
+        frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
         | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
         | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
         | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
         | _DIFFUSION_STAGE_METADATA_FIELDS
         | _DIFFUSION_DEFAULT_FACTORY_FIELDS
     ) - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+
+
+def diffusion_ingress_allowed_fields() -> frozenset[str]:
+    """Field names the diffusion ingress validator accepts from raw engine kwargs.
+
+    The stage-consumed fields plus the ones consumed elsewhere (shared engine,
+    serving frontend and orchestrator). Single source of truth for the
+    raw-ingress contract: ``normalize_and_validate_diffusion_engine_ingress_kwargs``
+    validates against it, and external embedders (RL frameworks strip their
+    LLM-only engine args against this set before submitting diffusion
+    requests, instead of mirroring the private per-owner sets).
+    """
+    from vllm_omni.engine.arg_utils import orchestrator_field_names
+
     externally_consumed_fields = (
         _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
         | _NON_STAGE_ENGINE_CLI_FIELDS
@@ -1710,7 +1719,7 @@ def diffusion_ingress_allowed_fields() -> frozenset[str]:
         # all of them are present on the CLI-only OrchestratorArgs dataclass.
         | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
     )
-    return stage_consumed_fields | externally_consumed_fields
+    return diffusion_ingress_stage_consumed_fields() | externally_consumed_fields
 
 
 def normalize_and_validate_diffusion_engine_ingress_kwargs(
@@ -1720,7 +1729,6 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
 ) -> dict[str, Any]:
     """Normalize and validate raw diffusion input without inserting defaults."""
     from vllm_omni.diffusion.data import (
-        OmniDiffusionConfig,
         normalize_omni_diffusion_kwargs,
         validate_omni_diffusion_kwargs,
     )
@@ -1736,17 +1744,8 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         raise ValueError("Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided.")
     normalized.update(engine_owned)
 
-    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
-    stage_consumed_fields = (
-        diffusion_fields
-        | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
-        | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
-        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
-        | _DIFFUSION_STAGE_METADATA_FIELDS
-        | _DIFFUSION_DEFAULT_FACTORY_FIELDS
-    ) - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
-    allowed_fields = stage_consumed_fields | diffusion_ingress_allowed_fields()
-    validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)
+    validate_omni_diffusion_kwargs(normalized, diffusion_ingress_allowed_fields(), stage_id=stage_id)
+    stage_consumed_fields = diffusion_ingress_stage_consumed_fields()
     return {name: value for name, value in normalized.items() if name in stage_consumed_fields}
 
 

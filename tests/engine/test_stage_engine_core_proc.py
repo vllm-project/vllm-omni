@@ -193,6 +193,41 @@ def test_preprocess_add_request_preserves_omni_fields():
     assert current_wave == 3
     assert result.external_req_id == "external"
     assert result.additional_information == {"conditioning": "payload"}
+    # No sampling_params and no typed field: the hidden-states opt-in stays off.
+    assert result.return_hidden_states is False
+
+
+@pytest.mark.parametrize(
+    ("typed", "extra_args", "expected"),
+    [
+        # Frontends that build a plain EngineCoreRequest never set the typed
+        # field; the SamplingParams.extra_args opt-in must still be lifted.
+        (False, {"return_hidden_states": True}, True),
+        ("missing", {"return_hidden_states": True}, True),
+        # A typed opt-in does not depend on the extra_args flag.
+        (True, None, True),
+        (True, {}, True),
+        (False, None, False),
+        (False, {"unrelated": 1}, False),
+        ("missing", {}, False),
+    ],
+)
+def test_preprocess_add_request_lifts_hidden_states_opt_in(mocker, typed, extra_args, expected):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    request = SimpleNamespace(
+        request_id="internal",
+        additional_information=None,
+        sampling_params=SimpleNamespace(extra_args=extra_args),
+    )
+    if typed != "missing":
+        request.return_hidden_states = typed
+    scheduler_request = SimpleNamespace()
+    mocker.patch.object(EngineCoreProc, "preprocess_add_request", return_value=(scheduler_request, 0))
+
+    result, _ = engine.preprocess_add_request(request)
+
+    assert result is scheduler_request
+    assert result.return_hidden_states is expected
 
 
 def test_first_audio_binding_preserves_talker_marker():

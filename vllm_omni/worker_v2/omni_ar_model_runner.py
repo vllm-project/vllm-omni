@@ -55,9 +55,12 @@ logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
 _SPARSE_AUDIO_META_FIELDS = frozenset({"req_id", "sparse_audio"})
 _SPARSE_AUDIO_PROTOCOL_KEYS = frozenset({"meta.req_id", "meta.sparse_audio"})
-# Key under which per-request last-layer hidden states ride the
-# ``multimodal_output`` channel (``CompletionOutput.multimodal_output``).
-HIDDEN_STATES_OUTPUT_KEY = "hidden_states"
+# Per-request last-layer hidden states for opted-in requests ride the
+# ``multimodal_output`` channel (``CompletionOutput.multimodal_output``) under
+# this key. It is the name RL teacher consumers already read, and unlike
+# ``"hidden_states"`` it is not one of the reserved ``OmniPayload`` nests in
+# ``data_entry_keys`` (thinker -> talker ``hidden_states.*`` pooler entries).
+TEACHER_HIDDEN_STATES_KEY = "teacher_hidden_states"
 
 
 def _without_sparse_audio_protocol(payload: dict[str, Any]) -> dict[str, Any]:
@@ -493,10 +496,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         _guard_graph_replay_for_pooler_copy(
             self.main_stream,
             async_output.copy_event,
-            need_pooler=(need_pooler and (include_hidden or not sampling_output.owns_multimodal_outputs))
-            or hidden_state_slices is not None,
+            need_pooler=need_pooler and (include_hidden or not sampling_output.owns_multimodal_outputs),
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
         )
+        if hidden_state_slices is not None:
+            # The slices view this step's hidden-states buffer, which the next
+            # CUDA graph replay overwrites, and unlike pooler payloads they are
+            # not snapshotted. Keep the main stream behind their copy in every
+            # mode.
+            self.main_stream.wait_event(async_output.copy_event)
 
         mm_inputs = None
         if self.speculator is not None and self.speculator.supports_mm_inputs and self.model_state.supports_mm_inputs:
@@ -611,56 +619,60 @@ class OmniARModelRunner(OmniGPUModelRunner):
         """GPU slices of the last-layer hidden states for opted-in requests.
 
         Returns ``None`` when no scheduled request opted in, so ordinary
-        batches pay nothing. Hidden states are collected on the step whose
-        schedule completes a request's prompt (decode rows carry no prompt
-        tokens; the completing prefill step already returned the full
-        payload). Chunked prefill and prefix-cache resumes are rejected:
-        without the full-prompt hidden rebuild there is no way to serve the
-        complete tensor.
+        batches pay nothing. A request's prefill rows are collected exactly
+        once, on the step whose schedule completes its prefill. ``prefill_len``
+        counts the tokens the runner actually sees (multimodal placeholders
+        expanded), so the slice matches ``text_hidden`` for multimodal prompts.
+
+        Nothing is emitted on a guess. A later prefill chunk or a prefix-cache
+        resume needs rows that are not in this step's tensor, and without the
+        prefill counters a decode row cannot be told from a prefill row; a
+        partial or repeated slice would hand the consumer a wrong-shaped
+        payload, so those cases raise instead.
         """
-        opted_in = getattr(self, "_hidden_state_req_ids", None)
+        opted_in = self._hidden_state_req_ids
         if not opted_in or text_hidden is None:
             return None
-        opted_in = opted_in.intersection(input_batch.req_ids[: input_batch.num_reqs])
         num_reqs = input_batch.num_reqs
+        opted_in = opted_in.intersection(input_batch.req_ids[:num_reqs])
+        if not opted_in:
+            return None
+        prefill_len = getattr(input_batch, "prefill_len_np", None)
+        num_computed_prefill = getattr(input_batch, "num_computed_prefill_tokens_np", None)
+        if prefill_len is None or num_computed_prefill is None:
+            raise RuntimeError(
+                "return_hidden_states needs InputBatch.prefill_len_np and "
+                "num_computed_prefill_tokens_np to tell prefill rows from decode rows; "
+                f"got a {type(input_batch).__name__} without them."
+            )
         query_start_loc = input_batch.query_start_loc_np
-        num_scheduled = np.asarray(input_batch.num_scheduled_tokens, dtype=np.int64)
-        num_computed = getattr(input_batch, "num_computed_tokens_np", None)
-        prompt_lens = getattr(self.req_states.prompt_len, "np", None)
+        num_scheduled = input_batch.num_scheduled_tokens
         slices: dict[str, torch.Tensor] = {}
         for index in range(num_reqs):
             req_id = input_batch.req_ids[index]
             if req_id not in opted_in:
                 continue
-            scheduled = int(num_scheduled[index])
-            if scheduled <= 0:
+            done = int(num_computed_prefill[index])
+            total = int(prefill_len[index])
+            if done >= total:
+                # Decode row: the prefill step already delivered the payload.
                 continue
+            if done > 0:
+                raise RuntimeError(
+                    f"return_hidden_states cannot return the full prompt hidden states for req {req_id}: "
+                    f"{done} of its {total} prefill tokens were computed before this step (chunked prefill "
+                    "or a prefix-cache hit), so this step's tensor holds neither the complete prompt nor "
+                    "a rebuilt prefix. Run engines that return hidden states with "
+                    "enable_chunked_prefill=False and enable_prefix_caching=False."
+                )
+            rows = min(total, int(num_scheduled[index]))
+            if rows < total:
+                raise RuntimeError(
+                    f"return_hidden_states does not support chunked prefill (req={req_id}: {rows} of {total} "
+                    "prefill tokens scheduled). Launch the engine with enable_chunked_prefill=False."
+                )
             start = int(query_start_loc[index])
-            if num_computed is None or prompt_lens is None:
-                # Without per-request progress counters, fall back to the
-                # scheduled rows (single-step prefill layouts).
-                slices[req_id] = text_hidden[start : start + scheduled]
-                continue
-            computed = int(num_computed[index])
-            prompt_len = int(prompt_lens[index])
-            remaining = prompt_len - computed
-            if remaining <= 0:
-                # Decode step: the prompt's hidden states were delivered on
-                # its completing prefill step.
-                continue
-            if scheduled < remaining:
-                raise RuntimeError(
-                    f"return_hidden_states does not support chunked prefill (req={req_id}: "
-                    f"{remaining - scheduled} prompt tokens left unscheduled). "
-                    "Launch the engine with enable_chunked_prefill=False."
-                )
-            if computed > 0:
-                raise RuntimeError(
-                    f"return_hidden_states cannot reconstruct the full-prompt hidden states for "
-                    f"req {req_id}: {computed} tokens were already computed (prefix cache hit). "
-                    "Disable prefix caching for engines that return hidden states."
-                )
-            slices[req_id] = text_hidden[start : start + scheduled]
+            slices[req_id] = text_hidden[start : start + rows]
         return slices or None
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
@@ -1058,8 +1070,9 @@ def _slice_pooler_value(
 def _merge_hidden_state_payloads(model_runner_output: Any, payloads: dict[str, torch.Tensor]) -> None:
     """Merge per-request hidden-state opt-in payloads into the wire channel.
 
-    Writes ``multimodal_output[HIDDEN_STATES_OUTPUT_KEY]`` per opted-in
-    request, preserving any pooler payload already present in that slot.
+    Writes ``multimodal_output[TEACHER_HIDDEN_STATES_KEY]`` per opted-in
+    request as a separate top-level key, so pooler entries already in that
+    slot (including the reserved ``hidden_states.*`` nest) are untouched.
     """
     req_ids = list(model_runner_output.req_ids)
     req_id_to_index = {req_id: index for index, req_id in enumerate(req_ids)}
@@ -1073,14 +1086,14 @@ def _merge_hidden_state_payloads(model_runner_output: Any, payloads: dict[str, t
             continue
         entry = mm[index]
         if entry is None:
-            mm[index] = {HIDDEN_STATES_OUTPUT_KEY: tensor}
+            mm[index] = {TEACHER_HIDDEN_STATES_KEY: tensor}
         elif isinstance(entry, dict):
             merged_entry = dict(entry)
-            merged_entry[HIDDEN_STATES_OUTPUT_KEY] = tensor
+            merged_entry[TEACHER_HIDDEN_STATES_KEY] = tensor
             mm[index] = merged_entry
         else:
             raise RuntimeError(
-                f"cannot attach {HIDDEN_STATES_OUTPUT_KEY} to req {req_id}: multimodal_outputs"
+                f"cannot attach {TEACHER_HIDDEN_STATES_KEY} to req {req_id}: multimodal_outputs"
                 f"[{index}] already holds a {type(entry).__name__}."
             )
     model_runner_output.multimodal_outputs = mm

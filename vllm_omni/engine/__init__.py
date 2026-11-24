@@ -81,9 +81,9 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         return_hidden_states: Per-request opt-in for returning the policy
             stage's last-layer hidden states (the tensor its logits head
             consumes) through ``CompletionOutput.multimodal_output`` under
-            the ``"hidden_states"`` key. RL teacher rollouts (on-policy
-            distillation) use this signal; ordinary requests leave it off so
-            no device-to-host copy is paid.
+            the ``"teacher_hidden_states"`` key. RL teacher rollouts
+            (on-policy distillation) use this signal; ordinary requests
+            leave it off so no device-to-host copy is paid.
     """
 
     # Optional additional information dictionary (serialized)

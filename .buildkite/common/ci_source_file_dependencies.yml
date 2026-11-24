@@ -564,13 +564,18 @@ source_file_dependencies:
 
   rlhf_verl_omni:
     - tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+    - tests/e2e/features/rlhf_test/test_verl_omni_ar_e2e.py
     - tests/e2e/features/helpers/verl_omni_server.py
+    - tests/e2e/features/helpers/verl_omni_ar_server.py
+    - tests/e2e/features/helpers/verl_omni_ar_worker.py
     - tests/e2e/features/helpers/custom_pipeline.py
     - vllm_omni/diffusion/
     - vllm_omni/engine/
     - vllm_omni/entrypoints/
     - vllm_omni/inputs/
     - vllm_omni/outputs/
+    - vllm_omni/model_executor/models/qwen3_omni/
+    - vllm_omni/worker_v2/
 
   rocm_diffusion_nightly_runner:
     - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
