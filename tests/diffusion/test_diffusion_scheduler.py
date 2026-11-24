@@ -1138,19 +1138,35 @@ class TestRequestScheduler:
         assert output.num_running_reqs == 2
         assert output.num_waiting_reqs == 1
 
-    def test_applied_token_budget_is_unclamped_in_dense_mode(self) -> None:
-        """Dense mode defines no token-counted capacity, so calibration applies unclamped."""
+    def test_apply_token_budget_replaces_the_session_budget_in_dense_mode(self) -> None:
+        """An applied budget is used as-is: dense mode defines no token-counted capacity."""
         self.scheduler.initialize(
             _scheduler_config(
-                max_num_batched_tokens=8192,
+                max_num_batched_tokens=2048,
                 diffusion_batching_config={"policy": "compute_budget"},
             )
         )
-        assert self.scheduler.token_budget_capacity is None
+        req_ids = [
+            self.scheduler.add_request(
+                OmniDiffusionRequest(
+                    prompt=f"prompt_{i}",
+                    sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
+                    request_id=f"req-{i}",
+                )
+            )
+            for i in range(4)
+        ]
 
-        self.scheduler.apply_token_budget(16384)
+        first = self.scheduler.schedule()
+        assert _new_ids(first) == req_ids[:2]
+        assert first.num_waiting_reqs == 2
 
-        assert self.scheduler.token_budget == 16384
+        self.scheduler.apply_token_budget(4096)
+        second = self.scheduler.schedule()
+
+        assert _new_ids(second) == req_ids[2:]
+        assert second.num_running_reqs == 4
+        assert second.num_waiting_reqs == 0
 
     @pytest.mark.parametrize("action", ["abort", "timeout", "preempt"])
     def test_diffusion_kv_loading_defers_free_and_blocks_preempt(self, mocker: MockerFixture, action: str) -> None:
@@ -1515,33 +1531,17 @@ class TestRequestScheduler:
                 "b", num_inference_steps=4, sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4, seed=123)
             )
         )
+        # c is compatible with a, but FIFO preserves arrival order and stops at
+        # the incompatible b instead of skipping it to fill the batch.
+        scheduler.add_request(
+            _make_step_request(
+                "c", num_inference_steps=2, sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123)
+            )
+        )
 
         first = scheduler.schedule()
 
         assert _new_ids(first) == [req_id_a]
-        assert first.num_running_reqs == 1
-        assert first.num_waiting_reqs == 1
-
-    def test_fifo_stops_at_incompatible_waiting_head(self) -> None:
-        scheduler = RequestScheduler()
-        scheduler.initialize(_scheduler_config(max_num_seqs=2))
-
-        compat_a = scheduler.add_request(
-            _make_step_request("compat_a", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123))
-        )
-        # Incompatible head: fixed-step batches are single-key, so b cannot join
-        # a. FIFO preserves arrival order and stops there instead of skipping b
-        # to batch the compatible c behind it.
-        scheduler.add_request(
-            _make_step_request("incompat", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4, seed=123))
-        )
-        scheduler.add_request(
-            _make_step_request("compat_c", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123))
-        )
-
-        first = scheduler.schedule()
-
-        assert _new_ids(first) == [compat_a]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 2
 
@@ -1698,7 +1698,21 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
-    def test_drr_respects_homogeneous_batch_gate_by_token_budget(self) -> None:
+    @pytest.mark.parametrize(
+        ("c_shape", "expected_first", "expected_second"),
+        [
+            # c is incompatible with the aged b (1024x768): the homogeneous
+            # batch gate keeps the step single-key, so b is admitted alone and
+            # a + c fill the next step.
+            ((1024, 1024), ["b"], ["a", "c"]),
+            # c is compatible with b: unlike FIFO, DRR keeps scanning past the
+            # incompatible a and admits c in the same step.
+            ((1024, 768), ["b", "c"], ["a"]),
+        ],
+    )
+    def test_drr_fills_batch_with_compatible_candidates(
+        self, c_shape: tuple[int, int], expected_first: list[str], expected_second: list[str]
+    ) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(
             _scheduler_config(
@@ -1709,106 +1723,40 @@ class TestRequestScheduler:
             )
         )
 
-        req_id_a = scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_a",
-                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
-                request_id="a",
+        req_ids = {
+            request_id: scheduler.add_request(
+                OmniDiffusionRequest(
+                    prompt=f"prompt_{request_id}",
+                    sampling_params=OmniDiffusionSamplingParams(height=height, width=width),
+                    request_id=request_id,
+                )
             )
-        )
-        req_id_b = scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_b",
-                sampling_params=OmniDiffusionSamplingParams(height=1024, width=768),
-                request_id="b",
-            )
-        )
-        req_id_c = scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_c",
-                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
-                request_id="c",
-            )
-        )
+            for request_id, (height, width) in {
+                "a": (1024, 1024),
+                "b": (1024, 768),
+                "c": c_shape,
+            }.items()
+        }
 
         # Age b so its DRR score dominates the microsecond-scale ages of the
         # fresh requests; otherwise the ordering would be timing-dependent.
-        state_b = scheduler.get_request_state(req_id_b)
+        state_b = scheduler.get_request_state(req_ids["b"])
         assert state_b is not None
         state_b.queued_at = time.perf_counter() - 1.0
 
         first = scheduler.schedule()
 
-        # The homogeneous-batching admission gate keeps request-mode batches
-        # single-key: the worker resolves height/width from the first
-        # request's sampling params, so b (1024x768 -> 3072) must be scheduled
-        # alone even though b + a (1024x1024 -> 4096) would fit the budget.
-        assert _new_ids(first) == [req_id_b]
-        assert first.num_running_reqs == 1
-        assert first.num_waiting_reqs == 2
-
-        scheduler.update_from_output(first, _make_request_output(req_id_b))
-        second = scheduler.schedule()
-
-        # With b finished, DRR fills the budget with same-key requests:
-        # a (4096) + c (4096) = 8192 <= 10240.
-        assert _new_ids(second) == [req_id_a, req_id_c]
-        assert second.num_running_reqs == 2
-        assert second.num_waiting_reqs == 0
-
-    def test_drr_skips_incompatible_candidate_to_fill_batch(self) -> None:
-        scheduler = RequestScheduler()
-        scheduler.initialize(
-            _scheduler_config(
-                max_num_batched_tokens=10240,
-                diffusion_batching_config={
-                    "policy": "compute_budget",
-                },
-            )
-        )
-
-        # b is the batch-shape owner (1024x768 -> 3072 units) and ages to the
-        # DRR head; a (1024x1024) is incompatible with it, c (1024x768) is
-        # compatible. Unlike FIFO, DRR keeps scanning past the incompatible a
-        # and admits c in the same step.
-        scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_a",
-                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
-                request_id="a",
-            )
-        )
-        req_id_b = scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_b",
-                sampling_params=OmniDiffusionSamplingParams(height=1024, width=768),
-                request_id="b",
-            )
-        )
-        req_id_c = scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_c",
-                sampling_params=OmniDiffusionSamplingParams(height=1024, width=768),
-                request_id="c",
-            )
-        )
-        state_b = scheduler.get_request_state(req_id_b)
-        assert state_b is not None
-        state_b.queued_at = time.perf_counter() - 1.0
-
-        first = scheduler.schedule()
-
-        assert _new_ids(first) == [req_id_b, req_id_c]
-        assert first.num_running_reqs == 2
-        assert first.num_waiting_reqs == 1
+        assert _new_ids(first) == [req_ids[i] for i in expected_first]
+        assert first.num_running_reqs == len(expected_first)
+        assert first.num_waiting_reqs == 3 - len(expected_first)
 
         scheduler.update_from_output(
             first,
-            BatchRunnerOutput.from_list([_make_request_output(req_id_b), _make_request_output(req_id_c)]),
+            BatchRunnerOutput.from_list([_make_request_output(req_ids[i]) for i in expected_first]),
         )
         second = scheduler.schedule()
 
-        assert _new_ids(second) == ["a"]
+        assert _new_ids(second) == [req_ids[i] for i in expected_second]
         assert second.num_waiting_reqs == 0
 
     def test_drr_charges_mixfusion_metadata_tokens_not_sampling_shape(self) -> None:
@@ -1844,84 +1792,56 @@ class TestRequestScheduler:
         assert _new_ids(output) == ["first", "second"]
         assert output.num_running_reqs == 2
 
-    def test_drr_charges_each_output_of_a_prompt(self) -> None:
-        """A prompt asking for two outputs occupies twice the admission budget."""
+    @pytest.mark.parametrize(
+        ("budget", "sampling_fields"),
+        [
+            # Two outputs of one prompt occupy twice the admission budget.
+            (2560, {"num_outputs_per_prompt": 2}),
+            # A multi-frame request occupies the budget once per frame.
+            (4096, {"num_frames": 4}),
+        ],
+        ids=["num_outputs_per_prompt", "num_frames"],
+    )
+    def test_drr_charges_tokens_per_output_and_frame(self, budget: int, sampling_fields: dict[str, int]) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_batched_tokens=2560,
+                max_num_batched_tokens=budget,
                 diffusion_batching_config={
                     "policy": "compute_budget",
                 },
             )
         )
 
-        req_multi = scheduler.add_request(
+        req_heavy = scheduler.add_request(
             OmniDiffusionRequest(
-                prompt="prompt_multi",
+                prompt="prompt_heavy",
                 sampling_params=OmniDiffusionSamplingParams(
                     height=512,
                     width=512,
-                    num_outputs_per_prompt=2,
+                    **sampling_fields,
                 ),
-                request_id="multi",
+                request_id="heavy",
             )
         )
-        req_single = scheduler.add_request(
+        req_light = scheduler.add_request(
             OmniDiffusionRequest(
-                prompt="prompt_single",
+                prompt="prompt_light",
                 sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
-                request_id="single",
+                request_id="light",
             )
         )
 
         first = scheduler.schedule()
 
-        # multi needs 2048 tokens; single's 1024 would exceed the 2560 budget.
-        assert _new_ids(first) == [req_multi]
+        # The heavy request alone fills the budget, so the light one waits.
+        assert _new_ids(first) == [req_heavy]
         assert first.num_waiting_reqs == 1
 
-        scheduler.update_from_output(first, _make_request_output(req_multi))
+        scheduler.update_from_output(first, _make_request_output(req_heavy))
         second = scheduler.schedule()
 
-        assert _new_ids(second) == [req_single]
-
-    def test_drr_charges_every_frame_of_a_request(self) -> None:
-        """A multi-frame request occupies the admission budget per frame."""
-        scheduler = RequestScheduler()
-        scheduler.initialize(
-            _scheduler_config(
-                max_num_batched_tokens=4096,
-                diffusion_batching_config={
-                    "policy": "compute_budget",
-                },
-            )
-        )
-
-        req_video = scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_video",
-                sampling_params=OmniDiffusionSamplingParams(
-                    height=512,
-                    width=512,
-                    num_frames=4,
-                ),
-                request_id="video",
-            )
-        )
-        scheduler.add_request(
-            OmniDiffusionRequest(
-                prompt="prompt_image",
-                sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
-                request_id="image",
-            )
-        )
-
-        output = scheduler.schedule()
-
-        # video needs 4096 tokens (4 frames x 1024), so image waits.
-        assert _new_ids(output) == [req_video]
-        assert output.num_waiting_reqs == 1
+        assert _new_ids(second) == [req_light]
 
     def test_drr_rejects_request_without_resolved_shape_at_submission(self) -> None:
         """An unaccountable request fails when submitted, not mid-schedule."""
@@ -2631,7 +2551,22 @@ class TestStepScheduler:
         assert state is not None
         state.queued_at = time.perf_counter() - age_s
 
-    def test_drr_aged_head_reserves_remaining_budget_gap(self) -> None:
+    @pytest.mark.parametrize(
+        ("age_s", "admit_small", "expected_running", "expected_waiting"),
+        [
+            # 120s > drr_reserve_time_s: the aged big (4096) cannot fit the
+            # 2048-token gap; reservation mode must not spend the gap on the
+            # late small, otherwise the gap never accumulates.
+            (120.0, False, 6, 2),
+            # 10s < drr_reserve_time_s: no reservation, so the young big head
+            # is skipped and the small (1024) fills the gap.
+            (10.0, True, 7, 1),
+        ],
+        ids=["aged_head_reserves_gap", "young_head_skipped"],
+    )
+    def test_drr_aged_head_controls_budget_gap_reservation(
+        self, age_s: float, admit_small: bool, expected_running: int, expected_waiting: int
+    ) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
             _scheduler_config(
@@ -2658,6 +2593,7 @@ class TestStepScheduler:
         first = scheduler.schedule()
         assert _new_ids(first) == small_ids
 
+        # Running units = 6 * 1024 = 6144, budget 8192 -> remaining 2048.
         req_big = scheduler.add_request(
             _make_step_request(
                 "big",
@@ -2668,8 +2604,8 @@ class TestStepScheduler:
                 ),
             )
         )
-        self._age_request(scheduler, req_big, 120.0)
-        scheduler.add_request(
+        self._age_request(scheduler, req_big, age_s)
+        req_small = scheduler.add_request(
             _make_step_request(
                 "late-small",
                 sampling_params=OmniDiffusionSamplingParams(
@@ -2680,14 +2616,11 @@ class TestStepScheduler:
             )
         )
 
-        # Running units = 6 * 1024 = 6144, budget 8192 -> remaining 2048. The
-        # aged big (4096) cannot fit; reservation mode must not spend the gap
-        # on the late small (1024), otherwise the gap never accumulates.
         second = scheduler.schedule()
 
-        assert _new_ids(second) == []
-        assert second.num_running_reqs == 6
-        assert second.num_waiting_reqs == 2
+        assert _new_ids(second) == ([req_small] if admit_small else [])
+        assert second.num_running_reqs == expected_running
+        assert second.num_waiting_reqs == expected_waiting
 
     def test_drr_aged_admission_respects_explicit_max_num_seqs_count_cap(self) -> None:
         scheduler = StepScheduler()
@@ -2729,65 +2662,6 @@ class TestStepScheduler:
         second = scheduler.schedule()
         assert _new_ids(second) == []
         assert second.num_running_reqs == 2
-        assert second.num_waiting_reqs == 1
-
-    def test_drr_young_head_is_skipped_to_fill_budget(self) -> None:
-        scheduler = StepScheduler()
-        scheduler.initialize(
-            _scheduler_config(
-                max_num_batched_tokens=8192,
-                diffusion_batching_config={
-                    "policy": "compute_budget",
-                },
-            )
-        )
-
-        small_ids = [
-            scheduler.add_request(
-                _make_step_request(
-                    f"small-{i}",
-                    sampling_params=OmniDiffusionSamplingParams(
-                        height=512,
-                        width=512,
-                        num_inference_steps=4,
-                    ),
-                )
-            )
-            for i in range(6)
-        ]
-        first = scheduler.schedule()
-        assert _new_ids(first) == small_ids
-
-        req_big = scheduler.add_request(
-            _make_step_request(
-                "big",
-                sampling_params=OmniDiffusionSamplingParams(
-                    height=1024,
-                    width=1024,
-                    num_inference_steps=4,
-                ),
-            )
-        )
-        # Young aged head: only 10s < drr_reserve_time_s, so it does not get
-        # reservation treatment.
-        self._age_request(scheduler, req_big, 10.0)
-        req_small = scheduler.add_request(
-            _make_step_request(
-                "late-small",
-                sampling_params=OmniDiffusionSamplingParams(
-                    height=512,
-                    width=512,
-                    num_inference_steps=4,
-                ),
-            )
-        )
-
-        # Remaining budget = 2048. Big (4096) does not fit but is young, so it
-        # is skipped and the small (1024) fills the budget.
-        second = scheduler.schedule()
-
-        assert _new_ids(second) == [req_small]
-        assert second.num_running_reqs == 7
         assert second.num_waiting_reqs == 1
 
     def test_drr_aging_promotes_waiting_request_over_new_arrivals(self) -> None:

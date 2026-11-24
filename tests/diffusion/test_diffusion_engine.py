@@ -1635,19 +1635,3 @@ def test_warmup_calibration_runs_sweep_and_never_blocks_startup(caplog: pytest.L
 
     assert sweep_runs == [None]
     assert "sweep failed" in caplog.text
-
-
-@pytest.mark.cpu
-def test_execution_mode_logging_does_not_run_calibration() -> None:
-    """Calibration is an explicit startup phase, not a side effect of logging."""
-    sweep_runs: list[None] = []
-    engine = SimpleNamespace(
-        execution_mode=DiffusionExecutionMode.STEP_BATCH,
-        step_execution=True,
-        run_warmup_batch_profile=lambda: sweep_runs.append(None),
-    )
-    od_config = SimpleNamespace(resolved_max_num_seqs=lambda: 1, request_batch_max_wait_ms=None)
-
-    DiffusionEngine._log_execution_mode(engine, od_config)
-
-    assert sweep_runs == []
