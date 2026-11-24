@@ -65,6 +65,16 @@ def test_chunk_matches_reference(policy):
     np.testing.assert_array_equal(rows[:, 6], ref.REFERENCE_CHUNK_ROWS[:, 6])
 
 
+# The vllm/vllm-openai-rocm v0.34.0 image sets MIOPEN_DEBUG_CONV_DIRECT=0 and
+# MIOPEN_DEBUG_CONV_GEMM=0. With deterministic algorithms MIOpen then finds no
+# solver for the Wan VAE encoder's 3-D convolution ("No suitable algorithm").
+_MIOPEN_DETERMINISM_BLOCKERS = tuple(
+    name
+    for name in ("MIOPEN_DEBUG_CONV_DIRECT", "MIOPEN_DEBUG_CONV_GEMM")
+    if os.environ.get(name, "").strip().lower() in ("0", "false", "no", "off", "disable", "disabled")
+)
+
+
 @contextlib.contextmanager
 def _deterministic_kernels():
     """Bitwise-repeatable kernels for the duration of the block. By default one
@@ -87,6 +97,11 @@ def _deterministic_kernels():
 
 @hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_seed_determinism_and_suite_conditioning(policy):
+    if current_omni_platform.is_rocm() and _MIOPEN_DETERMINISM_BLOCKERS:
+        pytest.skip(
+            f"{', '.join(_MIOPEN_DETERMINISM_BLOCKERS)} disabled: MIOpen has no deterministic solver for the "
+            "Wan VAE encoder convolution; unset these variables to run this check"
+        )
     with _deterministic_kernels():
         first = _infer(policy, 3)
         np.testing.assert_array_equal(first, _infer(policy, 3))
