@@ -3,6 +3,7 @@
 
 """Unit tests for DistributedLayerwiseOffloadHook and backend utilities."""
 
+import dataclasses
 import gc
 import json
 import weakref
@@ -3199,6 +3200,62 @@ class TestDistributedComponentSelection:
         assert dit_hooks  # the encoder is streamed
         assert all(getattr(block, "_hook_registry", None) is None for block in pipeline.transformer.blocks)
         backend.disable()
+
+    def test_rank_local_mmap_encoder_streams_beside_an_allgather_dit(self, tmp_path, patched_offload_runtime):
+        """A plan-backed encoder keeps streaming after the plan mappings are released.
+
+        With a multi-rank AllGather DiT the backend releases the checkpoint
+        mappings at the end of enable(). A rank-local mmap encoder planned
+        next to that DiT must still stage checkpoint values afterwards.
+        """
+
+        class Pipeline(_GenericDistributedEncoderPipeline):
+            # The H3 pipeline declares this; the resolver turns it into backing.
+            _offload_plan = dataclasses.replace(
+                _GenericDistributedEncoderPipeline._offload_plan,
+                component_backing={"text_encoder": BackingKind.CHECKPOINT_MMAP},
+            )
+
+        pipeline = Pipeline()
+        pipeline.transformer = _SingleBlockModel(num_blocks=2)
+        expected = {}
+        for name, parameter in pipeline.named_parameters():
+            parameter.data.copy_(torch.arange(parameter.numel(), dtype=torch.float32).view_as(parameter) + 1)
+            expected[name] = parameter.detach().clone()
+        checkpoint_file = tmp_path / "model.safetensors"
+        save_file(expected, str(checkpoint_file))
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"dit", "text_encoder"}),
+                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+            ),
+            torch.device("cpu"),
+            host_weight_plan=HostWeightPlan(
+                backing_kind="checkpoint_mmap",
+                bindings={
+                    name: TensorBinding(checkpoint_key=name, file_path=str(checkpoint_file)) for name in expected
+                },
+                planned_source_prefixes=frozenset({"transformer.", "text_encoder."}),
+            ),
+        )
+        backend.dp_group = object()
+
+        backend.enable(pipeline)
+
+        # The AllGather DiT is packed, so the checkpoint mappings are gone.
+        assert not hasattr(backend, "_mmap_file_cache")
+        encoder_groups = [group for group in backend._all_hook_groups if all(hook.rank_local_mmap for hook in group)]
+        dit_hooks = [hook for group in backend._all_hook_groups if group not in encoder_groups for hook in group]
+        assert dit_hooks and len(encoder_groups) == 1
+        encoder_hooks = encoder_groups[0]
+        for slot, hook in enumerate(encoder_hooks):
+            hook.prefetch_layer(slot=slot, non_blocking=False)
+        for index in range(2):
+            name = f"text_encoder.encoder.block.{index}.weight"
+            assert torch.equal(pipeline.text_encoder.encoder.block[index].weight, expected[name]), name
 
     def test_explicit_single_block_dit_is_rejected(self, patched_offload_runtime):
         pipeline = nn.Module()
