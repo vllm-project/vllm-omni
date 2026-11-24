@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Launch vLLM-Omni server for higgs-audio v2.
 #
 # v1 scope: plain text -> 24 kHz speech only. Voice cloning, multi-speaker,
@@ -22,6 +25,14 @@ echo "  MODEL=$MODEL"
 echo "  PORT=$PORT"
 echo "  CUDA_VISIBLE_DEVICES=$GPUS"
 
+stage_overrides=$(python3 -c '
+import json
+import sys
+
+gpu_util = float(sys.argv[1])
+print(json.dumps({stage_id: {"gpu_memory_utilization": gpu_util} for stage_id in (0, 1)}))
+' "$GPU_UTIL")
+
 # DeepGEMM FP8 kernels are optional and trip warmup on builds without
 # the deep_gemm backend; disable them so the example works out of the box.
 # Users with deep_gemm installed can re-enable via the same env vars.
@@ -32,6 +43,6 @@ vllm-omni serve "$MODEL" \
     --deploy-config vllm_omni/deploy/higgs_audio_v2.yaml \
     --host 0.0.0.0 \
     --port "$PORT" \
-    --gpu-memory-utilization "$GPU_UTIL" \
+    --stage-overrides "$stage_overrides" \
     --trust-remote-code \
     --omni

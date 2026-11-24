@@ -649,6 +649,7 @@ vllm_omni/
 │       ├── turn_detection.py        server-side VAD turn detector used by the session
 │       ├── audio.py                 compatibility re-export, via protocol/duplex
 │       ├── vad.py / intermediate.py
+│       ├── response_judge.py        post-ASR judge: does a committed turn need a reply
 │       └── session/                 one engine-resident session and everything that runs it
 │           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
 │           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)
@@ -1294,6 +1295,14 @@ cannot reopen a retired gate; the early-stop marker is removed at response end.
 A successful write is not proof of server acceptance, and the runner never sends
 playback ACKs on behalf of the application.
 
+The output-decision and concurrent-turn-release hooks receive the current
+request's streaming context. A host plugin can use that context to share a
+decision with its stage-input bridge without retaining request state on the
+shared plugin. For the optional response judge, AURA returns its listen
+decision from `decide_output`; the generic orchestrator does not interpret
+judge output. AURA resolves its stage roles in `configure_pipeline`, before
+serving requests, and rejects missing required roles or duplicate roles.
+
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
 sampling defaults once the stage pools exist. Plugin hooks that may block
@@ -1372,7 +1381,36 @@ all of them for that append. The timeouts' defaults are the same for every
 model (a per-plugin default is a possible follow-up). A plugin enables the mode with
 `supports_input_clock = True` once those hooks match its real unit
 boundaries; sessions of other models that ask for it are refused
-(`input_clock_unsupported`). No model opts in yet.
+(`input_clock_unsupported`). A plugin whose committed turn can split into
+several Stage-0 submissions for some input modality (vision units it
+replays separately, `prepare_commit_prefix`) names the modalities its
+clocked sessions do accept in `input_clock_input_modalities`; the session
+is then created without the others (`apply_input_clock_capabilities`), so
+the modality check refuses them (`invalid_input_modality`). MiniCPM-o 4.5
+opts in, for audio: its Code2Wav stage streams across unit boundaries, so
+its `unit_output_complete` waits for the Talker segment end and the Code2Wav
+output of the chunk that flushes the unit's remaining codes
+(`tts_is_last_chunk`). The orchestrator reads each stage's stream
+independently, so the flushes of several queued units can arrive before the
+first Talker segment end while the engine hands every final-stage output to
+the oldest speaking unit; the hook therefore counts the flags in `state` and
+consumes them in unit order, the n-th flag completing the n-th speaking unit
+(a Code2Wav segment end alone does not complete a unit, so a trailing
+control-only turn-end snapshot of the previous unit cannot complete the next
+one); a Stage-0 segment that
+hands the Talker nothing (`<|speak|>` straight into `<|chunk_eos|>`, or the
+chunk terminator drawn as the unit's first decision) is forwarded as an
+empty hand-off, which the Talker closes like any segment, so every speaking
+unit has a Talker segment end and a flagged Code2Wav output of its own and
+the default `unit_decision` is enough; and its input buffer implements
+`prepare_backlog`. The flag marks the end of what the bridge hands Code2Wav
+for the unit, not of its audio: the vocoder's lookahead, and a remainder
+shorter than 5 frames that the connector carries into the next unit's first
+chunk, put the unit's last codec frames (usually 200–440 ms of audio; no
+structural bound) into audio emitted with the next unit, as in real-time
+operation, so the codec path is the same with and without the clock. Only
+the chunk that ends the turn flushes everything; the API doc states this lag
+in the model's entry.
 
 What a plugin must guarantee before it opts in:
 
@@ -1432,9 +1470,11 @@ embeddings even when they do not add a pooled token.
 The default `minicpmo_4_5.yaml` deployment selects MRv2 for all three stages
 on CUDA, ROCm and NPU. The ROCm override changes runner selection while
 preserving the shared duplex session, async-chunk, device, connector and stage
-topology contracts. The CUDA-only reference-attention, FlashAttention, graph,
-speculation and fused-kernel behavior described below does not apply to ROCm;
-runner selection alone does not establish ROCm runtime or quality qualification.
+topology contracts. The CUDA-only reference-attention, FlashAttention, graph
+and speculation behavior described below does not apply to ROCm. A ROCm FP16
+Code2Wav configuration may select the shared fused CFM body with its SDPA
+fallback; it does not enable NVIDIA tiled attention. Runner selection and this
+dispatch coverage alone do not establish ROCm runtime or quality qualification.
 
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
@@ -1444,6 +1484,15 @@ ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
 cap is set. That cap keeps the token that crosses the target, then closes
 the chunk before another draw. Hard token and request caps retain priority;
 explicit `force_listen` bypasses only the soft character target.
+
+The listen decision takes the released `streaming_generate` knobs. A session
+created with `extra_body={"listen_prob_scale": s}` multiplies the listen logit
+by `s` after the repetition penalty, and `extra_body={"listen_top_k": k}`
+returns `<|listen|>` outright when it ranks within the top-`k` logits, before
+the final draw. Both default to neutral (`1.0` / unset) and are validated at
+session creation; they ride the append payload next to `force_listen` and
+cannot change once the session exists. An early listen never enters the
+repetition history, matching the reference decoder's early return.
 
 MiniCPM-o preserves the stage-2 sampled `<|turn_eos|>`, including after text
 without sentence-ending punctuation. The sampler does not infer whether an
@@ -1592,6 +1641,28 @@ budgets the JoyAI prompt against JoyAI's generation settings. Session model conf
 comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
+
+JoyAI keeps an empty assistant message for a retained visual observation's
+response when cancellation leaves no committed speech. This preserves the turn
+boundary in both direct and ASR-handoff prompts without restoring unheard text
+or treating cancellation as a model silence decision. The boundary follows the
+existing recent-history budget and disappears when its history item is deleted.
+The ASR handoff retains frame timestamps and observation-to-history references,
+so an old frame precedes its reply boundary and the new transcript accompanies
+only the current observation. Both paths apply the image limit before selecting
+recent history. An empty boundary is omitted when none of its observation's
+frames survives prompt assembly; pending consolidation records alone do not
+keep it alive. Non-empty committed replies
+still referenced by the observation ledger remain eligible at the recent-history
+boundary even after their frames leave the prompt.
+Frame eviction removes only the standalone generated timestamp paired with the
+frame; neighboring user text remains, even when it ends with a timestamp.
+
+For a speech-only follow-up without a new or working-window frame, the ASR
+handoff includes the latest frame still awaiting visual consolidation. It keeps
+that frame's original timestamp and observation-to-history references, before
+the new transcript's turn. Once the frame has been summarized, the summary
+provides its context instead of restoring the cached raw frame.
 
 While idle, JoyAI retains the latest camera frame and one input chunk of audio
 pre-roll. Once speech starts, it keeps the utterance until commit. An idle

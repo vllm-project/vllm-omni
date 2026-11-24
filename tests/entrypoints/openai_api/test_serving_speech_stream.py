@@ -1201,7 +1201,7 @@ class TestStreamingSpeechWebSocket:
             captured_requests.append(request)
             assert arrival_time is not None
             captured_timing["prepare_arrival"] = arrival_time
-            return request_id or "req-stream", object(), {"_qwen3_tts_effective_max_tokens": [192]}
+            return request_id or "req-stream", object(), {"task_type": ["Base"]}
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
@@ -1269,7 +1269,7 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].initial_codec_chunk_frames == 12
         assert captured_timing["prepare_arrival"] == captured_timing["chunk_arrival"]
         assert captured_timing["chunk_start"] > 0
-        assert captured_tts_params == [{"_qwen3_tts_effective_max_tokens": [192]}]
+        assert captured_tts_params == [{"task_type": ["Base"]}]
         assert speech_service._generate_audio_bytes.await_count == 0
 
     @staticmethod
@@ -2040,7 +2040,16 @@ class TestWebSocketSentenceSplitting:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42, "watermarking": False})
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "seed": 42,
+                        "watermarking": False,
+                        "temperature": 0.7,
+                        "repetition_penalty": 1.1,
+                    }
+                )
                 ws.send_json({"type": "input.text", "text": "Hello."})
                 ws.send_json({"type": "input.done"})
                 ws.receive_json()
@@ -2051,6 +2060,8 @@ class TestWebSocketSentenceSplitting:
         speech_request = speech_service._generate_audio_bytes.await_args_list[0].args[0]
         assert speech_request.seed == 42
         assert speech_request.watermarking is False
+        assert speech_request.temperature == 0.7
+        assert speech_request.repetition_penalty == 1.1
 
 
 def _qwen3_sample_rate_check(request: OpenAICreateSpeechRequest) -> str | None:

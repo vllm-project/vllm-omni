@@ -996,6 +996,36 @@ def test_i2v_minimax_h3_preserves_reference_geometry():
     assert (sampling_params.width, sampling_params.height) == (96, 64)
 
 
+@pytest.mark.parametrize(
+    ("model_class_name", "expected_size"),
+    [
+        ("Cosmos3OmniDiffusersPipeline", (480, 800)),
+        ("Cosmos3OmniPipeline", (480, 800)),
+        ("Cosmos3NanoSimBimanualPipeline", (320, 192)),
+    ],
+)
+def test_i2v_cosmos3_reference_geometry_reaches_pipeline(model_class_name, expected_size):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = model_class_name
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="nvidia/Cosmos3-Nano",
+    )
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A robot arm picks up a cup.", width=320, height=192),
+            "cosmos3-reference-geometry",
+            reference_image=ReferenceImage(Image.new("RGB", (480, 800))),
+        )
+    )
+
+    assert engine.captured_prompt is not None
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == expected_size
+
+
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
     image_bytes = _make_test_image_bytes((48, 48))
     mocker.patch(
@@ -2981,6 +3011,22 @@ def test_invalid_seconds_returns_422(test_client):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("flow_shift", ["nan", "inf", "-inf", "0", "-2"])
+def test_invalid_flow_shift_returns_422(test_client, flow_shift: str):
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "bad flow shift", "flow_shift": flow_shift},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "flow_shift"]
+
+
+@pytest.mark.parametrize("flow_shift", [float("nan"), float("inf"), float("-inf"), 0.0, -2.0])
+def test_video_request_rejects_invalid_flow_shift(flow_shift: float):
+    with pytest.raises(ValueError, match="flow_shift"):
+        VideoGenerationRequest(prompt="test", flow_shift=flow_shift)
+
+
 def test_negative_prompt_and_seed_pass_through(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -4505,6 +4551,33 @@ def test_h3_control_rejects_before_job_creation(endpoint, fields, roles, message
     persist.assert_not_called()
     assert engine.captured_prompt is None
     assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+@pytest.mark.parametrize(("task", "accepted"), [("ref2va", True), ("t2va", False), (None, False)])
+def test_h3_control_accepts_references_only_for_ref2va(task, accepted, test_client, mocker):
+    """FastH3 Omni takes control as Ref2VA, which needs a reference; other tasks keep refusing references."""
+    _mock_encode_video_bytes(mocker, b"controlled")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    extra = {"canny": {"control_context_scale": 1.0}}
+    if task is not None:
+        extra["task"] = task
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Controlled scene.", "control_type": "canny", "extra_params": json.dumps(extra)},
+        files=[
+            ("control_reference", ("hint.mp4", _make_test_video_bytes(), "video/mp4")),
+            ("input_reference", ("ref.png", _make_test_image_bytes(), "image/png")),
+        ],
+    )
+    if accepted:
+        assert response.status_code == 200, response.text
+        assert "control_path" in engine.captured_prompt["multi_modal_data"]["minimax_h3_control"]
+    else:
+        assert response.status_code == 400
+        assert "outside task=ref2va" in response.json()["detail"]
+        assert engine.captured_prompt is None
 
 
 @pytest.mark.parametrize("strength", [-1, float("nan"), float("inf"), 10**1000, "1", True])
