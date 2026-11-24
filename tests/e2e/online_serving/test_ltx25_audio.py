@@ -12,6 +12,7 @@ import wave
 import numpy as np
 import pytest
 import requests
+import torch
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -27,6 +28,7 @@ MODEL_REVISION = os.environ.get(
 )
 SAMPLE_RATE = 48_000
 EXPECTED_SAMPLE_COUNT = 96_480
+ATTENTION_BACKEND = "TORCH_SDPA" if torch.version.hip is not None else "CUDNN_ATTN"
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
@@ -40,12 +42,12 @@ def _server() -> OmniServerParams:
             "LTX2TextToAudioPipeline",
             "--enforce-eager",
             "--diffusion-attention-backend",
-            "CUDNN_ATTN",
+            ATTENTION_BACKEND,
         ],
     )
 
 
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_server(), id="ltx25_t2a")], indirect=True)
 def test_ltx25_text_to_audio_online(omni_server, openai_client) -> None:
     """The registered T2A pipeline returns a non-empty stereo 48 kHz WAV."""

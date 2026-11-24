@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
 from pathlib import Path
 
@@ -149,6 +150,23 @@ def test_iter_jpegs_fractional_fps_excludes_clip_endpoint(tmp_path):
     frames = list(iter_jpegs(path, fps=1.5, duration=4.0))
     assert [timestamp for timestamp, _ in frames] == pytest.approx([0, 2 / 3, 4 / 3, 2, 8 / 3, 10 / 3])
     assert all(jpeg.startswith(b"\xff\xd8") for _, jpeg in frames)
+
+
+def test_iter_jpegs_c8_concurrent_prepare_does_not_deadlock(tmp_path):
+    """C8 duplex prepare used to hang in concurrent PyAV open/seek on aarch64."""
+    paths = []
+    for i in range(8):
+        path = tmp_path / f"c8_{i}.mp4"
+        path.write_bytes(_make_synthetic_mp4(duration=2.0, fps=30))
+        paths.append(path)
+
+    def _pull(path: Path) -> int:
+        return len(list(iter_jpegs(path, fps=1.0, duration=2.0)))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_pull, path) for path in paths]
+        counts = [future.result(timeout=30) for future in as_completed(futures, timeout=30)]
+    assert counts == [2] * 8
 
 
 class TestVideoThreadType:

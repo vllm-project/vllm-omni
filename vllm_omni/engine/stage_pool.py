@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm.logger import init_logger
+from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
@@ -270,24 +271,18 @@ class StagePool:
     def __init__(
         self,
         stage_id: int,
-        clients: StagePoolClient | list[StagePoolClient],
+        clients: StagePoolClient | Sequence[StagePoolClient | None],
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
         watermarkers: Mapping[str, Watermarker] | None = None,
         strict_watermarking: bool = False,
     ) -> None:
-        if isinstance(clients, list):
-            normalized_clients: list[StagePoolClient] = list(clients)
-        else:
-            normalized_clients = [clients]
-
-        # Allow empty pools when running in distributed head mode for a
-        # non-self stage; clients will arrive via add_client(...).
         self.stage_id = stage_id
-        # Slots can become None after a dynamic remove_client (distributed mode);
-        # iterate via live_replica_ids() to skip holes.
-        self.clients: list[StagePoolClient | None] = list(normalized_clients)
+        # A slot is empty after a startup failure or dynamic removal. Keep its
+        # index reserved so routing and metrics use the original replica IDs.
+        # Distributed heads can also start with no slots and add clients later.
+        self.clients: list[StagePoolClient | None] = list(clients) if isinstance(clients, Sequence) else [clients]
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self.collect_stage_metrics = True
@@ -1426,6 +1421,8 @@ class StagePool:
         return self._has_non_empty_output(request_output)
 
     def _has_non_empty_output(self, request_output: Any) -> bool:
+        if isinstance(request_output, PoolingRequestOutput):
+            return self._is_non_empty_value(request_output.outputs.data)
         final_output_type = getattr(request_output, "final_output_type", None)
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
