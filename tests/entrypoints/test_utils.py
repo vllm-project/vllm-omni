@@ -701,8 +701,8 @@ def test_prepare_stage_config_inputs_filters_frontend_options(api_server_count):
         ("fixed", None, {"policy": "fixed"}),
         (
             "compute_budget",
-            {"compute_unit_budget": 4096},
-            {"compute_unit_budget": 4096, "policy": "compute_budget"},
+            {"drr_beta": 0.5},
+            {"drr_beta": 0.5, "policy": "compute_budget"},
         ),
     ],
 )

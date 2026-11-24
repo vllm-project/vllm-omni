@@ -24,7 +24,11 @@ from vllm_omni.diffusion.attention.schedule import (
     stage_runs_denoising,
     validate_request_attention_schedules,
 )
-from vllm_omni.diffusion.data import DiffusionBatchingConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DEFAULT_DIFFUSION_TOKEN_BUDGET,
+    DiffusionBatchingConfig,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
     KVTransferRegistrationError,
@@ -100,9 +104,15 @@ class BaseScheduler(ABC):
         self._running_sampling_params_key: BatchSamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
-        # DRR budget pinned by an explicit max_num_seqs (> 1), in compute
-        # units. None means the budget comes from ``batching_config``.
-        self.user_request_budget_units: int | None = None
+        # Literal request-count cap for budgeted admission; None means
+        # ``max_num_seqs`` was unset and the token budget alone bounds the batch.
+        self._request_count_cap: int | None = None
+        # DRR admission budget in packed patch tokens; None when the active
+        # policy has no budget.
+        self._token_budget: int | None = None
+        # Paged KV token capacity the budget must respect; None when unknown
+        # (dense mode has no admission capacity counted in tokens).
+        self._token_budget_capacity: int | None = None
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
         self._kv_connector = None
@@ -140,16 +150,17 @@ class BaseScheduler(ABC):
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         self._reset_kv_transfer_state()
-        max_num_seqs = od_config.max_num_seqs
-        try:
-            self.max_num_running_reqs = max(1, int(max_num_seqs))
-        except (TypeError, ValueError):
-            self.max_num_running_reqs = 1
+        self.max_num_running_reqs = od_config.resolved_max_num_seqs()
+        # Only an explicit ``max_num_seqs`` is a literal request-count cap; the
+        # unset ``None`` sentinel leaves the token budget as the sole bound.
+        self._request_count_cap = None if od_config.max_num_seqs is None else self.max_num_running_reqs
         self.batching_config = self._resolve_batching_config(od_config)
-        self.user_request_budget_units = self._explicit_request_budget_units()
+        self._token_budget_capacity = self._resolve_token_budget_capacity(od_config, kv_vllm_config)
+        self._token_budget = self._resolve_token_budget(od_config)
         self.batching_policy = create_diffusion_batching_policy(
             self.batching_config,
-            request_budget_units=self.user_request_budget_units,
+            request_count_cap=self._request_count_cap,
+            token_budget=self._token_budget,
         )
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
@@ -406,24 +417,24 @@ class BaseScheduler(ABC):
         if not candidates:
             return
 
-        budget = self._admission_budget_units()
+        budget = self._token_budget if policy.consumes_token_budget else None
         running_tokens = self._running_admission_tokens() if budget is not None else 0
 
         # A request costlier than the whole budget must not deadlock admission:
-        # when nothing is running there is no concurrency left to budget, so
-        # the head candidate is admitted regardless of its cost. This also
-        # covers a budget calibrated from cheaper reference requests (no CFG,
-        # single frame) than the ones the server actually serves.
+        # when nothing is running there is no batch left to budget, so admit the
+        # cheapest waiting request regardless of its cost. This also covers a
+        # budget calibrated from cheaper reference requests (no CFG, single
+        # frame) than the ones the server actually serves. When the cheapest
+        # request fits, the normal loop below admits it with the rest.
         if budget is not None and not self._running:
-            head = candidates[0]
-            if not self._can_schedule_waiting(head):
-                return
-            outcome = self._admission_scan_outcome(head, scheduled_new_reqs, scheduled_cached_request_ids, now)
-            if outcome == "stop":
-                return
-            if outcome == "admitted":
-                running_tokens += policy.request_tokens(head)
-            candidates = candidates[1:]
+            cheapest = min(candidates, key=policy.request_tokens)
+            if policy.request_tokens(cheapest) > budget:
+                outcome = self._admission_scan_outcome(cheapest, scheduled_new_reqs, scheduled_cached_request_ids, now)
+                if outcome == "stop":
+                    return
+                if outcome == "admitted":
+                    running_tokens += policy.request_tokens(cheapest)
+                candidates = [state for state in candidates if state is not cheapest]
 
         if budget is not None:
             remaining = budget - running_tokens
@@ -487,13 +498,73 @@ class BaseScheduler(ABC):
             if outcome == "admitted" and budget is not None:
                 running_tokens += tokens
 
-    def _admission_budget_units(self) -> int | None:
-        """Capacity budget for this schedule step; None means unbudgeted."""
+    def _resolve_token_budget(self, od_config: OmniDiffusionConfig) -> int | None:
+        """DRR admission budget in packed patch tokens; None for unbudgeted policies."""
         if not self.batching_config.uses_compute_budget:
             return None
-        if self.user_request_budget_units is not None:
-            return max(1, int(self.user_request_budget_units))
-        return self.batching_config.effective_compute_unit_budget()
+        explicit = od_config.max_num_batched_tokens
+        if explicit is not None:
+            budget = self._clamp_token_budget(max(1, int(explicit)), source="max_num_batched_tokens")
+            logger.info("DRR admission budget: max_num_batched_tokens=%s.", budget)
+            return budget
+        budget = self._clamp_token_budget(DEFAULT_DIFFUSION_TOKEN_BUDGET, source="the default token budget")
+        logger.info(
+            "DRR admission budget: %s packed tokens (default; set max_num_batched_tokens to override).",
+            budget,
+        )
+        return budget
+
+    def _resolve_token_budget_capacity(
+        self,
+        od_config: OmniDiffusionConfig,
+        kv_vllm_config: VllmConfig | None,
+    ) -> int | None:
+        """Token capacity the DRR budget must respect, if the mode defines one.
+
+        Paged scheduling sizes its KV block table from
+        ``scheduler_config.max_num_batched_tokens`` and rejects a step that
+        exceeds it at runtime, so the admission budget must stay within it.
+        Dense mode has no admission capacity counted in tokens (the MoE LoRA
+        token capacity is a preallocation, not an admission bound).
+        """
+        if od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return None
+        if kv_vllm_config is None:
+            return None
+        capacity = kv_vllm_config.scheduler_config.max_num_batched_tokens
+        if capacity is None:
+            return None
+        return max(1, int(capacity))
+
+    def _clamp_token_budget(self, token_budget: int, *, source: str) -> int:
+        if self._token_budget_capacity is not None and token_budget > self._token_budget_capacity:
+            logger.info(
+                "DRR admission budget from %s (%s packed tokens) clamped to paged KV capacity %s.",
+                source,
+                token_budget,
+                self._token_budget_capacity,
+            )
+            return self._token_budget_capacity
+        return token_budget
+
+    def apply_token_budget(self, token_budget: int) -> None:
+        """Adopt ``token_budget`` as the DRR admission budget, re-enabling DRR.
+
+        Used by startup calibration; the value is clamped to the paged KV
+        capacity so a calibrated sweep can never admit past the block table.
+        """
+        self._token_budget = self._clamp_token_budget(max(1, int(token_budget)), source="warmup calibration")
+        self.batching_config = replace(self.batching_config, policy="compute_budget")
+        self.batching_policy = create_diffusion_batching_policy(
+            self.batching_config,
+            request_count_cap=self._request_count_cap,
+            token_budget=self._token_budget,
+        )
+
+    @property
+    def token_budget(self) -> int | None:
+        """Current DRR admission budget in packed tokens; ``None`` when DRR is off."""
+        return self._token_budget
 
     def _running_admission_tokens(self) -> int:
         tokens = 0
@@ -962,17 +1033,6 @@ class BaseScheduler(ABC):
             )
             return replace(config, policy=resolved_policy)
         return config
-
-    def _explicit_request_budget_units(self) -> int | None:
-        """Return the DRR budget pinned by an explicit ``max_num_seqs > 1``.
-
-        ``max_num_seqs <= 1`` is the default/unset sentinel: the admission
-        budget then comes from ``compute_unit_budget`` (or warmup calibration)
-        and no literal request-count cap applies.
-        """
-        if self.max_num_running_reqs <= 1:
-            return None
-        return self.max_num_running_reqs * self.batching_config.reference_compute_units()
 
     def _enqueue_waiting(self, state: SchedulerRequestState, *, front: bool = False) -> None:
         request_id = state.request_id

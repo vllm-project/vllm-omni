@@ -914,16 +914,14 @@ class VideoOutputTransportConfig:
             raise TypeError("enable_borrowed_frames must be a bool")
 
 
+# Fallback DRR admission budget when ``max_num_batched_tokens`` is unset:
+# 16384 packed tokens, i.e. sixteen 512x512 images or four 1024x1024 images.
+DEFAULT_DIFFUSION_TOKEN_BUDGET = 16384
+
+
 @dataclass
 class DiffusionBatchingConfig:
     """Configuration for diffusion batching policy plugins.
-
-    The built-in reference budget is profiled from Qwen-Image on one 910B2
-    NPU, where 512x512 requests have batch-size sweet spot 10:
-    ``(512 / 16) * (512 / 16) * 10 = 10240``.
-
-    For other models, hardware, or backend setups, run the profiler policy and
-    set ``compute_unit_budget`` from the generated config.
 
     The ``compute_budget`` policy (DRR admission) is coupled to MixFusion:
     it requires ``enable_mixfusion=True`` and engine startup fails fast
@@ -931,20 +929,30 @@ class DiffusionBatchingConfig:
     on, and falls back to ``fixed`` when it is off. Set ``policy="fixed"``
     explicitly to keep MixFusion but disable DRR.
 
+    The DRR admission budget counts packed patch tokens: one token per
+    ``(vae_scale_factor * latent_patch_size)`` latent patch, multiplied by the
+    frame count (``512x512`` is 1024 tokens). This is the same unit as the
+    MixFusion chunk envelope, and it deliberately excludes the CFG weight: the
+    CFG multiplier only scales the DRR ordering score.
+
     How the DRR budget is chosen:
-    - Explicit ``max_num_seqs > 1``: the user already stated how many
-      reference requests to run, so ``budget = max_num_seqs *
-      reference_compute_units`` (one 512x512 image by default) and neither
-      ``compute_unit_budget`` nor warmup calibration is used.
-    - ``max_num_seqs <= 1`` (the default "unset" sentinel): the policy uses
-      ``compute_unit_budget`` (optionally warmup-calibrated) and the
-      budget-derived request cap replaces the literal ``max_num_seqs``.
+    - Explicit ``od_config.max_num_batched_tokens``: used as the admission
+      budget, clamped to the paged KV token capacity when that capacity is
+      known; warmup calibration is skipped.
+    - Unset (the default): ``DEFAULT_DIFFUSION_TOKEN_BUDGET``, optionally
+      replaced by warmup calibration. The default is not written back into
+      ``od_config.max_num_batched_tokens``, which keeps its own meaning for
+      native MoE LoRA and paged block-table sizing.
+
+    ``od_config.max_num_seqs`` is a literal request-count cap, independent of
+    the budget. ``None`` means unset: most consumers resolve it to 1, while
+    DRR admission then applies no count cap and the token budget alone bounds
+    the batch.
     """
 
     # "auto" enables DRR (compute_budget) whenever MixFusion is on and keeps
     # the fixed FIFO policy otherwise. "fixed" disables DRR explicitly.
     policy: str = "auto"
-    compute_unit_budget: int = 10240
 
     # Qwen-Image packs VAE latents into 2x2 patches. The effective sequence
     # length is (height / (vae_scale_factor * latent_patch_size)) *
@@ -952,7 +960,8 @@ class DiffusionBatchingConfig:
     vae_scale_factor: int = 8
     latent_patch_size: int = 2
 
-    # Cost multiplier for true CFG / negative-branch execution.
+    # Weight of true CFG / negative-branch execution in the DRR ordering score.
+    # It never inflates the admission capacity of a request.
     cfg_compute_multiplier: float = 2.0
 
     default_height: int = 1024
@@ -963,7 +972,8 @@ class DiffusionBatchingConfig:
 
     # DRR (improved DRR: cost-normalized aging) waiting-queue ordering and admission.
     # Waiting requests are ordered by score = age_s**alpha / (cost/1024)**beta,
-    # where cost is the request's compute units and 1024 is one 512x512 image.
+    # where cost is the request's token cost times the CFG weight and 1024 is
+    # the packed-token count of one 512x512 image.
     drr_alpha: float = 1.0
     drr_beta: float = 1.0
     # A request waiting longer than this becomes an aged head: it reserves the
@@ -971,8 +981,8 @@ class DiffusionBatchingConfig:
     drr_reserve_time_s: float = 60.0
 
     # Warmup-time automatic budget calibration. Opt-in via warmup_auto_calibrate.
-    # The ladder sweep runs at startup (step_execution + max_num_seqs > 1) and
-    # rewrites compute_unit_budget based on a sparse ladder of batch sizes.
+    # The ladder sweep runs at startup when no explicit max_num_batched_tokens
+    # is set and rewrites the DRR token budget from a sparse batch-size ladder.
     warmup_auto_calibrate: bool = False
     warmup_profile_max_batch: int = 128
     warmup_profile_num_steps: int = 3
@@ -994,6 +1004,11 @@ class DiffusionBatchingConfig:
         if not isinstance(data, dict):
             raise TypeError(f"Expected batching config dict, got {type(data)!r}")
         field_names = {f.name for f in fields(cls)}
+        if "compute_unit_budget" in data:
+            raise ValueError(
+                "Diffusion batching config field 'compute_unit_budget' was removed; "
+                "set OmniDiffusionConfig.max_num_batched_tokens instead."
+            )
         unknown = sorted(set(data) - field_names)
         if unknown:
             raise ValueError(
@@ -1020,12 +1035,13 @@ class DiffusionBatchingConfig:
     def latent_divisor(self) -> int:
         return max(1, int(self.vae_scale_factor) * int(self.latent_patch_size))
 
-    def spatial_compute_units(
+    def spatial_tokens(
         self,
         height: int | None,
         width: int | None,
         num_frames: int | None = None,
     ) -> int:
+        """Packed patch tokens one request of this shape occupies."""
         h = int(height or self.default_height)
         w = int(width or self.default_width)
         frames = max(1, int(num_frames or 1))
@@ -1034,33 +1050,8 @@ class DiffusionBatchingConfig:
         latent_w = max(1, w // divisor)
         return latent_h * latent_w * frames
 
-    def request_compute_units(self, sampling_params: Any, prompts: list[Any]) -> int:
-        units = self.spatial_compute_units(
-            getattr(sampling_params, "height", None),
-            getattr(sampling_params, "width", None),
-            getattr(sampling_params, "num_frames", 1),
-        )
-        if self._uses_true_cfg(sampling_params, prompts):
-            units = int(units * float(self.cfg_compute_multiplier))
-        return max(1, units)
-
-    def effective_compute_unit_budget(self) -> int:
-        return max(1, int(self.compute_unit_budget))
-
-    def reference_compute_units(self) -> int:
-        """Compute units of one reference request (512x512 by default).
-
-        An explicit ``max_num_seqs > 1`` defines the DRR admission budget as
-        ``max_num_seqs * reference_compute_units``, i.e. each admitted slot is
-        worth one 512x512 image.
-        """
-        return max(
-            1,
-            self.spatial_compute_units(self.warmup_reference_height, self.warmup_reference_width),
-        )
-
     @staticmethod
-    def _uses_true_cfg(sampling_params: Any, prompts: list[Any]) -> bool:
+    def uses_true_cfg(sampling_params: Any, prompts: list[Any]) -> bool:
         if bool(getattr(sampling_params, "do_classifier_free_guidance", False)):
             return True
 
@@ -1439,7 +1430,10 @@ class OmniDiffusionConfig:
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 
     # Maximum number of sequences to generate in a batch
-    max_num_seqs: int = 1
+    # Literal request-count cap. None means unset: consumers resolve it to 1,
+    # while DRR admission applies no count cap and the token budget alone
+    # bounds the batch.
+    max_num_seqs: int | None = None
     diffusion_batching_config: DiffusionBatchingConfig | dict[str, Any] = field(default_factory=DiffusionBatchingConfig)
 
     # Native vLLM KV-cache sizing inputs used only by paged_scheduler mode.
@@ -1472,6 +1466,12 @@ class OmniDiffusionConfig:
             return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False
+
+    def resolved_max_num_seqs(self) -> int:
+        """Literal request-count cap with the unset ``None`` sentinel resolved to 1."""
+        if self.max_num_seqs is None:
+            return 1
+        return max(1, int(self.max_num_seqs))
 
     def _resolve_master_port(self) -> int:
         """Resolve torch.distributed master port without unnecessary random jitter.

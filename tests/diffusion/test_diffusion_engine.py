@@ -152,6 +152,16 @@ class MockScheduler:
         pass
 
 
+def _od_config(**fields: Any) -> SimpleNamespace:
+    """A stand-in for OmniDiffusionConfig carrying the fields the engine reads directly."""
+    values = {"max_num_seqs": None}
+    values.update(fields)
+    config = SimpleNamespace(**values)
+    # Mirrors OmniDiffusionConfig's only-None-is-unset sentinel resolution.
+    config.resolved_max_num_seqs = lambda: 1 if config.max_num_seqs is None else max(1, int(config.max_num_seqs))
+    return config
+
+
 def _make_admission_engine(pre_process_func) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
     engine._request_chunk_states = {}
@@ -245,7 +255,7 @@ class TestRequestBatchCapability:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name="QwenImagePipeline",
             custom_pipeline_args=None,
             diffusion_load_format="diffusers",
@@ -396,7 +406,7 @@ class TestRequestBatchCapability:
         mocker: MockerFixture,
         custom_pipeline_args: dict[str, Any] | None,
     ) -> None:
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name="SinglePipeline",
             custom_pipeline_args=custom_pipeline_args,
             streaming_output=False,
@@ -445,7 +455,7 @@ class TestRequestBatchCapability:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name="SinglePipeline",
             custom_pipeline_args=None,
             streaming_output=False,
@@ -480,7 +490,7 @@ class TestRequestBatchCapability:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name="SinglePipeline",
             custom_pipeline_args=None,
             streaming_output=False,
@@ -596,7 +606,7 @@ class TestRequestBatchCapability:
     @pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
     def test_engine_allows_h3_serial_hsdp(self, model_class_name, monkeypatch):
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name=model_class_name,
             streaming_output=False,
             max_num_seqs=1,
@@ -624,7 +634,7 @@ class TestRequestBatchCapability:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name="BatchPipeline",
             custom_pipeline_args=None,
             streaming_output=False,
@@ -669,7 +679,7 @@ class TestRequestBatchCapability:
         fake_executor.execute_request.assert_not_called()
 
     def test_make_engine_runs_startup_warmup(self, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name="SinglePipeline",
             custom_pipeline_args=None,
             engine_backend="default",
@@ -722,7 +732,7 @@ class TestMixFusionCapability:
 
     @staticmethod
     def _resolve(monkeypatch: pytest.MonkeyPatch, pipeline_cls: type, **config: object):
-        od_config = SimpleNamespace(
+        od_config = _od_config(
             model_class_name="StubPipeline",
             custom_pipeline_args=None,
             streaming_output=False,
@@ -1545,7 +1555,7 @@ def test_warmup_profile_stops_recording_when_sweep_fails(
         batching_config=batching_config,
         batching_policy=saved_policy,
         max_num_running_reqs=1,
-        user_request_budget_units=None,
+        token_budget=None,
         get_request_state=lambda request_id: None,
     )
     engine = SimpleNamespace(
@@ -1553,6 +1563,7 @@ def test_warmup_profile_stops_recording_when_sweep_fails(
         od_config=SimpleNamespace(
             model="fake-model",
             model_class_name="FakePipeline",
+            max_num_batched_tokens=None,
             parallel_config=SimpleNamespace(),
         ),
         step_execution=True,

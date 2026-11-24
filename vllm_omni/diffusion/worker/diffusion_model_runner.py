@@ -1495,17 +1495,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if not states:
             return
 
-        prompt = states[0].prompt
-        request_units = batching_config.request_compute_units(
-            states[0].sampling,
-            [prompt] if prompt is not None else [],
+        request_tokens = batching_config.spatial_tokens(
+            getattr(states[0].sampling, "height", None),
+            getattr(states[0].sampling, "width", None),
+            getattr(states[0].sampling, "num_frames", None),
         )
         logger.info(
-            "[DiffusionBatchProfiler] batch_size=%s request_compute_units=%s "
-            "total_compute_units=%s denoise_step_time=%.6f",
+            "[DiffusionBatchProfiler] batch_size=%s request_tokens=%s total_tokens=%s denoise_step_time=%.6f",
             len(states),
-            request_units,
-            request_units * len(states),
+            request_tokens,
+            request_tokens * len(states),
             elapsed,
         )
 

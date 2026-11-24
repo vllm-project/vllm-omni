@@ -15,8 +15,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# DRR cost-normalization reference: one 512x512 image in packed latents
-# ((512 / 16) ** 2 = 1024 compute units).
+# DRR score normalization reference: the packed-token count of one 512x512
+# image ((512 / 16) ** 2 = 1024 tokens), the same unit as the MixFusion chunk
+# envelope. Costs carry the CFG weight; capacities do not.
 _DRR_REFERENCE_UNITS = 1024.0
 
 
@@ -34,6 +35,11 @@ class DiffusionBatchingPolicy:
     # order. Policies that may skip incompatible candidates to fill the batch
     # (DRR) set this to False.
     stops_at_incompatible_head: bool = True
+
+    # Whether the scheduler's admission loop should take the token budget from
+    # this policy. A policy that does not budget by tokens leaves admission
+    # bounded only by the request-count cap.
+    consumes_token_budget: bool = False
 
     def on_schedule_start(self) -> None:
         """Hook called once at the beginning of a scheduler cycle."""
@@ -70,22 +76,21 @@ class FixedDiffusionBatchingPolicy(DiffusionBatchingPolicy):
 
 
 class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
-    """DRR admission: order by cost-normalized aging, fill a compute budget."""
+    """DRR admission: order by cost-normalized aging, fill a token budget."""
 
     stops_at_incompatible_head = False
+    consumes_token_budget = True
 
     def __init__(
         self,
         config: DiffusionBatchingConfig,
         *,
-        request_budget_units: int | None = None,
+        request_count_cap: int | None = None,
     ) -> None:
         self.config = config
-        # An explicit ``max_num_seqs > 1`` pins the admission budget to
-        # ``max_num_seqs * reference_compute_units``. None means the scheduler
-        # saw the default/unset ``max_num_seqs <= 1`` sentinel, so the budget
-        # comes from ``compute_unit_budget`` (optionally warmup-calibrated).
-        self.request_budget_units = max(1, int(request_budget_units)) if request_budget_units is not None else None
+        # An explicit ``max_num_seqs`` is a literal request-count cap; None
+        # (the unset sentinel) lets the token budget alone bound the batch.
+        self.request_count_cap = max(1, int(request_count_cap)) if request_count_cap is not None else None
 
     def order_candidates(self, scheduler: BaseScheduler, now: float) -> list[SchedulerRequestState]:
         """Order waiting requests by DRR score, descending.
@@ -108,20 +113,36 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         return [item[3] for item in scored]
 
     def request_tokens(self, state: SchedulerRequestState) -> int:
+        """Packed patch tokens the request occupies against the admission budget."""
         config = self.config
         key = state.sampling_params_key
         if key is None:
-            return config.request_compute_units(state.req.sampling_params, state.req.prompts)
+            sampling = state.req.sampling_params
+            return config.spatial_tokens(
+                getattr(sampling, "height", None),
+                getattr(sampling, "width", None),
+                getattr(sampling, "num_frames", 1),
+            )
         # Mixfusion shape relaxation nulls the key's resolution so mixed sizes
         # can share a batch; fall back to the request's own resolution instead
         # of the config default, which would overcost smaller requests.
         sampling = state.req.sampling_params
         height = key.height if key.height is not None else getattr(sampling, "height", None)
         width = key.width if key.width is not None else getattr(sampling, "width", None)
-        units = config.spatial_compute_units(height, width, key.num_frames)
-        if key.do_classifier_free_guidance or (key.true_cfg_scale is not None and key.true_cfg_scale > 1):
-            units = int(units * float(config.cfg_compute_multiplier))
-        return max(1, units)
+        return config.spatial_tokens(height, width, key.num_frames)
+
+    def request_cost(self, state: SchedulerRequestState) -> int:
+        """Token cost weighted by CFG, used only to score admission order."""
+        tokens = self.request_tokens(state)
+        if self._uses_true_cfg(state):
+            return max(1, int(tokens * float(self.config.cfg_compute_multiplier)))
+        return tokens
+
+    def _uses_true_cfg(self, state: SchedulerRequestState) -> bool:
+        key = state.sampling_params_key
+        if key is not None:
+            return key.do_classifier_free_guidance or (key.true_cfg_scale is not None and key.true_cfg_scale > 1)
+        return self.config.uses_true_cfg(state.req.sampling_params, state.req.prompts)
 
     def reservation_target(self, candidates: list[SchedulerRequestState], now: float) -> SchedulerRequestState | None:
         """Pick the oldest waiting request that has aged past the reserve threshold.
@@ -145,12 +166,12 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
     def count_cap(self, hard_cap: int) -> int:
         """Request-count bound for budgeted admission.
 
-        The compute-unit sum is the real admission constraint, so the count
-        bound only matters when the caller pinned ``max_num_seqs`` explicitly.
-        With an unset ``max_num_seqs <= 1`` sentinel no literal count cap
-        applies; the budget decides how many requests fit.
+        The token budget is the real admission constraint, so a literal count
+        cap only applies when ``max_num_seqs`` was set. With the unset ``None``
+        sentinel no literal count cap applies; the budget decides how many
+        requests fit.
         """
-        if self.request_budget_units is not None:
+        if self.request_count_cap is not None:
             return max(1, int(hard_cap))
         return 1 << 30
 
@@ -182,21 +203,16 @@ class DiffusionBatchProfilerPolicy(DiffusionBatchingPolicy):
 def create_diffusion_batching_policy(
     config: DiffusionBatchingConfig,
     *,
-    request_budget_units: int | None = None,
+    request_count_cap: int | None = None,
+    token_budget: int | None = None,
 ) -> DiffusionBatchingPolicy:
     if config.uses_compute_budget:
-        budget_source = "max_num_seqs" if request_budget_units is not None else "compute_unit_budget"
-        budget = (
-            max(1, int(request_budget_units))
-            if request_budget_units is not None
-            else config.effective_compute_unit_budget()
-        )
         logger.info(
-            "ComputeBudgetDiffusionBatchingPolicy enabled (%s=%s)",
-            budget_source,
-            budget,
+            "ComputeBudgetDiffusionBatchingPolicy enabled (token_budget=%s, request_count_cap=%s)",
+            token_budget,
+            request_count_cap,
         )
-        return ComputeBudgetDiffusionBatchingPolicy(config, request_budget_units=request_budget_units)
+        return ComputeBudgetDiffusionBatchingPolicy(config, request_count_cap=request_count_cap)
     if config.uses_profiler:
         return DiffusionBatchProfilerPolicy(config)
     if config.policy in ("auto", "fixed"):

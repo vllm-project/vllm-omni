@@ -216,6 +216,11 @@ def test_config_unknown_field_is_rejected():
         DiffusionBatchingConfig.from_dict({"unknown_field": 1})
 
 
+def test_removed_compute_unit_budget_points_at_max_num_batched_tokens():
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+        DiffusionBatchingConfig.from_dict({"compute_unit_budget": 10240})
+
+
 # ---------------------------------------------------------------------------
 # profile cache helpers
 # ---------------------------------------------------------------------------

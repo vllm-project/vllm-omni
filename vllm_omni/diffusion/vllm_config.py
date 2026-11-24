@@ -344,7 +344,7 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         max_rows_per_request = getattr(od_config, "diffusion_kv_max_rows_per_request", None)
         if type(max_rows_per_request) is not int or max_rows_per_request <= 0:
             raise ValueError("paged_scheduler requires a positive diffusion_kv_max_rows_per_request")
-        vllm_config.scheduler_config.max_num_seqs = int(od_config.max_num_seqs) * max_rows_per_request
+        vllm_config.scheduler_config.max_num_seqs = od_config.resolved_max_num_seqs() * max_rows_per_request
         max_num_batched_tokens = getattr(od_config, "max_num_batched_tokens", None)
         if max_num_batched_tokens is not None:
             vllm_config.scheduler_config.max_num_batched_tokens = int(max_num_batched_tokens)

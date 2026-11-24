@@ -583,7 +583,7 @@ class _OmniVoiceCUDAGraphForward:
         self._pool_handle: int | None = None
 
     def _derive_capture_batch_size(self) -> list[int]:
-        return list(range(1, self._gen.od_config.max_num_seqs + 1))
+        return list(range(1, self._gen.od_config.resolved_max_num_seqs() + 1))
 
     def _derive_capture_bucket_sizes(self, capture_sizes: list[int]) -> dict[int, list[int]]:
         """Build a triangular, batch-aware token-bucket capture plan."""

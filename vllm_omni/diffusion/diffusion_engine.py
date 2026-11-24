@@ -70,10 +70,7 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.request_streaming import RequestStreamState
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.batching_policy import (
-    FixedDiffusionBatchingPolicy,
-    create_diffusion_batching_policy,
-)
+from vllm_omni.diffusion.sched.batching_policy import FixedDiffusionBatchingPolicy
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionRequestStatus,
@@ -180,13 +177,6 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
 
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     return pipeline_supports(od_config, "supports_request_batch")
-
-
-def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
-    try:
-        return max(1, int(getattr(od_config, "max_num_seqs", 1)))
-    except (TypeError, ValueError):
-        return 1
 
 
 def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
@@ -443,7 +433,7 @@ class DiffusionEngine:
         self.supports_request_batch = supports_request_batch(od_config)
         if (
             not self.supports_request_batch
-            and _max_num_seqs(od_config) > 1
+            and od_config.resolved_max_num_seqs() > 1
             and not uses_rank_local_dp_concurrency(od_config)
         ):
             raise ValueError(
@@ -555,7 +545,7 @@ class DiffusionEngine:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
             logger.info(
                 "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
-                getattr(od_config, "max_num_seqs", None),
+                od_config.resolved_max_num_seqs(),
                 getattr(od_config, "request_batch_max_wait_ms", None),
             )
 
@@ -1682,7 +1672,7 @@ class DiffusionEngine:
             if (
                 not self.od_config.streaming_output
                 or self.execution_mode != DiffusionExecutionMode.STEP_BATCH
-                or self.od_config.max_num_seqs != 1
+                or self.od_config.resolved_max_num_seqs() != 1
                 or not request.use_step_execution
             ):
                 raise ValueError("playback feedback requires step execution, streaming_output=True and max_num_seqs=1")
@@ -2074,7 +2064,7 @@ class DiffusionEngine:
             self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH
             and uses_rank_local_dp_concurrency(self.od_config)
         )
-        profile_batch_size = 1 if rank_local_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_batch_size = 1 if rank_local_dp_request_mode else self.od_config.resolved_max_num_seqs()
         profile_requests: list[OmniDiffusionRequest] = []
         for index in range(profile_batch_size):
             profile_request = copy.copy(request)
@@ -2210,19 +2200,20 @@ class DiffusionEngine:
             return [outputs[rid] for rid in target_ids]
 
     def run_warmup_batch_profile(self) -> None:
-        """Auto-calibrate ``compute_unit_budget`` at startup via a ladder sweep.
+        """Auto-calibrate the DRR token budget at startup via a ladder sweep.
 
         Preconditions (skip with an INFO log otherwise): step_execution enabled,
         the resolved policy is DRR (``compute_budget``), ``warmup_auto_calibrate``
         opted in via the diffusion batching config, and no explicit
-        ``max_num_seqs > 1`` (that value already pins the budget).
-        ``max_num_seqs <= 1`` is the default "unset" sentinel, so the ladder is
-        bounded by ``warmup_profile_max_batch`` and the scheduler cap is raised
-        temporarily for the sweep. The sweep forces a ``fixed`` policy so the
-        target ladder batches are not truncated, then applies the sweet-spot batch
-        as ``compute_unit_budget = ref_units * B*`` and switches to
-        ``compute_budget``. Any failure restores the original policy and never
-        blocks startup.
+        ``max_num_batched_tokens`` (that value already defines the budget).
+        An unset ``max_num_batched_tokens`` also leaves the DRR request-count
+        cap unset, so the ladder is bounded by ``warmup_profile_max_batch`` and
+        the scheduler count cap is raised temporarily for the sweep. The sweep
+        forces a ``fixed`` policy so the target ladder batches are not
+        truncated, then applies the sweet-spot batch as
+        ``token_budget = ref_tokens * B*`` through
+        ``scheduler.apply_token_budget`` and switches back to ``compute_budget``.
+        Any failure restores the original policy and never blocks startup.
         """
         batching_config = getattr(self.scheduler, "batching_config", None)
         if batching_config is None or not getattr(batching_config, "warmup_auto_calibrate", False):
@@ -2233,12 +2224,10 @@ class DiffusionEngine:
         if not self.step_execution:
             logger.info("Warmup batch profile skipped: requires step_execution.")
             return
-        explicit_budget = getattr(self.scheduler, "user_request_budget_units", None)
+        explicit_budget = self.od_config.max_num_batched_tokens
         if explicit_budget is not None:
             logger.info(
-                "Warmup batch profile skipped: explicit max_num_seqs=%s already defines the "
-                "DRR budget (%s compute units).",
-                getattr(self.scheduler, "max_num_running_reqs", 1),
+                "Warmup batch profile skipped: explicit max_num_batched_tokens=%s already defines the DRR budget.",
                 explicit_budget,
             )
             return
@@ -2292,12 +2281,10 @@ class DiffusionEngine:
             )
             if cached is not None:
                 b_star = int(cached["b_star"])
-                ref_units = batching_config.spatial_compute_units(ref_h, ref_w)
-                new_budget = int(ref_units * b_star)
-                old_budget = int(batching_config.compute_unit_budget)
-                batching_config.compute_unit_budget = new_budget
-                batching_config.policy = "compute_budget"
-                self.scheduler.batching_policy = create_diffusion_batching_policy(batching_config)
+                ref_tokens = batching_config.spatial_tokens(ref_h, ref_w)
+                new_budget = int(ref_tokens * b_star)
+                old_budget = int(self.scheduler.token_budget or 0)
+                self.scheduler.apply_token_budget(new_budget)
                 logger.info(
                     "[WarmupBatchProfile] cache hit key=%s: B*=%s old_budget=%s new_budget=%s "
                     "(sweep skipped; set warmup_profile_refresh=True to recalibrate)",
@@ -2309,19 +2296,18 @@ class DiffusionEngine:
                 return
 
         saved_policy = self.scheduler.batching_policy
-        saved_config_policy = batching_config.policy
         saved_max_num_reqs = int(getattr(self.scheduler, "max_num_running_reqs", 1))
         points: list[dict[str, float]] = []
         stop_reason: str | None = None
         warmup_request_ids: list[str] = []
         try:
-            # Force fixed policy so each ladder batch is scheduled at full size.
-            # The config's policy string must switch too: admission branches on
-            # batching_config.uses_compute_budget, not the policy object.
+            # Force fixed policy so each ladder batch is scheduled at full size:
+            # admission takes the token budget only from a policy that
+            # consumes one, so the fixed policy leaves the ladder bounded by
+            # the temporary count cap below.
             self.scheduler.batching_policy = FixedDiffusionBatchingPolicy()
-            batching_config.policy = "fixed"
-            # max_num_seqs <= 1 is the unset sentinel; temporarily lift the
-            # scheduler cap so the ladder batches can actually be admitted.
+            # An unset max_num_batched_tokens also leaves the count cap unset;
+            # temporarily pin it to the ladder so the batches can be admitted.
             self.scheduler.max_num_running_reqs = b_max
 
             for batch in levels:
@@ -2368,13 +2354,11 @@ class DiffusionEngine:
                     max_step_ms,
                     b_star,
                 )
-            ref_units = batching_config.spatial_compute_units(ref_h, ref_w)
-            new_budget = int(ref_units * b_star)
-            old_budget = int(batching_config.compute_unit_budget)
+            ref_tokens = batching_config.spatial_tokens(ref_h, ref_w)
+            new_budget = int(ref_tokens * b_star)
+            old_budget = int(self.scheduler.token_budget or 0)
 
-            batching_config.compute_unit_budget = new_budget
-            batching_config.policy = "compute_budget"
-            self.scheduler.batching_policy = create_diffusion_batching_policy(batching_config)
+            self.scheduler.apply_token_budget(new_budget)
 
             logger.info(
                 "[WarmupBatchProfile] ladder=%s points=%s stop_reason=%s B*=%s method=%s "
@@ -2409,7 +2393,6 @@ class DiffusionEngine:
                     logger.warning("[WarmupBatchProfile] failed to write profile cache under %s.", cache_dir)
         except Exception as exc:
             self.scheduler.batching_policy = saved_policy
-            batching_config.policy = saved_config_policy
             logger.warning("Warmup batch profile failed (%s); restored original policy.", exc, exc_info=True)
             raise
         finally:

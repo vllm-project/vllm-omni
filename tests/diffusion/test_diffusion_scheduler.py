@@ -113,20 +113,25 @@ def _scheduler_config(**fields) -> SimpleNamespace:
         stage_role=None,
         model_stage=None,
         model_class_name=None,
-        max_num_seqs=1,
+        max_num_seqs=None,
+        max_num_batched_tokens=None,
         omni_kv_config={},
         diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
     )
     defaults.update(fields)
-    return SimpleNamespace(**defaults)
+    config = SimpleNamespace(**defaults)
+    # Mirrors OmniDiffusionConfig's only-None-is-unset sentinel resolution.
+    config.resolved_max_num_seqs = lambda: 1 if config.max_num_seqs is None else max(1, int(config.max_num_seqs))
+    return config
 
 
 def _initialize_paged_scheduler(
     scheduler: BaseScheduler,
     *,
     num_blocks: int = 64,
-    max_num_seqs: int = 1,
+    max_num_seqs: int | None = None,
     enable_prefix_caching: bool = False,
+    kv_max_num_batched_tokens: int | None = None,
     **config_fields,
 ) -> None:
     native_kv_managers.register_all_kvcache_specs(None)
@@ -154,6 +159,7 @@ def _initialize_paged_scheduler(
         kv_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=64),
             max_in_flight_tokens=64,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=kv_max_num_batched_tokens),
             cache_config=SimpleNamespace(
                 enable_prefix_caching=enable_prefix_caching,
                 prefix_caching_hash_algo="sha256",
@@ -1059,10 +1065,9 @@ class TestRequestScheduler:
         _initialize_paged_scheduler(
             self.scheduler,
             num_blocks=2,
-            max_num_seqs=1,
+            max_num_batched_tokens=4096,
             diffusion_batching_config={
                 "policy": "compute_budget",
-                "compute_unit_budget": 4096,
             },
         )
         slow = _make_request("slow")
@@ -1100,6 +1105,37 @@ class TestRequestScheduler:
         else:
             assert slow_state.status == DiffusionRequestStatus.WAITING
             assert output.finished_req_ids == set()
+
+    def test_drr_token_budget_is_clamped_to_paged_kv_capacity(self) -> None:
+        """An explicit budget larger than the paged KV capacity must not over-admit."""
+        _initialize_paged_scheduler(
+            self.scheduler,
+            num_blocks=8,
+            kv_max_num_batched_tokens=2048,
+            max_num_batched_tokens=8192,
+            diffusion_batching_config={
+                "policy": "compute_budget",
+            },
+        )
+        req_ids = []
+        for i in range(3):
+            request = OmniDiffusionRequest(
+                prompt=f"prompt_{i}",
+                sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
+                request_id=f"req-{i}",
+            )
+            _attach_diffusion_kv(request)
+            self.scheduler.add_request(request)
+            req_ids.append(f"req-{i}")
+
+        output = self.scheduler.schedule()
+
+        # Each 512x512 request costs 1024 tokens; the requested 8192-token
+        # budget is clamped to the 2048-token paged KV capacity, so only two
+        # requests fit.
+        assert _new_ids(output) == req_ids[:2]
+        assert output.num_running_reqs == 2
+        assert output.num_waiting_reqs == 1
 
     @pytest.mark.parametrize("action", ["abort", "timeout", "preempt"])
     def test_diffusion_kv_loading_defers_free_and_blocks_preempt(self, mocker: MockerFixture, action: str) -> None:
@@ -1647,14 +1683,13 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
-    def test_drr_respects_homogeneous_batch_gate_by_compute_budget(self) -> None:
+    def test_drr_respects_homogeneous_batch_gate_by_token_budget(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=1,
+                max_num_batched_tokens=10240,
                 diffusion_batching_config={
                     "policy": "compute_budget",
-                    "compute_unit_budget": 10240,
                 },
             )
         )
@@ -1698,10 +1733,9 @@ class TestRequestScheduler:
         scheduler = RequestScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=1,
+                max_num_batched_tokens=10240,
                 diffusion_batching_config={
                     "policy": "compute_budget",
-                    "compute_unit_budget": 10240,
                 },
             )
         )
@@ -1894,7 +1928,12 @@ class TestDiffusionEngine:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
+        od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            streaming_output=False,
+            max_num_seqs=None,
+            resolved_max_num_seqs=lambda: 1,
+        )
         fake_executor_cls = mocker.Mock(return_value=mocker.Mock())
         scheduler = mocker.Mock()
         kv_cache_config = object()
@@ -2407,10 +2446,9 @@ class TestStepScheduler:
         scheduler = StepScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=8,
+                max_num_batched_tokens=8192,
                 diffusion_batching_config={
                     "policy": "compute_budget",
-                    "compute_unit_budget": 8192,
                 },
             )
         )
@@ -2467,9 +2505,9 @@ class TestStepScheduler:
         scheduler.initialize(
             _scheduler_config(
                 max_num_seqs=2,
+                max_num_batched_tokens=2048,
                 diffusion_batching_config={
                     "policy": "compute_budget",
-                    "compute_unit_budget": 2048,
                 },
             )
         )
@@ -2508,10 +2546,9 @@ class TestStepScheduler:
         scheduler = StepScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=8,
+                max_num_batched_tokens=8192,
                 diffusion_batching_config={
                     "policy": "compute_budget",
-                    "compute_unit_budget": 8192,
                 },
             )
         )
@@ -2568,12 +2605,9 @@ class TestStepScheduler:
         scheduler = StepScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=1,
+                max_num_batched_tokens=4096,
                 diffusion_batching_config={
                     "policy": "compute_budget",
-                    # Room for exactly one 1024x1024 request, so the aged
-                    # expensive request wins the only slot.
-                    "compute_unit_budget": 4096,
                 },
             )
         )
@@ -2659,16 +2693,14 @@ class TestStepScheduler:
         assert _new_ids(second) == [req_cheap]
         assert second.num_waiting_reqs == 1
 
-    def test_explicit_max_num_seqs_ignores_compute_unit_budget(self) -> None:
-        """max_num_seqs > 1 pins the budget: 128 slots of 512x512 = 131072 units."""
+    def test_explicit_max_num_seqs_is_a_literal_count_cap(self) -> None:
+        """max_num_seqs=1 is a literal cap, not the "unset" sentinel."""
         scheduler = StepScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=128,
+                max_num_seqs=1,
                 diffusion_batching_config={
                     "policy": "compute_budget",
-                    # Deliberately small: an explicit max_num_seqs must win.
-                    "compute_unit_budget": 2048,
                 },
             )
         )
@@ -2678,30 +2710,28 @@ class TestStepScheduler:
                 _make_step_request(
                     f"req-{i}",
                     sampling_params=OmniDiffusionSamplingParams(
-                        height=1024,
-                        width=1024,
+                        height=512,
+                        width=512,
                         num_inference_steps=4,
                     ),
                 )
             )
-            for i in range(8)
+            for i in range(3)
         ]
 
         sched_output = scheduler.schedule()
 
-        # User-stated budget: 128 slots * 1024 units = 131072. Qwen-Image
-        # 1024x1024 requests cost (1024 / 16)^2 = 4096 each, so all 8 fit
-        # (8 * 4096 = 32768) even though compute_unit_budget=2048 is tiny.
-        assert _new_ids(sched_output) == req_ids
-        assert sched_output.num_running_reqs == 8
-        assert sched_output.num_waiting_reqs == 0
+        # The default token budget would fit three 512x512 requests, but the
+        # explicit count cap allows exactly one.
+        assert _new_ids(sched_output) == req_ids[:1]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 2
 
-    def test_unset_max_num_seqs_replaces_default_cap_with_computed_budget(self) -> None:
-        """max_num_seqs=1 (unset) must not pin the batch to one request."""
+    def test_unset_max_num_seqs_is_bounded_by_token_budget(self) -> None:
+        """The None sentinel applies no count cap; the token budget bounds the batch."""
         scheduler = StepScheduler()
         scheduler.initialize(
             _scheduler_config(
-                max_num_seqs=1,
                 diffusion_batching_config={
                     "policy": "compute_budget",
                 },
@@ -2724,11 +2754,54 @@ class TestStepScheduler:
 
         sched_output = scheduler.schedule()
 
-        # compute_unit_budget=10240 and 512x512 -> 1024 units each: the derived
-        # cap of 10 replaces the max_num_seqs=1 sentinel.
-        assert _new_ids(sched_output) == req_ids[:10]
-        assert sched_output.num_running_reqs == 10
-        assert sched_output.num_waiting_reqs == 2
+        # Twelve 512x512 requests cost 1024 tokens each, well under the
+        # 16384-token default budget, so every request is admitted.
+        assert _new_ids(sched_output) == req_ids
+        assert sched_output.num_running_reqs == 12
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_drr_admits_cheapest_request_when_budget_fits_none(self) -> None:
+        """An empty batch must make progress even when every request exceeds the budget."""
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            _scheduler_config(
+                max_num_batched_tokens=512,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_expensive = scheduler.add_request(
+            _make_step_request(
+                "expensive",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        req_cheap = scheduler.add_request(
+            _make_step_request(
+                "cheap",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        # Both cost more than the 512-token budget. Age the expensive one so
+        # DRR sorts it first; the empty-batch exception must still pick the
+        # cheapest request, not the head.
+        self._age_request(scheduler, req_expensive, 120.0)
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_cheap]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 1
 
     def test_profile_batching_policy_ramps_batch_size(self) -> None:
         scheduler = StepScheduler()
