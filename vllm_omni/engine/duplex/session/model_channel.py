@@ -1429,6 +1429,21 @@ class ModelChannel:
                 and auto_response
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
+                if (
+                    not draining
+                    and model_turn_id is not None
+                    and self._ctx.run.partial_input_continuation_turn == (session.epoch, model_turn_id)
+                ):
+                    # A text unit can contain only a speech decision and a
+                    # chunk terminator. Its empty Talker boundary needs the
+                    # same response ownership as a direct empty text unit,
+                    # including waiting for the previous response's tail.
+                    return await self._on_model_listen(
+                        dict(model_result, is_listen=True, model_listen=False, continue_with_partial_input=True),
+                        model_turn_id=model_turn_id,
+                        data_plane_request_id=data_plane_request_id,
+                        expected_epoch=expected_epoch,
+                    )
                 request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
                 draining_response_id = (
                     session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None

@@ -78,8 +78,14 @@ waits for the previous response's final audio and `response.done` before opening
 the new response and continuing. Cancellation discards this deferred unit. The exception does not
 carry over to a later audio-only response or a new epoch. Disabling silence continuation or
 using the input clock still prevents synthetic units.
-The Talker handoff skips those completed control units in cumulative output
-before aligning the next speech unit's text and hidden states.
+An empty Talker segment, such as a unit containing only `<|speak|>` and a
+chunk terminator, uses the same deferred response transition when Stage 0 has
+confirmed its text turn. It retains its normal handoff and segment boundary;
+the session binds continuation to that text turn even if the previous response
+has ended before the empty segment arrives.
+For units returned directly to the session, the Talker handoff skips their
+completed control tokens in cumulative output before aligning the next speech
+unit's text and hidden states.
 Replayed prefill cannot reopen an ended reply. This does not change the separate
 conversation-item text-turn capability or replace assistant playback controls.
 

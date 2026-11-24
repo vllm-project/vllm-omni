@@ -43,6 +43,7 @@ def _text_output(request_id: str, *, empty: bool = False):
     output = listen_output(request_id)
     output.finished = False
     output.outputs[0].token_ids = [151718] if empty else [42]
+    output.outputs[0].stop_reason = 151718 if empty else None
     output.multimodal_output.update(duplex_text_input=torch.tensor(True))
     output.multimodal_output["meta.chunk_eos_token_id"] = 151718
     return output
@@ -343,7 +344,8 @@ async def test_text_reply_continues_when_appended_while_previous_talker_drains()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("previous_talker_finished", [False, True])
-async def test_empty_text_unit_opens_its_own_response_during_talker_overlap(previous_talker_finished):
+@pytest.mark.parametrize("talker_boundary", [None, 151718, 151719])
+async def test_empty_text_unit_opens_its_own_response_during_talker_overlap(previous_talker_finished, talker_boundary):
     h = await open_harness()
     try:
         await h.run(append_audio())
@@ -351,13 +353,27 @@ async def test_empty_text_unit_opens_its_own_response_during_talker_overlap(prev
         old_response_id = h.session.active_response_id
         await h.run(append_audio(samples=8000))
         await h.run(commands.AppendText(text="Second question."))
+        empty = _text_output(h.stage0_request_id(), empty=True)
+        if talker_boundary is not None:
+            # SPEAK + a chunk terminator has no TTS condition rows, but it
+            # still takes the normal handoff and closes an empty TTS segment.
+            empty.outputs[0].token_ids = [151704, talker_boundary]
+            empty.outputs[0].stop_reason = talker_boundary
+            empty.multimodal_output["meta.speak_token_id"] = 151704
+            empty.multimodal_output["meta.chunk_tts_eos_token_id"] = 151719
+            assert h.deliver(empty, stage_id=0, segment_finished=True, model_turn_id=1) is False
+            await h.settle()
+            assert h.session.active_response_id == old_response_id
+            empty = tts_output(
+                h.stage0_request_id(), samples=0, text="", turn_id=1, tts_is_last_chunk=True, finished=True
+            )
         if previous_talker_finished:
             await h.deliver_and_settle(
                 tts_output(h.stage0_request_id(), tts_is_last_chunk=True, turn_end=True, finished=True)
             )
         events = await h.deliver_and_settle(
-            _text_output(h.stage0_request_id(), empty=True),
-            stage_id=0,
+            empty,
+            stage_id=0 if talker_boundary is None else 1,
             segment_finished=True,
             model_turn_id=1,
         )
@@ -406,21 +422,34 @@ async def test_empty_text_unit_opens_its_own_response_during_talker_overlap(prev
         done = [e for e in events if e.type == "response.done"]
         assert len(done) == 1 and done[0].response_id == new_response_id
         assert done[0].status == "completed"
+        assert len([e for e in h.events if e.type == "response.done" and e.response_id == new_response_id]) == 1
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 32000
+        # The reply completed without another client event. Later microphone
+        # input must still consume the original half-unit without alteration.
+        tail = append_audio(samples=8000, value=0.1)
+        await h.run(tail)
+        payload = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert base64.b64decode(payload["audio"]) == append_audio(samples=8000).audio + tail.audio
     finally:
         await close_harness(h)
 
 
 @pytest.mark.asyncio
-async def test_cancel_discards_empty_text_waiting_for_previous_tail():
+@pytest.mark.parametrize("via_talker", [False, True])
+async def test_cancel_discards_empty_text_waiting_for_previous_tail(via_talker):
     h = await open_harness()
     try:
         await h.run(append_audio())
         await h.deliver_and_settle(tts_output(h.stage0_request_id(), text="First reply"))
         await h.run(commands.AppendText(text="Second question."))
         old_request_id = h.stage0_request_id()
-        await h.deliver_and_settle(
-            _text_output(old_request_id, empty=True), stage_id=0, segment_finished=True, model_turn_id=1
-        )
+        if via_talker:
+            await h.deliver_and_settle(_text_output(old_request_id), stage_id=0, model_turn_id=1)
+            empty = tts_output(old_request_id, samples=0, text="", turn_id=1, tts_is_last_chunk=True, finished=True)
+        else:
+            empty = _text_output(old_request_id, empty=True)
+        await h.deliver_and_settle(empty, stage_id=1 if via_talker else 0, segment_finished=True, model_turn_id=1)
+        assert h.runner.model._deferred_text_listen is not None
         await h.run(commands.BargeIn())
         assert h.session.epoch == 1
         events = await h.deliver_and_settle(
