@@ -441,12 +441,14 @@ def _make_backend(num_blocks: int = 3) -> Any:
     backend = object.__new__(DiffusionKVModelRunnerBackend)
     backend.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
     backend.device = torch.device("cpu")
-    backend.block_tables = SimpleNamespace(blocks_per_kv_block=[2])
+    # Upstream BlockTables pages directly at each group's block_size, so the
+    # layer cache's block axis is indexed by the manager block id itself.
+    backend.block_tables = SimpleNamespace(num_blocks=num_blocks)
     backend.kv_cache_config = SimpleNamespace(
         num_blocks=num_blocks,
         kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
     )
-    base = torch.arange(6 * 2 * 2 * 8, dtype=torch.float32).reshape(6, 2, 2, 8).to(torch.bfloat16)
+    base = torch.arange(num_blocks * 2 * 2 * 8, dtype=torch.float32).reshape(num_blocks, 2, 2, 8).to(torch.bfloat16)
     backend._kv_cache_layer_adapters = {
         "l0": SimpleNamespace(kv_cache=base.clone()),
         "l1": SimpleNamespace(kv_cache=base.add(1).to(torch.bfloat16)),
@@ -455,8 +457,57 @@ def _make_backend(num_blocks: int = 3) -> Any:
     return backend
 
 
-def test_backend_capture_covers_all_layers_and_kernel_blocks() -> None:
+def test_backend_capture_covers_all_layers() -> None:
     backend = _make_backend()
+    page = _page(1, source_block_id=1)
+
+    sizes = backend.save_diffusion_kv_pages([page])
+
+    expected = (
+        torch.cat(
+            [
+                backend._kv_cache_layer_adapters["l0"].kv_cache[1],
+                backend._kv_cache_layer_adapters["l1"].kv_cache[1],
+            ]
+        )
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(-1)
+    )
+    assert sizes == {page.key: expected.numel()}
+    store = backend._kv_page_offload_store
+    assert store is not None and len(store) == 1
+    assert torch.equal(store.restore(page.key), expected)
+    assert store.bytes_used == expected.numel()
+
+
+def test_backend_capture_is_group_scoped() -> None:
+    backend = _make_backend()
+    backend.kv_cache_config.kv_cache_groups.append(SimpleNamespace(layer_names=["l2"]))
+    backend._kv_cache_layer_adapters["l2"] = SimpleNamespace(
+        kv_cache=backend._kv_cache_layer_adapters["l0"].kv_cache.add(2).to(torch.bfloat16)
+    )
+
+    group_zero = _page(1, group_index=0, source_block_id=1)
+    group_one = _page(1, group_index=1, source_block_id=2)
+    sizes = backend.save_diffusion_kv_pages([group_zero, group_one])
+
+    assert group_zero.key != group_one.key
+    store = backend._kv_page_offload_store
+    assert torch.equal(
+        store.restore(group_one.key),
+        backend._kv_cache_layer_adapters["l2"].kv_cache[2].contiguous().view(torch.uint8).reshape(-1),
+    )
+    # Group zero covers two layers, group one a single layer.
+    assert sizes[group_zero.key] == 2 * sizes[group_one.key]
+
+
+def test_backend_capture_derives_the_kernel_block_ratio_from_the_cache() -> None:
+    backend = _make_backend()
+    # A backend that splits blocks virtually stores two kernel blocks per
+    # manager block, so the layer cache's block axis is num_blocks * 2.
+    for adapter in backend._kv_cache_layer_adapters.values():
+        adapter.kv_cache = adapter.kv_cache.repeat_interleave(2, dim=0)
     page = _page(1, source_block_id=1)
 
     sizes = backend.save_diffusion_kv_pages([page])
@@ -473,32 +524,16 @@ def test_backend_capture_covers_all_layers_and_kernel_blocks() -> None:
         .reshape(-1)
     )
     assert sizes == {page.key: expected.numel()}
-    store = backend._kv_page_offload_store
-    assert store is not None and len(store) == 1
-    assert torch.equal(store.restore(page.key), expected)
-    assert store.bytes_used == expected.numel()
+    assert torch.equal(backend._kv_page_offload_store.restore(page.key), expected)
 
 
-def test_backend_capture_uses_each_group_kernel_block_count() -> None:
+def test_backend_capture_rejects_a_cache_axis_that_does_not_divide() -> None:
     backend = _make_backend()
-    backend.block_tables = SimpleNamespace(blocks_per_kv_block=[2, 1])
-    backend.kv_cache_config.kv_cache_groups.append(SimpleNamespace(layer_names=["l2"]))
-    backend._kv_cache_layer_adapters["l2"] = SimpleNamespace(
-        kv_cache=backend._kv_cache_layer_adapters["l0"].kv_cache.add(2).to(torch.bfloat16)
-    )
+    adapter = backend._kv_cache_layer_adapters["l1"]
+    adapter.kv_cache = adapter.kv_cache[:5]
 
-    group_zero = _page(1, group_index=0, source_block_id=1)
-    group_one = _page(1, group_index=1, source_block_id=2)
-    sizes = backend.save_diffusion_kv_pages([group_zero, group_one])
-
-    assert group_zero.key != group_one.key
-    store = backend._kv_page_offload_store
-    assert torch.equal(
-        store.restore(group_one.key),
-        backend._kv_cache_layer_adapters["l2"].kv_cache[2:3].contiguous().view(torch.uint8).reshape(-1),
-    )
-    # Group zero spans two layers x two kernel blocks; group one one layer x one block.
-    assert sizes[group_zero.key] == 4 * sizes[group_one.key]
+    with pytest.raises(ValueError, match="not a multiple"):
+        backend.save_diffusion_kv_pages([_page(1)])
 
 
 def test_backend_capture_rejects_unknown_group_and_block() -> None:

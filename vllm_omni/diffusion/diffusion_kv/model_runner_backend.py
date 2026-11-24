@@ -672,9 +672,9 @@ class DiffusionKVModelRunnerBackend:
 
         Returns the byte size of every saved page, keyed by page key.  The
         payload of one page is the group's layers in ``layer_names`` order,
-        each flattened from its ``[blocks_per_kv_block, H, N, C]``
-        kernel-block slice; a later restore reverses this with the same group
-        config.  The Scheduler only ever sees page names and byte sizes.
+        each flattened from that manager block's ``[H, N, C]`` slice; a later
+        restore reverses this with the same group config.  The Scheduler only
+        ever sees page names and byte sizes.
         """
 
         if (
@@ -689,7 +689,6 @@ class DiffusionKVModelRunnerBackend:
             return {}
 
         groups = self.kv_cache_config.kv_cache_groups
-        blocks_per_kv_block = self.block_tables.blocks_per_kv_block
         caches_by_layer = self.kv_caches_by_layer
         if self._kv_page_offload_store is None:
             # Pinned host staging can be added once phase 1 proves the copy
@@ -712,7 +711,6 @@ class DiffusionKVModelRunnerBackend:
                     page,
                     group=groups[page.group_index],
                     caches_by_layer=caches_by_layer,
-                    blocks_per_kv_block=blocks_per_kv_block[page.group_index],
                 ),
             )
         logger.info(
@@ -742,23 +740,35 @@ class DiffusionKVModelRunnerBackend:
         *,
         group: KVCacheGroupSpec,
         caches_by_layer: Mapping[str, torch.Tensor],
-        blocks_per_kv_block: int,
     ) -> torch.Tensor:
         """Flatten one manager block across a group's layers into host bytes.
 
-        The payload is one contiguous uint8 tensor: for every layer of the
-        group, in ``layer_names`` order, the ``[blocks_per_kv_block, H, N, C]``
-        slice covering the manager block's kernel blocks.  Layers and kernel
-        blocks share one attention geometry per rank, so the slice shapes are
-        recomputable at restore time from the same group config.
+        Upstream addresses a manager block directly at its group's
+        ``block_size``; a backend that splits blocks virtually gives the layer
+        cache ``ratio`` kernel blocks per manager block (FlashAttention uses
+        one).  The ratio is derived from the cache's own block axis rather than
+        from ``BlockTables``, whose subdivision attribute was removed in the
+        vLLM 0.34 alignment.  The payload is one contiguous uint8 tensor: for
+        every layer of the group, in ``layer_names`` order, that manager
+        block's kernel blocks.  Every layer of a group shares one attention
+        geometry per rank, so the slice shapes are recomputable at restore time
+        from the same group config.
         """
 
-        start = page.source_block_id * blocks_per_kv_block
-        byte_slices = [
-            caches_by_layer[name][start : start + blocks_per_kv_block].view(torch.uint8) for name in group.layer_names
-        ]
+        num_blocks = self.kv_cache_config.num_blocks
+        byte_slices = []
+        for name in group.layer_names:
+            cache = caches_by_layer[name]
+            if cache.shape[0] % num_blocks:
+                raise ValueError(
+                    f"KV cache axis of layer {name!r} has {cache.shape[0]} block(s), "
+                    f"which is not a multiple of the group's {num_blocks} manager block(s)"
+                )
+            ratio = cache.shape[0] // num_blocks
+            start = page.source_block_id * ratio
+            byte_slices.append(cache[start : start + ratio].view(torch.uint8))
         numels = [slc.numel() for slc in byte_slices]
-        # Copy each strided kernel slice straight into its host position: one
+        # Copy each strided block slice straight into its host position: one
         # D2H transfer per layer instead of a device-side gather first.
         payload = torch.empty(sum(numels), dtype=torch.uint8, device="cpu")
         offset = 0
