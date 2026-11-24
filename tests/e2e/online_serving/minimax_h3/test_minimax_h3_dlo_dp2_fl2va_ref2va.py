@@ -77,11 +77,13 @@ def _partition_params() -> OmniServerParams:
         ],
         # A cold B200 nightly (#10660, build #20135) spent 664 s downloading
         # weights, ~710 s loading, then a silent DLO shard-and-pin phase and
-        # hit the previous 1800 s cap mid-work. Match the 60-minute budget the
-        # official-reference accuracy test already uses for the same class of
-        # cold multi-stage load.
+        # hit the previous 1800 s cap mid-work. Match the 60-minute engine
+        # budget the official-reference accuracy test already uses for the
+        # same class of cold multi-stage load, and its 65-minute fixture
+        # readiness budget so a 40-60 minute cold start still passes setup.
         stage_init_timeout=3600,
         init_timeout=3600,
+        startup_timeout=65 * 60,
     )
 
 
