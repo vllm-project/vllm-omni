@@ -2476,7 +2476,7 @@ async def generate_images(
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
                 extra_body=extra_body,
-                request_id=f"img_gen-{random_uuid()}",
+                request_id=f"img_gen-{chat_handler._base_request_id(raw_request)}",
                 raw_request=raw_request,
                 arrival_time=request_timestamp,
             )

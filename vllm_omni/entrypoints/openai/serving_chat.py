@@ -3733,6 +3733,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 sampling_params_list = [gen_params]
 
             sampling_params_list = coerce_param_message_types(sampling_params_list, stream)
+            # Instances built by for_diffusion() have no request logger.
+            if getattr(self, "request_logger", None) is not None:
+                self._log_inputs(
+                    request_id,
+                    engine_prompt,
+                    params_list=sampling_params_list,
+                    lora_request=None,
+                )
             result_generator = diffusion_engine.generate(
                 prompt=engine_prompt,
                 sampling_params_list=sampling_params_list,

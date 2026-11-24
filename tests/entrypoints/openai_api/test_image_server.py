@@ -285,6 +285,7 @@ def async_omni_test_client():
             self.default_sampling_params_list = default_sampling_params_list
             self.captured_sampling_params_list = None
             self.captured_prompt = None
+            self.captured_request_id = None
             self._images = [Image.new("RGB", (64, 64), color="green")]
             self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
 
@@ -294,6 +295,7 @@ def async_omni_test_client():
             else:
                 self.captured_sampling_params_list = [sampling_params]
             self.captured_prompt = prompt
+            self.captured_request_id = request_id
             images = [img.copy() for img in self._images]
             yield MockGenerationResult(images)
 
@@ -918,6 +920,52 @@ def test_multistage_generate_without_layers_keeps_default(async_omni_test_client
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert captured[1].layers == OmniDiffusionSamplingParams().layers
+
+
+def test_multistage_generate_uses_x_request_id_header(async_omni_test_client):
+    """Multi-stage /v1/images/generations reuses ``X-Request-Id`` like vLLM chat."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat"},
+        headers={"X-Request-Id": "trace-123"},
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    assert engine.captured_request_id == "img_gen-trace-123"
+
+
+def test_multistage_generate_without_x_request_id_uses_random_id(async_omni_test_client):
+    """Without the header, two requests still get distinct ``img_gen-`` ids."""
+    engine = async_omni_test_client.app.state.engine_client
+    request_ids = []
+    for _ in range(2):
+        response = async_omni_test_client.post("/v1/images/generations", json={"prompt": "a cat"})
+        assert response.status_code == 200
+        request_ids.append(engine.captured_request_id)
+
+    assert all(rid.startswith("img_gen-") and len(rid) > len("img_gen-") for rid in request_ids)
+    assert request_ids[0] != request_ids[1]
+
+
+def test_multistage_generate_logs_request_inputs(async_omni_test_client, mocker: MockerFixture):
+    """``--enable-log-requests`` logs multi-stage image requests under the same id."""
+    chat_handler = async_omni_test_client.app.state.openai_serving_chat
+    chat_handler.request_logger = mocker.Mock()
+    chat_handler.model_config = SimpleNamespace(is_encoder_decoder=False)
+
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat"},
+        headers={"X-Request-Id": "trace-123"},
+    )
+    assert response.status_code == 200
+
+    chat_handler.request_logger.log_inputs.assert_called_once()
+    args, kwargs = chat_handler.request_logger.log_inputs.call_args
+    assert args[0] == "img_gen-trace-123"
+    assert args[1] == "a cat"
+    assert len(kwargs["params"]) == 2
 
 
 def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion):
