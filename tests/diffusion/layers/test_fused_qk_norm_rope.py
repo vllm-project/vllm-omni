@@ -37,14 +37,7 @@ def _reference(q, k, q_weight, k_weight, rope_table):
     return apply(q), apply(k)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-@pytest.mark.parametrize("seq_len", [1, 257, 1024])
-def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
-        fused_qk_norm_rope,
-    )
-
+def _inputs(seq_len):
     torch.manual_seed(17)
     heads = 14
     qkv = torch.randn(
@@ -63,6 +56,16 @@ def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
     k_weight = torch.randn(_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     freqs = torch.randn(seq_len, _ROTARY_DIM // 2, device="cuda")
     rope_table = torch.cat((torch.cos(freqs), torch.sin(freqs)), dim=-1).to(torch.bfloat16)
+    return q, k, q_weight, k_weight, rope_table
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("seq_len", [1, 257, 1024])
+def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
+    from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
+
+    q, k, q_weight, k_weight, rope_table = _inputs(seq_len)
 
     expected_q, expected_k = _reference(
         q,
@@ -82,6 +85,44 @@ def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
 
     torch.testing.assert_close(actual_q, expected_q, atol=0.0625, rtol=0.02)
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+def test_fused_qk_norm_rope_fullgraph_compile():
+    from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
+
+    inputs = _inputs(257)
+    original = tuple(x.clone() for x in inputs)
+    compiled = torch.compile(fused_qk_norm_rope, fullgraph=True)
+    for actual, expected in zip(compiled(*inputs, _EPS), fused_qk_norm_rope(*inputs, _EPS)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual, expected in zip(inputs, original):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+def test_fused_qk_norm_rope_cuda_graph_replay():
+    from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
+
+    inputs = _inputs(257)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Finish kernel compilation and allocator warmup before capture.
+        for _ in range(3):
+            fused_qk_norm_rope(*inputs, _EPS)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fused_qk_norm_rope(*inputs, _EPS)
+
+    # Replay must read updated buffers rather than reuse capture-time results.
+    inputs[0].add_(0.25)
+    inputs[1].mul_(0.75)
+    expected = fused_qk_norm_rope(*inputs, _EPS)
+    graph.replay()
+    for actual, reference in zip(captured, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -114,10 +155,10 @@ def _boogu_inputs(strided: bool):
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("strided", [False, True])
 def test_fused_qk_norm_rope_interleaved(strided):
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import (
         _eager_qk_norm_rope,
         _launch_fused_qk_norm_rope,
-        fused_qk_norm_rope,
     )
 
     q, k, q_weight, k_weight, rope_table = _boogu_inputs(strided)
@@ -143,7 +184,7 @@ def test_fused_qk_norm_rope_half_split_general_dim():
     public op falls back to eager at this geometry), pending the
     maintainers' call.
     """
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import (
         _eager_qk_norm_rope,
         _launch_fused_qk_norm_rope,
     )
@@ -161,7 +202,8 @@ def test_fused_qk_norm_rope_half_split_general_dim():
 def test_fused_qk_norm_rope_cuda_rms_norm_is_bitwise(eps, table_dtype):
     from vllm import _custom_ops as ops
 
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _apply_rope_table, fused_qk_norm_rope
+    from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import _apply_rope_table
 
     torch.manual_seed(17)
     qkv = torch.randn(257, 13, 128, device="cuda", dtype=torch.bfloat16)
@@ -186,7 +228,7 @@ def test_fused_joint_qkv_norm_rope_cuda_rms_norm_is_bitwise(table_dtype):
     fp32 interleaved RoPE — bit for bit, including the V gather."""
     from vllm import _custom_ops as ops
 
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _apply_rope_table, fused_joint_qkv_norm_rope
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import _apply_rope_table, fused_joint_qkv_norm_rope
 
     batch, txt_len, img_len, eps = 2, 77, 1030, 1e-6
     (q0, k0, v0, q1, k1, v1), (q0_w, k0_w, q1_w, k1_w), rope_table = _flux2_inputs(batch, txt_len, img_len, heads=8)
@@ -270,7 +312,7 @@ def test_fused_joint_qkv_norm_rope_matches_single_stream_op(batch, txt_len, img_
     logic is the stream/row routing and the V gather, so equality must be
     exact.
     """
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import (
         _launch_fused_joint_qkv_norm_rope,
         _launch_fused_qk_norm_rope,
         fused_joint_qkv_norm_rope,
@@ -317,7 +359,7 @@ def test_fused_joint_qkv_norm_rope_matches_single_stream_op(batch, txt_len, img_
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_joint_qkv_norm_rope_matches_eager_reference():
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import (
         _eager_joint_qkv_norm_rope,
         _launch_fused_joint_qkv_norm_rope,
     )
@@ -429,7 +471,7 @@ def test_pack_qk_norm_rope_table_skips_when_fused_path_unavailable():
 def test_pack_qk_norm_rope_table_skips_under_sequence_parallel(monkeypatch):
     """Under SP (``sequence_parallel_size > 1``) no table is packed: RoPE is
     applied per stream/shard and the consumer keeps its eager chain."""
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as mod
+    from vllm_omni.diffusion.layers.ops.rope import qk_norm_rope as mod
 
     monkeypatch.setattr(mod, "fused_qk_norm_rope_available", lambda *a, **k: True)
     cos, sin = torch.randn(8, 4), torch.randn(8, 4)
@@ -506,7 +548,7 @@ def test_fused_ops_bitwise_under_torch_compile_and_cuda_graph(cuda_rms_norm):
 def test_pack_qk_norm_rope_table_identity_rows(monkeypatch):
     """``identity_rows`` appends ``cos = 1, sin = 0`` rows after the rotated
     rows (per batch element)."""
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as mod
+    from vllm_omni.diffusion.layers.ops.rope import qk_norm_rope as mod
 
     monkeypatch.setattr(mod, "fused_qk_norm_rope_available", lambda *a, **k: True)
     cos, sin = torch.randn(5, 4), torch.randn(5, 4)
@@ -540,7 +582,7 @@ def test_fused_qk_norm_rope_large_storage_offsets(interleaved):
 @pytest.mark.parametrize("large_stream", [0, 1])
 def test_fused_joint_qkv_norm_rope_large_storage_offsets(large_stream):
     """Both input streams must retain 64-bit addressing for Q, K, and V."""
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _launch_fused_joint_qkv_norm_rope
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import _launch_fused_joint_qkv_norm_rope
 
     # As in the single-stream regression, touch only three rows of a 4 GiB view.
     large = torch.empty_strided((1, 3, 1, 128), (3 * 2**30, 2**30, 128, 1), device="cuda", dtype=torch.bfloat16)

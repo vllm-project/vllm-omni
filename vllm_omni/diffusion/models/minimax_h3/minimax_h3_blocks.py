@@ -30,13 +30,13 @@ from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
     rms_norm_indexed_scale_shift,
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
 

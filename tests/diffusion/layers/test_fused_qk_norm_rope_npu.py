@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 import types
@@ -58,7 +58,7 @@ def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, t
 def test_npu_qk_norm_rope_uses_torch_npu_fused_primitives_without_mindiesd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
+    from vllm_omni.diffusion.layers.ops.rope import qk_norm_rope as fused
 
     calls: dict[str, int] = {"rms_norm": 0, "rotary_mul": 0}
 
@@ -111,7 +111,7 @@ def test_npu_qk_norm_rope_ignores_installed_mindiesd(monkeypatch: pytest.MonkeyP
     mindiesd install must never route ``_npu_apply_rope_table`` back to
     ``mindiesd.rotary_position_embedding``.
     """
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
+    from vllm_omni.diffusion.layers.ops.rope import qk_norm_rope as fused
 
     calls: dict[str, int] = {"rms_norm": 0, "rotary_mul": 0, "mindiesd_rope": 0}
 
@@ -167,8 +167,8 @@ def test_npu_qk_norm_rope_ignores_installed_mindiesd(monkeypatch: pytest.MonkeyP
 
 @hardware_test(res={"npu": "A3"}, num_cards=1)
 def test_fused_qk_norm_rope_npu_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise the public Ascend dispatch with real torch_npu/MindIE operators."""
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
+    """Exercise the public Ascend dispatch with real torch_npu operators."""
+    from vllm_omni.diffusion.layers.ops.rope import qk_norm_rope as fused
 
     q, k, q_weight, k_weight, rope_table = (tensor.to("npu") for tensor in _inputs())
     calls = 0
