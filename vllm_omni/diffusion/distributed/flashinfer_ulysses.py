@@ -4,8 +4,9 @@
 
 Selected with ``ulysses_a2a_backend="flashinfer"`` (on top of ``ulysses_a2a_permute``). On NVLink nodes FlashInfer
 runs one-sided kernels; outputs registered with ``allocate_output()`` take its direct route, where every rank writes
-its blocks straight into the peers' outputs. Those outputs belong to the communicator and are reused by every call,
-so a returned tensor stays valid until the next exchange of the same kind on the group.
+its blocks straight into the peers' outputs. Those outputs belong to the communicator and are reused by every call:
+Q/K/V are returned as those outputs because attention consumes them inside the Ulysses strategy, while the attention
+output, which goes back to model code, is copied out.
 """
 
 from __future__ import annotations
@@ -82,7 +83,8 @@ def ulysses_fi_o(y: torch.Tensor, group_name: str, world_size: int) -> torch.Ten
     """(B, S, H/P, D) -> (B, S/P, H, D)."""
     y = y.contiguous()
     comm = _communicator(group_name, y.numel() * y.element_size(), y.dtype)
-    return comm.gather_heads(y, out=_output(comm, group_name, y, "gather_heads", 0))
+    # The output goes back to model code, so it gets its own storage instead of the reused communicator buffer.
+    return comm.gather_heads(y, out=_output(comm, group_name, y, "gather_heads", 0)).clone()
 
 
 @ulysses_fi_o.register_fake

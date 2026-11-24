@@ -232,6 +232,7 @@ In `DiffusionParallelConfig`:
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
 | `ulysses_a2a_permute` | bool | `False` | Enable CUDA copy engines (CE) for strict Ulysses; disabled uses NCCL. On NPU, use platform SHMEM. |
+| `ulysses_a2a_backend` | str | `"copy_engine"` | Transport for `ulysses_a2a_permute` on CUDA: `"copy_engine"` (copy engines into symmetric memory) or `"flashinfer"` (FlashInfer `UlyssesCommunicator` NVLink kernels). Requires `ulysses_a2a_permute=True`. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -250,6 +251,38 @@ vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-permute
 
 On NPU, the flag retains the existing
 [NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).
+
+### FlashInfer transport
+
+`ulysses_a2a_backend="flashinfer"` (CLI: `--ulysses-a2a-backend flashinfer`) moves the strict Ulysses
+Q/K/V scatter and output gather onto FlashInfer's `UlyssesCommunicator` instead of the copy engines.
+It needs everything the copy-engine path needs, plus a FlashInfer build that provides
+`flashinfer.comm.UlyssesCommunicator`.
+
+```bash
+vllm serve MiniMaxAI/MiniMax-H3 --omni --ulysses-degree 8 \
+  --ulysses-a2a-permute --ulysses-a2a-backend flashinfer
+```
+
+```python
+parallel_config=DiffusionParallelConfig(
+    ulysses_degree=8,
+    ulysses_a2a_permute=True,
+    ulysses_a2a_backend="flashinfer",
+)
+```
+
+When to use it: on MiniMax-H3 with B200 it is the fastest transport at 8 GPUs, where each GPU's
+exchange is small and the copy-engine path is dominated by per-copy overhead. At 2 and 4 GPUs it is
+about as fast as the copy-engine path. Outputs are bit-identical to the copy-engine and NCCL paths,
+and the attention output returned to the model is an ordinary tensor (it is copied out of the
+communicator's buffer). FlashInfer's communicator buffers use up to ~0.8 GB of extra memory per GPU;
+communicators are created on first use for each Ulysses group and kept for the life of the process.
+
+Common errors:
+
+- `ulysses_a2a_backend requires ulysses_a2a_permute=True`: add `--ulysses-a2a-permute`.
+- `ulysses_a2a_backend='flashinfer' requires flashinfer with UlyssesCommunicator`: upgrade FlashInfer.
 
 ## Best Practices
 
