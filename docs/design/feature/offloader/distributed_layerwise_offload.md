@@ -156,7 +156,9 @@ requests must take the same execution path at every denoising step.
 
 ### NPU INT8 weight layout
 
-`VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE` defaults to `off`. Set it to `cast` or
+Set `weight_nz_mode` in the INT8 component configuration, for example
+`--diffusion-quantization-config '{"transformer":{"method":"int8","weight_nz_mode":"cast"}}'`.
+The default is `off`. Choose `cast` or
 `reactor` to convert finalized NPU INT8 linear weights to `FRACTAL_NZ`
 (format 29). Both modes convert resident weights once after loading.
 
@@ -176,8 +178,8 @@ and on Ascend 950DT (A5) with CANN 9.3.0, using TorchNPU `2.10.0.post7`
 on both systems. The four-card A5 MiniMax-H3 smoke used DLO AllGather
 with `--dlo-chunk-size-mb 1`.
 
-With sleep mode enabled, NPU startup rejects `cast` and `reactor` before
-loading weights. Ordinary model-level and layer-wise CPU offload also reject
+A diffusion stage with sleep mode enabled rejects `cast` and `reactor` in its
+own NPU INT8 configuration before loading weights. Ordinary model-level and layer-wise CPU offload also reject
 either mode when the model contains eligible INT8 weights.
 
 ### Rank-local path without DLO AllGather

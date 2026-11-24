@@ -560,8 +560,7 @@ class TestDistributedLayerwiseOffloadHook:
         block.padded_weight = nn.Parameter(torch.arange(561).to(torch.int8).reshape(17, 33), requires_grad=False)
         block.weight_scale = nn.Parameter(torch.arange(33, dtype=torch.float32), requires_grad=False)
         expected = {name: tensor.detach().clone() for name, tensor in block.named_parameters()}
-        mocker.patch.object(nz, "get_weight_nz_mode", return_value=mode)
-        mocker.patch.object(nz, "int8_weight_names", return_value={"weight", "padded_weight"})
+        mocker.patch.object(nz, "int8_weight_modes", return_value={"weight": mode, "padded_weight": mode})
         mocker.patch.object(nz, "check_reactor_support")
         events = []
         converted = []
@@ -643,8 +642,7 @@ class TestDistributedLayerwiseOffloadHook:
             block.weight = nn.Parameter(expected.clone(), requires_grad=False)
             block.weight_scale = nn.Parameter(scale.clone(), requires_grad=False)
             blocks.append(block)
-        mocker.patch.object(nz, "get_weight_nz_mode", return_value="reactor")
-        mocker.patch.object(nz, "int8_weight_names", return_value={"weight"})
+        mocker.patch.object(nz, "int8_weight_modes", return_value={"weight": "reactor"})
         mocker.patch.object(nz, "check_reactor_support")
         mocker.patch.object(
             nz,
@@ -1321,8 +1319,7 @@ class TestPinnedModuleStager:
             # Like a borrowed NZ descriptor, the stand-in must not keep the buffer owner alive.
             return nz.unpack_nz_weight(buffer[offset:], shape).clone()
 
-        monkeypatch.setattr(nz, "get_weight_nz_mode", lambda: "reactor")
-        monkeypatch.setattr(nz, "int8_weight_names", lambda _: {"weight"})
+        monkeypatch.setattr(nz, "int8_weight_modes", lambda _: {"weight": "reactor"})
         monkeypatch.setattr(nz, "check_reactor_support", lambda: None)
         monkeypatch.setattr(nz, "nz_view", nz_view)
         # The indexed CPU device makes Tensor.to allocate a distinct staging buffer.
@@ -3161,26 +3158,6 @@ class _GenericDistributedEncoderPipeline(nn.Module):
 
 
 class TestDistributedComponentSelection:
-    def test_allgather_rejects_different_nz_shard_layouts(self, patched_offload_runtime, mocker, monkeypatch):
-        from vllm_omni.diffusion.distributed import parallel_state
-
-        config = OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, dp_size=2)
-        backend = DistributedLayerwiseOffloadBackend(config, torch.device("cpu"))
-        backend.device = SimpleNamespace(type="npu")
-        coord = mocker.Mock(world_size=2)
-        mocker.patch.object(dist, "is_initialized", return_value=True)
-        mocker.patch.object(parallel_state, "get_data_parallel_world_size", return_value=2)
-        mocker.patch.object(parallel_state, "get_dp_group", return_value=coord)
-        monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", raising=False)
-
-        def gather(modes, local, group):
-            assert group is coord.cpu_group and local == "off"
-            modes[:] = [local, "reactor"]
-
-        mocker.patch.object(dist, "all_gather_object", side_effect=gather)
-        with pytest.raises(ValueError, match="mode must match"):
-            backend._init_dp_group()
-
     def test_on_demand_only_encoder_cannot_claim_allgather(self, patched_offload_runtime):
         class Pipeline(nn.Module):
             _offload_plan = OffloadPlan(

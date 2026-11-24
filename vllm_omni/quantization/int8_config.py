@@ -174,6 +174,7 @@ class DiffusionInt8Config(QuantizationConfig):
         is_checkpoint_int8_serialized: bool = False,
         activation_scheme: str = "dynamic",
         ignored_layers: list[str] | None = None,
+        weight_nz_mode: str = "off",
     ) -> None:
         super().__init__()
 
@@ -181,6 +182,9 @@ class DiffusionInt8Config(QuantizationConfig):
 
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
+        if weight_nz_mode not in ("off", "cast", "reactor"):
+            raise ValueError("weight_nz_mode must be 'off', 'cast' or 'reactor'")
+        self.weight_nz_mode = weight_nz_mode
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
 
@@ -218,6 +222,7 @@ class DiffusionInt8Config(QuantizationConfig):
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
+            weight_nz_mode=config.get("weight_nz_mode", "off"),
         )
 
     def get_quant_method(

@@ -7,13 +7,17 @@ weights are cast after device placement; offload owners use the packing and
 view helpers to preserve NZ across their own storage transitions.
 """
 
-import os
-from collections.abc import Sequence, Set
+from collections.abc import Iterable, Sequence, Set
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 
 _NZ_FORMAT = 29
 _ROW_BLOCK = 16
@@ -22,30 +26,29 @@ _verified_view_devices: set[torch.device] = set()
 _verified_a5_reactor_devices: set[torch.device] = set()
 
 
-def configured_weight_nz_mode() -> str:
-    return os.getenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "off").strip().lower()
+def stage_uses_weight_nz(config: "QuantizationConfig | None") -> bool:
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    configs = (
+        (*config.component_configs.values(), config.default_config)
+        if isinstance(config, ComponentQuantizationConfig)
+        else (config,)
+    )
+    return any(isinstance(item, DiffusionInt8Config) and item.weight_nz_mode != "off" for item in configs)
 
 
-def get_weight_nz_mode() -> str | None:
-    """Return the explicit layout mode on NPU, or None when disabled."""
+def int8_weight_modes(model: nn.Module) -> dict[str, str]:
+    """Read each finalized NPU INT8 layer's resolved component config."""
     if not current_omni_platform.is_npu():
-        return None
-    mode = configured_weight_nz_mode()
-    if mode == "off":
-        return None
-    if mode not in ("cast", "reactor"):
-        raise ValueError("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE must be 'off', 'cast' or 'reactor'")
-    return mode
-
-
-def int8_weight_names(model: nn.Module) -> set[str]:
-    """Select finalized weights for online and checkpoint NPU INT8 linear layers."""
+        return {}
     from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
 
     return {
-        f"{name}.weight" if name else "weight"
+        (f"{name}.weight" if name else "weight"): method.quant_config.weight_nz_mode
         for name, layer in model.named_modules()
-        if isinstance(getattr(layer, "quant_method", None), NPUInt8LinearMethod)
+        if isinstance(method := getattr(layer, "quant_method", None), NPUInt8LinearMethod)
+        and method.quant_config.weight_nz_mode != "off"
         and layer._parameters.get("weight") is not None
     }
 
@@ -74,9 +77,11 @@ def cast_weight_to_nz(weight: torch.Tensor, *, resident: bool = False) -> torch.
     return result
 
 
-def prepare_resident_weights(model: nn.Module, excluded_parameter_ids: Set[int] = frozenset()) -> None:
+def prepare_resident_weights(
+    model: nn.Module, names: Iterable[str], excluded_parameter_ids: Set[int] = frozenset()
+) -> None:
     """Cast finalized resident weights, leaving offloader-owned parameters alone."""
-    for name in int8_weight_names(model):
+    for name in names:
         weight = model.get_parameter(name)
         if weight.device.type == "npu" and id(weight) not in excluded_parameter_ids:
             weight.data = cast_weight_to_nz(weight.data, resident=True)

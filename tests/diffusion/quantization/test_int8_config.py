@@ -514,7 +514,7 @@ def test_npu_int8_resident_weight_nz(mocker, monkeypatch, method_name, device_na
     from vllm_omni.quantization import int8_config
 
     layer = Module()
-    layer.quant_method = mocker.Mock(spec=getattr(int8_config, method_name))
+    layer.quant_method = getattr(int8_config, method_name)(build_quant_config("int8"))
     logical_weight = torch.arange(64 * 32).reshape(64, 32).to(torch.int8)
     layer.weight = Parameter(logical_weight.clone(), requires_grad=False)
     layer.weight_scale = scale = Parameter(torch.ones(32), requires_grad=False)
@@ -532,10 +532,9 @@ def test_npu_int8_resident_weight_nz(mocker, monkeypatch, method_name, device_na
     npu.npu.get_device_name.return_value = device_name
     device = mocker.Mock(type="npu")
     monkeypatch.setattr(torch.Tensor, "device", property(lambda _: device))
-    monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", raising=False)
     offloader.enable_offload_backend(config, model)
     assert npu.get_npu_format(layer.weight) == 2
-    monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", mode)
+    layer.quant_method = getattr(int8_config, method_name)(build_quant_config("int8", weight_nz_mode=mode))
     offloader.enable_offload_backend(config, model)
     if device_name.startswith("Ascend950"):
         npu.npu_format_cast.assert_called_once()
@@ -551,17 +550,16 @@ def test_npu_int8_resident_weight_nz(mocker, monkeypatch, method_name, device_na
 
 
 @pytest.mark.parametrize("quantized", [False, True])
-def test_npu_int8_nz_ordinary_offload(mocker, monkeypatch, quantized):
+def test_npu_int8_nz_ordinary_offload(mocker, quantized):
     from vllm_omni.diffusion import offloader
     from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
 
     model = torch.nn.Linear(4, 4)
     if quantized:
-        model.quant_method = mocker.Mock(spec=NPUInt8LinearMethod)
+        model.quant_method = NPUInt8LinearMethod(build_quant_config("int8", weight_nz_mode="cast"))
     backend = mocker.Mock(spec=offloader.LayerWiseOffloadBackend)
     mocker.patch.object(offloader, "get_offload_backend", return_value=backend)
     mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
-    monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "cast")
 
     if quantized:
         with pytest.raises(ValueError, match="distributed layerwise offload"):
@@ -572,16 +570,30 @@ def test_npu_int8_nz_ordinary_offload(mocker, monkeypatch, quantized):
         backend.enable.assert_called_once_with(model)
 
 
-@pytest.mark.parametrize("mode", ["cast", "reactor"])
-def test_load_model_rejects_npu_int8_nz_with_sleep(monkeypatch, mode):
+@pytest.mark.parametrize(
+    ("spec", "reject"),
+    [
+        (None, False),
+        ({"transformer": "int8"}, False),
+        ({"method": "int8", "weight_nz_mode": "cast"}, True),
+        ({"transformer": {"method": "int8", "weight_nz_mode": "reactor"}}, True),
+    ],
+)
+def test_load_model_checks_stage_int8_layout_with_sleep(mocker, spec, reject):
     from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(enable_sleep_mode=True)
-    monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", mode)
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
-    with pytest.raises(ValueError, match="enable_sleep_mode.*VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE"):
-        runner.load_model()
+    runner.od_config = SimpleNamespace(enable_sleep_mode=True, quantization_config=build_quant_config(spec))
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+    reached_load = mocker.patch.object(runner, "_require_attention_schedule_pipeline", side_effect=StopIteration)
+    if reject:
+        with pytest.raises(ValueError, match="enable_sleep_mode.*weight_nz_mode"):
+            runner.load_model()
+        reached_load.assert_not_called()
+    else:
+        with pytest.raises(StopIteration):
+            runner.load_model()
+        reached_load.assert_called_once()
 
 
 @npu_available

@@ -473,22 +473,20 @@ class PinnedModuleStager:
         self.retain_device_storage = retain_device_storage
         self.loaded = False
         self._offload_pending = False
-        self._nz_mode = weight_nz.get_weight_nz_mode()
         self._nz_masters: dict[torch.Tensor, torch.Tensor] = {}
-        self._nz_host_weights: dict[torch.Tensor, torch.Tensor] = {}
-        if self._nz_mode is not None:
-            for item in modules:
-                for name in weight_nz.int8_weight_names(item):
-                    target = item.get_parameter(name)
-                    with torch.inference_mode(_local_tensor(target).is_inference()):
-                        master = _local_tensor(target).detach().cpu()
-                        host_weight = weight_nz.pack_nz_weight(master) if self._nz_mode == "reactor" else master
-                        if pin_memory and not host_weight.is_pinned():
-                            host_weight = host_weight.pin_memory()
-                    self._nz_masters[target] = master if self._nz_mode == "reactor" else host_weight
-                    self._nz_host_weights[target] = host_weight
-            if self._nz_masters and self._nz_mode == "reactor":
-                weight_nz.check_reactor_support()
+        self._nz_host_weights: dict[torch.Tensor, tuple[torch.Tensor, str]] = {}
+        for item in modules:
+            for name, mode in weight_nz.int8_weight_modes(item).items():
+                target = item.get_parameter(name)
+                with torch.inference_mode(_local_tensor(target).is_inference()):
+                    master = _local_tensor(target).detach().cpu()
+                    host_weight = weight_nz.pack_nz_weight(master) if mode == "reactor" else master
+                    if pin_memory and not host_weight.is_pinned():
+                        host_weight = host_weight.pin_memory()
+                self._nz_masters[target] = master if mode == "reactor" else host_weight
+                self._nz_host_weights[target] = (host_weight, mode)
+        if any(mode == "reactor" for _, mode in self._nz_host_weights.values()):
+            weight_nz.check_reactor_support()
         self._groups = self._snapshot_groups(
             modules,
             pin_memory=pin_memory,
@@ -569,9 +567,9 @@ class PinnedModuleStager:
                 device_storage.copy_(group.master, non_blocking=group.master.is_pinned())
             for target, master in self._nz_masters.items():
                 with torch.inference_mode(_local_tensor(target).is_inference()):
-                    host_weight = self._nz_host_weights[target]
+                    host_weight, mode = self._nz_host_weights[target]
                     buffer = host_weight.to(self.device, non_blocking=host_weight.is_pinned())
-                    if self._nz_mode == "reactor":
+                    if mode == "reactor":
                         self._nz_device_buffers.append(buffer)
                         weight = weight_nz.nz_view(buffer, 0, master.shape)
                     else:
